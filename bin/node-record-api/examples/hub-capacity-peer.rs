@@ -16,7 +16,7 @@ use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
     future::Future,
     io::Write,
@@ -197,6 +197,9 @@ struct Command {
     /// Executed epoch batch digests, supplied by the coordinator's retained RPC observations.
     #[serde(default)]
     batch_digests: BTreeSet<B256>,
+    /// Retained source epoch for each of the selected executed batch digests.
+    #[serde(default)]
+    batch_epochs: BTreeMap<B256, Epoch>,
     /// Completed epoch selected by the coordinator's declared executed-batch selection rule.
     sync_epoch: Option<Epoch>,
 }
@@ -462,15 +465,20 @@ impl Peer {
     }
 
     /// Transfer a completed primary epoch and verify the same real batches on both worker swarms.
-    async fn sync(&self, batch_digests: &BTreeSet<B256>, epoch: Epoch) -> Result<Value> {
-        if batch_digests.len() != 4 {
-            Err(eyre!("bulk qualification requires four executed batch digests"))?;
-        }
+    async fn sync(
+        &self,
+        batch_digests: &BTreeSet<B256>,
+        batch_epochs: &BTreeMap<B256, Epoch>,
+        epoch: Epoch,
+    ) -> Result<Value> {
+        let batch_requests = worker_batch_requests(batch_digests, batch_epochs, epoch)?;
         let target = self.config.target;
         let limit = self.config.network.libp2p_config().max_rpc_message_size;
         let transfers = futures::future::try_join_all(self.handles.clone().into_iter().map(
             |(role, handle)| {
                 let batch_digests = batch_digests.clone();
+                let batch_epochs = batch_epochs.clone();
+                let batch_requests = batch_requests.clone();
                 async move {
                     match role {
                         NetworkType::Primary => {
@@ -478,12 +486,24 @@ impl Peer {
                             Ok::<_, eyre::Report>(json!({"swarm": role_name(role), "bytes": frames.iter().map(Vec::len).sum::<usize>(), "completed": true}))
                         }
                         NetworkType::Worker(_) => {
-                            let frames = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: batch_digests.clone(), epoch }, limit).await?;
-                            let received = frames.iter().map(|data| try_decode::<Batch>(data).map(|batch| batch.digest())).collect::<Result<BTreeSet<_>, _>>()?;
-                            if received != batch_digests || frames.len() != batch_digests.len() {
-                                Err(eyre!("worker transfer did not return the requested batches"))?;
-                            }
-                            Ok(json!({"swarm": role_name(role), "bytes": frames.iter().map(Vec::len).sum::<usize>(), "batch_digests": received, "completed": true}))
+                            let (bytes, frames) = futures::stream::iter(batch_requests.into_iter().map(Ok::<_, eyre::Report>))
+                                .try_fold((0usize, Vec::new()), |(total, mut frames), (source_epoch, requested)| {
+                                    let handle = handle.clone();
+                                    let batch_epochs = batch_epochs.clone();
+                                    async move {
+                                        let data = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: requested.clone(), epoch: source_epoch }, limit).await?;
+                                        verify_worker_batches(&data, &requested, &batch_epochs)?;
+                                        total.checked_add(data.iter().map(Vec::len).sum::<usize>())
+                                            .filter(|bytes| *bytes <= 64 * 1024 * 1024)
+                                            .ok_or_else(|| eyre!("sync exceeded its 64 MiB or 1024-frame transfer bound"))
+                                            .map(|total| {
+                                                frames.extend(data);
+                                                (total, frames)
+                                            })
+                                    }
+                                }).await?;
+                            verify_worker_batches(&frames, &batch_digests, &batch_epochs).map(|received|
+                                json!({"swarm": role_name(role), "bytes": bytes, "batch_digests": received, "completed": true}))
                         }
                     }
                 }
@@ -491,6 +511,55 @@ impl Peer {
         )).await?;
         Ok(json!({"epoch": epoch, "target": target, "transfers": transfers, "completed": true}))
     }
+}
+
+/// Validate retained provenance and group the unchanged selected digests by source epoch.
+fn worker_batch_requests(
+    batch_digests: &BTreeSet<B256>,
+    batch_epochs: &BTreeMap<B256, Epoch>,
+    epoch: Epoch,
+) -> Result<BTreeMap<Epoch, BTreeSet<B256>>> {
+    if batch_digests.len() != 4 {
+        Err(eyre!("bulk qualification requires four executed batch digests"))?;
+    }
+    if batch_epochs.keys().copied().collect::<BTreeSet<_>>() != *batch_digests
+        || batch_epochs.values().any(|source_epoch| *source_epoch < epoch)
+        || !batch_epochs.values().any(|source_epoch| *source_epoch == epoch)
+    {
+        Err(eyre!("bulk batch source epochs do not match the selected executed batches"))?;
+    }
+    Ok(batch_epochs.iter().fold(BTreeMap::new(), |mut requests, (digest, source_epoch)| {
+        requests.entry(*source_epoch).or_insert_with(BTreeSet::new).insert(*digest);
+        requests
+    }))
+}
+
+/// Every source-epoch transfer and the aggregate must contain exactly the requested real batches.
+fn verify_worker_batches(
+    frames: &[Vec<u8>],
+    batch_digests: &BTreeSet<B256>,
+    batch_epochs: &BTreeMap<B256, Epoch>,
+) -> Result<BTreeSet<B256>> {
+    frames
+        .iter()
+        .map(|data| {
+            try_decode::<Batch>(data).map_err(eyre::Report::from).and_then(|batch| {
+                let digest = batch.digest();
+                batch_epochs
+                    .get(&digest)
+                    .filter(|source_epoch| **source_epoch == batch.epoch)
+                    .map(|_| digest)
+                    .ok_or_else(|| eyre!("worker batch did not match its retained source epoch"))
+            })
+        })
+        .collect::<Result<BTreeSet<_>, _>>()
+        .and_then(|received| {
+            if received != *batch_digests || frames.len() != batch_digests.len() {
+                Err(eyre!("worker transfer did not return the requested batches"))
+            } else {
+                Ok(received)
+            }
+        })
 }
 
 /// Read a finite nonempty production sync exchange, rejecting invalid ordering and oversized data.
@@ -566,6 +635,7 @@ async fn command(State(peer): State<Arc<Peer>>, Json(request): Json<Command>) ->
                 Scenario::ConcurrentSync => {
                     peer.sync(
                         &request.batch_digests,
+                        &request.batch_epochs,
                         request.sync_epoch.unwrap_or(peer.config.sync_epoch),
                     )
                     .await
@@ -799,6 +869,113 @@ mod tests {
 
     use super::*;
     use tn_network_libp2p::types::NetworkCommand;
+
+    /// The four selected digests retain their individual source epochs and the primary epoch.
+    #[test]
+    fn mixed_epoch_worker_requests_preserve_selected_batches() -> Result<()> {
+        let digests = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]].map(B256::from);
+        let batch_epochs =
+            BTreeMap::from([(digests[0], 5), (digests[1], 5), (digests[2], 6), (digests[3], 7)]);
+        let request: Command = serde_json::from_value(json!({
+            "operation_id": "nonce", "scenario": "concurrent_sync", "not_before_unix_us": 0,
+            "sync_epoch": 5, "batch_digests": digests, "batch_epochs": batch_epochs,
+        }))?;
+        let requests = worker_batch_requests(&request.batch_digests, &request.batch_epochs, 5)?;
+        assert_eq!(request.sync_epoch, Some(5));
+        assert_eq!(
+            requests,
+            BTreeMap::from([
+                (5, BTreeSet::from([digests[0], digests[1]])),
+                (6, BTreeSet::from([digests[2]])),
+                (7, BTreeSet::from([digests[3]])),
+            ])
+        );
+        assert_eq!(
+            requests.into_values().flatten().collect::<BTreeSet<_>>(),
+            request.batch_digests
+        );
+        Ok(())
+    }
+
+    /// No worker transfer may substitute absent, mismatched, or stale retained provenance.
+    #[test]
+    fn worker_requests_reject_invalid_epoch_maps() -> Result<()> {
+        let digests = [[1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]].map(B256::from);
+        let selected = BTreeSet::from(digests);
+        let valid =
+            BTreeMap::from([(digests[0], 5), (digests[1], 5), (digests[2], 6), (digests[3], 6)]);
+        let missing = valid.iter().skip(1).map(|(digest, epoch)| (*digest, *epoch)).collect();
+        let extra = valid
+            .iter()
+            .map(|(digest, epoch)| (*digest, *epoch))
+            .chain([(B256::ZERO, 5)])
+            .collect();
+        let stale =
+            BTreeMap::from([(digests[0], 4), (digests[1], 5), (digests[2], 6), (digests[3], 6)]);
+        let wrong_primary = digests.into_iter().map(|digest| (digest, 6)).collect();
+        [BTreeMap::new(), missing, extra, stale, wrong_primary].into_iter().for_each(|epochs| {
+            assert!(worker_batch_requests(&selected, &epochs, 5).is_err());
+        });
+        assert!(worker_batch_requests(
+            &BTreeSet::from([digests[0], digests[1], digests[2]]),
+            &valid,
+            5
+        )
+        .is_err());
+        let payload = json!({"operation_id": "nonce", "scenario": "concurrent_sync",
+            "not_before_unix_us": 0, "sync_epoch": 5, "batch_digests": digests});
+        let missing: Command = serde_json::from_value(payload.clone())?;
+        assert!(worker_batch_requests(&missing.batch_digests, &missing.batch_epochs, 5).is_err());
+        [
+            json!([]),
+            json!({"invalid-digest": 5}),
+            json!({digests[0].to_string(): "5"}),
+            json!({digests[0].to_string(): -1}),
+        ]
+        .into_iter()
+        .for_each(|epochs| {
+            let mut malformed = payload.clone();
+            malformed["batch_epochs"] = epochs;
+            assert!(serde_json::from_value::<Command>(malformed).is_err());
+        });
+        Ok(())
+    }
+
+    /// Completed worker witnesses aggregate real mixed-epoch batches and reject substitutions.
+    #[test]
+    fn mixed_epoch_worker_witness_requires_exact_digests_and_source_epochs() -> Result<()> {
+        let batches = (0u8..4)
+            .map(|index| Batch {
+                transactions: vec![vec![index + 1; 32 * 1024]],
+                epoch: 5 + Epoch::from(index / 2),
+                ..Batch::default()
+            })
+            .collect::<Vec<_>>();
+        let selected = batches.iter().map(Batch::digest).collect::<BTreeSet<_>>();
+        let epochs =
+            batches.iter().map(|batch| (batch.digest(), batch.epoch)).collect::<BTreeMap<_, _>>();
+        let frames = batches.iter().map(tn_types::encode).collect::<Vec<_>>();
+        let requests = worker_batch_requests(&selected, &epochs, 5)?;
+        requests.into_iter().try_for_each(|(epoch, requested)| {
+            let data = batches
+                .iter()
+                .filter(|batch| batch.epoch == epoch)
+                .map(tn_types::encode)
+                .collect::<Vec<_>>();
+            verify_worker_batches(&data, &requested, &epochs)
+                .map(|received| assert_eq!(received, requested))
+        })?;
+        assert_eq!(verify_worker_batches(&frames, &selected, &epochs)?, selected);
+        assert!(frames.iter().map(Vec::len).sum::<usize>() >= 128 * 1024);
+        assert!(verify_worker_batches(&frames[..3], &selected, &epochs).is_err());
+        assert!(verify_worker_batches(&vec![frames[0].clone(); 4], &selected, &epochs).is_err());
+        let duplicate = frames.iter().cloned().chain([frames[0].clone()]).collect::<Vec<_>>();
+        assert!(verify_worker_batches(&duplicate, &selected, &epochs).is_err());
+        assert!(verify_worker_batches(&[vec![0xff]], &selected, &epochs).is_err());
+        let stale = epochs.into_iter().map(|(digest, epoch)| (digest, epoch + 1)).collect();
+        assert!(verify_worker_batches(&frames, &selected, &stale).is_err());
+        Ok(())
+    }
 
     /// Native payloads are clipped at Unicode scalar boundaries without altering the error.
     #[test]

@@ -8,13 +8,14 @@ import io
 import json
 import os
 from pathlib import Path
+import socket
 import socketserver
 import sys
 import tempfile
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import warnings
 
 
@@ -79,6 +80,90 @@ def environment(scenario="public_join"):
 
 
 class ControlTests(unittest.TestCase):
+    def test_response_readers_retain_socket_until_last_idempotent_close(self):
+        raw, peer = socket.socketpair()
+        with raw, peer:
+            tracked = Mock(wraps=raw)
+            owner = CONTROL.DeadlineSocket(tracked, time.monotonic() + 2)
+            first = owner.makefile("rb")
+            second = owner.makefile("rb")
+            try:
+                owner.close()
+                owner.close()
+                tracked.close.assert_not_called()
+                peer.sendall(b"body")
+                self.assertEqual(first.read(4), b"body")
+                first.close()
+                first.close()
+                tracked.close.assert_not_called()
+                second.close()
+                second.close()
+                tracked.close.assert_called_once_with()
+                self.assertEqual(raw.fileno(), -1)
+            finally:
+                first.close()
+                second.close()
+                owner.close()
+
+    def test_connection_close_and_http10_read_delayed_body_without_retry_or_leak(self):
+        for headers in (b"HTTP/1.1 200 OK\r\nConnection: close\r\n",
+                        b"HTTP/1.0 200 OK\r\n"):
+            with self.subTest(headers=headers):
+                def reply(connection, payload):
+                    body = json.dumps(acknowledgement(payload)).encode()
+                    connection.sendall(headers + b"\r\n")
+                    time.sleep(0.03)
+                    connection.sendall(body)
+
+                sockets = []
+                original = CONTROL.DeadlineSocket
+
+                def track(raw, deadline):
+                    sockets.append(raw)
+                    return original(raw, deadline)
+
+                with server(reply) as (url, requests), patch.object(CONTROL, "DeadlineSocket", side_effect=track), patch.object(WORKLOAD.subprocess, "Popen", side_effect=AssertionError("unexpected retry process")), patch.object(CONTROL.urllib.request, "urlopen", side_effect=AssertionError("unexpected fallback")):
+                    result = WORKLOAD.execute(agent(url), "public_join", "nonce", time.monotonic(), 2)
+                self.assertTrue(result["success"], result.get("rejection_reason"))
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(sockets), 1)
+                self.assertEqual(sockets[0].fileno(), -1)
+                gc.collect()
+
+    def test_connection_close_body_keeps_original_deadline_and_response_bound(self):
+        for mode, reason in (("drip", "timeout"), ("oversized", "64 KiB")):
+            with self.subTest(mode=mode):
+                def reply(connection, payload):
+                    connection.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+                    time.sleep(0.02)
+                    if mode == "drip":
+                        for _ in range(100):
+                            connection.sendall(b" ")
+                            time.sleep(0.02)
+                    else:
+                        connection.sendall(b" " * (64 * 1024 + 1))
+
+                sockets = []
+                original = CONTROL.DeadlineSocket
+
+                def track(raw, deadline):
+                    sockets.append(raw)
+                    return original(raw, deadline)
+
+                with server(reply) as (url, requests), patch.object(CONTROL, "DeadlineSocket", side_effect=track), patch.object(WORKLOAD.subprocess, "Popen", side_effect=AssertionError("unexpected retry process")), patch.object(CONTROL.urllib.request, "urlopen", side_effect=AssertionError("unexpected fallback")):
+                    started = time.monotonic()
+                    result = WORKLOAD.execute(agent(url), "public_join", "nonce", started, 0.1)
+                    elapsed = time.monotonic() - started
+                self.assertFalse(result["success"])
+                self.assertIn(reason, result["rejection_reason"])
+                if mode == "drip":
+                    self.assertGreaterEqual(elapsed, 0.09)
+                    self.assertLess(elapsed, 0.35)
+                self.assertEqual(len(requests), 1)
+                self.assertEqual(len(sockets), 1)
+                self.assertEqual(sockets[0].fileno(), -1)
+                gc.collect()
+
     def test_shared_cli_and_deadline_adapter_preserve_payload_and_witness(self):
         with server(lambda connection, payload: send(connection, acknowledgement(payload))) as (url, requests):
             args = argparse.Namespace(url=url, identity=None, observations=None, bulk_root=None)
@@ -148,7 +233,9 @@ class ControlTests(unittest.TestCase):
             with tempfile.TemporaryDirectory() as directory:
                 fixture = Path(directory) / "candidate"
                 fixture.mkdir()
-                targets = {"sync_epoch": 5, "batch_digests": [f"0x{index:064x}" for index in range(4)]}
+                digests = [f"0x{index:064x}" for index in range(4)]
+                targets = {"sync_epoch": 5, "batch_digests": digests,
+                           "batch_epochs": {digest: 5 + index // 2 for index, digest in enumerate(digests)}}
                 (fixture / "bulk-targets.json").write_text(json.dumps(targets))
                 args.bulk_root = directory
                 CONTROL.invoke(args, environment("concurrent_sync"), deadline=time.monotonic() + 2)

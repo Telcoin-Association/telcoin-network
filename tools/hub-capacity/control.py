@@ -42,9 +42,10 @@ def remaining_timeout(deadline):
 class DeadlineReader(io.RawIOBase):
     """Recheck the operation deadline even when headers or bodies arrive in a drip."""
 
-    def __init__(self, connection, deadline):
+    def __init__(self, connection, deadline, release):
         self.connection = connection
         self.deadline = deadline
+        self.release = release
 
     def readable(self):
         return True
@@ -54,16 +55,19 @@ class DeadlineReader(io.RawIOBase):
         return self.connection.recv_into(buffer)
 
     def close(self):
-        try:
-            self.connection.close()
-        finally:
-            super().close()
+        if not self.closed:
+            try:
+                super().close()
+            finally:
+                self.release()
 
 
 class DeadlineSocket:
     def __init__(self, connection, deadline):
         self.connection = connection
         self.deadline = deadline
+        self._closed = False
+        self._readers = 0
 
     def sendall(self, data):
         self.connection.settimeout(remaining_timeout(self.deadline))
@@ -72,10 +76,27 @@ class DeadlineSocket:
     def makefile(self, mode):
         if mode != "rb":
             raise ValueError("control response requires a binary reader")
-        return io.BufferedReader(DeadlineReader(self.connection, self.deadline))
+        if self._closed:
+            raise ValueError("control socket is closed")
+        reader = DeadlineReader(self.connection, self.deadline, self._release_reader)
+        self._readers += 1
+        try:
+            return io.BufferedReader(reader)
+        except BaseException:
+            reader.close()
+            raise
+
+    def _release_reader(self):
+        self._readers -= 1
+        if self._closed and not self._readers:
+            self.connection.close()
 
     def close(self):
-        self.connection.close()
+        # HTTPConnection releases its owner before a Connection: close body is read.
+        if not self._closed:
+            self._closed = True
+            if not self._readers:
+                self.connection.close()
 
 
 def deadline_post(url, body, deadline):
@@ -144,7 +165,7 @@ def invoke(args, environment, deadline=None, started=None):
         if fixture.stat().st_size > 8192:
             raise ValueError("bulk target observations exceed 8 KiB")
         targets = json.loads(fixture.read_text())
-        payload.update({key: targets[key] for key in ("sync_epoch", "batch_digests")})
+        payload.update({key: targets[key] for key in ("sync_epoch", "batch_digests", "batch_epochs")})
     if payload["scenario"] == "committee_progress":
         if not args.identity or not args.observations:
             raise ValueError("committee observations require a declared hub and production-log service")
