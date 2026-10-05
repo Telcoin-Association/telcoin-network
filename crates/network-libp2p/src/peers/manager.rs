@@ -1075,42 +1075,130 @@ impl PeerManager {
     /// Atomically validate and seed a swarm's local launch bindings.
     ///
     /// Matching entries use the launch address. Unrelated bootstrap/trusted entries survive.
-    /// Contradictory configured or restored identities fail without partial insertion. Seeding
-    /// provides dial hints only; membership still comes from the committee update command.
+    /// Only operator-provisioned data can fail the batch: a contradictory inventory, or a
+    /// configured bootstrap/trusted stub that contradicts it. Such a failure inserts nothing.
+    ///
+    /// A cached record that is not a stub was restored from the kad store or learned from the
+    /// network, and any peer can fill that store. A contradictory record of that kind is dropped
+    /// with a warning and never stops startup. The kad store row stays in place:
+    /// [`Self::cache_known_peer`] rejects it against the inventory from here on, and the next
+    /// restart drops it again. The seeding upserts re-key the peer store, so no identity binding
+    /// of a dropped record survives.
+    ///
+    /// A learned record that already carries the launch binding is kept, as in
+    /// [`Self::add_bootstrap_peer`]: it is pinned and takes the launch address, but keeps its
+    /// signed timestamp, its RPC info and its learned status. Seeding provides dial hints only;
+    /// membership still comes from the committee update command.
     pub(crate) fn seed_committee_peers(
         &mut self,
         peers: BTreeMap<BlsPublicKey, tn_types::P2pNode>,
     ) -> NetworkResult<()> {
         peers.iter().try_for_each(|(key, peer)| {
             let peer_id = PeerId::from(peer.network_key.clone());
-            let conflict = self.committee_peers.get(key).is_some_and(|configured| {
-                configured.network_key != peer.network_key || configured.network_address != peer.network_address
-            }) || self.known_peers.iter().any(|(known_key, info)| {
-                let known_id = PeerId::from(info.pubkey.clone());
-                (*known_key == *key && known_id != peer_id)
-                    || (*known_key != *key && known_id == peer_id)
-            }) || peers.iter().any(|(other_key, other)| {
-                other_key != key && other.network_key == peer.network_key
-            }) || peer.network_address.is_empty() || peer.network_address.iter().any(|protocol| {
-                matches!(protocol, Protocol::P2p(address_id) if address_id != peer_id)
+            let invalid = |reason: String| {
+                NetworkError::ProtocolError(format!(
+                    "committee_peers: BLS key {key}, network identity {peer_id}: {reason}"
+                ))
+            };
+            let reseeded = self.committee_peers.get(key).is_some_and(|configured| {
+                configured.network_key != peer.network_key
+                    || configured.network_address != peer.network_address
             });
-            (!conflict).then_some(()).ok_or_else(|| NetworkError::ProtocolError(format!(
-                "committee_peers: conflicting configured/cached binding for BLS key {key}, network identity {peer_id}; reconcile inventories before startup"
-            )))
+            let bad_address = peer.network_address.is_empty()
+                || peer.network_address.iter().any(
+                    |protocol| matches!(protocol, Protocol::P2p(address_id) if address_id != peer_id),
+                );
+            let shared = peers
+                .iter()
+                .chain(self.committee_peers.iter())
+                .find(|(other_key, other)| {
+                    *other_key != key && other.network_key == peer.network_key
+                })
+                .map(|(other_key, _)| *other_key);
+            let configured = self
+                .known_peers
+                .iter()
+                .find(|(known_key, known)| {
+                    self.stub_records.contains(*known_key)
+                        && Self::contradicts_launch_binding(known_key, known, key, peer)
+                })
+                .map(|(known_key, _)| *known_key);
+            match () {
+                () if reseeded => Err(invalid(
+                    "the inventory already seeded another network key or address".to_owned(),
+                )),
+                () if bad_address => Err(invalid(
+                    "the address is empty or its /p2p component names another identity".to_owned(),
+                )),
+                () => shared
+                    .map(|other| format!("the inventory also assigns it to BLS key {other}"))
+                    .or_else(|| {
+                        configured.map(|other| {
+                            format!("a configured bootstrap/trusted entry for {other} contradicts it")
+                        })
+                    })
+                    .map_or(Ok(()), |reason| Err(invalid(reason))),
+            }
         })?;
+        // every hard failure is ruled out; what still contradicts the inventory is peer-fillable
+        // cache (restored or learned), so drop it instead of failing startup
+        let dropped: Vec<(BlsPublicKey, BlsPublicKey, PeerId)> = self
+            .known_peers
+            .iter()
+            .filter(|(known_key, _)| !self.stub_records.contains(*known_key))
+            .filter_map(|(known_key, known)| {
+                peers
+                    .iter()
+                    .find(|(key, peer)| {
+                        Self::contradicts_launch_binding(known_key, known, key, peer)
+                    })
+                    .map(|(key, _)| (*known_key, *key, PeerId::from(known.pubkey.clone())))
+            })
+            .collect();
+        dropped.into_iter().for_each(|(cached_key, inventory_key, cached_id)| {
+            warn!(
+                target: "peer-manager",
+                ?inventory_key,
+                ?cached_key,
+                ?cached_id,
+                "dropping cached peer record that contradicts committee_peers"
+            );
+            self.known_peers.remove(&cached_key);
+        });
         self.committee_peers.extend(peers.clone());
         peers.into_iter().for_each(|(key, peer)| {
-            self.add_known_peer(
-                key,
-                NetworkInfo {
-                    pubkey: peer.network_key,
-                    multiaddrs: vec![peer.network_address],
-                    timestamp: tn_types::now(),
-                    rpc: peer.rpc,
-                },
-            );
+            if self.record_unlearned(&key) {
+                self.add_known_peer(
+                    key,
+                    NetworkInfo {
+                        pubkey: peer.network_key,
+                        multiaddrs: vec![peer.network_address],
+                        timestamp: tn_types::now(),
+                        rpc: peer.rpc,
+                    },
+                );
+            } else {
+                // a learned record with the launch binding: pin it and re-cache it so the launch
+                // address applies, without discarding its signed timestamp and rpc
+                self.pinned_peers.insert(key);
+                self.known_peers
+                    .remove(&key)
+                    .into_iter()
+                    .for_each(|known| self.cache_known_peer(key, known));
+            }
         });
         Ok(())
+    }
+
+    /// Whether a cached record contradicts a launch binding in either direction: the same BLS
+    /// key under another network key, or another BLS key under the same network key.
+    fn contradicts_launch_binding(
+        known_key: &BlsPublicKey,
+        known: &NetworkInfo,
+        key: &BlsPublicKey,
+        peer: &tn_types::P2pNode,
+    ) -> bool {
+        (known_key == key) != (known.pubkey == peer.network_key)
     }
 
     /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.

@@ -982,11 +982,7 @@ where
         self.bootstrap_servers = network_config
             .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
         let node_info = &self.builder.tn_config.node_info;
-        network_config.validate_committee_peers(
-            &committee,
-            &self.bootstrap_servers,
-            node_info.num_workers(),
-        )?;
+        network_config.validate_committee_peers(&committee, &self.bootstrap_servers)?;
         network_config.validate_local_committee_peer(
             public_key,
             None,

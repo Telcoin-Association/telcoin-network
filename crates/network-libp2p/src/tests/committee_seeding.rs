@@ -63,7 +63,6 @@ async fn committee_seeding_connects_every_swarm_without_hubs_after_fresh_restart
     network_config.validate_committee_peers(
         configs.first().ok_or_else(|| eyre::eyre!("no validators"))?.committee(),
         &BTreeMap::new(),
-        2,
     )?;
     futures::stream::iter([0, 1].into_iter().map(Ok::<_, eyre::Report>))
         .try_for_each(|round| {

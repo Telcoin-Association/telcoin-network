@@ -72,15 +72,15 @@ async fn committee_seeding_unions_bootstrap_and_trusted_peers() -> eyre::Result<
     Ok(())
 }
 
-/// Conflicting restored bindings reject the whole seed batch without partial insertion.
+/// A configured stub that contradicts the inventory rejects the whole seed batch.
 #[tokio::test]
-async fn committee_seeding_rejects_conflicting_cache_atomically() -> eyre::Result<()> {
+async fn committee_seeding_rejects_conflicting_configured_stub_atomically() -> eyre::Result<()> {
     let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
     let peers = committee.bootstrap_servers();
     let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
     let other = peers.values().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
     let mut manager = create_test_peer_manager(None);
-    manager.add_restored_peer(*key, launch_peer_info(&other.primary));
+    manager.add_bootstrap_peer(*key, launch_peer_info(&other.primary));
     let inventory = peers.iter().map(|(key, peer)| (*key, peer.primary.clone())).collect();
     assert!(manager.seed_committee_peers(inventory).is_err());
     assert_eq!(manager.known_peers.len(), 1);
@@ -90,6 +90,78 @@ async fn committee_seeding_rejects_conflicting_cache_atomically() -> eyre::Resul
         Some(&other.primary.network_key)
     );
     assert_ne!(peer.primary.network_key, other.primary.network_key);
+    Ok(())
+}
+
+/// A restored record under a key outside the inventory cannot stop seeding.
+#[tokio::test]
+async fn committee_seeding_drops_planted_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (outside_key, _) = peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    // the persisted kad store is peer-fillable: a row can bind any key to a seeded network key
+    manager.add_restored_peer(*outside_key, launch_peer_info(&peer.primary));
+    manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
+    assert!(!manager.known_peers.contains_key(outside_key));
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&peer.primary.network_key)
+    );
+    assert_eq!(
+        manager.peers.bls_for_peer(&PeerId::from(peer.primary.network_key.clone())),
+        Some(*key),
+    );
+    Ok(())
+}
+
+/// A stale restored record under an inventory key gives way to the launch bindings.
+#[tokio::test]
+async fn committee_seeding_replaces_stale_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (other_key, other) =
+        peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    manager.add_restored_peer(*key, launch_peer_info(&other.primary));
+    let inventory = peers.iter().map(|(key, peer)| (*key, peer.primary.clone())).collect();
+    manager.seed_committee_peers(inventory)?;
+    assert_eq!(manager.known_peers.len(), peers.len());
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&peer.primary.network_key)
+    );
+    assert_eq!(
+        manager.known_peers.get(other_key).map(|info| &info.pubkey),
+        Some(&other.primary.network_key)
+    );
+    assert_eq!(
+        manager.peers.bls_for_peer(&PeerId::from(other.primary.network_key.clone())),
+        Some(*other_key),
+    );
+    Ok(())
+}
+
+/// Seeding keeps a restored signed record that already carries the launch binding.
+#[tokio::test]
+async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let mut manager = create_test_peer_manager(None);
+    let mut restored = launch_peer_info(&peer.primary);
+    restored.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
+    restored.timestamp = 1_000;
+    let signed = restored.timestamp;
+    manager.add_restored_peer(*key, restored);
+    manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
+    let cached = manager.known_peers.get(key).ok_or_else(|| eyre::eyre!("missing record"))?;
+    assert_eq!(cached.timestamp, signed);
+    assert_eq!(cached.multiaddrs, vec![peer.primary.network_address.clone()]);
+    assert!(!manager.stub_records.contains(key));
+    assert!(manager.pinned_peers.contains(key));
     Ok(())
 }
 

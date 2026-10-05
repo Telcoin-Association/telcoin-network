@@ -37,8 +37,9 @@ pub struct NetworkConfig {
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
     /// Operator-owned launch inventory, independent of bootstrap selection.
     ///
-    /// A nonempty map must cover every current committee member's primary and workers. Bindings
-    /// are fixed until a coordinated config update and restart. Addresses here take precedence
+    /// At genesis (epoch 0) a nonempty map must cover every committee member's primary and
+    /// on-chain workers. After launch a gap is logged and discovery covers it. Bindings are
+    /// fixed until a coordinated config update and restart. Addresses here take precedence
     /// over matching bootstrap hints. An empty map retains discovery-based startup.
     #[serde(deserialize_with = "deserialize_committee_peers")]
     committee_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
@@ -101,31 +102,47 @@ impl NetworkConfig {
     ///
     /// Select bootstrap configuration first. Matching identities may carry different addresses;
     /// committee addresses win during seeding. Conflicting bindings, reused network identities
-    /// and mismatched `/p2p` components are rejected.
+    /// and mismatched `/p2p` components are rejected at every epoch.
+    ///
+    /// Coverage is fail-closed only at genesis (epoch 0), where the inventory must list every
+    /// committee member with the on-chain worker count. After launch the committee can move past
+    /// the inventory, so a missing validator or a short worker list is logged and left to
+    /// discovery. The local worker count sets no bar for other validators' entries.
     pub fn validate_committee_peers(
         &self,
         committee: &Committee,
         bootstrap: &BTreeMap<BlsPublicKey, BootstrapServer>,
-        configured_workers: usize,
     ) -> Result<(), CommitteePeerError> {
         if self.committee_peers.is_empty() {
             Ok(())
         } else {
             let invalid = CommitteePeerError::InvalidConfiguration;
-            committee.bls_keys().iter().try_for_each(|key| {
-                let peer = self
-                    .committee_peers
-                    .get(key)
-                    .ok_or_else(|| invalid(format!("committee_peers: missing validator {key}")))?;
-                let required_workers = committee.number_of_workers().max(configured_workers);
-                (peer.num_workers() >= required_workers).then_some(()).ok_or_else(|| {
-                    invalid(format!(
-                        "committee_peers: validator {key} has {} workers, needs {}",
-                        peer.num_workers(),
-                        required_workers
-                    ))
+            let required_workers = committee.number_of_workers();
+            let gaps: Vec<String> = committee
+                .bls_keys()
+                .iter()
+                .filter_map(|key| {
+                    self.committee_peers.get(key).map_or_else(
+                        || Some(format!("committee_peers: missing validator {key}")),
+                        |peer| {
+                            (peer.num_workers() < required_workers).then(|| {
+                                format!(
+                                    "committee_peers: validator {key} has {} workers, needs {}",
+                                    peer.num_workers(),
+                                    required_workers
+                                )
+                            })
+                        },
+                    )
                 })
-            })?;
+                .collect();
+            if committee.epoch() == 0 {
+                gaps.into_iter().next().map_or(Ok(()), |gap| Err(invalid(gap)))?;
+            } else {
+                gaps.iter().for_each(|gap| {
+                    warn!("{gap}; discovery covers this gap until the inventory is updated");
+                });
+            }
             let mut identities = BTreeMap::new();
             let mut bindings = BTreeMap::new();
             [bootstrap, &self.committee_peers].into_iter().try_for_each(|peers| {
@@ -155,6 +172,9 @@ impl NetworkConfig {
     }
 
     /// Check this node's advertised identity against its launch entry before spawning swarms.
+    ///
+    /// A local worker that the entry does not list is accepted, so a node can stage a spare
+    /// worker before governance raises the on-chain count. A listed swarm must match.
     pub fn validate_local_committee_peer(
         &self,
         key: BlsPublicKey,
@@ -163,7 +183,7 @@ impl NetworkConfig {
     ) -> Result<(), CommitteePeerError> {
         self.committee_peers.get(&key).map_or(Ok(()), |server| {
             let configured = worker.map_or(Some(&server.primary), |id| server.worker(id));
-            configured.filter(|peer| peer.network_key == local.network_key).map(|_| ())
+            configured.is_none_or(|peer| peer.network_key == local.network_key).then_some(())
                 .ok_or_else(|| CommitteePeerError::InvalidConfiguration(format!(
                     "committee_peers: local validator {key}, worker {worker:?}, network key does not match node configuration"
                 )))
@@ -875,20 +895,28 @@ mod tests {
         assert_eq!(parsed.committee_peers(), &inventory);
         let selected = parsed.resolve_bootstrap_peers(&inventory, Some(&BTreeMap::new()));
         assert_eq!(selected, inventory);
-        parsed.validate_committee_peers(&committee, &selected, 1)?;
+        parsed.validate_committee_peers(&committee, &selected)?;
         assert!(NetworkConfig::default().committee_peers().is_empty());
         Ok(())
     }
 
-    /// Missing validators and worker mappings fail before networking starts.
+    /// Missing validators and worker mappings fail at genesis only; later epochs use discovery.
     #[test]
     fn committee_peers_require_complete_launch_coverage() -> eyre::Result<()> {
         let committee: Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
-        let mut config =
-            NetworkConfig { committee_peers: committee.bootstrap_servers(), ..Default::default() };
-        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 2).is_err());
+        let later: Committee =
+            serde_yaml::from_str(&tn_types::MAINNET_COMMITTEE.replace("epoch: 0", "epoch: 1"))?;
+        assert_eq!((committee.epoch(), later.epoch()), (0, 1));
+        let full = committee.bootstrap_servers();
+        let mut config = NetworkConfig { committee_peers: full.clone(), ..Default::default() };
+        config.validate_committee_peers(&committee, &BTreeMap::new())?;
+        config.committee_peers.values_mut().for_each(|peer| peer.workers.clear());
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new()).is_err());
+        config.validate_committee_peers(&later, &BTreeMap::new())?;
+        config.committee_peers = full;
         config.committee_peers.pop_first().ok_or_else(|| eyre::eyre!("missing fixture peer"))?;
-        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new()).is_err());
+        config.validate_committee_peers(&later, &BTreeMap::new())?;
         Ok(())
     }
 
@@ -911,9 +939,11 @@ mod tests {
         let mut bootstrap = config.committee_peers.clone();
         bootstrap.get_mut(key).ok_or_else(|| eyre::eyre!("missing bootstrap peer"))?.primary =
             other.primary.clone();
-        assert!(config.validate_committee_peers(&committee, &bootstrap, 1).is_err());
+        assert!(config.validate_committee_peers(&committee, &bootstrap).is_err());
         assert!(config.validate_local_committee_peer(*key, None, &other.primary).is_err());
         config.validate_local_committee_peer(*key, None, &peer.primary)?;
+        // a staged local worker that the entry does not list is not a conflict
+        config.validate_local_committee_peer(*key, Some(WorkerId::MAX), &other.primary)?;
         let mut mismatched = config.clone();
         mismatched
             .committee_peers
@@ -921,7 +951,7 @@ mod tests {
             .ok_or_else(|| eyre::eyre!("missing fixture peer"))?
             .primary
             .network_address = other.primary.network_address.clone();
-        assert!(mismatched.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        assert!(mismatched.validate_committee_peers(&committee, &BTreeMap::new()).is_err());
         Ok(())
     }
 
@@ -944,7 +974,7 @@ mod tests {
             .nth(1)
             .ok_or_else(|| eyre::eyre!("missing other peer"))?;
         peer.primary = primary;
-        assert!(config.validate_committee_peers(&committee, &BTreeMap::new(), 1).is_err());
+        assert!(config.validate_committee_peers(&committee, &BTreeMap::new()).is_err());
         Ok(())
     }
 
@@ -992,7 +1022,7 @@ mod tests {
         let config = NetworkConfig { committee_peers: peers.clone(), ..Default::default() };
         let parsed: NetworkConfig = serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
         assert_eq!(parsed.committee_peers(), &peers);
-        parsed.validate_committee_peers(&committee, &BTreeMap::new(), 2).map_err(Into::into)
+        parsed.validate_committee_peers(&committee, &BTreeMap::new()).map_err(Into::into)
     }
 
     /// Network config round-trips every worker and peer in the current bootstrap format.
