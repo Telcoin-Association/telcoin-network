@@ -55,6 +55,12 @@ const EXEX_CERTIFICATES_CHANNEL_CAPACITY: usize = 1_000;
 /// `TnExExNotification::Lagged` reconciliation), so match the engine's `consensus_output`
 /// capacity instead of buffering hundreds of MB for a slow ExEx.
 const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
+/// Capacity of the epoch pack request queue.
+///
+/// Producers wait while the queue is full, which paces them to the fetch workers. The fetch workers
+/// that drain the queue must never wait on it: a worker that waits for room in its own queue stops
+/// the consumption that would make room (see [`ConsensusBusApp::try_requeue_epoch_pack_file`]).
+pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
 
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
@@ -440,7 +446,8 @@ impl ConsensusBusApp {
 
         let (tx_epoch_record, _) = watch::channel(None);
 
-        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
+        let (epoch_request_queue_tx, epochs_rx) =
+            tokio::sync::mpsc::channel(EPOCH_REQUEST_QUEUE_CAPACITY);
         let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {
@@ -902,6 +909,29 @@ impl ConsensusBusApp {
         let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
     }
 
+    /// Put an epoch pack request back on the queue without waiting for room.
+    ///
+    /// Returns the request when the queue is full so the caller can hold it and offer it again
+    /// later. Only the queue's consumers call this: a consumer that waits for room in its own
+    /// queue stops the consumption that would make room, and once every consumer waits that way
+    /// every producer waits forever (#1563). Producers call [`Self::request_epoch_pack_file`],
+    /// which waits.
+    ///
+    /// A producer already queued as a waiter takes a freed slot before this call can, so a
+    /// held request goes back only once the producers stop waiting.
+    pub fn try_requeue_epoch_pack_file(
+        &self,
+        previous_epoch_record: EpochRecord,
+        epoch_record: EpochRecord,
+    ) -> Option<(EpochRecord, EpochRecord)> {
+        match self.inner.epoch_request_queue_tx.try_send((previous_epoch_record, epoch_record)) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(request)) => Some(request),
+            // cannot happen while the bus exists: the inner struct owns the receiver
+            Err(mpsc::error::TrySendError::Closed(_)) => None,
+        }
+    }
+
     /// Send a request to download the epoch pack file for the provided Epoch.
     /// Use this when you only have the epoch vs the EpochRecords.
     pub async fn request_epoch_pack_file_by_epoch(
@@ -1254,11 +1284,13 @@ mod exex_receiver_count_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusBusApp, QueChannel, SYNC_OUTPUT_CHANNEL_CAPACITY};
+    use super::{
+        ConsensusBusApp, QueChannel, EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
+    };
     use std::{collections::VecDeque, task::Poll, time::Duration};
     use tn_types::{
-        CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, TnReceiver as _, TnSender as _,
-        TryRecvError, TrySendError,
+        CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord,
+        TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
     };
 
     /// The smallest output that can sit in `sync_output`; only its number matters here.
@@ -1271,6 +1303,97 @@ mod tests {
             VecDeque::new(),
             vec![],
         )
+    }
+
+    /// An epoch record that carries only its epoch.
+    fn epoch_record(epoch: Epoch) -> EpochRecord {
+        EpochRecord { epoch, ..EpochRecord::default() }
+    }
+
+    /// Fill the empty epoch request queue with `EPOCH_REQUEST_QUEUE_CAPACITY` epochs from
+    /// `first` on, and return the first epoch that no longer fits.
+    async fn fill_epoch_request_queue(bus: &ConsensusBusApp, first: Epoch) -> Epoch {
+        let capacity =
+            Epoch::try_from(EPOCH_REQUEST_QUEUE_CAPACITY).expect("the capacity fits an epoch");
+        for epoch in first..first + capacity {
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(epoch)).await;
+        }
+        first + capacity
+    }
+
+    /// Take the next epoch pack request, failing the test if none is queued.
+    async fn next_request(bus: &ConsensusBusApp) -> (EpochRecord, EpochRecord) {
+        tokio::time::timeout(Duration::from_secs(1), bus.get_next_epoch_pack_file_request())
+            .await
+            .expect("a request is queued")
+            .expect("the request queue is open")
+    }
+
+    /// Take the next epoch pack request and return its epoch.
+    async fn next_epoch(bus: &ConsensusBusApp) -> Epoch {
+        next_request(bus).await.1.epoch
+    }
+
+    /// Whether the epoch request queue is empty, checked without waiting.
+    async fn epoch_request_queue_is_empty(bus: &ConsensusBusApp) -> bool {
+        // unconstrained: once the task's coop budget is spent, the receiver lock reports pending
+        // without looking at the queue
+        let next = tokio::task::unconstrained(bus.get_next_epoch_pack_file_request());
+        tokio::pin!(next);
+        futures::poll!(next.as_mut()).is_pending()
+    }
+
+    /// A re-queue into the full epoch request queue hands the request back instead of waiting,
+    /// and once a request is taken the re-queue fits and drains after everything queued before it.
+    #[tokio::test]
+    async fn try_requeue_epoch_pack_file_returns_the_request_when_full() {
+        let bus = ConsensusBusApp::new();
+        // a fetch worker holds epoch 0 while producers fill the queue behind it
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(0)).await;
+        let (previous, record) = next_request(&bus).await;
+        let end = fill_epoch_request_queue(&bus, 1).await;
+
+        let (previous, record) = bus
+            .try_requeue_epoch_pack_file(previous, record)
+            .expect("a full queue hands the request back");
+        assert_eq!(record.epoch, 0, "the same request comes back");
+
+        assert_eq!(next_epoch(&bus).await, 1);
+        assert!(
+            bus.try_requeue_epoch_pack_file(previous, record).is_none(),
+            "the freed slot takes the re-queued request"
+        );
+        for expected in 2..end {
+            assert_eq!(next_epoch(&bus).await, expected);
+        }
+        assert_eq!(next_epoch(&bus).await, 0, "the re-queued request drains last");
+        assert!(epoch_request_queue_is_empty(&bus).await);
+    }
+
+    /// A producer waiting on the full epoch request queue takes the slot a consumer frees before a
+    /// re-queue can, so a held request goes back only once the producers stop waiting.
+    #[tokio::test]
+    async fn waiting_producer_takes_a_freed_slot_before_a_requeue() {
+        let bus = ConsensusBusApp::new();
+        let next = fill_epoch_request_queue(&bus, 0).await;
+        // unconstrained: the fill spends the task's coop budget, and a send polled without budget
+        // reports pending before it joins the queue of senders waiting for a slot
+        let waiting = tokio::task::unconstrained(
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        );
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending(), "a producer waits on a full queue");
+
+        let (previous, record) = next_request(&bus).await;
+        assert_eq!(record.epoch, 0);
+        assert!(
+            bus.try_requeue_epoch_pack_file(previous, record).is_some(),
+            "the waiting producer holds the freed slot"
+        );
+        assert!(
+            futures::poll!(waiting.as_mut()).is_ready(),
+            "the waiting producer's send completes"
+        );
     }
 
     /// A bounded que channel queues exactly its capacity, then makes the producer wait.
