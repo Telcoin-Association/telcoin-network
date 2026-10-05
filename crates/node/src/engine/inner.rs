@@ -94,9 +94,9 @@ impl ExecutionNodeInner {
         Ok(())
     }
 
-    /// The worker's RPC, TX pool, and block builder
-    pub(super) async fn start_batch_builder(
-        &mut self,
+    /// Start the worker's batch builder for the epoch without mutating engine state.
+    pub(super) fn start_batch_builder(
+        &self,
         worker_id: WorkerId,
         block_provider_sender: BatchSender,
         epoch_task_spawner: &TaskSpawner,

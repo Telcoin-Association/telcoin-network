@@ -402,7 +402,7 @@ where
             .build()?
             .block_on(call_rpc_inner(node, command, params, retries, debug_params)),
     };
-    Ok(resp?)
+    resp
 }
 
 /// Check if the network is advancing (query all nodes).
@@ -730,7 +730,8 @@ pub(crate) fn send_and_confirm(
     }
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
+    let expected_bal =
+        current_basefee.checked_div(nonce).map_or(0, |per_tx| current_basefee + per_tx);
     if nonce > 0 && bal < expected_bal {
         error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
@@ -872,12 +873,14 @@ pub(crate) fn create_genesis_for_test(
     let genesis = config_committee(
         temp_path,
         &shared_genesis_dir,
-        passphrase,
-        governance_wallet,
-        accounts,
-        committee,
-        epoch_duration,
-        None,
+        GenesisConfig {
+            passphrase,
+            consensus_registry_owner: governance_wallet,
+            accounts,
+            validators: committee,
+            epoch_duration,
+            chain_id: None,
+        },
     )?;
 
     // copy genesis for the extra validator
@@ -898,6 +901,22 @@ pub(crate) fn create_genesis_for_test(
     Ok(genesis)
 }
 
+/// Genesis inputs for [`config_committee`].
+pub(crate) struct GenesisConfig<'a> {
+    /// Passphrase for the validators' keys.
+    pub(crate) passphrase: Option<String>,
+    /// Owner of the `ConsensusRegistry`.
+    pub(crate) consensus_registry_owner: Address,
+    /// Accounts funded in genesis.
+    pub(crate) accounts: Vec<(Address, GenesisAccount)>,
+    /// The initial committee: node name and execution address.
+    pub(crate) validators: &'a [(&'a str, Address)],
+    /// Epoch duration in seconds.
+    pub(crate) epoch_duration: u64,
+    /// Overrides the genesis ceremony's default chain id (see [`config_committee`]).
+    pub(crate) chain_id: Option<u64>,
+}
+
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
@@ -910,13 +929,16 @@ pub(crate) fn create_genesis_for_test(
 pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
-    passphrase: Option<String>,
-    consensus_registry_owner: Address,
-    accounts: Vec<(Address, GenesisAccount)>,
-    validators: &Vec<(&str, Address)>,
-    epoch_duration: u64,
-    chain_id: Option<u64>,
+    config: GenesisConfig<'_>,
 ) -> eyre::Result<Genesis> {
+    let GenesisConfig {
+        passphrase,
+        consensus_registry_owner,
+        accounts,
+        validators,
+        epoch_duration,
+        chain_id,
+    } = config;
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
@@ -1618,15 +1640,19 @@ pub(crate) const CROSS_FORK_EPOCH: Epoch = 1;
 ///
 /// Call once per test, before the first node spawn and before anything in the process reads any
 /// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
-/// is sound because nextest runs each test in its own process (`.config/nextest.toml`); under
-/// plain `cargo test` two of these tests in one process would fight over it, and the assertions
-/// below are what turn that into a loud failure instead of a mis-decoded pack.
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`). Under
+/// plain `cargo test`, two of these tests in one process would fight over it, and a later pin
+/// would re-point the environment an already-running test spawns its nodes with. So only the
+/// first pin in a process is allowed ([`FORKS_PINNED_BY`]); any later one fails at once, before
+/// touching the environment, naming the test that holds the pins.
 pub(crate) fn pin_fork_epochs(
     force_multi_workers: Option<Epoch>,
     force_seed_signature: Option<Epoch>,
     force_leader_seeded: Option<Epoch>,
     force_subsecond: Option<Epoch>,
 ) {
+    claim_fork_pins();
+
     // what `TestBinary::command` would forward to a child: the value the lane exported, or the
     // stated per-fork default when it exported nothing. an unparseable value normalizes to the
     // same default the gate would have fallen back to.
@@ -1661,6 +1687,22 @@ pub(crate) fn pin_fork_epochs(
         SUBSECOND_TIMESTAMP_FORK_ENV,
         force_subsecond.unwrap_or_else(|| lane(SUBSECOND_TIMESTAMP_FORK_ENV, 0)),
         subsecond_timestamp_fork_epoch_override,
+    );
+}
+
+/// The test (libtest names each test's thread after it) that pinned this process's fork epochs.
+static FORKS_PINNED_BY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Claim this process's fork pins for the current test, or fail with how to run the tests apart.
+fn claim_fork_pins() {
+    let me = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    let holder = FORKS_PINNED_BY.get_or_init(|| me.clone());
+    assert_eq!(
+        holder, &me,
+        "fork epochs are process-wide and `{holder}` already pinned them in this process, so \
+         `{me}` cannot run here. Run each e2e test in its own process: nextest \
+         (`make test-e2e` / `make test-epochs`), or `cargo test -p e2e-tests --test it -- \
+         <test> --exact --include-ignored`"
     );
 }
 

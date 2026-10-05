@@ -145,12 +145,12 @@ async fn test_consensus_recovery_with_bullshark() {
     let (certificates, _next_parents) =
         make_optimal_certificates(&committee, 1..=7, &genesis, &ids);
     let temp_dir = TempDir::new().unwrap();
-    let mut consensus_chain =
+    let consensus_chain =
         ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -255,11 +255,11 @@ async fn test_consensus_recovery_with_bullshark() {
     // Make new chain DB to "clear" it.
     let path2 = temp_dir.path().join("2");
     create_dir_all(&path2).await.unwrap();
-    let mut consensus_chain = ConsensusChain::new_for_test(path2, committee.clone()).await.unwrap();
+    let consensus_chain = ConsensusChain::new_for_test(path2, committee.clone()).await.unwrap();
 
     let leader_schedule = LeaderSchedule::from_store(
         committee.clone(),
-        &mut consensus_chain,
+        &consensus_chain,
         DEFAULT_BAD_NODES_STAKE_THRESHOLD,
     )
     .await
@@ -819,6 +819,36 @@ async fn test_seed_chain_survives_restart() {
         first_commit.randomness(),
         "the chain must still advance after the restart"
     );
+}
+
+/// A certificate pack that cannot be used again is dropped on its first failure; only a full
+/// channel (transient backpressure) keeps it. A failed open or save latches an error that every
+/// later call returns, so before this only `SendFailed` dropped the pack, and a pack whose open
+/// failed was kept and logged an error for every certificate.
+#[test]
+fn test_certificate_pack_failure_policy() {
+    use tn_storage::certificate_pack::{CertificatePack, PackError};
+
+    assert!(super::keep_certificate_pack_after(&PackError::SendFull));
+    assert!(!super::keep_certificate_pack_after(&PackError::SendFailed));
+    assert!(!super::keep_certificate_pack_after(&PackError::Append("disk full".into())));
+
+    // The premise: a pack whose open failed returns its latched error (not `SendFailed`) from
+    // every later `try_save`. A plain file where the epoch directory belongs makes the open fail.
+    let dir = TempDir::new().expect("temp dir");
+    std::fs::write(dir.path().join("epoch-0"), b"not a directory").expect("block the epoch dir");
+    let pack = CertificatePack::open(dir.path(), 0);
+    // The open runs on the pack's thread; wait (bounded) for it to latch its failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while pack.get_error().is_ok() {
+        assert!(std::time::Instant::now() < deadline, "the failed open never latched an error");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    for _ in 0..2 {
+        let err = pack.try_save(Certificate::default()).expect_err("a failed pack refuses saves");
+        assert!(!matches!(err, PackError::SendFailed), "the latched error is returned: {err:?}");
+        assert!(!super::keep_certificate_pack_after(&err), "a failed pack is dropped: {err:?}");
+    }
 }
 
 /// Whole seconds of every header's creation time in the epoch commit floor tests (see
