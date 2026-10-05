@@ -850,8 +850,9 @@ mod tests {
 
     /// Return a node identity that no fixture entry uses.
     fn outside_identity() -> (BlsPublicKey, P2pNode, Vec<P2pNode>) {
-        let endpoint =
-            || P2pNode::from((NetworkKeypair::generate_ed25519().public(), Multiaddr::empty()));
+        let endpoint = || {
+            P2pNode::from((NetworkKeypair::generate_ed25519().public().into(), Multiaddr::empty()))
+        };
         (
             *BlsKeypair::generate(&mut StdRng::from_seed([7; 32])).public(),
             endpoint(),
