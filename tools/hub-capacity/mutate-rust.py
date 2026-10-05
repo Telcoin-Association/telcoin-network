@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CASES = [
     ("trusted_live_connection_state", "crates/network-libp2p/src/peers/all_peers.rs",
      ".for_each(|record| peer.retain_connection_state(record));",
-     ".for_each(|_| {});",
+     ".for_each(|_| { let _retain_connection_state: fn(&mut Peer, &Peer) = Peer::retain_connection_state; });",
      "test_add_trusted_peer_preserves_connected_authenticated_state"),
     ("closed_connection_io", "crates/network-libp2p/src/consensus.rs",
      "ReqResOutboundFailure::Io(e) => match e.kind() {\n                        ErrorKind::NotConnected\n                        | ErrorKind::ConnectionReset",
