@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 /// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
 /// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
 /// 2.5 s of subscriber work at 7-13 ms per saved output.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+pub const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Depth of the bounded `consensus_output` queue.
 ///
 /// `consensus_output` is a bounded mpsc: once this many outputs are queued, the subscriber's
