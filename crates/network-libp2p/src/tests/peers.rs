@@ -384,7 +384,14 @@ fn test_add_trusted_peer_preserves_protocol_ban_and_observed_ips() {
     let observed_ips: HashSet<_> =
         all_peers.get_peer(&peer_id).unwrap().known_ip_addresses().collect();
     assert!(!observed_ips.is_empty());
-    assert!(all_peers.process_penalty(&peer_id, Penalty::Fatal).is_ban());
+    assert!(matches!(all_peers.process_penalty(&peer_id, Penalty::Fatal), PeerAction::Disconnect));
+    let penalized = all_peers.get_peer(&peer_id).unwrap();
+    assert!(penalized.reputation().banned());
+    assert!(matches!(
+        penalized.connection_status(),
+        ConnectionStatus::Disconnecting { banned: true }
+    ));
+    assert_eq!(all_peers.banned_peers.total(), 0);
     all_peers.add_trusted_peer(bls, net.clone());
     assert!(matches!(
         all_peers.get_peer(&peer_id).unwrap().connection_status(),
