@@ -1639,6 +1639,15 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// `PeerExchange` variant embedded in the request enum.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
+    /// A legacy peer supports gossip and exchanges peers through the main RPC.
+    #[derive(NetworkBehaviour)]
+    struct LegacyPeerBehaviour {
+        /// Main RPC, including the embedded peer-exchange request.
+        req_res: request_response::Behaviour<TNCodec<TestWorkerRequest, TestWorkerResponse>>,
+        /// Gossip support prevents a fatal ban before heartbeat pruning.
+        gossipsub: gossipsub::Behaviour,
+    }
+
     tn_types::test_utils::init_test_tracing();
     // 4 committee peers fill the target to its limit; validators are protected from
     // pruning, so the raw legacy peer is deterministically the excess one
@@ -1706,8 +1715,7 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         .await?;
     }
 
-    // raw legacy peer: the target's main req-res protocol only, no dedicated
-    // peer-exchange protocol
+    // The legacy peer supports gossip and exchanges peers through the main RPC.
     let chain_id = network_config.libp2p_config().chain_id;
     let raw_keypair = NetworkKeypair::generate_ed25519();
     let raw_peer_id: PeerId = raw_keypair.public().into();
@@ -1719,10 +1727,20 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         vec![(NetworkType::Primary.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
         request_response::Config::default(),
     );
+    let legacy_gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(raw_keypair.clone()),
+        gossipsub::ConfigBuilder::default()
+            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
+            .build()?,
+    )
+    .map_err(NetworkError::GossipBehavior)?;
     let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| legacy_req_res)
+        .with_behaviour(|_| LegacyPeerBehaviour {
+            req_res: legacy_req_res,
+            gossipsub: legacy_gossipsub,
+        })
         .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
@@ -1735,18 +1753,20 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
     tokio::spawn(async move {
         let mut goodbye_tx = Some(goodbye_tx);
         loop {
-            if let SwarmEvent::Behaviour(request_response::Event::Message {
-                message:
-                    request_response::Message::Request {
-                        request: TestWorkerRequest::PeerExchange(map),
-                        channel,
-                        ..
-                    },
-                ..
-            }) = raw_swarm.select_next_some().await
+            if let SwarmEvent::Behaviour(LegacyPeerBehaviourEvent::ReqRes(
+                request_response::Event::Message {
+                    message:
+                        request_response::Message::Request {
+                            request: TestWorkerRequest::PeerExchange(map),
+                            channel,
+                            ..
+                        },
+                    ..
+                },
+            )) = raw_swarm.select_next_some().await
             {
                 let ack = TestWorkerResponse::from(PeerExchangeMap::default());
-                let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
+                let _ = raw_swarm.behaviour_mut().req_res.send_response(channel, ack);
                 if let Some(tx) = goodbye_tx.take() {
                     let _ = tx.send(map);
                 }
