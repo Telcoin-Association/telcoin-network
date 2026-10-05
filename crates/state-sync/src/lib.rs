@@ -10,9 +10,9 @@ use tn_test_utils as _;
 #[cfg(test)]
 use tn_test_utils_committee as _;
 
-use std::time::Duration;
+use std::{future::Future, time::Duration};
 use tn_config::ConsensusConfig;
-use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics};
+use tn_primary::{ConsensusBusApp, NodeMode, PrimaryMetrics, SYNC_OUTPUT_CHANNEL_CAPACITY};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Database, Epoch, TaskError,
@@ -33,6 +33,33 @@ pub use consensus::{request_missing_packs, spawn_fetch_consensus, spawn_fetch_re
 const STREAM_RETRY_INITIAL_DELAY: Duration = Duration::from_secs(5);
 /// Upper bound on the consensus stream retry delay.
 const STREAM_RETRY_MAX_DELAY: Duration = Duration::from_secs(60);
+/// How long the follower waits for execution to reach an output's base block before it warns,
+/// and how often it warns again while the wait goes on.
+const EXECUTION_WAIT_WARN_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a `sync_output` send may stay blocked on a full queue before the follower warns, and
+/// how often it warns again while the send goes on. The queue-side counterpart of
+/// [`EXECUTION_WAIT_WARN_INTERVAL`].
+const SYNC_OUTPUT_SEND_WARN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Drive `fut` to completion, calling `on_tick` with the time waited so far each time `interval`
+/// passes without it completing.
+///
+/// The future is pinned once and that same future is polled on every tick, so a wait that holds a
+/// watch subscription or a place in a queue keeps it, and no wake-up is lost to a rebuilt future.
+async fn complete_with_stall_ticks<F: Future>(
+    fut: F,
+    interval: Duration,
+    mut on_tick: impl FnMut(Duration),
+) -> F::Output {
+    let started = tokio::time::Instant::now();
+    tokio::pin!(fut);
+    loop {
+        match tokio::time::timeout(interval, fut.as_mut()).await {
+            Ok(output) => return output,
+            Err(_) => on_tick(started.elapsed()),
+        }
+    }
+}
 
 /// Sets some bus defaults.
 /// Call this somewhere when starting an epoch.
@@ -517,7 +544,23 @@ async fn catch_up_consensus_from_to<DB: Database>(
         // through a long empty stretch the leaders keep referencing a block that is already
         // executed and this returns at once. There the bounded `sync_output` queue below is the
         // only thing that keeps this loop from outrunning the subscriber.
-        if consensus_bus.wait_for_execution(base_execution_block).await.is_err() {
+        // a stalled engine shows up in the log instead of parking this task silently
+        let wait_result = complete_with_stall_ticks(
+            consensus_bus.wait_for_execution(base_execution_block),
+            EXECUTION_WAIT_WARN_INTERVAL,
+            |waited| {
+                warn!(
+                    target: "tn::observer",
+                    block_number = number,
+                    target_block = base_execution_block.number,
+                    executed_block = consensus_bus.latest_execution_block_num_hash().number,
+                    waited_secs = waited.as_secs(),
+                    "still waiting for execution to reach the output's base block"
+                )
+            },
+        )
+        .await;
+        if wait_result.is_err() {
             // We seem to have forked, so die.
             error!(
                 target: "tn::observer",
@@ -532,9 +575,27 @@ async fn catch_up_consensus_from_to<DB: Database>(
         }
         // Deliver the full, verified output (with batches) for execution. The queue is bounded, so
         // this send blocks while the subscriber is behind; the epoch task manager aborts this task
-        // at teardown, so a blocked send cannot outlive the epoch. Record the header as progress
-        // only once the output is queued, so `from` never names an output that was not sent.
-        consensus_bus.sync_output().send(output).await?;
+        // at teardown, so a blocked send cannot outlive the epoch. Through an empty stretch this
+        // queue is the loop's only throttle, so a subscriber that stops draining would park the
+        // loop here with nothing in the log: a send blocked for a whole warn interval is logged
+        // and counted instead. Record the header as progress only once the output is queued, so
+        // `from` never names an output that was not sent.
+        complete_with_stall_ticks(
+            consensus_bus.sync_output().send(output),
+            SYNC_OUTPUT_SEND_WARN_INTERVAL,
+            |waited| {
+                STATE_SYNC_METRICS.output_send_stalls_total.increment(1);
+                warn!(
+                    target: "tn::observer",
+                    block_number = number,
+                    queue_capacity = SYNC_OUTPUT_CHANNEL_CAPACITY,
+                    executed_block = consensus_bus.latest_execution_block_num_hash().number,
+                    waited_secs = waited.as_secs(),
+                    "still waiting for the subscriber to take the consensus output: the sync_output queue is full"
+                )
+            },
+        )
+        .await?;
         *from = consensus_header;
     }
     Ok(())
@@ -543,12 +604,22 @@ async fn catch_up_consensus_from_to<DB: Database>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::VecDeque, time::Duration};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
+        time::Duration,
+    };
     use tempfile::TempDir;
     use tn_config::NetworkConfig;
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
-    use tn_types::{CommittedSubDag, EpochSeedChainValue, ReputationScores, B256};
+    use tn_types::{
+        CommittedSubDag, ConsensusNumHash, EpochSeedChainValue, ExecHeader, ReputationScores,
+        SealedHeader, TnReceiver, B256,
+    };
 
     /// Consensus output `number` chained on `parent`, built from one round-1 certificate per
     /// authority. The headers carry no batches, so a saved output reads back from the pack without
@@ -578,6 +649,33 @@ mod tests {
     /// A parent digest that no honest chain links to.
     fn wrong_parent() -> ConsensusHeaderDigest {
         [99u8; 32].into()
+    }
+
+    /// Counts the `tn::observer` warnings emitted on the thread it is installed on with
+    /// [`tracing::subscriber::set_default`]; a current-thread test runtime runs its spawned
+    /// tasks on that thread, so the warnings the catch-up loop emits land here.
+    struct ObserverWarnCounter(Arc<AtomicUsize>);
+
+    impl tracing::Subscriber for ObserverWarnCounter {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "tn::observer" && *metadata.level() == tracing::Level::WARN
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, _: &tracing::Event<'_>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
     }
 
     /// A consensus chain holding block 1 with `parent_hash = B256::ZERO`. Zero is not the default
@@ -767,6 +865,127 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), handle)
             .await
             .expect("shutdown must interrupt the retry backoff")??;
+        Ok(())
+    }
+
+    /// The stall-tick driver reports once per elapsed interval with the time waited so far, keeps
+    /// polling the one pinned future throughout and hands back its output when it completes. A
+    /// future that completes within the first interval produces no tick.
+    #[tokio::test(start_paused = true)]
+    async fn stall_ticks_fire_once_per_interval_until_the_future_completes() {
+        let interval = Duration::from_secs(30);
+        let ticks = std::cell::RefCell::new(Vec::new());
+
+        let prompt = complete_with_stall_ticks(std::future::ready(1u8), interval, |waited| {
+            ticks.borrow_mut().push(waited.as_secs())
+        })
+        .await;
+        assert_eq!(prompt, 1);
+        assert!(ticks.borrow().is_empty(), "a prompt future must not tick");
+
+        let slow = complete_with_stall_ticks(
+            async {
+                tokio::time::sleep(interval * 2 + Duration::from_secs(1)).await;
+                2u8
+            },
+            interval,
+            |waited| ticks.borrow_mut().push(waited.as_secs()),
+        )
+        .await;
+        assert_eq!(slow, 2, "the driver must hand back the future's output");
+        assert_eq!(
+            *ticks.borrow(),
+            [30, 60],
+            "one tick per elapsed interval, with the time waited"
+        );
+    }
+
+    /// The bounded `sync_output` queue is the catch-up loop's only throttle through an empty
+    /// stretch, so a subscriber that stops draining parks the loop at the send. The loop must stay
+    /// parked (not fail, not skip the output) and warn once per elapsed interval while it waits,
+    /// then resume as soon as the subscriber frees one slot and record the output as progress.
+    /// With the bare `send().await` this replaces, the warning count stays at 0.
+    #[tokio::test(start_paused = true)]
+    async fn catch_up_stays_parked_on_a_full_sync_output_queue_until_a_slot_frees(
+    ) -> eyre::Result<()> {
+        let warnings = Arc::new(AtomicUsize::new(0));
+        let _log_guard = tracing::subscriber::set_default(ObserverWarnCounter(warnings.clone()));
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new()?;
+        let chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee()).await?;
+        // block 1 waits in the cache and is above the empty chain's latest number, so the walk
+        // reaches the send (a fresh node adopts block 1's parent, whatever it is)
+        let block1 = output_at(&fixture, 1, B256::ZERO.into());
+        let target = block1.consensus_header();
+        let db = MemDatabase::default();
+        db.insert::<ConsensusCache>(&1, &block1)?;
+
+        let consensus_bus = ConsensusBusApp::new();
+        // the fixture's leaders reference the default execution block (number 0, zero hash); an
+        // executed block with that hash makes wait_for_execution return at once, so the send is
+        // the only wait left in the walk
+        consensus_bus.recent_blocks().send_modify(|blocks| {
+            blocks.push_latest(
+                0,
+                ConsensusNumHash::default(),
+                Some(SealedHeader::new(ExecHeader::default(), B256::ZERO)),
+            )
+        });
+        // a subscriber that never reads, behind a queue already full of fillers numbered from
+        // 1_000 so the follower's output can be told apart from them below
+        let mut rx_sync_output = consensus_bus.subscribe_sync_output();
+        let filler = |number: u64| {
+            ConsensusOutput::new(
+                CommittedSubDag::default(),
+                B256::ZERO.into(),
+                number,
+                false,
+                VecDeque::new(),
+                vec![],
+            )
+        };
+        for i in 0..SYNC_OUTPUT_CHANNEL_CAPACITY as u64 {
+            consensus_bus.sync_output().send(filler(1_000 + i)).await?;
+        }
+        assert!(
+            consensus_bus.sync_output().try_send(filler(0)).is_err(),
+            "the queue must be full before catch-up runs"
+        );
+
+        let epoch = fixture.committee().epoch();
+        let catch_up = tokio::spawn(async move {
+            let mut from = ConsensusHeader::default();
+            let result =
+                catch_up_consensus_from_to(&consensus_bus, &mut from, target, &db, &chain, epoch)
+                    .await;
+            (result, from)
+        });
+
+        // three warn intervals pass with the subscriber taking nothing: the loop is still parked
+        // on the send rather than finished, failed or past the output
+        tokio::time::sleep(SYNC_OUTPUT_SEND_WARN_INTERVAL * 3 + Duration::from_secs(1)).await;
+        assert!(!catch_up.is_finished(), "catch-up must stay parked while the queue is full");
+        assert_eq!(
+            warnings.load(Ordering::SeqCst),
+            3,
+            "one warning per elapsed interval while the send is parked"
+        );
+
+        // the subscriber frees one slot and the parked send goes through
+        let first = rx_sync_output.recv().await.expect("a queued output");
+        assert_eq!(first.consensus_header().number, 1_000, "the oldest filler leaves first");
+        let (result, from) = tokio::time::timeout(Duration::from_secs(5), catch_up)
+            .await
+            .expect("the send must complete once the subscriber takes an output")?;
+        result?;
+        assert_eq!(from.number, 1, "progress is recorded once the output is queued");
+        // the remaining fillers are followed by the follower's output and nothing else
+        let queued: Vec<_> = std::iter::from_fn(|| rx_sync_output.try_recv().ok())
+            .map(|output| output.consensus_header().number)
+            .collect();
+        assert_eq!(queued.len(), SYNC_OUTPUT_CHANNEL_CAPACITY, "the fillers left plus one output");
+        assert_eq!(queued.last(), Some(&1), "the follower's output is the newest in the queue");
         Ok(())
     }
 }

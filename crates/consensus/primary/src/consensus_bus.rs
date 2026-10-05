@@ -29,7 +29,7 @@ use tokio::{
     },
     time::error::Elapsed,
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Depth of the bounded `sync_output` queue.
 ///
@@ -43,7 +43,7 @@ use tracing::{error, warn};
 /// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
 /// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
 /// 2.5 s of subscriber work at 7-13 ms per saved output.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+pub const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity for the `exex_certificates` broadcast.
 ///
 /// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
@@ -922,19 +922,35 @@ impl ConsensusBusApp {
         } else {
             consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
         };
-        if let Some(previous_epoch_record) = maybe_previous {
-            if let Some(epoch_record) =
-                consensus_chain.epochs().record_by_epoch(current_epoch).await
-            {
-                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
-                // If the pack file is missing or incomplete request it.
-                // Note since we have an epoch record this is a past epoch
-                // not the current epoch.
-                if !contains_final_header {
-                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
-                }
-            }
+        let Some(previous_epoch_record) = maybe_previous else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: previous epoch record is missing"
+            );
+            return;
+        };
+        let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_epoch).await
+        else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch record is missing"
+            );
+            return;
+        };
+        // If the pack file is missing or incomplete request it.
+        // Note since we have an epoch record this is a past epoch
+        // not the current epoch.
+        if consensus_chain.is_epoch_complete(&epoch_record).await {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch pack is already complete"
+            );
+            return;
         }
+        self.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
     }
 
     /// Retrieve the next request to down load an epoch pack file.
