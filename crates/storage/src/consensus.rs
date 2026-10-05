@@ -2834,6 +2834,169 @@ mod test {
         assert!(!consensus_chain.is_epoch_complete(&short).await);
     }
 
+    /// A power loss can leave the durable latest-consensus marker one output ahead of the pack
+    /// that recovery rebuilds at the next open. The clamp the node runs right after opening must
+    /// lower the marker to the pack tail after a real reopen. It is in-memory only, so a second
+    /// open must clamp again, and the next save must be accepted and leave a marker that the
+    /// following open agrees with.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_across_reopen() {
+        let temp_dir = TempDir::with_prefix("test_marker_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.clamp_latest_to_pack().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        for i in 0..k {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        consensus_chain.close().await;
+        // the marker for output k + 1 reached disk but the output itself did not
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 0, k + 1).expect("write hint");
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("first reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads the ahead marker");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 0);
+        assert_eq!(reopened.latest_consensus_number(), k, "marker clamped to the pack tail");
+        reopened.close().await;
+
+        // the clamp never reaches the slot files, so a second open must clamp again
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("second reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the slot files still hold k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 0);
+        assert_eq!(reopened.latest_consensus_number(), k, "clamp repeats on every open");
+        let next = make_test_output(&committee, (k % 4) as usize, chain.clone(), k + 1, parent);
+        reopened
+            .save_consensus_output(next)
+            .await
+            .expect("the output after the pack tail must be accepted");
+        reopened.persist_current().await.expect("persist");
+        reopened.close().await;
+        // slot1 still holds the k + 1 hint, so only the slot the save flipped to shows its marker
+        let mut slot2 =
+            std::fs::File::open(temp_dir.path().join("consensus_slot2")).expect("open slot2");
+        assert_eq!(
+            LatestConsensus::read_slot(&mut slot2).expect("read slot2"),
+            (0, k + 1),
+            "the save wrote its marker to consensus_slot2"
+        );
+
+        // both slots now hold k + 1, so the next open agrees with the pack before any clamp
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("third reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the clamp leaves k + 1");
+        let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
+        assert_eq!(latest.number, k + 1);
+        reopened.close().await;
+    }
+
+    /// The first save of a new epoch fsyncs the marker because the epoch changed, while the output
+    /// itself is only msynced at the next persist. After a power loss the marker names the new
+    /// epoch's first output and that pack holds only its epoch meta. The clamp after a real
+    /// reopen must keep the new epoch and lower the number to the previous epoch's last output,
+    /// and the first output of the new epoch must be accepted afterwards.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_epoch_ahead_across_reopen() {
+        let temp_dir = TempDir::with_prefix("test_marker_epoch_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let committee1 = committee.advance_epoch_for_test(1);
+
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.clamp_latest_to_pack().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        for i in 0..k {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        let epoch0_record =
+            EpochRecord { final_consensus: ConsensusNumHash::new(k, parent), ..previous_epoch };
+        // opens and persists the epoch 1 pack with only its epoch meta
+        consensus_chain.new_epoch(epoch0_record, committee1.clone()).await.unwrap();
+        consensus_chain.close().await;
+        // the marker for epoch 1's first output reached disk but the output itself did not
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 1, k + 1).expect("write hint");
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("first reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads the ahead marker");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1, "marker keeps the new epoch");
+        assert_eq!(reopened.latest_consensus_number(), k, "marker clamped to the previous final");
+        // nothing is saved in epoch 1 yet, callers fall back to the last executed header
+        assert!(reopened.consensus_header_latest().await.unwrap().is_none());
+        reopened.close().await;
+
+        // the clamp never reaches the slot files, so a second open must clamp again
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("second reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the slot files still hold k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1);
+        assert_eq!(reopened.latest_consensus_number(), k, "clamp repeats on every open");
+        let next = make_test_output(&committee1, (k % 4) as usize, chain.clone(), k + 1, parent);
+        reopened
+            .save_consensus_output(next)
+            .await
+            .expect("the first output of the new epoch must be accepted");
+        assert_eq!(reopened.latest_consensus_number(), k + 1);
+        reopened.persist_current().await.expect("persist");
+        reopened.close().await;
+        // slot1 still holds the k + 1 hint, so only the slot the save flipped to shows its marker
+        let mut slot2 =
+            std::fs::File::open(temp_dir.path().join("consensus_slot2")).expect("open slot2");
+        assert_eq!(
+            LatestConsensus::read_slot(&mut slot2).expect("read slot2"),
+            (1, k + 1),
+            "the save wrote its marker to consensus_slot2"
+        );
+
+        // both slots now hold k + 1, so the next open agrees with the pack before any clamp
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("third reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1);
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the clamp leaves k + 1");
+        let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
+        assert_eq!(latest.number, k + 1);
+        reopened.close().await;
+    }
+
     #[tokio::test]
     async fn test_consensus_store_db_stream() {
         let temp_dir = TempDir::with_prefix("test_consensus_pack").expect("temp dir");
