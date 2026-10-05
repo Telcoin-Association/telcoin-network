@@ -1421,23 +1421,25 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     Ok(())
 }
 
+/// An excess ordinary peer receives discovery peers and reconnects through the committee.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
-    let target = NonZeroUsize::new(5).unwrap();
+    let target = NonZeroUsize::new(6).ok_or_else(|| eyre!("committee size must be nonzero"))?;
     let mut network_config = NetworkConfig::default();
-    network_config.peer_config_mut().target_num_peers = 5; // entire committee + 1
+    network_config.peer_config_mut().target_num_peers = 5; // five remote committee peers
     network_config.peer_config_mut().peer_excess_factor = 0.1;
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     network_config.libp2p_config_mut().k_bucket_size = target;
 
     // Set up peers with the custom config
-    let (mut target_peer, mut other_peers, _) = create_test_peers::<
-        TestWorkerRequest,
-        TestWorkerResponse,
-    >(target, Some(network_config.clone()));
+    let (mut target_peer, mut other_peers, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            target,
+            Some(network_config.clone()),
+        );
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
@@ -1453,6 +1455,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
+
+    // Discovery entries do not grant retention privileges. Install authoritative membership
+    // so the excess non-validator is the only peer eligible for pruning.
+    let committee_keys = target_peer.config.committee_pub_keys();
+    target_peer
+        .network_handle
+        .update_committees(Default::default(), committee_keys.clone(), Default::default())
+        .await?;
 
     debug!(target: "network", ?target_peer_id, ?target_peer_bls, "target peer started");
 
@@ -1497,9 +1507,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         .await?;
     }
 
-    // allow heartbeat to trigger peer pruning - increased to give libp2p time to
-    // stabilize internal connection state and avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(5), "committee fills target peer budget", move || async move {
+        target_handle.connected_peers().await.map(|peers| peers.len() == 5).map_err(Into::into)
+    })
+    .await?;
 
     // check that target has limited peers
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -1515,40 +1527,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     );
 
     // create a new non-validator peer
-    let TestTypes { peer1: nvv_peer, peer2, .. } =
+    let TestTypes { peer1: nvv_peer, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-
-    let NetworkPeer {
-        config: peer2_config,
-        network_handle: peer2,
-        network: peer2_network,
-        network_events: _,
-    } = peer2;
-
-    // connect peer2
-    tokio::spawn(async move {
-        if let Err(e) = peer2_network.run().await {
-            error!(target: "network", ?e, "peer2 network run failed");
-        }
-    });
-
-    peer2.start_listening(peer2_config.primary_address()).await?;
-
-    // add peers to each other's known peers
-    // add target as a bootstrap nodes
-    peer2.add_explicit_peer(target_peer_bls, target_peer_net.clone(), target_addr.clone()).await?;
-
-    // subscribe to topic for gossip
-    peer2
-        .subscribe_with_publishers(TEST_TOPIC.into(), vec![target_peer_bls].into_iter().collect())
-        .await?;
-
-    // connect to target
-    peer2.dial_by_bls(target_peer_bls).await?;
-
-    // give time for connection to establish and libp2p state to stabilize
-    // target should be at max capacity
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // spawn nvv that goes through px
     let NetworkPeer {
@@ -1579,9 +1559,23 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect nvv to target (which already has too many peers)
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // allow time for kademlia records to propagate and libp2p connection state to
-    // stabilize after disconnection - increased to avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // Wait for the goodbye and peer exchange to lead to a committee connection before publishing.
+    let nvv_handle = &nvv;
+    let committee_keys = &committee_keys;
+    wait_until(
+        Duration::from_secs(10),
+        "excess peer reconnects through peer exchange",
+        move || async move {
+            tokio::try_join!(target_handle.connected_peers(), nvv_handle.connected_peers())
+                .map(|(target_connected, connected)| {
+                    !target_connected.contains(&nvv_peer_bls)
+                        && !connected.contains(&target_peer_bls)
+                        && connected.iter().any(|peer| committee_keys.contains(peer))
+                })
+                .map_err(Into::into)
+        },
+    )
+    .await?;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
@@ -1672,6 +1666,16 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
     let target_addr = target_peer.config.primary_address();
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
+
+    // Adding discovery peers alone does not protect them from pruning.
+    target_peer
+        .network_handle
+        .update_committees(
+            Default::default(),
+            target_peer.config.committee_pub_keys(),
+            Default::default(),
+        )
+        .await?;
 
     // fill the target with protected committee peers
     for peer in other_peers.iter_mut() {
