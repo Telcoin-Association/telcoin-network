@@ -1062,9 +1062,15 @@ async fn resolve_prior_epoch_record(
 /// copies are redundant. Keeping them until the epoch-close clear makes the fixed-size cache map
 /// hold a whole epoch of batches, which overflows it under sustained load (issue #1443).
 ///
-/// Our own batches have reached execution, so they no longer need rebroadcasting either. The
-/// removes share one write txn, so a `Durable` env pays one fsync per output, not one per batch.
-/// A failure is only logged: a batch left behind holds space until epoch close.
+/// Our own batches have reached execution, so they no longer need rebroadcasting either.
+///
+/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) both tables live in
+/// the cache env, a [`LayeredDatabase`](tn_storage::layered_db::LayeredDatabase): each remove
+/// drops the key from the memory layer and queues the delete to that env's writer thread, which
+/// runs the backend write txn and its commit (an fsync under MDBX `Durable`). The caller pays a
+/// map remove and a channel send per key. Sharing one txn makes the writer commit once per
+/// output where bare removes would commit once per key. A failure is only logged: a batch left
+/// behind holds space until epoch close.
 fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash>) {
     if digests.is_empty() {
         return;

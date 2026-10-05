@@ -30,7 +30,7 @@ mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
-/// `LayeredDatabase`: a write-through in-memory layer plus a shared write-txn guard over a backend.
+/// `LayeredDatabase`: a write-behind memory layer whose writer thread commits to a backend.
 pub mod layered_db;
 /// The reth MDBX key/value backend (the default `Database` backend).
 #[cfg(feature = "reth-libmdbx")]

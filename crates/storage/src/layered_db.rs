@@ -406,10 +406,12 @@ fn db_run<DB: Database>(
     tracing::info!(target: "layered_db_runner", "Layerd DB thread Shutdown complete");
 }
 
-/// Implement the Database trait with an in-memory store.
-/// This means no persistance.
-/// This DB also plays loose with transactions, but since it is in-memory and we do not do
-/// roll-backs this should be fine.
+/// A memory layer over `db` whose writes reach `db` on a dedicated writer thread (`db_run`).
+///
+/// A write updates the memory layer and queues the backend operation over an unbounded channel,
+/// so it never waits on disk; the writer thread runs every backend write txn and commit.
+/// Overlapping write txns share one physical txn, committed when the last one ends. There is no
+/// rollback.
 #[derive(Clone, Debug)]
 pub struct LayeredDatabase<DB: Database> {
     mem_db: MemDatabase,
