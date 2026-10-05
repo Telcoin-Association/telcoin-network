@@ -92,3 +92,51 @@ impl<V: ValueT> Value for ValWrap<V> {
         TypeName::new(std::any::type_name::<V>())
     }
 }
+
+/// Byte view of the stored keys or values of a table whose rows are `T`.
+///
+/// Reports the same redb type name as [`KeyWrap`] and [`ValWrap`], so it opens the same table
+/// and yields each row's bytes without decoding them.
+#[derive(Debug)]
+pub struct RawBytes<T: Debug>(PhantomData<T>);
+
+impl<T: Debug> Value for RawBytes<T> {
+    type SelfType<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = &'a [u8]
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        data
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'a,
+        Self: 'b,
+    {
+        value
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new(std::any::type_name::<T>())
+    }
+}
+
+impl<T: Debug> Key for RawBytes<T> {
+    fn compare(data1: &[u8], data2: &[u8]) -> std::cmp::Ordering {
+        data1.cmp(data2)
+    }
+}
