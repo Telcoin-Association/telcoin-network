@@ -90,15 +90,17 @@ async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::
     wait_until(
         Duration::from_secs(15),
         "trusted hub connects alongside unrelated peer",
-        || async { Ok(local.connected_peer_count().await? == 2) },
+        || async { Ok(local.established_peer_count().await? == 2) },
     )
     .await?;
     hub_task.abort();
     assert!(hub_task.await.err().is_some_and(|error| error.is_cancelled()));
+    // Count established connections only. The retry timer keeps an offline hub in a pending
+    // dial, and `connected_peer_count` counts pending dials.
     wait_until(
         Duration::from_secs(15),
         "hub disconnect leaves unrelated peer connected",
-        || async { Ok(local.connected_peer_count().await? == 1) },
+        || async { Ok(local.established_peer_count().await? == 1) },
     )
     .await?;
     local
@@ -119,7 +121,7 @@ async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::
     wait_until(
         Duration::from_secs(15),
         "trusted hub reconnects after outage and rotation",
-        || async { Ok(local.connected_peer_count().await? == 2) },
+        || async { Ok(local.established_peer_count().await? == 2) },
     )
     .await?;
     local_task.abort();
@@ -1539,8 +1541,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     error!(target: "network", ?connected, "nvv connected peers");
     assert!(!connected.contains(&target_peer_id));
 
-    // Configuration is a dial hint, so wait for the author proof obtained through peer exchange.
+    // `add_explicit_peer` stores only a configuration stub. A stub is a dial hint, not proof of
+    // the author's BLS binding. Peer exchange does not carry signed records, so request the
+    // target's signed record through kad until nvv verifies it.
     wait_until(Duration::from_secs(120), "nvv verifies disconnected gossip author", || async {
+        nvv.find_authorities(vec![target_peer_bls]).await?;
         Ok(nvv.verified_peer_bls(target_peer_id).await? == Some(target_peer_bls))
     })
     .await?;
