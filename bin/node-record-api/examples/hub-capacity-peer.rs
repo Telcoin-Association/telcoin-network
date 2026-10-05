@@ -233,6 +233,23 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
     Ok(())
 }
 
+/// Retain native dial detail that the existing error's Display deliberately omits.
+fn bounded_dial_cause(error: &NetworkError) -> String {
+    if let NetworkError::Dial(detail) = error {
+        detail.chars().take(MAX_DIAL_ERROR_CHARS).collect()
+    } else {
+        error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect()
+    }
+}
+
+/// Preserve typed error propagation while exposing bounded detail at the fixture boundary.
+fn bounded_report_cause(error: &eyre::Report) -> String {
+    error
+        .downcast_ref::<NetworkError>()
+        .map(bounded_dial_cause)
+        .unwrap_or_else(|| error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect())
+}
+
 /// Confirm the authenticated target after a successful or potentially raced dial.
 async fn dial_and_confirm<F>(
     handle: &Handle,
@@ -246,7 +263,7 @@ where
     let outcome = dial.await.inspect_err(|error| {
         tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
             phase = "confirmation", role = %role_name(role), peer = %target, outcome = "rejected",
-            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            cause = %bounded_dial_cause(error),
             "native dial rejected");
     });
     if outcome.as_ref().is_err_and(|error| {
@@ -262,7 +279,7 @@ where
                 tracing::error!(target: "hub_capacity::peer", event = "peer_dial_confirmation",
                     phase = "confirmation", role = %role_name(role), peer = %target,
                     confirmation = "not_attempted",
-                    cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+                    cause = %bounded_dial_cause(error),
                     "native dial failure prevents authenticated confirmation");
             })
             .map_err(eyre::Report::from)
@@ -273,6 +290,7 @@ where
                 tracing::error!(target: "hub_capacity::peer", event = "peer_dial_confirmation",
                     phase = "confirmation", role = %role_name(role), peer = %target, confirmation = "failed",
                     cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+                    native_cause = %outcome.as_ref().err().map(bounded_dial_cause).unwrap_or_default(),
                     "authenticated target confirmation failed");
             })
             .map_err(|confirmation_error| {
@@ -293,6 +311,7 @@ where
     F: Future<Output = std::result::Result<(), NetworkError>>,
 {
     let outcome = dial.await;
+    let initial_dial_cause = outcome.as_ref().err().map(bounded_dial_cause);
     let retry_count = if outcome.as_ref().is_err_and(|error| matches!(error, NetworkError::Dial(_)))
     {
         1
@@ -310,7 +329,7 @@ where
     let outcome = outcome.inspect_err(|error| {
         tracing::warn!(target: "hub_capacity::peer", event = "peer_dial_rejection",
             phase = "startup", role = %role_name(role), peer = %target, outcome = "rejected", retry_count,
-            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            cause = %bounded_dial_cause(error),
             "native dial rejected");
     });
     let result = if outcome.is_ok() {
@@ -325,7 +344,9 @@ where
         .map_err(|error| {
             tracing::error!(target: "hub_capacity::peer", event = "peer_startup_recovery",
                 role = %role_name(role), peer = %target, retry_count,
-                confirmation = "deadline", "startup recovery window elapsed");
+                confirmation = "deadline",
+                native_cause = initial_dial_cause.as_deref().unwrap_or_default(),
+                "startup recovery window elapsed");
             eyre::Report::from(error)
         })
         .and_then(std::convert::identity)
@@ -343,7 +364,7 @@ where
         tracing::error!(target: "hub_capacity::peer", event = "peer_startup_failure",
             phase = "startup", role = %role_name(role), peer = %target, outcome = "rejected", retry_count,
             confirmation = if needs_confirmation { "failed" } else { "not_attempted" },
-            cause = %error.to_string().chars().take(MAX_DIAL_ERROR_CHARS).collect::<String>(),
+            cause = %bounded_report_cause(error),
             "startup dial failed");
     })
 }
@@ -778,6 +799,65 @@ mod tests {
 
     use super::*;
     use tn_network_libp2p::types::NetworkCommand;
+
+    /// Native payloads are clipped at Unicode scalar boundaries without altering the error.
+    #[test]
+    fn dial_cause_keeps_unicode_boundaries_and_original_payload() {
+        [0, 255, 256, 257].into_iter().for_each(|length| {
+            let original = "🙂".repeat(length);
+            let error = NetworkError::Dial(original.clone());
+            let cause = bounded_dial_cause(&error);
+            assert_eq!(cause, "🙂".repeat(length.min(MAX_DIAL_ERROR_CHARS)));
+            assert!(matches!(error, NetworkError::Dial(payload) if payload == original));
+        });
+        let error = NetworkError::ProtocolError("protocol detail".to_owned());
+        assert_eq!(bounded_dial_cause(&error), error.to_string());
+    }
+
+    /// Default ERROR logging retains native detail when exact target confirmation fails.
+    #[tokio::test]
+    async fn failed_confirmation_retains_native_dial_detail_and_typed_error() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(6376)));
+        let target = keys.primary_public_key();
+        let trace = tempfile::NamedTempFile::new()?;
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::builder()
+                    .with_default_directive(tracing_subscriber::filter::LevelFilter::ERROR.into())
+                    .parse("")?,
+            )
+            .without_time()
+            .with_ansi(false)
+            .with_writer(trace.as_file().try_clone()?)
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let handle = Handle::new(sender);
+        let detail = "界".repeat(300);
+        let error = dial_and_confirm(
+            &handle,
+            NetworkType::Worker(0),
+            target,
+            futures::future::ready(Err(NetworkError::Dial(detail.clone()))),
+        )
+        .await
+        .expect_err("a native rejection without authenticated confirmation remains a failure");
+        assert!(
+            matches!(error.downcast_ref::<NetworkError>(), Some(NetworkError::Dial(original)) if original == &detail)
+        );
+        let retained = std::fs::read_to_string(trace.path())?;
+        assert!(!retained.contains("peer_dial_rejection"));
+        assert!(retained.contains("peer_dial_confirmation"));
+        assert!(retained.contains("confirmation=\"failed\""));
+        assert!(retained.contains("role=worker-0"));
+        assert!(retained.contains(&format!("peer={target}")));
+        assert!(retained.contains("native_cause="));
+        assert_eq!(retained.matches('界').count(), MAX_DIAL_ERROR_CHARS);
+        assert!(!retained.contains(&detail));
+        Ok(())
+    }
 
     /// The production default ERROR filter retains bounded fatal detail and the original error.
     #[tokio::test]

@@ -4,11 +4,13 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -18,6 +20,9 @@ ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("hub_qualify", ROOT / "qualify.py")
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
+CONTROL_SPEC = importlib.util.spec_from_file_location("hub_control", ROOT / "control.py")
+CONTROL = importlib.util.module_from_spec(CONTROL_SPEC)
+CONTROL_SPEC.loader.exec_module(CONTROL)
 
 # Leave eight control-server slots for handlers finishing timed-out commands.
 MAX_ACTIVE_COMMANDS = 64
@@ -52,32 +57,70 @@ def validate_manifest(plan, manifest):
         raise ValueError("retain network namespaces, links, NAT rules, and peer topology")
 
 
+def control_arguments(argv):
+    """Recognize only the source-owned adapter and its exact declared CLI form."""
+    if (len(argv) < 4 or argv[0] not in {"python3", sys.executable} or
+            argv[1:3] != ["-B", "-I"] or argv[3] != str(ROOT / "control.py")):
+        return None
+    values = {"url": None, "identity": None, "observations": None, "bulk_root": None}
+    options = argv[4:]
+    if len(options) % 2:
+        return None
+    seen = set()
+    for option, value in zip(options[::2], options[1::2]):
+        name = option.removeprefix("--").replace("-", "_")
+        if option not in {"--url", "--identity", "--observations", "--bulk-root"} or name in seen:
+            return None
+        seen.add(name)
+        values[name] = value
+    if any(url is not None and not CONTROL.direct_http_url(url)
+           for url in (values["url"], values["observations"])):
+        return None
+    return argparse.Namespace(**values)
+
+
 def execute(agent, scenario, operation_id, origin, timeout):
     """Measure one command, keeping timeouts and refusals in the operation population."""
     started = time.monotonic()
     result = {"scenario": scenario, "id": operation_id, "success": False,
               "rejection_reason": None, "agent": agent["identity"], "argv": agent["argv"],
-              "driver_started_unix_us": time.time_ns() // 1000}
+              "driver_started_unix_us": time.time_ns() // 1000,
+              "driver_execution_mode": "subprocess"}
     environment = {**os.environ, "HUB_CAPACITY_OPERATION_ID": operation_id,
                    "HUB_CAPACITY_SCENARIO": scenario,
                    "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(time.time_ns() // 1000 - int((started - origin) * 1_000_000))}
     child = None
     try:
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-            child = subprocess.Popen(agent["argv"], stdout=output, stderr=errors, env=environment)
-            result["driver_spawn_completed_unix_us"] = time.time_ns() // 1000
-            while child.poll() is None:
-                if time.monotonic() - started > timeout:
-                    result["rejection_reason"] = "timeout"
-                    child.kill()
-                    break
-                if os.fstat(output.fileno()).st_size + os.fstat(errors.fileno()).st_size > 65536:
-                    result["rejection_reason"] = "agent_output_limit"
-                    child.kill()
-                    break
-                time.sleep(0.01)
-            status = child.wait()
-            result["driver_child_completed_unix_us"] = time.time_ns() // 1000
+            args = control_arguments(agent["argv"])
+            if args is not None:
+                result["driver_execution_mode"] = "in_process_control"
+                result["driver_adapter_started_unix_us"] = time.time_ns() // 1000
+                try:
+                    response = CONTROL.invoke(args, environment, deadline=started + timeout)
+                    encoded = json.dumps(response, allow_nan=False, separators=(",", ":")).encode()
+                    CONTROL.remaining_timeout(started + timeout)
+                    if len(encoded) > 65536:
+                        result["rejection_reason"] = "agent_output_limit"
+                    output.write(encoded[:65536])
+                    status = 0
+                finally:
+                    result["driver_adapter_completed_unix_us"] = time.time_ns() // 1000
+            else:
+                child = subprocess.Popen(agent["argv"], stdout=output, stderr=errors, env=environment)
+                result["driver_spawn_completed_unix_us"] = time.time_ns() // 1000
+                while child.poll() is None:
+                    if time.monotonic() - started > timeout:
+                        result["rejection_reason"] = "timeout"
+                        child.kill()
+                        break
+                    if os.fstat(output.fileno()).st_size + os.fstat(errors.fileno()).st_size > 65536:
+                        result["rejection_reason"] = "agent_output_limit"
+                        child.kill()
+                        break
+                    time.sleep(0.01)
+                status = child.wait()
+                result["driver_child_completed_unix_us"] = time.time_ns() // 1000
             output.seek(0)
             errors.seek(0)
             stdout = output.read(65536).decode(errors="replace")
@@ -126,13 +169,17 @@ def execute(agent, scenario, operation_id, origin, timeout):
                             raise ValueError("committee observation does not belong to the measured request population")
                         measured.append({"scenario": scenario, "id": f"{operation_id}-{index}",
                                          "agent": agent["identity"], "argv": agent["argv"],
+                                         "driver_execution_mode": result["driver_execution_mode"],
                                          "success": fields["success"], "latency_ms": latency / 1000,
                                          "cancelled": not fields["completed"],
                                          "rejection_reason": None if fields["success"] else "committee request failed or was cancelled",
                                          "elapsed_seconds": (ended - measurement) / 1_000_000,
                                          "trace": {"observation": observation}})
                     result["committee_observations"] = measured
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except TimeoutError:
+        result["success"] = False
+        result["rejection_reason"] = "timeout"
+    except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as error:
         result["success"] = False
         result["rejection_reason"] = f"driver_validation: {error}"
     finally:
@@ -178,7 +225,14 @@ def run(plan, manifest, output, origin):
         def record(entry):
             with write_lock:
                 entries = entry.pop("committee_observations", None) if entry["success"] else None
-                for measured in entries or [entry]:
+                if entries is not None:
+                    # Final scrapes retain drain completions only for requests started in the window.
+                    entries = [measured for measured in entries
+                               if 0 <= round(measured["elapsed_seconds"] * 1_000_000)
+                               - round(measured["latency_ms"] * 1000) < duration * 1_000_000]
+                else:
+                    entries = [entry]
+                for measured in entries:
                     stream.write(json.dumps(measured, allow_nan=False, separators=(",", ":")) + "\n")
                 stream.flush()
 

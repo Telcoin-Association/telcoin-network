@@ -74,7 +74,8 @@ def evidence(plan, phase="candidate"):
             "artifacts": [{"path": "synthetic.json", "sha256": hashlib.sha256(b"synthetic").hexdigest()}],
             "samples": samples, "operations": {scenario: [
                 {"id": str(index), "success": True, "latency_ms": 10,
-                 "elapsed_seconds": index * 60, "hops": 2, "rejection_reason": None}
+                 "elapsed_seconds": index * 60 + (0.01 if scenario == "committee_progress" else 0),
+                 "hops": 2, "rejection_reason": None}
                 for index in range(10)] for scenario in QUALIFY.SCENARIOS}}
 
 
@@ -82,6 +83,51 @@ class QualificationTests(unittest.TestCase):
     def setUp(self):
         self.plan = declaration()
         self.run = evidence(self.plan)
+
+    def test_native_committee_deadline_is_exclusive_at_microsecond_precision(self):
+        sample = copy.deepcopy(self.run["samples"][-1])
+        sample["elapsed_seconds"] = 605
+        self.run["samples"].append(sample)
+        for ended in (0.000999, 0.001, 0.001001, 600.000999, 600.001, 600.001001):
+            for success, cancelled in ((True, False), (False, False), (False, True)):
+                with self.subTest(ended=ended, success=success, cancelled=cancelled):
+                    run = copy.deepcopy(self.run)
+                    run["operations"]["committee_progress"].append({
+                        "id": "boundary", "success": success, "cancelled": cancelled,
+                        "latency_ms": 1, "elapsed_seconds": ended,
+                        "rejection_reason": None if success else "failed"})
+                    if ended in (0.001, 0.001001, 600.000999):
+                        QUALIFY.validate_evidence(self.plan, run, "candidate")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "started outside measurement interval"):
+                            QUALIFY.validate_evidence(self.plan, run, "candidate")
+
+    def test_predeadline_drain_outcomes_preserve_denominators(self):
+        sample = copy.deepcopy(self.run["samples"][-1])
+        sample["elapsed_seconds"] = 605
+        self.run["samples"].append(sample)
+        operations = self.run["operations"]["committee_progress"]
+        operations.extend({"id": f"native-{index}", "success": success, "cancelled": cancelled,
+                           "latency_ms": 1000, "elapsed_seconds": 600.5,
+                           "rejection_reason": None if success else "failed"}
+                          for index, (success, cancelled) in enumerate([
+                              (True, False), (False, False), (False, True)]))
+        operations.append({"id": "query-failure", "success": False, "latency_ms": 1000,
+                           "elapsed_seconds": 600.5, "rejection_reason": "query failure"})
+        QUALIFY.validate_evidence(self.plan, self.run, "candidate")
+        summary = QUALIFY.score(self.plan, self.run)["scenarios"]
+        self.assertEqual(summary["committee_progress"], {
+            "attempts": 13, "cancelled": 1, "success_rate": 11 / 13, "p99_ms": 1000})
+
+    def test_postdeadline_committee_success_cannot_omit_cancellation_state_to_pass(self):
+        sample = copy.deepcopy(self.run["samples"][-1])
+        sample["elapsed_seconds"] = 605
+        self.run["samples"].append(sample)
+        self.run["operations"]["committee_progress"].append({
+            "id": "late-success", "success": True, "latency_ms": 1,
+            "elapsed_seconds": 601, "rejection_reason": None})
+        with self.assertRaisesRegex(ValueError, "started outside measurement interval"):
+            QUALIFY.validate_evidence(self.plan, self.run, "candidate")
 
     def test_fractional_cpu_limit_preserves_headroom(self):
         self.plan["envelope"]["cpus_per_hub"] = 1

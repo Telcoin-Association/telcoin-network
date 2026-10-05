@@ -18,6 +18,56 @@ SPEC.loader.exec_module(WORKLOAD)
 
 
 class WorkloadTests(unittest.TestCase):
+    def test_final_scrape_keeps_only_predeadline_native_requests_and_query_failures(self):
+        native = [{"scenario": "committee_progress", "id": f"native-{index}",
+                   "success": success, "cancelled": cancelled, "latency_ms": 1,
+                   "elapsed_seconds": ended, "rejection_reason": None if success else "failed"}
+                  for index, (ended, success, cancelled) in enumerate([
+                      (600.000999, True, False), (600.000999, False, False),
+                      (600.000999, False, True), (600.001, True, False),
+                      (600.001001, False, False), (600.001001, False, True),
+                      (0.000999, True, False), (0.000999, False, False),
+                      (0.000999, False, True), (0.001, True, False),
+                      (0.001, False, False), (0.001, False, True),
+                      (0.001001, True, False), (0.001001, False, False),
+                      (0.001001, False, True)])]
+
+        def execute(_agent, scenario, operation_id, _origin, _timeout):
+            entry = {"scenario": scenario, "id": operation_id, "success": False,
+                     "rejection_reason": "query failure", "latency_ms": 1000,
+                     "elapsed_seconds": 600.5}
+            if operation_id in ("committee_progress-final-0", "committee_progress-final-1"):
+                entries = native if operation_id.endswith("-0") else native[3:9]
+                entry.update(success=True, rejection_reason=None,
+                             committee_observations=[{**item} for item in entries])
+            return entry
+
+        with tempfile.TemporaryDirectory() as directory:
+            topology = Path(directory) / "topology.json"
+            topology.write_text('{"synthetic":true}')
+            manifest = {"topology_artifact": str(topology), "scenarios": {
+                scenario: {"concurrency": 1, "agents": [
+                    {"identity": f"synthetic-{index}", "argv": ["synthetic"]}
+                    for index in range(3)]} for scenario in WORKLOAD.QUALIFY.SCENARIOS}}
+            plan = {"envelope": {"duration_seconds": 600, "public_peers": 1,
+                                 "shared_nat_peers": 1, "dao_observers": 1},
+                    "thresholds": {"scenarios": {scenario: {"minimum_attempts": 1}
+                                                  for scenario in WORKLOAD.QUALIFY.SCENARIOS}}}
+            output = Path(directory) / "operations.jsonl"
+            with patch.object(WORKLOAD, "execute", execute), \
+                    patch.object(WORKLOAD.time, "monotonic", return_value=600.5), \
+                    patch.object(WORKLOAD.time, "sleep"):
+                WORKLOAD.run(plan, manifest, output, 0)
+            operations = [json.loads(line) for line in output.read_text().splitlines()]
+            observed = [entry for entry in operations if "cancelled" in entry]
+            self.assertEqual(observed, native[:3] + native[9:])
+            queries = [entry for entry in operations if "cancelled" not in entry]
+            self.assertEqual(len(queries), 2400 + len(WORKLOAD.QUALIFY.SCENARIOS))
+            self.assertTrue(all(not entry["success"] for entry in queries))
+            self.assertEqual(sum(entry["id"] == "committee_progress-final-2" for entry in queries), 1)
+            self.assertFalse(any(entry["id"] in ("committee_progress-final-0", "committee_progress-final-1")
+                                 for entry in queries))
+
     def test_declared_overlap_has_execution_headroom(self):
         concurrency = {"committee_progress": 4, "concurrent_sync": 8,
                        "dao_connectivity": 4, "gossip_two_hops": 32,

@@ -36,9 +36,10 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusOutput,
-    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, WorkerId,
+    encode, AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest,
+    ConsensusOutput, ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+    EpochVote, Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
+    WorkerId,
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
@@ -110,9 +111,203 @@ impl Drop for VoteObservation {
     }
 }
 
+/// Report only slow inbound vote stages, without adding a timer or retaining request history.
+const INBOUND_VOTE_SLOW_STAGE: Duration = Duration::from_secs(1);
+
+/// Existing header identity shared by inbound stage events. Retries can share this context.
+#[derive(Clone)]
+struct InboundVoteContext {
+    epoch: Epoch,
+    round: Round,
+    header: HeaderDigest,
+    author: AuthorityIdentifier,
+}
+
+impl InboundVoteContext {
+    fn new(header: &Header) -> Self {
+        Self {
+            epoch: header.epoch(),
+            round: header.round(),
+            header: header.digest(),
+            author: header.author().clone(),
+        }
+    }
+}
+
+/// Finite inbound work categories. These labels do not identify a unique RPC attempt.
+#[derive(Clone, Copy)]
+enum InboundVoteStageKind {
+    Dispatch,
+    Vote,
+    AuthorLock,
+    Execution,
+    MissingParents,
+    AcceptParents,
+    ReadParents,
+    HeaderLead,
+    Batches,
+    Persistence,
+    PeerPenalty,
+    SendResponse,
+}
+
+impl InboundVoteStageKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Vote => "vote",
+            Self::AuthorLock => "author_lock",
+            Self::Execution => "execution",
+            Self::MissingParents => "missing_parents",
+            Self::AcceptParents => "accept_parents",
+            Self::ReadParents => "read_parents",
+            Self::HeaderLead => "header_lead",
+            Self::Batches => "batches",
+            Self::Persistence => "persistence",
+            Self::PeerPenalty => "peer_penalty",
+            Self::SendResponse => "send_response",
+        }
+    }
+}
+
+/// Distinguish a completed wait from a future dropped by cancellation or its existing timeout.
+#[derive(Clone, Copy)]
+enum InboundVoteStageOutcome {
+    Returned,
+    Error,
+    Dropped,
+}
+
+impl InboundVoteStageOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Returned => "returned",
+            Self::Error => "error",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// One constant-size observation owned by the existing request future.
+struct InboundVoteStage {
+    context: InboundVoteContext,
+    stage: InboundVoteStageKind,
+    started: std::time::Instant,
+    outcome: InboundVoteStageOutcome,
+}
+
+impl InboundVoteStage {
+    fn new(context: &InboundVoteContext, stage: InboundVoteStageKind) -> Self {
+        Self {
+            context: context.clone(),
+            stage,
+            started: std::time::Instant::now(),
+            outcome: InboundVoteStageOutcome::Dropped,
+        }
+    }
+
+    fn finish(mut self, outcome: InboundVoteStageOutcome) {
+        self.outcome = outcome;
+    }
+
+    async fn observe<F, T, E>(self, future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = future.await;
+        self.finish(if result.is_ok() {
+            InboundVoteStageOutcome::Returned
+        } else {
+            InboundVoteStageOutcome::Error
+        });
+        result
+    }
+
+    fn is_slow(elapsed: Duration) -> bool {
+        elapsed >= INBOUND_VOTE_SLOW_STAGE
+    }
+}
+
+impl Drop for InboundVoteStage {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if Self::is_slow(elapsed) {
+            info!(target: "network::capacity", event = "committee_vote_stage",
+                direction = "inbound", trace_scope = "header",
+                epoch = self.context.epoch, round = self.context.round,
+                header = %self.context.header, author = %self.context.author,
+                stage = self.stage.label(), outcome = self.outcome.label(),
+                latency_us = %elapsed.as_micros(),
+                unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |time| time.as_micros()), "slow inbound vote stage");
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+mod inbound_vote_observation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+
+    fn context() -> InboundVoteContext {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authority = fixture.authorities().next().expect("fixture authority");
+        let header = authority.header_builder(authority.consensus_config().committee()).build();
+        InboundVoteContext::new(&header)
+    }
+
+    #[test]
+    fn slow_vote_stage_boundary_is_inclusive() {
+        assert!(!InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE - Duration::from_nanos(1)));
+        assert!(InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE));
+        assert!(InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE + Duration::from_nanos(1)));
+    }
+
+    #[tokio::test]
+    async fn vote_stage_observation_preserves_success_and_error() {
+        let context = context();
+        let success = InboundVoteStage::new(&context, InboundVoteStageKind::Batches)
+            .observe(futures::future::ready(Ok::<_, &str>(17)))
+            .await;
+        assert_eq!(success, Ok(17));
+        let failure = InboundVoteStage::new(&context, InboundVoteStageKind::ReadParents)
+            .observe(futures::future::ready(Err::<u8, _>("original parent error")))
+            .await;
+        assert_eq!(failure, Err("original parent error"));
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_vote_stage_observation_drops_the_existing_wait() {
+        let released = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(released.clone());
+        let future = async move {
+            let _probe = probe;
+            futures::future::pending::<Result<(), ()>>().await
+        };
+        let context = context();
+        let mut observed = Box::pin(
+            InboundVoteStage::new(&context, InboundVoteStageKind::Execution).observe(future),
+        );
+        assert!(observed.as_mut().now_or_never().is_none());
+        assert!(!released.load(Ordering::SeqCst));
+        drop(observed);
+        assert!(released.load(Ordering::SeqCst));
+    }
+}
 
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
@@ -1645,10 +1840,19 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let task_name = format!("VoteRequest-{}", header.digest());
+        let context = InboundVoteContext::new(&header);
+        let dispatch = InboundVoteStage::new(&context, InboundVoteStageKind::Dispatch);
 
         self.task_spawner.spawn_task(task_name, async move {
+            dispatch.finish(InboundVoteStageOutcome::Returned);
+            let evaluation = InboundVoteStage::new(&context, InboundVoteStageKind::Vote);
             tokio::select! {
                 vote = request_handler.vote(peer, header, parents) => {
+                    evaluation.finish(if vote.is_ok() {
+                        InboundVoteStageOutcome::Returned
+                    } else {
+                        InboundVoteStageOutcome::Error
+                    });
                     // report penalty if any
                     //
                     // votes are consensus-critical, so a peer that returns a penalizable
@@ -1660,12 +1864,15 @@ where
                         if let Some(penalty) = e.into() {
                             warn!(target: "primary-network", ?peer, ?penalty, error = %e,
                                 "vote request rejected with a peer penalty");
+                            let observation = InboundVoteStage::new(&context, InboundVoteStageKind::PeerPenalty);
                             network_handle.report_penalty(peer, penalty).await;
+                            observation.finish(InboundVoteStageOutcome::Returned);
                         }
                     }
 
                     let response = vote.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
+                    let _ = InboundVoteStage::new(&context, InboundVoteStageKind::SendResponse)
+                        .observe(network_handle.handle.send_response(response, channel)).await;
                 }
                 // cancel notification from network layer
                 _ = cancel => (),

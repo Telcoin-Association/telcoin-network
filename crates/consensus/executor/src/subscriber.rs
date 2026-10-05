@@ -449,6 +449,10 @@ impl<DB: Database> Subscriber<DB> {
         let num_certs = sub_dag.len();
 
         if num_blocks == 0 {
+            info!(target: "consensus::metrics", event = "consensus_output_empty",
+                number, leader_round = sub_dag.leader_round(), num_certs,
+                num_batches = 0, total_txs = 0, leader_epoch = sub_dag.leader_epoch(),
+                parent_hash = %parent_hash, "consensus output has no primary batches");
             debug!(target: "subscriber", "No blocks to fetch, payload is empty");
             return Ok(ConsensusOutput::new_with_subdag(sub_dag, parent_hash, number));
         }
@@ -919,6 +923,139 @@ mod worker_fanout_tests {
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils::CommitteeFixture;
     use tokio::sync::mpsc;
+
+    #[derive(Clone)]
+    struct OutputEvents(Arc<std::sync::Mutex<Vec<BTreeMap<String, String>>>>);
+
+    struct OutputFields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl tracing::field::Visit for OutputFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    impl tracing::Subscriber for OutputEvents {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            metadata.target() == "consensus::metrics" && metadata.level() <= &tracing::Level::INFO
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut fields = BTreeMap::new();
+            event.record(&mut OutputFields(&mut fields));
+            self.0.lock().expect("output event capture").push(fields);
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    /// Empty outputs keep the early return, and both paths retain the same INFO metadata schema.
+    #[tokio::test]
+    async fn fetch_batches_keeps_empty_and_nonempty_output_and_info_metadata() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let primary = fixture.authorities().next().expect("fixture authority");
+        let config = primary.consensus_config().clone();
+        let temp_dir = TempDir::new().expect("temp dir");
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), config.committee().clone())
+                .await
+                .expect("consensus chain");
+        let (tx, _rx) = mpsc::channel(5);
+        let consensus_bus = ConsensusBus::new();
+        let subscriber = Subscriber {
+            consensus_bus: consensus_bus.app().clone(),
+            config: config.clone(),
+            network_handle: PrimaryNetworkHandle::new_for_test(tx),
+            inner: Arc::new(Inner {
+                authority_id: config.authority_id(),
+                committee: config.committee().clone(),
+                consensus_chain,
+                epoch_boundary: u64::MAX,
+                metrics: ExecutorMetrics::default(),
+            }),
+        };
+        let events = OutputEvents(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let _trace = tracing::subscriber::set_default(events.clone());
+        let parent_hash = ConsensusHeaderDigest::default();
+        let empty_header = primary.header_builder(config.committee()).build();
+        let empty_cert = fixture.certificate(&empty_header);
+        let empty = CommittedSubDag::new(
+            vec![empty_cert.clone()],
+            empty_cert,
+            1,
+            tn_types::ReputationScores::new(config.committee()),
+            None,
+        );
+        assert_eq!(empty.num_primary_batches(), 0);
+        let expected = ConsensusOutput::new_with_subdag(empty.clone(), parent_hash, 19);
+        // No worker handler is installed: the empty path must not request any batches.
+        let empty_output =
+            subscriber.fetch_batches(empty, parent_hash, 19).await.expect("empty output");
+        assert_eq!(empty_output.digest(), expected.digest());
+        assert_eq!(empty_output.number(), 19);
+        assert_eq!(empty_output.parent_hash(), parent_hash);
+        assert!(empty_output.batches().is_empty());
+        assert!(empty_output.batch_digests().is_empty());
+
+        let batch = Batch::default();
+        let digest = batch.digest();
+        config
+            .local_network(0)
+            .expect("worker 0 local network")
+            .set_primary_to_worker_local_handler(Arc::new(MockPrimaryToWorkerClient {
+                batches: HashMap::from([(digest, batch.clone())]),
+            }))
+            .expect("register worker 0 mock");
+        let header =
+            primary.header_builder(config.committee()).with_payload_batch(&batch, 0).build();
+        let cert = fixture.certificate(&header);
+        let nonempty = CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            2,
+            tn_types::ReputationScores::new(config.committee()),
+            None,
+        );
+        let output =
+            subscriber.fetch_batches(nonempty, parent_hash, 20).await.expect("nonempty output");
+        assert_eq!(output.number(), 20);
+        assert_eq!(output.parent_hash(), parent_hash);
+        assert_eq!(output.batch_digests(), &VecDeque::from([digest]));
+        assert_eq!(output.batches().len(), 1);
+        assert_eq!(output.batches()[0].batches, vec![batch]);
+
+        let retained = events.0.lock().expect("output events");
+        assert_eq!(retained.len(), 2);
+        let empty_event = &retained[0];
+        let nonempty_event = &retained[1];
+        assert_eq!(empty_event["event"], "consensus_output_empty");
+        assert_eq!(empty_event["message"], "consensus output has no primary batches");
+        assert_eq!(nonempty_event["message"], "consensus output ready");
+        assert_eq!(empty_event["number"], "19");
+        assert_eq!(nonempty_event["number"], "20");
+        assert_eq!(empty_event["leader_round"], nonempty_event["leader_round"]);
+        assert_eq!(empty_event["num_certs"], nonempty_event["num_certs"]);
+        assert_eq!(empty_event["num_batches"], "0");
+        assert_eq!(nonempty_event["num_batches"], "1");
+        assert_eq!(empty_event["total_txs"], "0");
+        assert_eq!(nonempty_event["total_txs"], "0");
+        assert_eq!(empty_event["leader_epoch"], empty_header.epoch().to_string());
+        assert_eq!(empty_event["parent_hash"], parent_hash.to_string());
+    }
 
     /// One fetch leg per worker id, merged into one result; an id with no local network
     /// instance is the protocol violation `UnexpectedWorkerId` (issue #556).

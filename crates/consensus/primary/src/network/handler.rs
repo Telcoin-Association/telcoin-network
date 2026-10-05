@@ -1,6 +1,9 @@
 //! Handle specific request types received from the network.
 
-use super::PrimaryResponse;
+use super::{
+    InboundVoteContext, InboundVoteStage, InboundVoteStageKind, InboundVoteStageOutcome,
+    PrimaryResponse,
+};
 use crate::{
     error::{CertManagerError, PrimaryNetworkError, PrimaryNetworkResult},
     network::message::{PrimaryGossip, PrimaryRPCError},
@@ -584,6 +587,7 @@ where
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let observation_context = InboundVoteContext::new(&header);
         // Sanity check the peer is the author and bounce quick if not.
         // This should keep a malicious validator from corrupting another
         // nodes vote cache.
@@ -615,9 +619,8 @@ where
                 // against. The poison latch fails this barrier after any failed
                 // commit; fail-stop the node rather than recast a non-durable vote
                 // (issue #975).
-                self.consensus_config
-                    .node_storage()
-                    .persist::<Votes>()
+                InboundVoteStage::new(&observation_context, InboundVoteStageKind::Persistence)
+                    .observe(self.consensus_config.node_storage().persist::<Votes>())
                     .await
                     .inspect_err(|e| {
                         error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
@@ -632,7 +635,10 @@ where
         // voted on in parallel but only one vote for an authority can proceed at a time.
         if let Some(auth_lock) = self.auth_last_vote.get(header.author()) {
             // Check for validator equivocation early and reject if so
+            let observation =
+                InboundVoteStage::new(&observation_context, InboundVoteStageKind::AuthorLock);
             let mut auth_last_vote = auth_lock.lock().await;
+            observation.finish(InboundVoteStageOutcome::Returned);
             // put back below when this request ends without a decision on the header
             let previous_vote = auth_last_vote.clone();
             if let Some((last_epoch, last_round, last_digest, last_response)) =
@@ -841,6 +847,7 @@ where
         header: Header,
         parents: Vec<Certificate>,
     ) -> PrimaryNetworkResult<PrimaryResponse> {
+        let observation_context = InboundVoteContext::new(&header);
         // current committee
         let committee = self.consensus_config.committee();
 
@@ -918,7 +925,11 @@ where
         // if peer is ahead, wait for execution to catch up
         // NOTE: this doesn't hurt since this node shouldn't vote until execution is caught up
         // ensure execution results match if this succeeds.
-        if self.consensus_bus.wait_for_execution(header.latest_execution_block()).await.is_err() {
+        if InboundVoteStage::new(&observation_context, InboundVoteStageKind::Execution)
+            .observe(self.consensus_bus.wait_for_execution(header.latest_execution_block()))
+            .await
+            .is_err()
+        {
             error!(
                 target: "primary",
                 peer_hash = ?header.latest_execution_block(),
@@ -937,7 +948,10 @@ where
         // NOTE: this is a latency optimization and is not required for liveness
         if parents.is_empty() {
             // check if any parents missing
-            let missing_parents = self.check_for_missing_parents(&header).await?;
+            let missing_parents =
+                InboundVoteStage::new(&observation_context, InboundVoteStageKind::MissingParents)
+                    .observe(self.check_for_missing_parents(&header))
+                    .await?;
             if !missing_parents.is_empty() {
                 // return request for missing parents
                 debug!(
@@ -961,7 +975,9 @@ where
                 .collect::<HeaderResult<Vec<Certificate>>>()?;
 
             // try to accept parent certificates
-            self.try_accept_unknown_certs(&header, verified).await?;
+            InboundVoteStage::new(&observation_context, InboundVoteStageKind::AcceptParents)
+                .observe(self.try_accept_unknown_certs(&header, verified))
+                .await?;
         }
 
         // Confirm all parents are accepted. If any are missing, this call will wait until they are
@@ -969,7 +985,10 @@ where
         // that never arrive.
         //
         // NOTE: this check is necessary for correctness.
-        let parents = self.state_sync.notify_read_parent_certificates(&header).await?;
+        let parents =
+            InboundVoteStage::new(&observation_context, InboundVoteStageKind::ReadParents)
+                .observe(self.state_sync.notify_read_parent_certificates(&header))
+                .await?;
 
         // Verify parent certs. Ensure the parents:
         // - are from the previous round
@@ -1032,7 +1051,12 @@ where
         match self.check_header_lead(&header, subsecond_active)? {
             HeaderLead::Tolerated(lead) => {
                 if !lead.is_zero() {
+                    let observation = InboundVoteStage::new(
+                        &observation_context,
+                        InboundVoteStageKind::HeaderLead,
+                    );
                     tokio::time::sleep(lead).await;
+                    observation.finish(InboundVoteStageOutcome::Returned);
                 }
             }
             HeaderLead::Deferred(reason) => return Ok(PrimaryResponse::RecoverableError(reason)),
@@ -1040,7 +1064,9 @@ where
 
         // parents valid - now verify batches
         // NOTE: this blocks until batches become available
-        self.state_sync.sync_header_batches(&header, false, 0).await?;
+        InboundVoteStage::new(&observation_context, InboundVoteStageKind::Batches)
+            .observe(self.state_sync.sync_header_batches(&header, false, 0))
+            .await?;
 
         // Check if node should vote for this header:
         // 1. when there is no existing vote for this public key for the epoch/round
@@ -1122,9 +1148,8 @@ where
                         // self-inflicted equivocation on restart. The poison latch fails this
                         // barrier after any failed commit; fail-stop rather than recast a
                         // non-durable vote (issue #975).
-                        self.consensus_config
-                            .node_storage()
-                            .persist::<Votes>()
+                        InboundVoteStage::new(&observation_context, InboundVoteStageKind::Persistence)
+                            .observe(self.consensus_config.node_storage().persist::<Votes>())
                             .await
                             .inspect_err(|e| {
                                 error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
@@ -1160,9 +1185,8 @@ where
         // node and refuse to return the vote. The error maps to `PrimaryNetworkError::Storage`,
         // which carries no peer penalty: this is our local disk failure, not the peer's fault
         // (issue #975).
-        self.consensus_config
-            .node_storage()
-            .persist::<Votes>()
+        InboundVoteStage::new(&observation_context, InboundVoteStageKind::Persistence)
+            .observe(self.consensus_config.node_storage().persist::<Votes>())
             .await
             .inspect_err(|e| {
                 error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");

@@ -222,10 +222,15 @@ def validate_evidence(plan, evidence, phase):
                 fail("rejected operations require a reason")
             if type(operation.get("cancelled", False)) is not bool or (operation.get("cancelled", False) and (scenario != "committee_progress" or operation["success"])):
                 fail("only unsuccessful committee requests may be classified as cancelled")
-            number(operation["latency_ms"], "operation latency")
+            latency = number(operation["latency_ms"], "operation latency")
             at = number(operation["elapsed_seconds"], "operation timestamp")
             if at > samples[-1]["elapsed_seconds"]:
                 fail("operation lies outside captured interval")
+            # Native committee observations declare cancellation state; failed queries do not.
+            if scenario == "committee_progress" and (operation["success"] or "cancelled" in operation):
+                started_us = round(at * 1_000_000) - round(latency * 1000)
+                if not 0 <= started_us < plan["envelope"]["duration_seconds"] * 1_000_000:
+                    fail("committee request started outside measurement interval")
             if scenario == "gossip_two_hops" and operation["success"]:
                 if integer(operation["hops"], "gossip hops") < 2:
                     fail("direct hub delivery is insufficient gossip evidence")
