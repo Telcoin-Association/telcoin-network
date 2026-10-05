@@ -963,6 +963,7 @@ dependencies = [
  "multistream-select",
  "rand",
  "smallvec",
+ "tokio",
  "tracing",
  "wasm-bindgen-futures",
  "web-time",

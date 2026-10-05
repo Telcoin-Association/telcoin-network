@@ -52,10 +52,30 @@ materializing only the inherited edition and complete workspace lint tables.
 
 An isolated package-only lock resolution adds `quickcheck-ext` 0.1.0, `quickcheck`
 1.1.0, `num-traits` 0.2.19, `autocfg` 1.5.1, `env_filter` 2.0.0, `env_logger`
-0.11.11 and `regex` 1.13.1. Every prior package entry remains unchanged except that
-the `libp2p-kad` entry gains the helper dependency. The root workspace lock and
-runtime dependency graph are unchanged. Static provenance and lock comparisons
+0.11.11 and `regex` 1.13.1. The `libp2p-kad` entry gains the helper dependency, and
+the `libp2p-swarm` entry gains the test-only Tokio dependency described below.
+Every other prior package entry, version and checksum remains unchanged. The root
+workspace lock and runtime dependency graph are unchanged. Static provenance and
+lock comparisons
 do not establish a unit-test or capacity result; remote validation remains required.
+
+The standalone manifest also restores a `libp2p-swarm` development dependency at
+the existing 0.48.0 version with its `tokio` feature. The retained library-test
+constructor calls `Config::with_tokio_executor`, whose
+[pinned upstream definition](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/swarm/src/lib.rs#L1412)
+requires that feature. `Cargo.toml.orig` declares it on the upstream swarm dev
+dependency; the normalized registry manifest omits that declaration. The normal
+swarm dependency remains unchanged. The existing Tokio dev dependency already
+enables the runtime, macro and timer features used by the unit tests. Swarm's
+separate `macros` feature is used only by the retained `client_mode` integration
+test, which the isolated `--lib` command does not select.
+
+The authenticated `libp2p-swarm` 0.48.0 archive checksum is
+`57ccbe1baeaef036ffde4b265871e11c64d29464036bba635378f356bcdca854`;
+its VCS metadata names the same published revision. The inspected `src/lib.rs`
+SHA256 is `ffa84fc0ed5092b8932f2278e5247fe5fafcc576bf6399d674d564ff0e1386f6`.
+Restoring the feature requires only the swarm-to-Tokio edge in the standalone
+lock, with no additional packages or version changes.
 
 ## Runtime behavior
 
