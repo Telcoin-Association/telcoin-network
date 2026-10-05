@@ -226,6 +226,25 @@ pub fn config_local_testnet_with_gc_depth(
     config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
 }
 
+/// Like [`config_local_testnet_with_gc_depth`], but also sets the epoch duration in seconds, so a
+/// restart test can cross epoch boundaries within the test budget.
+pub fn config_local_testnet_with_gc_depth_and_epoch_duration(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    gc_depth: u32,
+    epoch_duration_secs: u32,
+) -> eyre::Result<()> {
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        Some(epoch_duration_secs),
+        &[],
+        Some(gc_depth),
+    )
+}
+
 /// Shared implementation for the `config_local_testnet*` helpers.
 ///
 /// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs` and one
