@@ -74,7 +74,12 @@ pub struct EpochMeta {
     /// The epoch this record is for.
     pub epoch: Epoch,
     /// The active committee for this epoch.
-    /// Store the full committee not just Bls Keys so we can reconstruct ConsensusOutput easier.
+    ///
+    /// The full committee is stored, not just the BLS keys, so `ConsensusOutput` can be
+    /// reconstructed from the pack. Only the BLS key set is authenticated (by `verify_epoch_meta`
+    /// on import, and re-checked by `open_append` on reopen). In a pack imported from a peer every
+    /// other field is the serving peer's copy, may differ from the local committee for the same
+    /// epoch, and must not feed consensus-critical logic.
     pub committee: Committee,
     /// The first consensus block number of this epoch.
     pub start_consensus_number: u64,
@@ -84,6 +89,60 @@ pub struct EpochMeta {
     /// The hash of the last ['ConsensusHeader'] of the previous epoch.
     /// This is the "genesis" consensus ofder  this epoch.
     pub genesis_consensus: ConsensusNumHash,
+}
+
+impl EpochMeta {
+    /// Compares `on_disk` with this chain-derived meta on exactly the fields
+    /// [`verify_epoch_meta`] authenticates, and describes the first one that differs.
+    ///
+    /// The checks run in `verify_epoch_meta`'s order: the epoch, the on-disk committee's own epoch,
+    /// the start consensus number, the genesis execution state, the genesis consensus header, and
+    /// the committee's BLS key set. Nothing else in the committee is compared: a pack imported from
+    /// a peer stores the serving peer's copy of the remaining fields, which import cannot
+    /// authenticate, so comparing them would refuse a correctly imported epoch whose committee
+    /// differs from the local one only where no syncing node can check it.
+    ///
+    /// Returns `None` when every authenticated field matches. Otherwise the message names the
+    /// differing field and carries only that field's expected (chain-derived) and actual (on-disk)
+    /// values; a key-set difference lists the keys missing from and added to the on-disk committee.
+    pub(crate) fn authenticated_mismatch(&self, on_disk: &EpochMeta) -> Option<String> {
+        if self.epoch != on_disk.epoch {
+            return Some(format!("epoch: expected {}, got {}", self.epoch, on_disk.epoch));
+        }
+        if on_disk.committee.epoch() != on_disk.epoch {
+            return Some(format!(
+                "committee epoch: expected {}, got {}",
+                on_disk.epoch,
+                on_disk.committee.epoch()
+            ));
+        }
+        if self.start_consensus_number != on_disk.start_consensus_number {
+            return Some(format!(
+                "start_consensus_number: expected {}, got {}",
+                self.start_consensus_number, on_disk.start_consensus_number
+            ));
+        }
+        if self.genesis_exec_state != on_disk.genesis_exec_state {
+            return Some(format!(
+                "genesis_exec_state: expected {:?}, got {:?}",
+                self.genesis_exec_state, on_disk.genesis_exec_state
+            ));
+        }
+        if self.genesis_consensus != on_disk.genesis_consensus {
+            return Some(format!(
+                "genesis_consensus: expected {:?}, got {:?}",
+                self.genesis_consensus, on_disk.genesis_consensus
+            ));
+        }
+        let expected_keys = self.committee.bls_keys();
+        let on_disk_keys = on_disk.committee.bls_keys();
+        if expected_keys != on_disk_keys {
+            let missing: Vec<_> = expected_keys.difference(&on_disk_keys).collect();
+            let added: Vec<_> = on_disk_keys.difference(&expected_keys).collect();
+            return Some(format!("committee bls keys: missing {missing:?}, added {added:?}"));
+        }
+        None
+    }
 }
 
 /// Descriminant type for records in a Consensus Pack file.
@@ -441,6 +500,11 @@ impl ConsensusPack {
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
+    ///
+    /// The pack carries the committee from the on-disk meta, so after a mid-epoch restart of an
+    /// imported epoch its fields outside the BLS key set are the serving peer's copy, even if an
+    /// earlier [`Self::open_append`] ran with the chain-derived committee. Today they reach only
+    /// telemetry; `verify_epoch_meta` is where any field becomes authenticated.
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
@@ -980,12 +1044,14 @@ impl ConsensusPack {
         !self.tx.is_closed()
     }
 
-    /// Return the committee persisted in this pack's [`EpochMeta`] — the epoch-START
-    /// snapshot this epoch's consensus output is decoded and verified against.
+    /// Return the epoch-START committee this epoch's consensus output is decoded and verified
+    /// against.
     ///
-    /// Every open path keeps this handle-level copy faithful to the on-disk meta:
-    /// `open_append` either writes it as the new meta or errors on a meta mismatch, and
-    /// the reopen/import paths clone it out of the persisted record.
+    /// Which copy depends on the door that opened the pack. After [`Self::open_append`] it is the
+    /// chain-derived committee the caller passed, whether written as the new meta or matched
+    /// against the on-disk one on the authenticated fields only. After
+    /// [`Self::open_append_exists`], [`Self::open_static`] or an import it is the committee in
+    /// the on-disk [`EpochMeta`].
     ///
     /// For a pack imported from a peer only the committee's BLS key set is authenticated (see
     /// [`verify_epoch_meta`]); its other fields (execution addresses, network keys, hosts, stake)
@@ -2768,8 +2834,18 @@ impl Inner {
     /// epoch.  An unreadable first record fails the open (an invalid pack) rather than repairing
     /// it: the meta is committed the instant it is written (msync'd, its size extension fsync'd),
     /// so a valid pack always has a durable meta and a torn/missing meta is not a recoverable
-    /// state. A header-only file (no meta
-    /// yet) is initialized by writing and committing the meta.
+    /// state. A header-only file (no meta yet) is initialized by writing and committing the meta.
+    ///
+    /// "Matching" is decided by [`EpochMeta::authenticated_mismatch`] against the meta derived from
+    /// `previous_epoch` and `committee`, and covers only the six fields [`verify_epoch_meta`]
+    /// authenticates on import: the record's and its committee's epoch, the start consensus number,
+    /// the genesis execution and consensus states, and the committee's BLS key set. The key set is
+    /// compared against `committee`'s, not against `previous_epoch.next_committee` as import does,
+    /// because `new_epoch` does not guarantee the two sets are equal. The rest of the on-disk
+    /// committee is the serving peer's copy when the epoch was imported, so it is not compared. A
+    /// mismatch fails the open before any meta is written or index opened; on success this open
+    /// carries the chain-derived meta, never the one read from disk, though a later
+    /// [`Self::open_append_exists`] or [`Self::open_static`] of the epoch loads the on-disk one.
     fn open_append<P: AsRef<Path>>(
         path: P,
         previous_epoch: &EpochRecord,
@@ -2789,12 +2865,10 @@ impl Inner {
         }
         let mut data: Pack<PackRecord> =
             Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
-        let start_consensus_number =
-            if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
         let epoch_meta = EpochMeta {
             epoch,
             committee,
-            start_consensus_number,
+            start_consensus_number: epoch_start_consensus_number(epoch, previous_epoch),
             genesis_exec_state: previous_epoch.final_state,
             genesis_consensus: previous_epoch.final_consensus,
         };
@@ -2816,10 +2890,13 @@ impl Inner {
             match data.fetch(DATA_HEADER_BYTES as u64) {
                 Ok(record) => {
                     let meta = record.into_epoch()?;
-                    if epoch_meta != meta {
+                    // an imported pack stores the serving peer's committee, authenticated only by
+                    // its bls key set, so a full comparison would refuse a correctly imported
+                    // epoch. the opened pack keeps the chain-derived `epoch_meta` either way.
+                    if let Some(mismatch) = epoch_meta.authenticated_mismatch(&meta) {
                         return Err(PackError::InvalidEpoch(
                             epoch,
-                            format!("open append has unexpected meta data, expected {epoch_meta:?} got {meta:?}"),
+                            format!("open append has unexpected meta data: {mismatch}"),
                         ));
                     }
                 }
@@ -4033,6 +4110,16 @@ fn available_space(path: &Path) -> io::Result<u64> {
 /// check them (it has not executed the previous epoch's final state). Today they reach only
 /// telemetry (`CertifiedBatch::address`; fees go to each batch's own digest-covered
 /// `beneficiary`), and nothing consensus-critical may come to depend on them.
+///
+/// [`Inner::open_append`] re-checks the same six fields, through
+/// [`EpochMeta::authenticated_mismatch`], when it reopens a pack whose meta is already on disk,
+/// but compares the key set against the committee its caller passes (the chain-derived one), not
+/// against `previous_epoch.next_committee`, because `new_epoch` does not guarantee the two sets
+/// are equal. It must never check more: a field this function does not authenticate holds the
+/// serving peer's value in an imported pack, so comparing it would refuse a correctly imported
+/// epoch.
+/// Tightening starts here: authenticate a new field in this function first, then extend
+/// `authenticated_mismatch` to match.
 pub(crate) fn verify_epoch_meta(
     epoch: Epoch,
     previous_epoch: &EpochRecord,
@@ -4054,8 +4141,7 @@ pub(crate) fn verify_epoch_meta(
             ),
         ));
     }
-    let start_consensus_number =
-        if epoch == 0 { 1 } else { previous_epoch.final_consensus.number + 1 };
+    let start_consensus_number = epoch_start_consensus_number(epoch, previous_epoch);
     if start_consensus_number != epoch_meta.start_consensus_number {
         return Err(PackError::InvalidEpoch(
             epoch,
@@ -4091,6 +4177,19 @@ pub(crate) fn verify_epoch_meta(
         ));
     }
     Ok(())
+}
+
+/// The first consensus number of `epoch`, given the record of the epoch before it.
+///
+/// Shared by [`Inner::open_append`], which writes it into a local meta, and [`verify_epoch_meta`],
+/// which checks an imported meta against it, so the two can never disagree on where an epoch
+/// starts.
+fn epoch_start_consensus_number(epoch: Epoch, previous: &EpochRecord) -> u64 {
+    if epoch == 0 {
+        1
+    } else {
+        previous.final_consensus.number + 1
+    }
 }
 
 /// Upper bound on how many `Batch` records `iter_to_output` will buffer before the terminating
@@ -4851,8 +4950,8 @@ pub(crate) mod test {
     use crate::{
         archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
         consensus_pack::{
-            max_batches_per_output, ConsensusPack, EpochMigrate, EpochRepair, Inner, PackRecord,
-            PACK_VERSION,
+            epoch_start_consensus_number, max_batches_per_output, ConsensusPack, EpochMeta,
+            EpochMigrate, EpochRepair, Inner, PackRecord, PACK_VERSION,
         },
         mem_db::MemDatabase,
     };
@@ -9853,6 +9952,312 @@ pub(crate) mod test {
                 "committee epoch {committee_epoch}: a different check rejected this meta: {err}"
             );
         }
+    }
+
+    /// An epoch-1 committee and the epoch-0 record that hands off to it, with non-default genesis
+    /// links so every authenticated [`EpochMeta`] field has a value to drift from.
+    fn open_append_meta_fixture() -> (Committee, EpochRecord) {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlockNumHash, BlsKeypair, BlsPublicKey};
+
+        let mut rng = StdRng::seed_from_u64(0x0BE7A);
+        let keys: Vec<BlsPublicKey> =
+            (0..4).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+        let authorities = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+            .collect::<BTreeMap<_, _>>();
+        let committee = Committee::new_for_test(authorities, 1, BTreeMap::default());
+        let previous = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: keys,
+            final_state: BlockNumHash::new(42, BlockHash::repeat_byte(0x42)),
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        (committee, previous)
+    }
+
+    /// The meta `Inner::open_append` derives for `committee`'s epoch from the `previous` record:
+    /// the first record of a pack this node creates, and what a reopen compares the on-disk meta
+    /// against.
+    fn derived_epoch_meta(committee: &Committee, previous: &EpochRecord) -> EpochMeta {
+        let epoch = committee.epoch();
+        EpochMeta {
+            epoch,
+            committee: committee.clone(),
+            start_consensus_number: epoch_start_consensus_number(epoch, previous),
+            genesis_exec_state: previous.final_state,
+            genesis_consensus: previous.final_consensus,
+        }
+    }
+
+    /// `committee` with fields outside its BLS key set changed: every execution address and, where
+    /// the multi-worker fork is active for its epoch, the worker count. A pack imported from a peer
+    /// can carry such a committee, because import authenticates only the key set. Before the fork
+    /// (adiri builds) the committee layout encodes a single worker, so only the addresses drift.
+    fn with_unauthenticated_drift(committee: &Committee) -> Committee {
+        use tn_types::{forks::multi_workers_fork_active, Address, Authority};
+
+        let authorities = committee
+            .authorities()
+            .into_iter()
+            .map(|authority| {
+                let key = *authority.protocol_key();
+                (key, Authority::new_for_test(key, Address::repeat_byte(0xEE)))
+            })
+            .collect();
+        // the pre-fork layout refuses to encode any worker count but one
+        let added = if multi_workers_fork_active(committee.epoch()) { 2 } else { 0 };
+        let workers = NonZeroUsize::new(committee.number_of_workers() + added)
+            .expect("a positive worker count");
+        let drifted =
+            Committee::new_for_test(authorities, committee.epoch(), committee.bootstrap_servers())
+                .with_num_workers(workers);
+        assert_eq!(drifted.bls_keys(), committee.bls_keys(), "drift must keep the BLS key set");
+        assert_ne!(&drifted, committee, "drift must change the committee");
+        drifted
+    }
+
+    /// Writes `meta` as the only record of a fresh data file for `epoch` under `dir`, standing in
+    /// for a pack whose meta this node did not write itself (an import), and returns the data
+    /// file's path. `epoch` places and stamps the file, so `meta` may claim a different one.
+    fn write_epoch_meta_by_hand(dir: &Path, epoch: Epoch, meta: &EpochMeta) -> std::path::PathBuf {
+        let epoch_dir = dir.join(format!("epoch-{epoch}"));
+        std::fs::create_dir_all(&epoch_dir).expect("create epoch dir");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        let mut pack: Pack<PackRecord> =
+            Pack::open(&data_path, epoch as u64, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("open data file");
+        pack.append(&PackRecord::EpochMeta(meta.clone())).expect("append meta");
+        pack.commit().expect("commit meta");
+        data_path
+    }
+
+    /// Reads the epoch meta at the head of the data file at `data_path`.
+    fn read_epoch_meta(data_path: &Path, epoch: Epoch) -> EpochMeta {
+        let mut pack: Pack<PackRecord> =
+            Pack::open(data_path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)
+                .expect("open data file read-only");
+        pack.fetch(DATA_HEADER_BYTES as u64)
+            .expect("fetch the first record")
+            .into_epoch()
+            .expect("the first record is the epoch meta")
+    }
+
+    /// `open_append` reopens an epoch whose on-disk meta matches the chain-derived meta on every
+    /// field import authenticates but carries a committee that differs outside its key set, as a
+    /// pack imported from a peer can. The pack carries the chain-derived committee and the on-disk
+    /// meta stays as it was.
+    #[tokio::test]
+    async fn test_open_append_accepts_unauthenticated_committee_drift() {
+        use crate::consensus_pack::verify_epoch_meta;
+
+        let temp_dir = TempDir::with_prefix("test_cp_meta_unauth_drift").expect("temp dir");
+        let (committee, previous) = open_append_meta_fixture();
+        let on_disk = EpochMeta {
+            committee: with_unauthenticated_drift(&committee),
+            ..derived_epoch_meta(&committee, &previous)
+        };
+        verify_epoch_meta(1, &previous, &on_disk).expect("import must accept the drifted meta");
+        let data_path = write_epoch_meta_by_hand(temp_dir.path(), 1, &on_disk);
+
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous, committee.clone())
+            .expect("a committee drifted outside its BLS key set must not refuse the reopen");
+        assert_eq!(pack.committee(), &committee, "the pack must carry the chain-derived committee");
+        pack.close().await;
+
+        assert_eq!(
+            read_epoch_meta(&data_path, 1),
+            on_disk,
+            "the reopen must not rewrite the on-disk meta"
+        );
+    }
+
+    /// `Inner::open_append` over an on-disk meta drifted outside the authenticated fields keeps
+    /// the meta it derives from the chain, not the one it read. The [`ConsensusPack`] wrapper
+    /// stores the caller's committee either way, so only the inner meta shows which one was kept.
+    #[test]
+    fn test_inner_open_append_keeps_chain_derived_meta() {
+        let temp_dir = TempDir::with_prefix("test_cp_meta_inner_keeps").expect("temp dir");
+        let (committee, previous) = open_append_meta_fixture();
+        let derived = derived_epoch_meta(&committee, &previous);
+        let on_disk =
+            EpochMeta { committee: with_unauthenticated_drift(&committee), ..derived.clone() };
+        write_epoch_meta_by_hand(temp_dir.path(), 1, &on_disk);
+
+        let inner = Inner::open_append(temp_dir.path(), &previous, committee, PACK_VERSION)
+            .expect("a committee drifted outside its BLS key set must not refuse the reopen");
+        assert_eq!(inner.epoch_meta, derived, "the open must keep the chain-derived meta");
+        assert_ne!(inner.epoch_meta, on_disk, "the on-disk meta must not replace it");
+    }
+
+    /// `open_append` refuses to reopen an epoch whose on-disk meta differs from the chain-derived
+    /// meta on any field import authenticates. The error names the differing field, and the
+    /// refusal comes before any write: the epoch directory is left byte for byte as it was.
+    #[tokio::test]
+    async fn test_open_append_rejects_authenticated_meta_drift() {
+        use std::collections::BTreeMap;
+
+        use tn_types::BlockNumHash;
+
+        use crate::consensus_pack::PackError;
+
+        let (committee, previous) = open_append_meta_fixture();
+        let local = derived_epoch_meta(&committee, &previous);
+        let one_dropped = Committee::new_for_test(
+            committee.authorities().into_iter().skip(1).map(|a| (*a.protocol_key(), a)).collect(),
+            committee.epoch(),
+            BTreeMap::default(),
+        );
+        let drifts = [
+            ("epoch", EpochMeta { epoch: 2, ..local.clone() }),
+            (
+                "committee epoch",
+                EpochMeta { committee: committee.advance_epoch_for_test(2), ..local.clone() },
+            ),
+            ("committee bls keys", EpochMeta { committee: one_dropped, ..local.clone() }),
+            (
+                "genesis_consensus",
+                EpochMeta {
+                    genesis_consensus: ConsensusNumHash::new(
+                        local.genesis_consensus.number,
+                        ConsensusHeader::default().digest(),
+                    ),
+                    ..local.clone()
+                },
+            ),
+            (
+                "start_consensus_number",
+                EpochMeta {
+                    start_consensus_number: local.start_consensus_number + 1,
+                    ..local.clone()
+                },
+            ),
+            (
+                "genesis_exec_state",
+                EpochMeta {
+                    genesis_exec_state: BlockNumHash::new(
+                        local.genesis_exec_state.number,
+                        BlockHash::repeat_byte(0x24),
+                    ),
+                    ..local.clone()
+                },
+            ),
+        ];
+        // every entry of the epoch directory, with each file's bytes
+        let snapshot = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .expect("read epoch dir")
+                .map(|entry| {
+                    let path = entry.expect("epoch dir entry").path();
+                    let bytes = path.is_file().then(|| std::fs::read(&path).expect("read file"));
+                    (path, bytes)
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        for (field, on_disk) in drifts {
+            assert_ne!(on_disk, local, "{field}: the case must drift");
+            let temp_dir = TempDir::with_prefix("test_cp_meta_auth_drift").expect("temp dir");
+            let data_path = write_epoch_meta_by_hand(temp_dir.path(), 1, &on_disk);
+            let epoch_dir = data_path.parent().expect("data file is in its epoch dir");
+            let before = snapshot(epoch_dir);
+
+            let Err(err) =
+                ConsensusPack::open_append(temp_dir.path(), previous.clone(), committee.clone())
+            else {
+                panic!("{field}: a drifted authenticated field must refuse the reopen")
+            };
+            let PackError::InvalidEpoch(1, msg) = &err else {
+                panic!("{field}: expected InvalidEpoch(1, _), got {err:?}")
+            };
+            assert!(
+                msg.starts_with(&format!("open append has unexpected meta data: {field}:")),
+                "{field}: the error must name the field: {msg}"
+            );
+            assert_eq!(
+                snapshot(epoch_dir),
+                before,
+                "{field}: a refused reopen must leave the epoch directory unchanged"
+            );
+        }
+    }
+
+    /// Over the ejection shapes of `test_verify_epoch_meta_across_ejection_shapes`, `open_append`'s
+    /// reopen check accepts an imported meta exactly when `verify_epoch_meta` does, for a node
+    /// whose chain-derived committee holds the key set import authenticates against
+    /// (`previous.next_committee`) but different addresses (and, past the multi-worker fork,
+    /// worker count). Two shapes are accepted and two refused, so it fails if
+    /// `authenticated_mismatch` compares a field import does not authenticate or stops comparing
+    /// the key set.
+    #[test]
+    fn test_open_append_check_is_implied_by_verify_epoch_meta() {
+        use std::collections::BTreeMap;
+
+        use rand::{rngs::StdRng, SeedableRng as _};
+        use tn_types::{Address, Authority, BlsKeypair, BlsPublicKey};
+
+        use crate::consensus_pack::verify_epoch_meta;
+
+        let mut rng = StdRng::seed_from_u64(0xE2EC7);
+        let keys: Vec<BlsPublicKey> =
+            (0..5).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+        let build_committee = |members: &[BlsPublicKey], epoch: Epoch| {
+            let authorities = members
+                .iter()
+                .enumerate()
+                .map(|(i, k)| (*k, Authority::new_for_test(*k, Address::repeat_byte(i as u8 + 1))))
+                .collect::<BTreeMap<_, _>>();
+            Committee::new_for_test(authorities, epoch, BTreeMap::default())
+        };
+
+        // swap-and-pop ejection of keys[2]: rec0 predates it (next committee stored in reverse
+        // order), rec1 is the ejection epoch's record
+        let survivors = vec![keys[0], keys[1], keys[4], keys[3]];
+        let mut next0 = keys.clone();
+        next0.reverse();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: keys.clone(),
+            next_committee: next0,
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let rec1 = EpochRecord {
+            epoch: 1,
+            committee: survivors.clone(),
+            next_committee: survivors.clone(),
+            final_consensus: ConsensusNumHash::new(20, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let shapes = [
+            (&rec0, build_committee(&keys, 1)),
+            (&rec0, build_committee(&survivors, 1)),
+            (&rec1, build_committee(&survivors, 2)),
+            (&rec1, build_committee(&keys, 2)),
+        ];
+
+        let mut accepted = 0;
+        for (previous, imported_committee) in shapes {
+            let imported = derived_epoch_meta(&imported_committee, previous);
+            let epoch = imported.epoch;
+            let local_committee =
+                with_unauthenticated_drift(&build_committee(&previous.next_committee, epoch));
+            let local = derived_epoch_meta(&local_committee, previous);
+            let import_accepts = verify_epoch_meta(epoch, previous, &imported).is_ok();
+            assert_eq!(
+                local.authenticated_mismatch(&imported).is_none(),
+                import_accepts,
+                "epoch {epoch}: open_append must reopen exactly the metas import accepts"
+            );
+            accepted += usize::from(import_accepts);
+        }
+        assert_eq!(accepted, 2, "two of the ejection shapes are metas import accepts");
     }
 
     /// PEER PATH: `stream_import` rejects a record stream whose [`EpochMeta`] carries a committee
