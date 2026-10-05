@@ -39,7 +39,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     num::NonZeroUsize,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tn_config::{
     KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,

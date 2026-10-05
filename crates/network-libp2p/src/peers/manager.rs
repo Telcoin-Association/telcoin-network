@@ -616,7 +616,7 @@ impl PeerManager {
     }
 
     /// Returns a boolean if the peer is connected.
-    pub(super) fn is_connected(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.peers.get_peer(peer_id).is_some_and(|peer| {
             matches!(peer.connection_status(), ConnectionStatus::Connected { .. })
         })

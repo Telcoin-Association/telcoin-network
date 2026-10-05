@@ -126,6 +126,10 @@ version = "0.47.0"
 [dev-dependencies.libp2p-yamux]
 version = "0.48.0"
 
+[dev-dependencies.quickcheck]
+package = "quickcheck-ext"
+path = "test-support/quickcheck-ext"
+
 [dev-dependencies.tokio]
 version = "1.53"
 features = [

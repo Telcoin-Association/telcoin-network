@@ -16,16 +16,46 @@ the original connection-limits step, conditions and aggregate gates remain requi
 - Original `src/behaviour.rs` SHA256:
   `bc29c4d2714b3c0c6a2079bcbb1fb183d8418ef76d88541662d8654dc3765d16`.
 - All 29 published members were copied byte for byte before applying the delta.
-  Source copyright notices, licensing metadata, integration tests and every runtime
-   and dev dependency are retained. The published `Cargo.lock` is retained byte for
-   byte and controls the excluded crate's isolated unit tests.
+  Source copyright notices, licensing metadata, integration tests and every published
+  runtime and dev dependency are retained. The standalone `Cargo.lock` starts from
+  the published lock and adds the restored upstream test helper described below,
+  preserving every existing dependency version and checksum.
 
 The root lockfile selects the path package without changing the Kad version or
 runtime dependency versions. Root workspace integration tests use that root lock.
 The additional unit-test command selects the excluded crate with `--manifest-path`,
-using its authenticated upstream lock and unchanged dev dependency graph. Mutation
+using its standalone lock with the restored test dependency. Mutation
 controls for the carried crate use the same standalone manifest selection. Neither
 lane drops dev dependencies or upstream tests, and both require `--locked`.
+
+### Upstream test support
+
+The registry-normalized manifest omits the `quickcheck` dependency present in
+`Cargo.toml.orig`. At the published VCS revision, the
+[upstream workspace manifest](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/Cargo.toml)
+aliases it to the unpublished `quickcheck-ext` package. The library tests use that
+helper's `GenRange` and `SliceRandom` traits as well as the re-exported QuickCheck
+API. Restoring a registry `quickcheck` dependency alone would omit these extensions.
+
+`test-support/quickcheck-ext` carries that upstream helper solely through a dev
+dependency. Its `src/lib.rs` is byte-identical to
+[the pinned upstream source](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/misc/quickcheck-ext/src/lib.rs).
+Its manifest preserves the original package metadata and dependency requirements,
+materializing only the inherited edition and complete workspace lint tables.
+
+- Pinned workspace `Cargo.toml` SHA256:
+  `86212aada3c65719d93a7f589ef69890a286f9e2d9e5a00909b503e8863c52be`.
+- Original helper `Cargo.toml` SHA256:
+  `35c3b2f9dd9d32ef9261865184f5aaecb90d0571fa68c5782d33c9aa52d08080`.
+- Carried helper `src/lib.rs` SHA256:
+  `4a6dd30f7afcc84e6e1c0dad0738c7bda93ac68561d80b8c00e67aaf05f42d75`.
+
+An isolated package-only lock resolution adds `quickcheck-ext` 0.1.0, `quickcheck`
+1.1.0, `num-traits` 0.2.19, `autocfg` 1.5.1, `env_filter` 2.0.0, `env_logger`
+0.11.11 and `regex` 1.13.1. Every prior package entry remains unchanged except that
+the `libp2p-kad` entry gains the helper dependency. The root workspace lock and
+runtime dependency graph are unchanged. Static provenance and lock comparisons
+do not establish a unit-test or capacity result; remote validation remains required.
 
 ## Runtime behavior
 
