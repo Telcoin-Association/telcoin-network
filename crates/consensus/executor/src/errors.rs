@@ -148,6 +148,20 @@ pub enum SubscriberError {
     #[error("Consensus chain read failure: {0}")]
     ConsensusChainRead(String),
 
+    /// A sync output skipped past the next consensus number.
+    ///
+    /// State sync only sends contiguous runs and the latest saved number only moves when the
+    /// subscriber saves, so a number past `latest + 1` means the outputs in between were lost on
+    /// the way. Saving it would leave a hole in the consensus chain, so the subscriber refuses it
+    /// and fails, and state sync resumes from the last saved output when the epoch restarts.
+    #[error("sync output gap: expected consensus number {expected} but received {received}")]
+    SyncOutputGap {
+        /// The only number the chain can take next (latest saved + 1).
+        expected: u64,
+        /// The number that arrived.
+        received: u64,
+    },
+
     /// An error from spawning consensus.
     #[error("Consensus error (from spawn): {0}")]
     Consensus(#[from] ConsensusError),
