@@ -1376,11 +1376,16 @@ impl ConsensusChain {
     }
 
     /// Return true if we have a complete pack file for epoch_record.
+    ///
+    /// An empty or short pack for the record's epoch, or a record that ends before the pack's
+    /// first output, returns `false` with a debug log rather than an error, like a missing pack
+    /// does.
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
-        match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
-            Ok(result) => result.is_some(),
+        let lookup = self.consensus_header_by_number(epoch_record.final_consensus.number).await;
+        match Self::epoch_completeness(lookup) {
+            Ok(true) => true,
             // an incomplete pack ends before the epoch's final output, so this is the normal answer
-            Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh)) => {
+            Ok(false) => {
                 debug!(
                     target: "consensus-chain",
                     epoch=?epoch_record.epoch,
@@ -1392,6 +1397,25 @@ impl ConsensusChain {
                 error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
                 false
             }
+        }
+    }
+
+    /// Classify the final-header lookup behind [`Self::is_epoch_complete`].
+    ///
+    /// A final number outside the pack's range means the epoch is not complete here, the same
+    /// answer as `Ok(None)`: [`PackError::ConsensusNumberTooHigh`] when the pack is empty or
+    /// shorter than the record, [`PackError::ConsensusNumberTooLow`] when the record ends before
+    /// the pack's first output (the dummy epoch-0 record). Any other error is a real read failure
+    /// and is returned unchanged.
+    fn epoch_completeness(
+        lookup: Result<Option<ConsensusHeader>, ConsensusChainError>,
+    ) -> Result<bool, ConsensusChainError> {
+        match lookup {
+            Ok(header) => Ok(header.is_some()),
+            Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooLow | PackError::ConsensusNumberTooHigh,
+            )) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -2842,6 +2866,148 @@ mod test {
         let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
         assert_eq!(latest.number, k + 1);
         reopened.close().await;
+    }
+
+    /// An out-of-range final number means the pack is empty or short for that record, so the
+    /// completeness check answers "not complete", the same as a missing header; every other error
+    /// is still returned as a read failure.
+    #[test]
+    fn test_epoch_completeness_treats_range_misses_as_incomplete() {
+        use crate::consensus_pack::PackError;
+
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Ok(Some(ConsensusHeader::default()))),
+            Ok(true)
+        ));
+        assert!(matches!(ConsensusChain::epoch_completeness(Ok(None)), Ok(false)));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooHigh
+            ))),
+            Ok(false)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooLow
+            ))),
+            Ok(false)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ReadOnly
+            ))),
+            Err(ConsensusChainError::PackError(PackError::ReadOnly))
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::CrcError)),
+            Err(ConsensusChainError::CrcError)
+        ));
+    }
+
+    /// A fresh node pre-opens an empty epoch-0 pack whose range starts at 1, so looking up an
+    /// epoch-0 record's final header misses the range: `TooHigh` for a real record and `TooLow`
+    /// for the dummy record (final number 0). Both mean "not held here", not a read failure.
+    #[tokio::test]
+    async fn test_is_epoch_complete_fresh_epoch0_pack() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_epoch_complete_fresh").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // a real epoch-0 record ends past the empty pack's range
+        let lookup = consensus_chain.consensus_header_by_number(5).await;
+        assert!(
+            matches!(
+                lookup,
+                Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh))
+            ),
+            "expected ConsensusNumberTooHigh, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        let record = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        assert!(!consensus_chain.is_epoch_complete(&record).await);
+
+        // the dummy epoch-0 record (final number 0) sits below the range
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let lookup = consensus_chain.consensus_header_by_number(dummy.final_consensus.number).await;
+        assert!(
+            matches!(lookup, Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooLow))),
+            "expected ConsensusNumberTooLow, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        assert!(!consensus_chain.is_epoch_complete(&dummy).await);
+    }
+
+    /// The completeness check follows whichever pack holds the record's epoch: the current pack
+    /// while the epoch is live and the sealed pack after the boundary. A final number past the
+    /// pack's last output reads as incomplete in both, not as a read failure.
+    #[tokio::test]
+    async fn test_is_epoch_complete_tracks_saved_and_sealed_packs() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_epoch_complete_sealed").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        let mut short = record0.clone();
+        short.final_consensus = ConsensusNumHash::new(5, ConsensusHeaderDigest::default());
+
+        // live epoch: the current pack holds outputs 1..=3
+        assert!(consensus_chain.is_epoch_complete(&record0).await);
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(
+                consensus_chain.consensus_header_by_number(record0.final_consensus.number).await
+            ),
+            Ok(true)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(consensus_chain.consensus_header_by_number(5).await),
+            Ok(false)
+        ));
+        assert!(!consensus_chain.is_epoch_complete(&short).await);
+
+        // seal epoch 0 without saving record0, so number 5 still maps to epoch 0 and the lookup
+        // reads the sealed pack
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+
+        assert!(consensus_chain.is_epoch_complete(&record0).await);
+        assert_eq!(
+            consensus_chain.epochs().number_to_epoch(5),
+            0,
+            "number 5 must still map to the sealed epoch-0 pack"
+        );
+        let lookup = consensus_chain.consensus_header_by_number(5).await;
+        assert!(
+            matches!(
+                lookup,
+                Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh))
+            ),
+            "expected ConsensusNumberTooHigh from the sealed pack, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        assert!(!consensus_chain.is_epoch_complete(&short).await);
     }
 
     #[tokio::test]
