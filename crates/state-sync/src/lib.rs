@@ -403,7 +403,7 @@ async fn spawn_stream_consensus_headers<DB: Database>(
 /// applied (sent for execution) or skipped (already saved), or the first header of the next epoch,
 /// which ends the walk. After an error the caller resumes from it. Re-reading the last consensus
 /// block (the executed tip) instead would re-send outputs still queued in `sync_output` but not yet
-/// saved, which the subscriber rejects as `NonMonotonicConsensusNumber`.
+/// saved. The subscriber skips them as stale, but each one uses a queue slot.
 ///
 /// A fresh node (`from` is the default header at number 0) anchors block 1 on the
 /// `parent_hash` block 1 carries rather than on `from.digest()`. The default header's digest is
