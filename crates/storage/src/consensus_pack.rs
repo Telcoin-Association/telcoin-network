@@ -10847,6 +10847,153 @@ pub(crate) mod test {
         );
     }
 
+    /// PEER PATH: `stream_import` rejects an [`EpochMeta`] whose committee has a single authority
+    /// as the sender's undecodable bytes, without panicking and before appending anything.
+    ///
+    /// No [`Committee`] constructor builds a one-member committee, so the hostile record is written
+    /// through test-local shadow types that mirror [`PackRecord::EpochMeta`]'s bcs layout. Two
+    /// checks pin the shadow before it is trusted: its encoding equals the real record's byte for
+    /// byte, and a well-formed shadow imports far enough to be rejected by `verify_epoch_meta`.
+    /// Only the committee's own decode validation can then reject the hostile one.
+    #[tokio::test]
+    async fn test_stream_import_rejects_single_authority_committee_meta() {
+        use std::collections::BTreeMap;
+
+        use serde::{Deserialize, Serialize};
+        use tn_types::{Authority, BlockNumHash, BlsPublicKey, BootstrapServer};
+
+        use crate::consensus_pack::{EpochMeta, PackError};
+
+        /// Post-fork wire layout of a [`Committee`]: bcs writes no field names, so only the field
+        /// types and their order decide the bytes.
+        #[derive(Clone, Debug, Serialize, Deserialize)]
+        struct WireCommittee {
+            authorities: BTreeMap<BlsPublicKey, Authority>,
+            epoch: Epoch,
+            bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+            num_workers: NonZeroUsize,
+        }
+
+        /// Wire layout of an [`EpochMeta`], in its field order.
+        #[derive(Debug, Serialize, Deserialize)]
+        struct WireEpochMeta {
+            epoch: Epoch,
+            committee: WireCommittee,
+            start_consensus_number: u64,
+            genesis_exec_state: BlockNumHash,
+            genesis_consensus: ConsensusNumHash,
+        }
+
+        /// Wire layout of [`PackRecord`] up to its first variant: bcs tags a variant by its index,
+        /// so `EpochMeta` must stay first here as it is there.
+        #[derive(Debug, Serialize, Deserialize)]
+        enum WirePackRecord {
+            EpochMeta(WireEpochMeta),
+        }
+
+        /// Write `record` as the only record of an epoch-0 pack, stream-import it into `target`
+        /// and return the import's error.
+        async fn import_meta(
+            target: &Path,
+            record: &WirePackRecord,
+            previous_epoch: &EpochRecord,
+        ) -> PackError {
+            let source_dir = TempDir::with_prefix("test_cp_meta_single_src").expect("temp dir");
+            let source = source_dir.path().join("peer_stream");
+            {
+                let mut pack: Pack<WirePackRecord> =
+                    Pack::open(&source, 0, false, PackCompression::ZStd, PACK_VERSION)
+                        .expect("open peer stream");
+                pack.append(record).expect("append meta");
+                pack.commit().expect("commit peer stream");
+            }
+            let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+            ConsensusPack::stream_import(
+                target,
+                stream,
+                0,
+                previous_epoch,
+                1,
+                Duration::from_secs(5),
+            )
+            .await
+            .expect_err("the meta must not import")
+        }
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // u32::MAX is past every multi-workers fork point, so the real committee encodes in the
+        // post-fork layout the shadow mirrors under any feature set or fork override.
+        let real = committee.advance_epoch_for_test(u32::MAX);
+        let wire_committee = WireCommittee {
+            authorities: real.authorities().into_iter().map(|a| (*a.protocol_key(), a)).collect(),
+            epoch: real.epoch(),
+            bootstrap_servers: real.bootstrap_servers(),
+            num_workers: NonZeroUsize::new(real.number_of_workers()).expect("at least one worker"),
+        };
+        let wire_meta = |committee: WireCommittee| {
+            WirePackRecord::EpochMeta(WireEpochMeta {
+                epoch: 0,
+                committee,
+                start_consensus_number: 1,
+                genesis_exec_state: previous_epoch.final_state,
+                genesis_consensus: previous_epoch.final_consensus,
+            })
+        };
+
+        // (1) layout: the shadow encodes byte for byte as the real record.
+        let real_meta = PackRecord::EpochMeta(EpochMeta {
+            epoch: 0,
+            committee: real,
+            start_consensus_number: 1,
+            genesis_exec_state: previous_epoch.final_state,
+            genesis_consensus: previous_epoch.final_consensus,
+        });
+        assert_eq!(
+            tn_types::encode(&wire_meta(wire_committee.clone())),
+            tn_types::encode(&real_meta),
+            "the shadow types no longer match the PackRecord::EpochMeta wire layout"
+        );
+
+        // (2) control: the real decoder reads a well-formed shadow and gets as far as
+        // `verify_epoch_meta`, which rejects only the committee's epoch.
+        let target = TempDir::with_prefix("test_cp_meta_single_ctl").expect("temp dir");
+        let err =
+            import_meta(target.path(), &wire_meta(wire_committee.clone()), &previous_epoch).await;
+        assert!(matches!(err, PackError::InvalidEpoch(0, _)), "got {err:?}");
+        assert!(
+            err.to_string().contains(&format!("committee is for epoch {}", u32::MAX)),
+            "a different check rejected the control import: {err}"
+        );
+
+        // (3) hostile: the same meta with only the first authority. the sender's bytes do not
+        // decode, so the import fails as an undecodable record (the requester charges the peer)
+        // instead of panicking in the import task.
+        let single = WireCommittee {
+            authorities: wire_committee.authorities.into_iter().take(1).collect(),
+            ..wire_committee
+        };
+        let target = TempDir::with_prefix("test_cp_meta_single_out").expect("temp dir");
+        let err = import_meta(target.path(), &wire_meta(single), &previous_epoch).await;
+        let PackError::UndecodableRecord(msg) = &err else {
+            panic!("a single-authority meta must be an undecodable record, got {err:?}")
+        };
+        assert!(
+            msg.contains("at least 2 authorities"),
+            "a different check rejected the hostile meta: {msg}"
+        );
+
+        // rejected before the append: nothing follows the data file's header, if the import got as
+        // far as creating the file, so no reader can pick the hostile committee up.
+        let data_file = target.path().join("epoch-0").join(Inner::DATA_NAME);
+        let appended = data_file.exists()
+            && Pack::<PackRecord>::open(&data_file, 0, true, PackCompression::ZStd, PACK_VERSION)
+                .expect("reopen the import's data file")
+                .record_present_at(DATA_HEADER_BYTES as u64);
+        assert!(!appended, "the rejected meta was appended anyway");
+    }
+
     /// The import stops reading at the requested final: outputs a peer streams past it are never
     /// read, so they can neither be imported nor fail an otherwise-valid download.
     #[tokio::test]
@@ -11115,10 +11262,10 @@ pub(crate) mod test {
 
     /// The frozen pack's committee: two authorities, each with a single-worker bootstrap server.
     ///
-    /// Two is the minimum — `CommitteeInner::load` asserts a committee larger than one — and the
-    /// point of the fixture is the wire layout, not the quorum math, so it stays at the minimum to
-    /// keep the frozen vector small. One worker per server is the only shape the legacy layout can
-    /// express at all.
+    /// Two is the minimum — `Committee::new` (builder) and `CommitteeInner::validate` (decode)
+    /// both refuse a committee of one — and the point of the fixture is the wire layout, not the
+    /// quorum math, so it stays at the minimum to keep the frozen vector small. One worker per
+    /// server is the only shape the legacy layout can express at all.
     #[cfg(feature = "adiri")]
     fn legacy_pack_committee() -> Committee {
         use std::collections::BTreeMap;
