@@ -43,7 +43,7 @@ use tracing::{error, info, warn};
 /// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
 /// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
 /// 2.5 s of subscriber work at 7-13 ms per saved output.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+pub const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity for the `exex_certificates` broadcast.
 ///
 /// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
