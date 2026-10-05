@@ -750,13 +750,18 @@ mod tests {
 
         let handle = tokio::spawn(spawn_stream_consensus_headers(config, consensus_bus, chain));
 
-        // the mismatch happens at once; the task must now be parked in its retry backoff
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // the cache entry is consumed just before the digest check, so its removal marks the point
+        // where the task has hit the error; wait for that instead of a fixed sleep
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while node_storage.get::<ConsensusCache>(&2)?.is_some() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            eyre::Ok(())
+        })
+        .await
+        .expect("the mismatched cache entry is dropped so the retry refetches it")?;
+        // the task has run past the error and must now be parked in its retry backoff
         assert!(!handle.is_finished(), "a catch-up error must not end the stream task");
-        assert!(
-            node_storage.get::<ConsensusCache>(&2)?.is_none(),
-            "the mismatched cache entry is dropped so the retry refetches it"
-        );
 
         shutdown.notify();
         tokio::time::timeout(Duration::from_secs(1), handle)
