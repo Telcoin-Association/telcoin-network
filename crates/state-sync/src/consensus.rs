@@ -674,8 +674,7 @@ async fn manage_new_consensus<DB: TNDatabase>(
     let consensus_chain_clone = consensus_chain.clone();
     // map the number to an epoch the same way `request_consensus_output` does
     let walk_epoch = consensus_chain.epochs().number_to_epoch(number);
-    let decodable = consensus_chain.staging_epoch() == Some(walk_epoch)
-        || consensus_chain.contains_decode_epoch(walk_epoch).await;
+    let decodable = consensus_chain.contains_decode_epoch(walk_epoch).await;
     // the last three conditions are bails inside `try_partial_pack_catch_up`, checked here so an
     // attempt that would bail does not start the backoff
     let want_partial = (partial_gate.is_first() || !decodable)
