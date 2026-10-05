@@ -4480,6 +4480,66 @@ mod test {
             .expect("exact full import of data we already hold must be Ok");
     }
 
+    /// A process killed during an import leaves `import-{epoch}/{pid}.inproc` behind. When the
+    /// next process gets the same pid (pid 1 in a container), that sentinel would make every later
+    /// import of the epoch a silent no-op. Opening the chain must sweep stale import dirs, so the
+    /// epoch is no longer in flight and an import of it installs the pack.
+    #[tokio::test]
+    async fn test_new_clears_stale_import_dirs() {
+        let source_dir = TempDir::with_prefix("test_stale_import_src").expect("temp dir");
+        let target_dir = TempDir::with_prefix("test_stale_import_dst").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        // a complete epoch 0 pack to import from
+        let source = ConsensusChain::new(source_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            source.save_consensus_output(output).await.unwrap();
+        }
+        source.persist_current().await.expect("persist");
+        let epoch_record = EpochRecord {
+            final_consensus: ConsensusNumHash::new(5, parent),
+            ..previous_epoch.clone()
+        };
+        source.epochs().save_record(epoch_record.clone()).await.expect("save record");
+
+        // the sentinel a killed import of epoch 0 leaves when this process had its pid
+        let import_dir = target_dir.path().join("import-0");
+        std::fs::create_dir_all(&import_dir).expect("create import dir");
+        std::fs::File::create(import_dir.join(format!("{}.inproc", std::process::id())))
+            .expect("create sentinel");
+
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        assert!(!import_dir.exists(), "the open must remove the stale import dir");
+        assert!(
+            !target.already_streaming_epoch(0),
+            "a stale import sentinel must not survive open"
+        );
+        target.epochs().save_record(epoch_record.clone()).await.expect("save record");
+        assert!(!target.is_epoch_complete(&epoch_record).await);
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = source.get_epoch_stream(0).await.expect("epoch stream");
+        target
+            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import");
+        assert!(target.is_epoch_complete(&epoch_record).await, "the import must install the pack");
+        source.close().await;
+        target.close().await;
+    }
+
     #[tokio::test]
     async fn test_consensus_output_bytes_by_number() {
         use crate::{archive::pack::PackCompression, consensus_pack::bytes_to_output};
