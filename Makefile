@@ -55,6 +55,10 @@ help:
 	@echo "    :::> Build the adiri e2e node binary and run the governance-Safe fork across a live boundary." ;
 	@echo "    :::> The only lane where TN_GOVERNANCE_SAFE_FORK_EPOCH is not inert." ;
 	@echo ;
+	@echo "make build-e2e-bin-prev" ;
+	@echo "    :::> Build the e2e node binary at TN_PREV_REF (default ba7654d8a) for the mixed-binary (rolling upgrade) e2e tests." ;
+	@echo "    :::> Export the path it prints as TN_BIN_PATH_PREV; the tests that need it skip without it." ;
+	@echo ;
 	@echo "make coverage" ;
 	@echo "    :::> Run tests with coverage using cargo-llvm-cov + nextest." ;
 	@echo "    :::> Requires: cargo install cargo-llvm-cov" ;
@@ -171,6 +175,48 @@ build-e2e-bin-adiri:
 # Location of the binary built by build-e2e-bin-adiri. Same expression pairing as E2E_BIN above,
 # so the producing and the consuming path cannot diverge.
 E2E_BIN_ADIRI := $(E2E_TARGET_ROOT_ADIRI)/e2e/telcoin-network
+
+# The commit the mixed-binary (rolling upgrade) e2e tests run as the PREVIOUS node version: the old
+# half of an in-place upgrade, or a validator still on the old binary when the rest of the network
+# has moved on. Defaults to ba7654d8a, the main commit #1453 was merged onto, so the old binary is
+# the last one built without the sub-second timestamp change. Any commit-ish works; the last
+# release is
+#   make build-e2e-bin-prev TN_PREV_REF=v0.15.0-adiri
+# which also lacks the commits merged between that tag and ba7654d8a, so the two binaries then
+# differ by more than one change.
+TN_PREV_REF ?= ba7654d8a
+
+# Source checkout and target root for the previous binary. Both are NESTED in E2E_TARGET_ROOT, like
+# E2E_TARGET_ROOT_ADIRI, so a developer's CARGO_TARGET_DIR is honored the same way and the
+# `target/` ignore rule covers them. The sources are a detached git worktree rather than a fresh
+# clone or a checkout of this tree: it shares this clone's objects (nothing to fetch), leaves this
+# checkout's branch and files alone, and builds the ref with its own Makefile, Cargo.lock and
+# .cargo/config.toml, so the binary is what that ref builds and not old sources under new build
+# settings. The target root is separate for the same reason the adiri one is: a shared root would
+# rebuild the whole graph on every switch and leave target/e2e/telcoin-network holding whichever
+# sources built last.
+E2E_PREV_SRC := $(E2E_TARGET_ROOT)/prev-src
+E2E_TARGET_ROOT_PREV := $(E2E_TARGET_ROOT)/prev-e2e
+
+# Location of the binary built by build-e2e-bin-prev, passed to the mixed-binary e2e tests via
+# TN_BIN_PATH_PREV. The old ref's Makefile derives its --target-dir from CARGO_TARGET_DIR, which
+# the build sets to E2E_TARGET_ROOT_PREV, so this is the same expression pairing as E2E_BIN.
+E2E_BIN_PREV := $(E2E_TARGET_ROOT_PREV)/e2e/telcoin-network
+
+# Build the node binary at TN_PREV_REF with that ref's own `make build-e2e-bin`. The script adds the
+# worktree or checks the ref out in it, initializes tn-contracts with --reference to this
+# checkout's copy (the contract history comes from local objects instead of a second download),
+# builds, and fails unless the binary's --version names the ref's commit. The steps and their edge
+# cases are described in etc/build-prev-e2e-bin.sh.
+#
+# The worktree is registered with this clone, so `git worktree list` shows it. Remove it with
+#   git worktree remove --force target/prev-src
+# (--force because it holds an initialized submodule). `cargo clean` deletes the directory but not
+# the registration, which `git worktree list` then marks prunable: `git worktree prune` clears it,
+# and the next build-e2e-bin-prev replaces it rather than registering the path a second time.
+.PHONY: build-e2e-bin-prev
+build-e2e-bin-prev:
+	./etc/build-prev-e2e-bin.sh "$(TN_PREV_REF)" "$(E2E_PREV_SRC)" "$(E2E_TARGET_ROOT_PREV)" "$(E2E_BIN_PREV)" ;
 
 # Seed-signature fork epoch for the e2e lanes (#1032). Defaults to u32::MAX so the default
 # lanes run the fork DORMANT (wire-identical to pre-fork mainnet); non-adiri builds are
