@@ -330,6 +330,14 @@ pub struct PrimaryNetworkHandle {
     /// is against the current epoch) and the whole map is cleared on rotation via
     /// [`Self::clear_sync_capability`].
     epoch_sync_failed: Arc<Mutex<HashMap<BlsPublicKey, Epoch>>>,
+    /// The last peer that served a full pack, a partial pack or a verified consensus output.
+    ///
+    /// The probe loops try this peer first unless it already failed a probe for the epoch being
+    /// fetched, so the header-by-header output walk returns to the peer that just served instead
+    /// of reshuffling across the whole peer set for every number. Set only by a pack import that
+    /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe.
+    /// [`Self::clear_sync_capability`] deliberately leaves it in place.
+    last_sync_server: Arc<Mutex<Option<BlsPublicKey>>>,
 }
 
 // Test-only conversion that defaults the chain id to 0. Gated to tests so the only
@@ -344,6 +352,7 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
+            last_sync_server: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -356,6 +365,7 @@ impl PrimaryNetworkHandle {
             chain_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
+            last_sync_server: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -366,6 +376,7 @@ impl PrimaryNetworkHandle {
             chain_id: 0,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
+            last_sync_server: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -373,10 +384,23 @@ impl PrimaryNetworkHandle {
     ///
     /// Called at each epoch boundary: committees rotate and binaries are upgraded
     /// there, so a peer that did not answer the sync protocol last epoch is
-    /// re-probed for it this epoch.
+    /// re-probed for it this epoch. The last peer that served a sync request stays
+    /// preferred: a peer that served the previous epoch very likely serves this one,
+    /// and a wrong guess costs one probe.
     pub fn clear_sync_capability(&self) {
         self.sync_capability.lock().clear();
         self.epoch_sync_failed.lock().clear();
+    }
+
+    /// Record that `peer` served a full pack, a partial pack or a verified consensus output.
+    ///
+    /// The peer is cached sync-capable, any failure it recorded this epoch is cleared so a peer
+    /// that recovered is no longer de-prioritised, and it becomes the peer the next probe walk
+    /// tries first.
+    fn record_sync_served(&self, peer: BlsPublicKey) {
+        self.sync_capability.lock().insert(peer, true);
+        self.epoch_sync_failed.lock().remove(&peer);
+        *self.last_sync_server.lock() = Some(peer);
     }
 
     /// Return a reference to the inner handle.
@@ -606,10 +630,17 @@ impl PrimaryNetworkHandle {
         // Resolve the committee-selecting epoch once and bundle the request so every probe hop
         // carries the chain and the verified hash needed to stream-decode + verify in place.
         let request = ConsensusOutputSyncRequest { number, epoch, expected_hash, consensus_chain };
-        // Shuffle + de-prioritise peers that already failed a probe for this epoch (same anti-
-        // starvation ordering as the full-pack path).
-        let peers =
-            order_probe_peers(peers, &self.epoch_sync_failed.lock(), epoch, &mut rand::rng());
+        // Shuffle, put the last peer that served first, and de-prioritise peers that already
+        // failed a probe for this epoch (same ordering as the full-pack path). The preference is
+        // read in its own statement so its lock guard never overlaps the failure map's.
+        let preferred = *self.last_sync_server.lock();
+        let peers = order_probe_peers(
+            peers,
+            &self.epoch_sync_failed.lock(),
+            epoch,
+            preferred,
+            &mut rand::rng(),
+        );
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable for free, `then` runs each exchange
@@ -624,8 +655,7 @@ impl PrimaryNetworkHandle {
             .then(move |peer| async move {
                 match self.sync_consensus_output_from_peer(peer, request).await {
                     ConsensusOutputAttempt::Fetched(output) => {
-                        self.sync_capability.lock().insert(peer, true);
-                        self.epoch_sync_failed.lock().remove(&peer);
+                        self.record_sync_served(peer);
                         debug!(
                             target: "primary::network",
                             %peer,
@@ -941,12 +971,20 @@ impl PrimaryNetworkHandle {
     async fn request_epoch_pack_sync(&self, sync: EpochPackSyncRequest<'_>) -> NetworkResult<()> {
         let EpochPackSyncRequest { epoch, last_consensus_number, .. } = sync;
         let peers = self.handle.connected_peers().await?;
-        // Shuffle and de-prioritise peers that already failed a probe for this epoch: a peer
-        // that failed once for this epoch is probed after every fresh peer, so a Byzantine
-        // peer fixed in stable `HashMap` order cannot stall the front of every one of
-        // state-sync's retries for the same epoch (see `order_probe_peers`).
-        let peers =
-            order_probe_peers(peers, &self.epoch_sync_failed.lock(), epoch, &mut rand::rng());
+        // Shuffle, put the last peer that served first, and de-prioritise peers that already
+        // failed a probe for this epoch: a peer that failed once for this epoch is probed after
+        // every fresh peer, so a Byzantine peer fixed in stable `HashMap` order cannot stall the
+        // front of every one of state-sync's retries for the same epoch (see
+        // `order_probe_peers`). The preference is read in its own statement so its lock guard
+        // never overlaps the failure map's.
+        let preferred = *self.last_sync_server.lock();
+        let peers = order_probe_peers(
+            peers,
+            &self.epoch_sync_failed.lock(),
+            epoch,
+            preferred,
+            &mut rand::rng(),
+        );
 
         // Probe candidate peers one at a time (the async analog of a short-circuiting
         // fold): `filter` drops peers cached unsyncable this epoch for free, `then` runs
@@ -961,10 +999,7 @@ impl PrimaryNetworkHandle {
             .then(move |peer| async move {
                 match self.sync_epoch_pack_from_peer(peer, sync).await {
                     EpochPackAttempt::Imported => {
-                        self.sync_capability.lock().insert(peer, true);
-                        // Clear any prior this-epoch failure so a peer that recovered is no longer
-                        // de-prioritised.
-                        self.epoch_sync_failed.lock().remove(&peer);
+                        self.record_sync_served(peer);
                         info!(
                             target: "primary::network",
                             %peer,
@@ -1341,24 +1376,30 @@ impl PrimaryNetworkHandle {
     }
 }
 
-/// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then move any
-/// peer that already failed/timed-out a probe for THIS `epoch` to the back (a stable partition
-/// preserving the shuffled order within each group). Pure so it is unit-testable with a seeded rng.
+/// Order the candidate peers for a sync probe: shuffle for an unbiased base order, then stably
+/// sort them into four groups, each keeping its shuffled order: the `preferred` peer (the last one
+/// that served) if it is fresh, the other fresh peers, the `preferred` peer if it already
+/// failed/timed-out a probe for THIS `epoch`, and the other peers that failed this epoch. A
+/// `preferred` peer that is not in `peers` changes nothing. Pure so it is unit-testable with a
+/// seeded rng.
 ///
 /// The shuffle defeats the stable-`HashMap`-order starvation (a Byzantine peer fixed at the front
 /// of every walk), and the de-prioritisation keeps a slow/drip peer that failed one call from being
 /// probed first again on the retries for the same epoch — without dropping it (a small network
-/// whose only peer had a transient failure is still retried, just last).
+/// whose only peer had a transient failure is still retried, just last). A stale `preferred` peer
+/// costs at most one probe per walk until another peer serves and takes the preference; once a
+/// probe to it fails it also sorts behind every fresh peer for the rest of the epoch.
 fn order_probe_peers(
     mut peers: Vec<BlsPublicKey>,
     failed_this_epoch: &HashMap<BlsPublicKey, Epoch>,
     epoch: Epoch,
+    preferred: Option<BlsPublicKey>,
     rng: &mut impl Rng,
 ) -> Vec<BlsPublicKey> {
     peers.shuffle(rng);
-    // `sort_by_key` is stable, so `false` (fresh) peers keep their shuffled order ahead of `true`
-    // (failed-this-epoch) peers, which keep theirs behind.
-    peers.sort_by_key(|p| failed_this_epoch.get(p) == Some(&epoch));
+    // `sort_by_key` is stable and `false < true`, so the groups come out as fresh preferred,
+    // fresh, failed preferred, failed, each keeping its shuffled order.
+    peers.sort_by_key(|p| (failed_this_epoch.get(p) == Some(&epoch), Some(*p) != preferred));
     peers
 }
 
