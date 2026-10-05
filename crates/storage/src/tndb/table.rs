@@ -1,44 +1,32 @@
 //! A single tndb table — a [`Pack`] value log plus its sorted [`BtreeIndex`] — as a cheap `Clone`
-//! [`TnTable`] handle.  It is a **hybrid**: point ops lock a shared [`Inner`] directly (no
-//! cross-thread hop), while ordered scans run on a dedicated thread.  This file is byte-oriented
-//! (byte-slice keys and values in, owned bytes out of scans); the typed `encode`/`decode` stays in
-//! `database.rs`.
+//! [`TnTable`] handle.  Every op locks a shared [`Inner`] directly (no thread, no channel).  This
+//! file is byte-oriented (byte-slice keys and values in, borrowed bytes out); the typed
+//! `encode`/`decode` stays in `database.rs`.
 //!
 //! Point reads/writes take the `RwLock<Inner>` — a shared read lock for reads (`&self`:
 //! `get`/`contains`/…), an exclusive write lock for writes (`&mut self`: `insert`/`remove`/…) — so
 //! an uncontended op costs a lock, not a thread round-trip. (An earlier pure-actor version routed
 //! every op through a channel, which was ~2–3× slower for point ops.)
 //!
-//! A scan needs a live `BtreeIter` borrowing the index, which can't be handed back as a
-//! self-referential iterator; so scans run on a dedicated thread that takes a read lock and
-//! **streams** the `(key, value)` pairs over a bounded channel with backpressure (dropping the
-//! consumer stops the walk).  A scan therefore holds a read lock for its duration: concurrent point
-//! reads are fine, but a point write to the *same* table waits until the scan is drained or dropped
-//! — so a caller must not hold an unconsumed scan across a write of the same table on one thread.
+//! A scan ([`TableScan`]) is an owned read guard on the table plus a [`BtreeCursor`] detached from
+//! the index (each step takes the index as an argument), so there is no self-reference to work
+//! around: each step borrows the key from the mapped leaf and the value from the log.  A scan holds
+//! its read lock until it is dropped — the same contract as `mem_db`'s iterators: concurrent reads
+//! on other threads are fine, but a write to the *same* table waits until the scan is dropped, so a
+//! caller must drop (or drain and drop) a scan before writing that table on the same thread.
 
-use std::{
-    path::PathBuf,
-    sync::{
-        mpsc::{self, SyncSender},
-        Arc,
-    },
-    thread::JoinHandle,
-};
+use std::{ops::Bound, path::PathBuf, sync::Arc};
 
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 
 use crate::archive::{
-    btree_index::BtreeIndex,
+    btree_index::{iter::BtreeCursor, BtreeIndex},
     error::fetch::FetchError,
     pack::{Pack, PackCompression},
 };
 
 /// Pack/index format version for tndb tables (matches `tndb::database`).
 const PACK_VERSION: u16 = 1;
-
-/// Bounded capacity of a scan's item channel — backpressure so a slow consumer bounds the actor's
-/// look-ahead memory.
-const SCAN_CHANNEL_CAP: usize = 1024;
 
 /// Which ordered scan to run over a table's index.
 pub(crate) enum ScanKind {
@@ -50,6 +38,19 @@ pub(crate) enum ScanKind {
     From(Vec<u8>),
     /// Descending over the entries whose keys are strictly less than the given key bytes.
     RevFrom(Vec<u8>),
+}
+
+impl ScanKind {
+    /// A cursor positioned for this scan over `index`.
+    fn cursor(self, index: &BtreeIndex) -> Result<BtreeCursor, FetchError> {
+        let (reverse, lower, upper) = match self {
+            Self::Forward => (false, Bound::Unbounded, Bound::Unbounded),
+            Self::Reverse => (true, Bound::Unbounded, Bound::Unbounded),
+            Self::From(key) => (false, Bound::Included(key), Bound::Unbounded),
+            Self::RevFrom(key) => (true, Bound::Unbounded, Bound::Excluded(key)),
+        };
+        BtreeCursor::new(index, reverse, lower, upper)
+    }
 }
 
 /// Table state — the append-only value log plus its sorted key index (created lazily on the first
@@ -129,67 +130,25 @@ impl Inner {
     fn len(&self) -> usize {
         self.idx.as_ref().map_or(0, |idx| idx.len())
     }
-
-    /// Stream `(key_bytes, value_bytes)` over `out` in key order.  Split-borrowing `data`/`idx`
-    /// keeps the live B+tree iterator (over `idx`) and the value fetch (from `data`) disjoint, so
-    /// values stream lazily; a dropped receiver (`send` error) stops the walk early.
-    fn scan(&self, kind: ScanKind, out: &SyncSender<(Vec<u8>, Vec<u8>)>) {
-        let Inner { data, idx, .. } = self;
-        let Some(idx) = idx.as_ref() else { return };
-        let iter = match kind {
-            ScanKind::Forward => idx.iter(),
-            ScanKind::Reverse => idx.rev_iter(),
-            ScanKind::From(from) => idx.range(from..),
-            ScanKind::RevFrom(from) => idx.rev_range(..from),
-        };
-        let Ok(iter) = iter else { return };
-        for item in iter {
-            let Ok((key_bytes, pos)) = item else { break };
-            // The item is sent across the channel, so the value must be owned: copy it out of the
-            // mmap via the raw byte-log read paired with `append_raw`.
-            let Ok(value_bytes) = data.record_bytes(pos) else { break };
-            if out.send((key_bytes, value_bytes.to_vec())).is_err() {
-                break;
-            }
-        }
-    }
 }
 
-/// A request sent to a table's scan thread (point ops bypass it and lock `Inner` directly).
-enum ScanRequest {
-    /// Stream the given scan's `(key, value)` pairs over `out`.
-    Scan { kind: ScanKind, out: SyncSender<(Vec<u8>, Vec<u8>)> },
-    /// Stop the scan thread (sent by the last handle's `Drop`).
-    Shutdown,
-}
-
-/// A cheap `Clone` handle to a table.  Point ops lock the shared [`Inner`] directly (a read lock
-/// for reads, a write lock for writes); ordered scans are streamed by a dedicated thread.
+/// A cheap `Clone` handle to a table.  Ops lock the shared [`Inner`] directly (a read lock for
+/// reads and scans, a write lock for writes).  The table closes cleanly when the last handle — or
+/// the last live [`TableScan`], whose guard shares `inner` — is dropped.
 #[derive(Clone, Debug)]
 pub(crate) struct TnTable {
-    /// The table state, locked per operation — no cross-thread hop for point reads/writes.
+    /// The table state, locked per operation.
     inner: Arc<RwLock<Inner>>,
-    /// Requests to the scan thread (which shares `inner`).
-    scan_tx: mpsc::Sender<ScanRequest>,
-    /// The scan thread's join handle, taken by the last handle's `Drop` for a clean, durable
-    /// close.
-    join: Arc<Mutex<Option<JoinHandle<()>>>>,
 }
 
 impl TnTable {
-    /// Open (creating if needed) the table rooted at `dir` and spawn its actor thread.  `dir` holds
-    /// the `data` log and (once populated) the `btx/` index.
+    /// Open (creating if needed) the table rooted at `dir`.  `dir` holds the `data` log and (once
+    /// populated) the `btx/` index.
     pub(crate) fn open(dir: PathBuf) -> eyre::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         let data =
             Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)?;
-        let inner = Arc::new(RwLock::new(Inner { dir, data, idx: None }));
-        let (scan_tx, scan_rx) = mpsc::channel();
-        let scan_inner = Arc::clone(&inner);
-        let join = std::thread::Builder::new()
-            .name("tndb-table-scan".into())
-            .spawn(move || run_scan_loop(scan_inner, scan_rx))?;
-        Ok(Self { inner, scan_tx, join: Arc::new(Mutex::new(Some(join))) })
+        Ok(Self { inner: Arc::new(RwLock::new(Inner { dir, data, idx: None })) })
     }
 
     /// Insert (or overwrite) `key → value`.
@@ -239,56 +198,54 @@ impl TnTable {
         Ok(self.inner.read().len())
     }
 
-    /// A lazy, key-ordered iterator over `(key_bytes, value_bytes)`.  The scan thread streams items
-    /// over a bounded channel (holding a read lock); dropping the returned iterator stops the scan.
-    /// If the scan thread is gone the iterator is simply empty.
-    pub(crate) fn scan(&self, kind: ScanKind) -> TnTableScan {
-        let (out, rx) = mpsc::sync_channel(SCAN_CHANNEL_CAP);
-        let _ = self.scan_tx.send(ScanRequest::Scan { kind, out });
-        TnTableScan { rx }
+    /// A lazy, key-ordered scan over `(key_bytes, value_bytes)`.  It holds the table's read lock
+    /// until dropped (see the module docs); a table with no index yet scans empty.
+    pub(crate) fn scan(&self, kind: ScanKind) -> TableScan {
+        let guard = self.inner.read_arc();
+        let cursor = guard.idx.as_ref().and_then(|idx| kind.cursor(idx).ok());
+        TableScan { guard, cursor }
+    }
+
+    /// Map the single `(key_bytes, value_bytes)` a scan of `kind` lands on first with `f`, or
+    /// `None` if it lands on nothing — a direct seek under a short read lock.
+    pub(crate) fn first_with<R>(
+        &self,
+        kind: ScanKind,
+        f: impl FnOnce(&[u8], &[u8]) -> R,
+    ) -> Option<R> {
+        let inner = self.inner.read();
+        let idx = inner.idx.as_ref()?;
+        let (key, pos) = kind.cursor(idx).ok()?.next(idx)?.ok()?;
+        Some(f(key, inner.data.record_bytes(pos).ok()?))
     }
 }
 
-impl Drop for TnTable {
-    fn drop(&mut self) {
-        // The last live handle stops the scan thread and joins it, so the scan thread releases its
-        // `inner` clone; this handle's `inner` is then the last ref, and dropping it clean-closes.
-        if Arc::strong_count(&self.join) == 1 {
-            if let Some(handle) = self.join.lock().take() {
-                let _ = self.scan_tx.send(ScanRequest::Shutdown);
-                let _ = handle.join();
+/// A lazy, key-ordered scan of a table (see [`TnTable::scan`]): an owned read guard plus a cursor,
+/// stepped with [`Self::next_with`].  Holds the table's read lock until dropped.
+pub(crate) struct TableScan {
+    guard: ArcRwLockReadGuard<RawRwLock, Inner>,
+    /// `None` once the scan is exhausted or failed (or the table had no index).
+    cursor: Option<BtreeCursor>,
+}
+
+impl TableScan {
+    /// Map the next `(key_bytes, value_bytes)` with `f` — the key borrowed from the index leaf, the
+    /// value from the log — or `None` when the scan is done.  A fetch failure ends the scan.
+    pub(crate) fn next_with<R>(&mut self, f: impl FnOnce(&[u8], &[u8]) -> R) -> Option<R> {
+        let Inner { data, idx, .. } = &*self.guard;
+        let row = self.cursor.as_mut()?.next(idx.as_ref()?).and_then(|item| {
+            let (key, pos) = item.ok()?;
+            Some((key, data.record_bytes(pos).ok()?))
+        });
+        match row {
+            Some((key, value)) => Some(f(key, value)),
+            None => {
+                // Exhausted, or a fetch failure ended the scan.
+                self.cursor = None;
+                None
             }
         }
     }
-}
-
-/// The iterator returned by [`TnTable::scan`]: it pulls streamed items from the scan thread.
-pub(crate) struct TnTableScan {
-    rx: mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
-}
-
-impl Iterator for TnTableScan {
-    type Item = (Vec<u8>, Vec<u8>);
-
-    fn next(&mut self) -> Option<Self::Item> {
-        // `Err` means the scan finished (the scan thread dropped its sender).
-        self.rx.recv().ok()
-    }
-}
-
-/// The scan thread: shares `inner` (via the `RwLock`) and streams scans until shutdown.  Point ops
-/// never reach here — they lock `inner` on the caller's thread.
-fn run_scan_loop(inner: Arc<RwLock<Inner>>, rx: mpsc::Receiver<ScanRequest>) {
-    while let Ok(req) = rx.recv() {
-        match req {
-            // Hold a read lock only for the duration of the scan (concurrent reads OK; writes
-            // wait).
-            ScanRequest::Scan { kind, out } => inner.read().scan(kind, &out),
-            ScanRequest::Shutdown => break,
-        }
-    }
-    // Drop this thread's `inner` clone; the last handle's `Drop` then clean-closes the table.
-    drop(inner);
 }
 
 #[cfg(test)]
@@ -302,12 +259,16 @@ mod test {
         (i.to_be_bytes().to_vec(), format!("v{i}").into_bytes())
     }
 
-    fn keys_of(scan: TnTableScan) -> Vec<u64> {
-        scan.map(|(k, _)| u64::from_be_bytes(k.try_into().expect("8-byte key"))).collect()
+    fn key_u64(key: &[u8]) -> u64 {
+        u64::from_be_bytes(key.try_into().expect("8-byte key"))
+    }
+
+    fn keys_of(mut scan: TableScan) -> Vec<u64> {
+        std::iter::from_fn(|| scan.next_with(|k, _| key_u64(k))).collect()
     }
 
     #[test]
-    fn test_tntable_actor_ops_and_scans() {
+    fn test_tntable_ops_and_scans() {
         let tmp = TempDir::with_prefix("tntable").expect("temp dir");
         let table = TnTable::open(tmp.path().join("t")).expect("open");
 
@@ -336,9 +297,12 @@ mod test {
             (50..100).collect::<Vec<_>>()
         );
 
-        // Early-terminate a scan: take a few, drop the rest — must not hang.
-        let head: Vec<_> = table.scan(ScanKind::Forward).take(3).collect();
-        assert_eq!(head.len(), 3);
+        // Early-terminate a scan: take a few, drop the rest.
+        let mut scan = table.scan(ScanKind::Forward);
+        let head: Vec<_> =
+            std::iter::from_fn(|| scan.next_with(|k, _| key_u64(k))).take(3).collect();
+        assert_eq!(head, vec![0, 1, 2]);
+        drop(scan);
 
         // Remove + clear.
         assert!(table.remove(&kv(0).0).expect("remove"));
@@ -376,5 +340,62 @@ mod test {
             None,
             "removal persisted"
         );
+    }
+
+    /// Dropping a scan releases the table's read lock, so the same thread can write the table
+    /// afterwards (a scan held across the write would block it, as with `mem_db`).
+    #[test]
+    fn test_tntable_dropped_scan_releases_the_table() {
+        let tmp = TempDir::with_prefix("tntable_scan_drop").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t")).expect("open");
+        for i in 0..3_000u64 {
+            let (k, v) = kv(i);
+            table.insert(&k, &v).expect("insert");
+        }
+        let mut scan = table.scan(ScanKind::Forward);
+        assert_eq!(scan.next_with(|k, v| (key_u64(k), v.to_vec())), Some((0, kv(0).1)));
+        drop(scan); // an unconsumed scan, far more rows left than the old channel held
+        let (k, v) = kv(9_999);
+        table.insert(&k, &v).expect("write after the scan is dropped");
+        assert_eq!(table.len().expect("len"), 3_001);
+    }
+
+    /// A live scan keeps the table open (its guard shares the state) even after the last handle
+    /// is dropped; the table then closes cleanly when the scan ends.
+    #[test]
+    fn test_tntable_scan_outlives_its_handle() {
+        let tmp = TempDir::with_prefix("tntable_scan_outlives").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone()).expect("open");
+        for i in 0..10u64 {
+            let (k, v) = kv(i);
+            table.insert(&k, &v).expect("insert");
+        }
+        let scan = table.scan(ScanKind::Reverse);
+        drop(table);
+        assert_eq!(keys_of(scan), (0..10).rev().collect::<Vec<_>>());
+        let table = TnTable::open(dir).expect("reopen after the scan closed the table");
+        table.insert(&kv(10).0, &kv(10).1).expect("insert after reopen"); // reopens the index
+        assert_eq!(table.len().expect("len"), 11);
+    }
+
+    /// `first_with` seeks directly: the last entry, the greatest entry below a key, and the first
+    /// entry at or above a key.
+    #[test]
+    fn test_tntable_first_with_seeks() {
+        let tmp = TempDir::with_prefix("tntable_first_with").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t")).expect("open");
+        assert_eq!(table.first_with(ScanKind::Reverse, |k, _| key_u64(k)), None, "no index yet");
+        for i in (0..100u64).map(|i| i * 2) {
+            let (k, v) = kv(i);
+            table.insert(&k, &v).expect("insert");
+        }
+        let first = |kind| table.first_with(kind, |k, v| (key_u64(k), v.to_vec()));
+        assert_eq!(first(ScanKind::Reverse), Some((198, kv(198).1)));
+        assert_eq!(first(ScanKind::RevFrom(kv(50).0)), Some((48, kv(48).1)), "strictly below");
+        assert_eq!(first(ScanKind::RevFrom(kv(51).0)), Some((50, kv(50).1)));
+        assert_eq!(first(ScanKind::RevFrom(kv(0).0)), None, "nothing below the smallest key");
+        assert_eq!(first(ScanKind::From(kv(51).0)), Some((52, kv(52).1)));
+        assert_eq!(first(ScanKind::Forward), Some((0, kv(0).1)));
     }
 }

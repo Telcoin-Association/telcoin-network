@@ -475,9 +475,10 @@ impl BtreeIndex {
         self.node
     }
 
-    /// Return an owned copy of page `p` for iteration (one copy per leaf hop).
-    pub(super) fn fetch_page(&self, p: u32) -> Result<Vec<u8>, FetchError> {
-        Ok(self.page(p)?.to_vec())
+    /// Borrow leaf page `p` for a scan step (via [`Self::page`], so its corruption checks apply).
+    /// The slice is valid while the index is not modified, which the scan's holder guarantees.
+    pub(super) fn leaf_page(&self, p: u32) -> Result<&[u8], FetchError> {
+        self.page(p)
     }
 
     /// Descend to the leaf page that would contain `key`.

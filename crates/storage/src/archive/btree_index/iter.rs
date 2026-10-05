@@ -1,9 +1,10 @@
 //! Sorted iteration over a [`BtreeIndex`]: forward, reverse, bounded ranges, and key prefixes.
 //!
-//! All iterators walk the doubly-linked leaf chain, so once positioned they advance one leaf at a
-//! time with no re-descent.  Each step yields `Result<(Vec<u8>, u64), FetchError>` (the key is a
-//! fresh `ksize`-byte `Vec`) and streams (holding `&mut BtreeIndex` to fetch successive leaves); a
-//! fetch/CRC failure is surfaced as a terminal `Err`.
+//! All scans walk the doubly-linked leaf chain, so once positioned they advance one leaf at a time
+//! with no re-descent.  The scan state is a [`BtreeCursor`], detached from the index (each step
+//! takes it as an argument and yields the key borrowed from the mapped leaf); [`BtreeIter`] binds
+//! one to a `&BtreeIndex` and yields `Result<(Vec<u8>, u64), FetchError>` (the key copied to a
+//! fresh `ksize`-byte `Vec`).  A fetch/CRC failure is surfaced as a terminal `Err`.
 
 use std::ops::{Bound, RangeBounds};
 
@@ -18,26 +19,212 @@ use crate::archive::{
 /// Marker `pos` value (for reverse scans) meaning "step to the previous leaf on the next call".
 const NEED_PREV: usize = usize::MAX;
 
-/// A sorted iterator over `(key, position)` entries of a [`BtreeIndex`].
+/// The position of a sorted scan over a [`BtreeIndex`], detached from the index: every step takes
+/// the index as an argument, so the cursor can live beside whatever keeps the index alive and
+/// unchanged between steps (a `&BtreeIndex` borrow in [`BtreeIter`], or a held read guard).
 ///
-/// Created by [`BtreeIndex::iter`], [`BtreeIndex::rev_iter`], [`BtreeIndex::range`],
-/// [`BtreeIndex::rev_range`], and [`BtreeIndex::prefix`].
+/// It stores only the current leaf number and slot, re-reading the leaf from the mapping on each
+/// step (no page copy), and yields keys borrowed from the mapped leaf. Its holder must ensure the
+/// index is not modified between steps.
 #[derive(Debug)]
-pub struct BtreeIter<'a> {
-    index: &'a BtreeIndex,
-    /// Page geometry (key size) copied from the index, to decode leaf buffers.
+pub(crate) struct BtreeCursor {
+    /// Page geometry (key size) copied from the index, to decode leaves.
     node: Node,
-    /// Owned copy of the current leaf page (empty until initialized).
-    buf: Vec<u8>,
     /// Current leaf page number, or [`NULL_PAGE`] when exhausted.
     leaf: u32,
-    /// Next slot to yield within `buf` (or [`NEED_PREV`] in reverse mode).
+    /// Next slot to yield within the leaf (or [`NEED_PREV`] in reverse mode).
     pos: usize,
     reverse: bool,
     /// Inclusive/exclusive lower bound (the stop bound in reverse, start bound in forward).
     lower: Bound<Vec<u8>>,
     /// Inclusive/exclusive upper bound (the stop bound in forward, start bound in reverse).
     upper: Bound<Vec<u8>>,
+}
+
+impl BtreeCursor {
+    /// Position a cursor on `index` at the first entry in scan order within the bounds.
+    pub(crate) fn new(
+        index: &BtreeIndex,
+        reverse: bool,
+        lower: Bound<Vec<u8>>,
+        upper: Bound<Vec<u8>>,
+    ) -> Result<Self, FetchError> {
+        let node = index.node();
+        let mut cursor = Self { node, leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
+        if reverse {
+            cursor.reverse_start(index)?;
+        } else {
+            cursor.forward_start(index)?;
+        }
+        Ok(cursor)
+    }
+
+    /// Position the cursor at the first entry `>= lower` (ascending).
+    fn forward_start(&mut self, index: &BtreeIndex) -> Result<(), FetchError> {
+        let (leaf, pos) = match &self.lower {
+            Bound::Unbounded => {
+                let sl = index.first_leaf();
+                index.leaf_page(sl)?;
+                (sl, 0)
+            }
+            Bound::Included(lo) => {
+                let sl = index.find_leaf(lo)?;
+                let pos = match self.node.leaf_search(index.leaf_page(sl)?, lo) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+                (sl, pos)
+            }
+            Bound::Excluded(lo) => {
+                let sl = index.find_leaf(lo)?;
+                let pos = match self.node.leaf_search(index.leaf_page(sl)?, lo) {
+                    Ok(i) => i + 1,
+                    Err(i) => i,
+                };
+                (sl, pos)
+            }
+        };
+        self.leaf = leaf;
+        self.pos = pos;
+        Ok(())
+    }
+
+    /// Position the cursor at the greatest entry `<= upper` (descending).
+    fn reverse_start(&mut self, index: &BtreeIndex) -> Result<(), FetchError> {
+        let (leaf, sp): (u32, isize) = match &self.upper {
+            Bound::Unbounded => {
+                let sl = index.last_leaf();
+                (sl, self.node.entry_count(index.leaf_page(sl)?) as isize - 1)
+            }
+            Bound::Included(hi) => {
+                let sl = index.find_leaf(hi)?;
+                let sp = match self.node.leaf_search(index.leaf_page(sl)?, hi) {
+                    Ok(i) => i as isize,
+                    Err(i) => i as isize - 1,
+                };
+                (sl, sp)
+            }
+            Bound::Excluded(hi) => {
+                let sl = index.find_leaf(hi)?;
+                let sp = match self.node.leaf_search(index.leaf_page(sl)?, hi) {
+                    Ok(i) => i as isize - 1,
+                    Err(i) => i as isize - 1,
+                };
+                (sl, sp)
+            }
+        };
+        self.leaf = leaf;
+        // A negative start means the greatest matching entry is in an earlier leaf.
+        self.pos = if sp >= 0 { sp as usize } else { NEED_PREV };
+        Ok(())
+    }
+
+    /// Read leaf `p` for a step, ending the scan on a fetch failure.
+    fn read_leaf<'i>(&mut self, index: &'i BtreeIndex, p: u32) -> Result<&'i [u8], FetchError> {
+        index.leaf_page(p).inspect_err(|_| self.leaf = NULL_PAGE)
+    }
+
+    /// The next `(key, position)` in scan order (the key borrowed from the mapped leaf), `None`
+    /// once the scan is exhausted, or a terminal `Err` on a fetch failure.
+    pub(crate) fn next<'i>(
+        &mut self,
+        index: &'i BtreeIndex,
+    ) -> Option<Result<(&'i [u8], u64), FetchError>> {
+        if self.reverse {
+            self.next_reverse(index)
+        } else {
+            self.next_forward(index)
+        }
+    }
+
+    fn next_forward<'i>(
+        &mut self,
+        index: &'i BtreeIndex,
+    ) -> Option<Result<(&'i [u8], u64), FetchError>> {
+        loop {
+            if self.leaf == NULL_PAGE {
+                return None;
+            }
+            let buf = match self.read_leaf(index, self.leaf) {
+                Ok(buf) => buf,
+                Err(e) => return Some(Err(e)),
+            };
+            if self.pos >= self.node.entry_count(buf) {
+                let nx = self.node.leaf_next(buf);
+                self.leaf = nx;
+                self.pos = 0;
+                continue; // `NULL_PAGE` ends the scan at the top of the loop
+            }
+            let key = self.node.leaf_key(buf, self.pos);
+            let stop = match &self.upper {
+                Bound::Unbounded => false,
+                Bound::Included(hi) => key > hi.as_slice(),
+                Bound::Excluded(hi) => key >= hi.as_slice(),
+            };
+            if stop {
+                self.leaf = NULL_PAGE;
+                return None;
+            }
+            let val = self.node.leaf_value(buf, self.pos);
+            self.pos += 1;
+            return Some(Ok((key, val)));
+        }
+    }
+
+    fn next_reverse<'i>(
+        &mut self,
+        index: &'i BtreeIndex,
+    ) -> Option<Result<(&'i [u8], u64), FetchError>> {
+        loop {
+            if self.leaf == NULL_PAGE {
+                return None;
+            }
+            let buf = match self.read_leaf(index, self.leaf) {
+                Ok(buf) => buf,
+                Err(e) => return Some(Err(e)),
+            };
+            if self.pos == NEED_PREV || self.node.entry_count(buf) == 0 {
+                let pv = self.node.leaf_prev(buf);
+                if pv == NULL_PAGE {
+                    self.leaf = NULL_PAGE;
+                    return None;
+                }
+                let prev = match self.read_leaf(index, pv) {
+                    Ok(prev) => prev,
+                    Err(e) => return Some(Err(e)),
+                };
+                let n = self.node.entry_count(prev);
+                self.leaf = pv;
+                self.pos = if n > 0 { n - 1 } else { NEED_PREV };
+                continue;
+            }
+            let key = self.node.leaf_key(buf, self.pos);
+            let stop = match &self.lower {
+                Bound::Unbounded => false,
+                Bound::Included(lo) => key < lo.as_slice(),
+                Bound::Excluded(lo) => key <= lo.as_slice(),
+            };
+            if stop {
+                self.leaf = NULL_PAGE;
+                return None;
+            }
+            let val = self.node.leaf_value(buf, self.pos);
+            // Advance to the previous entry for the next call.
+            self.pos = if self.pos == 0 { NEED_PREV } else { self.pos - 1 };
+            return Some(Ok((key, val)));
+        }
+    }
+}
+
+/// A sorted iterator over `(key, position)` entries of a [`BtreeIndex`]: a [`BtreeCursor`] bound
+/// to a borrow of the index (which keeps it unchanged for the iterator's life).
+///
+/// Created by [`BtreeIndex::iter`], [`BtreeIndex::rev_iter`], [`BtreeIndex::range`],
+/// [`BtreeIndex::rev_range`], and [`BtreeIndex::prefix`].
+#[derive(Debug)]
+pub struct BtreeIter<'a> {
+    index: &'a BtreeIndex,
+    cursor: BtreeCursor,
 }
 
 impl<'a> BtreeIter<'a> {
@@ -47,166 +234,7 @@ impl<'a> BtreeIter<'a> {
         lower: Bound<Vec<u8>>,
         upper: Bound<Vec<u8>>,
     ) -> Result<Self, FetchError> {
-        let node = index.node();
-        let mut it =
-            Self { index, node, buf: Vec::new(), leaf: NULL_PAGE, pos: 0, reverse, lower, upper };
-        if reverse {
-            it.reverse_start()?;
-        } else {
-            it.forward_start()?;
-        }
-        Ok(it)
-    }
-
-    /// Position the cursor at the first entry `>= lower` (ascending).
-    fn forward_start(&mut self) -> Result<(), FetchError> {
-        match self.lower.clone() {
-            Bound::Unbounded => {
-                let sl = self.index.first_leaf();
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                self.pos = 0;
-            }
-            Bound::Included(lo) => {
-                let sl = self.index.find_leaf(&lo)?;
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                self.pos = match self.node.leaf_search(&self.buf, &lo) {
-                    Ok(i) => i,
-                    Err(i) => i,
-                };
-            }
-            Bound::Excluded(lo) => {
-                let sl = self.index.find_leaf(&lo)?;
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                self.pos = match self.node.leaf_search(&self.buf, &lo) {
-                    Ok(i) => i + 1,
-                    Err(i) => i,
-                };
-            }
-        }
-        Ok(())
-    }
-
-    /// Position the cursor at the greatest entry `<= upper` (descending).
-    fn reverse_start(&mut self) -> Result<(), FetchError> {
-        let sp: isize = match self.upper.clone() {
-            Bound::Unbounded => {
-                let sl = self.index.last_leaf();
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                self.node.entry_count(&self.buf) as isize - 1
-            }
-            Bound::Included(hi) => {
-                let sl = self.index.find_leaf(&hi)?;
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                match self.node.leaf_search(&self.buf, &hi) {
-                    Ok(i) => i as isize,
-                    Err(i) => i as isize - 1,
-                }
-            }
-            Bound::Excluded(hi) => {
-                let sl = self.index.find_leaf(&hi)?;
-                self.buf = self.index.fetch_page(sl)?;
-                self.leaf = sl;
-                match self.node.leaf_search(&self.buf, &hi) {
-                    Ok(i) => i as isize - 1,
-                    Err(i) => i as isize - 1,
-                }
-            }
-        };
-        // A negative start means the greatest matching entry is in an earlier leaf.
-        self.pos = if sp >= 0 { sp as usize } else { NEED_PREV };
-        Ok(())
-    }
-
-    fn key_at(&self, i: usize) -> Vec<u8> {
-        self.node.leaf_key(&self.buf, i).to_vec()
-    }
-
-    fn next_forward(&mut self) -> Option<Result<(Vec<u8>, u64), FetchError>> {
-        loop {
-            if self.leaf == NULL_PAGE {
-                return None;
-            }
-            let n = self.node.entry_count(&self.buf);
-            if self.pos >= n {
-                let nx = self.node.leaf_next(&self.buf);
-                if nx == NULL_PAGE {
-                    self.leaf = NULL_PAGE;
-                    return None;
-                }
-                match self.index.fetch_page(nx) {
-                    Ok(b) => {
-                        self.buf = b;
-                        self.leaf = nx;
-                        self.pos = 0;
-                    }
-                    Err(e) => {
-                        self.leaf = NULL_PAGE;
-                        return Some(Err(e));
-                    }
-                }
-                continue;
-            }
-            let key = self.key_at(self.pos);
-            let stop = match &self.upper {
-                Bound::Unbounded => false,
-                Bound::Included(hi) => key > *hi,
-                Bound::Excluded(hi) => key >= *hi,
-            };
-            if stop {
-                self.leaf = NULL_PAGE;
-                return None;
-            }
-            let val = self.node.leaf_value(&self.buf, self.pos);
-            self.pos += 1;
-            return Some(Ok((key, val)));
-        }
-    }
-
-    fn next_reverse(&mut self) -> Option<Result<(Vec<u8>, u64), FetchError>> {
-        loop {
-            if self.leaf == NULL_PAGE {
-                return None;
-            }
-            if self.pos == NEED_PREV || self.node.entry_count(&self.buf) == 0 {
-                let pv = self.node.leaf_prev(&self.buf);
-                if pv == NULL_PAGE {
-                    self.leaf = NULL_PAGE;
-                    return None;
-                }
-                match self.index.fetch_page(pv) {
-                    Ok(b) => {
-                        let n = self.node.entry_count(&b);
-                        self.buf = b;
-                        self.leaf = pv;
-                        self.pos = if n > 0 { n - 1 } else { NEED_PREV };
-                    }
-                    Err(e) => {
-                        self.leaf = NULL_PAGE;
-                        return Some(Err(e));
-                    }
-                }
-                continue;
-            }
-            let key = self.key_at(self.pos);
-            let stop = match &self.lower {
-                Bound::Unbounded => false,
-                Bound::Included(lo) => key < *lo,
-                Bound::Excluded(lo) => key <= *lo,
-            };
-            if stop {
-                self.leaf = NULL_PAGE;
-                return None;
-            }
-            let val = self.node.leaf_value(&self.buf, self.pos);
-            // Advance to the previous entry for the next call.
-            self.pos = if self.pos == 0 { NEED_PREV } else { self.pos - 1 };
-            return Some(Ok((key, val)));
-        }
+        Ok(Self { index, cursor: BtreeCursor::new(index, reverse, lower, upper)? })
     }
 }
 
@@ -214,11 +242,7 @@ impl Iterator for BtreeIter<'_> {
     type Item = Result<(Vec<u8>, u64), FetchError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.reverse {
-            self.next_reverse()
-        } else {
-            self.next_forward()
-        }
+        self.cursor.next(self.index).map(|item| item.map(|(key, pos)| (key.to_vec(), pos)))
     }
 }
 

@@ -1,6 +1,6 @@
-//! A [`Database`] backed by per-table actors ([`TnTable`]): each table owns an append-only value
-//! log plus a sorted B+tree index on its own thread, so operations take no lock — the store maps a
-//! table name to that table's `TnTable` handle (a cheap `Clone` channel sender).
+//! A [`Database`] backed by per-table [`TnTable`]s: each table owns an append-only value log plus a
+//! sorted B+tree index behind its own lock, and the store maps a table name to that table's
+//! `TnTable` handle (a cheap `Clone`).
 //!
 //! This module is the typed layer, modeled on [`crate::mem_db`]: keys are encoded with `encode_key`
 //! (binary-sortable) and values with `encode` (bcs); each op hands the encoded bytes to the table
@@ -9,8 +9,9 @@
 //! `encode_key(key).len()` — `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is
 //! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
 //!
-//! Scans stream lazily off the table actor.  Not yet covered: pack compaction on clear, warm-start
-//! reads before the first insert, and durability-barrier tuning.
+//! Scans are lazy: each `DBIter` holds its table's read lock and a B+tree cursor, decoding every
+//! row straight from the index leaf and the log.  Not yet covered: pack compaction on clear,
+//! warm-start reads before the first insert, and durability-barrier tuning.
 
 use std::{
     cell::RefCell,
@@ -72,9 +73,10 @@ fn with_read_key<K: Serialize, R>(
 // Each op clones the table's handle (and, for writes, its buffers) out of the `DashMap` and drops
 // the shard `Ref` before the (blocking) table operation, so no shard lock is held across one.
 //
-// NOTE: a table actor serves one scan at a time, so a caller must drain or drop an iterator
-// (`iter`/`reverse_iter`/`skip_to`) before issuing another blocking op on the *same* table from the
-// same thread — an unconsumed scan keeps the actor busy.
+// NOTE: an iterator (`iter`/`reverse_iter`/`skip_to`) holds its table's read lock until dropped —
+// the same contract as `mem_db`'s iterators. A caller must drop it before writing the *same* table
+// on the same thread, and a same-thread read of that table can block behind another thread's
+// pending write while the iterator is alive.
 
 /// Clone the table's handle out of the store, dropping the `DashMap` shard lock.
 fn handle(store: &StoreType, name: &'static str) -> Option<TnTable> {
@@ -144,23 +146,26 @@ fn is_empty<T: Table>(store: &StoreType) -> bool {
     handle(store, T::NAME).and_then(|table| table.is_empty().ok()).unwrap_or(false)
 }
 
-/// A lazy, key-ordered [`DBIter`] streamed straight off the table actor.
+/// A lazy, key-ordered [`DBIter`] over the table (holding its read lock until dropped).
 fn scan<T: Table>(store: &StoreType, kind: ScanKind) -> DBIter<'static, T> {
     match handle(store, T::NAME) {
-        Some(table) => Box::new(table.scan(kind).map(|(key_bytes, value_bytes)| {
-            (decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes))
-        })),
+        Some(table) => {
+            let mut scan = table.scan(kind);
+            Box::new(std::iter::from_fn(move || {
+                scan.next_with(|key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
+            }))
+        }
         None => Box::new(std::iter::empty()),
     }
 }
 
-/// The single `(key, value)` a one-shot scan lands on (its first item).
+/// The single `(key, value)` a one-shot scan lands on (its first item), found by a direct seek.
 fn first_of<T: Table>(store: &StoreType, kind: ScanKind) -> Option<(T::Key, T::Value)> {
-    let (key_bytes, value_bytes) = handle(store, T::NAME)?.scan(kind).next()?;
-    Some((decode_key::<T::Key>(&key_bytes), decode::<T::Value>(&value_bytes)))
+    handle(store, T::NAME)?
+        .first_with(kind, |key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
 }
 
-/// A [`Database`] backed by per-table actors ([`super::table::TnTable`]).
+/// A [`Database`] backed by per-table [`TnTable`]s.
 #[derive(Clone, Debug)]
 pub struct TnDatabase {
     store: Arc<StoreType>,
@@ -194,6 +199,17 @@ impl DbTx for TnDbTx {
 #[derive(Clone, Debug)]
 pub struct TnDbTxMut {
     store: Arc<StoreType>,
+    /// The tables this transaction wrote, so `commit` flushes only those (flushing takes a table's
+    /// write lock, which must not wait on an unrelated table's live scan).
+    written: Vec<&'static str>,
+}
+
+impl TnDbTxMut {
+    fn wrote(&mut self, name: &'static str) {
+        if !self.written.contains(&name) {
+            self.written.push(name);
+        }
+    }
 }
 
 impl DbTx for TnDbTxMut {
@@ -204,24 +220,27 @@ impl DbTx for TnDbTxMut {
 
 impl DbTxMut for TnDbTxMut {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
+        self.wrote(T::NAME);
         insert::<T>(&self.store, key, value)
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
+        self.wrote(T::NAME);
         remove::<T>(&self.store, key)
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
+        self.wrote(T::NAME);
         clear_table::<T>(&self.store)
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // Durably flush every table's log.  Clone the handles out first so no shard lock is held
-        // across a (blocking) flush.
-        let tables: Vec<TnTable> =
-            self.store.iter().map(|entry| entry.value().table.clone()).collect();
-        for table in tables {
-            table.flush()?;
+        // Durably flush the log of each table this transaction wrote (`handle` drops the shard lock
+        // before the blocking flush).
+        for name in self.written {
+            if let Some(table) = handle(&self.store, name) {
+                table.flush()?;
+            }
         }
         Ok(())
     }
@@ -249,7 +268,7 @@ impl Database for TnDatabase {
     }
 
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
-        Ok(TnDbTxMut { store: self.store.clone() })
+        Ok(TnDbTxMut { store: self.store.clone(), written: Vec::new() })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
@@ -419,6 +438,46 @@ mod test {
         db.remove::<TestTable>(&2).expect("remove");
         assert!(!db.contains_key::<TestTable>(&2).expect("contains 2"));
         assert!(db.contains_key::<TestTable>(&1).expect("contains 1"));
+    }
+
+    /// A second table for the cross-table tests.
+    #[derive(Debug)]
+    struct OtherTable;
+    impl tn_types::Table for OtherTable {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "OtherTable";
+        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+    }
+
+    /// Committing a write txn flushes only the tables it wrote: a live scan of another table
+    /// (holding that table's read lock) must not block the commit.
+    #[test]
+    fn test_tndb_commit_ignores_unrelated_scans() {
+        use std::{sync::mpsc, time::Duration};
+        use tn_types::DbTxMut as _;
+
+        let (db, _tmp) = open_db();
+        db.open_table::<OtherTable>().expect("open other table");
+        for i in 0..10u64 {
+            db.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+        }
+        let mut scan = db.iter::<TestTable>();
+        assert!(scan.next().is_some());
+
+        // Commit on another thread, so a regression fails the test instead of hanging it.
+        let (done_tx, done_rx) = mpsc::channel();
+        let writer = db.clone();
+        let commit = std::thread::spawn(move || {
+            let mut txn = writer.write_txn().expect("write txn");
+            txn.insert::<OtherTable>(&1, &"x".to_string()).expect("txn insert");
+            done_tx.send(txn.commit().is_ok()).expect("report commit");
+        });
+        let committed = done_rx.recv_timeout(Duration::from_secs(10));
+        drop(scan);
+        commit.join().expect("commit thread");
+        assert_eq!(committed, Ok(true), "the commit must not wait on an unrelated table's scan");
     }
 
     #[test]
