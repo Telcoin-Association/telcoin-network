@@ -31,7 +31,7 @@ use std::{
     io::{Read, Write},
     net::TcpStream,
     ops::RangeInclusive,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ExitStatus},
     sync::{Arc, Condvar, Mutex},
     time::Duration,
@@ -439,6 +439,28 @@ pub(crate) fn start_validator_with_args(
     run: u32,
     extra_args: &[&str],
 ) -> Child {
+    start_validator_with_env(instance, bin, base_dir, rpc_port, test, run, extra_args, &[])
+}
+
+/// Start a validator node process with additional CLI arguments and extra environment
+/// variables for that child only.
+///
+/// Each `(key, value)` pair is set on the spawned command after the variables
+/// [`TestBinary::command`] forwards, so a pair overrides a forwarded variable of the same
+/// name. The harness process itself is never touched: a per-node setting such as
+/// `TN_TEST_CLOCK_OFFSET_MS` must not be exported with `std::env::set_var`, or every node
+/// spawned afterwards would inherit it.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn start_validator_with_env(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+    extra_env: &[(&str, &str)],
+) -> Child {
     let data_dir = base_dir.join(format!("validator-{}", instance + 1));
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -462,10 +484,46 @@ pub(crate) fn start_validator_with_args(
         .arg(format!("{test}-node{instance}"));
 
     command.args(extra_args);
+    command.envs(extra_env.iter().copied());
 
     setup_log_dir(&mut command, instance, test, run);
 
     command.spawn().expect("failed to execute")
+}
+
+/// The log file [`setup_log_dir`] gives run `run` of node `instance` under `test_logs/<test>/`:
+/// `node<instance>-run<run>.log` for stdout, `node<instance>-run<run>.stderr.log` for stderr.
+///
+/// The directory is read from `CARGO_MANIFEST_DIR` at run time, as [`setup_log_dir`] reads it,
+/// and falls back to the crate's build-time manifest directory only where that variable is unset,
+/// in which case [`setup_log_dir`] would have panicked before writing any log.
+pub(crate) fn node_log_path(test: &str, instance: usize, run: u32, stderr: bool) -> PathBuf {
+    let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
+        .map_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")), PathBuf::from);
+    let suffix = if stderr { ".stderr" } else { "" };
+    manifest_dir.join("test_logs").join(test).join(format!("node{instance}-run{run}{suffix}.log"))
+}
+
+/// `text` without its ANSI escape sequences (`ESC [ parameters final-byte`), so node log lines
+/// read as plain `name=value` fields.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            plain.push(c);
+            continue;
+        }
+        if chars.next() == Some('[') {
+            // parameter and intermediate bytes, up to and including the final byte
+            for c in chars.by_ref() {
+                if ('@'..='~').contains(&c) {
+                    break;
+                }
+            }
+        }
+    }
+    plain
 }
 
 /// Advertise a validator's JSON-RPC endpoint on its worker record.
