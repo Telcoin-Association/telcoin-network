@@ -999,6 +999,7 @@ mod worker_fanout_tests {
             1,
             tn_types::ReputationScores::new(config.committee()),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         assert_eq!(empty.num_primary_batches(), 0);
         let expected = ConsensusOutput::new_with_subdag(empty.clone(), parent_hash, 19);
@@ -1029,6 +1030,7 @@ mod worker_fanout_tests {
             2,
             tn_types::ReputationScores::new(config.committee()),
             None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
         );
         let output =
             subscriber.fetch_batches(nonempty, parent_hash, 20).await.expect("nonempty output");
