@@ -117,7 +117,15 @@ async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::
         ..
     } = trusted_hub_network(hub_config.clone(), &tasks)?;
     let restarted_task = tokio::spawn(network.run());
-    restarted_hub.start_listening(hub_config.primary_address()).await?;
+    // The QUIC endpoint of the stopped hub keeps its UDP socket until its closed connections
+    // drain. Thus the first bind to the same address can fail, so retry it.
+    let hub_address = hub_config.primary_address();
+    wait_until(
+        Duration::from_secs(15),
+        "restarted hub binds the address of the stopped hub",
+        || async { Ok(restarted_hub.start_listening(hub_address.clone()).await.is_ok()) },
+    )
+    .await?;
     wait_until(
         Duration::from_secs(15),
         "trusted hub reconnects after outage and rotation",
