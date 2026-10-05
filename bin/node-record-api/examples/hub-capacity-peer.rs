@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use eyre::{eyre, Result};
+use eyre::{eyre, Result, WrapErr};
 use futures::{StreamExt, TryStreamExt};
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
@@ -403,7 +403,9 @@ impl Peer {
         let target = self.config.target;
         let records = futures::future::try_join_all(self.handles.clone().into_iter().map(
             |(role, handle)| async move {
-                let record = handle.get_node_record(target).await?;
+                let record = handle.get_node_record(target).await.wrap_err_with(|| {
+                    format!("records get_node_record swarm={} target={target:?}", role_name(role))
+                })?;
                 if require_rpc && matches!(role, NetworkType::Worker(_)) {
                     record
                         .info
@@ -431,7 +433,9 @@ impl Peer {
         settle_reconnects(targets.into_iter().map(|(role, handle, key)| async move {
             let peers = handle.connected_peers().await?;
             if peers.contains(&key) {
-                let record = handle.get_node_record(key).await?;
+                let record = handle.get_node_record(key).await.wrap_err_with(|| {
+                    format!("reconnect get_node_record swarm={} target={key:?}", role_name(role))
+                })?;
                 let peer: PeerId = record.info.pubkey.into();
                 handle.disconnect_peer(peer).await?;
                 connected(&handle, key, false).await?;
@@ -482,7 +486,9 @@ impl Peer {
                 async move {
                     match role {
                         NetworkType::Primary => {
-                            let frames = transfer(handle, target, PrimarySyncRequest::EpochPack { epoch }, limit).await?;
+                            let frames = transfer(handle, target, PrimarySyncRequest::EpochPack { epoch }, limit)
+                                .await
+                                .wrap_err_with(|| format!("sync transfer swarm={} source_epoch={epoch}", role_name(role)))?;
                             Ok::<_, eyre::Report>(json!({"swarm": role_name(role), "bytes": frames.iter().map(Vec::len).sum::<usize>(), "completed": true}))
                         }
                         NetworkType::Worker(_) => {
@@ -491,7 +497,9 @@ impl Peer {
                                     let handle = handle.clone();
                                     let batch_epochs = batch_epochs.clone();
                                     async move {
-                                        let data = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: requested.clone(), epoch: source_epoch }, limit).await?;
+                                        let data = transfer(handle, target, WorkerSyncRequest::Batches { batch_digests: requested.clone(), epoch: source_epoch }, limit)
+                                            .await
+                                            .wrap_err_with(|| format!("sync transfer swarm={} source_epoch={source_epoch}", role_name(role)))?;
                                         verify_worker_batches(&data, &requested, &batch_epochs)?;
                                         total.checked_add(data.iter().map(Vec::len).sum::<usize>())
                                             .filter(|bytes| *bytes <= 64 * 1024 * 1024)
@@ -572,9 +580,15 @@ async fn transfer<Request>(
 where
     Request: Serialize + serde::de::DeserializeOwned + Send + Sync + 'static,
 {
-    let mut stream = handle.open_stream(target).await??;
+    let mut stream = handle
+        .open_stream(target)
+        .await
+        .wrap_err("sync stream open outer channel")?
+        .wrap_err("sync stream open inner stream")?;
     let request = SyncFrame::Req(request);
-    write_frame(&mut stream, &request, &mut Vec::new(), &mut Vec::new(), limit).await?;
+    write_frame(&mut stream, &request, &mut Vec::new(), &mut Vec::new(), limit)
+        .await
+        .wrap_err("sync request write")?;
     let frames = futures::stream::try_unfold(
         (stream, Vec::new(), Vec::new(), false, false),
         move |(mut stream, mut plain, mut compressed, admitted, ended)| async move {
@@ -582,7 +596,9 @@ where
                 Ok(None)
             } else {
                 let frame: SyncFrame<Request> =
-                    read_frame(&mut stream, &mut plain, &mut compressed, limit).await?;
+                    read_frame(&mut stream, &mut plain, &mut compressed, limit)
+                        .await
+                        .wrap_err("sync response read")?;
                 match frame {
                     SyncFrame::Ack if !admitted => {
                         Ok(Some((None, (stream, plain, compressed, true, false))))
@@ -853,8 +869,10 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Mode::Run(args) => {
+            let filter = tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("network::identity=debug".parse()?);
             tracing_subscriber::fmt()
-                .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+                .with_env_filter(filter)
                 .with_ansi(false)
                 .with_writer(std::io::stderr)
                 .init();

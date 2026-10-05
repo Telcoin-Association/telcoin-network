@@ -812,6 +812,8 @@ impl PeerManager {
     ) -> bool {
         if self.peers.peer_banned(peer_id) {
             // log error if the peer is banned
+            tracing::debug!(target: "network::identity", event = "connection_registered",
+                ?peer_id, outcome = "banned");
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
         }
@@ -839,6 +841,8 @@ impl PeerManager {
             }
         }
 
+        tracing::debug!(target: "network::identity", event = "connection_registered",
+            ?peer_id, bls_key = ?self.peer_to_bls(peer_id));
         true
     }
 
@@ -1267,6 +1271,8 @@ impl PeerManager {
         let advertised: PeerId = info.pubkey.clone().into();
         if self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key) {
             if self.kad_record_is_stale(&bls_key, &info) {
+                tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                    ?source, ?advertised, ?bls_key, outcome = "stale");
                 trace!(
                     target: "peer-manager",
                     ?bls_key,
@@ -1275,8 +1281,12 @@ impl PeerManager {
                 );
                 return;
             }
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "accepted_known");
             self.cache_known_peer(bls_key, info);
         } else if source == advertised {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "accepted_self_owned");
             trace!(
                 target: "peer-manager",
                 ?bls_key,
@@ -1285,6 +1295,8 @@ impl PeerManager {
             );
             self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
         } else {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "not_self_owned");
             trace!(
                 target: "peer-manager",
                 ?bls_key,

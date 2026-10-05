@@ -126,9 +126,11 @@ impl AllPeers {
     /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
     fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
         let removed = self.peers.remove(identity);
-        if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
+        if let (PeerIdentity::Confirmed(bls_key), Some(peer)) = (identity, removed.as_ref()) {
             if let Some(peer_id) = peer.peer_id() {
-                self.bls_by_peer_id.remove(&peer_id);
+                let indexed_key = self.bls_by_peer_id.remove(&peer_id);
+                tracing::debug!(target: "network::identity", event = "identity_removed",
+                    ?peer_id, ?bls_key, ?indexed_key, outcome = "evicted");
             }
         }
         removed
@@ -223,8 +225,10 @@ impl AllPeers {
             peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
             self.banned_peers.add_banned_peer(&peer);
         }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        let previous_key = self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
+        tracing::debug!(target: "network::identity", event = "identity_confirmed",
+            ?peer_id, bls_key = ?bls_public_key, ?previous_key, outcome = "trusted");
     }
 
     /// Create a peer.
@@ -272,8 +276,10 @@ impl AllPeers {
         if carried {
             self.normalize_carried_status(&mut peer);
         }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        let previous_key = self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
+        tracing::debug!(target: "network::identity", event = "identity_confirmed",
+            ?peer_id, bls_key = ?bls_public_key, ?previous_key, outcome = "upserted");
     }
 
     /// Handle reported action.
@@ -345,7 +351,9 @@ impl AllPeers {
             && !self.peers.contains_key(&resolved)
         {
             error!(target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
-            self.bls_by_peer_id.remove(peer_id);
+            let indexed_key = self.bls_by_peer_id.remove(peer_id);
+            tracing::debug!(target: "network::identity", event = "identity_removed",
+                ?peer_id, ?indexed_key, outcome = "stale_index_repaired");
             PeerIdentity::Unidentified(*peer_id)
         } else {
             resolved

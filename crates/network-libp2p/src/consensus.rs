@@ -864,11 +864,23 @@ where
     /// Verify the address list in Record was signed by the key and the kad record's publisher
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
-        let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
+        let key = BlsPublicKey::from_literal_bytes(record.key.as_ref())
+            .inspect_err(|_| {
+                tracing::debug!(target: "network::identity", event = "record_classified",
+                    domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                    value_bytes = record.value.len(), outcome = "invalid_key");
+            })
+            .ok()?;
 
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
         let (pubkey, node_record) =
-            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
+            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)
+                .or_else(|| {
+                    tracing::debug!(target: "network::identity", event = "record_classified",
+                        domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                        value_bytes = record.value.len(), outcome = "decode_or_signature_failed");
+                    None
+                })?;
 
         // reject records advertising an implausible number of addresses: a legitimate record
         // carries a single address, so a large set is only ever an attempt to inflate the
@@ -876,6 +888,9 @@ where
         // attacker-chosen data admitted per record; the per-peer `MAX_MULTIADDRS_PER_PEER` cap is
         // what bounds accumulation across repeated records.
         if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
+            tracing::debug!(target: "network::identity", event = "record_classified",
+                domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                value_bytes = record.value.len(), outcome = "address_limit");
             warn!(
                 target: "network-kad",
                 count = node_record.info.multiaddrs.len(),
@@ -889,6 +904,9 @@ where
         // this prevents replay attacks where malicious nodes republish outdated records
         let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
         if record.publisher != Some(expected_peer_id) {
+            tracing::debug!(target: "network::identity", event = "record_classified",
+                domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                value_bytes = record.value.len(), outcome = "publisher_mismatch");
             warn!(
                 target: "network-kad",
                 "NodeRecord validation failed: publisher {:?} doesn't match network key (expected {:?})",
@@ -928,11 +946,13 @@ where
     fn publish_our_data_to_peer(&mut self, peer: PeerId) {
         let record = self.get_peer_record();
         info!(target: "network-kad", "Publishing our record to peer {peer:?}");
-        let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
+        let query_id = self.swarm.behaviour_mut().kademlia.put_record_to(
             record,
             vec![peer].into_iter(),
             kad::Quorum::One,
         );
+        tracing::debug!(target: "network::identity", event = "publication_enqueued",
+            domain = ?self.record_domain, ?peer, ?query_id);
     }
 
     /// Record that we have pushed our [`NodeRecord`] to `peer_id`, returning `true` the first time
@@ -1012,7 +1032,27 @@ where
             self.metrics.record_connection_limit_rejection();
         }
         match event {
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                cause,
+                num_established: 0,
+                ..
+            } => {
+                if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                    let (outcome, io_kind) =
+                        cause.as_ref().map_or(("no_error_cause", None), |cause| match cause {
+                            libp2p::swarm::ConnectionError::IO(error) => {
+                                ("io_error", Some(error.kind()))
+                            }
+                            libp2p::swarm::ConnectionError::KeepAliveTimeout => {
+                                ("keep_alive_timeout", None)
+                            }
+                        });
+                    tracing::debug!(target: "network::identity", event = "connection_closed",
+                        domain = ?self.record_domain, ?peer_id, ?connection_id,
+                        outcome, ?io_kind, remaining_connections = 0_u32);
+                }
                 // Connection-owned rows are gone at the receiver too. A reconnect needs a fresh
                 // direct advertisement even when the bounded publication cache saw this peer
                 // before.
@@ -1420,6 +1460,9 @@ where
                 if self.kad_record_queries.values().filter(|query| query.reply.is_some()).count()
                     >= 100
                 {
+                    tracing::debug!(target: "network::identity", event = "query_refused",
+                        domain = ?self.record_domain, target = ?key,
+                        outcome = "application_allocation_exhausted");
                     let _ = reply.send(Err(std::io::Error::other(
                         "application node-record query allocation exhausted",
                     )
@@ -1431,6 +1474,9 @@ where
                         query_id,
                         KadQuery { request: key, result: None, reply: Some(reply) },
                     );
+                    tracing::debug!(target: "network::identity", event = "query_open",
+                        domain = ?self.record_domain, ?query_id, target = ?key,
+                        application = true);
                 }
             }
             NetworkCommand::GetAllValidatorRpcs { reply } => {
@@ -1515,6 +1561,9 @@ where
                 if self.kad_record_queries.values().all(|query| query.request != key) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
+                    tracing::debug!(target: "network::identity", event = "query_open",
+                        domain = ?self.record_domain, query_id = ?id, target = ?key,
+                        application = false);
                 }
             });
     }
@@ -2200,6 +2249,9 @@ where
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
+                        tracing::debug!(target: "network::identity", event = "query_open",
+                            domain = ?self.record_domain, ?query_id, target = ?bls_key,
+                            application = false);
                     } else {
                         trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
                     }
@@ -2228,6 +2280,9 @@ where
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
                 if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                    tracing::debug!(target: "network::identity", event = "stream_identity",
+                        domain = ?self.record_domain, ?peer, bls_key = ?bls,
+                        outcome = "identified");
                     if let Err(e) = self
                         .event_stream
                         .try_send(NetworkEvent::InboundStream { peer: bls, stream })
@@ -2235,6 +2290,8 @@ where
                         error!(target: "network", ?e, "failed to forward inbound stream");
                     }
                 } else {
+                    tracing::debug!(target: "network::identity", event = "stream_identity",
+                        domain = ?self.record_domain, ?peer, outcome = "unidentified");
                     warn!(target: "network", ?peer, "received inbound stream from unknown peer");
                 }
             }
@@ -2301,6 +2358,10 @@ where
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
                     ))) => {
+                        tracing::debug!(target: "network::identity",
+                            event = if step.last { "query_terminal" } else { "query_progress" },
+                            domain = ?self.record_domain, ?query_id, outcome = "found_record",
+                            key_bytes = record.key.as_ref().len(), value_bytes = record.value.len());
                         if let Some((key, node_record)) = self.peer_record_valid(&record) {
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
                             // Only a matching requested key may supply a required store row. Query
@@ -2353,10 +2414,24 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
+                        tracing::debug!(target: "network::identity", event = "query_terminal",
+                            domain = ?self.record_domain, ?query_id, outcome = "no_additional_record");
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                         self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::GetRecord(Err(err)) => {
+                        if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                            let error_class = match &err {
+                                kad::GetRecordError::NotFound {
+                                    key: _key,
+                                    closest_peers: _closest_peers,
+                                } => "not_found",
+                                kad::GetRecordError::Timeout { key: _key } => "timeout",
+                            };
+                            tracing::debug!(target: "network::identity", event = "query_terminal",
+                                domain = ?self.record_domain, ?query_id,
+                                outcome = "get_record_failed", error_class);
+                        }
                         debug!(
                             target: "network-kad",
                             key = ?BlsPublicKey::from_literal_bytes(err.key().as_ref()),
@@ -2366,6 +2441,8 @@ where
                         self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                        tracing::debug!(target: "network::identity", event = "publication_outcome",
+                            domain = ?self.record_domain, ?query_id, outcome = "success");
                         debug!(
                             target: "network-kad",
                             key = ?BlsPublicKey::from_literal_bytes(key.as_ref()),
@@ -2373,6 +2450,23 @@ where
                         );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
+                        if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                            let error_class = match &err {
+                                kad::PutRecordError::QuorumFailed {
+                                    key: _key,
+                                    success: _success,
+                                    quorum: _quorum,
+                                } => "quorum_failed",
+                                kad::PutRecordError::Timeout {
+                                    key: _key,
+                                    success: _success,
+                                    quorum: _quorum,
+                                } => "timeout",
+                            };
+                            tracing::debug!(target: "network::identity", event = "publication_outcome",
+                                domain = ?self.record_domain, ?query_id,
+                                outcome = "failed", error_class);
+                        }
                         debug!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
@@ -2458,6 +2552,9 @@ where
         mut record: kad::Record,
     ) -> NetworkResult<()> {
         // check if source or publisher are banned
+        tracing::debug!(target: "network::identity", event = "advertisement_received",
+            domain = ?self.record_domain, ?source, publisher = ?record.publisher,
+            key_bytes = record.key.as_ref().len(), value_bytes = record.value.len());
         let publisher_is_banned = record
             .publisher
             .map(|peer| self.swarm.behaviour().peer_manager.peer_banned(&peer))
@@ -2466,6 +2563,9 @@ where
 
         // reject record
         if publisher_is_banned || source_is_banned {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                domain = ?self.record_domain, ?source, publisher_is_banned,
+                source_is_banned, outcome = "banned_or_missing_publisher");
             error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
             // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
             // with `StoreInserts::FilterBoth`, so this inbound record was never
@@ -2502,6 +2602,8 @@ where
         // message above the hard cutoff so a sustained flood promptly triggers disconnection.
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
+                tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                    domain = ?self.record_domain, ?source, outcome = "rate_flooding");
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
                 self.swarm
                     .behaviour_mut()
@@ -2509,6 +2611,8 @@ where
                     .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
             }
             PutRecordRate::Shed => {
+                tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                    domain = ?self.record_domain, ?source, outcome = "rate_shed");
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
             }
             PutRecordRate::Allowed => {
@@ -2528,6 +2632,8 @@ where
                             );
                     }
                     trace!(target: "network-kad", "Got record {key} {value:?}");
+                    tracing::debug!(target: "network::identity", event = "advertisement_validated",
+                        domain = ?self.record_domain, ?source, bls_key = ?key);
 
                     // Confirm before the fallible store write, including for equal or older records.
                     // The peer manager never reads the store. It caches the record for a committee
@@ -2750,6 +2856,9 @@ where
     fn close_kad_query(&mut self, query_id: &QueryId) {
         self.kad_record_queries.remove(query_id).into_iter().for_each(|query| {
             let KadQuery { request, result, reply } = query;
+            tracing::debug!(target: "network::identity", event = "query_close",
+                domain = ?self.record_domain, ?query_id, valid_record = result.is_some(),
+                application = reply.is_some());
             reply.into_iter().for_each(|reply| {
                 let outcome = result.clone().ok_or_else(|| {
                     std::io::Error::other("node-record query ended without a valid signed record")
