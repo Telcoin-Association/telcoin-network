@@ -3,6 +3,7 @@
 //! Process management, cleanup guards, and helpers used across all test modules.
 
 use alloy::{
+    eips::BlockNumberOrTag,
     primitives::{utils::parse_ether, Bytes},
     providers::{Provider, ProviderBuilder},
     sol_types::SolCall as _,
@@ -24,7 +25,8 @@ use secp256k1::{Keypair, Secp256k1, SecretKey};
 use serde_json::Value;
 use std::{
     cell::RefCell,
-    collections::HashMap,
+    collections::{btree_map::Entry, BTreeMap, HashMap},
+    convert::Infallible,
     fmt::Debug,
     io::{Read, Write},
     net::TcpStream,
@@ -43,16 +45,21 @@ use tn_reth::{
 };
 use tn_test_utils::{wait_until, wait_until_blocking};
 use tn_types::{
-    address, get_available_tcp_port, keccak256,
+    address,
+    forks::{
+        leader_seeded_ordering_fork_epoch_override, multi_workers_fork_active,
+        seed_signature_active, subsecond_timestamp_fork_epoch_override,
+    },
+    get_available_tcp_port, keccak256,
     test_utils::{init_test_tracing, CommandParser},
-    Address, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo,
+    Address, Epoch, EpochCertificate, EpochRecord, Genesis, GenesisAccount, NodeMode, RpcInfo,
     DEFAULT_WORKER_ID, U256,
 };
 use tokio::{
     runtime::Builder,
     time::{timeout, Instant},
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 /// Max number of e2e tests that can run concurrently.
 /// Each test spawns 4-6 node processes; limiting concurrency prevents resource exhaustion.
@@ -1483,10 +1490,239 @@ pub(crate) fn decode_key(key: &str) -> eyre::Result<(String, String, String)> {
 }
 
 // ---------------------------------------------------------------------------------------------
+// Fork pins
+// ---------------------------------------------------------------------------------------------
+
+/// Environment variable selecting the multi-workers fork epoch (issue #554) for this process
+/// and every node it spawns (`tn_types::forks::multi_workers_fork_epoch_override`).
+pub(crate) const MULTI_WORKERS_FORK_ENV: &str = "TN_MULTI_WORKERS_FORK_EPOCH";
+
+/// Environment variable selecting the seed-signature fork epoch (#1032) for this process and every
+/// node it spawns (`tn_types::forks::seed_signature_fork_epoch_override`).
+pub(crate) const SEED_SIGNATURE_FORK_ENV: &str = "TN_SEED_SIGNATURE_FORK_EPOCH";
+
+/// Environment variable selecting the leader-seeded-ordering fork epoch (#1260) for this process
+/// and every node it spawns (`tn_types::forks::leader_seeded_ordering_fork_epoch_override`).
+pub(crate) const LEADER_SEEDED_ORDERING_FORK_ENV: &str = "TN_LEADER_SEEDED_ORDERING_FORK_EPOCH";
+
+/// Environment variable selecting the sub-second-timestamp fork epoch for this process and every
+/// node it spawns (`tn_types::forks::subsecond_timestamp_fork_epoch_override`).
+pub(crate) const SUBSECOND_TIMESTAMP_FORK_ENV: &str = "TN_SUBSECOND_TIMESTAMP_FORK_EPOCH";
+
+/// Fork epoch for a test that crosses a fork inside its run: epoch 0 runs pre-fork, every later
+/// epoch post-fork.
+///
+/// The cross-fork sync tests, [`crate::epochs::test_epoch_sync_across_multi_workers_fork`] and
+/// [`crate::epochs::test_epoch_sync_across_leader_seeded_ordering_fork`], are why it is 1. The
+/// kill in [`crate::epochs::test_epoch_sync_inner`] happens after `loop_epochs` has watched three
+/// boundaries pass, so the epoch open at that point is at least 3 and the sealed set — which stops
+/// two below it, see [`crate::epochs::sealed_epochs`] — always covers epochs 0 and 1. Pinning a
+/// fork at 1 therefore guarantees those sealed packs straddle it: epoch 0 written pre-fork (the
+/// legacy single-worker committee layout, or the legacy DFS commit order), epoch 1 onward written
+/// post-fork.
+pub(crate) const CROSS_FORK_EPOCH: Epoch = 1;
+
+/// Pin four fork epochs for this process and every node it spawns: the multi-workers fork
+/// (issue #554), the seed-signature fork (#1032), the leader-seeded-ordering fork (#1260), and the
+/// sub-second-timestamp fork. The PREVRANDAO and governance-Safe forks are not pinned; see below.
+///
+/// Two helpers decode consensus data inside this process, and they reach three of those gates:
+/// [`crate::epochs::assert_sealed_packs_unchanged`] validates sealed pack bytes, and
+/// [`read_consensus_headers`] reads a stopped node's consensus chain. The `EpochMeta`'s
+/// [`tn_types::Committee`] is laid out by [`multi_workers_fork_active`], and every nested
+/// `ConsensusHeader` by [`seed_signature_active`] and by
+/// `tn_types::forks::subsecond_timestamp_active` (the millisecond fields of its sub-DAG and of
+/// the headers inside it). So the harness has to resolve all three to the same fork points the
+/// nodes wrote under. Left alone the two sides disagree the same way for the first two:
+/// `TestBinary::command` forwards `u32::MAX` to a child when the variable is unset, while this
+/// (non-adiri) harness build is active from genesis without it. Writing the variables settles
+/// both sides at once — children inherit them verbatim at spawn, and the harness's own overrides
+/// latch them on first read. The sub-second-timestamp fork's unset default already agrees
+/// (`TestBinary::command` forwards `0`, and this build is active from genesis), so its pin is
+/// what carries a forced fork point to both sides and turns a latched-earlier override into a
+/// named failure. The leader-seeded-ordering fork changes no serialized layout, only the commit
+/// order nodes write inside a pack, so neither decoder consults it; it is pinned here for the
+/// children (and against a latched-earlier override), with the always-armed `0` default
+/// `TestBinary::command` forwards for it.
+///
+/// All four are pinned, not just the one a given test is about. Pinning only some leaves the rest
+/// asymmetric whenever the suite runs outside the Makefile wrapper that exports them, and the
+/// symptom is misleading: children write dormant-layout headers, the harness decodes them as
+/// genesis-active, and the decoder reports a corrupt pack rather than an environment mismatch.
+///
+/// The other two forks cannot put the harness and the nodes at odds. PREVRANDAO changes only the
+/// executed block's `mix_hash`, which neither decoder reads and no e2e test checks, so children
+/// run whatever `TestBinary::command` forwards: the lane's `TN_PREVRANDAO_FORK_EPOCH`, else the
+/// dormant `u32::MAX`. Everything the governance-Safe fork is made of is `adiri`-gated, so it is
+/// compiled out of this harness and of the default e2e node binary; only the
+/// `make test-e2e-governance-safe` lane runs it, and that lane runs `test_governance_safe_fork`
+/// alone.
+///
+/// Each `force_*` argument states that fork epoch outright, for a test whose claim is about a
+/// specific boundary. `None` inherits whatever the lane exported, defaulting to what
+/// `TestBinary::command` would have forwarded anyway (the dormant `u32::MAX`, or `0` for the
+/// leader-seeded-ordering and sub-second-timestamp forks), so
+/// `TN_MULTI_WORKERS_FORK_EPOCH=1 make test-epochs` keeps meaning what it says.
+///
+/// Call once per test, before the first node spawn and before anything in the process reads any
+/// gate: the overrides are process-wide `OnceLock`s and the environment is process-wide too. That
+/// is sound because nextest runs each test in its own process (`.config/nextest.toml`). Under
+/// plain `cargo test`, two of these tests in one process would fight over it, and a later pin
+/// would re-point the environment an already-running test spawns its nodes with. So only the
+/// first pin in a process is allowed ([`FORKS_PINNED_BY`]); any later one fails at once, before
+/// touching the environment, naming the test that holds the pins.
+pub(crate) fn pin_fork_epochs(
+    force_multi_workers: Option<Epoch>,
+    force_seed_signature: Option<Epoch>,
+    force_leader_seeded: Option<Epoch>,
+    force_subsecond: Option<Epoch>,
+) {
+    claim_fork_pins();
+
+    // what `TestBinary::command` would forward to a child: the value the lane exported, or the
+    // stated per-fork default when it exported nothing. an unparseable value normalizes to the
+    // same default the gate would have fallen back to.
+    let lane = |var: &str, default: Epoch| -> Epoch {
+        std::env::var(var).ok().and_then(|raw| raw.trim().parse().ok()).unwrap_or(default)
+    };
+
+    // one shared helper rather than a block per fork, mirroring `TestBinary::command`, so the
+    // forks cannot drift apart in mechanism; they arm independently, so each carries its own gate
+    pin_fork_epoch(
+        MULTI_WORKERS_FORK_ENV,
+        force_multi_workers.unwrap_or_else(|| lane(MULTI_WORKERS_FORK_ENV, u32::MAX)),
+        multi_workers_fork_active,
+    );
+    pin_fork_epoch(
+        SEED_SIGNATURE_FORK_ENV,
+        force_seed_signature.unwrap_or_else(|| lane(SEED_SIGNATURE_FORK_ENV, u32::MAX)),
+        seed_signature_active,
+    );
+    // the leader-seeded gate (`leader_seeded_ordering_active`) conjoins the seed-signature fork
+    // fail-closed, so asserting through the gate would entangle this pin with the seed pin's
+    // value: with the seed fork dormant the gate reads false at every epoch, pinned or not. pin
+    // through the conjunct-free override reader instead; same latched-earlier failure mode.
+    pin_fork_epoch_override(
+        LEADER_SEEDED_ORDERING_FORK_ENV,
+        force_leader_seeded.unwrap_or_else(|| lane(LEADER_SEEDED_ORDERING_FORK_ENV, 0)),
+        leader_seeded_ordering_fork_epoch_override,
+    );
+    // `subsecond_timestamp_active` conjoins the seed-signature fork the same way, so this pin
+    // goes through its conjunct-free override reader for the same reason
+    pin_fork_epoch_override(
+        SUBSECOND_TIMESTAMP_FORK_ENV,
+        force_subsecond.unwrap_or_else(|| lane(SUBSECOND_TIMESTAMP_FORK_ENV, 0)),
+        subsecond_timestamp_fork_epoch_override,
+    );
+}
+
+/// The test (libtest names each test's thread after it) that pinned this process's fork epochs.
+static FORKS_PINNED_BY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Claim this process's fork pins for the current test, or fail with how to run the tests apart.
+fn claim_fork_pins() {
+    let me = std::thread::current().name().unwrap_or("<unnamed test>").to_string();
+    let holder = FORKS_PINNED_BY.get_or_init(|| me.clone());
+    assert_eq!(
+        holder, &me,
+        "fork epochs are process-wide and `{holder}` already pinned them in this process, so \
+         `{me}` cannot run here. Run each e2e test in its own process: nextest \
+         (`make test-e2e` / `make test-epochs`), or `cargo test -p e2e-tests --test it -- \
+         <test> --exact --include-ignored`"
+    );
+}
+
+/// Write `fork_epoch` to the `var` override and check `gate` reads the same fork point back.
+///
+/// Reading the gate here, rather than leaving it to whatever decodes a pack minutes later, is what
+/// turns an override that latched before this pin into a named failure instead of a corrupt-looking
+/// pack. A failed pin puts `var` back the way it found it before panicking (see
+/// [`restore_fork_override`]).
+pub(crate) fn pin_fork_epoch(var: &str, fork_epoch: Epoch, gate: impl Fn(Epoch) -> bool) {
+    let previous = std::env::var_os(var);
+    std::env::set_var(var, fork_epoch.to_string());
+
+    // The gate is `>=`, so it fires at the fork epoch and nowhere below it; both checks hold for
+    // the dormant pin too, since `u32::MAX >= u32::MAX`.
+    let active_at_fork = gate(fork_epoch);
+    let dormant_below = fork_epoch.checked_sub(1).is_none_or(|below| !gate(below));
+    if !(active_at_fork && dormant_below) {
+        restore_fork_override(var, previous);
+    }
+    assert!(
+        active_at_fork,
+        "harness gate must be active at the pinned fork epoch {fork_epoch}: {var} latched to \
+         another value before this test pinned it"
+    );
+    assert!(
+        dormant_below,
+        "harness gate must be dormant below the pinned fork epoch {fork_epoch}: {var} latched \
+         to another value before this test pinned it"
+    );
+    info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
+}
+
+/// Write `fork_epoch` to the `var` override and check the override reader `read` latched it.
+///
+/// The [`pin_fork_epoch`] variant for a fork whose public gate conjoins another fork (the
+/// leader-seeded ordering conjoins the seed signature): the gate cannot witness this pin on its
+/// own, but equality on the conjunct-free override reader gives callers the same guarantee, an
+/// override that latched before this pin becomes a named failure instead of nodes silently
+/// running a different fork point than the test states. A failed pin puts `var` back the way it
+/// found it before panicking (see [`restore_fork_override`]).
+pub(crate) fn pin_fork_epoch_override(
+    var: &str,
+    fork_epoch: Epoch,
+    read: impl Fn() -> Option<Epoch>,
+) {
+    let previous = std::env::var_os(var);
+    std::env::set_var(var, fork_epoch.to_string());
+
+    let latched = read();
+    if latched != Some(fork_epoch) {
+        restore_fork_override(var, previous);
+    }
+    assert_eq!(
+        latched,
+        Some(fork_epoch),
+        "harness override must read back the pinned fork epoch {fork_epoch}: {var} latched to \
+         another value before this test pinned it"
+    );
+    info!(target: "epoch-test", var, fork_epoch, "pinned a fork epoch");
+}
+
+/// Put the `var` override back to `previous`, what it held before a pin wrote it: the old value,
+/// or unset when it had none.
+///
+/// A pin that fails must not leave its value behind. The environment is process-wide, and
+/// [`acquire_test_permit`] admits two e2e tests into one process under a single-process runner
+/// (plain `cargo test`), so a failed pin's value would otherwise reach the other test's later node
+/// spawns through `TestBinary::command` and fail that test with an error about its own network.
+/// The check cannot run before the write instead: the override readers latch on first read, so
+/// peeking would latch the old value and make the pin fail.
+fn restore_fork_override(var: &str, previous: Option<std::ffi::OsString>) {
+    match previous {
+        Some(value) => std::env::set_var(var, value),
+        None => std::env::remove_var(var),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Commit-time, metrics and consensus-chain readers
 // ---------------------------------------------------------------------------------------------
 
-/// One `tn_getBlockTimestampMillis` response, parsed out of its hex-encoded JSON.
+/// How long a block walk waits for any one RPC answer before it fails naming the node and block.
+///
+/// A node that accepts a connection and never answers would otherwise hold the walk until
+/// nextest's terminate-after kill (`.config/nextest.toml`), with no message naming the node. Ten
+/// seconds matches `call_rpc`'s request timeout and is far above what a local node takes to
+/// serve one block.
+pub(crate) const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// One execution block's commit time: its `tn_getBlockTimestampMillis` response, parsed out of
+/// its hex-encoded JSON, plus whether `eth_getBlockByNumber` marks the block as closing an epoch.
+///
+/// [`walk_block_commit_times`] builds these after checking each one against the block.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct BlockCommitTime {
     /// The execution block's number.
@@ -1504,21 +1740,41 @@ pub(crate) struct BlockCommitTime {
     /// The digest of that consensus header, which is the block's `parentBeaconBlockRoot`; `None`
     /// for genesis.
     pub(crate) consensus_digest: Option<tn_types::B256>,
+    /// Whether the block closes an epoch, read from the execution block rather than from
+    /// `tn_getBlockTimestampMillis`, which does not report it.
+    ///
+    /// A block closes an epoch when it is the last block of the epoch's closing output. The node
+    /// marks it by storing the closing epoch's 32-byte seed in `extra_data`, which every other
+    /// block leaves empty (`TNBlockAssembler::assemble_block` in
+    /// `crates/tn-reth/src/evm/block.rs`, read back on replay by `context_for_block` in
+    /// `crates/tn-reth/src/evm/config.rs`).
+    pub(crate) closes_epoch: bool,
 }
 
-/// Fetch and parse `tn_getBlockTimestampMillis` for execution block `block_number`.
+/// Fetch and parse `tn_getBlockTimestampMillis` for execution block `block_number`, which
+/// `closes_epoch` says whether it closes an epoch (the caller has read that from the block).
 ///
 /// The node answers `null` for a block it does not know, so callers should only ask for heights
 /// at or below the node's head. A `null` answer, a missing required field, or a malformed one is an
 /// error naming the field. The two consensus fields are optional in the response (genesis has
-/// neither), so only a present-but-malformed value fails for them.
-pub(crate) async fn get_block_commit_time<P: Provider>(
+/// neither), so only a present-but-malformed value fails for them. No answer within
+/// [`RPC_REQUEST_TIMEOUT`] is an error naming the block.
+async fn get_block_commit_time<P: Provider>(
     provider: &P,
     block_number: u64,
+    closes_epoch: bool,
 ) -> eyre::Result<BlockCommitTime> {
-    let response: Option<Value> = provider
-        .raw_request("tn_getBlockTimestampMillis".into(), (format!("0x{block_number:x}"),))
-        .await?;
+    let response: Option<Value> = timeout(
+        RPC_REQUEST_TIMEOUT,
+        provider.raw_request("tn_getBlockTimestampMillis".into(), (format!("0x{block_number:x}"),)),
+    )
+    .await
+    .map_err(|_| {
+        eyre::eyre!(
+            "tn_getBlockTimestampMillis for block {block_number} got no answer within \
+             {RPC_REQUEST_TIMEOUT:?}"
+        )
+    })??;
     let response = response.ok_or_else(|| {
         eyre::eyre!("tn_getBlockTimestampMillis returned null for block {block_number}")
     })?;
@@ -1556,7 +1812,160 @@ pub(crate) async fn get_block_commit_time<P: Provider>(
             .ok_or_else(|| malformed("subSecond"))?,
         consensus_number,
         consensus_digest,
+        closes_epoch,
     })
+}
+
+/// Check the sub-second timestamp invariants `provider` (the RPC of `node`) serves for every
+/// execution block in `blocks`, and return each block's commit time in block order.
+///
+/// Per block, `tn_getBlockTimestampMillis` must describe the block `eth_getBlockByNumber` returns
+/// (number, hash and `timestamp`); the `timestamp` must equal the commit time floored to whole
+/// seconds and be no smaller than the previous walked block's; and the consensus digest must be
+/// the block's `parentBeaconBlockRoot`, with genesis (block 0, which has neither) the only
+/// exception. Blocks built from one consensus output name the same consensus header there and
+/// must report the same commit time. The node reads that time from the header the digest names,
+/// so this last check mostly restates the lookup, and how many blocks shared a header is logged,
+/// not required.
+///
+/// The walk requires no coverage: it passes for a range that is all pre-fork, all post-fork, or
+/// holds no epoch boundary, so the caller states which cases its run must contain (see
+/// `crate::epochs::assert_block_commit_times`). `blocks` is an argument rather than genesis to
+/// head so a node restored from a snapshot, which serves nothing below its restore floor, can be
+/// walked from there; the first walked block is not compared with its parent. Every block in
+/// `blocks` must be at or below the node's head, and each RPC request gets
+/// [`RPC_REQUEST_TIMEOUT`].
+pub(crate) async fn walk_block_commit_times<P: Provider>(
+    provider: &P,
+    node: &str,
+    blocks: RangeInclusive<u64>,
+) -> eyre::Result<Vec<BlockCommitTime>> {
+    eyre::ensure!(!blocks.is_empty(), "{node}: no block to walk in {blocks:?}");
+    let mut served: Vec<BlockCommitTime> = Vec::new();
+    let mut by_beacon_root: BTreeMap<tn_types::B256, u64> = BTreeMap::new();
+    let mut shared_root_blocks = 0usize;
+    for number in blocks.clone() {
+        let block = timeout(
+            RPC_REQUEST_TIMEOUT,
+            provider.get_block_by_number(BlockNumberOrTag::Number(number)),
+        )
+        .await
+        .map_err(|_| {
+            eyre::eyre!(
+                "{node} did not answer eth_getBlockByNumber for block {number} within \
+                         {RPC_REQUEST_TIMEOUT:?}"
+            )
+        })??
+        .ok_or_else(|| eyre::eyre!("{node} has no block {number} of {blocks:?}"))?;
+        let commit = get_block_commit_time(provider, number, !block.header.extra_data.is_empty())
+            .await
+            .map_err(|e| eyre::eyre!("{node}: {e}"))?;
+        let context = format!("{node} block {number}: {commit:?}");
+        eyre::ensure!(
+            commit.block_number == number
+                && commit.block_hash == block.header.hash
+                && commit.timestamp == block.header.timestamp,
+            "tn_getBlockTimestampMillis disagrees with eth_getBlockByNumber (hash {}, timestamp \
+             {}): {context}",
+            block.header.hash,
+            block.header.timestamp,
+        );
+        eyre::ensure!(
+            commit.timestamp == commit.timestamp_millis / 1000,
+            "EVM timestamp is not the consensus commit time floored to seconds: {context}"
+        );
+        if let Some(parent) = served.last() {
+            eyre::ensure!(
+                commit.timestamp >= parent.timestamp,
+                "EVM timestamp went backwards from block {} at {}: {context}",
+                parent.block_number,
+                parent.timestamp,
+            );
+        }
+        // genesis carries the eip-4788 field zeroed; every later block names its consensus header
+        match block.header.parent_beacon_block_root.filter(|root| !root.is_zero()) {
+            None => eyre::ensure!(
+                number == 0 && commit.consensus_digest.is_none(),
+                "execution block without a consensus header: {context}"
+            ),
+            Some(root) => {
+                eyre::ensure!(
+                    commit.consensus_digest == Some(root),
+                    "consensusDigest is not the parentBeaconBlockRoot {root}: {context}"
+                );
+                match by_beacon_root.entry(root) {
+                    Entry::Vacant(entry) => {
+                        entry.insert(commit.timestamp_millis);
+                    }
+                    Entry::Occupied(entry) => {
+                        eyre::ensure!(
+                            *entry.get() == commit.timestamp_millis,
+                            "blocks from consensus header {root} report different commit times \
+                             ({} ms earlier): {context}",
+                            entry.get(),
+                        );
+                        shared_root_blocks += 1;
+                    }
+                }
+            }
+        }
+        served.push(commit);
+    }
+    info!(
+        target: "epoch-test",
+        node,
+        first = blocks.start(),
+        last = blocks.end(),
+        consensus_headers = by_beacon_root.len(),
+        shared_root_blocks,
+        "execution block commit times verified",
+    );
+    Ok(served)
+}
+
+/// Assert every node reports the same block and commit time at every height it shares with the
+/// first node, the reference; `served[i]` is the walk of `nodes[i]`.
+///
+/// Both derive from consensus output alone, so a disagreement at a shared height is a fork in the
+/// execution chain (the hash) or in the commit-time derivation (the milliseconds). Blocks are
+/// matched by number rather than by position, so walks that start at different heights (a node
+/// restored from a snapshot starts at its floor) still line up. A node that shares no height with
+/// the reference fails, since comparing nothing would pass without checking anything.
+pub(crate) fn assert_nodes_agree_on_commit_times(
+    served: &[Vec<BlockCommitTime>],
+    nodes: &[String],
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        served.len() == nodes.len(),
+        "{} block walks for {} nodes: every walk needs the node it came from",
+        served.len(),
+        nodes.len(),
+    );
+    let Some((reference, others)) = served.split_first() else {
+        return Ok(());
+    };
+    let reference: BTreeMap<u64, &BlockCommitTime> =
+        reference.iter().map(|commit| (commit.block_number, commit)).collect();
+    for (other, node) in others.iter().zip(nodes.iter().skip(1)) {
+        let mut shared = 0usize;
+        for actual in other {
+            let Some(&expected) = reference.get(&actual.block_number) else { continue };
+            eyre::ensure!(
+                expected == actual,
+                "{node} disagrees with {} at block {}: {actual:?} vs {expected:?}",
+                nodes[0],
+                expected.block_number,
+            );
+            shared += 1;
+        }
+        eyre::ensure!(
+            shared > 0,
+            "{node} served no block number that {} also served, so their commit times were never \
+             compared",
+            nodes[0],
+        );
+    }
+    Ok(())
 }
 
 /// Read the value of the prometheus series `name` from the metrics endpoint at `addr` (the
@@ -1625,6 +2034,10 @@ fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
 /// starts at number 1, since the genesis header (number 0) is never stored. Any number in between
 /// that the chain cannot serve is an error, so a gap fails the read instead of shortening the
 /// walk.
+///
+/// The headers are decoded in this process, under its own fork gates, so this process must sit on
+/// the same fork epochs as the nodes that wrote them; [`pin_fork_epochs`] establishes that, and a
+/// test that reads headers without it can see a decode error that looks like a corrupt pack.
 pub(crate) async fn read_consensus_headers(
     datadir: &Path,
 ) -> eyre::Result<Vec<tn_types::ConsensusHeader>> {
@@ -1664,4 +2077,172 @@ pub(crate) async fn read_consensus_headers(
         headers.push(header);
     }
     Ok(headers)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Light transaction load and the EVM-timestamp clamp counter
+// ---------------------------------------------------------------------------------------------
+
+/// Prometheus series of the engine counter `tn_engine.evm_timestamp_clamped_total`.
+///
+/// The engine bumps it whenever it raises an EVM `timestamp` to its parent's. Consensus is meant
+/// to produce non-decreasing commit times on its own, so a non-zero reading in
+/// [`crate::epochs::test_epoch_subsecond_timestamps_across_fork`] is a consensus bug. On a real
+/// network the first commits of epoch 0 can also be raised, when the validators' clocks lag the
+/// genesis timestamp, but not in that test: it keeps epoch 0 pre-fork
+/// ([`crate::epochs::SUBSECOND_FORK_EPOCH`]), where the engine never clamps, and it stamps genesis
+/// from the host clock the nodes share, before they start.
+pub(crate) const EVM_TIMESTAMP_CLAMPED_SERIES: &str = "tn_engine_evm_timestamp_clamped_total";
+
+/// Pause between rounds of [`drive_light_tx_load`].
+pub(crate) const LIGHT_LOAD_INTERVAL: Duration = Duration::from_millis(750);
+
+/// Keep a light transaction load on every node until the caller drops this future.
+///
+/// Each round sends one transfer from `senders[i]` to `providers[i]`, so every worker regularly
+/// seals a batch of its own and a single commit often carries batches from several workers; the
+/// execution blocks built from such a commit share a `parentBeaconBlockRoot`, which is what the
+/// per-header commit-time check in [`walk_block_commit_times`] compares.
+///
+/// [`crate::epochs::assert_block_commit_times`] requires blocks inside post-fork epochs, which only
+/// this load produces, so a sender must survive a rejected transfer. Signing has already advanced
+/// its nonce, and without a resync every later transfer from it would wait behind the gap. After a
+/// rejection the sender takes its next nonce from the node before it sends again. Each rejection is
+/// logged at warn and each resync at info (`light-load sender nonce resynced`).
+pub(crate) async fn drive_light_tx_load<P: Provider>(
+    providers: &[P],
+    senders: &mut [TransactionFactory],
+    chain: Arc<RethChainSpec>,
+) -> Infallible {
+    let sink = Address::from_slice(&[0x5e; 20]);
+    let mut stale_nonces = vec![false; senders.len()];
+    loop {
+        for ((provider, sender), stale) in
+            providers.iter().zip(senders.iter_mut()).zip(stale_nonces.iter_mut())
+        {
+            let address = sender.address();
+            if *stale {
+                // take the next nonce from the count the node has executed. while earlier
+                // transfers are still pooled that count trails them, so the next send repeats a
+                // pooled nonce and is rejected, and the sender resyncs each round until they
+                // execute. a sender whose resync fails sits the round out rather than sign past
+                // the gap
+                match provider.get_transaction_count(address).await {
+                    Ok(nonce) => {
+                        sender.set_nonce(nonce);
+                        *stale = false;
+                        info!(
+                            target: "epoch-test",
+                            sender = %address,
+                            nonce,
+                            "light-load sender nonce resynced",
+                        );
+                    }
+                    Err(error) => {
+                        warn!(
+                            target: "epoch-test",
+                            %error,
+                            sender = %address,
+                            "light-load sender nonce resync failed",
+                        );
+                        continue;
+                    }
+                }
+            }
+            let tx = sender.create_eip1559_encoded(
+                chain.clone(),
+                None,
+                100,
+                Some(sink),
+                U256::from(1),
+                Bytes::new(),
+            );
+            if let Err(error) = provider.send_raw_transaction(&tx).await {
+                warn!(
+                    target: "epoch-test",
+                    %error,
+                    sender = %address,
+                    "light-load transfer rejected",
+                );
+                // signing advanced the factory past the rejected nonce whether or not the node
+                // took the transfer
+                *stale = true;
+            }
+        }
+        tokio::time::sleep(LIGHT_LOAD_INTERVAL).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{pin_fork_epoch, pin_fork_epoch_override};
+    use std::{
+        cell::Cell,
+        panic::{catch_unwind, AssertUnwindSafe},
+    };
+    use tn_types::Epoch;
+
+    /// A variable no fork override reads, so the probe below cannot move a real fork point.
+    const PROBE: &str = "TN_TEST_PIN_LEAK_PROBE";
+
+    /// A pin that fails its check puts the variable back the way it found it before it panics: a
+    /// variable that was unset is unset again, and one that held a value holds it again. Each
+    /// failing check also records what the variable held while it ran, which shows the pin had
+    /// written its own epoch first, so the restore is what removed it. A pin whose check passes
+    /// keeps its value, so the restore belongs to the failure path alone.
+    ///
+    /// This is a plain `#[test]` rather than an ignored e2e test because it spawns no node and
+    /// needs no node binary, so the default `cargo nextest run --workspace` lane can run it on
+    /// every change. The ignored lanes would not catch a regression anyway: nextest gives each of
+    /// those tests its own process, where a leaked variable has no other test to reach.
+    #[test]
+    fn pin_leak_failed_pin_restores_the_variable() {
+        const PINNED: Epoch = 3;
+        let seen: Cell<Option<String>> = Cell::new(None);
+        let seen = &seen;
+        // an override reader that latched `latched` before the pin ran
+        let reader = move |latched: Epoch| {
+            move || {
+                seen.set(std::env::var(PROBE).ok());
+                Some(latched)
+            }
+        };
+
+        std::env::remove_var(PROBE);
+        let pinned =
+            catch_unwind(AssertUnwindSafe(|| pin_fork_epoch_override(PROBE, PINNED, reader(4))));
+        assert!(pinned.is_err(), "a pin whose override reads back another epoch must panic");
+        assert_eq!(seen.take().as_deref(), Some("3"), "the pin did not write before checking");
+        assert_eq!(std::env::var_os(PROBE), None, "a failed pin left an unset variable set");
+
+        std::env::set_var(PROBE, "7");
+        let pinned =
+            catch_unwind(AssertUnwindSafe(|| pin_fork_epoch_override(PROBE, PINNED, reader(7))));
+        assert!(pinned.is_err(), "a pin whose override reads back another epoch must panic");
+        assert_eq!(seen.take().as_deref(), Some("3"), "the pin did not write before checking");
+        assert_eq!(
+            std::env::var(PROBE).as_deref(),
+            Ok("7"),
+            "a failed pin did not restore the value it overwrote"
+        );
+
+        // the gate-checked pin restores the same way; this gate is dormant at every epoch
+        let dormant_gate = |_: Epoch| {
+            seen.set(std::env::var(PROBE).ok());
+            false
+        };
+        let pinned = catch_unwind(AssertUnwindSafe(|| pin_fork_epoch(PROBE, PINNED, dormant_gate)));
+        assert!(pinned.is_err(), "a pin whose gate is dormant at the fork epoch must panic");
+        assert_eq!(seen.take().as_deref(), Some("3"), "the pin did not write before checking");
+        assert_eq!(
+            std::env::var(PROBE).as_deref(),
+            Ok("7"),
+            "a failed gate-checked pin did not restore the value it overwrote"
+        );
+
+        pin_fork_epoch_override(PROBE, PINNED, reader(PINNED));
+        assert_eq!(std::env::var(PROBE).as_deref(), Ok("3"), "a passing pin lost its value");
+
+        std::env::remove_var(PROBE);
+    }
 }
