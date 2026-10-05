@@ -1237,6 +1237,32 @@ impl PeerManager {
         }
     }
 
+    /// Expired proofs can only confirm a new anonymous public identity.
+    /// Existing peer bindings and configured or learned authority records remain unchanged.
+    pub(crate) fn can_confirm_expired_public_identity(
+        &self,
+        source: &PeerId,
+        bls_key: &BlsPublicKey,
+    ) -> bool {
+        self.peer_to_bls(source).is_none()
+            && !self.peers.has_confirmed_identity(bls_key)
+            && !self.known_peers.contains_key(bls_key)
+            && !self.peers.is_committee_member(bls_key)
+            && !self.pinned_peers.contains(bls_key)
+    }
+
+    /// Confirm a fully validated live source without learning expired address or RPC metadata.
+    pub(crate) fn confirm_expired_public_identity(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        if self.can_confirm_expired_public_identity(&source, &bls_key) {
+            self.peers.upsert_peer(bls_key, info.pubkey, Vec::new());
+        }
+    }
+
     /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
     /// whose `source` is the sending peer).
     ///

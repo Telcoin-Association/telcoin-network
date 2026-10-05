@@ -1328,6 +1328,9 @@ where
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
             }
+            NetworkCommand::IsPeerConnected { peer_id, reply } => {
+                send_or_log_error!(reply, self.swarm.is_connected(&peer_id), "IsPeerConnected");
+            }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour().peer_manager.peer_score(&peer_id);
                 send_or_log_error!(reply, opt_score, "PeerScore");
@@ -2616,7 +2619,24 @@ where
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
             }
             PutRecordRate::Allowed => {
-                self.peer_record_valid(&record).map(|(key, value)| {
+                self.peer_record_valid(&record).and_then(|(key, value)| {
+                    // Publisher validation binds the signed advertised network key. DHT expiry
+                    // still permits a live self-owned identity proof, without storage ownership.
+                    if record.is_expired(Instant::now()) {
+                        let live_self_owned = record.publisher == Some(source)
+                            && self.swarm.is_connected(&source)
+                            && self.swarm.behaviour().peer_manager.is_connected(&source);
+                        if live_self_owned {
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .confirm_expired_public_identity(source, key, value.info);
+                        }
+                        None
+                    } else {
+                        Some((key, value))
+                    }
+                }).map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
 
                     let freshness = self.record_freshness(&record);

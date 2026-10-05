@@ -18,6 +18,50 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = [
+    ("filtered_expired_identity_delivery", "patches/libp2p-kad/src/behaviour.rs",
+     "if !record.is_expired(now) || matches!(self.record_filtering, StoreInserts::FilterBoth) {",
+     "if !record.is_expired(now) {",
+     "filtered_expired_record_reaches_application_without_storage"),
+    ("expired_identity_storage_separation", "crates/network-libp2p/src/consensus.rs",
+     "if record.is_expired(Instant::now()) {",
+     "if std::hint::black_box(false) && record.is_expired(Instant::now()) {",
+     "expired_kad_live_self_identity_is_confirmed_without_storage"),
+    ("expired_identity_source_binding", "crates/network-libp2p/src/consensus.rs",
+     "let live_self_owned = record.publisher == Some(source)",
+     "let live_self_owned = true",
+     "expired_kad_relay_cannot_replace_pinned_or_own_record"),
+    ("expired_identity_physical_source", "crates/network-libp2p/src/consensus.rs",
+     "&& self.swarm.is_connected(&source)\n                            && self.swarm.behaviour().peer_manager.is_connected(&source)",
+     "&& true\n                            && self.swarm.behaviour().peer_manager.is_connected(&source)",
+     "expired_kad_requires_physical_source_connection"),
+    ("expired_identity_pending_ban", "crates/network-libp2p/src/consensus.rs",
+     "&& self.swarm.behaviour().peer_manager.is_connected(&source)",
+     "&& true",
+     "expired_kad_pending_protocol_ban_cannot_promote_identity"),
+    ("expired_identity_configured_cache", "crates/network-libp2p/src/peers/manager.rs",
+     "if self.can_confirm_expired_public_identity(&source, &bls_key) {",
+     "if { let _eligible = self.can_confirm_expired_public_identity(&source, &bls_key); true } {",
+     "expired_kad_configured_key_claim_preserves_binding_and_cache"),
+    ("expired_identity_existing_public_binding", "crates/network-libp2p/src/peers/manager.rs",
+     "!self.peers.has_confirmed_identity(bls_key)",
+     "{ let _occupied = self.peers.has_confirmed_identity(bls_key); true }",
+     "expired_kad_existing_public_identity_cannot_be_rotated"),
+    ("expired_identity_address_metadata", "crates/network-libp2p/src/peers/manager.rs",
+     "self.peers.upsert_peer(bls_key, info.pubkey, Vec::new());",
+     "self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);",
+     "expired_kad_live_self_identity_is_confirmed_without_storage"),
+    ("physical_query_pool_state", "crates/network-libp2p/src/consensus.rs",
+     'self.swarm.is_connected(&peer_id), "IsPeerConnected"',
+     'self.swarm.behaviour().peer_manager.connected_peers().contains(&peer_id), "IsPeerConnected"',
+     "physical_peer_query_waits_for_last_connection_close"),
+    ("reconnect_physical_close", "bin/node-record-api/examples/hub-capacity-peer.rs",
+     "disconnected(handle, target, peer).await?;",
+     "let _disconnected = disconnected; connected(handle, target, false).await?;",
+     "reconnect_waits_for_physical_close_before_redial"),
+    ("reconnect_identity_close", "bin/node-record-api/examples/hub-capacity-peer.rs",
+     "!peers.contains(&target) && !physically_connected",
+     "{ let _logical_close = !peers.contains(&target); !physically_connected }",
+     "reconnect_waits_for_physical_close_before_redial"),
     ("trusted_live_connection_state", "crates/network-libp2p/src/peers/all_peers.rs",
      ".for_each(|record| peer.retain_connection_state(record));",
      ".for_each(|_| { let _retain_connection_state: fn(&mut Peer, &Peer) = Peer::retain_connection_state; });",
@@ -148,9 +192,16 @@ def mutation_commands(relative, regression):
     package = tomllib.loads(manifests[0].read_text()).get("package", {}).get("name")
     if not package:
         raise ValueError("mutation source must have an owning Cargo package")
-    compile_argv = ["cargo", "+1.94", "test", "--locked", "-p", package, "--no-run"]
-    test_argv = ["cargo", "+1.94", "nextest", "run", "--locked", "-p", package,
+    excluded = tomllib.loads((repository / "Cargo.toml").read_text()).get("workspace", {}).get("exclude", [])
+    standalone = manifests[0].parent.relative_to(repository).as_posix() in excluded
+    selection = ["--manifest-path", str(manifests[0])] if standalone else ["-p", package]
+    compile_argv = ["cargo", "+1.94", "test", "--locked", *selection, "--no-run"]
+    test_argv = ["cargo", "+1.94", "nextest", "run", "--locked", *selection,
                  "-E", f"test({regression})", "--no-tests", "fail", "--test-threads", "1"]
+    if source.parent == manifests[0].parent / "examples":
+        target = ["--example", source.stem]
+        compile_argv += target
+        test_argv += target
     return package, compile_argv, test_argv
 
 

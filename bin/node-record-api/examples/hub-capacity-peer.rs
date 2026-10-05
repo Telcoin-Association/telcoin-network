@@ -236,6 +236,41 @@ async fn connected(handle: &Handle, target: BlsPublicKey, expected: bool) -> Res
     Ok(())
 }
 
+/// Wait for both authenticated peer absence and completion of the physical connection close.
+async fn disconnected(handle: &Handle, target: BlsPublicKey, peer: PeerId) -> Result<()> {
+    let polls = futures::stream::unfold(
+        (handle.clone(), tokio::time::interval(Duration::from_millis(20))),
+        move |(handle, mut interval)| async move {
+            interval.tick().await;
+            let closed =
+                futures::future::try_join(handle.connected_peers(), handle.is_peer_connected(peer))
+                    .await
+                    .map(|(peers, physically_connected)| {
+                        !peers.contains(&target) && !physically_connected
+                    });
+            Some((closed, (handle, interval)))
+        },
+    )
+    .try_filter(|closed| futures::future::ready(*closed));
+    let mut polls = Box::pin(polls);
+    tokio::time::timeout(Duration::from_secs(8), polls.try_next())
+        .await??
+        .ok_or_else(|| eyre!("peer observation stream ended"))?;
+    Ok(())
+}
+
+/// Re-dial the validated peer only after its previous physical connection has closed.
+async fn disconnect_and_redial(
+    handle: &Handle,
+    role: NetworkType,
+    target: BlsPublicKey,
+    peer: PeerId,
+) -> Result<()> {
+    handle.disconnect_peer(peer).await?;
+    disconnected(handle, target, peer).await?;
+    dial_and_confirm(handle, role, target, handle.dial_by_bls(target)).await
+}
+
 /// Retain native dial detail that the existing error's Display deliberately omits.
 fn bounded_dial_cause(error: &NetworkError) -> String {
     if let NetworkError::Dial(detail) = error {
@@ -437,12 +472,12 @@ impl Peer {
                     format!("reconnect get_node_record swarm={} target={key:?}", role_name(role))
                 })?;
                 let peer: PeerId = record.info.pubkey.into();
-                handle.disconnect_peer(peer).await?;
-                connected(&handle, key, false).await?;
+                disconnect_and_redial(&handle, role, key, peer).await
             } else if require_existing {
-                Err(eyre!("shared-NAT restart requires an existing hub connection"))?;
+                Err(eyre!("shared-NAT restart requires an existing hub connection"))
+            } else {
+                dial_and_confirm(&handle, role, key, handle.dial_by_bls(key)).await
             }
-            dial_and_confirm(&handle, role, key, handle.dial_by_bls(key)).await
         }))
         .await?;
         self.connectivity().await
@@ -887,6 +922,126 @@ mod tests {
 
     use super::*;
     use tn_network_libp2p::types::NetworkCommand;
+
+    async fn accept_disconnect(
+        receiver: &mut mpsc::Receiver<NetworkCommand<Message, Message>>,
+        peer: PeerId,
+    ) -> Result<()> {
+        let command = receiver.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+        if let NetworkCommand::DisconnectPeer { peer_id, reply } = command {
+            assert_eq!(peer_id, peer);
+            reply.send(Ok(())).map_err(|_| eyre!("disconnect acknowledgement canceled"))
+        } else {
+            Err(eyre!("expected disconnect before close observations"))
+        }
+    }
+
+    async fn reply_disconnect_poll(
+        receiver: &mut mpsc::Receiver<NetworkCommand<Message, Message>>,
+        peer: PeerId,
+        logical_peers: Vec<BlsPublicKey>,
+        physically_connected: bool,
+    ) -> Result<()> {
+        let command = receiver.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+        if let NetworkCommand::ConnectedPeers { reply } = command {
+            reply.send(logical_peers).map_err(|_| eyre!("logical observation canceled"))
+        } else {
+            Err(eyre!("expected logical observation before redial"))
+        }?;
+        let command = receiver.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+        if let NetworkCommand::IsPeerConnected { peer_id, reply } = command {
+            assert_eq!(peer_id, peer);
+            reply.send(physically_connected).map_err(|_| eyre!("physical observation canceled"))
+        } else {
+            Err(eyre!("expected physical close observation before redial"))
+        }
+    }
+
+    /// Neither an absent logical identity nor physical absence alone permits a redial.
+    #[tokio::test]
+    async fn reconnect_waits_for_physical_close_before_redial() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(7376)));
+        let target = keys.primary_public_key();
+        let peer = PeerId::random();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let handle = Handle::new(sender);
+        let commands = async {
+            accept_disconnect(&mut receiver, peer).await?;
+            reply_disconnect_poll(&mut receiver, peer, Vec::new(), true).await?;
+            reply_disconnect_poll(&mut receiver, peer, vec![target], false).await?;
+            reply_disconnect_poll(&mut receiver, peer, Vec::new(), false).await?;
+            let command = receiver.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            if let NetworkCommand::DialBls { bls_key, reply } = command {
+                assert_eq!(bls_key, target);
+                reply.send(Ok(())).map_err(|_| eyre!("redial canceled"))
+            } else {
+                Err(eyre!("expected one redial after physical close"))
+            }?;
+            let command = receiver.recv().await.ok_or_else(|| eyre!("commands closed"))?;
+            if let NetworkCommand::ConnectedPeers { reply } = command {
+                reply.send(vec![target]).map_err(|_| eyre!("confirmation canceled"))
+            } else {
+                Err(eyre!("expected authenticated confirmation after redial"))
+            }
+        };
+        let (result, commands) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(
+                disconnect_and_redial(&handle, NetworkType::Primary, target, peer),
+                commands
+            )
+        })
+        .await?;
+        commands?;
+        result?;
+        assert!(receiver.try_recv().is_err(), "reconnect must not queue another dial");
+        Ok(())
+    }
+
+    async fn hold_physical_close(
+        receiver: &mut mpsc::Receiver<NetworkCommand<Message, Message>>,
+        peer: PeerId,
+    ) -> Result<()> {
+        accept_disconnect(receiver, peer).await?;
+        futures::stream::try_unfold(receiver, move |receiver| async move {
+            reply_disconnect_poll(receiver, peer, Vec::new(), true).await?;
+            Ok::<_, eyre::Report>(Some(((), receiver)))
+        })
+        .try_for_each(|()| futures::future::ready(Ok(())))
+        .await
+    }
+
+    /// A stuck physical close exhausts the original single eight-second deadline without a dial.
+    #[tokio::test]
+    async fn reconnect_stuck_physical_close_times_out_without_redial() -> Result<()> {
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(8376)));
+        let target = keys.primary_public_key();
+        let peer = PeerId::random();
+        let (sender, mut receiver) = mpsc::channel(4);
+        let handle = Handle::new(sender);
+        let started = tokio::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(9), async {
+            tokio::select! {
+                biased;
+                result = disconnect_and_redial(&handle, NetworkType::Primary, target, peer) => result,
+                result = hold_physical_close(&mut receiver, peer) => {
+                    result?;
+                    Err(eyre!("pending close responder ended"))
+                },
+            }
+        })
+        .await?;
+        let error = result.expect_err("a stuck physical close must time out");
+        assert!(error.downcast_ref::<tokio::time::error::Elapsed>().is_some());
+        assert!(started.elapsed() >= Duration::from_secs(8));
+        assert!(
+            std::iter::from_fn(|| receiver.try_recv().ok())
+                .all(|command| !matches!(command, NetworkCommand::DialBls { .. })),
+            "a timed out close must not queue a dial"
+        );
+        Ok(())
+    }
 
     /// The four selected digests retain their individual source epochs and the primary epoch.
     #[test]

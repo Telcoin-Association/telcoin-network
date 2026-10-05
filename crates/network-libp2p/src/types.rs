@@ -395,6 +395,13 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<Vec<BlsPublicKey>>,
     },
+    /// Whether the swarm still has an established connection to this peer.
+    IsPeerConnected {
+        /// Physical peer identity to query.
+        peer_id: PeerId,
+        /// Reply to caller, including connections whose close is in progress.
+        reply: oneshot::Sender<bool>,
+    },
     /// Collection of all mesh peers by a certain topic hash.
     MeshPeers {
         /// The topic to filter peers.
@@ -681,6 +688,15 @@ where
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
         peers.await.map_err(Into::into)
+    }
+
+    /// Query whether the swarm has any established connection to this physical peer.
+    ///
+    /// This remains true while a disconnect is in progress and until the last connection closes.
+    pub async fn is_peer_connected(&self, peer_id: PeerId) -> NetworkResult<bool> {
+        let (reply, connected) = oneshot::channel();
+        self.sender.send(NetworkCommand::IsPeerConnected { peer_id, reply }).await?;
+        connected.await.map_err(Into::into)
     }
 
     /// Send a request to a peer.

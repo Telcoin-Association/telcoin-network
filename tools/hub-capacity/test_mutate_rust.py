@@ -38,6 +38,40 @@ class MutationTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "repository"):
                     MUTATIONS.mutation_commands("../outside.rs", "must_reject")
 
+    def test_example_regression_selects_the_example_in_both_commands(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            self.fixture(root)
+            source = root / "crates/owner/examples/probe.rs"
+            source.parent.mkdir()
+            source.write_text("original expression\n")
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(owner, "source-owner")
+            for command in (compilation, regression):
+                self.assertEqual(command[command.index("--example") + 1], "probe")
+                self.assertIn("--locked", command)
+            self.assertIn("--no-run", compilation)
+            self.assertEqual(regression[regression.index("--no-tests") + 1], "fail")
+
+    def test_excluded_dependency_patch_selects_its_own_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "Cargo.toml").write_text('[workspace]\nexclude = ["patches/kad"]\n')
+            source = root / "patches/kad/src/behaviour.rs"
+            source.parent.mkdir(parents=True)
+            source.write_text("original expression\n")
+            (source.parent.parent / "Cargo.toml").write_text('[package]\nname = "libp2p-kad"\nversion = "0.49.0"\n')
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(owner, "libp2p-kad")
+            for command in (compilation, regression):
+                self.assertEqual(command[command.index("--manifest-path") + 1], str((source.parent.parent / "Cargo.toml").resolve()))
+                self.assertIn("--locked", command)
+                self.assertNotIn("--example", command)
+                self.assertNotIn("-p", command)
+            self.assertEqual(regression[regression.index("--no-tests") + 1], "fail")
+
     def run_rejected_case(self, results, message):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

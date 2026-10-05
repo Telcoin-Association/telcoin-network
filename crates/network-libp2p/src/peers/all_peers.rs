@@ -885,6 +885,11 @@ impl AllPeers {
         self.bls_by_peer_id.get(peer_id).copied()
     }
 
+    /// Whether a BLS identity already owns a peer record.
+    pub(super) fn has_confirmed_identity(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
+    }
+
     /// Boolean indicating if this peer is a validator in the previous, current, or next committee.
     ///
     /// Membership spans all three tracked committees so peers from the just-completed epoch are not

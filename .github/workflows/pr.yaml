@@ -259,6 +259,9 @@ jobs:
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
 
+      - name: Test carried Kademlia application filtering patch
+        run: cargo +1.94 test --locked --manifest-path patches/libp2p-kad/Cargo.toml --lib
+
   # Capacity instrumentation needs executable validation even before a live run is available.
   # Keep this lane independent of draft/maintainer deferral, with a finite source scope.
   hub-capacity:
