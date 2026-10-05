@@ -8,6 +8,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use std::{
+    collections::HashSet,
     error::Error,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -365,10 +366,13 @@ pub struct ConsensusBusAppInner {
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
-    epoch_request_queue_tx: tokio::sync::mpsc::Sender<(EpochRecord, EpochRecord)>,
+    epoch_request_queue_tx: tokio::sync::mpsc::Sender<EpochPackRequest>,
     /// Reciever for epoch records to download pack files for.
-    epoch_request_queue_rx:
-        Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
+    epoch_request_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<EpochPackRequest>>>,
+    /// The epochs with a pack request queued or being fetched.
+    ///
+    /// Not reset between epochs: a request outlives the epoch that queued it.
+    epoch_pack_claims: EpochPackClaims,
     /// Channel to request consensus headers to cache.
     /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
     consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
@@ -381,6 +385,86 @@ pub struct ConsensusBusAppInner {
     /// Canonical execution-DB fallback for `wait_for_execution` (installed once the execution
     /// engine is built); empty until then and in engine-less tests/tools.
     canonical_reader: CanonicalReaderSlot,
+}
+
+/// The epochs that have a pack request queued or being fetched.
+///
+/// Every queued [`EpochPackRequest`] carries the claim on its epoch, and dropping the request
+/// releases it, so an epoch is queued at most once until its fetch ends, however it ends. The set
+/// is only ever locked for one insert or remove, never across an await.
+#[derive(Clone, Debug, Default)]
+struct EpochPackClaims(Arc<Mutex<HashSet<Epoch>>>);
+
+impl EpochPackClaims {
+    /// Claim `epoch`, or return `None` if a request for it is already queued or being fetched.
+    fn claim(&self, epoch: Epoch) -> Option<EpochPackClaim> {
+        let claimed = self.0.lock().insert(epoch);
+        claimed.then(|| EpochPackClaim { epoch, claims: self.clone() })
+    }
+}
+
+/// An [`EpochPackRequest`]'s claim on its epoch; dropping it releases the epoch.
+///
+/// Releasing on drop frees the epoch on every path that ends a request: a finished fetch, a skip,
+/// shutdown, a panic, a cancelled send and dropping the queue.
+struct EpochPackClaim {
+    /// The claimed epoch.
+    epoch: Epoch,
+    /// The set to release the epoch from.
+    claims: EpochPackClaims,
+}
+
+impl Drop for EpochPackClaim {
+    fn drop(&mut self) {
+        self.claims.0.lock().remove(&self.epoch);
+    }
+}
+
+/// Prints only the claimed epoch, not the shared set behind it.
+impl std::fmt::Debug for EpochPackClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochPackClaim").field("epoch", &self.epoch).finish_non_exhaustive()
+    }
+}
+
+/// A request to download the pack file for one epoch.
+///
+/// The request holds the claim on its epoch, and dropping the request releases the epoch, so no
+/// second request for the epoch is queued until this one is done with. The fields are private so a
+/// caller cannot take the request apart and drop the claim partway through a fetch.
+#[derive(Debug)]
+pub struct EpochPackRequest {
+    /// The record of the epoch before the requested one, which verifies the requested epoch.
+    previous_epoch_record: EpochRecord,
+    /// The record of the requested epoch.
+    epoch_record: EpochRecord,
+    /// This request's claim on its epoch.
+    claim: EpochPackClaim,
+}
+
+impl EpochPackRequest {
+    /// The requested epoch.
+    pub fn epoch(&self) -> Epoch {
+        self.claim.epoch
+    }
+
+    /// The record of the epoch before the requested one.
+    pub fn previous_epoch_record(&self) -> &EpochRecord {
+        &self.previous_epoch_record
+    }
+
+    /// The record of the requested epoch.
+    pub fn epoch_record(&self) -> &EpochRecord {
+        &self.epoch_record
+    }
+
+    /// Replace the record of the requested epoch, for example with a newer one that arrived after
+    /// the request was queued. A record for a different epoch is ignored.
+    pub fn set_epoch_record(&mut self, record: EpochRecord) {
+        if record.epoch == self.claim.epoch {
+            self.epoch_record = record;
+        }
+    }
 }
 
 /// Late-bound handle to the canonical execution database, used by
@@ -484,6 +568,7 @@ impl ConsensusBusApp {
                 primary_network_events: QueChannel::new_always_subscribed(),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
+                epoch_pack_claims: EpochPackClaims::default(),
                 consensus_request_queue: QueChannel::new(),
                 // new_with_labels (not Default): binds to the recorder active at bus
                 // construction instead of caching the first-bound recorder process-wide
@@ -924,12 +1009,20 @@ impl ConsensusBusApp {
     }
 
     /// Send a request to download the epoch pack file for the provided EpochRecord.
+    ///
+    /// Returns at once if a request for the same epoch is already queued or being fetched; that
+    /// request keeps the record it was queued with, and the fetcher refreshes a stale record from
+    /// the epoch records after a failed attempt. Otherwise waits for room in the queue.
     pub async fn request_epoch_pack_file(
         &self,
         previous_epoch_record: EpochRecord,
         epoch_record: EpochRecord,
     ) {
-        let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
+        let Some(claim) = self.inner.epoch_pack_claims.claim(epoch_record.epoch) else {
+            return;
+        };
+        let request = EpochPackRequest { previous_epoch_record, epoch_record, claim };
+        let _ = self.inner.epoch_request_queue_tx.send(request).await;
     }
 
     /// Put an epoch pack request back on the queue without waiting for room.
@@ -942,12 +1035,14 @@ impl ConsensusBusApp {
     ///
     /// A producer already queued as a waiter takes a freed slot before this call can, so a
     /// held request goes back only once the producers stop waiting.
+    ///
+    /// The request keeps its claim, so no producer can queue a second request for the epoch while
+    /// this one is held or queued.
     pub fn try_requeue_epoch_pack_file(
         &self,
-        previous_epoch_record: EpochRecord,
-        epoch_record: EpochRecord,
-    ) -> Option<(EpochRecord, EpochRecord)> {
-        match self.inner.epoch_request_queue_tx.try_send((previous_epoch_record, epoch_record)) {
+        request: EpochPackRequest,
+    ) -> Option<EpochPackRequest> {
+        match self.inner.epoch_request_queue_tx.try_send(request) {
             Ok(()) => None,
             Err(mpsc::error::TrySendError::Full(request)) => Some(request),
             // cannot happen while the bus exists: the inner struct owns the receiver
@@ -993,7 +1088,8 @@ impl ConsensusBusApp {
     /// Retrieve the next request to down load an epoch pack file.
     /// Will not resolve until a request is ready and will only ever
     /// provide each request once.  Returns None when the underlying channel closes.
-    pub async fn get_next_epoch_pack_file_request(&self) -> Option<(EpochRecord, EpochRecord)> {
+    /// The epoch stays claimed until the returned request is dropped.
+    pub async fn get_next_epoch_pack_file_request(&self) -> Option<EpochPackRequest> {
         self.inner.epoch_request_queue_rx.lock().await.recv().await
     }
 
@@ -1308,7 +1404,7 @@ mod exex_receiver_count_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConsensusBusApp, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
+        ConsensusBusApp, EpochPackRequest, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
         EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
     };
     use std::{collections::VecDeque, task::Poll, time::Duration};
@@ -1347,7 +1443,7 @@ mod tests {
     }
 
     /// Take the next epoch pack request, failing the test if none is queued.
-    async fn next_request(bus: &ConsensusBusApp) -> (EpochRecord, EpochRecord) {
+    async fn next_request(bus: &ConsensusBusApp) -> EpochPackRequest {
         tokio::time::timeout(Duration::from_secs(1), bus.get_next_epoch_pack_file_request())
             .await
             .expect("a request is queued")
@@ -1356,7 +1452,7 @@ mod tests {
 
     /// Take the next epoch pack request and return its epoch.
     async fn next_epoch(bus: &ConsensusBusApp) -> Epoch {
-        next_request(bus).await.1.epoch
+        next_request(bus).await.epoch()
     }
 
     /// Whether the epoch request queue is empty, checked without waiting.
@@ -1375,17 +1471,16 @@ mod tests {
         let bus = ConsensusBusApp::new();
         // a fetch worker holds epoch 0 while producers fill the queue behind it
         bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(0)).await;
-        let (previous, record) = next_request(&bus).await;
+        let request = next_request(&bus).await;
         let end = fill_epoch_request_queue(&bus, 1).await;
 
-        let (previous, record) = bus
-            .try_requeue_epoch_pack_file(previous, record)
-            .expect("a full queue hands the request back");
-        assert_eq!(record.epoch, 0, "the same request comes back");
+        let request =
+            bus.try_requeue_epoch_pack_file(request).expect("a full queue hands the request back");
+        assert_eq!(request.epoch(), 0, "the same request comes back");
 
         assert_eq!(next_epoch(&bus).await, 1);
         assert!(
-            bus.try_requeue_epoch_pack_file(previous, record).is_none(),
+            bus.try_requeue_epoch_pack_file(request).is_none(),
             "the freed slot takes the re-queued request"
         );
         for expected in 2..end {
@@ -1409,16 +1504,106 @@ mod tests {
         tokio::pin!(waiting);
         assert!(futures::poll!(waiting.as_mut()).is_pending(), "a producer waits on a full queue");
 
-        let (previous, record) = next_request(&bus).await;
-        assert_eq!(record.epoch, 0);
+        let request = next_request(&bus).await;
+        assert_eq!(request.epoch(), 0);
         assert!(
-            bus.try_requeue_epoch_pack_file(previous, record).is_some(),
+            bus.try_requeue_epoch_pack_file(request).is_some(),
             "the waiting producer holds the freed slot"
         );
         assert!(
             futures::poll!(waiting.as_mut()).is_ready(),
             "the waiting producer's send completes"
         );
+    }
+
+    /// An epoch is queued once: a second request is refused while the first is queued or held by a
+    /// fetch, and the epoch can be queued again once that request is dropped.
+    #[tokio::test]
+    async fn epoch_pack_request_is_queued_once_until_released() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let request = next_request(&bus).await;
+        assert_eq!(request.epoch(), 7);
+        assert!(epoch_request_queue_is_empty(&bus).await, "a queued epoch is not queued twice");
+
+        // a fetch worker holds the dequeued request
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert!(epoch_request_queue_is_empty(&bus).await, "an epoch being fetched is not queued");
+
+        drop(request);
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7, "a released epoch is queued again");
+    }
+
+    /// A re-queued request carries its claim back into the queue, so a producer's request for the
+    /// same epoch is refused and the epoch drains once.
+    #[tokio::test]
+    async fn requeued_epoch_pack_request_keeps_its_claim() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let request = next_request(&bus).await;
+        assert!(bus.try_requeue_epoch_pack_file(request).is_none(), "the queue has room");
+
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7);
+        assert!(epoch_request_queue_is_empty(&bus).await, "the re-queued epoch drains once");
+    }
+
+    /// A producer that stops waiting on the full queue releases its epoch, so a later request for
+    /// it is queued.
+    #[tokio::test]
+    async fn cancelled_epoch_pack_send_releases_its_claim() {
+        let bus = ConsensusBusApp::new();
+        let next = fill_epoch_request_queue(&bus, 0).await;
+        // boxed so dropping it drops the send; unconstrained because the fill spends the task's
+        // coop budget, and a send polled without budget reports pending before it joins the queue
+        // of senders waiting for a slot
+        let mut waiting = Box::pin(tokio::task::unconstrained(
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        ));
+        assert!(futures::poll!(waiting.as_mut()).is_pending(), "a producer waits on a full queue");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        )
+        .await
+        .expect("a request for the epoch the waiting send claimed returns at once");
+        drop(waiting);
+
+        assert_eq!(next_epoch(&bus).await, 0);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        )
+        .await
+        .expect("the freed slot takes the request");
+        for expected in 1..next {
+            assert_eq!(next_epoch(&bus).await, expected);
+        }
+        assert_eq!(next_epoch(&bus).await, next, "the cancelled send's epoch is queued again");
+        assert!(epoch_request_queue_is_empty(&bus).await);
+    }
+
+    /// A fetch that panics while it holds a request still releases the epoch.
+    #[tokio::test]
+    async fn panicking_fetch_releases_its_claim() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let fetch = tokio::spawn({
+            let bus = bus.clone();
+            async move {
+                let request = bus.get_next_epoch_pack_file_request().await;
+                if request.is_some() {
+                    panic!("the fetch panics while it holds the request");
+                }
+            }
+        });
+        let error = fetch.await.expect_err("the fetch panicked");
+        assert!(error.is_panic(), "the fetch ended by panicking");
+
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7, "the panicked fetch released its epoch");
     }
 
     /// A bounded que channel queues exactly its capacity, then makes the producer wait.
