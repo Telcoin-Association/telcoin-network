@@ -1276,6 +1276,13 @@ where
             }
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 debug!(target: "network", "penalty reported for peer {peer}");
+                if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
+                    warn!(
+                        target: "network",
+                        ?penalty,
+                        "severe or fatal penalty reported for peer {peer}"
+                    );
+                }
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
@@ -1643,6 +1650,7 @@ where
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
+                        | ErrorKind::NotConnected
                         | ErrorKind::Interrupted => {
                             // transport flap on WAN — no penalty
                         }
@@ -1691,6 +1699,7 @@ where
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
+                        | ErrorKind::NotConnected
                         | ErrorKind::Interrupted => {
                             // transport flap on WAN — no penalty
                         }

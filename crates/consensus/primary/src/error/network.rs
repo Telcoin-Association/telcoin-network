@@ -228,8 +228,13 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         | HeaderError::InvalidParentRound
         | HeaderError::InvalidSeedSignature => Some(Penalty::Severe),
         // fatal
-        HeaderError::AlreadyVotedForLaterRound { .. }
-        | HeaderError::AlreadyVoted(_, _)
+        //
+        // Equal rounds mean a second, different header for a round that this node already
+        // evaluated for the author. A lower round is in the ignore arm below.
+        HeaderError::AlreadyVotedForLaterRound { theirs, ours } if theirs == ours => {
+            Some(Penalty::Fatal)
+        }
+        HeaderError::AlreadyVoted(_, _)
         | HeaderError::DuplicateParents
         | HeaderError::TooManyParents(_, _)
         | HeaderError::TooManyBatches(_, _)
@@ -249,11 +254,17 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // hurt"). Penalizing either would punish an honest peer for a local condition, and
         // contradicts the sibling PrimaryNetworkError::Storage and *::Timeout arms that
         // already map to None.
+        //
+        // AlreadyVotedForLaterRound with a lower round is a late request, not equivocation.
+        // Each vote request runs in its own task, so requests from one honest author can be
+        // evaluated out of order. This occurs when a node starts its primary with queued
+        // requests.
         HeaderError::PendingCertificateOneshot
         | HeaderError::Storage(_)
         | HeaderError::UnknownExecutionResult(_)
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
+        | HeaderError::AlreadyVotedForLaterRound { .. }
         | HeaderError::NotCommitteeMember
         | HeaderError::ClosedWatchChannel => None,
     }
