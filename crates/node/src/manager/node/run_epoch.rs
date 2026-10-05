@@ -1068,9 +1068,12 @@ async fn resolve_prior_epoch_record(
 /// the cache env, a [`LayeredDatabase`](tn_storage::layered_db::LayeredDatabase): each remove
 /// drops the key from the memory layer and queues the delete to that env's writer thread, which
 /// runs the backend write txn and its commit (an fsync under MDBX `Durable`). The caller pays a
-/// map remove and a channel send per key. Sharing one txn makes the writer commit once per
-/// output where bare removes would commit once per key. A failure is only logged: a batch left
-/// behind holds space until epoch close.
+/// map remove and a channel send per key. Sharing one txn makes the writer commit at most once
+/// per output where bare removes would each commit on their own. A failure here is only logged,
+/// and a backend failure is reported on the writer thread instead. A batch left in
+/// [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
+/// [`OurNodeBatchesCache`] survives that clear and reaches `orphan_batches` as if it had never
+/// been committed.
 fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash>) {
     if digests.is_empty() {
         return;
