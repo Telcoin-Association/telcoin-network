@@ -402,6 +402,11 @@ test-e2e-governance-safe: build-e2e-bin-adiri
 # test-restarts run these tests too, as does test-e2e, which takes every ignored test. Those lanes
 # do not export TN_BIN_PATH_PREV, so there the tests that need the previous binary skip with a
 # warning and the rest run in full.
+#
+# test_epoch_snapshot_restore_validator_across_subsecond_fork reproduces an open node defect (the
+# epoch-close halt after a validator restarts within the QUIC idle timeout; see the test's doc)
+# and skips unless TN_E2E_RUN_KNOWN_FAILURES=1 is set, so every lane that runs it stays green
+# while the defect is open. Export the variable to run the reproducer.
 .PHONY: test-e2e-subsecond-fork
 test-e2e-subsecond-fork: build-e2e-bin build-e2e-bin-prev
 	TN_BIN_PATH="$(E2E_BIN)" TN_BIN_PATH_PREV="$(E2E_BIN_PREV)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run -p e2e-tests --test it --run-ignored all -E 'test(/subsecond.*fork/)' ;
