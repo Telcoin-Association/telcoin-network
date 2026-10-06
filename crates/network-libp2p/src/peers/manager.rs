@@ -1240,6 +1240,14 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
+    /// Check the signed cache's freshness floor even when the durable kad copy is absent.
+    ///
+    /// Config stubs carry local provisioning timestamps and cannot establish a signed floor.
+    pub(crate) fn cached_record_newer(&self, bls_key: &BlsPublicKey, timestamp: u64) -> bool {
+        !self.stub_records.contains(bls_key)
+            && self.known_peers.get(bls_key).is_some_and(|info| info.timestamp > timestamp)
+    }
+
     /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
     ///
     /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced

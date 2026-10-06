@@ -22,6 +22,251 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// Sign a primary record with changed metadata using the fixture authority's BLS identity.
+fn resign_test_record(
+    record: &kad::Record,
+    info: NetworkInfo,
+    config: &ConsensusConfig<MemDatabase>,
+) -> kad::Record {
+    let chain_id = config.network_config().libp2p_config().chain_id;
+    let bytes = encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
+    let publisher = Some(info.pubkey.clone().into());
+    let signature = config.key_config().request_signature_direct(&bytes);
+    kad::Record { value: encode(&NodeRecord { info, signature }), publisher, ..record.clone() }
+}
+
+/// Find the single coalesced lookup for an authority without polling the swarm.
+fn test_authority_query(
+    network: &ConsensusNetworkMemoryDB<TestWorkerRequest, TestWorkerResponse>,
+    key: BlsPublicKey,
+) -> eyre::Result<QueryId> {
+    network
+        .kad_record_queries
+        .iter()
+        .find(|(_, query)| query.request() == key)
+        .map(|(id, _)| *id)
+        .ok_or_else(|| eyre!("authority query must be tracked"))
+}
+
+/// Refresh retains the durable freshness floor, and replay cannot roll it back after restart.
+#[tokio::test]
+async fn test_refresh_preserves_record_and_restart_freshness() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, _task_manager: task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let database = MemDatabase::default();
+    let (events, _receiver) = mpsc::channel(10);
+    let make_network = || {
+        ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+            peer1.config.network_config(),
+            events.clone(),
+            peer1.config.key_config().clone(),
+            peer1.config.key_config().primary_network_keypair().clone(),
+            database.clone(),
+            task_manager.get_spawner(),
+            NetworkType::Primary,
+            peer1.config.primary_address(),
+            None,
+        )
+    };
+    let mut network = make_network()?;
+    let key = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let current = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        HashSet::new(),
+        HashSet::from([key]),
+        HashSet::new(),
+    );
+    network.process_kad_put_request(source, current.clone())?;
+    network.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+    network.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+    assert_eq!(network.kad_record_queries.len(), 1);
+    let mut older = peer2.network.node_record.info.clone();
+    older.timestamp = older.timestamp.checked_sub(1).ok_or_else(|| eyre!("positive timestamp"))?;
+    let older_timestamp = older.timestamp;
+    let replay = resign_test_record(&current, older, &peer2.config);
+    assert!(network.peer_record_valid(&replay).is_some());
+    network.process_kad_put_request(source, replay.clone())?;
+    assert_eq!(
+        network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&current.key)
+            .map(|r| r.value.clone()),
+        Some(current.value.clone()),
+    );
+    drop(network);
+    let mut restarted = make_network()?;
+    assert!(restarted.swarm.behaviour().peer_manager.cached_record_newer(&key, older_timestamp));
+    assert_eq!(restarted.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(key));
+
+    // Expiry or capacity loss must not let a replay cross the surviving signed cache floor.
+    restarted.swarm.behaviour_mut().kademlia.store_mut().remove(&current.key);
+    restarted.process_kad_put_request(source, replay)?;
+    assert!(restarted.swarm.behaviour_mut().kademlia.store_mut().get(&current.key).is_none());
+    assert!(restarted.swarm.behaviour().peer_manager.cached_record_newer(&key, older_timestamp));
+    restarted.process_kad_put_request(source, current.clone())?;
+    assert_eq!(
+        restarted
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&current.key)
+            .map(|r| r.value.clone()),
+        Some(current.value),
+        "the identical current record can refill an absent store entry",
+    );
+    Ok(())
+}
+
+/// Local steps cannot satisfy refresh, whether refresh starts or joins the live lookup.
+#[tokio::test]
+async fn test_refresh_ignores_local_query_candidates() -> eyre::Result<()> {
+    [false, true].into_iter().try_for_each(|refresh_first| -> eyre::Result<()> {
+        let TestTypes { peer1, peer2, _task_manager } =
+            create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+        let mut network = peer1.network;
+        let key = peer2.config.key_config().primary_public_key();
+        let source = *peer2.network.swarm.local_peer_id();
+        network.swarm.behaviour_mut().peer_manager.update_committees(
+            HashSet::new(),
+            HashSet::from([key]),
+            HashSet::new(),
+        );
+        let event = if refresh_first {
+            PeerEvent::RefreshAuthorities(vec![key])
+        } else {
+            PeerEvent::MissingAuthorities(vec![key])
+        };
+        network.process_peer_manager_event(event)?;
+        let id = test_authority_query(&network, key)?;
+        network.process_kad_query_result(&id, key, peer2.network.node_record.clone(), None, false);
+        network.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+        network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
+        assert_eq!(test_authority_query(&network, key)?, id);
+        assert_eq!(network.kad_record_queries.len(), 1);
+        network.process_kad_query_result(&id, key, peer2.network.node_record.clone(), None, true);
+        assert!(network.kad_record_queries.is_empty());
+        assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), None);
+
+        // Ordinary discovery still accepts the local replica.
+        network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
+        let id = test_authority_query(&network, key)?;
+        network.process_kad_query_result(&id, key, peer2.network.node_record.clone(), None, true);
+        assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(key));
+        Ok(())
+    })
+}
+
+/// Coalescing retains remote answers even if a newer local candidate was already observed.
+#[tokio::test]
+async fn test_refresh_retains_remote_query_candidate() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let key = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        HashSet::new(),
+        HashSet::from([key]),
+        HashSet::new(),
+    );
+    network.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
+    let id = test_authority_query(&network, key)?;
+    let mut local_info = peer2.network.node_record.info.clone();
+    local_info.timestamp += 1;
+    let local = resign_test_record(&peer2.network.get_peer_record(), local_info, &peer2.config);
+    let (_, local) =
+        network.peer_record_valid(&local).ok_or_else(|| eyre!("valid local record"))?;
+    network.process_kad_query_result(&id, key, local, None, false);
+    network.process_kad_query_result(
+        &id,
+        key,
+        peer2.network.node_record.clone(),
+        Some(source),
+        false,
+    );
+    network.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+    network.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
+    network.close_kad_query(&id);
+    assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&source), Some(key));
+    assert!(!network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .cached_record_newer(&key, peer2.network.node_record.info.timestamp,));
+    Ok(())
+}
+
+/// A connected member keeps its kad entry with only the newly verified advertised addresses.
+#[tokio::test]
+async fn test_committee_address_update_preserves_connected_kad_peer() -> eyre::Result<()> {
+    let TestTypes { peer1, mut peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let key = peer2.config.key_config().primary_public_key();
+    let source = *peer2.network.swarm.local_peer_id();
+    let old_address = peer2.config.primary_address();
+    let current = peer2.network.get_peer_record();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        HashSet::new(),
+        HashSet::from([key]),
+        HashSet::new(),
+    );
+    network.process_kad_put_request(source, current.clone())?;
+    network.swarm.behaviour_mut().peer_manager.take_test_events();
+    let new_address: Multiaddr = "/ip4/192.0.2.1/udp/54321/quic-v1".parse()?;
+    let mut updated = peer2.network.node_record.info.clone();
+    updated.timestamp += 1;
+    updated.multiaddrs = vec![new_address.clone()];
+    let replacement = resign_test_record(&current, updated, &peer2.config);
+    peer2.network.swarm.listen_on(old_address.clone())?;
+    let target = tokio::spawn(peer2.network.run());
+    network.swarm.dial(old_address.clone())?;
+    timeout(
+        Duration::from_secs(10),
+        network
+            .swarm
+            .by_ref()
+            .filter(|event| {
+                futures::future::ready(matches!(
+                    event, SwarmEvent::ConnectionEstablished { peer_id, .. } if *peer_id == source
+                ))
+            })
+            .next(),
+    )
+    .await?
+    .ok_or_else(|| eyre!("swarm ended before connection"))?;
+    network.process_peer_manager_event(PeerEvent::PeerConnected(source, old_address))?;
+    network.swarm.behaviour_mut().peer_manager.take_test_events();
+    network.process_kad_put_request(source, replacement)?;
+    let updates = network.swarm.behaviour_mut().peer_manager.take_test_events();
+    assert!(updates.iter().any(|event| matches!(
+        event, PeerEvent::CommitteeRecordUpdated { previous, peer, .. }
+            if *previous == source && *peer == source
+    )));
+    updates.into_iter().try_for_each(|event| network.process_peer_manager_event(event))?;
+    assert!(network.swarm.is_connected(&source));
+    let bucket = network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .kbucket(source)
+        .ok_or_else(|| eyre!("peer bucket"))?;
+    let addresses = bucket
+        .iter()
+        .find(|entry| entry.node.key.preimage() == &source)
+        .map(|entry| entry.node.value.iter().cloned().collect::<Vec<_>>())
+        .ok_or_else(|| eyre!("connected member must remain in kad"))?;
+    let expected = new_address.with_p2p(source).map_err(|_| eyre!("matching peer address"))?;
+    assert_eq!(addresses, vec![expected]);
+    target.abort();
+    Ok(())
+}
+
 /// Recover a stale signed mapping through a real remote Kademlia query and replacement dial.
 async fn stale_committee_live_recovery(
     network_type: NetworkType,
@@ -149,7 +394,7 @@ async fn stale_committee_live_recovery(
         .kademlia
         .store_mut()
         .get(&node_record_key(&key))
-        .is_none());
+        .is_some());
     assert_eq!(observer.swarm.behaviour().peer_manager.peer_to_bls(&old_peer), Some(key));
     observer.process_peer_manager_event(PeerEvent::RefreshAuthorities(vec![key]))?;
     observer.process_peer_manager_event(PeerEvent::MissingAuthorities(vec![key]))?;
@@ -2866,12 +3111,12 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
         .process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a, unknown_b]))?;
     assert_eq!(network.kad_record_queries.len(), 2, "re-reported key must not issue a duplicate");
     assert_eq!(
-        network.kad_record_queries.values().filter(|q| q.request == unknown_a).count(),
+        network.kad_record_queries.values().filter(|q| q.request() == unknown_a).count(),
         1,
         "one in-flight query for the re-reported key"
     );
     assert_eq!(
-        network.kad_record_queries.values().filter(|q| q.request == unknown_b).count(),
+        network.kad_record_queries.values().filter(|q| q.request() == unknown_b).count(),
         1,
         "one in-flight query for the new key"
     );
@@ -2886,7 +3131,7 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
     let old_id = network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == unknown_a)
+        .find(|(_, query)| query.request() == unknown_a)
         .map(|(id, _)| *id)
         .ok_or_else(|| eyre!("in-flight query for unknown_a is tracked"))?;
     network.close_kad_query(&old_id);
@@ -2896,7 +3141,7 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
     let new_id = network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == unknown_a)
+        .find(|(_, query)| query.request() == unknown_a)
         .map(|(id, _)| *id)
         .ok_or_else(|| eyre!("re-armed query for unknown_a is tracked"))?;
     assert_ne!(old_id, new_id, "re-armed query must be a fresh kad query");

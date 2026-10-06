@@ -1989,20 +1989,35 @@ where
                     let _ = self.swarm.disconnect_peer_id(previous);
                     self.connected_peers.retain(|connected| *connected != previous);
                 }
+                // Manual kad insertion must preserve peers whose existing connection survives
+                // an address update. Disconnected peers are registered by PeerConnected.
+                let reinsert = self.swarm.is_connected(&peer)
+                    && !self.swarm.behaviour().peer_manager.peer_banned(&peer);
                 addresses.into_iter().for_each(|address| {
-                    self.swarm.add_peer_address(peer, address);
+                    self.swarm.add_peer_address(peer, address.clone());
+                    if reinsert {
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer, address);
+                    }
                 });
                 self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
             }
             PeerEvent::RefreshAuthorities(authorities) => {
-                // Keep the signed read model and admission identity. Evict only the local DHT
-                // copy so get_record cannot satisfy recovery from the very record that failed.
-                // The normal query path coalesces with periodic/missing-authority lookups and
-                // verifies signature, publisher, domain and freshness before changing a binding.
-                authorities.iter().for_each(|key| {
-                    self.swarm.behaviour_mut().kademlia.store_mut().remove(&node_record_key(key));
+                // Retain the durable replica and its inbound-PUT freshness floor. Only remote
+                // answers can repair an endpoint, including when joining an existing lookup.
+                authorities.into_iter().for_each(|key| {
+                    let query_id = self
+                        .kad_record_queries
+                        .iter()
+                        .find(|(_, query)| query.request() == key)
+                        .map(|(id, _)| *id)
+                        .unwrap_or_else(|| {
+                            self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key))
+                        });
+                    self.kad_record_queries
+                        .entry(query_id)
+                        .or_insert_with(|| key.into())
+                        .require_remote();
                 });
-                self.process_peer_manager_event(PeerEvent::MissingAuthorities(authorities))?;
             }
             PeerEvent::MissingAuthorities(missing) => {
                 // Polling callers such as `current_committee_rpcs` report a member as
@@ -2015,15 +2030,15 @@ where
                 // as its current query ends. The removal there runs before any result
                 // filtering, so even a query whose record is dropped as stale or
                 // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
+                missing.into_iter().for_each(|bls_key| {
+                    if self.kad_record_queries.values().all(|q| q.request() != bls_key) {
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
                     } else {
                         trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
                     }
-                }
+                });
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
@@ -2309,7 +2324,16 @@ where
                 self.peer_record_valid(&record).map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
 
-                    let freshness = self.record_freshness(&record);
+                    let freshness = if self
+                        .swarm
+                        .behaviour()
+                        .peer_manager
+                        .cached_record_newer(&key, value.info.timestamp)
+                    {
+                        RecordFreshness::Older
+                    } else {
+                        self.record_freshness(&record)
+                    };
                     if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
@@ -2467,14 +2491,8 @@ where
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.request == key {
-            match &mut query.result {
-                None => query.result = Some(new_record),
-                Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
-                    *tracked = new_record
-                }
-                Some(_) => {} // keep existing record
-            }
+        if query.request() == key {
+            query.record_result(new_record, peer);
         } else {
             // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
@@ -2501,14 +2519,16 @@ where
     /// lost: peers push their own records on first connect (an inbound kad put handled by
     /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(KadQuery::into_result)
+            .into_iter()
+            .for_each(|(request, node_record)| {
                 self.swarm
                     .behaviour_mut()
                     .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
-        }
+                    .add_discovered_peer(request, node_record.info);
+            });
     }
 }
 

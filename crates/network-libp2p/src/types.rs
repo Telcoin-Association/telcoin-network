@@ -813,14 +813,63 @@ pub use tn_node_record::{NetworkInfo, NodeRecord, RecordDomain};
 #[derive(Debug)]
 pub struct KadQuery {
     /// The [BlsPublicKey] for the requested authority record.
-    pub request: BlsPublicKey,
-    /// The best result so far.
-    pub result: Option<NodeRecord>,
+    request: BlsPublicKey,
+    /// Whether the local store can contribute to this lookup.
+    scope: KadQueryScope,
+    /// The local candidate, discarded when this lookup becomes a refresh.
+    local: Option<NodeRecord>,
+    /// The newest remote candidate, retained independently when a refresh joins the lookup.
+    remote: Option<NodeRecord>,
+}
+
+/// Sources allowed to satisfy an outbound authority lookup.
+#[derive(Debug)]
+enum KadQueryScope {
+    /// Ordinary discovery can use either the local replica or a remote holder.
+    LocalAndRemote,
+    /// Failure recovery requires a remote holder to confirm the record.
+    RemoteOnly,
+}
+
+impl KadQuery {
+    /// Return the authority whose record is requested.
+    pub(crate) fn request(&self) -> BlsPublicKey {
+        self.request
+    }
+
+    /// Upgrade a coalesced lookup to recovery without losing its remote candidate.
+    pub(crate) fn require_remote(&mut self) {
+        self.scope = KadQueryScope::RemoteOnly;
+        self.local = None;
+    }
+
+    /// Retain the newest verified candidate from each permitted source.
+    pub(crate) fn record_result(&mut self, record: NodeRecord, peer: Option<PeerId>) {
+        if peer.is_some() || matches!(self.scope, KadQueryScope::LocalAndRemote) {
+            let candidate = if peer.is_some() { &mut self.remote } else { &mut self.local };
+            if candidate
+                .as_ref()
+                .is_none_or(|tracked| tracked.info.timestamp < record.info.timestamp)
+            {
+                *candidate = Some(record);
+            }
+        }
+    }
+
+    /// Consume the lookup and return its newest eligible record with the requested identity.
+    pub(crate) fn into_result(self) -> Option<(BlsPublicKey, NodeRecord)> {
+        self.remote
+            .filter(|remote| {
+                self.local.as_ref().is_none_or(|local| local.info.timestamp < remote.info.timestamp)
+            })
+            .or(self.local)
+            .map(|record| (self.request, record))
+    }
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None }
+        Self { request, scope: KadQueryScope::LocalAndRemote, local: None, remote: None }
     }
 }
 
