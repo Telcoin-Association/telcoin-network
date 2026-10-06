@@ -16,7 +16,7 @@ use crate::archive::{
 
 use super::{
     crc::add_crc32,
-    data_file::{DataFileReader, MmapDataFile},
+    data_file::{DataFileReader, MmapDataFile, MmapFileOptions},
 };
 use std::{
     fmt::Debug,
@@ -53,7 +53,20 @@ where
         compression: PackCompression,
         version: u16,
     ) -> Result<Self, OpenError> {
-        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version)? })
+        Self::open_with(path, uid_idx, read_only, compression, version, MmapFileOptions::default())
+    }
+
+    /// [`Self::open`] with explicit options for the data file's mapping (for example a
+    /// [`reserve`](MmapFileOptions::reserve) so the mapping never moves while the pack is open).
+    pub fn open_with<P: AsRef<Path>>(
+        path: P,
+        uid_idx: u64,
+        read_only: bool,
+        compression: PackCompression,
+        version: u16,
+        opts: MmapFileOptions,
+    ) -> Result<Self, OpenError> {
+        Ok(Self { inner: PackInner::open(path, uid_idx, read_only, compression, version, opts)? })
     }
 
     /// Length of the Pack file.
@@ -327,9 +340,10 @@ where
         read_only: bool,
         compression: PackCompression,
         version: u16,
+        opts: MmapFileOptions,
     ) -> Result<Self, OpenError> {
         let (data_file, header) =
-            Self::open_data_file(path, uid_idx, read_only, compression, version)
+            Self::open_data_file(path, uid_idx, read_only, compression, version, opts)
                 .map_err(OpenError::DataFileOpen)?;
         Ok(Self {
             header,
@@ -543,8 +557,9 @@ where
         ro: bool,
         compression: PackCompression,
         version: u16,
+        opts: MmapFileOptions,
     ) -> Result<(MmapDataFile, DataHeader), LoadHeaderError> {
-        let mut data_file = MmapDataFile::open(path, ro)?;
+        let mut data_file = MmapDataFile::open_with(path, ro, opts)?;
         let header = Self::init_header(&mut data_file, uid_idx, compression, version, ro)?;
         Ok((data_file, header))
     }

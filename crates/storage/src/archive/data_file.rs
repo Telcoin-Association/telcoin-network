@@ -67,7 +67,7 @@ use std::{
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
-use memmap2::{Mmap, MmapMut};
+use memmap2::{Mmap, MmapMut, MmapOptions};
 
 use crate::archive::error::rename::RenameError;
 
@@ -162,6 +162,15 @@ pub struct MmapFileOptions {
     /// After a crash such a file may be shorter than its own header claims; that is safe only
     /// because an unsealed derived file is never trusted.
     pub derived: bool,
+    /// Bytes of address space a writable handle reserves for its mapping (0 = off). With a
+    /// reservation the file is mapped once, at `max(reserve, file length)` bytes, and grows
+    /// underneath that mapping (preallocate + extend) without ever remapping, so the mapping never
+    /// moves while the handle is open — the property a reader that holds no lock needs. Pages past
+    /// the physical EOF are never touched (reads are bounded by the logical end, writes by the
+    /// physical size). Growing past the reservation falls back to a remap with a larger one, the
+    /// only case in which the mapping moves. Virtual address space only; read-only handles (which
+    /// map sealed files) ignore it.
+    pub reserve: u64,
 }
 
 impl Default for MmapFileOptions {
@@ -173,6 +182,7 @@ impl Default for MmapFileOptions {
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
             derived: false,
+            reserve: 0,
         }
     }
 }
@@ -322,6 +332,9 @@ pub struct MmapDataFile {
     /// [`Self::sync_size_if_grown`]); a growth itself does not sync. `AtomicBool` because the
     /// barriers take `&self`.
     size_unsynced: AtomicBool,
+    /// Length of the reserved mapping (see [`MmapFileOptions::reserve`]), or 0 in the classic
+    /// mode, where the mapping is exactly the physical file and is replaced on every growth.
+    reserved: u64,
     /// Test-only: how many deferred size fsyncs barriers have run.
     #[cfg(test)]
     size_syncs: std::sync::atomic::AtomicUsize,
@@ -392,8 +405,33 @@ impl MmapDataFile {
         // the `[end, capacity)` padding region (the sentinel on a read-only open; zeros on a
         // writable one, retired above); any trailing padding a crashed writer left is handled by
         // the pack's heal path.
-        let (backing, capacity) = if orig_len == 0 {
-            (Backing::Empty, 0)
+        // A writable handle with a reservation maps it once (even over an empty file) and grows the
+        // file underneath; if the address space cannot be reserved, it runs in the classic mode.
+        let reserved_map = if !read_only && opts.reserve > 0 {
+            let map_len = opts.reserve.max(orig_len);
+            // SAFETY: single-writer pack model (as for the classic writable map below). The map may
+            // extend past EOF; those pages are never touched (reads are bounded by `end`, writes by
+            // `capacity`, the physical size).
+            match usize::try_from(map_len)
+                .map_err(io::Error::other)
+                .and_then(|len| unsafe { MmapOptions::new().len(len).map_mut(&file) })
+            {
+                Ok(map) => Some((map, map_len)),
+                Err(e) => {
+                    tracing::warn!(
+                        "MmapDataFile: could not reserve {map_len} bytes of address space for \
+                         {path:?} ({e}); using the classic remap-on-growth mapping"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (backing, capacity, reserved) = if let Some((map, map_len)) = reserved_map {
+            (Backing::Rw(map), orig_len, map_len)
+        } else if orig_len == 0 {
+            (Backing::Empty, 0, 0)
         } else if read_only {
             // SAFETY: a read-only handle must only ever map a *sealed* file — one that is
             // clean-closed (its `Drop` truncated the mmap capacity padding away and appended the
@@ -407,12 +445,12 @@ impl MmapDataFile {
             // index-attested length via `set_read_bound`, so reads never touch bytes a
             // writer truncation could remove even if that discipline slipped.
             let map = unsafe { Mmap::map(&file)? };
-            (Backing::Ro(map), orig_len)
+            (Backing::Ro(map), orig_len, 0)
         } else {
             // SAFETY: single-writer pack model — we hold the file open for writing for this
             // handle's lifetime and nothing else writes/truncates it concurrently.
             let map = unsafe { MmapMut::map_mut(&file)? };
-            (Backing::Rw(map), orig_len)
+            (Backing::Rw(map), orig_len, 0)
         };
 
         let df = Self {
@@ -430,6 +468,7 @@ impl MmapDataFile {
             committed_marker,
             write_failed: AtomicBool::new(false),
             size_unsynced: AtomicBool::new(false),
+            reserved,
             #[cfg(test)]
             size_syncs: std::sync::atomic::AtomicUsize::new(0),
             opts,
@@ -652,7 +691,9 @@ impl MmapDataFile {
     }
 
     /// Drop the current mapping, resize the physical file to `new_len`, and re-map it (leaving it
-    /// unmapped when `new_len == 0`). Never holds a mapping past EOF.
+    /// unmapped when `new_len == 0`). In the classic mode the new mapping is exactly the file; a
+    /// reserving handle (here only because a growth outran its reservation) maps a new, larger
+    /// reservation instead — the one case in which its mapping moves.
     fn remap(&mut self, new_len: u64) -> io::Result<()> {
         // release any existing map before resizing
         self.backing = Backing::Empty;
@@ -667,8 +708,21 @@ impl MmapDataFile {
         if new_len == 0 {
             return Ok(());
         }
-        // SAFETY: single-writer model; the file was sized to `new_len` immediately above.
-        let map = unsafe { MmapMut::map_mut(&self.file) }.inspect_err(|_| self.poison())?;
+        let map = if self.reserved > 0 {
+            let map_len = new_len.max(self.reserved.saturating_mul(2));
+            let len = usize::try_from(map_len)
+                .map_err(io::Error::other)
+                .inspect_err(|_| self.poison())?;
+            // SAFETY: single-writer model; the file was sized to `new_len` immediately above, and
+            // the pages of the reservation past it are never touched.
+            let map = unsafe { MmapOptions::new().len(len).map_mut(&self.file) }
+                .inspect_err(|_| self.poison())?;
+            self.reserved = map_len;
+            map
+        } else {
+            // SAFETY: single-writer model; the file was sized to `new_len` immediately above.
+            unsafe { MmapMut::map_mut(&self.file) }.inspect_err(|_| self.poison())?
+        };
         self.backing = Backing::Rw(map);
         self.capacity = new_len;
         self.advise_backing();
@@ -772,7 +826,13 @@ impl MmapDataFile {
         // `capacity` is the current physical size (== physical EOF); reserve the new range from it.
         let from = self.capacity;
         self.allocate_range(from, new_cap).inspect_err(|_| self.poison())?;
-        self.remap(new_cap)?;
+        if new_cap <= self.reserved && matches!(self.backing, Backing::Rw(_)) {
+            // The reserved mapping already covers the grown file (`allocate_range` extended it to
+            // `new_cap`): no remap, so the mapping does not move.
+            self.capacity = new_cap;
+        } else {
+            self.remap(new_cap)?;
+        }
         self.size_unsynced.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -870,7 +930,14 @@ impl MmapDataFile {
                 ),
             ));
         }
-        self.remap(len)?;
+        if self.reserved > 0 && matches!(self.backing, Backing::Rw(_)) {
+            // Shrink the file under the reserved mapping, which stays put; the pages past the new
+            // EOF are never touched (and read back as zeros if a later growth re-extends the file).
+            self.file.set_len(len).inspect_err(|_| self.poison())?;
+            self.capacity = len;
+        } else {
+            self.remap(len)?;
+        }
         self.end = len;
         // Bytes past `len` are gone; clamp the watermark so a later append below the old high-water
         // is still flushed (bytes still present under `len` stay durable).
@@ -1097,7 +1164,14 @@ impl MmapDataFile {
         // sentinel and `end` stays at the padded physical size — pair with
         // `set_read_bound`.
         let (logical_end, opened_unclean) = detect_sentinel(&self.file, disk_len)?;
-        if disk_len != self.capacity {
+        if disk_len != self.capacity
+            && !self.read_only
+            && disk_len <= self.reserved
+            && matches!(self.backing, Backing::Rw(_))
+        {
+            // The reserved mapping already covers the file at its new size: keep it in place.
+            self.capacity = disk_len;
+        } else if disk_len != self.capacity {
             self.backing = Backing::Empty;
             if disk_len > 0 {
                 self.backing = if self.read_only {
@@ -1405,6 +1479,7 @@ mod tests {
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
             derived: false,
+            reserve: 0,
         }
     }
 
@@ -1416,6 +1491,7 @@ mod tests {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
             derived: false,
+            reserve: 0,
         }
     }
 
@@ -1469,6 +1545,93 @@ mod tests {
         let mut buf = vec![0u8; 400];
         df.read_exact(&mut buf).expect("read back");
         assert_eq!(buf, pattern(400));
+    }
+
+    /// The reserving mode's point: the mapping never moves while the file grows underneath it, and
+    /// the data written through it is durable and reads back after a clean close.
+    #[test]
+    fn reserved_mapping_never_moves_across_growth() {
+        let tmp = TempDir::with_prefix("mmap_df_reserved").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { reserve: 1 << 20, ..tiny_opts() };
+        let mut expected = pattern(10);
+        {
+            let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+            df.write_all(&pattern(10)).expect("write");
+            let base = df.slice(0, 1).expect("slice").as_ptr();
+            for _ in 0..20 {
+                df.write_all(&pattern(500)).expect("grow");
+                expected.extend_from_slice(&pattern(500));
+                assert_eq!(df.slice(0, 1).expect("slice").as_ptr(), base, "the mapping moved");
+            }
+            assert!(df.capacity > 4096, "the file grew several times (capacity {})", df.capacity);
+            df.sync_all().expect("barrier");
+        }
+        let mut df = MmapDataFile::open(&path, true).expect("reopen");
+        assert!(!df.opened_unclean(), "the clean close sealed the file");
+        let mut buf = vec![0u8; expected.len()];
+        df.read_exact(&mut buf).expect("read back");
+        assert_eq!(buf, expected);
+    }
+
+    /// A shrink under a reservation keeps the mapping in place, and a later growth re-extends the
+    /// file through the same mapping (the re-grown range reads as the new data, not stale bytes).
+    #[test]
+    fn reserved_mapping_truncate_keeps_mapping() {
+        let tmp = TempDir::with_prefix("mmap_df_reserved_trunc").expect("temp dir");
+        let opts = MmapFileOptions { reserve: 1 << 20, ..tiny_opts() };
+        let mut df = MmapDataFile::open_with(tmp.path().join("data"), false, opts).expect("open");
+        df.write_all(&pattern(3000)).expect("write");
+        let base = df.slice(0, 1).expect("slice").as_ptr();
+        df.truncate(1000).expect("truncate");
+        assert_eq!(df.len(), 1000);
+        assert_eq!(df.slice(0, 1).expect("slice").as_ptr(), base, "truncate moved the mapping");
+        df.write_all(&pattern(2000)).expect("regrow");
+        assert_eq!(df.slice(0, 1).expect("slice").as_ptr(), base, "regrowth moved the mapping");
+        let mut expected = pattern(3000)[..1000].to_vec();
+        expected.extend_from_slice(&pattern(2000));
+        assert_eq!(df.slice(0, expected.len()).expect("slice"), &expected[..]);
+    }
+
+    /// Growing past the reservation falls back to a remap with a larger reservation (the mapping
+    /// may move then) and stays correct.
+    #[test]
+    fn reserved_mapping_falls_back_past_reservation() {
+        let tmp = TempDir::with_prefix("mmap_df_reserved_past").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { reserve: 4096, ..tiny_opts() };
+        {
+            let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+            df.write_all(&pattern(20_000)).expect("write past the reservation");
+            assert!(df.reserved >= 20_000, "re-reserved larger (reserved {})", df.reserved);
+            assert_eq!(df.slice(0, 20_000).expect("slice"), &pattern(20_000)[..]);
+            df.sync_all().expect("barrier");
+        }
+        let mut df = MmapDataFile::open(&path, true).expect("reopen");
+        assert!(!df.opened_unclean());
+        let mut buf = vec![0u8; 20_000];
+        df.read_exact(&mut buf).expect("read back");
+        assert_eq!(buf, pattern(20_000));
+    }
+
+    /// An empty file opened with a reservation is mapped at once (no first-write remap) and works
+    /// like any other: write, close, reopen.
+    #[test]
+    fn reserved_mapping_on_empty_file() {
+        let tmp = TempDir::with_prefix("mmap_df_reserved_empty").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { reserve: 1 << 20, ..tiny_opts() };
+        {
+            let mut df = MmapDataFile::open_with(&path, false, opts).expect("open empty");
+            assert_eq!((df.len(), df.capacity), (0, 0));
+            assert!(matches!(df.backing, Backing::Rw(_)), "the reservation is mapped up front");
+            df.write_all(&pattern(100)).expect("write");
+        }
+        let mut df = MmapDataFile::open(&path, true).expect("reopen");
+        assert!(!df.opened_unclean());
+        let mut buf = vec![0u8; 100];
+        df.read_exact(&mut buf).expect("read back");
+        assert_eq!(buf, pattern(100));
     }
 
     /// The digest-index write pattern: sequential fill, in-place overwrite, and extend-at-end.
@@ -2267,6 +2430,7 @@ mod tests {
             write_mode: WriteMode::Append,
             access: MmapAccess::Normal,
             derived: false,
+            reserve: 0,
         };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).

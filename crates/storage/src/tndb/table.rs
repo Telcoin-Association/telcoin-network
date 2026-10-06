@@ -21,12 +21,17 @@ use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
 
 use crate::archive::{
     btree_index::{iter::BtreeCursor, BtreeIndex},
+    data_file::MmapFileOptions,
     error::fetch::FetchError,
     pack::{Pack, PackCompression},
 };
 
 /// Pack/index format version for tndb tables (matches `tndb::database`).
 const PACK_VERSION: u16 = 1;
+
+/// Address space reserved for a table's value log mapping (see [`MmapFileOptions::reserve`]):
+/// virtual only, sized so a table's log never outgrows it in practice.
+const TNDB_MAP_RESERVE: u64 = crate::archive::btree_index::index::BTX_MAP_RESERVE;
 
 /// Which ordered scan to run over a table's index.
 pub(crate) enum ScanKind {
@@ -146,8 +151,17 @@ impl TnTable {
     /// populated) the `btx/` index.
     pub(crate) fn open(dir: PathBuf) -> eyre::Result<Self> {
         std::fs::create_dir_all(&dir)?;
-        let data =
-            Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)?;
+        // The value log keeps one reserved mapping for its whole open life (it never moves on
+        // growth), as the B-tree index does — groundwork for reads that take no table lock.
+        let opts = MmapFileOptions { reserve: TNDB_MAP_RESERVE, ..Default::default() };
+        let data = Pack::<Vec<u8>>::open_with(
+            dir.join("data"),
+            0,
+            false,
+            PackCompression::None,
+            PACK_VERSION,
+            opts,
+        )?;
         Ok(Self { inner: Arc::new(RwLock::new(Inner { dir, data, idx: None })) })
     }
 

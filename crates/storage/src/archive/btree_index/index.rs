@@ -47,6 +47,14 @@ use crate::archive::{
     pack::DataHeader,
 };
 
+/// Address space reserved for an index file's mapping (see
+/// [`MmapFileOptions::reserve`](crate::archive::data_file::MmapFileOptions::reserve)): virtual
+/// only, so the mapping never moves while the file stays within it; a file that outgrows it is
+/// re-reserved at double the size (the one case in which the mapping moves). 1 GiB rather than
+/// tens of GiB: on macOS the per-commit `msync` cost measurably grew with a 64 GiB reservation
+/// (tndb one-write-plus-sync +5–8%), and was flat at 1 GiB.
+pub(crate) const BTX_MAP_RESERVE: u64 = 1 << 30;
+
 /// Hard cap on tree height while descending, a corruption tripwire (real heights are tiny: at a
 /// branching factor of dozens, even 2^48 keys stay well under this).
 const MAX_DEPTH: usize = 48;
@@ -175,6 +183,7 @@ impl BtreeIndex {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
             derived: true,
+            reserve: BTX_MAP_RESERVE,
             ..Default::default()
         };
         let mut file = MmapDataFile::open_with(dir.join("index.btx"), read_only, opts)?;
