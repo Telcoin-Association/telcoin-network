@@ -9599,7 +9599,7 @@ pub(crate) mod test {
         std::fs::create_dir_all(&base_dir).expect("create epoch dir");
         let data_path = base_dir.join(Inner::DATA_NAME);
         {
-            let mut raw: Pack<PackRecord> =
+            let raw: Pack<PackRecord> =
                 Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("raw pack");
             raw.commit().expect("commit header");
@@ -9671,7 +9671,7 @@ pub(crate) mod test {
         std::fs::create_dir_all(&base_dir).expect("create epoch dir");
         let data_path = base_dir.join(Inner::DATA_NAME);
         {
-            let mut raw: Pack<PackRecord> =
+            let raw: Pack<PackRecord> =
                 Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("raw pack");
             raw.commit().expect("commit header");

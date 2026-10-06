@@ -118,7 +118,7 @@ impl Inner {
 
     /// Durably persist the value log (the WAL). The index is rebuildable from it and is synced by
     /// [`BtreeIndex`]'s `Drop` on clean close, matching today's barrier.
-    fn flush(&mut self) -> eyre::Result<()> {
+    fn flush(&self) -> eyre::Result<()> {
         self.data.commit()?;
         Ok(())
     }
@@ -182,9 +182,13 @@ impl TnTable {
         self.inner.write().clear()
     }
 
-    /// Durably persist the value log.
+    /// Durably persist the value log. Takes the table's read lock: readers (and live scans) keep
+    /// going during the sync; writers wait for it.
     pub(crate) fn flush(&self) -> eyre::Result<()> {
-        self.inner.write().flush()
+        // A commit is a pure barrier over bytes already appended (appends hold the write lock, so
+        // they finished before this read lock was granted), so it shares the lock with readers
+        // instead of stalling them for the whole sync; writers still wait.
+        self.inner.read().flush()
     }
 
     /// True if the table has no entries.
@@ -397,5 +401,33 @@ mod test {
         assert_eq!(first(ScanKind::RevFrom(kv(0).0)), None, "nothing below the smallest key");
         assert_eq!(first(ScanKind::From(kv(51).0)), Some((52, kv(52).1)));
         assert_eq!(first(ScanKind::Forward), Some((0, kv(0).1)));
+    }
+
+    /// A flush is a barrier over already-appended bytes and takes only the read lock, so it
+    /// completes while a scan of the same table is alive (a write-locked flush would wait for the
+    /// scan, stalling every reader for the whole sync).
+    #[test]
+    fn test_tntable_flush_does_not_wait_for_readers() {
+        use std::{sync::mpsc, time::Duration};
+
+        let tmp = TempDir::with_prefix("tntable_flush_shared").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t")).expect("open");
+        for i in 0..100u64 {
+            let (k, v) = kv(i);
+            table.insert(&k, &v).expect("insert");
+        }
+        let mut scan = table.scan(ScanKind::Forward);
+        assert!(scan.next_with(|_, _| ()).is_some());
+
+        // Flush on another thread so a regression fails the test instead of hanging it.
+        let (done_tx, done_rx) = mpsc::channel();
+        let flusher = table.clone();
+        let flush = std::thread::spawn(move || {
+            done_tx.send(flusher.flush().is_ok()).expect("report flush");
+        });
+        let flushed = done_rx.recv_timeout(Duration::from_secs(10));
+        drop(scan);
+        flush.join().expect("flush thread");
+        assert_eq!(flushed, Ok(true), "a flush must not wait for a live scan of its table");
     }
 }

@@ -50,6 +50,10 @@
 use std::{
     hash::BuildHasherDefault,
     path::Path,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Barrier,
+    },
     time::{Duration, Instant},
 };
 
@@ -655,5 +659,291 @@ fn pack_vs_mdbx_bench() {
         &sorted_legend,
         &sorted_rows,
         &sorted_cols,
+    );
+}
+
+// ---- concurrent reads: N reader threads over one shared `Database` ----
+
+/// Reader thread counts for [`kv_concurrent_read_bench`].
+const READ_THREADS: &[usize] = &[1, 2, 4, 8];
+/// Random point-gets per reader thread.
+const N_READ_MT: u64 = 50_000;
+/// Inserts per write transaction for the `shared+writer` variant's writer thread.
+const WRITER_BATCH: u64 = 64;
+/// The writer's pause between batches: a steady writer, not one holding the write lock nonstop.
+const WRITER_PAUSE: Duration = Duration::from_millis(1);
+
+/// Define per-reader-thread copies of [`KvTable`] for the `per-table` variant.
+macro_rules! kv_tables {
+    ($($ty:ident = $name:literal),* $(,)?) => {$(
+        /// A per-reader-thread copy of [`KvTable`] for the `per-table` variant.
+        #[derive(Debug)]
+        struct $ty;
+
+        impl Table for $ty {
+            type Key = B256;
+            type Value = Vec<u8>;
+            const NAME: &'static str = $name;
+            const HINT: TableHint = TableHint::Epoch;
+        }
+    )*};
+}
+
+kv_tables!(
+    KvT0 = "kv0",
+    KvT1 = "kv1",
+    KvT2 = "kv2",
+    KvT3 = "kv3",
+    KvT4 = "kv4",
+    KvT5 = "kv5",
+    KvT6 = "kv6",
+    KvT7 = "kv7",
+);
+
+/// How the reader threads share tables.
+#[derive(Clone, Copy, Debug)]
+enum ReadMode {
+    /// Every reader reads the same table.
+    Shared,
+    /// Reader `t` reads its own table (`KvT<t>`), all holding the same data.
+    PerTable,
+    /// `Shared`, plus one writer thread committing batches into the same table.
+    SharedWithWriter,
+}
+
+impl ReadMode {
+    const ALL: [Self; 3] = [Self::Shared, Self::PerTable, Self::SharedWithWriter];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Shared => "shared",
+            Self::PerTable => "per-table",
+            Self::SharedWithWriter => "shared+writer",
+        }
+    }
+}
+
+/// Open every table the concurrent bench uses.
+fn open_mt_tables<D: Database>(db: &D) {
+    db.open_table::<KvTable>().expect("open table");
+    db.open_table::<KvT0>().expect("open table");
+    db.open_table::<KvT1>().expect("open table");
+    db.open_table::<KvT2>().expect("open table");
+    db.open_table::<KvT3>().expect("open table");
+    db.open_table::<KvT4>().expect("open table");
+    db.open_table::<KvT5>().expect("open table");
+    db.open_table::<KvT6>().expect("open table");
+    db.open_table::<KvT7>().expect("open table");
+}
+
+/// Bulk-load `items` into table `T` with one commit.
+fn load<D: Database, T: Table<Key = B256, Value = Vec<u8>>>(db: &D, items: &[(B256, Vec<u8>)]) {
+    let mut txn = db.write_txn().expect("write_txn");
+    for (k, v) in items {
+        txn.insert::<T>(k, v).expect("insert");
+    }
+    txn.commit().expect("commit");
+}
+
+/// Load `items` into the shared table and every per-thread table.
+fn load_mt_tables<D: Database>(db: &D, items: &[(B256, Vec<u8>)]) {
+    load::<D, KvTable>(db, items);
+    load::<D, KvT0>(db, items);
+    load::<D, KvT1>(db, items);
+    load::<D, KvT2>(db, items);
+    load::<D, KvT3>(db, items);
+    load::<D, KvT4>(db, items);
+    load::<D, KvT5>(db, items);
+    load::<D, KvT6>(db, items);
+    load::<D, KvT7>(db, items);
+}
+
+/// Point-get every key from table `T` in one read transaction; return the number found.
+fn read_keys<D: Database, T: Table<Key = B256, Value = Vec<u8>>>(db: &D, keys: &[B256]) -> usize {
+    let txn = db.read_txn().expect("read_txn");
+    keys.iter().filter(|k| txn.get::<T>(k).expect("get").is_some()).count()
+}
+
+/// [`read_keys`] on per-thread table `KvT<table>`.
+fn read_per_table<D: Database>(db: &D, table: usize, keys: &[B256]) -> usize {
+    match table {
+        0 => read_keys::<D, KvT0>(db, keys),
+        1 => read_keys::<D, KvT1>(db, keys),
+        2 => read_keys::<D, KvT2>(db, keys),
+        3 => read_keys::<D, KvT3>(db, keys),
+        4 => read_keys::<D, KvT4>(db, keys),
+        5 => read_keys::<D, KvT5>(db, keys),
+        6 => read_keys::<D, KvT6>(db, keys),
+        7 => read_keys::<D, KvT7>(db, keys),
+        _ => unreachable!("at most 8 reader threads"),
+    }
+}
+
+/// Aggregate reader throughput (million gets per second) for `threads` readers in `mode` over a
+/// loaded `db`. Readers (and the writer, if any) start together on a barrier; the clock runs from
+/// the barrier until the last reader finishes.
+fn concurrent_reads<D: Database>(db: &D, mode: ReadMode, threads: usize, size: usize) -> f64 {
+    let keys: Vec<Vec<B256>> = (0..threads as u64)
+        .map(|t| (0..N_READ_MT).map(|m| key(mix(m + t * N_READ_MT) % N_BULK)).collect())
+        .collect();
+    let writer = matches!(mode, ReadMode::SharedWithWriter);
+    let start = Barrier::new(threads + 1 + usize::from(writer));
+    let stop = AtomicBool::new(false);
+    let elapsed = std::thread::scope(|scope| {
+        if writer {
+            let (start, stop) = (&start, &stop);
+            scope.spawn(move || {
+                start.wait();
+                let mut next = N_BULK; // new keys, past the loaded ones the readers ask for
+                while !stop.load(Ordering::Relaxed) {
+                    let mut txn = db.write_txn().expect("write_txn");
+                    for _ in 0..WRITER_BATCH {
+                        txn.insert::<KvTable>(&key(next), &value(size, next)).expect("insert");
+                        next += 1;
+                    }
+                    txn.commit().expect("commit");
+                    std::thread::sleep(WRITER_PAUSE);
+                }
+            });
+        }
+        let readers: Vec<_> = keys
+            .iter()
+            .enumerate()
+            .map(|(t, keys)| {
+                let start = &start;
+                scope.spawn(move || {
+                    start.wait();
+                    match mode {
+                        ReadMode::PerTable => read_per_table(db, t, keys),
+                        ReadMode::Shared | ReadMode::SharedWithWriter => {
+                            read_keys::<D, KvTable>(db, keys)
+                        }
+                    }
+                })
+            })
+            .collect();
+        start.wait();
+        let began = Instant::now();
+        for reader in readers {
+            let hits = reader.join().expect("reader thread");
+            assert_eq!(hits as u64, N_READ_MT, "every read must hit a loaded key");
+        }
+        let elapsed = began.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        elapsed
+    });
+    (threads as u64 * N_READ_MT) as f64 / elapsed.as_secs_f64() / 1e6
+}
+
+/// One concurrent-report column: throughput for every value size, mode and thread count, in
+/// [`concurrent_row_labels`] order. Each value size gets a fresh store with every table loaded.
+fn concurrent_column<D: Database>(open: impl Fn(&Path) -> D) -> Vec<f64> {
+    let mut out = Vec::new();
+    for (_, size) in VALUE_SIZES {
+        let dir = TempDir::with_prefix("packkv_mt").expect("temp dir");
+        let db = open(dir.path());
+        let items: Vec<(B256, Vec<u8>)> = (0..N_BULK).map(|i| (key(i), value(*size, i))).collect();
+        load_mt_tables(&db, &items);
+        for mode in ReadMode::ALL {
+            for &threads in READ_THREADS {
+                out.push(concurrent_reads(&db, mode, threads, *size));
+            }
+        }
+        drop(db);
+        drop(dir);
+    }
+    out
+}
+
+fn concurrent_row_labels() -> Vec<String> {
+    VALUE_SIZES
+        .iter()
+        .flat_map(|(name, _)| {
+            ReadMode::ALL.into_iter().flat_map(move |mode| {
+                READ_THREADS
+                    .iter()
+                    .map(move |threads| format!("{} {name} x{threads}", mode.label()))
+            })
+        })
+        .collect()
+}
+
+fn print_rate_table(title: &str, legend: &str, rows: &[String], cols: &[(&str, Vec<f64>)]) {
+    let label_w = rows.iter().map(|s| s.len()).max().unwrap_or(0).max("benchmark".len());
+    let cell_w = 13usize;
+
+    println!("\n{title}");
+    println!("{legend}");
+    print!("{:<label_w$}", "benchmark");
+    for (name, _) in cols {
+        print!(" {name:>cell_w$}");
+    }
+    println!();
+    for (i, label) in rows.iter().enumerate() {
+        print!("{label:<label_w$}");
+        for (_, rates) in cols {
+            print!(" {:>cell_w$}", format!("{:.2}", rates[i]));
+        }
+        println!();
+    }
+    println!();
+}
+
+/// Concurrent point reads: reader throughput as threads are added, for tndb, `MemDatabase` and
+/// MDBX — on one shared table, on a table per thread, and with a steady concurrent writer.
+///
+/// On-demand perf test (kept out of the default suite). Run with:
+/// `cargo test --release -p tn-storage kv_concurrent_read_bench -- --ignored --nocapture
+/// --test-threads 1`.
+#[test]
+#[ignore = "on-demand concurrent read benchmark; run with --ignored --nocapture --test-threads 1"]
+fn kv_concurrent_read_bench() {
+    let mut cols: Vec<(&str, Vec<f64>)> = Vec::new();
+    println!("  running tndb ...");
+    cols.push((
+        "tndb",
+        concurrent_column(|p| {
+            let db = TnDatabase::open(p).expect("open tndb");
+            open_mt_tables(&db);
+            db
+        }),
+    ));
+    println!("  running mem ...");
+    cols.push((
+        "mem",
+        concurrent_column(|_| {
+            let db = MemDatabase::new();
+            open_mt_tables(&db);
+            db
+        }),
+    ));
+    #[cfg(feature = "reth-libmdbx")]
+    {
+        println!("  running mdbx ...");
+        cols.push((
+            "mdbx",
+            concurrent_column(|p| {
+                let db = MdbxDatabase::open_with_sync_mode(
+                    p,
+                    16,
+                    4096 * MEGABYTE,
+                    8 * MEGABYTE,
+                    reth_libmdbx::SyncMode::SafeNoSync,
+                )
+                .expect("open mdbx");
+                open_mt_tables(&db);
+                db
+            }),
+        ));
+    }
+
+    let legend = format!(
+        "legend: aggregate reader throughput in million point-gets/s (higher is better); each reader does {N_READ_MT} random gets over {N_BULK} loaded keys. shared = all readers on one table; per-table = reader t on its own table (same data), so no table state is shared; shared+writer = shared plus one writer committing {WRITER_BATCH}-insert batches into that table every {WRITER_PAUSE:?}. Scaling = compare xN against x1."
+    );
+    print_rate_table(
+        "=== concurrent point reads (M gets/s; higher is better) ===",
+        &legend,
+        &concurrent_row_labels(),
+        &cols,
     );
 }

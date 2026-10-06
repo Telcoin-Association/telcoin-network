@@ -76,7 +76,8 @@ fn with_read_key<K: Serialize, R>(
 // NOTE: an iterator (`iter`/`reverse_iter`/`skip_to`) holds its table's read lock until dropped —
 // the same contract as `mem_db`'s iterators. A caller must drop it before writing the *same* table
 // on the same thread, and a same-thread read of that table can block behind another thread's
-// pending write while the iterator is alive.
+// pending write while the iterator is alive. A commit (flush) only shares that read lock, so it
+// does not wait for a live iterator.
 
 /// Clone the table's handle out of the store, dropping the `DashMap` shard lock.
 fn handle(store: &StoreType, name: &'static str) -> Option<TnTable> {

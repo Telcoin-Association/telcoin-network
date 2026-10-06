@@ -209,7 +209,11 @@ where
     /// Note this is an expensive call (syncing to disk is not cheap).
     /// On a pack in the failed state this returns [`CommitError::Failed`] with a copy of the
     /// error that caused the failed state.
-    pub fn commit(&mut self) -> Result<(), CommitError> {
+    ///
+    /// A pure durability barrier: it changes nothing but the data file's own (atomic) flush
+    /// bookkeeping, so it needs only shared access. An owner that serializes appends behind a lock
+    /// can commit under that lock's shared mode, leaving readers unblocked during the sync.
+    pub fn commit(&self) -> Result<(), CommitError> {
         self.inner.commit()
     }
 
@@ -517,7 +521,7 @@ where
     /// Flush any caches to disk and sync the data and index file.
     /// All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
-    fn commit(&mut self) -> Result<(), CommitError> {
+    fn commit(&self) -> Result<(), CommitError> {
         if self.read_only {
             return Err(CommitError::ReadOnly);
         }

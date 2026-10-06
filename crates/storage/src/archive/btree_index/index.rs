@@ -1252,7 +1252,8 @@ mod tests {
             let bytes = std::fs::read(&file).expect("read");
             BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("header")
         };
-        let mutations: [(&str, fn(&mut BtreeHeader)); 5] = [
+        type Mutation = (&'static str, fn(&mut BtreeHeader));
+        let mutations: [Mutation; 5] = [
             ("root past the tree", |h| h.root_page = h.page_count + 5),
             ("root is the header page", |h| h.root_page = 0),
             ("first leaf past the tree", |h| h.first_leaf = h.page_count),
