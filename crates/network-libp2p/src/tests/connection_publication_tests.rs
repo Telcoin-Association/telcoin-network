@@ -4,8 +4,6 @@ use super::*;
 /// connection is still live. No periodic publication or application lookup can rescue this test.
 #[tokio::test]
 async fn restarted_identity_receives_record_with_old_connection_alive() -> eyre::Result<()> {
-    use libp2p::swarm::dial_opts::{DialOpts, PeerCondition};
-
     let TestTypes { mut peer1, mut peer2, _task_manager } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let publisher_id = *peer1.network.swarm.local_peer_id();
@@ -69,16 +67,11 @@ async fn restarted_identity_receives_record_with_old_connection_alive() -> eyre:
     })
     .filter_map(|result| futures::future::ready(result.transpose()));
     let mut listening = Box::pin(listening);
-    let new_address = timeout(Duration::from_secs(5), listening.next())
+    timeout(Duration::from_secs(5), listening.next())
         .await?
         .ok_or_else(|| eyre!("replacement listener ended"))??;
     drop(listening);
-    peer1.network.swarm.dial(
-        DialOpts::peer_id(receiver_id)
-            .addresses(vec![new_address])
-            .condition(PeerCondition::Always)
-            .build(),
-    )?;
+    restarted.swarm.dial(peer1.config.primary_address())?;
 
     let second_delivery = futures::stream::unfold(
         (&mut peer1.network, &mut peer2.network, &mut restarted),

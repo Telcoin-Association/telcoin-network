@@ -6,8 +6,9 @@ network configuration path, preserving the deployment's bootstrap peers and
 hostname. Restart after changing the profile. Inactive configured workers are
 included in its allocation.
 
-This candidate has not passed live qualification. Its unit tests and
-synthetic scoring fixtures do not qualify capacity or complete issue #1476.
+Capacity qualification requires a passing live run and published evidence for
+the recorded source revision and envelope. Unit tests and synthetic scoring
+fixtures do not qualify capacity or complete issue #1476.
 Validator validated-address and handshake qualification retains its Launch scope.
 
 ## Coupled bounds
