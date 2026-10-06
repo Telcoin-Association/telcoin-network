@@ -171,6 +171,10 @@ jobs:
 
   # This carried dependency is outside the workspace, so workspace test lanes do not
   # exercise its accounting regressions. Run them for maintainer PRs as well.
+  #
+  # No cache step: main warms no entry for this package (cache-deps.yaml) and the
+  # policy above lets no lane save one, so a restore would find nothing. The cold
+  # dependency build takes about 75 s, inside the lane's 15-minute budget.
   connection-limits-patch:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -179,10 +183,6 @@ jobs:
 
       - name: Install pinned toolchain
         run: rustup toolchain install 1.94 --profile minimal
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: connection-limits-patch
 
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
