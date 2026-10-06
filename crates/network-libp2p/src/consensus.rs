@@ -31,14 +31,14 @@ use libp2p::{
         InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
         ProtocolSupport,
     },
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
-use lru::LruCache;
+#[cfg(test)]
+use std::num::NonZeroUsize;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
-    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 use tn_config::{
@@ -112,22 +112,6 @@ where
         command = commands.recv() => command.map_or(LoopEvent::CommandsClosed, LoopEvent::Command),
     }
 }
-
-/// Hard cap on the number of distinct peers retained in
-/// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
-/// already pushed our [`NodeRecord`] to.
-///
-/// Without a cap this set grows once per distinct `PeerId` ever connected and is never cleaned up
-/// (a `PeerId` is a peer-minted cryptographic identity, so a churn of fresh identities grows it
-/// without bound), which on a RAM-capped node is a slow but guaranteed OOM. Backing the set with a
-/// capacity-bounded LRU caps its resident size to this many entries (~64-80 B each, so well under
-/// 1 MB) while preserving the de-dup intent: an actively (re)connecting peer is promoted on every
-/// connect and so is never the eviction victim, and only a peer absent long enough to fall out of
-/// the LRU is re-pushed to on its eventual return - at worst once, which is self-limiting.
-///
-/// The value is a generous multiple of the live-peer target (`PeerConfig::max_peers()` defaults to
-/// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
-const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
 /// Maximum encoded kademlia message size in bytes, including the record and protocol overhead.
 ///
@@ -499,16 +483,6 @@ where
     /// Folded into every [NodeRecord] signature so a record signed for one
     /// network never verifies on another (GHSA-cc64-wfq5-56ph).
     record_domain: RecordDomain,
-    /// Peers we have already pushed our [NodeRecord] to.
-    ///
-    /// A peer needs our record before it can resolve our BLS key, so we push it on
-    /// `PeerConnected`. The last-connection close clears this marker because the receiver
-    /// relinquishes connection-owned retention and needs another advertisement on reconnect.
-    ///
-    /// A bounded LRU limits metadata for concurrent connections and failed publication attempts.
-    /// Entries survive intermediate connection closes and are removed on the last close. The
-    /// resident cap is [`MAX_PUBLISHED_TO_PEERS`].
-    published_to_peers: LruCache<PeerId, ()>,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
@@ -830,7 +804,6 @@ where
             node_record,
             external_addr,
             record_domain,
-            published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
@@ -977,33 +950,40 @@ where
         }
     }
 
-    /// Push our [NodeRecord] directly to a newly-connected peer.
-    ///
-    /// Used on first-time connections so the remote peer can resolve our BLS key
-    /// without waiting for the kad publication interval (12h). Callers must
-    /// short-circuit on reconnects - see [`Self::published_to_peers`]
-    fn publish_our_data_to_peer(&mut self, peer: PeerId) {
-        let record = self.get_peer_record();
-        info!(target: "network-kad", "Publishing our record to peer {peer:?}");
-        let query_id = self.swarm.behaviour_mut().kademlia.put_record_to(
-            record,
-            vec![peer].into_iter(),
-            kad::Quorum::One,
-        );
-        tracing::debug!(target: "network::identity", event = "publication_enqueued",
-            domain = ?self.record_domain, ?peer, ?query_id);
+    /// Queue our signed record for this accepted physical connection. Kademlia retains one small
+    /// pending state per live connection and bounds active targeted publications separately.
+    fn publish_our_data_to_peer(&mut self, peer: PeerId, connection: ConnectionId) {
+        self.swarm.behaviour_mut().kademlia.queue_record_to_connection(peer, connection);
+        self.drain_pending_publications();
     }
 
-    /// Record that we have pushed our [`NodeRecord`] to `peer_id`, returning `true` the first time
-    /// we see a peer (i.e. when a direct push is warranted) and `false` for a peer we have already
-    /// pushed to.
-    ///
-    /// Backed by the capacity-bounded [`Self::published_to_peers`] LRU so this de-dup gate cannot
-    /// grow without bound. A hit promotes the peer to most-recently-used, so an actively
-    /// (re)connecting peer is never evicted and never re-pushed to; only a peer absent long enough
-    /// to fall out of the LRU is pushed to again on its eventual return.
-    fn mark_published_to_peer(&mut self, peer_id: PeerId) -> bool {
-        self.published_to_peers.put(peer_id, ()).is_none()
+    /// Create the current signed payload only when an active publication slot is available.
+    /// A saturated query pool leaves the connection pending until completion frees capacity.
+    fn drain_pending_publications(&mut self) {
+        std::iter::from_fn(|| {
+            let (peer, connection) =
+                self.swarm.behaviour().kademlia.next_pending_record_connection()?;
+            if self.swarm.behaviour().peer_manager.peer_banned(&peer) {
+                self.swarm.behaviour_mut().kademlia.cancel_record_to_connection(connection);
+                Some(())
+            } else {
+                let record = self.get_peer_record();
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .put_record_to_connection(record, peer, connection)
+                    .map(|query_id| {
+                        tracing::debug!(target: "network::identity", event = "publication_enqueued",
+                            domain = ?self.record_domain, ?peer, ?connection, ?query_id);
+                    })
+                    .map_err(|error| {
+                        trace!(target: "network-kad", ?peer, ?connection, ?error,
+                            "connection publication remains pending or target is stale");
+                    })
+                    .ok()
+            }
+        })
+        .for_each(|()| ());
     }
 
     /// Run the network loop to process incoming gossip.
@@ -1092,10 +1072,6 @@ where
                         domain = ?self.record_domain, ?peer_id, ?connection_id,
                         outcome, ?io_kind, remaining_connections = 0_u32);
                 }
-                // Connection-owned rows are gone at the receiver too. A reconnect needs a fresh
-                // direct advertisement even when the bounded publication cache saw this peer
-                // before.
-                self.published_to_peers.pop(&peer_id);
                 self.swarm
                     .behaviour_mut()
                     .kademlia
@@ -2227,7 +2203,7 @@ where
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
-            PeerEvent::PeerConnected(peer_id, addr) => {
+            PeerEvent::PeerConnected(peer_id, connection_id, addr) => {
                 // Defense in depth: even if the peer-manager `handle_established_*_connection`
                 // path lets a banned peer reach this event (observed in adiri testnet logs),
                 // refuse to register the connection with kademlia/gossipsub. Otherwise the
@@ -2248,11 +2224,9 @@ where
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
 
-                // Each newly connected peer needs a direct record push. Concurrent connections
-                // share the publication marker; the last close clears it for a reconnect.
-                if self.mark_published_to_peer(peer_id) {
-                    self.publish_our_data_to_peer(peer_id);
-                }
+                // Each accepted physical connection needs its own advertisement, including a
+                // restarted receiver whose old connection with the same identity remains live.
+                self.publish_our_data_to_peer(peer_id, connection_id);
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
@@ -2360,6 +2334,9 @@ where
 
     /// Process event from kademlia behavior.
     fn process_kad_event(&mut self, event: kad::Event) -> NetworkResult<()> {
+        // Kademlia removes completed, timed-out and closed-target queries before emitting their
+        // terminal event, so this immediately admits waiting live connections into freed slots.
+        self.drain_pending_publications();
         match event {
             kad::Event::InboundRequest { request } => {
                 trace!(target: "network-kad", "inbound {request:?}");

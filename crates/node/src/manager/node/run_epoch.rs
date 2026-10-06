@@ -292,33 +292,10 @@ where
         // is threaded through the retry as the pin, so every attempt provably reads the same
         // block. The `try_into` arity checks are `eyre`, not `StateReadError`, so they stay
         // OUTSIDE the retried closure.
-        let epochs: Vec<_> =
-            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
-        let sets = retry_provider_faults(
-            "neighbor committees at the epoch-start pin",
-            &epoch_start_header,
-            |pin| engine.validators_for_epochs_at_header(&epochs, pin),
-        )
-        .await
-        .map_err(|e| {
-            eyre::eyre!(
-                "failed neighbor-committee read at the epoch-start pin - halting rather than \
-                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
-            )
-        })?;
-        let (previous_committee_keys, next_committee_keys): (HashSet<BlsPublicKey>, Vec<_>) =
-            if entered == 0 {
-                // epoch 0 has no previous committee
-                let [next] = sets.try_into().map_err(|_| {
-                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch 0")
-                })?;
-                (HashSet::new(), next)
-            } else {
-                let [previous, next] = sets.try_into().map_err(|_| {
-                    eyre::eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
-                })?;
-                (previous.into_iter().collect(), next)
-            };
+        let neighbors =
+            Self::read_neighbor_committee_keys(engine, entered, &epoch_start_header).await?;
+        let previous_committee_keys = neighbors.previous;
+        let next_committee_keys = neighbors.next;
 
         let consensus_config = self
             .configure_consensus(

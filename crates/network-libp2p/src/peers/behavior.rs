@@ -139,7 +139,10 @@ impl NetworkBehaviour for PeerManager {
         self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
             }) => {
                 // NOTE: The ConnectionEstablished event must be handled because
                 // NetworkBehaviour::handle_established_inbound_connection and
@@ -147,7 +150,7 @@ impl NetworkBehaviour for PeerManager {
                 //
                 // Another behaviour can terminate the connection early, making it unsafe to
                 // assume a peer is connected until this event is received.
-                self.on_connection_established(peer_id, endpoint)
+                self.on_connection_established(peer_id, connection_id, endpoint)
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
@@ -237,7 +240,12 @@ impl PeerManager {
     ///
     /// Another behavior can terminate the connection early, making it unsafe to
     /// assume a peer is connected until this event is received.
-    fn on_connection_established(&mut self, peer_id: PeerId, endpoint: &ConnectedPoint) {
+    fn on_connection_established(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        endpoint: &ConnectedPoint,
+    ) {
         debug!(
             target: "peer-manager",
             ?peer_id,
@@ -274,7 +282,7 @@ impl PeerManager {
             return;
         }
 
-        self.push_event(PeerEvent::PeerConnected(peer_id, multiaddr));
+        self.push_event(PeerEvent::PeerConnected(peer_id, connection_id, multiaddr));
 
         // log successful connection establishment
         info!(

@@ -49,6 +49,10 @@ use web_time::Instant;
 #[path = "expiry_delivery_tests.rs"]
 mod expiry_delivery_tests;
 
+#[cfg(test)]
+#[path = "connection_publication_tests.rs"]
+mod connection_publication_tests;
+
 pub use crate::query::QueryStats;
 use crate::{
     K_VALUE,
@@ -65,6 +69,48 @@ use crate::{
         store::{self, RecordStore},
     },
 };
+
+const MAX_ACTIVE_CONNECTION_PUBLICATIONS: usize = 32;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PublicationOrder(u64);
+
+#[derive(Clone, Copy)]
+enum ConnectionPublication {
+    Unpublished,
+    Pending(PublicationOrder),
+    Active(QueryId),
+    Complete,
+}
+
+struct ConnectionState {
+    peer: PeerId,
+    publication: ConnectionPublication,
+}
+
+/// A queued physical-connection publication could not be started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConnectionPublicationError {
+    /// All bounded active publication slots are occupied. The request remains pending.
+    AtCapacity,
+    /// The physical connection has closed or belongs to a different peer.
+    StaleConnection,
+    /// This connection has no waiting publication.
+    NotPending,
+}
+
+impl std::fmt::Display for ConnectionPublicationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::AtCapacity => "physical-connection publication capacity is occupied",
+            Self::StaleConnection => "physical-connection publication target is not live",
+            Self::NotPending => "physical connection has no pending publication",
+        };
+        formatter.write_str(message)
+    }
+}
+
+impl std::error::Error for ConnectionPublicationError {}
 
 /// `Behaviour` is a `NetworkBehaviour` that implements the libp2p
 /// Kademlia protocol.
@@ -110,7 +156,8 @@ pub struct Behaviour<TStore> {
 
     external_addresses: ExternalAddresses,
 
-    connections: HashMap<ConnectionId, PeerId>,
+    connections: HashMap<ConnectionId, ConnectionState>,
+    publication_order: PublicationOrder,
 
     /// See [`Config::caching`].
     caching: Caching,
@@ -513,6 +560,7 @@ where
             external_addresses: Default::default(),
             local_peer_id: id,
             connections: Default::default(),
+            publication_order: PublicationOrder(0),
             mode: Mode::Client,
             auto_mode: true,
             no_events_waker: None,
@@ -936,6 +984,130 @@ where
         self.queries.add_fixed(peers, info)
     }
 
+    /// Requests one publication on an existing physical connection. Repeated requests retain
+    /// its current pending, active or completed state. Pending work adds only a small state to
+    /// each live connection, with no retained record payload or independent queue.
+    ///
+    /// A swarm with a global physical connection limit also bounds total pending work. A swarm
+    /// without that limit has no fixed total bound, but retains at most one request per live
+    /// connection and removes it when that connection closes.
+    pub fn queue_record_to_connection(&mut self, peer: PeerId, connection: ConnectionId) {
+        if let Some(state) = self.connections.get_mut(&connection).filter(|state| {
+            state.peer == peer && matches!(state.publication, ConnectionPublication::Unpublished)
+        }) {
+            self.publication_order.0 = self.publication_order.0.saturating_add(1);
+            state.publication = ConnectionPublication::Pending(self.publication_order);
+        }
+    }
+
+    /// Cancels a waiting advertisement, for example after application admission is revoked.
+    pub fn cancel_record_to_connection(&mut self, connection: ConnectionId) {
+        if let Some(state) = self
+            .connections
+            .get_mut(&connection)
+            .filter(|state| matches!(state.publication, ConnectionPublication::Pending(_)))
+        {
+            state.publication = ConnectionPublication::Complete;
+        }
+    }
+
+    /// Selects the oldest waiting connection when a targeted query slot is available. Selection
+    /// does not allocate a list of pending connections or retain a record payload.
+    pub fn next_pending_record_connection(&self) -> Option<(PeerId, ConnectionId)> {
+        (self.active_connection_publications() < MAX_ACTIVE_CONNECTION_PUBLICATIONS)
+            .then(|| {
+                self.connections
+                    .iter()
+                    .filter_map(|(connection, state)| {
+                        if let ConnectionPublication::Pending(order) = state.publication {
+                            Some((order, state.peer, *connection))
+                        } else {
+                            None
+                        }
+                    })
+                    .min_by_key(|(order, _peer, _connection)| *order)
+                    .map(|(_order, peer, connection)| (peer, connection))
+            })
+            .flatten()
+    }
+
+    fn active_connection_publications(&self) -> usize {
+        self.queries
+            .iter()
+            .filter(|query| {
+                matches!(
+                    &query.info,
+                    QueryInfo::PutRecord {
+                        context: PutRecordContext::Connection(_),
+                        ..
+                    }
+                )
+            })
+            .count()
+    }
+
+    fn complete_connection_publication(&mut self, info: &QueryInfo, query_id: QueryId) {
+        if let QueryInfo::PutRecord {
+            context: PutRecordContext::Connection(connection),
+            ..
+        } = info
+        {
+            if let Some(state) = self.connections.get_mut(connection).filter(|state| {
+                matches!(
+                    state.publication, ConnectionPublication::Active(active) if active == query_id
+                )
+            }) {
+                state.publication = ConnectionPublication::Complete;
+            }
+        }
+    }
+
+    /// Starts a queued record publication on its physical connection, without dialing or
+    /// falling back to another connection for the same peer. Admission rechecks both the live
+    /// target and the finite active-query cap. Capacity pressure leaves the request pending.
+    pub fn put_record_to_connection(
+        &mut self,
+        mut record: Record,
+        peer: PeerId,
+        connection: ConnectionId,
+    ) -> Result<QueryId, ConnectionPublicationError> {
+        let state = self
+            .connections
+            .get(&connection)
+            .filter(|state| state.peer == peer)
+            .ok_or(ConnectionPublicationError::StaleConnection)?;
+        if !matches!(state.publication, ConnectionPublication::Pending(_)) {
+            Err(ConnectionPublicationError::NotPending)
+        } else if self.active_connection_publications() >= MAX_ACTIVE_CONNECTION_PUBLICATIONS {
+            Err(ConnectionPublicationError::AtCapacity)
+        } else {
+            record.expires = record
+                .expires
+                .or_else(|| self.record_ttl.map(|ttl| Instant::now() + ttl));
+            let info = QueryInfo::PutRecord {
+                context: PutRecordContext::Connection(connection),
+                record,
+                quorum: NonZeroUsize::MIN,
+                phase: PutRecordPhase::PutRecord {
+                    success: Vec::new(),
+                    get_closest_peers_stats: QueryStats::empty(),
+                },
+            };
+            let query_id = self.queries.add_fixed(std::iter::once(peer), info);
+            if let Some(state) = self.connections.get_mut(&connection) {
+                state.publication = ConnectionPublication::Active(query_id);
+            }
+            Ok(query_id)
+        }
+    }
+
+    /// Whether this physical connection belongs to the peer and is still live.
+    pub fn connection_matches(&self, peer: &PeerId, connection: ConnectionId) -> bool {
+        self.connections
+            .get(&connection)
+            .is_some_and(|state| &state.peer == peer)
+    }
+
     /// Removes the record with the given key from _local_ storage,
     /// if the local node is the publisher of the record.
     ///
@@ -1159,8 +1331,8 @@ where
             .extend(
                 self.connections
                     .iter()
-                    .map(|(conn_id, peer_id)| ToSwarm::NotifyHandler {
-                        peer_id: *peer_id,
+                    .map(|(conn_id, state)| ToSwarm::NotifyHandler {
+                        peer_id: state.peer,
                         handler: NotifyHandler::One(*conn_id),
                         event: HandlerIn::ReconfigureMode {
                             new_mode: self.mode,
@@ -1457,6 +1629,7 @@ where
     fn query_finished(&mut self, q: Query) -> Option<Event> {
         let query_id = q.id();
         tracing::trace!(query=?query_id, "Query finished");
+        self.complete_connection_publication(&q.info, query_id);
         match q.info {
             QueryInfo::Bootstrap {
                 peer,
@@ -1668,14 +1841,14 @@ where
                     }
                 };
                 match context {
-                    PutRecordContext::Publish | PutRecordContext::Custom => {
-                        Some(Event::OutboundQueryProgressed {
-                            id: query_id,
-                            stats: get_closest_peers_stats.merge(q.stats),
-                            result: QueryResult::PutRecord(mk_result(record.key)),
-                            step: ProgressStep::first_and_last(),
-                        })
-                    }
+                    PutRecordContext::Publish
+                    | PutRecordContext::Custom
+                    | PutRecordContext::Connection(_) => Some(Event::OutboundQueryProgressed {
+                        id: query_id,
+                        stats: get_closest_peers_stats.merge(q.stats),
+                        result: QueryResult::PutRecord(mk_result(record.key)),
+                        step: ProgressStep::first_and_last(),
+                    }),
                     PutRecordContext::Republish => Some(Event::OutboundQueryProgressed {
                         id: query_id,
                         stats: get_closest_peers_stats.merge(q.stats),
@@ -1693,6 +1866,7 @@ where
 
     /// Handles a query that timed out.
     fn query_timeout(&mut self, query: Query) -> Option<Event> {
+        self.complete_connection_publication(&query.info, query.id());
         let query_id = query.id();
         tracing::trace!(query=?query_id, "Query timed out");
         match query.info {
@@ -1774,14 +1948,14 @@ where
                     },
                 });
                 match context {
-                    PutRecordContext::Publish | PutRecordContext::Custom => {
-                        Some(Event::OutboundQueryProgressed {
-                            id: query_id,
-                            stats: query.stats,
-                            result: QueryResult::PutRecord(err),
-                            step: ProgressStep::first_and_last(),
-                        })
-                    }
+                    PutRecordContext::Publish
+                    | PutRecordContext::Custom
+                    | PutRecordContext::Connection(_) => Some(Event::OutboundQueryProgressed {
+                        id: query_id,
+                        stats: query.stats,
+                        result: QueryResult::PutRecord(err),
+                        step: ProgressStep::first_and_last(),
+                    }),
                     PutRecordContext::Republish => Some(Event::OutboundQueryProgressed {
                         id: query_id,
                         stats: query.stats,
@@ -2159,6 +2333,27 @@ where
     ) {
         self.connections.remove(&connection_id);
 
+        self.queries
+            .iter_mut()
+            .filter(|query| {
+                matches!(
+                    &query.info,
+                    QueryInfo::PutRecord { context: PutRecordContext::Connection(target), .. }
+                        if *target == connection_id
+                )
+            })
+            .for_each(|query| {
+                query.on_failure(&peer_id);
+                query.finish();
+            });
+        self.queued_events.retain(|event| {
+            !matches!(
+                event,
+                ToSwarm::NotifyHandler { handler: NotifyHandler::One(target), .. }
+                    if *target == connection_id
+            )
+        });
+
         if remaining_established == 0 {
             for query in self.queries.iter_mut() {
                 query.on_failure(&peer_id);
@@ -2176,7 +2371,13 @@ where
         connection_id: ConnectionId,
         peer: PeerId,
     ) {
-        self.connections.insert(connection_id, peer);
+        self.connections.insert(
+            connection_id,
+            ConnectionState {
+                peer,
+                publication: ConnectionPublication::Unpublished,
+            },
+        );
         // Queue events for sending pending RPCs to the connected peer.
         // There can be only one pending RPC for a particular peer and query per definition.
         for (_peer_id, event) in self.queries.iter_mut().filter_map(|q| {
@@ -2289,6 +2490,7 @@ where
         connection: ConnectionId,
         event: THandlerOutEvent<Self>,
     ) {
+        let connection_live = self.connection_matches(&source, connection);
         match event {
             HandlerEvent::ProtocolConfirmed { endpoint } => {
                 debug_assert!(self.connected_peers.contains(&source));
@@ -2411,7 +2613,13 @@ where
                 );
                 // If the query to which the error relates is still active,
                 // signal the failure w.r.t. `source`.
-                if let Some(query) = self.queries.get_mut(&query_id) {
+                if let Some(query) = self.queries.get_mut(&query_id).filter(|query| {
+                    !matches!(
+                        &query.info,
+                        QueryInfo::PutRecord { context: PutRecordContext::Connection(target), .. }
+                            if *target != connection || !connection_live
+                    )
+                }) {
                     query.on_failure(&source)
                 }
             }
@@ -2518,29 +2726,38 @@ where
             }
 
             HandlerEvent::PutRecordRes { query_id, .. } => {
-                if let Some(query) = self.queries.get_mut(&query_id) {
-                    query.on_success(&source, vec![]);
+                if let Some(query) = self.queries.get_mut(&query_id).filter(|query| {
+                    !matches!(
+                        &query.info,
+                        QueryInfo::PutRecord { context: PutRecordContext::Connection(target), .. }
+                            if *target != connection || !connection_live
+                    )
+                }) {
+                    let accepted = query.try_on_success(&source, vec![]);
                     if let QueryInfo::PutRecord {
+                        context,
                         phase: PutRecordPhase::PutRecord { success, .. },
                         quorum,
                         ..
                     } = &mut query.info
                     {
-                        success.push(source);
+                        if !matches!(context, PutRecordContext::Connection(_)) || accepted {
+                            success.push(source);
 
-                        let quorum = quorum.get();
-                        if success.len() >= quorum {
-                            let peers = success.clone();
-                            let finished = query.try_finish(peers.iter());
-                            if !finished {
-                                tracing::debug!(
-                                    peer=%source,
-                                    query=?query_id,
-                                    "PutRecord query reached quorum ({}/{}) with response \
-                                     from peer but could not yet finish.",
-                                    peers.len(),
-                                    quorum,
-                                );
+                            let quorum = quorum.get();
+                            if success.len() >= quorum {
+                                let peers = success.clone();
+                                let finished = query.try_finish(peers.iter());
+                                if !finished {
+                                    tracing::debug!(
+                                        peer=%source,
+                                        query=?query_id,
+                                        "PutRecord query reached quorum ({}/{}) with response \
+                                         from peer but could not yet finish.",
+                                        peers.len(),
+                                        quorum,
+                                    );
+                                }
                             }
                         }
                     }
@@ -2656,7 +2873,26 @@ where
                             query.on_success(&peer_id, vec![])
                         }
 
-                        if self.connected_peers.contains(&peer_id) {
+                        if let QueryInfo::PutRecord {
+                            context: PutRecordContext::Connection(connection),
+                            ..
+                        } = &query.info
+                        {
+                            if self
+                                .connections
+                                .get(connection)
+                                .is_some_and(|state| state.peer == peer_id)
+                            {
+                                self.queued_events.push_back(ToSwarm::NotifyHandler {
+                                    peer_id,
+                                    event,
+                                    handler: NotifyHandler::One(*connection),
+                                });
+                            } else {
+                                query.on_failure(&peer_id);
+                                query.finish();
+                            }
+                        } else if self.connected_peers.contains(&peer_id) {
                             self.queued_events.push_back(ToSwarm::NotifyHandler {
                                 peer_id,
                                 event,
@@ -3194,6 +3430,8 @@ pub enum PutRecordContext {
     /// The context is a custom store operation targeting specific
     /// peers initiated by [`Behaviour::put_record_to`].
     Custom,
+    /// A custom store operation restricted to one physical connection.
+    Connection(ConnectionId),
 }
 
 /// Information about a running query.

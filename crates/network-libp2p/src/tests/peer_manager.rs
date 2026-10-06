@@ -83,6 +83,64 @@ async fn public_peer_limit_preserves_protected_headroom() {
     assert!(!manager.peer_limit_reached(&endpoint));
 }
 
+#[tokio::test]
+async fn startup_committee_window_preserves_public_slots_and_cached_neighbors() {
+    let [previous_keys, current_keys, next_keys] = [91, 92, 93].map(|seed| {
+        KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])))
+    });
+    let address = create_multiaddr(None);
+    let endpoint =
+        ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address.clone() };
+    let network_info = |keys: &KeyConfig| NetworkInfo {
+        pubkey: keys.primary_network_public_key(),
+        multiaddrs: vec![address.clone()],
+        timestamp: now(),
+        rpc: None,
+    };
+    let create_manager = || {
+        let mut manager = create_test_peer_manager(None);
+        manager.set_public_peer_limit(std::num::NonZeroUsize::new(1));
+        manager.add_bootstrap_peer(current_keys.primary_public_key(), network_info(&current_keys));
+        // Persisted signed records are restored as unpinned known peers.
+        [&previous_keys, &next_keys].into_iter().for_each(|keys| {
+            manager.add_restored_peer(keys.primary_public_key(), network_info(keys));
+        });
+        manager
+    };
+    let current_peer: PeerId = current_keys.primary_network_public_key().into();
+    let mut unseeded = create_manager();
+    assert!(unseeded.register_peer_connection(
+        &current_peer,
+        ConnectionType::IncomingConnection { multiaddr: address.clone() },
+    ));
+    register_peer(&mut unseeded, None);
+    assert!(!unseeded.peer_is_important(&current_peer));
+    assert!(unseeded.peer_limit_reached(&endpoint));
+
+    let mut manager = create_manager();
+    manager.update_committees(
+        HashSet::from([previous_keys.primary_public_key()]),
+        HashSet::from([current_keys.primary_public_key()]),
+        HashSet::from([next_keys.primary_public_key()]),
+    );
+    [&previous_keys, &current_keys, &next_keys].into_iter().for_each(|keys| {
+        let peer: PeerId = keys.primary_network_public_key().into();
+        assert_eq!(
+            manager.auth_to_peer(keys.primary_public_key()),
+            Some((peer, vec![address.clone()])),
+        );
+        assert!(manager.register_peer_connection(
+            &peer,
+            ConnectionType::IncomingConnection { multiaddr: address.clone() },
+        ));
+        assert!(manager.peer_is_important(&peer));
+    });
+    register_peer(&mut manager, None);
+    assert!(!manager.peer_limit_reached(&endpoint));
+    register_peer(&mut manager, None);
+    assert!(manager.peer_limit_reached(&endpoint));
+}
+
 /// Pending dials do not consume established public slots or appear as live connections.
 #[tokio::test]
 async fn public_peer_limit_excludes_pending_dials() {

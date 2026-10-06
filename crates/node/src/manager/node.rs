@@ -82,6 +82,12 @@ const EXEX_EVENT_CAPACITY: usize = 16;
 /// manager's forwarder instead of consuming memory.
 const TO_ENGINE_CAPACITY: usize = 64;
 
+/// Authenticated neighbors of the committee at a single epoch-start header.
+struct NeighborCommitteeKeys {
+    previous: HashSet<BlsPublicKey>,
+    next: Vec<BlsPublicKey>,
+}
+
 /// Inputs for one worker swarm, validated before any process-lifetime network is spawned.
 struct PreparedWorkerNetwork<Events> {
     /// Worker identity shared by its key derivation, protocols, and network handle.
@@ -722,6 +728,39 @@ where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
+    /// Read the same pinned neighbor window for process startup and epoch entry.
+    async fn read_neighbor_committee_keys(
+        engine: &ExecutionNode,
+        entered: Epoch,
+        epoch_start_header: &SealedHeader,
+    ) -> eyre::Result<NeighborCommitteeKeys> {
+        let epochs: Vec<_> =
+            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
+        let sets = retry_provider_faults(
+            "neighbor committees at the epoch-start pin",
+            epoch_start_header,
+            |pin| engine.validators_for_epochs_at_header(&epochs, pin),
+        )
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed neighbor-committee read at the epoch-start pin - halting rather than \
+                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
+            )
+        })?;
+        if entered == 0 {
+            let [next] = sets
+                .try_into()
+                .map_err(|_| eyre!("neighbor-committee batch arity mismatch for epoch 0"))?;
+            Ok(NeighborCommitteeKeys { previous: HashSet::new(), next })
+        } else {
+            let [previous, next] = sets.try_into().map_err(|_| {
+                eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+            })?;
+            Ok(NeighborCommitteeKeys { previous: previous.into_iter().collect(), next })
+        }
+    }
+
     /// Construct the manager and its process-lifetime state.
     ///
     /// Opens the consensus chain, builds the application-scoped consensus bus, and loads bootstrap
@@ -949,6 +988,15 @@ where
         // Epoch 0 keeps the protocol-minimum defaults because it has no preceding close.
         let (committee, _, _, epoch_start_header) =
             self.get_committee_with_epoch_start_info(&engine).await?;
+        let startup_committee_keys: HashSet<_> = committee
+            .authorities()
+            .into_iter()
+            .map(|authority| *authority.protocol_key())
+            .collect();
+        let startup_neighbors =
+            Self::read_neighbor_committee_keys(&engine, committee.epoch(), &epoch_start_header)
+                .await?;
+        let startup_next_committee_keys: HashSet<_> = startup_neighbors.next.into_iter().collect();
         if committee.epoch() > 0 {
             read_base_fees_for_entered_epoch(
                 &engine.get_reth_env().await,
@@ -1005,9 +1053,9 @@ where
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
 
-        // Register bootstrap peers before per-epoch committee updates resolve known peers.
-        // Listening and bootstrap dials belong to process startup, before replay can close an
-        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
+        // Bind bootstrap peer identities before seeding authoritative startup membership.
+        // Membership must precede listening so validators cannot consume ordinary public slots.
+        // Per-epoch startup refreshes the complete committee window and waits for peers.
         primary_network_handle
             .inner_handle()
             .add_bootstrap_peers(
@@ -1015,6 +1063,14 @@ where
                     .iter()
                     .map(|(key, peer)| (*key, peer.primary.clone()))
                     .collect(),
+            )
+            .await?;
+        primary_network_handle
+            .inner_handle()
+            .update_committees(
+                startup_neighbors.previous.clone(),
+                startup_committee_keys.clone(),
+                startup_next_committee_keys.clone(),
             )
             .await?;
         let node_info = &self.builder.tn_config.node_info;
@@ -1035,6 +1091,9 @@ where
 
         let manager = &*self;
         let startup_spawner = &node_task_spawner;
+        let startup_membership = &startup_committee_keys;
+        let startup_previous_membership = &startup_neighbors.previous;
+        let startup_next_membership = &startup_next_committee_keys;
         futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
             .try_for_each(|network_handle| async move {
                 let worker_id = network_handle.worker_id();
@@ -1047,6 +1106,14 @@ where
                     })
                     .collect();
                 network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
+                network_handle
+                    .inner_handle()
+                    .update_committees(
+                        startup_previous_membership.clone(),
+                        startup_membership.clone(),
+                        startup_next_membership.clone(),
+                    )
+                    .await?;
                 let configured_address =
                     node_info.worker_network_address(worker_id).cloned().ok_or_else(|| {
                         eyre!("no network address for worker {worker_id} in node info")

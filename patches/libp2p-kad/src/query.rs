@@ -379,6 +379,14 @@ impl Query {
     where
         I: IntoIterator<Item = PeerId>,
     {
+        self.try_on_success(peer, new_peers);
+    }
+
+    /// Records success only if the peer iterator accepts this response transition.
+    pub(crate) fn try_on_success<I>(&mut self, peer: &PeerId, new_peers: I) -> bool
+    where
+        I: IntoIterator<Item = PeerId>,
+    {
         let updated = match &mut self.peers.peer_iter {
             QueryPeerIter::Closest(iter) => iter.on_success(peer, new_peers),
             QueryPeerIter::ClosestDisjoint(iter) => iter.on_success(peer, new_peers),
@@ -387,6 +395,7 @@ impl Query {
         if updated {
             self.stats.success += 1;
         }
+        updated
     }
 
     /// Advances the state of the underlying peer iterator.

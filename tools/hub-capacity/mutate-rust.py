@@ -18,6 +18,21 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = [
+    ("connection_publication_late_response", "patches/libp2p-kad/src/behaviour.rs",
+     "if !matches!(context, PutRecordContext::Connection(_)) || accepted {",
+     "if std::hint::black_box(true) || !matches!(context, PutRecordContext::Connection(_)) || accepted {",
+     "finished_query_rejects_a_late_response_on_its_still_live_target"),
+    ("connection_publication_handler", "patches/libp2p-kad/src/behaviour.rs",
+     "handler: NotifyHandler::One(*connection),", "handler: NotifyHandler::Any,",
+     "new_connection_publication_uses_its_handler_and_ignores_old_handler_reply"),
+    ("connection_publication_capacity", "patches/libp2p-kad/src/behaviour.rs",
+     "} else if self.active_connection_publications() >= MAX_ACTIVE_CONNECTION_PUBLICATIONS {",
+     "} else if std::hint::black_box(false) && self.active_connection_publications() >= MAX_ACTIVE_CONNECTION_PUBLICATIONS {",
+     "saturated_publications_remain_pending_and_deliver_after_a_slot_frees"),
+    ("connection_publication_same_identity", "crates/network-libp2p/src/consensus.rs",
+     "self.publish_our_data_to_peer(peer_id, connection_id);",
+     "if !self.connected_peers.contains(&peer_id) { self.publish_our_data_to_peer(peer_id, connection_id); }",
+     "restarted_identity_receives_record_with_old_connection_alive"),
     ("required_connection_reservation", "patches/libp2p-connection-limits/src/lib.rs",
      "current.saturating_add(missing_after)", "current.saturating_add(missing_after).min(current)",
      "required_identities_recover_without_increasing_the_total_cap"),

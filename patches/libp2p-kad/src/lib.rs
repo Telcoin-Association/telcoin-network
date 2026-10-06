@@ -59,12 +59,12 @@ use std::num::NonZeroUsize;
 pub use addresses::Addresses;
 pub use behaviour::{
     AddProviderContext, AddProviderError, AddProviderOk, AddProviderPhase, AddProviderResult,
-    Behaviour, BootstrapError, BootstrapOk, BootstrapResult, BucketInserts, Caching, Config, Event,
-    GetClosestPeersError, GetClosestPeersOk, GetClosestPeersResult, GetProvidersError,
-    GetProvidersOk, GetProvidersResult, GetRecordError, GetRecordOk, GetRecordResult,
-    InboundRequest, Mode, NoKnownPeers, PeerInfo, PeerRecord, ProgressStep, PutRecordContext,
-    PutRecordError, PutRecordOk, PutRecordPhase, PutRecordResult, QueryInfo, QueryMut, QueryRef,
-    QueryResult, QueryStats, Quorum, RoutingUpdate, StoreInserts,
+    Behaviour, BootstrapError, BootstrapOk, BootstrapResult, BucketInserts, Caching, Config,
+    ConnectionPublicationError, Event, GetClosestPeersError, GetClosestPeersOk,
+    GetClosestPeersResult, GetProvidersError, GetProvidersOk, GetProvidersResult, GetRecordError,
+    GetRecordOk, GetRecordResult, InboundRequest, Mode, NoKnownPeers, PeerInfo, PeerRecord,
+    ProgressStep, PutRecordContext, PutRecordError, PutRecordOk, PutRecordPhase, PutRecordResult,
+    QueryInfo, QueryMut, QueryRef, QueryResult, QueryStats, Quorum, RoutingUpdate, StoreInserts,
 };
 pub use kbucket::{
     Distance as KBucketDistance, EntryView, KBucketRef, Key as KBucketKey, NodeStatus, U256,
