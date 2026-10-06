@@ -3401,15 +3401,27 @@ async fn expired_kad_live_self_identity_is_confirmed_without_storage() -> eyre::
     let count = peer1.network.swarm.behaviour_mut().kademlia.store_mut().persisted_record_count();
     let connected = peer1.network.swarm.behaviour().peer_manager.connected_peers();
     let score = peer1.network.swarm.behaviour().peer_manager.peer_score(&source);
-    let addresses = peer1.network.swarm.behaviour().peer_manager.peer_multiaddr_count(&source);
-    assert!(peer1.network.peer_record_valid(&record).is_some());
+    let addresses = peer1
+        .network
+        .swarm
+        .behaviour()
+        .peer_manager
+        .peer_multiaddrs(&source)
+        .ok_or_else(|| eyre!("connected peer has no retained address snapshot"))?;
+    assert!(!addresses.is_empty());
+    let (_, advertised) = peer1
+        .network
+        .peer_record_valid(&record)
+        .ok_or_else(|| eyre!("expired record is invalid"))?;
+    assert!(!advertised.info.multiaddrs.is_empty());
+    assert!(advertised.info.multiaddrs.iter().all(|address| !addresses.contains(address)));
     peer1.network.process_kad_put_request(source, record.clone())?;
     let manager = &peer1.network.swarm.behaviour().peer_manager;
     assert_eq!(manager.peer_to_bls(&source), Some(peer2.config.key_config().primary_public_key()));
     assert!(manager.is_connected(&source));
     assert_eq!(manager.connected_peers(), connected);
     assert_eq!(manager.peer_score(&source), score);
-    assert_eq!(manager.peer_multiaddr_count(&source), addresses);
+    assert_eq!(manager.peer_multiaddrs(&source), Some(addresses));
     assert_eq!(manager.get_rpc(&peer2.config.key_config().primary_public_key()), None);
     let store = peer1.network.swarm.behaviour_mut().kademlia.store_mut();
     assert!(store.get(&record.key).is_none());

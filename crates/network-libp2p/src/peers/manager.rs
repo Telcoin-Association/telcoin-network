@@ -1344,6 +1344,12 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
+    /// Snapshot the exact multiaddrs currently retained for `peer_id`, if it is tracked.
+    #[cfg(test)]
+    pub(crate) fn peer_multiaddrs(&self, peer_id: &PeerId) -> Option<HashSet<Multiaddr>> {
+        self.peers.get_peer(peer_id).map(|peer| peer.multiaddrs_snapshot())
+    }
+
     /// Check whether a kad-sourced record's timestamp fails to advance the cached entry.
     ///
     /// Mirrors the store-side `is_newer_record` monotonicity check (consensus.rs) so kad-sourced
