@@ -10,12 +10,13 @@ This directory holds a vendored copy of `libp2p-quic` with a small additive chan
 - crates.io checksum (from the base `Cargo.lock`):
   `4f78ca359466657b380e469fe8c04df2f4447d1430838e6c3cef4a1c51ccb2ee`.
 - Resolved stack: libp2p 0.57.0, libp2p-tls 0.7.0, quinn 0.11.9, quinn-proto 0.11.18,
-  rustls 0.23.37.
+  rustls 0.23.45, AWS-LC 1.18.1 / 0.45.0 and rustls-webpki 0.103.15.
 - Dependencies, features and crypto provider are the same as upstream (tokio feature, quinn
   `rustls-aws-lc-rs` and `futures-io`, ring). `Cargo.toml` is the upstream
   `Cargo.toml.orig` with registry versions in place of workspace references, so the crate
-  builds outside the rust-libp2p workspace. The `Cargo.lock` of the node changes only in the
-  `source` and `checksum` lines of `libp2p-quic`.
+  builds outside the rust-libp2p workspace. The override changes the `source` and `checksum`
+  lines of `libp2p-quic`; the maintenance qualification also updates the registry crypto
+  pins to address RUSTSEC-2026-0285. The active record retains source and feature evidence.
 - The upstream `tests/stream_compliance.rs` is not carried: it needs a rust-libp2p
   workspace crate that is not published at a matching version.
 - The upstream `Cargo.lock` is not carried. The crate builds only as a dependency of the
@@ -73,15 +74,17 @@ rm -rf "$TMP"
 
 ## Advisory coverage
 
-`cargo audit` and `cargo deny` do not report advisories against a path crate. The
-repository has no `deny.toml` and no audit step in CI. Until #1431 defines the process, a
-reviewer covers this copy by hand:
+The [active maintenance record](../../docs/transport-patches/libp2p-quic/README.md)
+names @MavenRain as the accepted maintenance and advisory owner, with weekly review
+and review on every transport dependency update. It records upstream provenance,
+submission and removal plans, crypto features and the production key logging policy.
 
-- Watch the RustSec database and the rust-libp2p releases and security advisories for
-  `libp2p-quic`, `quinn` and `quinn-proto`.
-- On each upstream `libp2p-quic` release, rebase the patch onto it, regenerate
-  `upstream.diff`, and confirm that `Cargo.lock` changes only in the `libp2p-quic` lines.
-- `quinn` and `quinn-proto` stay registry crates, so the normal tools still see them.
+Required transport CI runs cargo-audit 0.22.2 and cargo-deny 0.20.2 against a real
+published advisory control. Both detect vulnerable registry `quinn-proto` 0.11.6
+and miss the identical path source. The record documents that gap, a source-neutral
+advisory match, separate Dependabot observations and the owned monitoring procedure.
+Quinn and TLS remain registry crates. Extend the same record before carrying them
+from another source form. Passing a scanner alone does not qualify this copy.
 
 ## Removal condition
 

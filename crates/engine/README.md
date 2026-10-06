@@ -25,9 +25,9 @@ is derived from the code at the cited paths; when the code and this file disagre
 Two shorthands used throughout:
 
 - **certified** — the value is covered by `ConsensusHeader::digest_from_parts` (`tn-types`
-  `primary/block.rs:44-57`), which hashes the sub-DAG digest, which hashes every committed header's
-  digest (`primary/output.rs:457-472`), which hashes the header's whole serialized body including
-  its payload map (`primary/header.rs:349-357`). A quorum signed that digest, so altering the value
+  `primary/block.rs:67-80`), which hashes the sub-DAG digest, which hashes every committed header's
+  digest (`primary/output.rs:875-890`), which hashes the header's whole serialized body including
+  its payload map (`primary/header.rs:620-631`). A quorum signed that digest, so altering the value
   alters a hash a committee already voted on.
 - **pre-certification only** — the check runs when a batch first reaches a worker, before its digest
   can enter a header. It is *not* re-run on the execution path: `store_synced_batches` gates
@@ -36,40 +36,59 @@ Two shorthands used throughout:
 
 | Input (engine read) | What the engine assumes | Where the enforcing check lives |
 |---|---|---|
-| Batch bytes (`batch.transactions`, `:217`) | The bytes hash to the digest at the same flat index, and their size / decodability / gas / fee properties were already checked. The engine decodes nothing; recovery and execution happen in `tn-reth`. | Content binding is unconditional: `read_sync_batches` recomputes `batch.digest()` from the received frame and rejects any batch not requested or sent twice (`crates/consensus/worker/src/network/handle.rs:473-486`); the local path re-keys by recomputed digest (`crates/consensus/worker/src/batch_fetcher.rs:312`). Field validation is `BatchValidator::validate_batch` (`crates/batch-validator/src/validator.rs:39-82`), reached from `crates/consensus/worker/src/network/handler.rs:252` (gossip prefetch), `:284` (reported batch), and `crates/consensus/worker/src/network/primary.rs:108` (vote-path sync, gated on `!is_certified`) — **pre-certification only**. |
-| Batch digests (`output.batch_digests()`, `:72`; `output.get_batch_digest()`, `:188-190`) | The deque is the in-order concatenation of every committed header's payload keys. | Each digest is **certified** as a key of `Header::payload` (an `IndexMap`, `primary/header.rs:165`), so both its value and its position inside a header are covered. The flat deque is not itself a committed field: it is re-flattened locally by `Subscriber::fetch_batches` (`crates/consensus/executor/src/subscriber.rs:447-452`) and again, identically, by the pack-replay reader (`crates/storage/src/consensus_pack.rs:1541-1546`). The engine checks only its length. |
-| `worker_id` (`batch.worker_id`, `:211`, `:244`) | Names a real worker of the authority that produced the batch. Selects the block `difficulty` low bits and the `GasAccumulator` slot the next epoch's base fee is computed from. | Three checks, none re-run here. (1) a worker rejects any batch whose `worker_id` is not its own (`crates/batch-validator/src/validator.rs:48-53`) — **pre-certification only**. (2) `Header::validate` rejects a peer header naming any `worker_id >= committee.number_of_workers()` (`primary/header.rs:138-143`); that bounds the *header's* declared id, which is **certified**. (3) header sync requires the `(digest, worker_id)` pair to exist locally before treating the batch as available (`crates/consensus/primary/src/state_sync/header_validator.rs:120`, `contains_payload`). **Nothing compares `Batch.worker_id` against the `WorkerId` the header declared for that digest**; they are bound only transitively, through (1) holding at the worker that first accepted the batch. |
-| `base_fee_per_gas` (`batch.base_fee_per_gas`, `:195`) | Equals the fee the committee agreed for that worker for that epoch. Handed to `TNPayload` and used as-is — `tn-reth` never recomputes or EIP-1559-adjusts it. | `BatchValidator::validate_basefee` (`crates/batch-validator/src/validator.rs:188-195`): exact equality against the per-worker per-epoch value seeded at epoch start from the `GasAccumulator` (`crates/node/src/manager/node/start_epoch.rs:480`). **Pre-certification only.** |
-| `gas_limit` — **not a `Batch` field** | Nothing. `Batch` carries no gas limit (`tn-types` `worker/sealed_batch.rs:63-93`), so there is nothing here for the engine to read or ignore: the block's limit is derived locally as `max_batch_gas(epoch)` (`:196`), currently a constant 30,000,000 (`worker/sealed_batch.rs:197-199`). | n/a. The worker's own build cap is a separate, pre-certification check — `BatchValidator::validate_batch` calls `validate_batch_gas` over the decoded transactions (`crates/batch-validator/src/validator.rs:77`). |
-| `close_epoch` (`output.close_epoch()`, `:106`) | `true` exactly on the epoch's last output. Selects whether the epoch-close system calls run. | **Nothing, in any digest.** Derived node-locally; see below. |
-| Leader identity (`output.leader().author()`, `:40`, `:126`) | The leader is in the current committee, so `RewardsCounter` can resolve its execution address. | **Certified**: a committed sub-DAG leader is a committee member by construction (`LeaderSchedule::leader` indexes `committee.authorities()`), and `Header::validate` rejects an unknown author (`primary/header.rs:133-136`). The engine adds a `TnEngineError::UnknownAuthority` fail-stop (`:145-148`) — **on the empty epoch-closing path only**; see below. |
+| Batch bytes (`batch.transactions`, `:262`) | The bytes hash to the digest at the same flat index, and their size / decodability / gas / fee properties were already checked. The engine decodes nothing; recovery and execution happen in `tn-reth`. | Content binding is unconditional: `read_sync_batches` recomputes `batch.digest()` from the received frame and rejects any batch not requested or sent twice (`crates/consensus/worker/src/network/handle.rs:504-517`); the local path re-keys by recomputed digest (`crates/consensus/worker/src/batch_fetcher.rs:312`). Field validation is `BatchValidator::validate_batch` (`crates/batch-validator/src/validator.rs:46-99`), reached from `crates/consensus/worker/src/network/handler.rs:253` (gossip prefetch), `:290` (reported batch), and `crates/consensus/worker/src/network/primary.rs:108` (vote-path sync, gated on `!is_certified`) — **pre-certification only**. |
+| Batch digests (`output.batch_digests()`, `:76`; `output.get_batch_digest()`, `:197-199`) | The deque is the in-order concatenation of every committed header's payload keys. | Each digest is **certified** as a key of `Header::payload` (an `IndexMap`, `primary/header.rs:34`), so both its value and its position inside a header are covered. The flat deque is not itself a committed field: it is re-flattened locally by `Subscriber::fetch_batches` (`crates/consensus/executor/src/subscriber.rs:460-465`) and again, identically, by the pack-replay reader (`crates/storage/src/consensus_pack.rs:1730-1735`). The engine checks only its length. |
+| `worker_id` (`batch.worker_id`, `:255`, `:285`) | Names a real worker of the authority that produced the batch. Selects the block `difficulty` low bits and the `GasAccumulator` slot the next epoch's base fee is computed from. | Three checks, none re-run here. (1) a worker rejects any batch whose `worker_id` is not its own (`crates/batch-validator/src/validator.rs:54-60`) — **pre-certification only**. (2) `Header::validate` rejects a peer header naming any `worker_id >= committee.number_of_workers()` (`primary/header.rs:189-194`); that bounds the *header's* declared id, which is **certified**. (3) header sync requires the `(digest, worker_id)` pair to exist locally before treating the batch as available (`crates/consensus/primary/src/state_sync/header_validator.rs:120`, `contains_payload`). **Nothing compares `Batch.worker_id` against the `WorkerId` the header declared for that digest**; they are bound only transitively, through (1) holding at the worker that first accepted the batch. |
+| `base_fee_per_gas` (`batch.base_fee_per_gas`, `:233`) | Equals the fee the committee agreed for that worker for that epoch. Handed to `TNPayload` and used as-is — `tn-reth` never recomputes or EIP-1559-adjusts it. | `BatchValidator::validate_basefee` (`crates/batch-validator/src/validator.rs:205-212`): exact equality against the per-worker per-epoch value seeded at epoch start from the `GasAccumulator` (`crates/node/src/manager/node/start_epoch.rs:526-527`, `:585`). **Pre-certification only.** |
+| `gas_limit` — **not a `Batch` field** | Nothing. `Batch` carries no gas limit (`tn-types` `worker/sealed_batch.rs:63-93`), so there is nothing here for the engine to read or ignore: the block's limit is derived locally as `max_batch_gas(epoch)` (`:234`), currently a constant 30,000,000 (`worker/sealed_batch.rs:197-199`). | n/a. The worker's own build cap is a separate, pre-certification check — `BatchValidator::validate_batch` calls `validate_batch_gas` over the decoded transactions (`crates/batch-validator/src/validator.rs:84`). |
+| `close_epoch` (`output.close_epoch()`, `:115`) | `true` exactly on the epoch's last output. Selects whether the epoch-close system calls run. | **Nothing, in any digest.** Derived node-locally; see below. |
+| Leader identity (`output.leader().author()`, `:44`, `:135`) | The leader is in the current committee, so `RewardsCounter` can resolve its execution address. | **Certified**: a committed sub-DAG leader is a committee member by construction (`LeaderSchedule::leader` indexes `committee.authorities()`), and `Header::validate` rejects an unknown author (`primary/header.rs:184-187`). The engine adds a `TnEngineError::UnknownAuthority` fail-stop (`:154-157`) — **on the empty epoch-closing path only**; see below. |
 | Batch beneficiary (`batch.beneficiary`, read just before `TNPayload::new`) | The producer's own `Batch::beneficiary`; receives the batch's priority fees (#1222). | **Certified**: `batch.beneficiary` is covered by the batch digest (only `received_at` is `#[serde(skip)]`, `tn-types` `worker/sealed_batch.rs:91-93`), so a byzantine header that copies another validator's batch digest cannot redirect the fees. **Residual: transaction poaching.** Certification binds the fees of a batch to that batch's producer; it does not stop a validator from reading another validator's gossiped batch and re-packing those transactions into a batch of its own, with itself as beneficiary. That is an inclusion race on publicly gossiped transactions (the public-mempool MEV class), not a digest redirect: the poacher pays to produce and certify its own batch, and only the copy ordered first collects the fees (the loser's duplicates fail nonce checks). Closing it needs sealed or committee-encrypted batch content, which is out of scope for the #1222 fee-crediting fix. |
-| Commit timestamp (via `TNPayload`, becomes block `timestamp`) | Monotonic across outputs. | **Certified** — `commit_timestamp` is hashed into the sub-DAG digest (`primary/output.rs:468`). Monotonicity is imposed at construction by taking the max with the previous sub-DAG's timestamp (`primary/output.rs:367-374`). |
+| Commit timestamp (via `TNPayload`, becomes block `timestamp`) | Its whole seconds are not behind the parent block's `timestamp`. From the sub-second timestamp fork on, the engine does not rely on that alone: the EVM `timestamp` is clamped to the parent's and every clamp is counted. | **Certified**: `commit_timestamp`, and post-fork its millisecond part, are hashed into the sub-DAG digest (`primary/output.rs:883-887`). The order is imposed at construction (`CommittedSubDag::new_with_commit_floor`, `primary/output.rs:622-697`): post-fork, milliseconds strictly increase within an epoch and whole seconds do not decrease across an epoch seam; pre-fork, whole seconds do not decrease within an epoch and nothing holds across a seam. See "Commit time ordering" below. |
+
+### Commit time ordering
+
+The rule that orders commit times depends on the sub-second timestamp fork, `subsecond_timestamp_active` (`tn-types` `forks.rs`), evaluated on the committing leader's epoch.
+Bullshark builds every sub-DAG with `CommittedSubDag::new_with_commit_floor`, passing the previous sub-DAG it committed and the epoch commit floor (`crates/consensus/primary/src/consensus/bullshark.rs:253-261`).
+Both live in consensus state that is rebuilt at every epoch start, and the previous sub-DAG is restored only from that epoch's own consensus pack (`crates/consensus/primary/src/consensus/state.rs:441-444`), so it is always from the same epoch, and an epoch's first commit has none.
+
+- Post-fork, the commit time is strictly increasing in milliseconds within an epoch: `commit_ms = max(leader_ms, floor + 1 ms)`, where the floor is the previous sub-DAG's commit time (`strict_commit_timestamp_ms`, `primary/output.rs:701-741`).
+- Post-fork, an epoch's first commit is floored on the prior epoch's closing EVM block timestamp in whole seconds, and epoch 0 takes no floor (`resolve_epoch_commit_floor`, `crates/consensus/primary/src/consensus/state.rs:391-411`).
+  The node passes that timestamp in when it configures consensus for the epoch (`configure_consensus`, `crates/node/src/manager/node/start_epoch.rs:296-322`).
+  Because the closing block keeps only whole seconds, milliseconds can step back by up to 998 ms across an epoch seam; whole seconds, and with them the EVM `timestamp`, do not.
+- Pre-fork, the commit time is whole seconds, the `max` of the leader's `created_at` and the previous sub-DAG's timestamp (`primary/output.rs:643-645`).
+  An epoch's first commit takes no floor and the EVM clamp below does not apply, so neither the commit time nor the EVM `timestamp` has a guarantee across an epoch seam.
+
+The EVM `timestamp` is the commit time in whole seconds (`ConsensusOutput::committed_at`).
+Post-fork, `TNPayload::new` clamps it to at least the parent block's `timestamp` (`evm_block_timestamp`, `crates/tn-reth/src/payload.rs:275-282`).
+The clamp is gated on the leader's epoch carried in the output, so replayed pre-fork history keeps its original timestamps.
+`report_timestamp_clamp` (`src/payload_builder.rs:375-389`) counts every raised block in `evm_timestamp_clamped_total` (`src/metrics.rs:45-49`) and logs a warning.
+A non-zero count indicates a consensus bug, except for the first commits of epoch 0: epoch 0 has no commit floor, so they are clamped when validator clocks lag the genesis timestamp.
 
 ### The engine validates three things itself
 
-1. **Batch/digest count** (`:72-92`), `TnEngineError::ConsensusOutputUnevenBatches`. This is the
+1. **Batch/digest count** (`:76-96`), `TnEngineError::ConsensusOutputUnevenBatches`. This is the
    only guard on the flat index space, and it guards more than the payload: `get_batch_digest(i)`
-   and the `close_epoch_for_last_batch(i)` boundary (`primary/output.rs:240-244`) are both indexed
+   and the `close_epoch_for_last_batch(i)` boundary (`primary/output.rs:264-268`) are both indexed
    off the digest deque while the transactions are indexed off the batch vectors, so unequal lengths
    mean the epoch-close system calls fire on the wrong block or on none. Under `adiri` the check is
    relaxed for epochs `<= ADIRI_DUP_BATCH_EPOCH` (160, `tn-types` `forks.rs`) so testnet can
    replay a historical duplicate-batch bug.
-2. **Digest index bounds** (`:188-190`), `TnEngineError::NextBlockDigestMissing`. Fires when the
+2. **Digest index bounds** (`:197-199`), `TnEngineError::NextBlockDigestMissing`. Fires when the
    deque is *shorter* than the flattened batches. The count check above rejects that condition
    first, so this is the live guard only where the count check is relaxed — i.e. `adiri` at or below
    `ADIRI_DUP_BATCH_EPOCH`.
-3. **Unknown leader fail-stop** (`:145-148`), `TnEngineError::UnknownAuthority`. **Asymmetric:** it
+3. **Unknown leader fail-stop** (`:154-157`), `TnEngineError::UnknownAuthority`. **Asymmetric:** it
    guards only the empty epoch-closing path, where the beneficiary has to be derived from
    `output.leader().author()`. The non-empty path takes its beneficiary from the batch
    (`batch.beneficiary`), which is covered by the batch digest and so needs no trust.
-   The empty-path check is deliberate and argued in place (`:127-144`); it is pinned by
+   The empty-path check is deliberate and argued in place (`:136-153`); it is pinned by
    `test_empty_close_epoch_unknown_leader_fail_stops` and
    `test_empty_close_epoch_without_committee_fail_stops` (`tests/it/main.rs`).
 
 Everything else the engine reads is indexed, not checked. `output.batches()[cert_idx]` and
-`cert_batch.batches[batch_idx_in_cert]` (`:191-192`) are unchecked index expressions. They cannot be
-out of bounds today — both indices come from `flatten_batches()` (`primary/output.rs:194-203`),
+`cert_batch.batches[batch_idx_in_cert]` (`:200-201`) are unchecked index expressions. They cannot be
+out of bounds today — both indices come from `flatten_batches()` (`primary/output.rs:218-227`),
 which enumerates exactly those two nested collections. If that ever stops holding, the engine panics
 in its blocking task instead of returning a `TnEngineError`; the dropped oneshot then surfaces as
 `ChannelClosed` (`src/error.rs:37-41`) and halts the engine anyway.
@@ -77,22 +96,22 @@ in its blocking task instead of returning a `TnEngineError`; the dropped oneshot
 ### Digest ↔ batch positional alignment is emergent, not asserted here
 
 The engine pairs the *i*-th flattened batch with the *i*-th digest in the deque.
-The digest becomes the block's `ommers_hash`, and the index and digest together go to `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs:310`, called from `crates/engine/src/payload_builder.rs:238`), which returns the block's `mix_hash` (EVM `PREVRANDAO`).
+The digest becomes the block's `ommers_hash`, and the index and digest together go to `ConsensusOutput::prev_randao` (`tn-types` `primary/output.rs:330`, called from `crates/engine/src/payload_builder.rs:239`), which returns the block's `mix_hash` (EVM `PREVRANDAO`).
 That function has two arms, chosen by `prevrandao_seed_active` (`tn-types` `forks.rs`) on the committing leader's epoch, which also requires the seed-signature fork:
 
 - the legacy arm, `output_digest ^ batch_digest`, runs on `adiri` epochs below `PREVRANDAO_FORK_EPOCH` (574).
   It is kept byte-identical so replayed testnet history reproduces the same headers.
   The empty epoch-closing block passes a zero batch digest (`:161`), so its `mix_hash` is the bare output digest.
-- the seed-chain fold, `seeded_prev_randao` (`primary/output.rs:324`), runs on `adiri` from epoch 574 and on every non-`adiri` build, mainnet included, from genesis.
+- the seed-chain fold, `seeded_prev_randao` (`primary/output.rs:344`), runs on `adiri` from epoch 574 and on every non-`adiri` build, mainnet included, from genesis.
   It computes `keccak256("TN_PREVRANDAO_V1" || seed chain value || consensus block number || batch index)`, integers as little-endian `u64`, where the seed chain value is `committee_shuffle_seed()` as of this commit.
   The batch digest is not an input, so after the fork a mispaired digest corrupts only `ommers_hash`.
 
 **This crate never verifies that pairing**: it does not re-derive `batch.digest()` at all, only compares counts.
 The property comes from two walks over the same source in `Subscriber::fetch_batches`:
 
-- `crates/consensus/executor/src/subscriber.rs:447-452` pushes every `header.payload()` key, in
+- `crates/consensus/executor/src/subscriber.rs:460-465` pushes every `header.payload()` key, in
   order, across `sub_dag.headers()`, into the `batch_digests` deque.
-- `:468-523` walks the same headers and the same payload keys, pushing one batch per key into that
+- `:481-536` walks the same headers and the same payload keys, pushing one batch per key into that
   certificate's `batches` vector.
 
 `Header::payload` is an `IndexMap`, so both walks see the proposer's declared insertion order, and
@@ -101,19 +120,19 @@ their keys upstream by `read_sync_batches`. Hence index *i* lines up.
 
 The property is not unguarded outside this crate:
 
-- `test_subscriber_dup_batch_across_certs` (`crates/consensus/executor/tests/it/main.rs:578-718`)
+- `test_subscriber_dup_batch_across_certs` (`crates/consensus/executor/tests/it/main.rs:596-741`)
   builds one output whose two certificates share a batch digest and asserts, for every flattened
   index, that `batch.digest() == output.get_batch_digest(index)`, and that only the final index
   closes the epoch.
 - the v1 pack-replay reader does check positions: batches must arrive in sorted-digest order and
   each is compared against the expected digest, erroring with `PackError::EpochLoad` on a mismatch
-  (`crates/storage/src/consensus_pack.rs:1561-1584`). The legacy (v0) reader has no positional
+  (`crates/storage/src/consensus_pack.rs:1750-1770`). The legacy (v0) reader has no positional
   check — it keys its batch map by recomputed `batch.digest()` and looks the batch up by digest
-  (`:1684`, `:1743`), so arrival order is irrelevant there and only content binding holds.
+  (`:1873`, `:1932`), so arrival order is irrelevant there and only content binding holds.
 
 Exactly one path breaks alignment on purpose: under `adiri` at epochs `<= ADIRI_DUP_BATCH_EPOCH`, a
 duplicate digest is pushed to the deque but its batch is *not* pushed to the certificate
-(`subscriber.rs:498-509`, same shape at `consensus_pack.rs:1615-1626`), shifting every later flat
+(`subscriber.rs:511-522`, same shape at `consensus_pack.rs:1805-1816`), shifting every later flat
 index. That is the historical testnet bug being replayed deliberately, and it is why the engine's
 count check needs an `adiri` escape hatch at all.
 
@@ -124,20 +143,20 @@ positional check those turn up is the pack reader above.
 
 ### `close_epoch` is outside the consensus digest
 
-`close_epoch` decides whether the epoch-closing system calls run for an output (`:106`, and
+`close_epoch` decides whether the epoch-closing system calls run for an output (`:115`, and
 `close_epoch_for_last_batch` per batch). It is not a consensus field:
 
 - `ConsensusHeader` has four fields — `parent_hash`, `sub_dag`, `number`, `extra` (`tn-types`
-  `primary/block.rs:19-34`) — and its digest hashes only the first three plus a literal
-  `B256::default()` (`block.rs:44-57`). `close_epoch` is not among them.
+  `primary/block.rs:43-57`) — and its digest hashes only the first three plus a literal
+  `B256::default()` (`block.rs:67-80`). `close_epoch` is not among them.
 - it lives on `ConsensusOutput` itself, outside the `Arc<ConsensusOutputInner>` that the
-  hand-written `Serialize` impl writes (`primary/output.rs:84-92`), and the matching `Deserialize`
-  hardcodes `close_epoch: false` (`:102`). **A deserialized `ConsensusOutput` always reports
-  `false`**, as that type documents in place (`output.rs:79-83`).
+  hand-written `Serialize` impl writes (`primary/output.rs:89-97`), and the matching `Deserialize`
+  hardcodes `close_epoch: false` (`:107`). **A deserialized `ConsensusOutput` always reports
+  `false`**, as that type documents in place (`output.rs:84-88`).
 - every producer derives it locally as `output.reaches_epoch_boundary(self.epoch_boundary)`
   (`crates/node/src/manager/node/run_epoch.rs:567` and `:626`; also `close_epoch.rs:240`,
-  `:269`, and `start_epoch.rs:100`). That delegates to `CommittedSubDag::reaches_epoch_boundary`
-  (`tn-types` `primary/output.rs:846`), the single boundary predicate. The boundary stays in
+  `:269`, and `start_epoch.rs:102`). That delegates to `CommittedSubDag::reaches_epoch_boundary`
+  (`tn-types` `primary/output.rs:837`), the single boundary predicate. The boundary stays in
   whole seconds while commits carry milliseconds: the predicate compares the commit's whole
   seconds (`commit_timestamp()`, the floor of `commit_timestamp_ms()`) against the boundary with
   `>=`, which holds exactly when the commit time is at least `1000 * epoch_boundary` ms, so the
@@ -150,7 +169,7 @@ epoch-close system calls. Both inputs are chain-consistent, so honest nodes agre
 **reproducibility** guarantee, not an authentication one. It is load-bearing in both directions —
 one of those system calls records every worker's next-epoch base fee, and the following epoch's
 entry read consumes exactly that write and halts the node when it is unreadable
-(`read_base_fees_for_entered_epoch`, defined in `node.rs:594`, called from `run_epoch.rs:206`). A wrong `close_epoch` does not
+(`read_base_fees_for_entered_epoch`, defined in `node.rs:605`, called from `run_epoch.rs:206`). A wrong `close_epoch` does not
 produce a bad block; it strands the next epoch.
 
 Determinism rules for block production live in `crates/tn-reth/README.md` ("Determinism rules"). The

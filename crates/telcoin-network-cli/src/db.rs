@@ -20,7 +20,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
-use tn_config::{Config, ConfigFmt, ConfigTrait as _, TelcoinDirs as _};
+use tn_config::{Config, ConfigFmt, ConfigTrait as _, PidLock, TelcoinDirs as _};
 use tn_reth::{
     iter_static_files, open_db_read_only, snapshot::SnapshotRestorer, DatabaseArguments,
     DatabaseEnv, RethCommand, RethConfig, RethDatabaseT as _, RethEnv, RethMdbxError,
@@ -28,10 +28,16 @@ use tn_reth::{
 };
 use tn_storage::{
     consensus::ConsensusChain,
-    consensus_pack::{ConsensusPack, DATA_NAME},
+    consensus_pack::{
+        legacy_migration_dry_run, pack_unsealed_version, wal_consistent_end, ConsensusPack,
+        EpochMigrate, EpochRepair, DATA_NAME, SENTINEL_MIN_VERSION,
+    },
     epoch_records::{validate_record_against_anchor, EpochRecordDb, EpochRecordValidation},
     exec_state_pack::ExecStatePackReader,
-    pack_validate::validate_pack_file,
+    pack_validate::{
+        classify_physical_corruption, incomplete_trailing_output, recovery_refusal,
+        validate_pack_file, validate_pack_file_bounded, Verdict,
+    },
 };
 use tn_types::{
     BlockNumHash, BlsPublicKey, Committee, Epoch, EpochCertificate, EpochDigest, EpochRecord,
@@ -53,7 +59,18 @@ enum DbSubcommand {
     Stats,
 
     /// Validate a consensus epoch pack file: walk the `data` stream and report integrity issues.
+    /// Read-only (never mutates). Validate the CURRENT/latest epoch only with the node STOPPED —
+    /// see the arg help.
     Validate(DbValidateArgs),
+
+    /// Repair consensus epoch packs at rest: truncate a torn data-file tail and rebuild indexes.
+    /// The node MUST be stopped. Dry-run by default; pass `--force` to apply.
+    Repair(DbRepairArgs),
+
+    /// Migrate legacy (pre-v2) consensus epoch packs up to the current v2 format: rewrite the data
+    /// log header-first, rebuild indexes, and re-seal. The node MUST be stopped. Dry-run by
+    /// default; pass `--force` to apply.
+    Migrate(DbMigrateArgs),
 
     /// Load an EVM state-export pack into a new reth database under the datadir.
     LoadState(DbLoadStateArgs),
@@ -85,6 +102,8 @@ impl DbCommand {
                 println!("{}", db_stats_table(&db)?);
             }
             DbSubcommand::Validate(args) => args.execute()?,
+            DbSubcommand::Repair(args) => args.execute(datadir)?,
+            DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
         }
         Ok(())
@@ -92,6 +111,14 @@ impl DbCommand {
 }
 
 /// Validate a consensus epoch pack file.
+///
+/// Read-only: this never mutates the pack. It opens the `data` stream read-only via mmap, so
+/// validating the CURRENT/latest epoch — the one a running node holds open for append — is unsafe:
+/// the node truncates that file on epoch-close and remaps it on growth, and a concurrent truncate
+/// can crash this command with a SIGBUS (node data is never harmed). `validate` takes a pack path
+/// rather than the datadir, so it does not consult the `telcoin.pid` lock — validate the
+/// current/latest epoch only with the node STOPPED. A sealed past epoch is safe to validate live,
+/// except briefly during an epoch handoff before the just-sealed pack has its clean-close sentinel.
 #[derive(Debug, Args)]
 pub struct DbValidateArgs {
     /// Path to a pack `data` stream file, or an `epoch-NN` directory containing one.
@@ -113,12 +140,170 @@ impl DbValidateArgs {
     fn execute(&self) -> eyre::Result<()> {
         let (data_file, epoch) = resolve_data_file_and_epoch(&self.path, self.epoch)?;
 
+        // Warn (do not refuse) if this looks like the current/latest epoch a running node may hold
+        // open — `db validate` maps it read-only, so a concurrent truncate/grow could SIGBUS us.
+        warn_if_current_epoch(&data_file, epoch);
+
+        // A legacy v0 (batches-first) pack is only ever read by its migration to v2, so it is
+        // judged by a dry run of that migration (what `db migrate`, `db repair` and the node all
+        // run on it), not by the header-first walks below.
+        if matches!(pack_unsealed_version(&data_file, epoch), Some((0, _))) {
+            return match legacy_migration_dry_run(&data_file, epoch) {
+                Ok(outputs) => {
+                    println!(
+                        "legacy v0 pack: a dry run of its migration to v2 copies {outputs} \
+                         output(s) cleanly; `db migrate --force`, or the node when it opens or \
+                         reads this epoch, converts it."
+                    );
+                    Ok(())
+                }
+                Err(why) => {
+                    println!("legacy v0 pack: its migration to v2 refuses: {why}");
+                    bail!("pack {} is INVALID (see report above)", data_file.display());
+                }
+            };
+        }
+
+        // Physical framing first: a torn/corrupt record stream cannot be walked for logical checks,
+        // so classify the failure mode (truncatable tail vs data-losing corruption) and report the
+        // recommended operator action instead of bailing with a bare read error.
+        if let Some(corruption) = classify_physical_corruption(&data_file, epoch)
+            .map_err(|e| eyre!("failed to open pack {}: {e}", data_file.display()))?
+        {
+            print!("{corruption}");
+            // A truncatable tail (torn/unacked) heals on the next append-open, but the intact
+            // committed prefix before it must still be logically checked — otherwise `db validate`
+            // reports nothing useful for the normal shape of any crashed current epoch. Bound the
+            // walk at the last COMPLETE output (the WAL `consistent_end`), NOT at the
+            // first bad record offset: a tear inside the in-flight output would
+            // otherwise report that output's unwritten batches as false "absent" and
+            // flip the verdict INVALID right after "SAFE".
+            let mut prefix_invalid = false;
+            // "Truncatable" is only what recovery would do: a tear past which an acked output
+            // still lies is refused by a node restart and `db repair --force` alike, and a legacy
+            // pack's tail is judged by the migration. Say so instead of promising a self-heal.
+            if corruption.kind.is_truncatable() {
+                if let Some(why) = recovery_refusal(&data_file, epoch) {
+                    println!("NOT TRUNCATABLE: recovery would refuse to truncate this tail: {why}");
+                    bail!("pack {} is corrupt (see report above)", data_file.display());
+                }
+                print_legacy_tail_note(&data_file, epoch);
+            }
+            if corruption.kind.is_truncatable() && corruption.records_ok_before > 0 {
+                let bound = wal_consistent_end(&data_file, epoch).unwrap_or(corruption.offset);
+                eprintln!("\nValidating the intact prefix before the tear (up to byte {bound})...",);
+                match validate_pack_file_bounded(&data_file, epoch, None, Some(bound)) {
+                    Ok(report) => {
+                        prefix_invalid = report.verdict == Verdict::Invalid;
+                        print!("{report}");
+                    }
+                    Err(e) => {
+                        // The prefix could not be checked, so it cannot be reported healthy.
+                        eprintln!("bounded validation of the intact prefix failed: {e}");
+                        prefix_invalid = true;
+                    }
+                }
+            }
+            // Exit code: a truncatable tail whose intact prefix is Valid is a benign, self-healing
+            // shape → success. A data-losing corruption kind (or an INVALID prefix) is a real
+            // problem → non-zero exit so scripts/operators notice.
+            if !corruption.kind.is_truncatable() || prefix_invalid {
+                bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
+            return require_current_epoch_for_tail(&data_file, epoch);
+        }
+
+        // Every record frames, but an unclean pack can still end in an incomplete output whose
+        // last record happens to end the file: an unacked in-flight write that recovery truncates,
+        // not corruption. Report it as such and validate the complete prefix before it.
+        if let Some(end) = incomplete_trailing_output(&data_file, epoch) {
+            if let Some(why) = recovery_refusal(&data_file, epoch) {
+                println!(
+                    "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
+                     incomplete (bytes past offset {end}), but recovery would refuse to truncate \
+                     it: {why}"
+                );
+                bail!("pack {} is corrupt (see report above)", data_file.display());
+            }
+            println!(
+                "TRUNCATABLE: the pack was not cleanly closed and its last output is incomplete \
+                 (bytes past offset {end}); this unacked in-flight write is truncated by a node \
+                 restart or `db repair --force`."
+            );
+            print_legacy_tail_note(&data_file, epoch);
+            eprintln!("\nValidating the complete prefix (up to byte {end})...");
+            let report = validate_pack_file_bounded(&data_file, epoch, None, Some(end))
+                .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
+            print!("{report}");
+            if report.verdict == Verdict::Invalid {
+                bail!("pack {} is INVALID (see report above)", data_file.display());
+            }
+            return require_current_epoch_for_tail(&data_file, epoch);
+        }
+
         let report = validate_pack_file(&data_file, epoch, None)
             .map_err(|e| eyre!("failed to validate pack {}: {e}", data_file.display()))?;
 
         // Report goes to stdout (tracing/logs go to stderr/file).
         print!("{report}");
+        // Non-zero exit on an INVALID verdict so automation can tell a healthy datadir from a
+        // corrupt one by exit status.
+        if report.verdict == Verdict::Invalid {
+            bail!("pack {} is INVALID (see report above)", data_file.display());
+        }
         Ok(())
+    }
+}
+
+/// A truncatable tail heals only where the node opens the epoch for append: the epoch it resumes
+/// (or one it has yet to reach). The node only reads a past epoch and never truncates it, so there
+/// the tail needs `db repair`: report that and fail. A legacy (pre-v2) pack is exempt, since the
+/// node migrates it to v2 when it reads the epoch, which drops the tail.
+fn require_current_epoch_for_tail(data_file: &Path, epoch: Epoch) -> eyre::Result<()> {
+    let legacy = pack_unsealed_version(data_file, epoch)
+        .is_some_and(|(version, _)| version < SENTINEL_MIN_VERSION);
+    if !legacy && is_past_epoch(data_file, epoch) {
+        println!(
+            "ACTION NEEDED: epoch {epoch} is a past epoch, which the node only reads and never \
+             truncates: stop the node and run `telcoin-network db repair --epoch {epoch} --force`."
+        );
+        bail!("pack {} needs `db repair` (see report above)", data_file.display());
+    }
+    Ok(())
+}
+
+/// Whether `epoch` is before the epoch the node resumes from, read from the latest-consensus hint
+/// in the epochs directory holding `data_file`'s `epoch-N` directory (what the node itself opens
+/// for append). Falls back to the directory listing when there is no hint.
+fn is_past_epoch(data_file: &Path, epoch: Epoch) -> bool {
+    let resume = data_file.parent().and_then(Path::parent).and_then(ConsensusChain::resume_epoch);
+    match resume {
+        Some(resume) => epoch < resume,
+        None => later_epoch_exists(data_file, epoch),
+    }
+}
+
+/// Whether the epochs directory holding `data_file`'s `epoch-N` directory also holds a later
+/// epoch. `false` when the layout cannot be read (e.g. a bare data file outside an epochs dir).
+fn later_epoch_exists(data_file: &Path, epoch: Epoch) -> bool {
+    data_file
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
+        .is_some_and(|epochs| epochs.last().is_some_and(|&last| last > epoch))
+}
+
+/// For a legacy (pre-v2) pack whose unacked tail is truncatable, say how it goes away: the
+/// migration to v2 drops it, whether run by `db migrate` or by the node when it opens or reads the
+/// epoch. (A v2 pack's tail is covered by the printed corruption's recommended action.)
+fn print_legacy_tail_note(data_file: &Path, epoch: Epoch) {
+    if let Some((version, _)) = pack_unsealed_version(data_file, epoch) {
+        if version < SENTINEL_MIN_VERSION {
+            println!(
+                "note: legacy (v{version}) pack — migrating it to v2 (`db migrate --force`, or the \
+                 node when it opens or reads this epoch) drops this unacked tail."
+            );
+        }
     }
 }
 
@@ -158,12 +343,335 @@ fn resolve_data_file_and_epoch(
     Ok((data_file, epoch))
 }
 
+/// Best-effort warning when `data_file` is a pack a running node may still be WRITING — which
+/// `db validate` maps read-only, so a concurrent truncate/grow could SIGBUS this process. Past
+/// epochs are safe to validate live ONCE SEALED, but there is no single "current epoch" number:
+/// just after an epoch transition the previous epoch is briefly padded-and-unsealed while it
+/// finishes closing, and a catching-up node holds an older epoch open while newer epoch dirs
+/// already exist. So warn on two signals, whatever the epoch number: (a) it is the highest
+/// `epoch-NN` dir (the usual live epoch), or (b) the pack carries no clean-close sentinel
+/// (`opened_unclean` — a writer is still finishing it). Never refuses — validation is read-only and
+/// is valid once the node is stopped.
+fn warn_if_current_epoch(data_file: &Path, epoch: Epoch) {
+    let is_highest = data_file
+        .parent()
+        .and_then(Path::parent)
+        .and_then(|epochs_dir| ConsensusPack::epoch_dirs(epochs_dir).ok())
+        .is_some_and(|all| all.last().copied() == Some(epoch));
+    // `None` if the pack cannot be opened — leave that to the classifier/validator below.
+    let unsealed = matches!(pack_unsealed_version(data_file, epoch), Some((_, true)));
+    if is_highest || unsealed {
+        let why = if is_highest {
+            "it is the current/latest epoch a running node holds open for append"
+        } else {
+            "it has no clean-close sentinel — a writer may still be finishing it (an epoch just \
+             transitioned, or a catching-up node holds it open)"
+        };
+        eprintln!(
+            "WARNING: epoch {epoch} may be written by a running node ({why}). `db validate` maps it \
+             read-only; if the node truncates or grows the file concurrently this command can crash \
+             (SIGBUS). Validate it only with the node STOPPED. (Node data is not modified either way.)"
+        );
+    }
+}
+
 /// Parse an epoch out of an `epoch-NN` directory name.
 fn epoch_from_dir_name(dir: &Path) -> Option<Epoch> {
     dir.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix("epoch-"))
         .and_then(|num| num.parse::<Epoch>().ok())
+}
+
+/// Select which epochs `db repair` targets, given all `epoch-{N}` dirs (sorted ascending) and an
+/// optional `--epoch`. In all-mode (`requested == None`) the current/latest epoch — the one a
+/// running node holds open for append — is skipped and returned as the second element; `--epoch N`
+/// targets exactly N (no skip). The caller validates that a requested epoch exists.
+///
+/// "Current" here is a best-effort heuristic: the highest-numbered `epoch-{N}` directory. That is
+/// the live epoch except in the brief window during an epoch transition when the next epoch's
+/// directory already exists on disk before the node has switched to it — the `LatestConsensus`
+/// slot, not the directory listing, is the authoritative current epoch. This skip is only a
+/// convenience guard against fat-fingering a repair of the live pack; the real safety requirement
+/// is that the node is stopped (a running node holds its pack mmap'd for append regardless of which
+/// epoch is "current"). Pass `--epoch N` to target an exact epoch when the heuristic would pick
+/// wrong.
+fn repair_targets(all: &[Epoch], requested: Option<Epoch>) -> (Vec<Epoch>, Option<Epoch>) {
+    let current = all.last().copied();
+    match requested {
+        Some(e) => (vec![e], None),
+        None => (all.iter().copied().filter(|e| Some(*e) != current).collect(), current),
+    }
+}
+
+/// Repair consensus epoch pack files at rest.
+///
+/// Truncates a torn `data`-file tail and rebuilds missing/corrupt sidecar indexes from the data log
+/// (the source of truth), then re-seals the pack. Damage that truncation cannot fix — a
+/// torn/corrupt epoch-meta, or mid-log data corruption — is reported (re-sync required), never
+/// touched.
+///
+/// The node MUST be stopped: with `--force` this opens packs for append and rewrites them, which
+/// would corrupt a running node's memory mapping. It refuses to run while the datadir PID lock
+/// (`telcoin.pid`) is held by a live node, and it takes that lock for its own run so a node cannot
+/// start mid-repair. It is a dry run by default (read-only classification, no writes) and requires
+/// `--force` to apply. In repair-all mode the current/latest epoch (the one a running node holds
+/// open for append) is skipped; repair it explicitly with `--epoch N` once the node is confirmed
+/// stopped.
+#[derive(Debug, Args)]
+pub struct DbRepairArgs {
+    /// Repair only this epoch. Without it, every epoch except the current/latest is repaired.
+    #[arg(long)]
+    pub epoch: Option<Epoch>,
+
+    /// Apply repairs. Without this the command is a dry run: it reports what it would repair but
+    /// writes nothing. Stop the node before passing `--force`.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbRepairArgs {
+    /// Assess (and, with `--force`, repair) the consensus epoch packs under the datadir.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+
+        // Loud safety banner in both modes (stderr; the report goes to stdout).
+        eprintln!(
+            "WARNING: `db repair` rewrites consensus pack files. The node MUST be stopped first — \
+             repairing files a running node holds mapped will corrupt them."
+        );
+        if !self.force {
+            eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
+        }
+
+        // Refuse to touch pack files a live node holds mapped. Take the datadir PID lock (writing
+        // our own PID) so a node cannot start mid-repair either; both are released when
+        // this returns. A stale lock from a previous crash is reclaimed. Do this before any
+        // read, in both dry-run and apply modes, so operators get a clear error rather than
+        // a confusing partial report.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+
+        let all = ConsensusPack::epoch_dirs(&epochs_dir)
+            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+        if let Some(e) = self.epoch {
+            if !all.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
+        let (targets, skipped_current) = repair_targets(&all, self.epoch);
+        if let Some(cur) = skipped_current {
+            println!(
+                "epoch {cur}: SKIPPED (current/latest epoch) — repair explicitly with \
+                 `--epoch {cur}` once the node is confirmed stopped"
+            );
+        }
+
+        // Both `ConsensusPack::repair_epoch` and `EpochRecordDb::persist` are async; drive them on
+        // a dedicated runtime (mirrors the restore path).
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        runtime.block_on(async {
+            // Counts both applied repairs (`--force` → `Repaired`) and dry-run findings
+            // (`WouldRepair`); the two variants are mutually exclusive per invocation, and the
+            // summary verb below reflects which one actually ran.
+            let mut actionable = 0usize;
+            let mut unrepairable = 0usize;
+            let mut errored = 0usize;
+            for epoch in &targets {
+                match ConsensusPack::repair_epoch(&epochs_dir, *epoch, self.force).await {
+                    Ok(EpochRepair::Healthy) => println!("epoch {epoch}: OK"),
+                    Ok(EpochRepair::Repaired(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: REPAIRED — {what}");
+                    }
+                    Ok(EpochRepair::WouldRepair(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: would repair — {what}");
+                    }
+                    Ok(EpochRepair::Unrepairable(why)) => {
+                        unrepairable += 1;
+                        println!("epoch {epoch}: UNREPAIRABLE — {why}");
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        println!("epoch {epoch}: ERROR — {e}");
+                    }
+                }
+            }
+
+            // The shared epoch-records DB (`epochs.pack`/`epoch_certs.pack`) auto-heals on open;
+            // only touch it under --force.
+            if self.force {
+                match EpochRecordDb::open(epochs_dir.as_path()) {
+                    Ok(db) => {
+                        db.persist()
+                            .await
+                            .map_err(|e| eyre!("failed to persist epoch-records DB: {e}"))?;
+                        db.close().await;
+                        println!(
+                            "epoch-records DB: opened and healed (torn tails truncated; \
+                             digest/position indexes rebuilt from the data logs if a prior crash \
+                             left them inconsistent)"
+                        );
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        println!(
+                            "epoch-records DB: could not open to heal ({e}); re-sync/restore may be \
+                             required"
+                        );
+                    }
+                }
+            } else {
+                // Predict, read-only, what the `--force` open would do, so a records DB that would
+                // refuse to open (and so block node startup) is reported now, not only on apply.
+                match EpochRecordDb::assess(epochs_dir.as_path()) {
+                    Ok(None) => println!("epoch-records DB: OK"),
+                    Ok(Some(what)) => {
+                        actionable += 1;
+                        println!("epoch-records DB: would heal with `--force` — {what}");
+                    }
+                    Err(e) => {
+                        errored += 1;
+                        println!(
+                            "epoch-records DB: would fail to open ({e}); re-sync/restore may be \
+                             required"
+                        );
+                    }
+                }
+            }
+
+            let verb = if self.force { "repaired" } else { "to repair (dry run)" };
+            println!(
+                "\nsummary: {actionable} epoch(s) {verb}, {unrepairable} unrepairable (data loss / \
+                 re-sync), {errored} error(s)."
+            );
+            // Non-zero exit when anything could not be made healthy, so automation can distinguish a
+            // clean datadir from one needing attention (a dry run that only found `WouldRepair` items
+            // is still success — nothing is wrong yet that this tool refused to handle).
+            if unrepairable > 0 || errored > 0 {
+                bail!(
+                    "{unrepairable} epoch(s) unrepairable, {errored} error(s) (see report above)"
+                );
+            }
+            Ok::<(), eyre::Report>(())
+        })?;
+        Ok(())
+    }
+}
+
+/// Migrate legacy (pre-v2) consensus epoch pack files up to the current v2 format.
+///
+/// v2 is the only writable pack format: it carries the clean-close sentinel that lets recovery tell
+/// a truncatable unacked tail from at-rest corruption of committed data. A pre-v2 pack (v0
+/// batches-first or v1 header-first, from before this format existed) never carried a sentinel, so
+/// leaving it in place makes recovery/repair guess at "sealed" and risks truncating committed data.
+/// Migration rewrites the data log into a fresh v2 log (reordering a v0 batches-first log
+/// header-first), rebuilds the indexes, and installs it atomically. A node reopening its current
+/// epoch after an upgrade migrates it automatically; this command lets an operator upgrade every
+/// epoch at once (it may become mandatory in a future release).
+///
+/// The node MUST be stopped: with `--force` this rewrites pack files, which would corrupt a running
+/// node's memory mapping. It refuses to run while the datadir PID lock (`telcoin.pid`) is held by a
+/// live node (and takes that lock for its own run), and is a dry run by default, requiring
+/// `--force` to apply. A legacy pack whose data log is damaged below the acked frontier is reported
+/// (re-sync required), never truncated.
+#[derive(Debug, Args)]
+pub struct DbMigrateArgs {
+    /// Migrate only this epoch. Without it, every legacy epoch is migrated.
+    #[arg(long)]
+    pub epoch: Option<Epoch>,
+
+    /// Apply migrations. Without this the command is a dry run: it reports what it would migrate
+    /// but writes nothing. Stop the node before passing `--force`.
+    #[arg(long)]
+    pub force: bool,
+}
+
+impl DbMigrateArgs {
+    /// Assess (and, with `--force`, apply) the v1/v0→v2 migration of consensus epoch packs under
+    /// the datadir.
+    fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        let epochs_dir = datadir.epochs_db_path();
+        if !epochs_dir.is_dir() {
+            bail!("no consensus epochs directory at {}", epochs_dir.display());
+        }
+
+        // Loud safety banner in both modes (stderr; the report goes to stdout).
+        eprintln!(
+            "WARNING: `db migrate` rewrites consensus pack files. The node MUST be stopped first — \
+             rewriting files a running node holds mapped will corrupt them."
+        );
+        if !self.force {
+            eprintln!("(dry run: reporting only; re-run with `--force` to apply)");
+        }
+
+        // Refuse to run while a live node holds the datadir PID lock, and take it for our own run
+        // so a node cannot start mid-migration; released when this returns. A stale lock is
+        // reclaimed.
+        let _pid_lock = PidLock::acquire(&datadir)?;
+
+        let all = ConsensusPack::epoch_dirs(&epochs_dir)
+            .map_err(|e| eyre!("failed to list epochs under {}: {e}", epochs_dir.display()))?;
+        if let Some(e) = self.epoch {
+            if !all.contains(&e) {
+                bail!("epoch {e} not found under {}", epochs_dir.display());
+            }
+        }
+        let targets: Vec<Epoch> = match self.epoch {
+            Some(e) => vec![e],
+            None => all,
+        };
+
+        let runtime =
+            tokio::runtime::Builder::new_multi_thread().enable_io().enable_time().build()?;
+        runtime.block_on(async {
+            // `actionable` counts applied migrations (`--force` → `Migrated`) or dry-run findings
+            // (`WouldMigrate`); the two are mutually exclusive per invocation.
+            let mut actionable = 0usize;
+            let mut already = 0usize;
+            let mut corrupt = 0usize;
+            for epoch in &targets {
+                match ConsensusPack::migrate_epoch(&epochs_dir, *epoch, self.force).await {
+                    Ok(EpochMigrate::AlreadyCurrent) => {
+                        already += 1;
+                        println!("epoch {epoch}: already v2");
+                    }
+                    Ok(EpochMigrate::Migrated(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: MIGRATED — {what}");
+                    }
+                    Ok(EpochMigrate::WouldMigrate(what)) => {
+                        actionable += 1;
+                        println!("epoch {epoch}: would migrate — {what}");
+                    }
+                    Ok(EpochMigrate::Corrupt(why)) => {
+                        corrupt += 1;
+                        println!("epoch {epoch}: CORRUPT — {why}");
+                    }
+                    Err(e) => {
+                        corrupt += 1;
+                        println!("epoch {epoch}: ERROR — {e}");
+                    }
+                }
+            }
+
+            let verb = if self.force { "migrated" } else { "to migrate (dry run)" };
+            println!(
+                "\nsummary: {actionable} epoch(s) {verb}, {already} already v2, {corrupt} corrupt \
+                 (re-sync required)."
+            );
+            // Non-zero exit when any pack could not be migrated, so scripts/operators notice.
+            if corrupt > 0 {
+                bail!("{corrupt} epoch(s) could not be migrated (see report above)");
+            }
+            Ok::<(), eyre::Report>(())
+        })?;
+        Ok(())
+    }
 }
 
 /// Restore an EVM state-export pack into a new reth database under the datadir.
@@ -187,6 +695,15 @@ pub struct DbLoadStateArgs {
 impl DbLoadStateArgs {
     /// Resolve the genesis chain spec, then restore the pack into a fresh reth DB under `datadir`.
     fn execute(&self, datadir: PathBuf) -> eyre::Result<()> {
+        // This writes chain data into the datadir: refuse to run while a live node holds the
+        // datadir PID lock, and take it for our own run so a node cannot start mid-import;
+        // released when this returns. Every config load below needs the datadir to exist, and so
+        // does the lockfile: say so directly rather than through the lockfile's open error.
+        if !datadir.is_dir() {
+            bail!("datadir {} does not exist", datadir.display());
+        }
+        let _pid_lock = PidLock::acquire(&datadir)?;
+
         // Genesis chain spec: bundled via `--chain`, else from the datadir config (mirrors the node
         // command). Genesis is the trust root, so it must match the chain the pack came from.
         let tn_config = self.chain.map_or_else(
@@ -619,7 +1136,7 @@ fn restore_consensus_and_records(
         verify_and_save_epoch_records(&db, genesis_committee.bls_keys(), &records, &cert_by_hash)
             .await?;
         db.persist().await.map_err(|e| eyre!("failed to persist epoch records: {e}"))?;
-        drop(db);
+        db.close().await;
 
         // 2. Rebuild the closed epoch's consensus pack. Epoch 0 would need a pre-epoch-0 genesis
         //    descriptor that a data-only bundle doesn't carry, so the pack cannot be rebuilt and a
@@ -642,13 +1159,17 @@ fn restore_consensus_and_records(
         })?;
         // Landing directly at `epochs_dir` (not a temp) is safe here: this is an offline, single
         // writer restore into a fresh datadir, so the online rename/install-lock dance is unneeded.
-        let pack = ConsensusPack::stream_import(
+        // No free-space floor: the floor guards the node's live stores against peer-supplied
+        // bytes, and this is the operator's own bundle into a datadir nothing else is using; a
+        // real shortage surfaces as the write error.
+        let pack = ConsensusPack::stream_import_with_floor(
             epochs_dir,
             file,
             n,
             previous,
             final_record.final_consensus.number,
             STREAM_IMPORT_TIMEOUT,
+            0,
         )
         .await
         .map_err(|e| {
@@ -659,7 +1180,7 @@ fn restore_consensus_and_records(
         // The chain was verified as it streamed; confirm the rebuilt tip is exactly the epoch's
         // final consensus header before declaring success.
         let tip = pack.latest_consensus_header().await;
-        drop(pack);
+        pack.close().await;
         // Read-back failure and tip mismatch are different diagnoses and get different messages: a
         // mismatch means the bundle rebuilt into the wrong chain, whereas an `Err` means the pack
         // could not be read at all. Both roll the epoch dir back, matching the import error path
@@ -978,12 +1499,128 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 
 #[cfg(test)]
 mod tests {
-    use super::{file_len_if_exists, static_files_summary_table};
+    use super::{file_len_if_exists, repair_targets, static_files_summary_table};
     use crate::{
         cli::{Cli, Commands},
         NoArgs,
     };
     use std::{collections::HashMap, fs, path::Path};
+
+    #[test]
+    fn repair_targets_skips_current_epoch_in_all_mode() {
+        // All-mode: every epoch except the current/latest, which is returned as skipped.
+        assert_eq!(repair_targets(&[0, 1, 2], None), (vec![0, 1], Some(2)));
+        // Single epoch is the current one: skipped, nothing to repair.
+        assert_eq!(repair_targets(&[5], None), (vec![], Some(5)));
+        // No epochs on disk.
+        assert_eq!(repair_targets(&[], None), (vec![], None));
+        // Explicit --epoch targets exactly that epoch (including the current one), no skip.
+        assert_eq!(repair_targets(&[0, 1, 2], Some(2)), (vec![2], None));
+        assert_eq!(repair_targets(&[0, 1, 2], Some(0)), (vec![0], None));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn db_repair_refuses_while_a_live_node_holds_the_datadir_lock() {
+        use tn_config::{PidLock, TelcoinDirs as _};
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        // `db repair` reaches the datadir lock only after the epochs dir exists.
+        fs::create_dir_all(datadir.epochs_db_path()).unwrap();
+
+        // A held advisory lock stands in for a running node holding the datadir.
+        let held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = super::DbRepairArgs { epoch: None, force: true }
+            .execute(datadir.clone())
+            .expect_err("repair must refuse while a node holds the lock");
+        assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+        // The refusal must not disturb the running node's lockfile.
+        assert_eq!(
+            fs::read_to_string(datadir.node_pid_path()).unwrap().trim().parse::<u32>().unwrap(),
+            std::process::id(),
+            "the held lock's PID must be left intact"
+        );
+
+        // Once the node releases the lock (drop clears the file), a dry-run repair takes the lock
+        // and releases it on exit.
+        drop(held);
+        super::DbRepairArgs { epoch: None, force: false }
+            .execute(datadir.clone())
+            .expect("dry-run repair should succeed on an empty epochs dir with no lock held");
+        // Released: the lockfile stays (it is never unlinked) but no longer records a holder, and a
+        // fresh acquire succeeds.
+        assert!(
+            fs::read_to_string(datadir.node_pid_path()).unwrap().is_empty(),
+            "repair must clear its PID on exit"
+        );
+        drop(PidLock::acquire(&datadir).expect("repair must release its lock on exit"));
+    }
+
+    /// A torn tail is only self-healing in the current epoch; whether a pack is a past epoch is
+    /// read from the epochs directory beside it.
+    #[test]
+    fn later_epoch_exists_reads_the_epochs_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        for epoch in [3, 4] {
+            fs::create_dir_all(dir.path().join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let data = |epoch: u32| dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        assert!(super::later_epoch_exists(&data(3), 3), "epoch 4 follows epoch 3");
+        assert!(!super::later_epoch_exists(&data(4), 4), "epoch 4 is the latest");
+        let bare = tempfile::tempdir().unwrap();
+        assert!(
+            !super::later_epoch_exists(&bare.path().join(super::DATA_NAME), 0),
+            "a bare data file has no epochs beside it"
+        );
+    }
+
+    /// Whether a pack is a past epoch comes from the latest-consensus hint the node resumes from,
+    /// not the directory listing: a later `epoch-{N}` can exist before the node switches to it (an
+    /// epoch handoff interrupted after creating the next epoch's directory, or an epoch imported
+    /// ahead while catching up), and the node still opens the hinted epoch for append, healing its
+    /// tail.
+    #[test]
+    fn past_epoch_follows_the_latest_consensus_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        for epoch in [3, 4] {
+            fs::create_dir_all(dir.path().join(format!("epoch-{epoch}"))).unwrap();
+        }
+        let data = |epoch: u32| dir.path().join(format!("epoch-{epoch}")).join(super::DATA_NAME);
+        // The slot format: epoch (u32 LE), number (u64 LE), crc32 (LE) over the two. The other
+        // slot is empty, which reads as (0, 0).
+        let write_hint = |epoch: u32| {
+            let mut slot = Vec::with_capacity(16);
+            slot.extend_from_slice(&epoch.to_le_bytes());
+            slot.extend_from_slice(&100u64.to_le_bytes());
+            let crc = crc32fast::hash(&slot);
+            slot.extend_from_slice(&crc.to_le_bytes());
+            fs::write(dir.path().join("consensus_slot1"), &slot).unwrap();
+            fs::write(dir.path().join("consensus_slot2"), []).unwrap();
+        };
+        let past = |epoch: u32| super::require_current_epoch_for_tail(&data(epoch), epoch).is_err();
+
+        assert!(past(3), "without a hint the directory listing decides: epoch 4 follows epoch 3");
+        write_hint(3);
+        assert!(!past(3), "the node resumes epoch 3 for append");
+        assert!(!past(4), "epoch 4 is ahead of the node, opened for append when it gets there");
+        write_hint(4);
+        assert!(past(3), "the node resumes epoch 4, so epoch 3 is past");
+    }
+
+    /// `db load-state` writes chain data into the datadir, so like repair and migrate it must
+    /// refuse to run while a live node holds the datadir lock, before touching anything.
+    #[cfg(unix)]
+    #[test]
+    fn db_load_state_refuses_while_a_live_node_holds_the_datadir_lock() {
+        use tn_config::PidLock;
+        let dir = tempfile::tempdir().unwrap();
+        let datadir = dir.path().to_path_buf();
+        let _held = PidLock::acquire(&datadir).expect("acquire datadir lock");
+        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
+            .execute(datadir)
+            .expect_err("load-state must refuse while a node holds the lock");
+        assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
+    }
 
     #[test]
     fn static_files_summary_table_renders_segment_breakdown() {
@@ -1031,6 +1668,76 @@ mod tests {
         let Commands::Db(_) = cli.command else {
             panic!("expected the db subcommand");
         };
+    }
+
+    /// A pack whose epoch meta is torn with nothing behind it holds no committed data, but both
+    /// open doors refuse it and `db repair` reports it unrepairable, so `db validate` must fail
+    /// (exit non-zero) rather than report a self-healing shape.
+    #[test]
+    fn db_validate_fails_on_a_torn_epoch_meta() {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+            consensus_pack::{PackRecord, PACK_VERSION},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let epoch_dir = dir.path().join("epoch-0");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data_file = epoch_dir.join(super::DATA_NAME);
+        // A header-only pack, then an unclean tail: a meta size prefix claiming more bytes than
+        // follow it.
+        drop(
+            Pack::<PackRecord>::open(&data_file, 0, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("create pack"),
+        );
+        let mut bytes = fs::read(&data_file).unwrap();
+        bytes.truncate(DATA_HEADER_BYTES);
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAB; 10]);
+        fs::write(&data_file, &bytes).unwrap();
+
+        let args = super::DbValidateArgs { path: epoch_dir, epoch: None };
+        assert!(args.execute().is_err(), "a torn epoch meta must fail validation");
+    }
+
+    /// A legacy v0 (batches-first) pack is only ever read by its migration to v2, so `db validate`
+    /// reports a dry run of that migration: success for one that migrates, failure (exit non-zero)
+    /// for one the migration refuses.
+    #[test]
+    fn db_validate_judges_a_v0_pack_by_its_migration() {
+        use tn_storage::{
+            archive::pack::{Pack, PackCompression},
+            consensus_pack::{EpochMeta, PackRecord},
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let epoch_dir = dir.path().join("epoch-0");
+        fs::create_dir_all(&epoch_dir).unwrap();
+        let data_file = epoch_dir.join(super::DATA_NAME);
+        let write_v0 = |records: &[PackRecord]| {
+            let _ = fs::remove_file(&data_file);
+            let mut pack =
+                Pack::<PackRecord>::open(&data_file, 0, false, PackCompression::ZStd, 0).unwrap();
+            for record in records {
+                pack.append(record).unwrap();
+            }
+            pack.commit().unwrap();
+        };
+        let validate = || super::DbValidateArgs { path: epoch_dir.clone(), epoch: None }.execute();
+
+        // The meta's committee must decode (a real committee of more than one authority).
+        let mut committee = tn_types::CommitteeBuilder::new(0);
+        for (i, signer) in test_signers(40, 4).iter().enumerate() {
+            committee.add_authority(signer.public_key(), tn_types::Address::repeat_byte(i as u8));
+        }
+        let meta =
+            PackRecord::EpochMeta(EpochMeta { committee: committee.build(), ..Default::default() });
+        write_v0(std::slice::from_ref(&meta));
+        assert_eq!(super::legacy_migration_dry_run(&data_file, 0), Ok(0));
+        assert!(validate().is_ok(), "a v0 pack that migrates cleanly validates");
+
+        // A batch with no consensus header after it belongs to no output: the migration refuses.
+        write_v0(&[meta, PackRecord::Batch(tn_types::Batch::default())]);
+        assert!(super::legacy_migration_dry_run(&data_file, 0).is_err());
+        assert!(validate().is_err(), "a v0 pack the migration refuses fails validation");
     }
 
     #[test]
