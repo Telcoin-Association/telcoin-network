@@ -46,6 +46,7 @@ fn close(behaviour: &mut Behaviour<MemoryStore>, peer: PeerId, connection: Conne
         peer_id: peer,
         connection_id: connection,
         endpoint: &endpoint,
+        cause: None,
         remaining_established: 1,
     });
 }
