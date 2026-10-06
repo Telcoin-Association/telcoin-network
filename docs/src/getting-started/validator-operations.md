@@ -104,7 +104,8 @@ In the 2026-09 benchmark the file reached its 1 GiB maximum on every c3 validato
 Mainnet and testnet use 6-hour epochs, so the ceiling there is about 260 TPS of the benchmark mix (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
 Read live occupancy from MDBX instead.
 The release exports no metric for it.
-The committee's batch output since the epoch started, summed over all validators from `tn_worker_batch_size_bytes`, gives a rough upper estimate, because that histogram records each batch when it reaches quorum, so it also counts batches that were never reported or committed.
+Summed over all validators since the epoch started, `tn_worker_batch_size_bytes` gives a rough estimate of the batch data a node has written to its cache, and on a node that stayed in sync the estimate runs low.
+The histogram records each batch once, when its worker reports it to the primary, but a node writes each of its own batches to the cache twice and also writes every peer batch it validates, including ones that failed quorum.
 
 Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
 Alert on how fast it climbs during load and after restarts, not only on the level.

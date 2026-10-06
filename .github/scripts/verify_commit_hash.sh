@@ -12,10 +12,12 @@
 #   2  the registry never answered (adiri RPC unreachable or erroring after retries)
 #
 # The `verify-on-chain` lane in .github/workflows/pr.yaml runs this on the pull request
-# head sha, and only there. Both non-zero codes fail that check, which is right at PR
-# level: an outage keeps a PR out of the queue until someone re-runs the job, and cannot
-# touch a PR already queued, because the lane does not run on `merge_group`. The codes
-# stay distinct so the annotation on the failed step can say which one it was.
+# head sha, and only there. It runs the copy on main as the job starts, never the PR's
+# own, so a change to this file judges every run after it lands, on every open PR. Both
+# non-zero codes fail that check, which is right at PR level: an outage keeps a PR out of
+# the queue until someone re-runs the job, and cannot touch a PR already queued, because
+# the lane does not run on `merge_group`. The codes stay distinct so the annotation on the
+# failed step can say which one it was.
 
 set -uo pipefail
 
