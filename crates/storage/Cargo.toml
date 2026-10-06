@@ -17,6 +17,7 @@ tn-types = { workspace = true }
 eyre = { workspace = true }
 ouroboros = { workspace = true }
 parking_lot = { workspace = true, features = ["arc_lock"] }
+arc-swap = { workspace = true }
 dashmap = { workspace = true }
 # For the persist async implemetation. `rt` is needed for `spawn_blocking` (offloading the blocking
 # pack writes in `export_bounded_bundle`); declared explicitly rather than relying on workspace
