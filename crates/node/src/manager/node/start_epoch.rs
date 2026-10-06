@@ -27,6 +27,7 @@ use crate::{
     engine::{ExecutionNode, WorkerState},
     manager::EpochManager,
     network_dial::{retry_peer_dial, DialOutcome},
+    network_readiness::probe,
     primary::PrimaryNode,
     worker::WorkerNode,
     EngineToPrimaryRpc,
@@ -37,7 +38,6 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
-    time::Duration,
 };
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
@@ -1218,6 +1218,7 @@ mod tests {
         use crate::engine::TnBuilder;
         use jsonrpsee::core::client::ClientT as _;
         use rand::{rngs::StdRng, SeedableRng as _};
+        use std::time::Duration;
         use tn_config::KeyConfig;
         use tn_network_libp2p::types::NetworkCommand;
         use tn_reth::RethEnv;
@@ -1616,6 +1617,7 @@ mod tests {
         use super::*;
         use crate::engine::TnBuilder;
         use rand::{rngs::StdRng, SeedableRng as _};
+        use std::time::Duration;
         use tn_config::KeyConfig;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::CommitteeFixture;
