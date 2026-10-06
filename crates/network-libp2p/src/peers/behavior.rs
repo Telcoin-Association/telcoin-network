@@ -155,8 +155,8 @@ impl NetworkBehaviour for PeerManager {
                 remaining_established,
                 ..
             }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
-            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
-                debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
+            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id }) => {
+                debug!(target: "peer-manager::dial", ?peer_id, ?connection_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {

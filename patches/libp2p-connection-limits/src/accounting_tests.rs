@@ -5,6 +5,12 @@ use libp2p_swarm::{DialError, ListenError};
 
 use super::*;
 
+/// Construct a reserved behaviour with deterministic identities and typed setup errors.
+fn reserved(limits: ConnectionLimits, required: &[PeerId]) -> Result<Behaviour, std::io::Error> {
+    Behaviour::new_with_required_peers(limits, peer(0).map_err(std::io::Error::other)?, required)
+        .map_err(std::io::Error::other)
+}
+
 /// Result of constructing the deterministic peer identities used by a test.
 type TestResult = Result<(), ParseError>;
 
@@ -104,6 +110,201 @@ fn assert_denied<T>(result: Result<T, ConnectionDenied>, kind: Kind) {
     assert!(result.err().and_then(|denied| denied.downcast::<Exceeded>().ok()).is_some_and(
         |exceeded| { std::mem::discriminant(&exceeded.kind) == std::mem::discriminant(&kind) }
     ));
+}
+
+/// Opportunistic pressure leaves room for both required identities and a closed identity's
+/// recovery.
+#[test]
+fn required_identities_recover_without_increasing_the_total_cap() -> Result<(), std::io::Error> {
+    let a = peer(1).map_err(std::io::Error::other)?;
+    let b = peer(2).map_err(std::io::Error::other)?;
+    let guest = peer(3).map_err(std::io::Error::other)?;
+    let other_guest = peer(4).map_err(std::io::Error::other)?;
+    let denied_guest = peer(5).map_err(std::io::Error::other)?;
+    let mut behaviour =
+        reserved(ConnectionLimits::default().with_max_established(Some(4)), &[a, b])?;
+    let inbound = endpoint(Endpoint::Listener);
+    let outbound = endpoint(Endpoint::Dialer);
+    establish(&mut behaviour, guest, ConnectionId::new_unchecked(1), &inbound);
+    establish(&mut behaviour, other_guest, ConnectionId::new_unchecked(2), &outbound);
+    [&inbound, &outbound].into_iter().for_each(|direction| {
+        assert_denied(
+            admit(&mut behaviour, denied_guest, ConnectionId::new_unchecked(3), direction),
+            Kind::EstablishedTotal,
+        );
+    });
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(3), &outbound);
+    establish(&mut behaviour, b, ConnectionId::new_unchecked(4), &inbound);
+    assert_counts(&behaviour, 2, 2, 4);
+    close(&mut behaviour, a, ConnectionId::new_unchecked(3), &outbound);
+    close(&mut behaviour, a, ConnectionId::new_unchecked(3), &outbound);
+    close(&mut behaviour, b, ConnectionId::new_unchecked(99), &inbound);
+    assert_counts(&behaviour, 2, 1, 3);
+    assert_denied(
+        admit(&mut behaviour, denied_guest, ConnectionId::new_unchecked(5), &outbound),
+        Kind::EstablishedTotal,
+    );
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(5), &outbound);
+    assert_counts(&behaviour, 2, 2, 4);
+    Ok(())
+}
+
+/// Duplicate transports count physically but never spend another required identity's slot.
+#[test]
+fn duplicate_required_transports_preserve_other_identity_reservations() -> Result<(), std::io::Error>
+{
+    let local = peer(0).map_err(std::io::Error::other)?;
+    let a = peer(1).map_err(std::io::Error::other)?;
+    let b = peer(2).map_err(std::io::Error::other)?;
+    let guest = peer(3).map_err(std::io::Error::other)?;
+    let other_guest = peer(4).map_err(std::io::Error::other)?;
+    let mut behaviour = reserved(
+        ConnectionLimits::default().with_max_established(Some(4)),
+        &[local, a, a, b, local, b],
+    )?;
+    assert_eq!(behaviour.required_peers.as_ref().map(HashSet::len), Some(2));
+    let inbound = endpoint(Endpoint::Listener);
+    let outbound = endpoint(Endpoint::Dialer);
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(1), &inbound);
+    establish(&mut behaviour, guest, ConnectionId::new_unchecked(2), &outbound);
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(3), &outbound);
+    assert_denied(
+        admit(&mut behaviour, a, ConnectionId::new_unchecked(4), &inbound),
+        Kind::EstablishedTotal,
+    );
+    close(&mut behaviour, a, ConnectionId::new_unchecked(1), &inbound);
+    establish(&mut behaviour, other_guest, ConnectionId::new_unchecked(4), &inbound);
+    close(&mut behaviour, a, ConnectionId::new_unchecked(3), &outbound);
+    assert_counts(&behaviour, 1, 1, 2);
+    assert_denied(
+        admit(&mut behaviour, guest, ConnectionId::new_unchecked(5), &inbound),
+        Kind::EstablishedTotal,
+    );
+    establish(&mut behaviour, b, ConnectionId::new_unchecked(5), &outbound);
+    assert_denied(
+        admit(&mut behaviour, b, ConnectionId::new_unchecked(6), &inbound),
+        Kind::EstablishedTotal,
+    );
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(6), &inbound);
+    assert_counts(&behaviour, 2, 2, 4);
+    Ok(())
+}
+
+/// Reservations neither bypass existing bounds nor consume a slot on rejected admission.
+#[test]
+fn reserved_peers_obey_pending_direction_peer_and_total_limits() -> Result<(), std::io::Error> {
+    let a = peer(1).map_err(std::io::Error::other)?;
+    let b = peer(2).map_err(std::io::Error::other)?;
+    let guest = peer(3).map_err(std::io::Error::other)?;
+    let mut behaviour = reserved(
+        ConnectionLimits::default()
+            .with_max_established(Some(2))
+            .with_max_established_per_peer(Some(1))
+            .with_max_established_incoming(Some(1))
+            .with_max_established_outgoing(Some(1))
+            .with_max_pending_incoming(Some(1))
+            .with_max_pending_outgoing(Some(1)),
+        &[a, b],
+    )?;
+    behaviour.bypass_peer_id(&a);
+    behaviour.bypass_peer_id(&guest);
+    assert!(!behaviour.is_bypassed(&a) && !behaviour.is_bypassed(&guest));
+    let first = ConnectionId::new_unchecked(1);
+    let second = ConnectionId::new_unchecked(2);
+    let addr = Multiaddr::empty();
+    assert!(behaviour.handle_pending_inbound_connection(first, &addr, &addr).is_ok());
+    assert_denied(
+        behaviour.handle_pending_inbound_connection(second, &addr, &addr),
+        Kind::PendingIncoming,
+    );
+    behaviour.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+        local_addr: &addr,
+        send_back_addr: &addr,
+        error: &ListenError::Aborted,
+        connection_id: first,
+        peer_id: Some(a),
+    }));
+    assert!(
+        behaviour.handle_pending_outbound_connection(first, Some(a), &[], Endpoint::Dialer).is_ok()
+    );
+    assert_denied(
+        behaviour.handle_pending_outbound_connection(second, Some(b), &[], Endpoint::Dialer),
+        Kind::PendingOutgoing,
+    );
+    behaviour.on_swarm_event(FromSwarm::DialFailure(DialFailure {
+        peer_id: Some(a),
+        error: &DialError::Aborted,
+        connection_id: first,
+    }));
+    assert!(behaviour.pending_inbound_connections.is_empty());
+    assert!(behaviour.pending_outbound_connections.is_empty());
+    let inbound = endpoint(Endpoint::Listener);
+    let outbound = endpoint(Endpoint::Dialer);
+    establish(&mut behaviour, a, first, &inbound);
+    assert_denied(admit(&mut behaviour, b, second, &inbound), Kind::EstablishedIncoming);
+    // A later behaviour may reject an admitted connection before the swarm emits Established.
+    assert!(admit(&mut behaviour, b, second, &outbound).is_ok());
+    behaviour.on_swarm_event(FromSwarm::DialFailure(DialFailure {
+        peer_id: Some(b),
+        error: &DialError::Aborted,
+        connection_id: second,
+    }));
+    assert_counts(&behaviour, 1, 0, 1);
+    assert_denied(admit(&mut behaviour, guest, second, &outbound), Kind::EstablishedTotal);
+    establish(&mut behaviour, b, second, &outbound);
+    let extra = ConnectionId::new_unchecked(3);
+    assert_denied(admit(&mut behaviour, a, extra, &inbound), Kind::EstablishedIncoming);
+    assert_denied(admit(&mut behaviour, b, extra, &outbound), Kind::EstablishedOutgoing);
+    *behaviour.limits_mut() = behaviour
+        .limits
+        .clone()
+        .with_max_established_incoming(Some(2))
+        .with_max_established_outgoing(Some(2));
+    assert_denied(admit(&mut behaviour, a, extra, &inbound), Kind::EstablishedPerPeer);
+    *behaviour.limits_mut() = behaviour.limits.clone().with_max_established_per_peer(Some(2));
+    assert_denied(admit(&mut behaviour, a, extra, &inbound), Kind::EstablishedTotal);
+    assert_counts(&behaviour, 1, 1, 2);
+    Ok(())
+}
+
+/// Construction validates finite capacity, deduplicates local input, and reads changed limits.
+#[test]
+fn reservation_construction_and_changed_limits_remain_bounded() -> Result<(), std::io::Error> {
+    let local = peer(0).map_err(std::io::Error::other)?;
+    let a = peer(1).map_err(std::io::Error::other)?;
+    let b = peer(2).map_err(std::io::Error::other)?;
+    assert_eq!(
+        Behaviour::new_with_required_peers(ConnectionLimits::default(), local, &[a]).err(),
+        Some(ReservationError::MissingTotalLimit),
+    );
+    assert_eq!(
+        Behaviour::new_with_required_peers(
+            ConnectionLimits::default().with_max_established(Some(1)),
+            local,
+            &[a, b]
+        )
+        .err(),
+        Some(ReservationError::TooManyRequiredPeers { limit: 1 }),
+    );
+    let empty = reserved(ConnectionLimits::default().with_max_established(Some(0)), &[local; 128])?;
+    assert_eq!(empty.required_peers.as_ref().map(HashSet::len), Some(0));
+    let mut behaviour =
+        reserved(ConnectionLimits::default().with_max_established(Some(2)), &[a; 128])?;
+    let outbound = endpoint(Endpoint::Dialer);
+    *behaviour.limits_mut() = behaviour.limits.clone().with_max_established(Some(0));
+    assert_denied(
+        admit(&mut behaviour, a, ConnectionId::new_unchecked(1), &outbound),
+        Kind::EstablishedTotal,
+    );
+    *behaviour.limits_mut() = behaviour.limits.clone().with_max_established(Some(2));
+    establish(&mut behaviour, a, ConnectionId::new_unchecked(1), &outbound);
+    *behaviour.limits_mut() = behaviour.limits.clone().with_max_established(None);
+    establish(&mut behaviour, b, ConnectionId::new_unchecked(2), &outbound);
+    assert_counts(&behaviour, 0, 2, 2);
+    let mut legacy = Behaviour::new(ConnectionLimits::default().with_max_established(Some(0)));
+    legacy.bypass_peer_id(&a);
+    assert!(legacy.is_bypassed(&a));
+    Ok(())
 }
 
 /// Historical identities return to the active-peer baseline with either per-peer configuration.

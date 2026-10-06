@@ -256,15 +256,54 @@ fn connection_limits_behaviour(
     max_pending_incoming: u32,
     budget: Option<SwarmNetworkBudget>,
 ) -> connection_limits::Behaviour {
-    connection_limits::Behaviour::new(
-        ConnectionLimits::default()
-            .with_max_established_per_peer(Some(
-                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
-                    budget.connections_per_peer()
-                }),
-            ))
-            .with_max_established(budget.map(|budget| budget.connections()))
-            .with_max_pending_incoming(Some(max_pending_incoming)),
+    connection_limits::Behaviour::new(swarm_connection_limits(max_pending_incoming, budget))
+}
+
+/// Keep the physical caps identical for reserved and legacy admission.
+fn swarm_connection_limits(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> ConnectionLimits {
+    ConnectionLimits::default()
+        .with_max_established_per_peer(Some(
+            budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                budget.connections_per_peer()
+            }),
+        ))
+        .with_max_established(budget.map(|budget| budget.connections()))
+        .with_max_pending_incoming(Some(max_pending_incoming))
+}
+
+/// Install immutable configured bootstrap reservations before the swarm starts admission.
+/// Runtime bootstrap or logical trust changes do not expand this physical reservation set.
+fn bootstrap_connection_limits(
+    network_config: &NetworkConfig,
+    network_type: NetworkType,
+    local_peer: PeerId,
+    budget: Option<SwarmNetworkBudget>,
+) -> NetworkResult<connection_limits::Behaviour> {
+    budget.map_or_else(
+        || Ok(connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None)),
+        |budget| {
+            let required_peers = network_config
+                .bootstrap_peers()
+                .values()
+                .filter_map(|server| match network_type {
+                    NetworkType::Primary => Some(server.primary.network_key.clone()),
+                    NetworkType::Worker(id) => {
+                        server.worker(id).map(|worker| worker.network_key.clone())
+                    }
+                })
+                .map(PeerId::from)
+                .collect::<Vec<_>>();
+            connection_limits::Behaviour::new_with_required_peers(
+                swarm_connection_limits(MAX_PENDING_INCOMING_CONNECTIONS, Some(budget)),
+                local_peer,
+                &required_peers,
+            )
+            .map_err(std::io::Error::other)
+            .map_err(NetworkError::from)
+        },
     )
 }
 
@@ -688,7 +727,7 @@ where
             stream_protocol,
         );
         behavior.connection_limits =
-            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
+            bootstrap_connection_limits(network_config, network_type, peer_id, budget)?;
         behavior.peer_manager.set_public_peer_limit(network_config.public_peer_limit());
         if network_config.dao_observers().len() > 8
             || network_config

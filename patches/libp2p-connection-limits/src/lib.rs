@@ -71,6 +71,8 @@ use libp2p_swarm::{
 /// ```
 pub struct Behaviour {
     limits: ConnectionLimits,
+    /// Immutable identities with one reserved slot whenever they are disconnected.
+    required_peers: Option<HashSet<PeerId>>,
     /// Peer IDs that bypass limit check, regardless of inbound or outbound.
     bypass_peer_id: HashSet<PeerId>,
 
@@ -85,6 +87,7 @@ impl Behaviour {
     pub fn new(limits: ConnectionLimits) -> Self {
         Self {
             limits,
+            required_peers: None,
             bypass_peer_id: Default::default(),
             pending_inbound_connections: Default::default(),
             pending_outbound_connections: Default::default(),
@@ -94,15 +97,70 @@ impl Behaviour {
         }
     }
 
+    /// Reserve one established slot per distinct nonlocal identity inside the total limit.
+    ///
+    /// Configure this before admitting connections. The finite input is deduplicated, and its
+    /// retained set never grows beyond the established-total limit. Reservations do not bypass
+    /// pending, directional, per-peer, or total limits, and disable the bypass list.
+    /// Logical trust added later does not change these physical reservations.
+    pub fn new_with_required_peers(
+        limits: ConnectionLimits,
+        local_peer: PeerId,
+        required_peers: &[PeerId],
+    ) -> Result<Self, ReservationError> {
+        let limit = limits.max_established_total.ok_or(ReservationError::MissingTotalLimit)?;
+        let required_peers = required_peers
+            .iter()
+            .copied()
+            .filter(|peer| *peer != local_peer)
+            .try_fold(HashSet::new(), |mut peers, peer| {
+                peers.insert(peer);
+                if peers.len() > limit as usize {
+                    Err(ReservationError::TooManyRequiredPeers { limit })
+                } else {
+                    Ok(peers)
+                }
+            })?;
+        Ok(Self { required_peers: Some(required_peers), ..Self::new(limits) })
+    }
+
+    /// Preserve every other absent required identity's slot, including on duplicate transports.
+    fn check_reservations(&self, candidate: PeerId) -> Result<(), ConnectionDenied> {
+        self.required_peers.as_ref().zip(self.limits.max_established_total).map_or(
+            Ok(()),
+            |(required, limit)| {
+                let missing_after = required
+                    .iter()
+                    .filter(|peer| {
+                        **peer != candidate
+                            && self.established_per_peer.get(*peer).is_none_or(HashSet::is_empty)
+                    })
+                    .count();
+                let current = self.established_inbound_connections.len()
+                    + self.established_outbound_connections.len();
+                if current.saturating_add(missing_after) >= limit as usize {
+                    Err(ConnectionDenied::new(Exceeded { limit, kind: Kind::EstablishedTotal }))
+                } else {
+                    Ok(())
+                }
+            },
+        )
+    }
+
     /// Returns a mutable reference to [`ConnectionLimits`].
     /// > **Note**: A new limit will not be enforced against existing connections.
+    /// Changing or removing the total limit can invalidate the original reservation guarantee;
+    /// subsequent admissions use the current cap without evicting existing connections.
     pub fn limits_mut(&mut self) -> &mut ConnectionLimits {
         &mut self.limits
     }
 
     /// Add the peer to bypass list.
+    /// Has no effect when physical reservations are configured.
     pub fn bypass_peer_id(&mut self, peer_id: &PeerId) {
-        self.bypass_peer_id.insert(*peer_id);
+        if self.required_peers.is_none() {
+            self.bypass_peer_id.insert(*peer_id);
+        }
     }
     /// Remove the peer from bypass list.
     pub fn remove_peer_id(&mut self, peer_id: &PeerId) {
@@ -110,9 +168,33 @@ impl Behaviour {
     }
     /// Whether the connection is bypassed.
     pub fn is_bypassed(&self, remote_peer: &PeerId) -> bool {
-        self.bypass_peer_id.contains(remote_peer)
+        self.required_peers.is_none() && self.bypass_peer_id.contains(remote_peer)
     }
 }
+
+/// Invalid physical reservation configuration.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ReservationError {
+    /// A finite established-total limit is required to reserve bounded capacity.
+    MissingTotalLimit,
+    /// Distinct required identities exceed the established-total capacity.
+    TooManyRequiredPeers { limit: u32 },
+}
+
+impl fmt::Display for ReservationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingTotalLimit => {
+                f.write_str("required peers need an established-total limit")
+            }
+            Self::TooManyRequiredPeers { limit } => {
+                write!(f, "required peers exceed total limit {limit}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReservationError {}
 
 fn check_limit(limit: Option<u32>, current: usize, kind: Kind) -> Result<(), ConnectionDenied> {
     let limit = limit.unwrap_or(u32::MAX);
@@ -140,11 +222,7 @@ impl Exceeded {
 
 impl fmt::Display for Exceeded {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "connection limit exceeded: at most {} {} are allowed",
-            self.limit, self.kind
-        )
+        write!(f, "connection limit exceeded: at most {} {} are allowed", self.limit, self.kind)
     }
 }
 
@@ -268,10 +346,7 @@ impl NetworkBehaviour for Behaviour {
         )?;
         check_limit(
             self.limits.max_established_per_peer,
-            self.established_per_peer
-                .get(&peer)
-                .map(|connections| connections.len())
-                .unwrap_or(0),
+            self.established_per_peer.get(&peer).map(|connections| connections.len()).unwrap_or(0),
             Kind::EstablishedPerPeer,
         )?;
         check_limit(
@@ -280,6 +355,8 @@ impl NetworkBehaviour for Behaviour {
                 + self.established_outbound_connections.len(),
             Kind::EstablishedTotal,
         )?;
+
+        self.check_reservations(peer)?;
 
         Ok(dummy::ConnectionHandler)
     }
@@ -325,10 +402,7 @@ impl NetworkBehaviour for Behaviour {
         )?;
         check_limit(
             self.limits.max_established_per_peer,
-            self.established_per_peer
-                .get(&peer)
-                .map(|connections| connections.len())
-                .unwrap_or(0),
+            self.established_per_peer.get(&peer).map(|connections| connections.len()).unwrap_or(0),
             Kind::EstablishedPerPeer,
         )?;
         check_limit(
@@ -338,26 +412,20 @@ impl NetworkBehaviour for Behaviour {
             Kind::EstablishedTotal,
         )?;
 
+        self.check_reservations(peer)?;
+
         Ok(dummy::ConnectionHandler)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm) {
         match event {
-            FromSwarm::ConnectionClosed(ConnectionClosed {
-                peer_id,
-                connection_id,
-                ..
-            }) => {
+            FromSwarm::ConnectionClosed(ConnectionClosed { peer_id, connection_id, .. }) => {
                 self.established_inbound_connections.remove(&connection_id);
                 self.established_outbound_connections.remove(&connection_id);
-                if self
-                    .established_per_peer
-                    .get_mut(&peer_id)
-                    .is_some_and(|connections| {
-                        connections.remove(&connection_id);
-                        connections.is_empty()
-                    })
-                {
+                if self.established_per_peer.get_mut(&peer_id).is_some_and(|connections| {
+                    connections.remove(&connection_id);
+                    connections.is_empty()
+                }) {
                     self.established_per_peer.remove(&peer_id);
                 }
             }
@@ -376,10 +444,7 @@ impl NetworkBehaviour for Behaviour {
                     }
                 }
 
-                self.established_per_peer
-                    .entry(peer_id)
-                    .or_default()
-                    .insert(connection_id);
+                self.established_per_peer.entry(peer_id).or_default().insert(connection_id);
             }
             FromSwarm::DialFailure(DialFailure { connection_id, .. }) => {
                 self.pending_outbound_connections.remove(&connection_id);

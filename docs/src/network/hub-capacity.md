@@ -39,6 +39,17 @@ normal load scoring. Additional operator-protected identities compete for the
 same protected headroom. Protocol violations can still cause bans, and every peer
 remains subject to the hard process, source, stream, and receive-credit limits.
 
+With a finite process connection budget, each swarm reserves one existing slot
+for each distinct, nonlocal bootstrap PeerId configured for that swarm. While a
+required identity is disconnected, opportunistic discovery and query connections
+cannot use its slot. A duplicate connection to another required peer cannot use
+that slot either. Reservations are installed before the swarm starts, and a
+bootstrap set larger than the swarm's connection cap is rejected. All existing
+total, per-peer, directional and pending connection limits still apply.
+Reservations cover the initial configuration, including configured DAO observers;
+adding logical trust at runtime does not add physical reservations. Networks
+without a finite process connection budget retain their existing admission rules.
+
 Network allocations do not bound RSS: engine state, record storage, caches, RPC,
 cryptography, queues, and allocator overhead also consume memory. Qualification
 therefore measures the whole process alongside every primary/worker allocation.
@@ -189,6 +200,8 @@ nonempty ACK/DATA/END epoch transfers. Shared-NAT commands restart the actual
 peer process, preserve its keys and verify connections to both hubs on every
 swarm. DAO checks observe those same live authenticated connections.
 Each client pins the two declared gateways as trusted peers in its own swarms.
+Its twelve-connection process budget gives each swarm four physical slots, with
+one reserved for each required gateway while that gateway is disconnected.
 The measured hubs apply their public and DAO admission rules to those clients.
 Commands for peers outside the shared-NAT group enter their native bounded command
 servers concurrently, with sixteen slots per client. Commands for a shared-NAT
