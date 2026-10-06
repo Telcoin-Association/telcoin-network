@@ -2172,11 +2172,14 @@ where
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
                             // Only a matching requested key may supply a required store row. Query
                             // ownership itself is temporary and cannot admit an unrelated record.
+                            // Our own key is skipped, so a queried copy cannot replace the
+                            // `expires: None` row that `provide_our_data` keeps for it.
                             let freshness = self.record_freshness(&record);
                             if self
                                 .kad_record_queries
                                 .get(&query_id)
                                 .is_some_and(|query| query.request == key)
+                                && key != self.key_config.primary_public_key()
                                 && matches!(
                                     freshness,
                                     RecordFreshness::Newer | RecordFreshness::Identical
@@ -2187,7 +2190,18 @@ where
                                 } else {
                                     record
                                 };
-                                self.swarm.behaviour_mut().kademlia.store_mut().put(record)
+                                // Mirror libp2p's inbound-put cap, so a queried copy never
+                                // outlives `kad_record_ttl`. A responder that answers from its own
+                                // `expires: None` row sends ttl 0, which decodes back to `None`.
+                                // The cap runs after the merge, so a stored `None` cannot win.
+                                let cap = std::time::Instant::now()
+                                    .checked_add(self.config.kad_record_ttl);
+                                let expires = cap
+                                    .map(|cap| {
+                                        record.expires.map_or(cap, |expires| expires.min(cap))
+                                    })
+                                    .or(record.expires);
+                                self.swarm.behaviour_mut().kademlia.store_mut().put(kad::Record { expires, ..record })
                                     .unwrap_or_else(|error| {
                                         debug!(target: "network-kad", ?key, ?error,
                                             "queried binding could not be retained; discovery remains available");
