@@ -196,7 +196,9 @@ def mutation_commands(relative, regression):
     if not package:
         raise ValueError("mutation source must have an owning Cargo package")
     excluded = tomllib.loads((repository / "Cargo.toml").read_text()).get("workspace", {}).get("exclude", [])
-    standalone = manifests[0].parent.relative_to(repository).as_posix() in excluded
+    excluded_package = manifests[0].parent.relative_to(repository).as_posix() in excluded
+    # An excluded patch without its own lock uses the root's locked dependency graph.
+    standalone = excluded_package and (manifests[0].parent / "Cargo.lock").is_file()
     selection = (["--manifest-path", manifests[0].relative_to(repository).as_posix()]
                  if standalone else ["-p", package])
     compile_argv = ["cargo", "+1.94", "test", "--locked", *selection, "--no-run"]
@@ -205,7 +207,7 @@ def mutation_commands(relative, regression):
     target = []
     if source.parent == manifests[0].parent / "examples":
         target = ["--example", source.stem]
-    elif standalone and source.is_relative_to(manifests[0].parent / "src"):
+    elif excluded_package and source.is_relative_to(manifests[0].parent / "src"):
         target = ["--lib"]
     compile_argv += target
     test_argv += target

@@ -23,13 +23,16 @@ class MutationTests(unittest.TestCase):
         (source.parent.parent / "Cargo.toml").write_text('[package]\nname = "source-owner"\nversion = "0.1.0"\n')
         return source
 
-    def standalone_fixture(self, root, relative):
+    def standalone_fixture(self, root, relative, *, lockfile=True, package_name="libp2p-kad"):
         (root / "Cargo.toml").write_text('[workspace]\nexclude = ["patches/kad"]\n')
         package = root / "patches/kad"
         source = package / relative
         source.parent.mkdir(parents=True)
         source.write_text("original expression\n")
-        (package / "Cargo.toml").write_text('[package]\nname = "libp2p-kad"\nversion = "0.49.0"\n')
+        (package / "Cargo.toml").write_text(f'[package]\nname = "{package_name}"\nversion = "0.49.0"\n')
+        (root / "Cargo.lock").write_text("# Synthetic root lockfile\nversion = 3\n")
+        if lockfile:
+            (package / "Cargo.lock").write_text("# Synthetic standalone lockfile\nversion = 3\n")
         return source
 
     def test_nested_source_selects_its_package_for_both_commands(self):
@@ -73,6 +76,39 @@ class MutationTests(unittest.TestCase):
             self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "--manifest-path",
                                          "patches/kad/Cargo.toml", "-E", "test(must_reject)",
                                          "--no-tests", "fail", "--test-threads", "1", "--lib"])
+
+    def test_excluded_library_without_lockfile_uses_locked_root_package(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.standalone_fixture(root, "src/lib.rs", lockfile=False,
+                                             package_name="libp2p-connection-limits")
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(owner, "libp2p-connection-limits")
+            self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "-p", owner, "--no-run", "--lib"])
+            self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "-p", owner,
+                                         "-E", "test(must_reject)", "--no-tests", "fail", "--test-threads", "1", "--lib"])
+
+    def test_excluded_example_without_lockfile_uses_root_package_example(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.standalone_fixture(root, "examples/probe.rs", lockfile=False)
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "-p", owner, "--no-run", "--example", "probe"])
+            self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "-p", owner,
+                                         "-E", "test(must_reject)", "--no-tests", "fail", "--test-threads", "1", "--example", "probe"])
+
+    def test_workspace_package_with_local_lockfile_keeps_root_selection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.fixture(root)
+            (source.parent.parent / "Cargo.lock").write_text("# Synthetic package lockfile\nversion = 3\n")
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "-p", owner, "--no-run"])
+            self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "-p", owner,
+                                         "-E", "test(must_reject)", "--no-tests", "fail", "--test-threads", "1"])
 
     def test_excluded_dependency_example_selects_the_example_without_library(self):
         with tempfile.TemporaryDirectory() as temporary:
