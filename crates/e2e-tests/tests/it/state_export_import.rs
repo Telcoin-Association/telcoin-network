@@ -7,13 +7,13 @@
 //!
 //! ## Topology: 4 validators, exactly one exporter
 //!
-//! A literal single producing node is not possible — `CommitteeInner::load`
-//! (`crates/types/src/committee.rs`) asserts a committee larger than one, and the whole point of
-//! the test (the importer must *sync and then follow*) requires a live network that keeps advancing
-//! epochs while and after the observer joins. So the network is the standard 4-validator committee
-//! used by every other epoch test, and `--enable-state-export` is enabled on **exactly one** of
-//! them (`validator-1`). That single exporter produces the bundle the observer imports; the other
-//! three only keep the quorum alive.
+//! A literal single producing node is not possible — `Committee::new` (builder) and
+//! `CommitteeInner::validate` (decode) in `crates/types/src/committee.rs` both refuse a committee
+//! of one, and the whole point of the test (the importer must *sync and then follow*) requires a
+//! live network that keeps advancing epochs while and after the observer joins. So the network is
+//! the standard 4-validator committee used by every other epoch test, and `--enable-state-export`
+//! is enabled on **exactly one** of them (`validator-1`). That single exporter produces the bundle
+//! the observer imports; the other three only keep the quorum alive.
 //!
 //! ## What the restored node needs from the snapshot block
 //!
@@ -908,9 +908,8 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
     // ---- 1) Warm-up: one transfer per epoch until worker 0's fee clears `FEE_WARMUP_FLOOR`.
     // `test-source` sends every transfer, so its nonce must stay monotonic.
     let funded_key = get_key("test-source");
-    let mut nonce: u128 = 0;
     let mut last_gas_epoch: Option<(u32, u64)> = None;
-    for i in 0..FEE_WARMUP_MAX_EPOCHS {
+    for (i, nonce) in (0..FEE_WARMUP_MAX_EPOCHS).zip(0_u128..) {
         let next_epoch = last_gas_epoch.map_or(1, |(epoch, _)| epoch + 1);
         wait_for_epoch_at_least(&provider, next_epoch).await?;
         // Land on a MEASURED mid-epoch phase so the transaction clears both boundaries and the
@@ -925,7 +924,6 @@ async fn test_state_export_import_recovers_recorded_fee_inner() -> eyre::Result<
                     snap.epoch_id
                 )
             })?;
-        nonce += 1;
         info!(target: "restart-test", epoch = snap.epoch_id, block, fee, "fee warm-up epoch");
         last_gas_epoch = Some((snap.epoch_id, fee));
         if fee >= FEE_WARMUP_FLOOR {
