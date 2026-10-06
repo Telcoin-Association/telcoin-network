@@ -3,7 +3,9 @@
 //! The header occupies a full [`PAGE_SIZE`] page (so node pages start on a page boundary) and ends
 //! with a CRC32 over the page.  It records the paired pack's `version`/`uid`/`appnum` (for
 //! cross-checking), the page/key/value geometry (validated on reopen), and the mutable tree state
-//! (`root_page`, `height`, `page_count`, `values`, `first_leaf`, `last_leaf`, `data_file_length`).
+//! (`root_page`, `height`, `page_count`, `values`, `data_file_length`). `first_leaf`/`last_leaf`
+//! keep their place in the layout but are no longer maintained: leaves are not linked (scans walk
+//! down from the root), because a copy-on-write tree could not keep sibling links current.
 //!
 //! The header is (de)serialized to/from a page-sized byte buffer; the index does the mmap slice IO.
 
@@ -34,7 +36,9 @@ pub(crate) struct BtreeHeader {
     pub(crate) height: u32,
     pub(crate) page_count: u32,
     pub(crate) values: u64,
+    /// Not maintained (see the module docs); kept for the on-disk layout.
     pub(crate) first_leaf: u32,
+    /// Not maintained (see the module docs); kept for the on-disk layout.
     pub(crate) last_leaf: u32,
     pub(crate) data_file_length: u64,
 }

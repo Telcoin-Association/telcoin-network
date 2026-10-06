@@ -64,7 +64,10 @@ use std::{
     io::{self, Read, Seek, SeekFrom, Write},
     os::{fd::AsRawFd, unix::fs::FileExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
+        Arc,
+    },
 };
 
 use memmap2::{Mmap, MmapMut, MmapOptions};
@@ -185,6 +188,77 @@ impl Default for MmapFileOptions {
             reserve: 0,
         }
     }
+}
+
+/// A reader's view of a file's mapping that needs no lock: the mapping's base address and length,
+/// plus a length the owner has published as fully written. Shared (`Arc`) between the file and its
+/// lock-free readers; the file updates the mapping fields whenever its mapping changes, and the
+/// owner advances [`Self::publish_len`].
+///
+/// Validity: a slice from [`Self::slice`] borrows mapped memory. The owner must keep the file open
+/// while any reader can reach the view, and a mapping replaced while the view is shared is retired
+/// (kept mapped until the file drops) rather than unmapped, so a reader that loaded the old base is
+/// still reading live memory. Mapping changes only ever grow the mapping while readers exist (a
+/// reservation overflow); anything that shrinks or unmaps happens with no readers (open-time
+/// recovery, close).
+#[derive(Debug)]
+pub(crate) struct MapView {
+    base: AtomicPtr<u8>,
+    mapped: AtomicU64,
+    published: AtomicU64,
+}
+
+impl MapView {
+    fn new() -> Self {
+        Self {
+            base: AtomicPtr::new(std::ptr::null_mut()),
+            mapped: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+        }
+    }
+
+    /// Point the view at a mapping. The base is stored before the length, and a reader loads the
+    /// length first: one that sees the new length then sees the new base, and one that sees the
+    /// old length reads a prefix of the (only ever larger) new mapping or the retired old one.
+    fn set_mapping(&self, base: *const u8, len: u64) {
+        self.base.store(base.cast_mut(), Ordering::Release);
+        self.mapped.store(len, Ordering::Release);
+    }
+
+    /// Publish `len` bytes as fully written and readable (they must already be in the mapping and
+    /// never change while readers can see them).
+    pub(crate) fn publish_len(&self, len: u64) {
+        self.published.store(len, Ordering::Release);
+    }
+
+    /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
+    pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
+        let end = offset.checked_add(len as u64)?;
+        if end > self.published.load(Ordering::Acquire) || end > self.mapped.load(Ordering::Acquire)
+        {
+            return None;
+        }
+        let base = self.base.load(Ordering::Acquire);
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs: the owner keeps the
+        // file open while readers can reach the view, and replaced mappings stay mapped until the
+        // file drops), and `[offset, end)` lies within it and within the published bytes, which
+        // the owner never modifies while readers can see them.
+        Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
+    }
+}
+
+/// Borrow `[start, start + len)` of a writable mapping mutably through its raw pointer, so only
+/// that range is borrowed: `MmapMut`'s `DerefMut` would assert unique access to the whole mapping
+/// while lock-free readers ([`MapView`]) hold slices of other, published bytes of it.
+fn map_range_mut(map: &mut MmapMut, start: usize, len: usize) -> &mut [u8] {
+    assert!(start.checked_add(len).is_some_and(|end| end <= map.len()), "range outside the map");
+    // SAFETY: the range lies within the live mapping (checked above), and `&mut map` makes this the
+    // only writer. Readers never read bytes being written: a reader sees only published bytes,
+    // which are never written again.
+    unsafe { std::slice::from_raw_parts_mut(map.as_mut_ptr().add(start), len) }
 }
 
 /// The active memory map, or none for a zero-length file.
@@ -335,6 +409,11 @@ pub struct MmapDataFile {
     /// Length of the reserved mapping (see [`MmapFileOptions::reserve`]), or 0 in the classic
     /// mode, where the mapping is exactly the physical file and is replaced on every growth.
     reserved: u64,
+    /// The lock-free reader view of the current mapping (see [`MapView`]).
+    view: Arc<MapView>,
+    /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
+    /// reader still holding an old base stays valid.
+    retired: Vec<Backing>,
     /// Test-only: how many deferred size fsyncs barriers have run.
     #[cfg(test)]
     size_syncs: std::sync::atomic::AtomicUsize,
@@ -469,10 +548,13 @@ impl MmapDataFile {
             write_failed: AtomicBool::new(false),
             size_unsynced: AtomicBool::new(false),
             reserved,
+            view: Arc::new(MapView::new()),
+            retired: Vec::new(),
             #[cfg(test)]
             size_syncs: std::sync::atomic::AtomicUsize::new(0),
             opts,
         };
+        df.sync_view();
         df.advise_backing();
         Ok(df)
     }
@@ -586,7 +668,7 @@ impl MmapDataFile {
         if let Backing::Rw(map) = &mut self.backing {
             let marker = commit_marker(self.end);
             let pos = marker_pos as usize;
-            map[pos..pos + COMMIT_MARKER_LEN as usize].copy_from_slice(&marker);
+            map_range_mut(map, pos, COMMIT_MARKER_LEN as usize).copy_from_slice(&marker);
         }
     }
 
@@ -651,7 +733,7 @@ impl MmapDataFile {
         }
         let start = offset as usize;
         match &mut self.backing {
-            Backing::Rw(map) => Some(&mut map[start..start + len]),
+            Backing::Rw(map) => Some(map_range_mut(map, start, len)),
             Backing::Ro(_map) => None,
             Backing::Empty => None,
         }
@@ -690,13 +772,37 @@ impl MmapDataFile {
         }
     }
 
+    /// Point [`Self::view`] at the current mapping (or at nothing).
+    fn sync_view(&self) {
+        let (base, len) = match &self.backing {
+            Backing::Rw(map) => (map.as_ptr(), map.len() as u64),
+            Backing::Ro(map) => (map.as_ptr(), map.len() as u64),
+            Backing::Empty => (std::ptr::null(), 0),
+        };
+        self.view.set_mapping(base, len);
+    }
+
+    /// Take the current mapping out of `backing`, retiring it (kept mapped until drop) when a
+    /// lock-free reader may still hold its base, else letting it unmap.
+    fn take_backing(&mut self) {
+        let old = std::mem::replace(&mut self.backing, Backing::Empty);
+        if Arc::strong_count(&self.view) > 1 && !matches!(old, Backing::Empty) {
+            self.retired.push(old);
+        }
+    }
+
+    /// The lock-free reader view of this file's mapping (see [`MapView`]).
+    pub(crate) fn view(&self) -> Arc<MapView> {
+        Arc::clone(&self.view)
+    }
+
     /// Drop the current mapping, resize the physical file to `new_len`, and re-map it (leaving it
     /// unmapped when `new_len == 0`). In the classic mode the new mapping is exactly the file; a
     /// reserving handle (here only because a growth outran its reservation) maps a new, larger
     /// reservation instead — the one case in which its mapping moves.
     fn remap(&mut self, new_len: u64) -> io::Result<()> {
-        // release any existing map before resizing
-        self.backing = Backing::Empty;
+        // Release (or retire, if a lock-free reader may hold it) the existing map before resizing.
+        self.take_backing();
         // Keep `capacity` consistent with `backing`: with no live mapping, a `set_len`/`map_mut`
         // failure below must leave `capacity == 0` rather than a stale value that lies about the
         // mapping size. Restored to `new_len` only once the new map is installed.
@@ -725,6 +831,7 @@ impl MmapDataFile {
         };
         self.backing = Backing::Rw(map);
         self.capacity = new_len;
+        self.sync_view();
         self.advise_backing();
         Ok(())
     }
@@ -976,7 +1083,8 @@ impl MmapDataFile {
             // truncate them at clean close, and SIGBUS-ing on a nearly-full disk.
             // Skipping already-zero chunks keeps the "padding reads as zeros" invariant
             // at a fraction of the cost.
-            for chunk in map[new_len as usize..self.end as usize].chunks_mut(64 << 10) {
+            let tail = (self.end - new_len) as usize;
+            for chunk in map_range_mut(map, new_len as usize, tail).chunks_mut(64 << 10) {
                 if chunk.iter().any(|&b| b != 0) {
                     chunk.fill(0);
                 }
@@ -1172,7 +1280,7 @@ impl MmapDataFile {
             // The reserved mapping already covers the file at its new size: keep it in place.
             self.capacity = disk_len;
         } else if disk_len != self.capacity {
-            self.backing = Backing::Empty;
+            self.take_backing();
             if disk_len > 0 {
                 self.backing = if self.read_only {
                     // SAFETY: read-only refresh is only sound while the underlying file is sealed
@@ -1189,6 +1297,7 @@ impl MmapDataFile {
                 };
             }
             self.capacity = disk_len;
+            self.sync_view();
             self.advise_backing();
         }
         self.end = logical_end;
@@ -1319,7 +1428,7 @@ impl Write for MmapDataFile {
         self.ensure_capacity(write_end)?;
         let start_us = start as usize;
         match &mut self.backing {
-            Backing::Rw(map) => map[start_us..start_us + buf.len()].copy_from_slice(buf),
+            Backing::Rw(map) => map_range_mut(map, start_us, buf.len()).copy_from_slice(buf),
             Backing::Ro(_) | Backing::Empty => return Err(io::Error::other("no writable mapping")),
         }
         match self.opts.write_mode {
@@ -1342,6 +1451,7 @@ impl Write for MmapDataFile {
 impl Drop for MmapDataFile {
     fn drop(&mut self) {
         if self.remove_on_drop {
+            self.view.set_mapping(std::ptr::null(), 0);
             self.backing = Backing::Empty; // release the map before removing the file
             if let Err(e) = std::fs::remove_file(&self.path) {
                 if !std::thread::panicking() {
@@ -1389,6 +1499,7 @@ impl Drop for MmapDataFile {
                 false
             }
         };
+        self.view.set_mapping(std::ptr::null(), 0);
         self.backing = Backing::Empty; // unmap before truncating
         if let Err(e) = self.file.set_len(self.end) {
             if !std::thread::panicking() {
@@ -1612,6 +1723,33 @@ mod tests {
         let mut buf = vec![0u8; 20_000];
         df.read_exact(&mut buf).expect("read back");
         assert_eq!(buf, pattern(20_000));
+    }
+
+    /// A [`MapView`] reads only published bytes, follows the mapping when growth outgrows the
+    /// reservation, and a slice borrowed before that move stays readable: the old mapping is
+    /// retired (kept mapped until the file drops), not unmapped, while the view is shared.
+    #[test]
+    fn map_view_survives_reservation_overflow() {
+        let tmp = TempDir::with_prefix("mmap_df_map_view").expect("temp dir");
+        let path = tmp.path().join("data");
+        let opts = MmapFileOptions { reserve: 4096, ..tiny_opts() };
+        let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
+        let view = df.view();
+        df.write_all(&pattern(1_000)).expect("write");
+        assert_eq!(view.slice(0, 100), None, "nothing published yet");
+        view.publish_len(1_000);
+        let old = view.slice(0, 1_000).expect("published slice");
+        assert_eq!(old, &pattern(1_000)[..]);
+        assert_eq!(view.slice(900, 101), None, "past the published length");
+
+        df.write_all(&pattern(40_000)[1_000..]).expect("grow past the reservation");
+        assert!(df.reserved >= 40_000, "re-reserved larger (reserved {})", df.reserved);
+        assert_eq!(df.retired.len(), 1, "the old mapping is retired, not unmapped");
+        assert_eq!(old, &pattern(1_000)[..], "a slice of the old mapping is still readable");
+        view.publish_len(40_000);
+        let new = view.slice(0, 40_000).expect("slice after the move");
+        assert_eq!(new, &pattern(40_000)[..]);
+        assert_ne!(new.as_ptr(), old.as_ptr(), "the view follows the new mapping");
     }
 
     /// An empty file opened with a reservation is mapped at once (no first-write remap) and works

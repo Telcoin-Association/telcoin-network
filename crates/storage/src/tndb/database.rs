@@ -1,6 +1,6 @@
 //! A [`Database`] backed by per-table [`TnTable`]s: each table owns an append-only value log plus a
-//! sorted B+tree index behind its own lock, and the store maps a table name to that table's
-//! `TnTable` handle (a cheap `Clone`).
+//! copy-on-write B+tree index, read lock-free from a published snapshot, and the store maps a table
+//! name to that table's `TnTable` handle (a cheap `Clone`).
 //!
 //! This module is the typed layer, modeled on [`crate::mem_db`]: keys are encoded with `encode_key`
 //! (binary-sortable) and values with `encode` (bcs); each op hands the encoded bytes to the table
@@ -9,9 +9,9 @@
 //! `encode_key(key).len()` — `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is
 //! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
 //!
-//! Scans are lazy: each `DBIter` holds its table's read lock and a B+tree cursor, decoding every
-//! row straight from the index leaf and the log.  Not yet covered: pack compaction on clear,
-//! warm-start reads before the first insert, and durability-barrier tuning.
+//! Scans are lazy: each `DBIter` owns a published snapshot of its table and a B+tree cursor,
+//! decoding every row straight from the index leaf and the log.  Not yet covered: pack compaction
+//! on clear, warm-start reads before the first insert, and durability-barrier tuning.
 
 use std::{
     cell::RefCell,
@@ -84,11 +84,11 @@ fn with_read_key<K: Serialize, R>(
 // lookup writes no shared memory. The snapshot is held for the op, including across a blocking
 // table op; that only occupies one of the thread's `ArcSwap` slots (scans own their table state).
 //
-// NOTE: an iterator (`iter`/`reverse_iter`/`skip_to`) holds its table's read lock until dropped —
-// the same contract as `mem_db`'s iterators. A caller must drop it before writing the *same* table
-// on the same thread, and a same-thread read of that table can block behind another thread's
-// pending write while the iterator is alive. A commit (flush) only shares that read lock, so it
-// does not wait for a live iterator.
+// NOTE: reads (`get`, `contains_key`, iterators, ...) see a table's last published (committed)
+// state and take no lock: an autocommit write publishes when it returns, a write transaction's
+// writes publish at `commit`, and only that transaction's own `get` sees them earlier. An iterator
+// owns the snapshot it started on, so writing (and committing) its table while iterating, from any
+// thread, neither blocks nor changes what the iterator yields.
 
 /// Run `f` on the named table, borrowed from the current snapshot of the table map, or return
 /// `None` if no such table is open.
@@ -99,8 +99,7 @@ fn with_table<R>(store: &StoreType, name: &str, f: impl FnOnce(&TableStore) -> R
 /// Look up a key: read its value bytes from the table, then decode.
 fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     with_table(store, T::NAME, |entry| {
-        // Decode `T::Value` straight from the log's mmap under the read lock (no intermediate
-        // `Vec`).
+        // Decode `T::Value` straight from the log's mmap (no intermediate `Vec`).
         with_read_key(key, |key| entry.table.get_with(key, |bytes| decode::<T::Value>(bytes)))
     })
     .unwrap_or(Ok(None))
@@ -137,7 +136,7 @@ fn clear_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
     with_table(store, T::NAME, |entry| entry.table.clear()).unwrap_or(Ok(()))
 }
 
-/// Durably persist a table's value log.
+/// Durably persist a table's value log, then publish its writes to readers.
 fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
     with_table(store, T::NAME, |entry| entry.table.flush()).unwrap_or(Ok(()))
 }
@@ -153,7 +152,7 @@ fn is_empty<T: Table>(store: &StoreType) -> bool {
     with_table(store, T::NAME, |entry| entry.table.is_empty().unwrap_or(false)).unwrap_or(false)
 }
 
-/// A lazy, key-ordered [`DBIter`] over the table (holding its read lock until dropped).
+/// A lazy, key-ordered [`DBIter`] over the table's published snapshot (holding no lock).
 fn scan<T: Table>(store: &StoreType, kind: ScanKind) -> DBIter<'static, T> {
     match with_table(store, T::NAME, |entry| entry.table.scan(kind)) {
         Some(mut scan) => Box::new(std::iter::from_fn(move || {
@@ -202,13 +201,14 @@ impl DbTx for TnDbTx {
     }
 }
 
-/// Read-write transaction: writes apply immediately to the shared store; durability is deferred to
-/// [`DbTxMut::commit`] (loose transactions, matching [`crate::mem_db`]).
+/// Read-write transaction: writes apply to each table's working state at once and become readable
+/// (and durable) at [`DbTxMut::commit`]; the transaction's own [`DbTx::get`] sees them before
+/// that. Loose, like [`crate::mem_db`]: there is no rollback, and a table has one working state, so
+/// concurrent write transactions on a table see (and a commit publishes) each other's writes.
 #[derive(Clone, Debug)]
 pub struct TnDbTxMut {
     store: Arc<StoreType>,
-    /// The tables this transaction wrote, so `commit` flushes only those (flushing takes a table's
-    /// write lock, which must not wait on an unrelated table's live scan).
+    /// The tables this transaction wrote, so `commit` flushes and publishes only those.
     written: Vec<&'static str>,
 }
 
@@ -221,8 +221,14 @@ impl TnDbTxMut {
 }
 
 impl DbTx for TnDbTxMut {
+    /// Reads the table's working state, so this transaction's own uncommitted writes are visible.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        get::<T>(&self.store, key)
+        with_table(&self.store, T::NAME, |entry| {
+            with_read_key(key, |key| {
+                entry.table.get_working_with(key, |bytes| decode::<T::Value>(bytes))
+            })
+        })
+        .unwrap_or(Ok(None))
     }
 }
 
@@ -243,7 +249,7 @@ impl DbTxMut for TnDbTxMut {
     }
 
     fn commit(self) -> eyre::Result<()> {
-        // Durably flush the log of each table this transaction wrote.
+        // Durably flush the log of each table this transaction wrote, then publish its writes.
         for name in self.written {
             if let Some(result) = with_table(&self.store, name, |entry| entry.table.flush()) {
                 result?;
@@ -499,8 +505,7 @@ mod test {
         const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
     }
 
-    /// Committing a write txn flushes only the tables it wrote: a live scan of another table
-    /// (holding that table's read lock) must not block the commit.
+    /// Committing a write txn while another table is being scanned does not wait for the scan.
     #[test]
     fn test_tndb_commit_ignores_unrelated_scans() {
         use std::{sync::mpsc, time::Duration};
@@ -526,6 +531,55 @@ mod test {
         drop(scan);
         commit.join().expect("commit thread");
         assert_eq!(committed, Ok(true), "the commit must not wait on an unrelated table's scan");
+    }
+
+    /// A write transaction's writes are readable by others only after its commit, while its own
+    /// `get` sees them at once; an autocommit write is readable when it returns.
+    #[test]
+    fn test_tndb_writes_visible_at_commit() {
+        use tn_types::{DbTx as _, DbTxMut as _};
+
+        let (db, _tmp) = open_db();
+        db.insert::<TestTable>(&1, &"one".to_string()).expect("autocommit insert");
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
+
+        let mut txn = db.write_txn().expect("write txn");
+        txn.insert::<TestTable>(&2, &"two".to_string()).expect("txn insert");
+        txn.remove::<TestTable>(&1).expect("txn remove");
+        assert_eq!(txn.get::<TestTable>(&2).expect("txn get"), Some("two".to_string()));
+        assert_eq!(txn.get::<TestTable>(&1).expect("txn get"), None);
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), None, "uncommitted");
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()), "uncommitted");
+        assert!(!db.contains_key::<TestTable>(&2).expect("contains"));
+        let read = db.read_txn().expect("read txn");
+        assert_eq!(read.get::<TestTable>(&2).expect("read txn get"), None);
+
+        txn.commit().expect("commit");
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), None);
+        assert_eq!(read.get::<TestTable>(&2).expect("read txn get"), Some("two".to_string()));
+    }
+
+    /// An iterator takes no lock: the same thread can write (and commit) its table mid-iteration,
+    /// and the iterator keeps yielding the state it started on.
+    #[test]
+    fn test_tndb_write_while_iterating_same_table() {
+        let (db, _tmp) = open_db();
+        for i in 0..10u64 {
+            db.insert::<TestTable>(&i, &i.to_string()).expect("insert");
+        }
+        let mut iter = db.iter::<TestTable>();
+        assert_eq!(iter.next(), Some((0, "0".to_string())));
+        for i in 0..10u64 {
+            db.insert::<TestTable>(&i, &"x".to_string()).expect("overwrite while iterating");
+        }
+        db.remove::<TestTable>(&5).expect("remove while iterating");
+        assert_eq!(
+            iter.collect::<Vec<_>>(),
+            (1..10u64).map(|i| (i, i.to_string())).collect::<Vec<_>>()
+        );
+        assert_eq!(db.get::<TestTable>(&3).expect("get"), Some("x".to_string()));
+        assert_eq!(db.iter::<TestTable>().count(), 9);
     }
 
     #[test]

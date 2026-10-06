@@ -1,27 +1,35 @@
 //! A single tndb table — a [`Pack`] value log plus its sorted [`BtreeIndex`] — as a cheap `Clone`
-//! [`TnTable`] handle.  Every op locks a shared [`Inner`] directly (no thread, no channel).  This
-//! file is byte-oriented (byte-slice keys and values in, borrowed bytes out); the typed
-//! `encode`/`decode` stays in `database.rs`.
+//! [`TnTable`] handle.  This file is byte-oriented (byte-slice keys and values in, borrowed bytes
+//! out); the typed `encode`/`decode` stays in `database.rs`.
 //!
-//! Point reads/writes take the `RwLock<Inner>` — a shared read lock for reads (`&self`:
-//! `get`/`contains`/…), an exclusive write lock for writes (`&mut self`: `insert`/`remove`/…) — so
-//! an uncontended op costs a lock, not a thread round-trip. (An earlier pure-actor version routed
-//! every op through a channel, which was ~2–3× slower for point ops.)
+//! Readers take no lock and write no shared memory. Writers serialize on a writer lock and change a
+//! copy-on-write working tree (a published index page is never modified); [`TnTable::flush`] makes
+//! the log durable and then installs a new [`Published`] snapshot — the index snapshot plus the
+//! published extent of the log — in an `ArcSwap`. A reader loads the current snapshot through a
+//! per-thread slot, looks the key up in its immutable pages and reads the value straight from the
+//! log, which never changes once appended. Both files keep one mapping that does not move (a
+//! reserved range; see [`MmapFileOptions::reserve`]), and a mapping replaced on the rare
+//! reservation overflow stays mapped until the file closes, so a snapshot's pages stay readable.
 //!
-//! A scan ([`TableScan`]) is an owned read guard on the table plus a [`BtreeCursor`] detached from
-//! the index (each step takes the index as an argument), so there is no self-reference to work
-//! around: each step borrows the key from the mapped leaf and the value from the log.  A scan holds
-//! its read lock until it is dropped — the same contract as `mem_db`'s iterators: concurrent reads
-//! on other threads are fine, but a write to the *same* table waits until the scan is dropped, so a
-//! caller must drop (or drain and drop) a scan before writing that table on the same thread.
+//! Writes are visible to readers from the next flush (snapshot isolation). The writer's own
+//! uncommitted writes are read through [`TnTable::get_working_with`].
+//!
+//! A scan ([`TableScan`]) owns a snapshot and a [`BtreeCursor`] over it and holds no lock, so a
+//! table can be written (and published) while it is being scanned, from any thread; the scan keeps
+//! reading the snapshot it started with.
 
 use std::{ops::Bound, path::PathBuf, sync::Arc};
 
-use parking_lot::{ArcRwLockReadGuard, RawRwLock, RwLock};
+use arc_swap::ArcSwap;
+use parking_lot::Mutex;
 
 use crate::archive::{
-    btree_index::{iter::BtreeCursor, BtreeIndex},
-    data_file::MmapFileOptions,
+    btree_index::{
+        index::IndexSnapshot,
+        iter::{BtreeCursor, PageSource},
+        BtreeIndex,
+    },
+    data_file::{MapView, MmapFileOptions},
     error::fetch::FetchError,
     pack::{Pack, PackCompression},
 };
@@ -46,30 +54,30 @@ pub(crate) enum ScanKind {
 }
 
 impl ScanKind {
-    /// A cursor positioned for this scan over `index`.
-    fn cursor(self, index: &BtreeIndex) -> Result<BtreeCursor, FetchError> {
+    /// A cursor positioned for this scan over the tree `src` reads.
+    fn cursor<S: PageSource + ?Sized>(self, src: &S) -> Result<BtreeCursor, FetchError> {
         let (reverse, lower, upper) = match self {
             Self::Forward => (false, Bound::Unbounded, Bound::Unbounded),
             Self::Reverse => (true, Bound::Unbounded, Bound::Unbounded),
             Self::From(key) => (false, Bound::Included(key), Bound::Unbounded),
             Self::RevFrom(key) => (true, Bound::Unbounded, Bound::Excluded(key)),
         };
-        BtreeCursor::new(index, reverse, lower, upper)
+        BtreeCursor::new(src, reverse, lower, upper)
     }
 }
 
-/// Table state — the append-only value log plus its sorted key index (created lazily on the first
-/// insert, once the encoded key length is known).  Shared behind an `RwLock`: reads (`&self`) take
-/// a read lock, writes (`&mut self`) an exclusive write lock.
+/// The writer's state: the value log and the working (copy-on-write) index, changed only under
+/// the writer lock.
 #[derive(Debug)]
-struct Inner {
+struct Writer {
     /// Table directory holding the `data` log and the `btx/` index.
     dir: PathBuf,
     data: Pack<Vec<u8>>,
+    /// Created lazily on the first insert, once the encoded key length is known.
     idx: Option<BtreeIndex>,
 }
 
-impl Inner {
+impl Writer {
     /// The index, created (with key byte length `ksize`) on first use.  On a reopened directory
     /// this reopens the on-disk index, whose header records the same `ksize`.
     fn index_mut(&mut self, ksize: u16) -> eyre::Result<&mut BtreeIndex> {
@@ -88,10 +96,8 @@ impl Inner {
         Ok(())
     }
 
+    /// Read `key` from the working tree (including writes not yet published).
     fn get_with<R>(&self, key: &[u8], decode: impl FnOnce(&[u8]) -> R) -> eyre::Result<Option<R>> {
-        // Resolve the position under the index borrow, then decode the value straight from the
-        // log's mmap (via `record_bytes`) while the caller's read lock is held -- no intermediate
-        // `Vec`.
         let pos = match self.idx.as_ref() {
             Some(idx) => match idx.load(key) {
                 Ok(pos) => pos,
@@ -103,10 +109,6 @@ impl Inner {
         Ok(Some(decode(self.data.record_bytes(pos)?)))
     }
 
-    fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
-        Ok(self.idx.as_ref().is_some_and(|idx| idx.contains(key)))
-    }
-
     fn remove(&mut self, key: &[u8]) -> eyre::Result<bool> {
         match self.idx.as_mut() {
             Some(idx) => Ok(idx.remove(key)?),
@@ -116,34 +118,71 @@ impl Inner {
 
     fn clear(&mut self) -> eyre::Result<()> {
         if let Some(idx) = self.idx.as_mut() {
-            idx.rebuild_from(std::iter::empty::<(Vec<u8>, u64)>())?;
+            idx.clear()?;
         }
         Ok(())
     }
 
     /// Durably persist the value log (the WAL). The index is rebuildable from it and is synced by
-    /// [`BtreeIndex`]'s `Drop` on clean close, matching today's barrier.
+    /// [`BtreeIndex`]'s `Drop` on clean close.
     fn flush(&self) -> eyre::Result<()> {
         self.data.commit()?;
         Ok(())
     }
 
-    fn is_empty(&self) -> bool {
-        self.idx.as_ref().is_none_or(|idx| idx.is_empty())
-    }
-
-    fn len(&self) -> usize {
-        self.idx.as_ref().map_or(0, |idx| idx.len())
+    /// Make every write so far readable: publish the index (its new pages become immutable) and
+    /// the log's current extent.
+    fn publish(&mut self, data_view: &Arc<MapView>) -> Published {
+        let index = self.idx.as_mut().map(BtreeIndex::publish);
+        data_view.publish_len(self.data.file_len());
+        Published { index, data_view: Arc::clone(data_view) }
     }
 }
 
-/// A cheap `Clone` handle to a table.  Ops lock the shared [`Inner`] directly (a read lock for
-/// reads and scans, a write lock for writes).  The table closes cleanly when the last handle — or
-/// the last live [`TableScan`], whose guard shares `inner` — is dropped.
+/// What readers see: the last published index snapshot and a view of the log (published up to
+/// the log's extent at that publish). Immutable; replaced as a whole by each publish.
+#[derive(Debug)]
+struct Published {
+    index: Option<IndexSnapshot>,
+    data_view: Arc<MapView>,
+}
+
+impl Published {
+    fn get_with<R>(&self, key: &[u8], decode: impl FnOnce(&[u8]) -> R) -> eyre::Result<Option<R>> {
+        let Some(index) = &self.index else { return Ok(None) };
+        let pos = match index.load(key) {
+            Ok(pos) => pos,
+            Err(FetchError::NotFound) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Some(decode(Pack::<Vec<u8>>::record_bytes_in(&self.data_view, pos)?)))
+    }
+
+    fn contains(&self, key: &[u8]) -> bool {
+        self.index.as_ref().is_some_and(|index| index.load(key).is_ok())
+    }
+
+    fn len(&self) -> usize {
+        self.index.as_ref().map_or(0, IndexSnapshot::len)
+    }
+}
+
+/// A table's state: the writer side and the published snapshot readers load. Field order makes
+/// the writer (and so the files) drop before the snapshot that points into their mappings.
+#[derive(Debug)]
+struct Inner {
+    writer: Mutex<Writer>,
+    published: ArcSwap<Published>,
+    data_view: Arc<MapView>,
+}
+
+/// A cheap `Clone` handle to a table.  Reads take no lock (they load the published snapshot);
+/// writes take the writer lock and become readable at the next [`Self::flush`].  The table closes
+/// cleanly when the last handle — or the last live [`TableScan`], which holds the table — is
+/// dropped.
 #[derive(Clone, Debug)]
 pub(crate) struct TnTable {
-    /// The table state, locked per operation.
-    inner: Arc<RwLock<Inner>>,
+    inner: Arc<Inner>,
 }
 
 impl TnTable {
@@ -152,7 +191,7 @@ impl TnTable {
     pub(crate) fn open(dir: PathBuf) -> eyre::Result<Self> {
         std::fs::create_dir_all(&dir)?;
         // The value log keeps one reserved mapping for its whole open life (it never moves on
-        // growth), as the B-tree index does — groundwork for reads that take no table lock.
+        // growth), as the B-tree index does, so lock-free readers can read it.
         let opts = MmapFileOptions { reserve: TNDB_MAP_RESERVE, ..Default::default() };
         let data = Pack::<Vec<u8>>::open_with(
             dir.join("data"),
@@ -162,98 +201,124 @@ impl TnTable {
             PACK_VERSION,
             opts,
         )?;
-        Ok(Self { inner: Arc::new(RwLock::new(Inner { dir, data, idx: None })) })
+        let data_view = data.view();
+        let mut writer = Writer { dir, data, idx: None };
+        let published = writer.publish(&data_view);
+        Ok(Self {
+            inner: Arc::new(Inner {
+                writer: Mutex::new(writer),
+                published: ArcSwap::from_pointee(published),
+                data_view,
+            }),
+        })
     }
 
-    /// Insert (or overwrite) `key → value`.
+    /// Insert (or overwrite) `key → value`; readable from the next flush.
     pub(crate) fn insert(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
-        self.inner.write().insert(key, value)
+        self.inner.writer.lock().insert(key, value)
     }
 
-    /// Read the value for `key` and map its bytes with `decode`, or `None` if absent. `decode` runs
-    /// while the read lock is held, so it can borrow the value straight from the log's mmap (via
-    /// [`Pack::record_bytes`]) without an intermediate `Vec`.
+    /// Remove `key`; returns whether it was present. Readable from the next flush.
+    pub(crate) fn remove(&self, key: &[u8]) -> eyre::Result<bool> {
+        self.inner.writer.lock().remove(key)
+    }
+
+    /// Reset the table to empty (a fresh index tree; log bytes orphaned until compaction). Readable
+    /// from the next flush.
+    pub(crate) fn clear(&self) -> eyre::Result<()> {
+        self.inner.writer.lock().clear()
+    }
+
+    /// Durably persist the value log, then publish every write so far: install a new snapshot for
+    /// readers. Readers are never blocked by it (they take no lock); writers wait for it.
+    pub(crate) fn flush(&self) -> eyre::Result<()> {
+        let mut writer = self.inner.writer.lock();
+        writer.flush()?;
+        // Stored under the writer lock, so snapshots are installed in publish order.
+        self.inner.published.store(Arc::new(writer.publish(&self.inner.data_view)));
+        Ok(())
+    }
+
+    /// Read the published value for `key` and map its bytes with `decode`, or `None` if absent. No
+    /// lock: `decode` borrows the value straight from the log's mapping.
     pub(crate) fn get_with<R>(
         &self,
         key: &[u8],
         decode: impl FnOnce(&[u8]) -> R,
     ) -> eyre::Result<Option<R>> {
-        self.inner.read().get_with(key, decode)
+        self.inner.published.load().get_with(key, decode)
     }
 
-    /// True if `key` is present.
+    /// Read `key` from the working tree, including writes not yet flushed (a write transaction's
+    /// own reads). Takes the writer lock.
+    pub(crate) fn get_working_with<R>(
+        &self,
+        key: &[u8],
+        decode: impl FnOnce(&[u8]) -> R,
+    ) -> eyre::Result<Option<R>> {
+        self.inner.writer.lock().get_with(key, decode)
+    }
+
+    /// True if `key` is present in the published snapshot.
     pub(crate) fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
-        self.inner.read().contains(key)
+        Ok(self.inner.published.load().contains(key))
     }
 
-    /// Remove `key`; returns whether it was present.
-    pub(crate) fn remove(&self, key: &[u8]) -> eyre::Result<bool> {
-        self.inner.write().remove(key)
-    }
-
-    /// Reset the table to empty (index rebuilt empty; log bytes orphaned until compaction).
-    pub(crate) fn clear(&self) -> eyre::Result<()> {
-        self.inner.write().clear()
-    }
-
-    /// Durably persist the value log. Takes the table's read lock: readers (and live scans) keep
-    /// going during the sync; writers wait for it.
-    pub(crate) fn flush(&self) -> eyre::Result<()> {
-        // A commit is a pure barrier over bytes already appended (appends hold the write lock, so
-        // they finished before this read lock was granted), so it shares the lock with readers
-        // instead of stalling them for the whole sync; writers still wait.
-        self.inner.read().flush()
-    }
-
-    /// True if the table has no entries.
+    /// True if the published snapshot has no entries.
     pub(crate) fn is_empty(&self) -> eyre::Result<bool> {
-        Ok(self.inner.read().is_empty())
+        Ok(self.inner.published.load().len() == 0)
     }
 
-    /// Number of entries. (Part of the table API; not currently used by `TnDatabase`.)
+    /// Number of entries in the published snapshot. (Part of the table API; not currently used by
+    /// `TnDatabase`.)
     #[allow(dead_code)]
     pub(crate) fn len(&self) -> eyre::Result<usize> {
-        Ok(self.inner.read().len())
+        Ok(self.inner.published.load().len())
     }
 
-    /// A lazy, key-ordered scan over `(key_bytes, value_bytes)`.  It holds the table's read lock
-    /// until dropped (see the module docs); a table with no index yet scans empty.
+    /// A lazy, key-ordered scan over `(key_bytes, value_bytes)` of the published snapshot. Takes no
+    /// lock (see the module docs); a table with no index yet scans empty.
     pub(crate) fn scan(&self, kind: ScanKind) -> TableScan {
-        let guard = self.inner.read_arc();
-        let cursor = guard.idx.as_ref().and_then(|idx| kind.cursor(idx).ok());
-        TableScan { guard, cursor }
+        let published = self.inner.published.load_full();
+        let cursor = published.index.as_ref().and_then(|index| kind.cursor(index).ok());
+        TableScan { published, cursor, _table: Arc::clone(&self.inner) }
     }
 
     /// Map the single `(key_bytes, value_bytes)` a scan of `kind` lands on first with `f`, or
-    /// `None` if it lands on nothing — a direct seek under a short read lock.
+    /// `None` if it lands on nothing — a direct seek in the published snapshot.
     pub(crate) fn first_with<R>(
         &self,
         kind: ScanKind,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Option<R> {
-        let inner = self.inner.read();
-        let idx = inner.idx.as_ref()?;
-        let (key, pos) = kind.cursor(idx).ok()?.next(idx)?.ok()?;
-        Some(f(key, inner.data.record_bytes(pos).ok()?))
+        let published = self.inner.published.load();
+        let index = published.index.as_ref()?;
+        let (key, pos) = kind.cursor(index).ok()?.next(index)?.ok()?;
+        Some(f(key, Pack::<Vec<u8>>::record_bytes_in(&published.data_view, pos).ok()?))
     }
 }
 
-/// A lazy, key-ordered scan of a table (see [`TnTable::scan`]): an owned read guard plus a cursor,
-/// stepped with [`Self::next_with`].  Holds the table's read lock until dropped.
+/// A lazy, key-ordered scan of a published snapshot (see [`TnTable::scan`]), stepped with
+/// [`Self::next_with`]. Holds no lock; it keeps the table (and so the mappings the snapshot reads)
+/// open until dropped.
 pub(crate) struct TableScan {
-    guard: ArcRwLockReadGuard<RawRwLock, Inner>,
+    published: Arc<Published>,
     /// `None` once the scan is exhausted or failed (or the table had no index).
     cursor: Option<BtreeCursor>,
+    /// Keeps the table's files open, so the snapshot's mappings stay valid. Declared last so it
+    /// drops after the snapshot.
+    _table: Arc<Inner>,
 }
 
 impl TableScan {
-    /// Map the next `(key_bytes, value_bytes)` with `f` — the key borrowed from the index leaf, the
+    /// Map the next `(key_bytes, value_bytes)` with `f` — the key borrowed from the index page, the
     /// value from the log — or `None` when the scan is done.  A fetch failure ends the scan.
     pub(crate) fn next_with<R>(&mut self, f: impl FnOnce(&[u8], &[u8]) -> R) -> Option<R> {
-        let Inner { data, idx, .. } = &*self.guard;
-        let row = self.cursor.as_mut()?.next(idx.as_ref()?).and_then(|item| {
+        let Published { index, data_view } = &*self.published;
+        let index = index.as_ref()?;
+        let row = self.cursor.as_mut()?.next(index).and_then(|item| {
             let (key, pos) = item.ok()?;
-            Some((key, data.record_bytes(pos).ok()?))
+            Some((key, Pack::<Vec<u8>>::record_bytes_in(data_view, pos).ok()?))
         });
         match row {
             Some((key, value)) => Some(f(key, value)),
@@ -295,6 +360,7 @@ mod test {
             let (k, v) = kv(i);
             table.insert(&k, &v).expect("insert");
         }
+        table.flush().expect("flush");
         assert!(!table.is_empty().expect("is_empty"));
         assert_eq!(table.len().expect("len"), 100);
 
@@ -325,7 +391,36 @@ mod test {
         // Remove + clear.
         assert!(table.remove(&kv(0).0).expect("remove"));
         assert!(!table.remove(&kv(0).0).expect("remove again"));
+        table.flush().expect("flush");
         assert_eq!(table.len().expect("len after remove"), 99);
+        table.clear().expect("clear");
+        table.flush().expect("flush");
+        assert!(table.is_empty().expect("is_empty after clear"));
+        assert_eq!(keys_of(table.scan(ScanKind::Forward)), Vec::<u64>::new());
+    }
+
+    /// Writes are invisible to readers until a flush publishes them, but visible to the writer's
+    /// own working reads at once.
+    #[test]
+    fn test_tntable_writes_visible_at_flush() {
+        let tmp = TempDir::with_prefix("tntable_visibility").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t")).expect("open");
+        let (k1, v1) = kv(1);
+        table.insert(&k1, &v1).expect("insert");
+        assert_eq!(table.get_with(&k1, |b| b.to_vec()).expect("get"), None, "not yet published");
+        assert!(!table.contains(&k1).expect("contains"));
+        assert_eq!(table.get_working_with(&k1, |b| b.to_vec()).expect("working"), Some(v1.clone()));
+        table.flush().expect("flush");
+        assert_eq!(table.get_with(&k1, |b| b.to_vec()).expect("get"), Some(v1.clone()));
+
+        // An unpublished overwrite and remove leave the published value in place.
+        table.insert(&k1, b"new").expect("overwrite");
+        assert_eq!(table.get_with(&k1, |b| b.to_vec()).expect("get"), Some(v1.clone()));
+        assert!(table.remove(&k1).expect("remove"));
+        assert_eq!(table.get_with(&k1, |b| b.to_vec()).expect("get"), Some(v1));
+        assert_eq!(table.get_working_with(&k1, |b| b.to_vec()).expect("working"), None);
+        table.flush().expect("flush");
+        assert_eq!(table.get_with(&k1, |b| b.to_vec()).expect("get"), None);
     }
 
     #[test]
@@ -347,6 +442,7 @@ mod test {
         let table = TnTable::open(dir).expect("reopen");
         let (k100, v100) = kv(100);
         table.insert(&k100, &v100).expect("insert after reopen");
+        table.flush().expect("flush");
         assert_eq!(table.get_with(&k100, |b| b.to_vec()).expect("get new"), Some(v100));
         assert_eq!(
             table.get_with(&kv(20).0, |b| b.to_vec()).expect("get old"),
@@ -360,25 +456,112 @@ mod test {
         );
     }
 
-    /// Dropping a scan releases the table's read lock, so the same thread can write the table
-    /// afterwards (a scan held across the write would block it, as with `mem_db`).
+    /// A scan holds no lock: the same thread can write and flush the table mid-scan, and the scan
+    /// keeps yielding the snapshot it started on (overwrites, removes and inserts made after it
+    /// started are not seen) while a new scan sees the new state.
     #[test]
-    fn test_tntable_dropped_scan_releases_the_table() {
-        let tmp = TempDir::with_prefix("tntable_scan_drop").expect("temp dir");
+    fn test_tntable_write_during_scan_keeps_the_snapshot() {
+        let tmp = TempDir::with_prefix("tntable_scan_write").expect("temp dir");
         let table = TnTable::open(tmp.path().join("t")).expect("open");
         for i in 0..3_000u64 {
             let (k, v) = kv(i);
             table.insert(&k, &v).expect("insert");
         }
+        table.flush().expect("flush");
         let mut scan = table.scan(ScanKind::Forward);
         assert_eq!(scan.next_with(|k, v| (key_u64(k), v.to_vec())), Some((0, kv(0).1)));
-        drop(scan); // an unconsumed scan, far more rows left than the old channel held
-        let (k, v) = kv(9_999);
-        table.insert(&k, &v).expect("write after the scan is dropped");
-        assert_eq!(table.len().expect("len"), 3_001);
+
+        for i in 0..3_000u64 {
+            table.insert(&kv(i).0, b"changed").expect("overwrite during the scan");
+        }
+        for i in 0..1_000u64 {
+            assert!(table.remove(&kv(i).0).expect("remove during the scan"));
+        }
+        table.insert(&kv(9_999).0, &kv(9_999).1).expect("insert during the scan");
+        table.flush().expect("flush during the scan");
+
+        let rest: Vec<_> =
+            std::iter::from_fn(|| scan.next_with(|k, v| (key_u64(k), v.to_vec()))).collect();
+        assert_eq!(rest, (1..3_000u64).map(|i| (i, kv(i).1)).collect::<Vec<_>>());
+        assert_eq!(table.len().expect("len"), 2_001);
+        assert_eq!(
+            table.get_with(&kv(2_000).0, |b| b.to_vec()).expect("get"),
+            Some(b"changed".to_vec())
+        );
     }
 
-    /// A live scan keeps the table open (its guard shares the state) even after the last handle
+    /// Readers on several threads against a writer that keeps overwriting and committing: every
+    /// read sees a complete committed value (all its keys from one commit generation or later,
+    /// never a torn or uncommitted value), across index and log growth.
+    #[test]
+    fn test_tntable_readers_against_committing_writer() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        const KEYS: u64 = 500;
+        let value = |i: u64, generation: u64| -> Vec<u8> {
+            let mut v = vec![(i ^ generation) as u8; 1_024];
+            v[..8].copy_from_slice(&generation.to_le_bytes());
+            v[8..16].copy_from_slice(&i.to_le_bytes());
+            v
+        };
+        let tmp = TempDir::with_prefix("tntable_concurrent").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t")).expect("open");
+        for i in 0..KEYS {
+            table.insert(&kv(i).0, &value(i, 0)).expect("insert");
+        }
+        table.flush().expect("flush");
+        let committed = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let readers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let (table, committed, stop) = (table.clone(), committed.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut x = t + 1;
+                    let mut reads = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let floor = committed.load(Ordering::Acquire);
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let i = (x >> 33) % KEYS;
+                        let v = table.get_with(&kv(i).0, |b| b.to_vec()).expect("get");
+                        let v = v.expect("every key is always present");
+                        let generation = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
+                        assert!(generation >= floor, "read generation {generation} < {floor}");
+                        assert_eq!(v, value(i, generation), "a torn or foreign value");
+                        if reads.is_multiple_of(64) {
+                            // A whole scan sees one generation per key and every key.
+                            let mut scan = table.scan(ScanKind::Forward);
+                            let mut n = 0;
+                            while let Some(ok) = scan.next_with(|k, v| {
+                                let g = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
+                                v == value(key_u64(k), g).as_slice()
+                            }) {
+                                assert!(ok, "a torn value in a scan");
+                                n += 1;
+                            }
+                            assert_eq!(n, KEYS);
+                        }
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        for generation in 1..=40u64 {
+            for i in 0..KEYS {
+                table.insert(&kv(i).0, &value(i, generation)).expect("overwrite");
+            }
+            table.flush().expect("commit");
+            committed.store(generation, Ordering::Release);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            assert!(reader.join().expect("reader") > 0);
+        }
+    }
+
+    /// A live scan keeps the table open (it shares the table's state) even after the last handle
     /// is dropped; the table then closes cleanly when the scan ends.
     #[test]
     fn test_tntable_scan_outlives_its_handle() {
@@ -389,11 +572,13 @@ mod test {
             let (k, v) = kv(i);
             table.insert(&k, &v).expect("insert");
         }
+        table.flush().expect("flush");
         let scan = table.scan(ScanKind::Reverse);
         drop(table);
         assert_eq!(keys_of(scan), (0..10).rev().collect::<Vec<_>>());
         let table = TnTable::open(dir).expect("reopen after the scan closed the table");
         table.insert(&kv(10).0, &kv(10).1).expect("insert after reopen"); // reopens the index
+        table.flush().expect("flush");
         assert_eq!(table.len().expect("len"), 11);
     }
 
@@ -408,6 +593,7 @@ mod test {
             let (k, v) = kv(i);
             table.insert(&k, &v).expect("insert");
         }
+        table.flush().expect("flush");
         let first = |kind| table.first_with(kind, |k, v| (key_u64(k), v.to_vec()));
         assert_eq!(first(ScanKind::Reverse), Some((198, kv(198).1)));
         assert_eq!(first(ScanKind::RevFrom(kv(50).0)), Some((48, kv(48).1)), "strictly below");
@@ -417,9 +603,7 @@ mod test {
         assert_eq!(first(ScanKind::Forward), Some((0, kv(0).1)));
     }
 
-    /// A flush is a barrier over already-appended bytes and takes only the read lock, so it
-    /// completes while a scan of the same table is alive (a write-locked flush would wait for the
-    /// scan, stalling every reader for the whole sync).
+    /// A scan takes no lock, so a flush of the same table completes while the scan is alive.
     #[test]
     fn test_tntable_flush_does_not_wait_for_readers() {
         use std::{sync::mpsc, time::Duration};
@@ -430,6 +614,7 @@ mod test {
             let (k, v) = kv(i);
             table.insert(&k, &v).expect("insert");
         }
+        table.flush().expect("flush");
         let mut scan = table.scan(ScanKind::Forward);
         assert!(scan.next_with(|_, _| ()).is_some());
 

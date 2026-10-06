@@ -4,9 +4,10 @@
 //!
 //! Keys are fixed `ksize`-byte byte strings (the key length is chosen at creation and stored in
 //! the header) compared lexicographically; values are `u64` byte
-//! offsets into a pack file.  The tree is a B+tree with doubly-linked leaves, stored in fixed
-//! 4 KiB pages (each protected by a trailing CRC32) in a single `index.btx` file.  See
-//! [`index::BtreeIndex`].
+//! offsets into a pack file.  The tree is a copy-on-write B+tree (a published page is never
+//! modified, so published snapshots are read with no lock), stored in fixed 4 KiB pages (each
+//! protected by a trailing CRC32) in a single `index.btx` file.  Leaves are not linked; scans walk
+//! down from the root.  See [`index::BtreeIndex`].
 
 pub(crate) mod header;
 pub(crate) mod page;

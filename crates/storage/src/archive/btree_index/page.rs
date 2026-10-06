@@ -31,7 +31,8 @@ pub(crate) const PAGE_TYPE_LEAF: u8 = 2;
 const TAG: usize = 4;
 /// Trailing CRC32 size.
 const CRC: usize = 4;
-/// Leaf sibling links: `prev(4) + next(4)`.
+/// Leaf sibling links: `prev(4) + next(4)`. No longer maintained (written as [`NULL_PAGE`]; the
+/// tree is copy-on-write); the bytes keep their place in the layout.
 const LINKS: usize = 8;
 /// On-disk value size (a `u64` file offset).
 const VALUE_SIZE: usize = 8;
@@ -128,23 +129,13 @@ impl Node {
 
     // ---- leaf accessors ----
 
-    /// Initialize `buf` as an empty leaf with the given sibling links.
+    /// Initialize `buf` as an empty leaf with the given (unused, see [`LINKS`]) sibling links.
     pub(crate) fn init_leaf(&self, buf: &mut [u8], prev: u32, next: u32) {
         buf.fill(0);
         buf[0] = PAGE_TYPE_LEAF;
         self.set_entry_count(buf, 0);
         write_u32(buf, LEAF_PREV_OFF, prev);
         write_u32(buf, LEAF_NEXT_OFF, next);
-    }
-
-    /// Previous-leaf page pointer (or [`NULL_PAGE`]).
-    pub(crate) fn leaf_prev(&self, buf: &[u8]) -> u32 {
-        read_u32(buf, LEAF_PREV_OFF)
-    }
-
-    /// Next-leaf page pointer (or [`NULL_PAGE`]).
-    pub(crate) fn leaf_next(&self, buf: &[u8]) -> u32 {
-        read_u32(buf, LEAF_NEXT_OFF)
     }
 
     /// Set the previous-leaf page pointer.
@@ -285,7 +276,7 @@ impl Node {
         read_u32(buf, INTERNAL_CHILDREN_OFF + i * 4)
     }
 
-    fn set_internal_child(&self, buf: &mut [u8], i: usize, v: u32) {
+    pub(crate) fn set_internal_child(&self, buf: &mut [u8], i: usize, v: u32) {
         write_u32(buf, INTERNAL_CHILDREN_OFF + i * 4, v);
     }
 

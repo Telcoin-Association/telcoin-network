@@ -16,7 +16,7 @@ use crate::archive::{
 
 use super::{
     crc::add_crc32,
-    data_file::{DataFileReader, MmapDataFile, MmapFileOptions},
+    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions},
 };
 use std::{
     fmt::Debug,
@@ -114,6 +114,19 @@ where
     /// straight from the map. Valid for an uncompressed pack (`PackCompression::None`).
     pub fn record_bytes(&self, pos: u64) -> Result<&[u8], FetchError> {
         self.inner.record_bytes(pos)
+    }
+
+    /// The lock-free reader view of the data file's mapping (see [`MapView`]). The owner publishes
+    /// how much of the log readers may see ([`MapView::publish_len`]).
+    pub(crate) fn view(&self) -> std::sync::Arc<MapView> {
+        self.inner.data_file.view()
+    }
+
+    /// [`Self::record_bytes`] through a lock-free [`MapView`]: CRC-check the record at `pos` within
+    /// the view's published bytes and borrow its payload. Log records never change once appended,
+    /// so a published record is safe to read with no lock.
+    pub(crate) fn record_bytes_in(view: &MapView, pos: u64) -> Result<&[u8], FetchError> {
+        checked_payload_in(|o, l| view.slice(o, l), pos)
     }
 
     /// Read the record size (with crc32) at position.
@@ -617,25 +630,7 @@ where
         position: u64,
         crc32_hasher: &mut crc32fast::Hasher,
     ) -> Result<(usize, &'a [u8]), FetchError> {
-        if let Some(bytes) = self.data_file.slice(position, 4) {
-            let mut val_size_buf = [0_u8; 4];
-            val_size_buf.copy_from_slice(&bytes[0..4]);
-            crc32_hasher.update(&val_size_buf);
-            let val_size = u32::from_le_bytes(val_size_buf);
-            if val_size > MAX_RECORD_SIZE {
-                return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
-            }
-            if let Some(bytes) = self.data_file.slice(position + 4, val_size as usize + 4) {
-                Ok((val_size as usize, bytes))
-            } else {
-                Err(FetchError::IO(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Unable to read the full record and CRC",
-                )))
-            }
-        } else {
-            Err(FetchError::IO(io::Error::other("Unable to get mmap slice.")))
-        }
+        record_size_bytes_in(|o, l| self.data_file.slice(o, l), position, crc32_hasher)
     }
 
     /// Read the record at position.
@@ -649,18 +644,7 @@ where
     /// stored value bytes (before any decompression), borrowed straight from the mmap. Shared
     /// by [`Self::read_record_into`] and [`Self::record_bytes`].
     fn checked_payload(&self, position: u64) -> Result<&[u8], FetchError> {
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
-        crc32_hasher.update(&bytes[0..val_size]);
-        let calc_crc32 = crc32_hasher.finalize();
-        let mut buf_u32 = [0_u8; 4];
-        buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
-        let read_crc32 = u32::from_le_bytes(buf_u32);
-        if calc_crc32 != read_crc32 {
-            return Err(FetchError::CrcFailed);
-        }
-        // The value bytes only — `bytes` is `[value | crc]`, so drop the trailing 4-byte CRC.
-        Ok(&bytes[0..val_size])
+        checked_payload_in(|o, l| self.data_file.slice(o, l), position)
     }
 
     /// Decode the record at `position`, decompressing first if the pack is compressed. The value
@@ -734,6 +718,53 @@ where
         let (dat_file, end) = self.data_file.try_clone()?;
         PackIter::open(dat_file, self.uid_idx, end)
     }
+}
+
+/// Read the record size prefix at `position` (feeding it to `crc32_hasher`) and borrow the
+/// `[payload | crc]` bytes that follow, reading through `slice`: the data file's own mapping, or a
+/// lock-free [`MapView`].
+fn record_size_bytes_in<'a>(
+    slice: impl Fn(u64, usize) -> Option<&'a [u8]>,
+    position: u64,
+    crc32_hasher: &mut crc32fast::Hasher,
+) -> Result<(usize, &'a [u8]), FetchError> {
+    let Some(prefix) = slice(position, 4) else {
+        return Err(FetchError::IO(io::Error::other("Unable to get mmap slice.")));
+    };
+    let mut val_size_buf = [0_u8; 4];
+    val_size_buf.copy_from_slice(&prefix[0..4]);
+    crc32_hasher.update(&val_size_buf);
+    let val_size = u32::from_le_bytes(val_size_buf);
+    if val_size > MAX_RECORD_SIZE {
+        return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+    }
+    match slice(position + 4, val_size as usize + 4) {
+        Some(bytes) => Ok((val_size as usize, bytes)),
+        None => Err(FetchError::IO(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "Unable to read the full record and CRC",
+        ))),
+    }
+}
+
+/// CRC-check the record at `position`, reading through `slice`, and return its payload (the raw
+/// stored value bytes, before any decompression) borrowed in place.
+fn checked_payload_in<'a>(
+    slice: impl Fn(u64, usize) -> Option<&'a [u8]>,
+    position: u64,
+) -> Result<&'a [u8], FetchError> {
+    let mut crc32_hasher = crc32fast::Hasher::new();
+    let (val_size, bytes) = record_size_bytes_in(slice, position, &mut crc32_hasher)?;
+    crc32_hasher.update(&bytes[0..val_size]);
+    let calc_crc32 = crc32_hasher.finalize();
+    let mut buf_u32 = [0_u8; 4];
+    buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
+    let read_crc32 = u32::from_le_bytes(buf_u32);
+    if calc_crc32 != read_crc32 {
+        return Err(FetchError::CrcFailed);
+    }
+    // The value bytes only — `bytes` is `[value | crc]`, so drop the trailing 4-byte CRC.
+    Ok(&bytes[0..val_size])
 }
 
 /// What one append writes: a value to encode through the pack's codec, or bytes the caller has

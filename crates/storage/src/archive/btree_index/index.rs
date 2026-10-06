@@ -29,6 +29,7 @@
 use std::{
     fs, io,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
 use tn_types::B256;
@@ -36,10 +37,11 @@ use tn_types::B256;
 use crate::archive::{
     btree_index::{
         header::{BtreeHeader, VALUE_SIZE},
+        iter::{PageSource, MAX_DEPTH},
         page::{Node, NULL_PAGE, PAGE_SIZE},
     },
     crc::{add_crc32_nonzero, crc_is_zero, crc_state, zero_crc, CrcState},
-    data_file::{fsync_directory, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
+    data_file::{fsync_directory, MapView, MmapAccess, MmapDataFile, MmapFileOptions, WriteMode},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -54,10 +56,6 @@ use crate::archive::{
 /// tens of GiB: on macOS the per-commit `msync` cost measurably grew with a 64 GiB reservation
 /// (tndb one-write-plus-sync +5–8%), and was flat at 1 GiB.
 pub(crate) const BTX_MAP_RESERVE: u64 = 1 << 30;
-
-/// Hard cap on tree height while descending, a corruption tripwire (real heights are tiny: at a
-/// branching factor of dozens, even 2^48 keys stay well under this).
-const MAX_DEPTH: usize = 48;
 
 /// Map a read failure encountered on the write path into an append error.
 fn fetch_to_append(e: FetchError) -> AppendError {
@@ -138,13 +136,105 @@ pub struct BtreeIndex {
     /// Set by [`Self::set_remove_on_drop`]: the file is deleted on drop, so `Drop` skips the sync
     /// it would otherwise run.
     remove_on_drop: bool,
-    /// Pages this handle has written (or allocated) since the last sync. Their all-zero CRC
-    /// trailer is the lazy-write marker; a zero trailer on any OTHER page is at-rest damage (a
-    /// clean close CRC-stamps every written page, and an unclean index is rebuilt rather than
-    /// trusted). Empty on open, so a read-only handle trusts no zero-trailer page; cleared by each
-    /// sync, which stamps exactly this set.
-    unsynced_pages: PageSet,
+    /// Pages this handle created (allocated or copied) since the last publish: the only pages it
+    /// modifies in place (copy-on-write — a published page is never modified). Their all-zero CRC
+    /// trailer is the lazy-write marker; a zero trailer on any OTHER page is at-rest damage (every
+    /// published page is CRC-stamped, and an unclean index is rebuilt rather than trusted). Empty
+    /// on open, so a read-only handle trusts no zero-trailer page; drained by each publish,
+    /// which stamps exactly this set.
+    private: PageSet,
+    /// Published pages replaced by a copy (copy-on-write) since open. Kept for reclamation once no
+    /// reader can still see them; not reused yet, so the file grows with each replaced page.
+    superseded: Vec<u32>,
+    /// The lock-free reader view of the index file's mapping, shared with published snapshots.
+    view: Arc<MapView>,
     _index_dir: PathBuf,
+}
+
+/// A published, immutable view of a B-tree: its root and page count at a [`BtreeIndex::publish`],
+/// read through a [`MapView`] with no lock and no shared write. Published pages are never modified
+/// (copy-on-write) and are always CRC-stamped, so a reader needs no coordination with the writer.
+/// The index's owner must keep it open while a snapshot is in use (see [`MapView`]).
+#[derive(Debug, Clone)]
+pub(crate) struct IndexSnapshot {
+    view: Arc<MapView>,
+    node: Node,
+    root: u32,
+    page_count: u32,
+    values: u64,
+}
+
+impl IndexSnapshot {
+    /// Number of keys in the snapshot.
+    pub(crate) fn len(&self) -> usize {
+        self.values as usize
+    }
+
+    /// The file position stored for `key`, or [`FetchError::NotFound`].
+    pub(crate) fn load(&self, key: &[u8]) -> Result<u64, FetchError> {
+        lookup(self, key)
+    }
+}
+
+impl PageSource for IndexSnapshot {
+    fn node(&self) -> Node {
+        self.node
+    }
+
+    fn root(&self) -> u32 {
+        self.root
+    }
+
+    fn page(&self, p: u32) -> Result<&[u8], FetchError> {
+        if p == 0 || p >= self.page_count {
+            return Err(FetchError::CorruptIndex(format!(
+                "page {p} is outside the published tree (page_count {})",
+                self.page_count
+            )));
+        }
+        let buf = self
+            .view
+            .slice(BtreeIndex::page_offset(p), PAGE_SIZE)
+            .ok_or_else(|| FetchError::CorruptIndex(format!("page {p} is not published")))?;
+        if crc_is_zero(buf) {
+            return Err(FetchError::CorruptIndex(format!(
+                "published page {p} has an all-zero CRC (at-rest corruption)"
+            )));
+        }
+        Ok(buf)
+    }
+}
+
+/// Point lookup of `key` in the tree `src` reads.
+fn lookup<S: PageSource + ?Sized>(src: &S, key: &[u8]) -> Result<u64, FetchError> {
+    let node = src.node();
+    let mut pno = src.root();
+    for _ in 0..MAX_DEPTH {
+        let buf = src.page(pno)?;
+        if node.is_leaf(buf) {
+            return match node.leaf_search(buf, key) {
+                Ok(i) => Ok(node.leaf_value(buf, i)),
+                Err(_) => Err(FetchError::NotFound),
+            };
+        }
+        let ci = node.internal_child_index(buf, key);
+        pno = node.internal_child(buf, ci);
+    }
+    Err(FetchError::CorruptIndex("btree descent exceeded max depth".to_string()))
+}
+
+impl PageSource for BtreeIndex {
+    fn node(&self) -> Node {
+        self.node
+    }
+
+    fn root(&self) -> u32 {
+        self.header.root_page
+    }
+
+    fn page(&self, p: u32) -> Result<&[u8], FetchError> {
+        BtreeIndex::page(self, p)
+    }
 }
 
 impl BtreeIndex {
@@ -188,7 +278,8 @@ impl BtreeIndex {
         };
         let mut file = MmapDataFile::open_with(dir.join("index.btx"), read_only, opts)?;
 
-        let header = if file.is_empty() {
+        let fresh = file.is_empty();
+        let header = if fresh {
             if read_only {
                 return Err(LoadHeaderError::ReadOnlyEmpty);
             }
@@ -238,8 +329,6 @@ impl BtreeIndex {
             let in_tree = |p: u32| p >= 1 && p < header.page_count;
             if header.page_count < 2
                 || !in_tree(header.root_page)
-                || !in_tree(header.first_leaf)
-                || !in_tree(header.last_leaf)
                 || header.height == 0
                 || header.height as usize > MAX_DEPTH
             {
@@ -276,6 +365,15 @@ impl BtreeIndex {
             header
         };
 
+        // The tree as opened is the published state readers may see.
+        let view = file.view();
+        view.publish_len(header.page_count as u64 * PAGE_SIZE as u64);
+        // A brand-new tree has never been published, so its root leaf is still private: the first
+        // writes change it in place instead of copying it.
+        let mut private = PageSet::default();
+        if fresh {
+            private.insert(header.root_page);
+        }
         Ok(Self {
             header,
             file,
@@ -283,7 +381,9 @@ impl BtreeIndex {
             read_only,
             synced: true,
             remove_on_drop: false,
-            unsynced_pages: PageSet::default(),
+            private,
+            superseded: Vec::new(),
+            view,
             _index_dir: dir.to_owned(),
         })
     }
@@ -390,8 +490,9 @@ impl BtreeIndex {
         self.header.height = 1;
         self.header.page_count = 2;
         self.header.values = 0;
-        self.header.first_leaf = 1;
-        self.header.last_leaf = 1;
+        // Open-time recovery only (nothing published to readers yet): readers see nothing until
+        // the rebuilt tree is published.
+        self.view.publish_len(0);
         self.file.truncate(0)?; // unmap + truncate to nothing
         self.file.ensure_len(2 * PAGE_SIZE as u64)?; // grow back to header + root leaf (zero-filled)
         let page = self.header.to_page();
@@ -407,7 +508,11 @@ impl BtreeIndex {
             self.node.init_leaf(leaf, NULL_PAGE, NULL_PAGE);
             add_crc32_nonzero(leaf);
         }
-        self.unsynced_pages.clear();
+        // The reset tree is unpublished: its root leaf stays private, so the rebuild's first writes
+        // change it in place instead of copying it.
+        self.private.clear();
+        self.private.insert(self.header.root_page);
+        self.superseded.clear();
         self.file.sync_all()?;
         self.synced = true;
         Ok(())
@@ -434,7 +539,7 @@ impl BtreeIndex {
         let buf = self.file.slice(Self::page_offset(p), PAGE_SIZE).ok_or_else(|| {
             FetchError::CorruptIndex(format!("page {p} is beyond the mapped index"))
         })?;
-        if crc_is_zero(buf) && !self.unsynced_pages.contains(p) {
+        if crc_is_zero(buf) && !self.private.contains(p) {
             return Err(FetchError::CorruptIndex(format!(
                 "page {p} has an all-zero CRC this handle did not write (at-rest corruption, not a \
                  live unsynced write)"
@@ -448,7 +553,7 @@ impl BtreeIndex {
     /// CRC-stamps as valid) a page that is damaged at rest.
     fn page_mut(&mut self, p: u32) -> Result<&mut [u8], FetchError> {
         self.page(p)?;
-        self.unsynced_pages.insert(p);
+        self.private.insert(p);
         self.file
             .slice_mut(Self::page_offset(p), PAGE_SIZE)
             .ok_or_else(|| FetchError::CorruptIndex(format!("page {p} is beyond the mapped index")))
@@ -463,89 +568,70 @@ impl BtreeIndex {
         let p = self.header.page_count;
         self.file.ensure_len((p as u64 + 1) * PAGE_SIZE as u64)?;
         self.header.page_count += 1;
-        self.unsynced_pages.insert(p);
+        self.private.insert(p);
         Ok(p)
     }
 
-    // ---- helpers for the leaf-chain iterators (see `super::iter`) ----
+    // ---- copy-on-write ----
 
-    /// The leftmost leaf page (start of an ascending scan).
-    pub(super) fn first_leaf(&self) -> u32 {
-        self.header.first_leaf
-    }
-
-    /// The rightmost leaf page (start of a descending scan).
-    pub(super) fn last_leaf(&self) -> u32 {
-        self.header.last_leaf
-    }
-
-    /// The page geometry (a small `Copy` value) for the iterators to decode leaves with.
-    pub(super) fn node(&self) -> Node {
-        self.node
-    }
-
-    /// Borrow leaf page `p` for a scan step (via [`Self::page`], so its corruption checks apply).
-    /// The slice is valid while the index is not modified, which the scan's holder guarantees.
-    pub(super) fn leaf_page(&self, p: u32) -> Result<&[u8], FetchError> {
-        self.page(p)
-    }
-
-    /// Descend to the leaf page that would contain `key`.
-    pub(super) fn find_leaf(&self, key: &[u8]) -> Result<u32, FetchError> {
-        let node = self.node;
-        let mut pno = self.header.root_page;
-        for _ in 0..MAX_DEPTH {
-            let buf = self.page(pno)?;
-            if node.is_leaf(buf) {
-                return Ok(pno);
-            }
-            let ci = node.internal_child_index(buf, key);
-            pno = node.internal_child(buf, ci);
+    /// The writable copy of page `p`: `p` itself if this handle created it since the last publish
+    /// (no reader can see it), otherwise a fresh copy — a published page is never modified, so a
+    /// snapshot reading it is unaffected. The replaced page is kept for reclamation (not reused
+    /// yet).
+    fn make_writable(&mut self, p: u32) -> Result<u32, AppendError> {
+        if self.private.contains(p) {
+            return Ok(p);
         }
-        Err(FetchError::CorruptIndex("btree descent exceeded max depth".to_string()))
+        let mut copy = [0_u8; PAGE_SIZE];
+        copy.copy_from_slice(self.page(p).map_err(fetch_to_append)?);
+        let q = self.allocate_page()?;
+        let dst = self.page_mut(q).map_err(fetch_to_append)?;
+        dst.copy_from_slice(&copy);
+        zero_crc(dst);
+        self.superseded.push(p);
+        Ok(q)
+    }
+
+    /// Make the root-to-leaf path for `key` writable, top-down: a copied child is re-pointed in its
+    /// (already writable) parent and a copied root becomes the working root. Returns the leaf and
+    /// the internal `(page, child_index)` path, every page on it private.
+    fn writable_path(&mut self, key: &[u8]) -> Result<(u32, Vec<(u32, usize)>), AppendError> {
+        let node = self.node;
+        let root = self.make_writable(self.header.root_page)?;
+        self.header.root_page = root;
+        let mut path = Vec::new();
+        let mut pno = root;
+        for _ in 0..MAX_DEPTH {
+            let (ci, child) = {
+                let buf = self.page(pno).map_err(fetch_to_append)?;
+                if node.is_leaf(buf) {
+                    return Ok((pno, path));
+                }
+                let ci = node.internal_child_index(buf, key);
+                (ci, node.internal_child(buf, ci))
+            };
+            let writable = self.make_writable(child)?;
+            if writable != child {
+                let buf = self.page_mut(pno).map_err(fetch_to_append)?;
+                node.set_internal_child(buf, ci, writable);
+                zero_crc(buf);
+            }
+            path.push((pno, ci));
+            pno = writable;
+        }
+        Err(AppendError::CorruptIndex("btree descent exceeded max depth".to_string()))
     }
 
     // ---- lookup ----
 
     fn get_value(&self, key: &[u8]) -> Result<u64, FetchError> {
-        let node = self.node;
-        let mut pno = self.header.root_page;
-        for _ in 0..MAX_DEPTH {
-            let buf = self.page(pno)?;
-            if node.is_leaf(buf) {
-                return match node.leaf_search(buf, key) {
-                    Ok(i) => Ok(node.leaf_value(buf, i)),
-                    Err(_) => Err(FetchError::NotFound),
-                };
-            }
-            let ci = node.internal_child_index(buf, key);
-            pno = node.internal_child(buf, ci);
-        }
-        Err(FetchError::CorruptIndex("btree descent exceeded max depth".to_string()))
+        lookup(self, key)
     }
 
-    // ---- insertion (all in place on the mapping) ----
+    // ---- insertion (copy-on-write: private pages change in place) ----
 
     fn insert_kv(&mut self, key: &[u8], val: u64) -> Result<(), AppendError> {
-        let node = self.node;
-        // Descend to the target leaf, recording the (page, child_index) path for split propagation.
-        let mut path: Vec<(u32, usize)> = Vec::new();
-        let mut pno = self.header.root_page;
-        let mut leaf_no = None;
-        for _ in 0..MAX_DEPTH {
-            let buf = self.page(pno).map_err(fetch_to_append)?;
-            if node.is_leaf(buf) {
-                leaf_no = Some(pno);
-                break;
-            }
-            let ci = node.internal_child_index(buf, key);
-            let child = node.internal_child(buf, ci);
-            path.push((pno, ci));
-            pno = child;
-        }
-        let leaf_no = leaf_no.ok_or_else(|| {
-            AppendError::CorruptIndex("btree descent exceeded max depth".to_string())
-        })?;
+        let (leaf_no, path) = self.writable_path(key)?;
         self.insert_into_leaf(leaf_no, path, key, val)
     }
 
@@ -599,36 +685,26 @@ impl BtreeIndex {
         val: u64,
     ) -> Result<(), AppendError> {
         let node = self.node;
-        // Read the old successor before mutating, then allocate the right sibling (may remap).
-        let old_next = {
-            let l = self.page(leaf_no).map_err(fetch_to_append)?;
-            node.leaf_next(l)
-        };
+        // Allocate the right sibling first (may grow the file), then split.
         let right_no = self.allocate_page()?;
 
-        // Split the left leaf in place; build the right leaf in a scratch buffer.
+        // Split the left leaf in place; build the right leaf in a scratch buffer. Leaves are not
+        // linked (copy-on-write could not keep sibling links current), so both links stay null.
         let mut rbuf = vec![0_u8; PAGE_SIZE];
         let sep = {
             let left = self.page_mut(leaf_no).map_err(fetch_to_append)?;
             let sep = node.leaf_split(left, &mut rbuf, at, key, val);
-            node.set_leaf_next(left, right_no);
+            node.set_leaf_prev(left, NULL_PAGE);
+            node.set_leaf_next(left, NULL_PAGE);
             zero_crc(left);
             sep
         };
-        node.set_leaf_prev(&mut rbuf, leaf_no);
-        node.set_leaf_next(&mut rbuf, old_next);
+        node.set_leaf_prev(&mut rbuf, NULL_PAGE);
+        node.set_leaf_next(&mut rbuf, NULL_PAGE);
         zero_crc(&mut rbuf);
         {
             let r = self.page_mut(right_no).map_err(fetch_to_append)?;
             r.copy_from_slice(&rbuf);
-        }
-        // Relink the old successor's back-pointer, or record the new rightmost leaf.
-        if old_next != NULL_PAGE {
-            let nb = self.page_mut(old_next).map_err(fetch_to_append)?;
-            node.set_leaf_prev(nb, right_no);
-            zero_crc(nb);
-        } else {
-            self.header.last_leaf = right_no;
         }
         self.synced = false;
         self.insert_into_parent(path, sep, right_no)
@@ -695,27 +771,23 @@ impl BtreeIndex {
     // ---- removal ----
 
     fn remove_kv(&mut self, key: &[u8]) -> Result<bool, AppendError> {
-        let node = self.node;
-        let mut pno = self.header.root_page;
-        for _ in 0..MAX_DEPTH {
-            let buf = self.page(pno).map_err(fetch_to_append)?;
-            if node.is_leaf(buf) {
-                match node.leaf_search(buf, key) {
-                    Err(_) => return Ok(false),
-                    Ok(i) => {
-                        let buf = self.page_mut(pno).map_err(fetch_to_append)?;
-                        node.leaf_delete(buf, i);
-                        zero_crc(buf);
-                        self.header.values -= 1;
-                        self.synced = false;
-                        return Ok(true);
-                    }
-                }
-            }
-            let ci = node.internal_child_index(buf, key);
-            pno = node.internal_child(buf, ci);
+        // Check first so a miss copies nothing (copy-on-write would otherwise replace the path).
+        match lookup(self, key) {
+            Err(FetchError::NotFound) => return Ok(false),
+            Err(e) => return Err(fetch_to_append(e)),
+            Ok(_) => {}
         }
-        Err(AppendError::CorruptIndex("btree descent exceeded max depth".to_string()))
+        let node = self.node;
+        let (leaf_no, _) = self.writable_path(key)?;
+        let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
+        let Ok(i) = node.leaf_search(buf, key) else {
+            return Err(AppendError::CorruptIndex("key vanished from its leaf".to_string()));
+        };
+        node.leaf_delete(buf, i);
+        zero_crc(buf);
+        self.header.values -= 1;
+        self.synced = false;
+        Ok(true)
     }
 
     /// Remove `key` from the index. Returns `true` if the key was present and removed, `false` if
@@ -781,7 +853,7 @@ impl BtreeIndex {
     /// zeroed at rest as valid — that page stays dirty, so lookups and [`Self::page_crc_scan`]
     /// still flag it. Page 0 (the header) is written separately.
     fn crc_dirty_pages(&mut self) {
-        for p in self.unsynced_pages.drain() {
+        for p in self.private.drain() {
             if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
                 if crc_is_zero(buf) {
                     // `crc_state` classifies pages, so stamp never-zero: a genuine CRC of 0 must
@@ -790,6 +862,46 @@ impl BtreeIndex {
                 }
             }
         }
+    }
+
+    /// Make every page this handle created since the last publish immutable and visible: stamp
+    /// their CRCs (they are never modified again; later writes copy them) and extend the readers'
+    /// view over them.
+    fn publish_pages(&mut self) {
+        self.crc_dirty_pages();
+        self.view.publish_len(self.header.page_count as u64 * PAGE_SIZE as u64);
+    }
+
+    /// Publish the working tree: every write since the last publish becomes visible to readers of
+    /// the returned snapshot (and of later ones). Durability is separate ([`Self::sync`]).
+    pub(crate) fn publish(&mut self) -> IndexSnapshot {
+        self.publish_pages();
+        IndexSnapshot {
+            view: Arc::clone(&self.view),
+            node: self.node,
+            root: self.header.root_page,
+            page_count: self.header.page_count,
+            values: self.header.values,
+        }
+    }
+
+    /// Reset to an empty tree without touching published pages: a fresh empty root leaf becomes the
+    /// working root (published snapshots keep reading the old tree). The old tree's pages are not
+    /// reclaimed yet.
+    pub fn clear(&mut self) -> Result<(), AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        let node = self.node;
+        let leaf = self.allocate_page()?;
+        let buf = self.page_mut(leaf).map_err(fetch_to_append)?;
+        node.init_leaf(buf, NULL_PAGE, NULL_PAGE);
+        zero_crc(buf);
+        self.header.root_page = leaf;
+        self.header.height = 1;
+        self.header.values = 0;
+        self.synced = false;
+        Ok(())
     }
 
     /// Write the in-memory header into page 0 (with a valid CRC — the commit marker).
@@ -806,9 +918,9 @@ impl BtreeIndex {
         if self.read_only {
             return Err(CommitError::ReadOnly);
         }
-        // CRC + msync all data pages BEFORE rewriting/msyncing the header, so the header (root
-        // pointer, page_count, first/last leaf) never becomes durable ahead of the pages it names.
-        self.crc_dirty_pages();
+        // Publish (CRC-stamp) and msync all data pages BEFORE rewriting/msyncing the header, so the
+        // header (root pointer, page_count) never becomes durable ahead of the pages it names.
+        self.publish_pages();
         self.file.sync_all().map_err(CommitError::IndexFileSync)?;
         self.write_header().map_err(CommitError::IndexFileSync)?;
         self.file.sync_range(0, PAGE_SIZE as u64).map_err(CommitError::IndexFileSync)?;
@@ -1158,7 +1270,6 @@ mod tests {
             for i in 0..2_000 {
                 idx.save(&key_of(i), i).expect("save");
             }
-            assert_eq!(idx.header.first_leaf, 1, "the first leaf stays page 1 across splits");
             assert_ne!(idx.header.root_page, 1, "page 1 must not be the root here");
         }
         write_at(&dir.join("index.btx"), PAGE_SIZE as u64, &[0_u8; PAGE_SIZE]);
@@ -1262,10 +1373,9 @@ mod tests {
             BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("header")
         };
         type Mutation = (&'static str, fn(&mut BtreeHeader));
-        let mutations: [Mutation; 5] = [
+        let mutations: [Mutation; 4] = [
             ("root past the tree", |h| h.root_page = h.page_count + 5),
             ("root is the header page", |h| h.root_page = 0),
-            ("first leaf past the tree", |h| h.first_leaf = h.page_count),
             ("zero height", |h| h.height = 0),
             ("height over the descent cap", |h| h.height = MAX_DEPTH as u32 + 1),
         ];
@@ -1333,6 +1443,130 @@ mod tests {
         let reader: BtreeIndex =
             BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("open ro");
         assert_eq!(reader.data_file_length(), 12_345, "the synced length is visible");
+    }
+
+    /// Every entry of the tree `src` reads, in scan order, through a fresh cursor.
+    fn scan_src<S: PageSource>(
+        src: &S,
+        reverse: bool,
+        lower: std::ops::Bound<Vec<u8>>,
+        upper: std::ops::Bound<Vec<u8>>,
+    ) -> Vec<(Vec<u8>, u64)> {
+        let mut cursor =
+            crate::archive::btree_index::iter::BtreeCursor::new(src, reverse, lower, upper)
+                .expect("cursor");
+        let mut out = Vec::new();
+        while let Some(item) = cursor.next(src) {
+            let (k, v) = item.expect("scan step");
+            out.push((k.to_vec(), v));
+        }
+        out
+    }
+
+    /// Copy-on-write against a `BTreeMap` model: random inserts, overwrites and removes with
+    /// publishes (and periodic syncs) in between; the working tree and every snapshot agree with
+    /// the model on lookups and on forward, reverse and range scans.
+    #[test]
+    fn test_archive_btx_cow_matches_model() {
+        use std::{collections::BTreeMap, ops::Bound};
+
+        let tmp = TempDir::with_prefix("test_archive_btx_model").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(tmp.path().join("idx"), &data_header, 32, false)
+                .expect("open");
+        let mut model: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let all = |m: &BTreeMap<[u8; 32], u64>| -> Vec<(Vec<u8>, u64)> {
+            m.iter().map(|(k, v)| (k.to_vec(), *v)).collect()
+        };
+        for round in 0..30 {
+            for _ in 0..400 {
+                let k = key_of(rand() % 3_000);
+                if rand() % 4 == 0 {
+                    let had = model.remove(&k).is_some();
+                    assert_eq!(idx.remove(&k).expect("remove"), had);
+                } else {
+                    let v = rand();
+                    model.insert(k, v);
+                    idx.save(&k, v).expect("save");
+                }
+            }
+            let snap = idx.publish();
+            if round % 7 == 0 {
+                idx.sync().expect("sync");
+            }
+            let expect = all(&model);
+            assert_eq!(scan_src(&idx, false, Bound::Unbounded, Bound::Unbounded), expect);
+            assert_eq!(scan_src(&snap, false, Bound::Unbounded, Bound::Unbounded), expect);
+            let mut rev = expect.clone();
+            rev.reverse();
+            assert_eq!(scan_src(&snap, true, Bound::Unbounded, Bound::Unbounded), rev);
+            assert_eq!(snap.len(), model.len());
+            let (a, b) = (key_of(rand() % 3_000), key_of(rand() % 3_000));
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            let fwd: Vec<_> = model.range(lo..hi).map(|(k, v)| (k.to_vec(), *v)).collect();
+            assert_eq!(
+                scan_src(&snap, false, Bound::Included(lo.to_vec()), Bound::Excluded(hi.to_vec())),
+                fwd
+            );
+            let back: Vec<_> = model.range(..=hi).rev().map(|(k, v)| (k.to_vec(), *v)).collect();
+            assert_eq!(scan_src(&snap, true, Bound::Unbounded, Bound::Included(hi.to_vec())), back);
+            for (k, v) in model.iter().take(64) {
+                assert_eq!(snap.load(k).expect("load"), *v);
+            }
+        }
+    }
+
+    /// A published snapshot never changes: later overwrites, removes, inserts, a clear and new
+    /// publishes copy pages instead of modifying them, so the old snapshot's pages are
+    /// byte-identical and it still reads its original contents.
+    #[test]
+    fn test_archive_btx_published_snapshot_is_immutable() {
+        use std::ops::Bound;
+
+        let tmp = TempDir::with_prefix("test_archive_btx_snapshot").expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(tmp.path().join("idx"), &data_header, 32, false)
+                .expect("open");
+        for i in 0..3_000 {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        let snap = idx.publish();
+        let pages: Vec<Vec<u8>> =
+            (1..snap.page_count).map(|p| snap.page(p).expect("page").to_vec()).collect();
+        let expect = scan_src(&snap, false, Bound::Unbounded, Bound::Unbounded);
+
+        for i in 0..3_000 {
+            idx.save(&key_of(i), i + 1_000_000).expect("overwrite");
+        }
+        for i in 0..1_000 {
+            assert!(idx.remove(&key_of(i)).expect("remove"));
+        }
+        for i in 3_000..6_000 {
+            idx.save(&key_of(i), i).expect("insert");
+        }
+        let snap2 = idx.publish();
+        idx.clear().expect("clear");
+        let snap3 = idx.publish();
+
+        for (i, p) in (1..snap.page_count).enumerate() {
+            assert_eq!(snap.page(p).expect("page"), &pages[i][..], "published page {p} changed");
+        }
+        assert_eq!(scan_src(&snap, false, Bound::Unbounded, Bound::Unbounded), expect);
+        assert_eq!(snap.load(&key_of(0)).expect("old snapshot"), 0);
+        assert!(matches!(snap2.load(&key_of(0)), Err(FetchError::NotFound)));
+        assert_eq!(snap2.load(&key_of(2_000)).expect("new snapshot"), 2_000 + 1_000_000);
+        assert_eq!(snap2.len(), 5_000);
+        assert_eq!(snap3.len(), 0);
+        assert!(matches!(snap3.load(&key_of(4_000)), Err(FetchError::NotFound)));
     }
 
     #[test]
