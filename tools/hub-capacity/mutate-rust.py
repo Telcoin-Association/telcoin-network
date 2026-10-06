@@ -18,6 +18,9 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 CASES = [
+    ("required_connection_reservation", "patches/libp2p-connection-limits/src/lib.rs",
+     "current.saturating_add(missing_after)", "current.saturating_add(missing_after).min(current)",
+     "required_identities_recover_without_increasing_the_total_cap"),
     ("filtered_expired_identity_delivery", "patches/libp2p-kad/src/behaviour.rs",
      "if !record.is_expired(now) || matches!(self.record_filtering, StoreInserts::FilterBoth) {",
      "if !record.is_expired(now) {",
@@ -163,9 +166,6 @@ CASES = [
     ("cache_retry_immutable_contents", "crates/consensus/worker/src/worker.rs",
      "is_none_or(|cached| cached == batch)", "is_none_or(|_| true)",
      "local_cache_same_digest_retry_preserves_accepted_bytes"),
-    ("required_connection_reservation", "patches/libp2p-connection-limits/src/lib.rs",
-     "current.saturating_add(missing_after)", "current",
-     "required_identities_recover_without_increasing_the_total_cap"),
 ]
 
 
