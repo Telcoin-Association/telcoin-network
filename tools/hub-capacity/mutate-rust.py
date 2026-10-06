@@ -194,14 +194,18 @@ def mutation_commands(relative, regression):
         raise ValueError("mutation source must have an owning Cargo package")
     excluded = tomllib.loads((repository / "Cargo.toml").read_text()).get("workspace", {}).get("exclude", [])
     standalone = manifests[0].parent.relative_to(repository).as_posix() in excluded
-    selection = ["--manifest-path", str(manifests[0])] if standalone else ["-p", package]
+    selection = (["--manifest-path", manifests[0].relative_to(repository).as_posix()]
+                 if standalone else ["-p", package])
     compile_argv = ["cargo", "+1.94", "test", "--locked", *selection, "--no-run"]
     test_argv = ["cargo", "+1.94", "nextest", "run", "--locked", *selection,
                  "-E", f"test({regression})", "--no-tests", "fail", "--test-threads", "1"]
+    target = []
     if source.parent == manifests[0].parent / "examples":
         target = ["--example", source.stem]
-        compile_argv += target
-        test_argv += target
+    elif standalone and source.is_relative_to(manifests[0].parent / "src"):
+        target = ["--lib"]
+    compile_argv += target
+    test_argv += target
     return package, compile_argv, test_argv
 
 

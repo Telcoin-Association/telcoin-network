@@ -23,6 +23,15 @@ class MutationTests(unittest.TestCase):
         (source.parent.parent / "Cargo.toml").write_text('[package]\nname = "source-owner"\nversion = "0.1.0"\n')
         return source
 
+    def standalone_fixture(self, root, relative):
+        (root / "Cargo.toml").write_text('[workspace]\nexclude = ["patches/kad"]\n')
+        package = root / "patches/kad"
+        source = package / relative
+        source.parent.mkdir(parents=True)
+        source.write_text("original expression\n")
+        (package / "Cargo.toml").write_text('[package]\nname = "libp2p-kad"\nversion = "0.49.0"\n')
+        return source
+
     def test_nested_source_selects_its_package_for_both_commands(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -30,11 +39,9 @@ class MutationTests(unittest.TestCase):
             with patch.object(MUTATIONS, "ROOT", root):
                 owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
                 self.assertEqual(owner, "source-owner")
-                self.assertEqual(compilation[compilation.index("-p") + 1], owner)
-                self.assertEqual(regression[regression.index("-p") + 1], owner)
-                self.assertIn("--no-run", compilation)
-                self.assertEqual(regression[regression.index("-E") + 1], "test(must_reject)")
-                self.assertEqual(regression[regression.index("--no-tests") + 1], "fail")
+                self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "-p", owner, "--no-run"])
+                self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "-p", owner,
+                                              "-E", "test(must_reject)", "--no-tests", "fail", "--test-threads", "1"])
                 with self.assertRaisesRegex(ValueError, "repository"):
                     MUTATIONS.mutation_commands("../outside.rs", "must_reject")
 
@@ -54,20 +61,43 @@ class MutationTests(unittest.TestCase):
             self.assertIn("--no-run", compilation)
             self.assertEqual(regression[regression.index("--no-tests") + 1], "fail")
 
-    def test_excluded_dependency_patch_selects_its_own_package(self):
+    def test_excluded_dependency_library_selects_only_the_library(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            (root / "Cargo.toml").write_text('[workspace]\nexclude = ["patches/kad"]\n')
-            source = root / "patches/kad/src/behaviour.rs"
-            source.parent.mkdir(parents=True)
-            source.write_text("original expression\n")
-            (source.parent.parent / "Cargo.toml").write_text('[package]\nname = "libp2p-kad"\nversion = "0.49.0"\n')
+            source = self.standalone_fixture(root, "src/behaviour.rs")
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(owner, "libp2p-kad")
+            self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "--manifest-path",
+                                          "patches/kad/Cargo.toml", "--no-run", "--lib"])
+            self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "--manifest-path",
+                                         "patches/kad/Cargo.toml", "-E", "test(must_reject)",
+                                         "--no-tests", "fail", "--test-threads", "1", "--lib"])
+
+    def test_excluded_dependency_example_selects_the_example_without_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.standalone_fixture(root, "examples/probe.rs")
+            with patch.object(MUTATIONS, "ROOT", root):
+                owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
+            self.assertEqual(owner, "libp2p-kad")
+            self.assertEqual(compilation, ["cargo", "+1.94", "test", "--locked", "--manifest-path",
+                                          "patches/kad/Cargo.toml", "--no-run", "--example", "probe"])
+            self.assertEqual(regression, ["cargo", "+1.94", "nextest", "run", "--locked", "--manifest-path",
+                                         "patches/kad/Cargo.toml", "-E", "test(must_reject)",
+                                         "--no-tests", "fail", "--test-threads", "1", "--example", "probe"])
+
+    def test_excluded_dependency_integration_source_does_not_select_library(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source = self.standalone_fixture(root, "tests/probe.rs")
             with patch.object(MUTATIONS, "ROOT", root):
                 owner, compilation, regression = MUTATIONS.mutation_commands(str(source.relative_to(root)), "must_reject")
             self.assertEqual(owner, "libp2p-kad")
             for command in (compilation, regression):
-                self.assertEqual(command[command.index("--manifest-path") + 1], str((source.parent.parent / "Cargo.toml").resolve()))
+                self.assertEqual(command[command.index("--manifest-path") + 1], "patches/kad/Cargo.toml")
                 self.assertIn("--locked", command)
+                self.assertNotIn("--lib", command)
                 self.assertNotIn("--example", command)
                 self.assertNotIn("-p", command)
             self.assertEqual(regression[regression.index("--no-tests") + 1], "fail")
