@@ -19,7 +19,7 @@ use tn_storage::{
 };
 use tn_types::{
     error::BlockSealError, BatchReceiver, BatchSender, BatchValidation, BlsPublicKey, Database,
-    SealedBatch, TaskManager, TxnForwarder, WorkerId,
+    SealedBatch, ShutdownNotifier, TaskManager, TxnForwarder, WorkerId,
 };
 use tracing::{error, info, instrument, warn};
 
@@ -119,6 +119,7 @@ fn new_worker_internal<DB: Database>(
         forwarder,
         committee_slots,
     )
+    .with_consensus_shutdown(consensus_config.shutdown().clone())
 }
 
 /// Process batch from EL into sealed batches for CL.
@@ -150,6 +151,11 @@ pub struct Worker<DB, QW> {
     committee_slots: Vec<BlsPublicKey>,
     /// Prometheus metrics for this worker.
     metrics: WorkerMetrics,
+    /// This epoch's consensus shutdown signal, the same notifier the primary's proposer exits on.
+    ///
+    /// Once it fires, a batch sealed by quorum could never be reported, so the seal is refused
+    /// before any peer is asked to vote. `None` disables the check.
+    consensus_shutdown: Option<ShutdownNotifier>,
 }
 
 // Need to implement clone directly because of the rx_batches field.
@@ -169,6 +175,7 @@ impl<DB: Clone, QW: Clone> Clone for Worker<DB, QW> {
             forwarder: self.forwarder.clone(),
             committee_slots: self.committee_slots.clone(),
             metrics: self.metrics.clone(),
+            consensus_shutdown: self.consensus_shutdown.clone(),
         }
     }
 }
@@ -205,7 +212,18 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             forwarder,
             committee_slots,
             metrics: WorkerMetrics::new_for_worker(id),
+            consensus_shutdown: None,
         }
+    }
+
+    /// Refuse quorum seals once `shutdown` is notified.
+    ///
+    /// Pass this epoch's consensus shutdown notifier. After it fires the proposer is exiting and
+    /// stops taking batch reports, so a quorum seal would make peers validate and store a batch
+    /// whose report fails. Forwarding by a worker outside the committee is not affected.
+    pub fn with_consensus_shutdown(mut self, shutdown: ShutdownNotifier) -> Self {
+        self.consensus_shutdown = Some(shutdown);
+        self
     }
 
     /// Spawn a little task to accept batches from a channel and seal them that way.
@@ -227,6 +245,15 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
     /// Return worker's ID.
     pub fn id(&self) -> WorkerId {
         self.id
+    }
+
+    /// True if this worker seals batches by collecting a committee quorum.
+    ///
+    /// A quorum-sealed batch must then be reported to this node's proposer, so the batch builder
+    /// feeding this worker is only useful while that proposer runs. A worker without a quorum
+    /// waiter forwards its transactions to committee validators instead.
+    pub fn seals_via_quorum(&self) -> bool {
+        self.quorum_waiter.is_some()
     }
 
     /// Return the network handle for this worker.
@@ -312,6 +339,12 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             return self.disburse_txns(sealed_batch).await;
         };
 
+        // the proposer exits on this signal, so a batch sealed now could never be reported;
+        // refuse before asking peers to validate and store it
+        if self.consensus_shutdown.as_ref().is_some_and(ShutdownNotifier::is_notified) {
+            return Err(BlockSealError::ConsensusShuttingDown);
+        }
+
         let batch_attest_handle = quorum_waiter.verify_batch(
             sealed_batch.clone(),
             self.timeout,
@@ -332,7 +365,8 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                 match res {
                     Ok(()) => {
                         // batch reached quorum!
-                        // Metric: batch_sealed - tracks successfully sealed batches
+                        // logged for every seal that reaches quorum; the batch metrics wait for
+                        // the report below, so a seal whose store or report fails is not counted
                         info!(
                             target: "consensus::metrics",
                             worker_id = self.id,
@@ -340,7 +374,6 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
                             num_txs = batch.transactions.len(),
                             "batch sealed"
                         );
-                        self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
                         // Publish the digest for the nodes subscribed to this gossip, i.e. the
                         // committee validators that consume individual current-epoch batches.
                         // Note, ignore error- this should not
@@ -396,6 +429,10 @@ impl<DB: Database, QW: QuorumWaiterTrait> Worker<DB, QW> {
             error!(target: "worker::batch_provider", "Failed to report our batch: {err:?}");
             Err(BlockSealError::FailedToReport)
         } else {
+            // recorded only after a successful report: a failed report leaves the transactions
+            // in the pool for the builder to seal again, and an earlier record would count them
+            // once per attempt (issue #1444)
+            self.metrics.record_batch_sealed(batch.size(), batch.transactions.len());
             Ok(())
         }
     }

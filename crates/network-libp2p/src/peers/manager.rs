@@ -55,8 +55,9 @@ const MAX_RATE_WINDOWS: usize = 1024;
 /// node (`libp2p-kad::jobs::PutRecordJob::poll`), one iterative query per record, each
 /// fanning out to the `replication_factor` (20) closest peers. The count one target sees
 /// from one source per tick is therefore
-///
-///     N * min(1, replication_factor / R)
+/// ```text
+///  N * min(1, replication_factor / R)
+/// ```
 ///
 /// where `N` is the source's stored-record count (~one row per node seen, capped by
 /// `MemoryStoreConfig::max_records` = 1024) and `R` is the peer set the source's lookup
