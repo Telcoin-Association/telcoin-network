@@ -1128,41 +1128,32 @@ where
                 }
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling or the per-peer established ceiling); count it, and log only the configured
-            // limit and the fixed limit description, never peer-supplied data
+            // ceiling or the per-peer established ceiling); count each refusal and warn only
+            // when repeated denials fill the rolling window, without peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
                 peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
-                    |exceeded| {
-                        // the pending hook runs before the remote is authenticated, so only a
-                        // refusal at establishment (the per-peer ceiling) carries a peer id
-                        let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                            InboundDenial::EstablishedPerPeerLimit
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
+                    // the pending hook runs before the remote is authenticated, so only a
+                    // refusal at establishment (the per-peer ceiling) carries a peer id
+                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
+                        InboundDenial::EstablishedPerPeerLimit
+                    });
+                    self.metrics.record_inbound_denied(&denial);
+                    self.inbound_denial_warning
+                        .record(tokio::time::Instant::now())
+                        .into_iter()
+                        .for_each(|denied| {
+                            warn!(
+                                target: "network",
+                                denied,
+                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                "inbound connections keep being refused by connection limits"
+                            );
                         });
-                        self.metrics.record_inbound_denied(&denial);
-                        debug!(
-                            target: "network",
-                            ?denial,
-                            limit = exceeded.limit(),
-                            %exceeded,
-                            "inbound connection refused by connection limit"
-                        );
-                        self.inbound_denial_warning
-                            .record(tokio::time::Instant::now())
-                            .into_iter()
-                            .for_each(|denied| {
-                                warn!(
-                                    target: "network",
-                                    denied,
-                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                    "inbound connections keep being refused by connection limits"
-                                );
-                            });
-                    },
-                );
+                });
             }
             // other events handled by peer manager and other behaviors
             _ => {}

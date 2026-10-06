@@ -1454,15 +1454,9 @@ where
             on_chain_workers,
         )?;
 
-        // Reject an invalid peer-score config before it is installed into the process-global,
-        // first-write-wins `GLOBAL_SCORE_CONFIG` by the `PeerManager` built below
-        // (`init_peer_score_config`). This is the boot-path install funnel, so validating here
-        // fails the node fast at start with a field-named error rather than letting a
-        // `min_score > max_score` or `NaN` bound poison the scoring path and later panic
-        // `Score::add`'s `f64::clamp` on the first peer penalty.
-        // `ConsensusConfig::new_with_committee` validates the same config for the
-        // construction path (tests, epoch transitions); this guard covers the node boot
-        // that actually performs the one-time install.
+        // Validate the instance's peer-score config before building its PeerManager so node
+        // startup reports invalid bounds by field name before they reach Score::add's clamp.
+        // ConsensusConfig::new_with_committee also validates tests and epoch transitions.
         network_config.peer_config().score_config.validate()?;
 
         // Validate the operator-provided kad cadences before installing them into either swarm,

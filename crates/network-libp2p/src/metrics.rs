@@ -225,11 +225,45 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Count failed source reservations with a bounded reason and no peer or address labels.
+    pub(crate) fn record_source_rejection(&self, error: crate::source_admission::AdmissionError) {
+        use crate::source_admission::AdmissionError;
+
+        let reason = match error {
+            AdmissionError::InvalidLimits => "invalid_limits",
+            AdmissionError::ProcessFull => "process_full",
+            AdmissionError::PeerFull => "peer_full",
+            AdmissionError::AddressFull => "address_full",
+            AdmissionError::PrefixFull => "prefix_full",
+            AdmissionError::SourcesFull => "sources_full",
+            AdmissionError::UnsupportedAddress => "unsupported_address",
+            AdmissionError::DuplicateConnection => "duplicate_connection",
+            AdmissionError::Poisoned => "poisoned",
+        };
+        metrics::counter!(
+            "tn_network.source_rejections_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
     /// Observe ordinary population and the reserved observer identities independently.
     pub(crate) fn set_population_counts(&self, ordinary: usize, observers: usize) {
         self.handles.ordinary_peers_connected.set(ordinary as f64);
         self.handles.dao_observers_connected.set(observers as f64);
     }
+
+    /// Record one failed inbound attempt with a fixed reason label, never a peer or address.
+    pub(crate) fn record_listen_failure(&self, reason: &'static str) {
+        metrics::counter!(
+            "tn_network.listen_failures_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
     /// Create the peer manager metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);

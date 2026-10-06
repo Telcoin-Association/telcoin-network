@@ -4,7 +4,6 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
-    score::init_peer_score_config,
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
@@ -26,6 +25,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
     num::NonZeroUsize,
+    sync::Arc,
     task::Context,
     time::Duration,
 };
@@ -37,6 +37,10 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/listen_failure.rs"]
+mod listen_failure_tests;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -279,9 +283,10 @@ impl PeerManager {
         peer: PeerId,
         address: &Multiaddr,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
-        self.source_connections
-            .reserve(connection, peer, address)
-            .map_err(libp2p::swarm::ConnectionDenied::new)
+        self.source_connections.reserve(connection, peer, address).map_err(|error| {
+            self.metrics.record_source_rejection(error);
+            libp2p::swarm::ConnectionDenied::new(error)
+        })
     }
 
     /// Create a new instance of Self.
@@ -297,14 +302,12 @@ impl PeerManager {
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,
+            Arc::new(config.score_config),
         );
         let temporarily_banned = BannedPeerCache::new(
             config.excess_peers_reconnection_timeout,
             config.max_temporarily_banned_peers,
         );
-
-        // initialize global score config
-        init_peer_score_config(config.score_config);
 
         Self {
             local_peer_id,
