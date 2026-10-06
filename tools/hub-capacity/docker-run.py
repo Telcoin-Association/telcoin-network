@@ -263,7 +263,8 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
             wait_file(phase_dir / f"{node['name']}.pid", processes)
             wait_file(phase_dir / f"{node['name']}.jsonl", processes)
             stops.append((container, f"{container_dir}/{node['name']}.pid", "/binaries/telcoin-network"))
-        peer_supervisor = docker.background_execute(coordinator, f"{phase}-peers", "python3", "-B", "-I",
+        peer_supervisor = docker.background_execute(coordinator, f"{phase}-peers",
+            "env", "RUST_LOG=error,peer-manager=debug,hub_capacity::peer=warn", "python3", "-B", "-I",
             "/tools/supervise.py", "/qualification/deployment", phase, "/binaries/examples/hub-capacity-peer",
             "--ready", f"{container_dir}/peers-ready.json", "--pid-file", f"{container_dir}/supervisor.pid")
         processes.append(peer_supervisor)
