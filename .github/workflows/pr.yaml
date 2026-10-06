@@ -1,4 +1,4 @@
-# Checks that gate a change into main, on both events that can produce one.
+# Checks for PRs into main or staging, and candidates entering the merge queue.
 #
 #   `pull_request`  -- the PR in isolation, on the author's head commit.
 #   `merge_group`   -- the merge queue's temporary commit: main, plus this PR, plus every
@@ -50,7 +50,8 @@ name: Pull Request and Merge Queue Checks
 
 on:
   pull_request:
-    branches: [main]
+    # Staging PRs need the same code, capacity and attestation checks before integration.
+    branches: [main, 'staging/**']
     # `review_requested` is load-bearing, not cosmetic: `make attest` writes to adiri and
     # touches nothing on GitHub, so after attesting a maintainer requests a review to
     # re-run `verify-on-chain` on the same sha. A push would mint a new, unattested sha.
