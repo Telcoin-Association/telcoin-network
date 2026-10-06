@@ -738,9 +738,13 @@ where
         // So we will panic for now, this will kill the node on startup for a critical error.
         let committee_zero =
             Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
-                .map_err(|_| {
-                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
-                    eyre::eyre!("unable to load committee zero (genesis committee), this is fatal")
+                .map_err(|e| {
+                    // `{e:#}` prints the whole chain: the top-level message of a decode failure is
+                    // only the loader's "bad yaml data" context, and the reason is its cause
+                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee: {e:#}");
+                    eyre::eyre!(
+                        "unable to load committee zero (genesis committee), this is fatal: {e:#}"
+                    )
                 })?;
         let bootstrap_servers = committee_zero.bootstrap_servers();
         let epochs_db_path = tn_datadir.epochs_db_path();
@@ -896,7 +900,7 @@ where
             let engine = engine.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
-                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
+                async move { engine.worker_readiness().await }
             };
             let _ = HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
