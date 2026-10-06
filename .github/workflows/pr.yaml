@@ -266,7 +266,7 @@ jobs:
   # Keep this lane independent of draft/maintainer deferral, with a finite source scope.
   hub-capacity:
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 90
+    timeout-minutes: 120
     outputs:
       qualification_required: ${{ steps.scope.outputs.changed }}
     env:
