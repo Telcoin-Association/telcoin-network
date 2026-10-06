@@ -22,7 +22,6 @@ use crate::{
 };
 use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
-    collections::HashSet,
     future::{ready, Future},
     time::Duration,
 };
