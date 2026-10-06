@@ -30,8 +30,12 @@ node's dependency graph. Its patch and counters are disposable profiling tools,
 not a production TLS fork or permanent negotiated-group metric.
 
 The runner refuses version drift for libp2p-tls, rustls, aws-lc-rs, aws-lc-sys and
-rustls-webpki. Commit any intentional lockfile update with new measurements and
-updated source hashes. CI builds and checks this harness, runs every scenario,
+rustls-webpki. The required `CI Success` check runs `run.py --check-versions` on
+every pull request and merge group, so a node lockfile change that moves one of
+these crates must move its `=` pin in `Cargo.toml` and refresh this lockfile in
+the same pull request: run `prepare.py`, then build once without `--locked`.
+Commit any intentional lockfile update with new measurements and updated source
+hashes. The profile workflow builds and checks this harness, runs every scenario,
 and retains raw samples. It has no timing threshold.
 
 ## Experiments and measurements

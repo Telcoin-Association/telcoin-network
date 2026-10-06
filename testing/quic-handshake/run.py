@@ -50,7 +50,10 @@ def validate_versions():
         expected = {p["version"] for p in node["package"] if p["name"] == name}
         actual = {p["version"] for p in fixture["package"] if p["name"] == name}
         if actual != expected or len(actual) != 1:
-            raise ValueError(f"node/profile dependency drift: {name}: {expected} != {actual}")
+            raise ValueError(
+                f"node/profile dependency drift: {name}: node {expected} != profile {actual}; "
+                "see testing/quic-handshake/README.md"
+            )
         versions[name] = next(iter(actual))
     return versions
 
@@ -145,9 +148,15 @@ def run(binary, output, samples):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--binary", type=Path, default=ROOT / "target/release/tn-quic-handshake-profile")
-    parser.add_argument("--output", type=Path, required=True)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output", type=Path)
+    mode.add_argument("--check-versions", action="store_true",
+                      help="only compare the pinned crates with the node's lockfile, as CI Success does")
     parser.add_argument("--samples", type=int, default=1000)
     args = parser.parse_args()
-    if not 2 <= args.samples <= 100_000:
-        parser.error("samples must be 2..100000")
-    run(args.binary.resolve(), args.output.resolve(), args.samples)
+    if args.check_versions:
+        print(json.dumps(validate_versions()))
+    else:
+        if not 2 <= args.samples <= 100_000:
+            parser.error("samples must be 2..100000")
+        run(args.binary.resolve(), args.output.resolve(), args.samples)
