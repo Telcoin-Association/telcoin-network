@@ -36,19 +36,18 @@ use tracing::{debug, error, info, warn};
 /// Set to an arbitrary 10 seconds to read 16kb buffer.
 const SEND_STREAM_BUFFER_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Total timeout for serving an entire epoch pack over the sync protocol.
+/// Total timeout for serving a single consensus-output response over the sync protocol.
 ///
-/// A backstop above the per-frame [`SEND_STREAM_BUFFER_TIMEOUT`]: a peer that
-/// drip-reads just fast enough to keep resetting the per-frame timer cannot pin
-/// the responder task (and the admission slot it holds) indefinitely.
+/// A single output is small and bounded (unlike a whole epoch pack, whose serve is bounded by a
+/// throughput floor rather than a fixed wall-clock cap — see `send_sync_epoch_pack_over_stream`),
+/// so a fixed backstop is fine here: it caps the admission slot a drip-reading peer can hold.
 const SEND_SYNC_PACK_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Total timeout for serving a missing-certificates response over the sync protocol.
 ///
 /// The streaming collector is already bounded by its DB-read time limit, but the
 /// number of frames and a slow reader are not, so this backstops the whole serve
-/// (and the admission slot it holds) the same way [`SEND_SYNC_PACK_TIMEOUT`] does
-/// for an epoch pack.
+/// (and the admission slot it holds).
 const SEND_SYNC_CERTS_TIMEOUT: Duration = Duration::from_secs(200);
 
 /// Map to hold vote info to detect invalid votes, equivocation and cache responses in case of
@@ -750,6 +749,86 @@ where
         first
     }
 
+    /// Decide a vote request's drift tier from how far `header`'s `created_at` leads the local
+    /// clock.
+    ///
+    /// Tier 1, a lead within `max_header_time_drift_tolerance`, is `HeaderLead::Tolerated` with
+    /// the lead for the caller to wait out. The lead is zero for a header that is not ahead:
+    /// there is no lower bound on `created_at` (see the parent timestamp rule in
+    /// `Self::vote_inner`). Tier 2, a lead within the tolerance plus `vote_timeout`, is
+    /// `HeaderLead::Deferred` with the reason for a recoverable response. Tier 3, anything
+    /// further ahead, is an `InvalidTimestamp` error.
+    ///
+    /// `subsecond_active` is the sub-second timestamp fork gate for the header's epoch; while it
+    /// is off, the lead is compared in whole seconds against the tolerance rounded up.
+    ///
+    /// Each call reads the clock afresh and consults nothing but the header, the clock and the
+    /// node's config, so the vote path can decide the tier before its signature check and waits
+    /// and again after them.
+    fn check_header_lead(
+        &self,
+        header: &Header,
+        subsecond_active: bool,
+    ) -> PrimaryNetworkResult<HeaderLead> {
+        let tolerance =
+            self.consensus_config.network_config().sync_config().max_header_time_drift_tolerance;
+        let now = now_ms();
+        let created_at = header.created_at_ms();
+        let ahead_ms = created_at.as_millis().saturating_sub(now.as_millis());
+        let within_tolerance = if subsecond_active {
+            u128::from(ahead_ms) <= tolerance.as_millis()
+        } else {
+            // whole-second timestamps: compare seconds against the rounded-up tolerance
+            header.created_at().saturating_sub(now.secs()) <= ceil_secs(tolerance)
+        };
+        if within_tolerance {
+            // tier 1: ordinary clock drift between validators. the caller waits out the exact
+            // lead, in milliseconds in every epoch, so the header is no longer in the future when
+            // this node votes; sleeping whole seconds would outlast a sub-second round
+            Ok(HeaderLead::Tolerated(Duration::from_millis(ahead_ms)))
+        } else if u128::from(ahead_ms)
+            <= tolerance.saturating_add(self.consensus_config.parameters().vote_timeout).as_millis()
+        {
+            // tier 2: too far ahead to wait out now, but within the tolerance plus the time a
+            // vote request stays open, so the lead may be honest skew a retry can outlast.
+            // answer with a recoverable response: it carries no penalty, `Self::vote` keeps the
+            // author's previous vote-cache entry, and the proposer retries the same request
+            self.consensus_bus.metrics().votes_deferred_future_header_total.increment(1);
+            debug!(
+                target: "primary",
+                ?header,
+                ahead_ms,
+                "header created ahead of the local clock beyond the drift tolerance; not voting yet"
+            );
+            if self.first_deferral_this_round(header) {
+                warn!(
+                    target: "primary",
+                    author = %header.author(),
+                    epoch = header.epoch(),
+                    round = header.round(),
+                    ahead_ms,
+                    "deferring vote: header created ahead of the local clock beyond the drift tolerance"
+                );
+            }
+            Ok(HeaderLead::Deferred(PrimaryRPCError(format!(
+                "header {} created {ahead_ms} ms ahead of the local clock, beyond the drift \
+                 tolerance of {tolerance:?}",
+                header.digest()
+            ))))
+        } else {
+            // tier 3: further ahead than the tolerance plus the time a vote request stays open,
+            // reject this header for good: `Self::vote` caches the error for its digest.
+            // Clock skew can be local to either peer, so rejection carries no score penalty.
+            warn!(
+                target: "primary",
+                "Rejected header {:?} due to timestamp {created_at} ms newer than {now} ms",
+                header,
+            );
+
+            Err(HeaderError::InvalidTimestamp { created: created_at, received: now }.into())
+        }
+    }
+
     /// Evaluate request to possibly issue a vote in support of peer's header.
     async fn vote_inner(
         &self,
@@ -786,6 +865,19 @@ where
             num_parents <= committee.size(),
             HeaderError::TooManyParents(num_parents, committee.size()).into()
         );
+
+        // the header's own epoch selects the timestamp rules, never the local committee's
+        let subsecond_active = subsecond_timestamp_active(header.epoch());
+
+        // decide the drift tier before the seed verify and every wait below, since it needs only
+        // the header and the local clock. a tier-2 answer is uncached and carries no penalty, so
+        // an author can make this node repeat it at will, with the same header or with a new one
+        // for the same round; decided here, each repeat costs no signature verify, no execution
+        // wait and no parent reads. a lead within the tolerance is waited out after the parent
+        // checks instead, because the time they take uses up part of it
+        if let HeaderLead::Deferred(reason) = self.check_header_lead(&header, subsecond_active)? {
+            return Ok(PrimaryResponse::RecoverableError(reason));
+        }
 
         // Verify the author's seed signature over the canonical per-`(author, round)` seed message
         // before any blocking wait or state mutation. A certificate needs 2f+1 votes, so refusing
@@ -878,9 +970,6 @@ where
         // - created before the header
         // - are from unique authorities
         // - form a quorum through staked weight
-        //
-        // the header's own epoch selects the timestamp rules, never the local committee's
-        let subsecond_active = subsecond_timestamp_active(header.epoch());
         let mut parent_authorities = BTreeSet::new();
         let mut stake = 0;
         for parent in parents.iter() {
@@ -928,67 +1017,19 @@ where
             CertManagerError::from(CertificateError::Inquorate { stake, threshold }).into()
         );
 
-        // verify the header was not created in the future. this runs before the batch sync so a
-        // rejection costs no batch fetches. there is only an upper bound (see the parent rule
-        // above).
-        let tolerance =
-            self.consensus_config.network_config().sync_config().max_header_time_drift_tolerance;
-        let now = now_ms();
-        let created_at = header.created_at_ms();
-        let ahead_ms = created_at.as_millis().saturating_sub(now.as_millis());
-        let within_tolerance = if subsecond_active {
-            u128::from(ahead_ms) <= tolerance.as_millis()
-        } else {
-            // whole-second timestamps: compare seconds against the rounded-up tolerance
-            header.created_at().saturating_sub(now.secs()) <= ceil_secs(tolerance)
-        };
-        if within_tolerance {
-            // tier 1: ordinary clock drift between validators. wait out the exact lead, in
-            // milliseconds in every epoch, so the header is no longer in the future when this
-            // node votes; sleeping whole seconds would outlast a sub-second round
-            if ahead_ms > 0 {
-                tokio::time::sleep(Duration::from_millis(ahead_ms)).await;
+        // the header passed the drift tier check on arrival; wait out what is left of a lead
+        // within the tolerance so the header is no longer in the future when this node votes.
+        // the checks above take time, so the tier is decided again on a fresh clock reading: the
+        // lead is usually smaller now, and if the local clock stepped back meanwhile the header
+        // is still deferred or rejected. this runs before the batch sync so a refusal costs no
+        // batch fetches
+        match self.check_header_lead(&header, subsecond_active)? {
+            HeaderLead::Tolerated(lead) => {
+                if !lead.is_zero() {
+                    tokio::time::sleep(lead).await;
+                }
             }
-        } else if u128::from(ahead_ms)
-            <= tolerance.saturating_add(self.consensus_config.parameters().vote_timeout).as_millis()
-        {
-            // tier 2: too far ahead to wait out now, but within the tolerance plus the time a
-            // vote request stays open, so the lead may be honest skew a retry can outlast.
-            // answer with a recoverable response: it carries no penalty, `Self::vote` keeps the
-            // author's previous vote-cache entry, and the proposer retries the same request
-            self.consensus_bus.metrics().votes_deferred_future_header_total.increment(1);
-            debug!(
-                target: "primary",
-                ?header,
-                ahead_ms,
-                "header created ahead of the local clock beyond the drift tolerance; not voting yet"
-            );
-            if self.first_deferral_this_round(&header) {
-                warn!(
-                    target: "primary",
-                    author = %header.author(),
-                    epoch = header.epoch(),
-                    round = header.round(),
-                    ahead_ms,
-                    "deferring vote: header created ahead of the local clock beyond the drift tolerance"
-                );
-            }
-            return Ok(PrimaryResponse::RecoverableError(PrimaryRPCError(format!(
-                "header {} created {ahead_ms} ms ahead of the local clock, beyond the drift \
-                 tolerance of {tolerance:?}",
-                header.digest()
-            ))));
-        } else {
-            // tier 3: further ahead than the tolerance plus the time a vote request stays open,
-            // more than ordinary clock skew explains. reject this header for good: `Self::vote`
-            // caches the error for its digest and the network layer charges a severe penalty
-            warn!(
-                target: "primary",
-                "Rejected header {:?} due to timestamp {created_at} ms newer than {now} ms",
-                header,
-            );
-
-            return Err(HeaderError::InvalidTimestamp { created: created_at, received: now }.into());
+            HeaderLead::Deferred(reason) => return Ok(PrimaryResponse::RecoverableError(reason)),
         }
 
         // parents valid - now verify batches
@@ -1319,7 +1360,8 @@ where
     ///
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening request frame read by the caller. This streams the pack via
-    /// [`send_sync_epoch_pack_over_stream`] under a total timeout. A send failure is
+    /// [`send_sync_epoch_pack_over_stream`], which bounds a slow reader with a per-frame write
+    /// timeout and a rolling throughput floor rather than a total timeout. A send failure is
     /// logged and best-effort signalled with [`SyncFrame::Err`] so the requester
     /// stops waiting; it is not a peer fault, so no penalty is returned (metrics-only
     /// during the item-6 rollout, like the legacy responder).
@@ -1336,21 +1378,20 @@ where
         debug!(target: "primary::network", %peer, epoch, ?stop_number, "serving inbound sync epoch pack stream");
         let max_frame = crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE;
 
-        // bound the whole serve; flatten the timeout's outer Result into the send's
-        let served = timeout(
-            SEND_SYNC_PACK_TIMEOUT,
-            crate::network::sync_codec::send_sync_epoch_pack_over_stream(
-                &mut stream,
-                consensus_chain,
-                epoch,
-                stop_number,
-                SEND_STREAM_BUFFER_TIMEOUT,
-                peer,
-            ),
+        // No fixed overall serve cap: `send_sync_epoch_pack_over_stream` enforces a per-frame write
+        // timeout (`SEND_STREAM_BUFFER_TIMEOUT`) AND a rolling-window throughput floor, so a large
+        // honest pack can take as long as it needs at/above the floor while a drip-reading peer
+        // (which keeps resetting the per-frame timer) is cut within roughly one window —
+        // without capping the pack size a slow-but-honest requester could ever receive.
+        let served = crate::network::sync_codec::send_sync_epoch_pack_over_stream(
+            &mut stream,
+            consensus_chain,
+            epoch,
+            stop_number,
+            SEND_STREAM_BUFFER_TIMEOUT,
+            peer,
         )
-        .await
-        .map_err(PrimaryNetworkError::from)
-        .and_then(|served| served);
+        .await;
 
         // a send failure or timeout is logged and best-effort signalled so the
         // requester stops waiting; it is not a peer fault, so no penalty
@@ -1539,4 +1580,16 @@ where
 
         Ok(())
     }
+}
+
+/// The drift tier `RequestHandler::check_header_lead` found for a vote request's header, when
+/// the header is not rejected outright.
+#[derive(Debug)]
+enum HeaderLead {
+    /// Tier 1: the lead is within the drift tolerance, and the vote may go ahead once this much
+    /// time has passed (zero when the header is not ahead of the local clock).
+    Tolerated(Duration),
+    /// Tier 2: too far ahead to vote on now. The request ends with a recoverable response
+    /// carrying this reason, and the proposer retries.
+    Deferred(PrimaryRPCError),
 }

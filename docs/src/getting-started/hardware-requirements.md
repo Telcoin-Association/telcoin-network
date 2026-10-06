@@ -391,7 +391,7 @@ Supported: Linux LTS releases (Debian 11+, Ubuntu 20.04+, Red Hat Enterprise Lin
 Use a kernel with pressure stall information (mainline 4.20 or later) so the checks in [Capacity monitoring](validator-operations.md#capacity-monitoring) work.
 
 - Disable swap (see [Memory](#memory)).
-- Run time sync (chrony or systemd-timesyncd). A node rejects a header timestamped more than 1 s ahead of its own clock and waits out any smaller difference before voting [^drift]. Clock error of 1 s makes a validator reject honest headers or have its own rejected, and smaller errors delay its votes.
+- Run time sync (chrony or systemd-timesyncd). A validator waits out a header timestamped up to `max_header_time_drift_tolerance` ahead of its own clock before voting: 250 ms by default, 1 s in a data directory first started by a binary from before sub-second timestamps, and rounded up to whole seconds in epochs before the sub-second timestamp fork. A header further ahead gets no vote yet and costs its proposer nothing, and the proposer retries; only a header more than the tolerance plus `vote_timeout` ahead (5.25 s at the defaults) is rejected without a score penalty [^drift]. Clock error within the tolerance delays votes by up to that error. Error beyond it holds back a validator's votes on honest headers, or other validators' votes on its own headers, until the difference shrinks, and error beyond the tolerance plus `vote_timeout` makes a validator reject honest headers or have its own rejected.
 
 Email support@telcoin.org to confirm hardware specifications before purchasing any equipment.
 
@@ -665,7 +665,7 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^ecrecover]: `crates/tn-reth/src/env/execution.rs:167-181`.
 [^rayon]: `crates/telcoin-network-cli/src/node.rs:218-226` (global pool size is available cores minus 2, at least 1).
 [^batch-validator]: `crates/batch-validator/src/validator.rs:170`.
-[^vote-wait]: `crates/consensus/primary/src/network/handler.rs:787`.
+[^vote-wait]: `crates/consensus/primary/src/network/handler.rs:913-916`.
 [^commit-wait]: `crates/consensus/primary/src/consensus/state.rs:501-502`.
 [^quorum]: `crates/types/src/committee.rs:1090-1091`.
 [^replay]: `crates/node/src/manager/node/start_epoch.rs:88-104` (replay loop; lines 89-97 refuse to cross an epoch boundary).
@@ -690,7 +690,7 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^seal-fatal]: `crates/storage/src/composite_db.rs:35` (the cache database runs in cache mode, `full_memory = false`), `crates/storage/src/layered_db.rs:477-482` (insert writes the in-memory layer and queues the MDBX write), `crates/storage/src/layered_db.rs:257-289` (a failed MDBX write is logged at error level, latches `commit_failed` and keeps the in-memory copy), `crates/storage/src/layered_db.rs:320-335` and `crates/storage/src/layered_db.rs:557-575` (only the `persist` barrier reads the latch), `crates/consensus/worker/src/worker.rs:322-326` and `crates/consensus/worker/src/worker.rs:388-391` (`FatalDBFailure` only when the insert call returns an error).
 [^qw-fanout]: `crates/consensus/worker/src/quorum_waiter.rs:136-137`.
 [^header-delay]: `crates/config/src/node.rs:336-342` (2.5 s maximum, 1 s minimum).
-[^drift]: `crates/consensus/primary/src/network/handler.rs:889-915`, `crates/config/src/network.rs:360` (1 s tolerance).
+[^drift]: `crates/consensus/primary/src/network/handler.rs:769-831` (`check_header_lead`: a lead within the tolerance is passed on to be waited out at 779-789, a lead within the tolerance plus `vote_timeout` gets a retryable answer with no penalty at 790-818, and a larger lead is rejected at 819-829), `crates/consensus/primary/src/network/handler.rs:879-881` (a deferral is answered on arrival), `crates/consensus/primary/src/network/handler.rs:1021-1034` (the wait before voting), `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` (no score penalty for relative clock skew), `crates/config/src/network.rs:362-363` (`max_header_time_drift_tolerance`), `crates/config/src/network.rs:400` (250 ms default), `crates/config/src/node.rs:366-368` (5 s `vote_timeout` default). The node writes its network config only when the file is missing (`crates/config/src/traits.rs:76-83`), so a data directory first started by an older binary keeps the `1` that binary wrote, read as 1 s. `crates/telcoin-network-cli/README.md`, section `max_header_time_drift_tolerance (network-config)`, shows how to check and change it.
 [^observer-role]: `crates/node/src/manager/node.rs:1047-1064`, `crates/telcoin-network-cli/src/node.rs:157-160`.
 [^forward]: `crates/consensus/worker/src/worker.rs:310-312`, `crates/consensus/worker/src/worker.rs:254-296`.
 [^observer-gossip]: `crates/consensus/worker/src/network/handler.rs:138-144`.

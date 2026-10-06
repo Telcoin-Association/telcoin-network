@@ -406,6 +406,14 @@ impl TaskManager {
         self.wait_for_task_shutdown_internal().await
     }
 
+    /// Give the tasks up to `grace` to exit on their own (after their shutdown was signalled), so
+    /// each can run its graceful exit, and report whether all of them did. Unlike
+    /// [`Self::wait_for_task_shutdown`], tasks still running when the grace lapses are not
+    /// reported as a failure: the caller is expected to abort them next.
+    pub async fn wait_for_exit(&mut self, grace: Duration) -> bool {
+        self.join_tasks_within(grace).await
+    }
+
     /// Abort all of our direct tasks (not sub task managers though).
     pub fn abort(&self) {
         for task in self.tasks.iter() {
@@ -496,9 +504,14 @@ impl TaskManager {
     async fn wait_for_task_shutdown_internal(&mut self) {
         let task_name = self.name.clone();
         let join_wait = Duration::from_millis(self.join_wait_millis);
-        // wait some time for shutdown...
-        // 2 seconds for our tasks to end...
-        if tokio::time::timeout(join_wait, async move {
+        if !self.join_tasks_within(join_wait).await {
+            tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
+        }
+    }
+
+    /// Join the tasks as they finish, logging each, for up to `wait`. True when all of them did.
+    async fn join_tasks_within(&mut self, wait: Duration) -> bool {
+        tokio::time::timeout(wait, async move {
             tracing::debug!(target: "tn::tasks", "awaiting shutdown for task manager\n{self:?}");
             while let Some(res) = self.tasks.next().await {
                 match res {
@@ -534,10 +547,7 @@ impl TaskManager {
             tracing::info!(target: "tn::tasks", "{}: All tasks shutdown", self.name);
         })
         .await
-        .is_err()
-        {
-            tracing::error!(target:"tn::tasks", "{}: All tasks NOT shutdown", task_name);
-        }
+        .is_ok()
     }
 
     /// Implements the join logic for the manager.
@@ -831,5 +841,40 @@ mod test {
             Err(TaskJoinError::CriticalJoinError(_name, _err)) => panic!("wrong error"),
             Err(TaskJoinError::CriticalExitError(name, _err)) => assert!(name.eq("Crit 2")),
         }
+    }
+
+    /// `wait_for_exit` lets tasks that honour their shutdown signal finish on their own (their
+    /// graceful exit runs), returns as soon as they have, and reports a task that ignores the
+    /// signal by returning `false` after the grace, leaving it running for the caller to abort.
+    #[tokio::test]
+    async fn test_wait_for_exit_lets_tasks_finish_before_an_abort() {
+        let mut task_manager = TaskManager::default();
+        let shutdown = ShutdownNotifier::default();
+        let (done_tx, mut done_rx) = mpsc::channel::<()>(1);
+        let rx_shutdown = shutdown.subscribe();
+        task_manager.spawn_task("graceful", async move {
+            rx_shutdown.await;
+            let _ = done_tx.send(()).await; // the graceful exit's own work
+            Ok(())
+        });
+        task_manager.update_tasks();
+        shutdown.notify();
+        let started = std::time::Instant::now();
+        assert!(task_manager.wait_for_exit(Duration::from_secs(5)).await, "the task exits");
+        assert!(started.elapsed() < Duration::from_secs(5), "returns once every task exited");
+        assert!(done_rx.try_recv().is_ok(), "the graceful exit ran");
+
+        let mut task_manager = TaskManager::default();
+        task_manager.spawn_task("stubborn", async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            Ok(())
+        });
+        task_manager.update_tasks();
+        assert!(
+            !task_manager.wait_for_exit(Duration::from_millis(50)).await,
+            "a task that does not exit is reported"
+        );
+        task_manager.abort_all_tasks();
+        task_manager.wait_for_task_shutdown().await;
     }
 }

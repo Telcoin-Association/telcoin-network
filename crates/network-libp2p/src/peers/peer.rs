@@ -14,7 +14,7 @@ use libp2p::{
 };
 use std::{collections::HashSet, net::IpAddr, time::Instant};
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -99,7 +99,7 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
-    /// Protocol failures survive trust grants; only load-only scores may be forgiven.
+    /// Protocol failures survive operator trust grants; committee promotion forgives all scores.
     penalty_history: PenaltyHistory,
     /// The multiaddrs associated with this peer: addresses observed on real connections plus any
     /// self-advertised addresses folded in via [`Self::update_net`].
@@ -294,14 +294,16 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// Load-scoring privileges suppress only temporary overload. Protocol and cryptographic
-    /// violations remain attributable, scored, and eligible for bans for every peer.
+    /// Committee peers remain score-exempt for liveness. Operator trust alone suppresses only
+    /// temporary overload; protocol and cryptographic failures remain scoreable for those peers.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty, policy: PeerPolicy) -> Reputation {
         if policy.applies(penalty) {
             self.penalty_history.record(penalty);
             self.score.apply_penalty(penalty);
-        } else {
+        } else if penalty.is_load() {
             debug!(target: "peer-manager", ?penalty, ?policy, "skipping load penalty for privileged peer");
+        } else {
+            warn!(target: "peer-manager", ?penalty, ?policy, "skipping protocol penalty for committee peer");
         }
 
         // return new reputation
@@ -500,15 +502,14 @@ impl Peer {
         self.penalty_history.permits_forgiveness()
     }
 
-    /// Reset a load-only score to the maximum when the peer acquires committee privileges.
+    /// Reset score and penalty history when the peer acquires committee privileges.
     ///
     /// Called when a peer enters the committee. Trust is not stored on the peer (validator
-    /// status is derived from the committee sets). A recorded protocol violation prevents
-    /// forgiveness, including during a later committee rotation or rediscovery.
+    /// status is derived from the committee sets). Pre-membership penalties must not prevent
+    /// reconnection to a validator needed for consensus liveness.
     pub(super) fn reset_score_to_max(&mut self) {
-        if self.permits_load_forgiveness() {
-            self.score = Score::new_max();
-        }
+        self.score = Score::new_max();
+        self.penalty_history = PenaltyHistory::default();
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.
