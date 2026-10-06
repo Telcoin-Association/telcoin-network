@@ -33,6 +33,10 @@ use tracing::{debug, error, trace, warn};
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
 
+#[cfg(test)]
+#[path = "../tests/listen_failure.rs"]
+mod listen_failure_tests;
+
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
 
