@@ -100,6 +100,7 @@ impl<DB: Database> CertifierContext<DB> {
             task_spawner: cx.task_manager.get_spawner(),
             new_proposal: Notifier::new(),
             proposal_lock: Arc::new(Mutex::new(())),
+            in_flight: Arc::default(),
             metrics: cx.consensus_bus.app().metrics().clone(),
             config,
         };
@@ -674,6 +675,177 @@ async fn new_header_cancels_inflight() {
     assert_eq!(cert.header().digest(), h2_digest, "the certificate must be for header 2");
     if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
         panic!("expected no certificate after header 2's, got {result:?}");
+    }
+}
+
+/// The identical header sent again while its proposal is in flight does not restart the proposal:
+/// no vote request is cancelled or sent again, and the certificate forms from votes received on
+/// both sides of the re-send.
+///
+/// The proposer re-sends its last header unchanged every max header delay while it waits for
+/// parents. In a 4-authority committee the proposer and two peers are exactly a quorum. The first
+/// peer votes before the re-send; the other two requests are held across it, and only then does
+/// the second peer vote. A restarted proposal would have discarded the first vote and cancelled
+/// the held requests, so the certificate over the proposer's and those two votes could not form.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_header_keeps_inflight_votes() {
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+    assert_eq!(
+        committee.quorum_threshold(),
+        3,
+        "precondition: the proposer and two voters are exactly a quorum"
+    );
+    let (expected, early, late) = {
+        let mut peers = cx.peers();
+        let early = peers.next().expect("committee has a first peer");
+        let late = peers.next().expect("committee has a second peer");
+        let expected = certificate_over(&committee, &header, [early, late, cx.proposer()]);
+        (expected, *early.authority().protocol_key(), *late.authority().protocol_key())
+    };
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let responses = cx
+        .network
+        .respond(votes.len(), "first send: one peer votes, the others are held", |peer, _| {
+            if *peer == early {
+                Reply::Vote(votes[peer].clone())
+            } else {
+                Reply::Hold
+            }
+        })
+        .await;
+    // on the paused clock a sleep ends only once every task is idle, so the early vote has
+    // reached the proposal before the header is sent again
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    cx.network
+        .assert_quiet("identical re-send: the proposal must not ask any peer for a vote again")
+        .await;
+    // the held requests, in arrival order, are those of the peers that did not vote early
+    let mut held: Vec<_> = responses
+        .requests
+        .iter()
+        .map(|request| request.peer)
+        .filter(|peer| *peer != early)
+        .zip(responses.held)
+        .collect();
+    assert!(
+        held.iter().all(|(_, reply)| !reply.is_closed()),
+        "identical re-send: every held vote request must still be in flight"
+    );
+    if let Ok(result) = tokio::time::timeout(Duration::ZERO, cert_rx.recv()).await {
+        panic!("identical re-send: expected no certificate before the late vote, got {result:?}");
+    }
+
+    // the other held request stays open: dropping it would fail it and its vote task would retry
+    let late_held = held.iter().position(|(peer, _)| *peer == late).expect("late peer held");
+    let (peer, reply) = held.swap_remove(late_held);
+    let vote = PrimaryResponse::Vote(votes[&peer].clone());
+    assert!(
+        reply.send(Ok(NetworkResponseMessage { peer, result: vote })).is_ok(),
+        "the late voter's request stopped waiting before its vote"
+    );
+
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("a certificate forms from the votes on both sides of the re-send")
+        .expect("certificate channel open");
+    assert!(
+        encode(&certificate) == encode(&expected),
+        "expected the certificate over the proposer's, the early and the late votes {expected:?}, \
+         got {certificate:?}"
+    );
+    let gossip = cx.network.next_publish("gossip of the certificate").await;
+    assert!(gossip == certificate_gossip(expected).await, "the gossip must carry the certificate");
+}
+
+/// The identical header sent again after its proposal has ended starts a new proposal.
+///
+/// Every peer fails its vote request with the fatal `NetworkError::RPCError`, so the first proposal
+/// ends with `CouldNotFormCertificate`. The re-sent header must ask every peer again rather than be
+/// taken for a proposal still in flight, and the votes it collects form the certificate.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_header_restarts_ended_proposal() {
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
+    let digest = header.digest();
+    let votes = cx.peer_votes(&header);
+    let peers: HashMap<_, _> = votes.keys().map(|peer| (*peer, 1)).collect();
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.network
+        .respond(votes.len(), "first send: every peer fails fatally", |_, _| {
+            Reply::Fail(NetworkError::RPCError("mock fatal peer error".to_string()))
+        })
+        .await;
+    // on the paused clock a sleep ends only once every task is idle, so the failed proposal has
+    // ended before the header is sent again
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    let responses = cx
+        .network
+        .respond(votes.len(), "re-send after the failed proposal: every peer votes", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    assert_eq!(responses.requests_per_peer(), peers, "the re-send asks each peer once more");
+
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the re-sent header is certified")
+        .expect("certificate channel open");
+    assert_eq!(certificate.header().digest(), digest, "the certificate is for the re-sent header");
+}
+
+/// The identical header sent again after it was certified republishes the stored certificate
+/// through the running certifier and asks no peer for a vote.
+///
+/// [`already_certified_header_is_republished`] covers the same branch by calling
+/// `spawn_header_proposal` directly; this test checks that the running certifier reaches it, that
+/// is, the certified proposal is no longer taken for one in flight.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_header_after_certificate_is_republished() {
+    let mut cx = CertifierContext::new();
+    let header = cx.proposer_header();
+    let votes = cx.peer_votes(&header);
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    cx.network
+        .respond(votes.len(), "first send: every peer votes", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("the header is certified")
+        .expect("certificate channel open");
+    let gossip = certificate_gossip(certificate).await;
+    assert!(
+        cx.network.next_publish("gossip of the new certificate").await == gossip,
+        "the first gossip must carry the new certificate"
+    );
+    // on the paused clock a sleep ends only once every task is idle, so the proposal has ended
+    // before the header is sent again
+    tokio::time::sleep(Duration::from_millis(1)).await;
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    assert!(
+        cx.network.next_publish("identical re-send: republish").await == gossip,
+        "the re-sent header must republish exactly the stored certificate"
+    );
+    cx.network.assert_quiet("identical re-send after the certificate: no vote request").await;
+    if let Ok(result) = tokio::time::timeout(QUIET_WINDOW, cert_rx.recv()).await {
+        panic!(
+            "identical re-send after the certificate: expected no new certificate, got {result:?}"
+        );
     }
 }
 

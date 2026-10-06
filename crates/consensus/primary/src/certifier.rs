@@ -53,12 +53,17 @@ pub(crate) struct Certifier<DB> {
     network: PrimaryNetworkHandle,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
-    /// Notifier to cancel pending proposals and vote requests if new header is received.
+    /// Notifier to cancel pending proposals and vote requests if a different header is received.
     new_proposal: Notifier,
     /// Lock to make sure we are only in one header proposal at a time.
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// The digest of the header whose proposal task is still running, if any.
+    ///
+    /// Set by [`Self::run`] before it spawns a proposal and cleared when that task ends, however
+    /// it ends (see [`InFlightProposal`]).
+    in_flight: Arc<parking_lot::Mutex<Option<HeaderDigest>>>,
     /// Prometheus metrics for vote collection and certificate formation.
     metrics: crate::PrimaryMetrics,
 }
@@ -116,6 +121,7 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                in_flight: Arc::default(),
                 metrics,
             }
             .run(rx_headers)
@@ -566,14 +572,29 @@ impl<DB: Database> Certifier<DB> {
                 Some(header) = rx_headers.recv() => {
                     debug!(target: "primary::certifier", ?header, "{:?} received header!", &self.authority_id);
 
+                    // the proposer re-sends its last header unchanged while it waits for parents.
+                    // restarting that proposal would cancel its vote requests and discard the votes
+                    // already received, so a header whose votes take longer than the re-send
+                    // interval to reach quorum could never be certified. the vote requests in
+                    // flight retry on their own until answered
+                    let digest = header.digest();
+                    let Some(in_flight) = InFlightProposal::start(&self.in_flight, digest) else {
+                        debug!(target: "primary::certifier", %digest, "identical re-proposal while certification is in flight; keeping vote collection");
+                        continue;
+                    };
+
                     // cancel any outstanding proposals and vote requests
                     self.new_proposal.notify();
 
                     // spawn certifier task so new proposals can cancel
                     let certifier = self.clone();
                     self.task_spawner.spawn_task(
-                        format!("propose-header-{:?}", header.digest()),
-                        certifier.spawn_header_proposal(header)
+                        format!("propose-header-{digest:?}"),
+                        async move {
+                            // held until the task ends, however it ends
+                            let _in_flight = in_flight;
+                            certifier.spawn_header_proposal(header).await
+                        },
                     );
                 },
 
@@ -586,6 +607,43 @@ impl<DB: Database> Certifier<DB> {
                     break Ok(());
                 }
             }
+        }
+    }
+}
+
+/// Marks a header as the certifier's proposal in flight for as long as this guard lives.
+///
+/// [`Certifier::run`] moves one into each proposal task it spawns, so the mark clears however the
+/// task ends: a certificate, a cancellation, an error, the already-certified republish, or the task
+/// being dropped before it runs. A later copy of the same header then starts a new proposal.
+struct InFlightProposal {
+    /// The certifier's record of the header in flight.
+    marker: Arc<parking_lot::Mutex<Option<HeaderDigest>>>,
+    /// The digest this guard marked.
+    digest: HeaderDigest,
+}
+
+impl InFlightProposal {
+    /// Mark `digest` as in flight, or return `None` if it already is.
+    fn start(
+        marker: &Arc<parking_lot::Mutex<Option<HeaderDigest>>>,
+        digest: HeaderDigest,
+    ) -> Option<Self> {
+        let mut current = marker.lock();
+        if *current == Some(digest) {
+            return None;
+        }
+        *current = Some(digest);
+        Some(Self { marker: marker.clone(), digest })
+    }
+}
+
+impl Drop for InFlightProposal {
+    fn drop(&mut self) {
+        let mut current = self.marker.lock();
+        // a different header may have replaced this one; its mark is not ours to clear
+        if *current == Some(self.digest) {
+            *current = None;
         }
     }
 }
