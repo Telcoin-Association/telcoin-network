@@ -10,6 +10,9 @@ use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
 use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
 use tracing::warn;
 
+mod quic;
+pub use quic::QuicConfig;
+
 impl ConfigTrait for NetworkConfig {}
 
 /// The container for all network configurations.
@@ -433,55 +436,6 @@ impl Default for SyncConfig {
             // 600 * 100ms = 60 seconds of passive polling before actively re-driving a request.
             consensus_header_catch_up_poll_interval: Duration::from_millis(100),
             consensus_header_catch_up_max_no_progress: 600,
-        }
-    }
-}
-
-/// Configure the quic transport for libp2p.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(default)]
-pub struct QuicConfig {
-    /// Timeout for the initial handshake when establishing a connection.
-    /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
-    pub handshake_timeout: Duration,
-    /// Maximum duration of inactivity in ms to accept before timing out the connection.
-    pub max_idle_timeout: u32,
-    /// Period of inactivity before sending a keep-alive packet.
-    /// Must be set lower than the idle_timeout of both
-    /// peers to be effective.
-    ///
-    /// See [`quinn::TransportConfig::keep_alive_interval`] for more
-    /// info.
-    pub keep_alive_interval: Duration,
-    /// Maximum number of incoming bidirectional streams that may be open
-    /// concurrently by the remote peer.
-    pub max_concurrent_stream_limit: u32,
-    /// Max unacknowledged data in bytes that may be sent on a single stream.
-    pub max_stream_data: u32,
-    /// Max unacknowledged data in bytes that may be sent in total on all streams
-    /// of a connection.
-    pub max_connection_data: u32,
-    /// Answer every incoming QUIC connection attempt whose source address is not
-    /// validated with a QUIC Retry packet (RFC 9000 section 8.1) before the listener
-    /// creates connection state. The remote must echo the token from its address.
-    ///
-    /// Default `true`. Set `false` only as an operator rollback switch.
-    pub retry_unvalidated_incoming: bool,
-}
-
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(65),
-            max_idle_timeout: 30 * 1_000, // 30s
-            keep_alive_interval: Duration::from_secs(5),
-            max_concurrent_stream_limit: 10_000,
-            // may need to increase these based on RTT
-            //
-            // maximum throughput = (buffer size / round-trip time)
-            max_stream_data: 50 * 1024 * 1024,      // 50MiB
-            max_connection_data: 100 * 1024 * 1024, // 100MiB
-            retry_unvalidated_incoming: true,
         }
     }
 }

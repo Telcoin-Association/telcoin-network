@@ -171,6 +171,16 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Record one failed inbound attempt with a fixed reason label, never a peer or address.
+    pub(crate) fn record_listen_failure(&self, reason: &'static str) {
+        metrics::counter!(
+            "tn_network.listen_failures_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
     /// Create the peer manager metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);

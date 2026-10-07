@@ -1,7 +1,7 @@
 //! Unit tests for `AllPeers`
 
 use super::*;
-use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
+use crate::common::{create_multiaddr, random_ip_addr};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use std::{
@@ -15,9 +15,98 @@ use tn_types::{BlsKeypair, NetworkKeypair};
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
     let config = peer_config.unwrap_or_default();
-    ensure_score_config(Some(config.score_config));
     let dial_timeout = Duration::from_secs(5);
-    AllPeers::new(dial_timeout, config.max_banned_peers, config.max_disconnected_peers)
+    AllPeers::new(
+        dial_timeout,
+        config.max_banned_peers,
+        config.max_disconnected_peers,
+        Arc::new(config.score_config),
+    )
+}
+
+/// Peer creation, promotion, reconnect and committee resets retain the registry's scoring policy.
+#[test]
+fn instance_peer_registry_configuration() {
+    let first = PeerConfig {
+        score_config: ScoreConfig {
+            default_score: 30.0,
+            max_score: 40.0,
+            ..ScoreConfig::default()
+        },
+        ..PeerConfig::default()
+    };
+    let second = PeerConfig {
+        score_config: ScoreConfig {
+            default_score: 60.0,
+            max_score: 80.0,
+            ..ScoreConfig::default()
+        },
+        ..PeerConfig::default()
+    };
+    [false, true].into_iter().for_each(|reverse| {
+        let configs = if reverse { [second, first] } else { [first, second] };
+        let registries =
+            configs.map(|config| (create_all_peers(Some(config)), config.score_config));
+        registries.into_iter().for_each(|(mut peers, config)| {
+            let mut rng = StdRng::from_seed([0; 32]);
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+            let peer_id: PeerId = net.clone().into();
+            let addr = create_multiaddr(None);
+
+            // A known peer receives this registry's default score.
+            peers.upsert_peer(bls, net.clone(), Vec::new());
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score)
+            );
+
+            // An anonymous connection also uses this registry's policy, then carries it through
+            // identity promotion and a disconnect/reconnect cycle.
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+            let peer_id: PeerId = net.clone().into();
+            peers.update_connection_status(
+                &peer_id,
+                NewConnectionStatus::Connected {
+                    multiaddr: addr.clone(),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score)
+            );
+            assert!(peers.get_peer_mut(&peer_id).is_some_and(|peer| {
+                peer.apply_penalty(Penalty::Severe, PeerPolicy::default());
+                peer.score().aggregate_score() == config.default_score - 10.0
+            }));
+            peers.upsert_peer(bls, net.clone(), Vec::new());
+            peers.register_disconnected(&peer_id);
+            peers.update_connection_status(
+                &peer_id,
+                NewConnectionStatus::Connected {
+                    multiaddr: addr,
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score - 10.0)
+            );
+
+            // Committee promotion and explicit operator trust both use this instance's maximum.
+            assert!(peers.get_peer_mut(&peer_id).is_some_and(|peer| {
+                peer.reset_score_to_max();
+                peer.score().aggregate_score() == config.max_score
+            }));
+            peers.add_trusted_peer(bls, net);
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.max_score)
+            );
+        });
+    });
 }
 
 #[test]
@@ -1070,8 +1159,8 @@ fn test_prune_disconnected_evicts_oldest_not_newest() {
 
 #[test]
 fn test_is_validator() {
-    ensure_score_config(None);
-    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+    let mut all_peers =
+        AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
 
     // a committee member is a confirmed peer (bls known) whose libp2p id resolves to its bls
     let mut rng = StdRng::from_seed([0; 32]);
@@ -1090,8 +1179,8 @@ fn test_is_validator() {
 /// (and, because operator trust is separate, never touches an operator allowlist).
 #[test]
 fn test_committee_rotation_revokes_validator_exemption() {
-    ensure_score_config(None);
-    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+    let mut all_peers =
+        AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
 
     // a committee validator that the operator did NOT allowlist
     let mut rng = StdRng::from_seed([0; 32]);
@@ -1120,9 +1209,9 @@ fn test_committee_rotation_revokes_validator_exemption() {
 /// Operator trust preserves protocol bans, but promotion to any committee slot restores liveness.
 #[test]
 fn test_committee_promotion_forgives_protocol_bans() -> Result<(), NetworkError> {
-    ensure_score_config(None);
     (0..3).try_for_each(|slot| {
-        let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+        let mut all_peers =
+            AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
         let mut rng = StdRng::from_seed([46; 32]);
         let (bls, net, peer_id) = committee_member(&mut rng);
         all_peers.add_trusted_peer(bls, net.clone());
