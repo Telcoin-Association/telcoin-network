@@ -11,7 +11,7 @@ Methods are grouped into namespaces. A namespace is the prefix before the unders
 | [web3](web3/README.md) | yes | low | Client version and Keccak-256 hashing |
 | [rpc](rpc/README.md) | yes | trivial | The namespaces the transport serves |
 | [tn](tn/README.md) | yes | low to moderate (blocking reads are capped at 64 concurrent requests) | Telcoin Network consensus, epoch, validator and staking data |
-| debug | no, only when named | high | Raw block and transaction data and geth-style EVM tracing |
+| [debug](debug/README.md) | no, only when named | high | Raw block and transaction data and geth-style EVM tracing |
 | trace | no, only when named | high | Parity-style call traces, replays and trace filters |
 
 `debug` and `trace` re-execute historical transactions against archive state. One request can cost far more than an `eth_*` call, so they are never part of the default set or of `all`.

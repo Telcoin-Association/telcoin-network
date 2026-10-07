@@ -49,7 +49,7 @@ If you serve them:
 - set `--rpc.max-tracing-requests` low (2 to 4 on a shared host) and `--rpc.max-trace-filter-blocks` small;
 - cap response size with `--rpc.max-response-size`.
 
-Some `debug_*` methods are registered but do nothing.
+Some `debug_*` methods are registered but do nothing; [debug](debug/README.md) lists them.
 
 ## Limits and access flags
 
