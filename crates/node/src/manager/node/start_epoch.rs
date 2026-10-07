@@ -45,7 +45,7 @@ use tn_config::{
 use tn_network_libp2p::{error::NetworkError, types::NetworkHandle, TNMessage};
 use tn_primary::{
     network::{PrimaryNetwork, PrimaryNetworkHandle},
-    ConsensusBus, NodeMode, StateSynchronizer,
+    ConsensusBus, ConsensusBusApp, NodeMode, StateSynchronizer,
 };
 use tn_reth::{
     system_calls::{
@@ -56,14 +56,39 @@ use tn_reth::{
 };
 use tn_rpc::RpcNodeInfo;
 use tn_types::{
-    gas_accumulator::GasAccumulator, BatchValidation, BlsPublicKey, BlsSigner, Committee,
-    CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader, TaskManager, TaskSpawner, WorkerId,
-    DEFAULT_WORKER_ID,
+    gas_accumulator::GasAccumulator, Address, AuthorityIdentifier, BatchValidation, BlsPublicKey,
+    BlsSigner, Committee, CommitteeBuilder, ConsensusHeaderDigest, ConsensusOutput,
+    Database as TNDatabase, Epoch, EpochDigest, Multiaddr, NetworkPublicKey, SealedHeader,
+    TaskManager, TaskSpawner, WorkerId, DEFAULT_WORKER_ID,
 };
 use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
+
+/// Worker-independent RPC state shared while initializing an epoch's workers.
+///
+/// Each worker supplies its own network identity before constructing a complete [`RpcNodeInfo`].
+#[derive(Clone)]
+struct WorkerRpcContext {
+    /// Consensus channels used by the worker's RPC adapter.
+    consensus_bus: ConsensusBusApp,
+    /// Chain id shared by all workers.
+    chain_id: u64,
+    /// Version of the running software.
+    version: &'static str,
+    /// Configured name of the node.
+    name: String,
+    /// BLS public key identifying the node.
+    bls_public_key: BlsPublicKey,
+    /// Authority identifier derived from the node's BLS key.
+    authority_id: AuthorityIdentifier,
+    /// Execution address receiving the node's consensus rewards.
+    execution_address: Address,
+    /// Public key identifying the primary network.
+    primary_network_key: NetworkPublicKey,
+    /// External address of the primary network.
+    primary_external_address: Multiaddr,
+}
 
 impl<P, DB> EpochManager<P, DB>
 where
@@ -224,13 +249,29 @@ where
             )
             .await?;
 
-        let engine_to_primary = self.engine_to_primary_rpc(engine).await?;
+        let public_key = self.key_config.public_key();
+        let rpc_context = WorkerRpcContext {
+            consensus_bus: self.consensus_bus.clone(),
+            chain_id: engine.get_reth_env().await.chainspec().chain_id(),
+            name: self.builder.tn_config.node_info.name.clone(),
+            bls_public_key: public_key,
+            authority_id: public_key.into(),
+            execution_address: self.builder.tn_config.node_info.execution_address,
+            primary_network_key: self.key_config.primary_network_public_key(),
+            primary_external_address: self
+                .builder
+                .tn_config
+                .node_info
+                .primary_network_address()
+                .clone(),
+            version: self.version_str,
+        };
         let workers = self
             .spawn_worker_node_components(
                 &consensus_config,
                 engine,
                 epoch_task_manager.get_spawner(),
-                engine_to_primary,
+                rpc_context,
                 gas_accumulator,
                 previous_committee_keys,
             )
@@ -454,8 +495,8 @@ where
 
     /// Build the process-lifetime TN RPC handler before any epoch needs to start.
     ///
-    /// Worker 0 uses this information during startup synchronization. Additional workers replace
-    /// the worker-specific fields when their RPC servers are initialized at epoch entry.
+    /// Worker 0 uses this information during startup synchronization. Additional workers construct
+    /// their own worker-specific information when their RPC servers are initialized at epoch entry.
     pub(super) async fn engine_to_primary_rpc(
         &self,
         engine: &ExecutionNode,
@@ -504,7 +545,7 @@ where
         consensus_config: &ConsensusConfig<DB>,
         engine: &ExecutionNode,
         epoch_task_spawner: TaskSpawner,
-        engine_to_primary: EngineToPrimaryRpc,
+        rpc_context: WorkerRpcContext,
         gas_accumulator: GasAccumulator,
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<Vec<WorkerNode<DB>>> {
@@ -542,7 +583,7 @@ where
                 self.initialize_worker_node(
                     worker_id,
                     engine,
-                    engine_to_primary.clone(),
+                    rpc_context.clone(),
                     &gas_accumulator,
                 )
             })
@@ -568,7 +609,7 @@ where
         &self,
         worker_id: WorkerId,
         engine: &ExecutionNode,
-        mut engine_to_primary: EngineToPrimaryRpc,
+        rpc_context: WorkerRpcContext,
         gas_accumulator: &GasAccumulator,
     ) -> eyre::Result<()> {
         // The worker's shared base-fee container and a u64 snapshot of its current value. The
@@ -593,15 +634,29 @@ where
             // are reused when governance reactivates their worker ids.
             match engine.worker_state(worker_id).await {
                 WorkerState::Uninitialized => {
-                    engine_to_primary.node_info.worker_network_key =
-                        self.key_config.worker_network_public_key(worker_id);
-                    engine_to_primary.node_info.worker_external_address = self
-                        .builder
-                        .tn_config
-                        .node_info
-                        .worker_network_address(worker_id)
-                        .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
-                        .clone();
+                    let node_info = RpcNodeInfo {
+                        chain_id: rpc_context.chain_id,
+                        name: rpc_context.name,
+                        bls_public_key: rpc_context.bls_public_key,
+                        authority_id: rpc_context.authority_id,
+                        execution_address: rpc_context.execution_address,
+                        primary_network_key: rpc_context.primary_network_key,
+                        worker_network_key: self.key_config.worker_network_public_key(worker_id),
+                        primary_external_address: rpc_context.primary_external_address,
+                        worker_external_address: self
+                            .builder
+                            .tn_config
+                            .node_info
+                            .worker_network_address(worker_id)
+                            .ok_or_else(|| eyre!("no network address for worker {worker_id}"))?
+                            .clone(),
+                        version: rpc_context.version,
+                    };
+                    let engine_to_primary = EngineToPrimaryRpc::new(
+                        rpc_context.consensus_bus,
+                        self.consensus_chain.clone(),
+                        node_info,
+                    );
                     engine
                         .initialize_worker_components(
                             worker_id,
@@ -1208,12 +1263,24 @@ mod tests {
         Ok((node_config, reth_db))
     }
 
-    /// Epoch entry reuses worker 0's early RPC and joins worker peer waits concurrently.
-    /// Subsequent entries reuse active RPC servers and pools, refresh sync state, and stop and
-    /// reactivate removed workers over their retained pools.
+    /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
+    /// two-to-one-to-two transitions, closing and reopening removed workers' RPC listeners.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
+        assert_epoch_workers_are_reused(NodeMode::Observer).await
+    }
+
+    /// Active validators subscribe each worker and refresh its components after regrowing.
+    #[cfg(not(feature = "adiri"))]
+    #[tokio::test]
+    async fn cvv_epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
+        assert_epoch_workers_are_reused(NodeMode::CvvActive).await
+    }
+
+    /// Exercise the production startup seam with changing worker counts and distinct epochs.
+    #[cfg(not(feature = "adiri"))]
+    async fn assert_epoch_workers_are_reused(mode: NodeMode) -> eyre::Result<()> {
         use super::*;
         use crate::engine::TnBuilder;
         use jsonrpsee::core::client::ClientT as _;
@@ -1224,12 +1291,35 @@ mod tests {
         use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::{wait_until, CommitteeFixture};
-        use tn_types::{BlsKeypair, P2pNode, MIN_PROTOCOL_BASE_FEE};
+        use tn_types::{BlsKeypair, Committee, P2pNode, MIN_PROTOCOL_BASE_FEE};
+
+        /// The topic operation observed on one worker's network command channel.
+        #[derive(Debug, PartialEq)]
+        enum BatchTopicChange {
+            /// Subscribe with the committee's authorized publishers.
+            Subscribe(WorkerId, String, Option<HashSet<BlsPublicKey>>),
+            /// Remove a subscription when this node follows consensus as an observer.
+            Unsubscribe(WorkerId, String),
+        }
 
         let temp = tempfile::TempDir::new()?;
-        let keys =
-            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)));
+        let count = NonZeroUsize::new(2).ok_or_else(|| eyre!("two workers"))?;
+        let fixture =
+            CommitteeFixture::builder(MemDatabase::default).number_of_workers(count).build();
+        let committee = fixture.committee();
+        let keys = if mode.is_observer() {
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(557)))
+        } else {
+            fixture
+                .authorities()
+                .next()
+                .ok_or_else(|| eyre!("committee member"))?
+                .consensus_config()
+                .key_config()
+                .clone()
+        };
         let mut config = Config::default_for_test();
+        config.update_protocol_key(keys.primary_public_key())?;
         config.node_info.p2p_info.workers = (0..2)
             .map(|worker_id| {
                 Ok(P2pNode {
@@ -1240,11 +1330,6 @@ mod tests {
                 })
             })
             .collect::<eyre::Result<Vec<_>>>()?;
-        let count = NonZeroUsize::new(2).ok_or_else(|| eyre!("two workers"))?;
-        let committee = CommitteeFixture::builder(MemDatabase::default)
-            .build()
-            .committee()
-            .with_num_workers(count);
         let datadir = temp.path().to_path_buf();
         let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
         let network_tasks = TaskManager::default();
@@ -1254,15 +1339,30 @@ mod tests {
         let builder = TnBuilder::new(node_config, config.clone(), reth_db);
         let engine = ExecutionNode::new(&builder, reth_env)?;
         let db = MemDatabase::default();
-        let consensus_config = ConsensusConfig::new_with_committee_for_test(
-            config.clone(),
-            db.clone(),
-            keys.clone(),
-            committee.clone(),
-            NetworkConfig::default(),
-        )?;
-        let mut manager =
-            EpochManager::new(builder, datadir.clone(), db.clone(), keys, "test").await?;
+        let epoch_config = |epoch, workers| {
+            let committee = Committee::new_for_test(
+                committee
+                    .authorities()
+                    .into_iter()
+                    .map(|authority| (*authority.protocol_key(), authority))
+                    .collect(),
+                epoch,
+                committee.bootstrap_servers(),
+            )
+            .with_num_workers(workers);
+            ConsensusConfig::new_with_committee_for_test(
+                config.clone(),
+                db.clone(),
+                keys.clone(),
+                committee,
+                NetworkConfig::default(),
+            )
+        };
+        let consensus_config = epoch_config(0, count)?;
+        let repeat_config = epoch_config(1, count)?;
+        let shrink_config = epoch_config(2, NonZeroUsize::MIN)?;
+        let regrow_config = epoch_config(3, count)?;
+        let mut manager = EpochManager::new(builder, datadir.clone(), db, keys, "test").await?;
 
         accumulator.base_fee(DEFAULT_WORKER_ID).set_base_fee(100_000_000);
         // The startup listener needs no worker network or epoch tasks. It must report syncing
@@ -1294,27 +1394,47 @@ mod tests {
 
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
-        let mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
-        assert!(mode.is_observer(), "fixture must start as an observer");
+        let identified_mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        assert_eq!(std::mem::discriminant(&identified_mode), std::mem::discriminant(&mode));
+        let (topic_sender, mut topic_changes) = mpsc::unbounded_channel();
         // Neither worker can finish its first probe until both networks have entered their wait.
         let first_probes = Arc::new(tokio::sync::Barrier::new(2));
         manager.worker_network_handles = (0..2)
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
+                let topic_sender = topic_sender.clone();
                 let first_probes = first_probes.clone();
                 network_tasks.spawn_task("test worker commands", async move {
                     let probed = std::sync::atomic::AtomicBool::new(false);
                     tokio_stream::wrappers::ReceiverStream::new(receiver)
-                        .for_each(|command| async {
-                            if let NetworkCommand::EstablishedPeerCount { reply } = command {
-                                if !probed.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                    first_probes.wait().await;
+                        .for_each(|command| {
+                            let topic_sender = topic_sender.clone();
+                            let first_probes = &first_probes;
+                            let probed = &probed;
+                            async move {
+                                if let NetworkCommand::EstablishedPeerCount { reply } = command {
+                                    if !probed.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                        first_probes.wait().await;
+                                    }
+                                    let _ = reply.send(1);
+                                } else if let NetworkCommand::Subscribe {
+                                    topic,
+                                    publishers,
+                                    reply,
+                                } = command
+                                {
+                                    let _ = topic_sender.send(BatchTopicChange::Subscribe(
+                                        worker_id, topic, publishers,
+                                    ));
+                                    let _ = reply.send(Ok(true));
+                                } else if let NetworkCommand::Unsubscribe { topic, reply } = command
+                                {
+                                    let _ = topic_sender
+                                        .send(BatchTopicChange::Unsubscribe(worker_id, topic));
+                                    let _ = reply.send(false);
+                                } else if let NetworkCommand::ConnectedPeerIds { reply } = command {
+                                    let _ = reply.send(Default::default());
                                 }
-                                let _ = reply.send(1);
-                            } else if let NetworkCommand::Unsubscribe { reply, .. } = command {
-                                let _ = reply.send(false);
-                            } else if let NetworkCommand::ConnectedPeerIds { reply } = command {
-                                let _ = reply.send(Default::default());
                             }
                         })
                         .await;
@@ -1329,30 +1449,51 @@ mod tests {
                 )
             })
             .collect();
+        let publishers = committee
+            .authorities()
+            .into_iter()
+            .map(|authority| *authority.protocol_key())
+            .collect::<HashSet<_>>();
+        let chain_id = consensus_config.chain_id();
+        let mut assert_topics = |active_workers| {
+            let expected =
+                [(0, format!("tn-worker-{chain_id}-0")), (1, format!("tn-worker-{chain_id}-1"))]
+                    .into_iter()
+                    .take(active_workers)
+                    .map(|(id, topic)| {
+                        if mode.is_observer() {
+                            BatchTopicChange::Unsubscribe(id, topic)
+                        } else {
+                            BatchTopicChange::Subscribe(id, topic, Some(publishers.clone()))
+                        }
+                    })
+                    .collect::<Vec<_>>();
+            let mut observed =
+                std::iter::from_fn(|| topic_changes.try_recv().ok()).collect::<Vec<_>>();
+            // Worker peer waits run concurrently, so topic commands can arrive in either order.
+            observed.sort_by_key(|change| match change {
+                BatchTopicChange::Subscribe(worker_id, ..)
+                | BatchTopicChange::Unsubscribe(worker_id, ..) => *worker_id,
+            });
+            assert_eq!(observed, expected);
+        };
         let key = manager.key_config.public_key();
-        let rpc = EngineToPrimaryRpc::new(
-            manager.consensus_bus.clone(),
-            manager.consensus_chain.clone(),
-            RpcNodeInfo {
-                chain_id: consensus_config.chain_id(),
-                name: "multi-worker test".to_owned(),
-                bls_public_key: key,
-                authority_id: key.into(),
-                execution_address: manager.builder.tn_config.node_info.execution_address,
-                primary_network_key: manager.key_config.primary_network_public_key(),
-                worker_network_key: manager.key_config.worker_network_public_key(0),
-                primary_external_address: manager
-                    .builder
-                    .tn_config
-                    .node_info
-                    .primary_network_address()
-                    .clone(),
-                worker_external_address: consensus_config
-                    .worker_address(0)
-                    .ok_or_else(|| eyre!("worker zero address"))?,
-                version: "test",
-            },
-        );
+        let rpc_context = WorkerRpcContext {
+            consensus_bus: manager.consensus_bus.clone(),
+            chain_id: consensus_config.chain_id(),
+            name: "multi-worker test".to_owned(),
+            bls_public_key: key,
+            authority_id: key.into(),
+            execution_address: manager.builder.tn_config.node_info.execution_address,
+            primary_network_key: manager.key_config.primary_network_public_key(),
+            primary_external_address: manager
+                .builder
+                .tn_config
+                .node_info
+                .primary_network_address()
+                .clone(),
+            version: "test",
+        };
         accumulator.base_fee(0).set_base_fee(100_000_001);
         accumulator.base_fee(1).set_base_fee(100_000_002);
         assert_eq!(engine.worker_state(1).await, WorkerState::Uninitialized);
@@ -1362,7 +1503,7 @@ mod tests {
                 &consensus_config,
                 &engine,
                 epoch_tasks.get_spawner(),
-                rpc.clone(),
+                rpc_context.clone(),
                 accumulator.clone(),
                 HashSet::new(),
             )
@@ -1370,6 +1511,7 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
+        assert_topics(2);
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1413,50 +1555,47 @@ mod tests {
         epoch_tasks.abort_all_tasks();
         epoch_tasks.wait_for_task_shutdown().await;
         drop(epoch_tasks);
-        let mut next_tasks = TaskManager::default();
+
         accumulator.base_fee(1).set_base_fee(100_000_003);
-        let restarted = manager
+        let mut repeat_tasks = TaskManager::default();
+        let repeated = manager
             .spawn_worker_node_components(
-                &consensus_config,
+                &repeat_config,
                 &engine,
-                next_tasks.get_spawner(),
-                rpc.clone(),
+                repeat_tasks.get_spawner(),
+                rpc_context.clone(),
                 accumulator.clone(),
                 HashSet::new(),
             )
             .await?;
-        assert_eq!(restarted.len(), 2);
+        assert_eq!(repeated.len(), 2);
+        assert_topics(2);
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
-        assert_eq!(
-            engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
-            100_000_003
-        );
+        assert_eq!(retained_pool.block_info().pending_basefee, 100_000_003);
+        drop(repeated);
+        repeat_tasks.update_tasks();
+        repeat_tasks.abort_all_tasks();
+        repeat_tasks.wait_for_task_shutdown().await;
+        drop(repeat_tasks);
 
-        drop(restarted);
-        next_tasks.update_tasks();
-        next_tasks.abort_all_tasks();
-        next_tasks.wait_for_task_shutdown().await;
-        drop(next_tasks);
         accumulator.set_num_workers(1);
-        let smaller_committee = ConsensusConfig::new_with_committee_for_test(
-            config,
-            db,
-            manager.key_config.clone(),
-            committee.with_num_workers(NonZeroUsize::MIN),
-            NetworkConfig::default(),
-        )?;
         let mut shrink_tasks = TaskManager::default();
         let shrunk = manager
             .spawn_worker_node_components(
-                &smaller_committee,
+                &shrink_config,
                 &engine,
                 shrink_tasks.get_spawner(),
-                rpc.clone(),
+                rpc_context.clone(),
                 accumulator.clone(),
                 HashSet::new(),
             )
             .await?;
-        assert_eq!(shrunk.len(), 1);
+        let ids =
+            futures::stream::iter(&shrunk).then(|worker| worker.id()).collect::<Vec<_>>().await;
+        assert_eq!(ids, vec![0]);
+        assert_topics(1);
+        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1467,7 +1606,6 @@ mod tests {
         assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
         assert!(!engine.is_worker_initialized(1).await);
         assert!(engine.worker_http_client(&1).await.is_err());
-        assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert!(engine.is_worker_initialized(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
         wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
@@ -1479,6 +1617,14 @@ mod tests {
         engine.deactivate_workers_above(1).await;
         engine.set_workers_syncing(false).await;
         assert!(!engine.is_worker_initialized(1).await);
+        assert_eq!(
+            manager
+                .worker_network_handles
+                .iter()
+                .map(WorkerNetworkHandle::epoch)
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
         drop(shrunk);
         shrink_tasks.update_tasks();
         shrink_tasks.abort_all_tasks();
@@ -1486,19 +1632,23 @@ mod tests {
         drop(shrink_tasks);
 
         accumulator.set_num_workers(2);
+        let mut next_tasks = TaskManager::default();
         accumulator.base_fee(1).set_base_fee(100_000_004);
-        let regrow_tasks = TaskManager::default();
-        let regrown = manager
+        let restarted = manager
             .spawn_worker_node_components(
-                &consensus_config,
+                &regrow_config,
                 &engine,
-                regrow_tasks.get_spawner(),
-                rpc,
-                accumulator,
+                next_tasks.get_spawner(),
+                rpc_context.clone(),
+                accumulator.clone(),
                 HashSet::new(),
             )
             .await?;
-        assert_eq!(regrown.len(), 2);
+        assert_eq!(restarted.len(), 2);
+        let ids =
+            futures::stream::iter(&restarted).then(|worker| worker.id()).collect::<Vec<_>>().await;
+        assert_eq!(ids, vec![0, 1]);
+        assert_topics(2);
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1508,7 +1658,31 @@ mod tests {
         );
         assert!(engine.is_worker_initialized(1).await);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
+        assert_eq!(engine.worker_state(1).await, WorkerState::Running);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
+        assert_eq!(
+            manager
+                .worker_network_handles
+                .iter()
+                .map(WorkerNetworkHandle::epoch)
+                .collect::<Vec<_>>(),
+            vec![3, 3]
+        );
+        manager
+            .worker_network_handles
+            .get(1)
+            .ok_or_else(|| eyre!("regrown worker handle"))?
+            .get_task_spawner()
+            .spawn_task("regrown worker 1 task", futures::future::pending());
+        next_tasks.update_tasks();
+        assert!(
+            next_tasks.to_string().contains("regrown worker 1 task"),
+            "worker 1 must register tasks with the regrown epoch"
+        );
+        assert_eq!(
+            engine.get_worker_transaction_pool(&1).await?.block_info().pending_basefee,
+            100_000_004
+        );
         let reactivated =
             engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
         let syncing: serde_json::Value =
@@ -1524,7 +1698,7 @@ mod tests {
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
-        consensus_config.shutdown().notify();
+        regrow_config.shutdown().notify();
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1533,6 +1707,9 @@ mod tests {
             ]
         );
         assert!(engine.worker_http_local_address(&1).await?.is_some());
+        drop(restarted);
+        next_tasks.abort_all_tasks();
+        next_tasks.wait_for_task_shutdown().await;
         Ok(())
     }
 
