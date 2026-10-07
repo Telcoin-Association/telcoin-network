@@ -1541,6 +1541,43 @@ mod tests {
         }
     }
 
+    /// `AsyncPackIter::open` is the parser behind the peer-facing stream import, so it must refuse
+    /// a file stamped newer than the caller's `max_version` before reading any record, and still
+    /// read a file stamped at or below it. The equal and newer-reader cases pin `>` as the
+    /// comparison: `>=` would refuse the equal case and `!=` the newer-reader one.
+    #[tokio::test]
+    async fn test_async_pack_iter_version_gate() {
+        use crate::archive::pack_iter::AsyncPackIter;
+
+        let tmp_path = TempDir::with_prefix("test_async_pack_iter_version").expect("temp dir");
+        let path = tmp_path.path().join("pack_v1");
+        {
+            let mut pack: TestPack =
+                Pack::open(&path, 0, false, PackCompression::None, 1).expect("open pack");
+            pack.append(&TestRec { idx: 1, name: "Value One".to_string() }).expect("append");
+            pack.commit().expect("commit");
+        }
+
+        let file = tokio::fs::File::open(&path).await.expect("open file");
+        let res = AsyncPackIter::<TestRec, _>::open(file, 0, 0).await;
+        assert!(
+            matches!(res, Err(LoadHeaderError::InvalidVersion)),
+            "a v1 file must be refused by a reader that supports only v0, got {res:?}"
+        );
+
+        for max_version in [1, 2] {
+            let file = tokio::fs::File::open(&path).await.expect("open file");
+            let mut iter = AsyncPackIter::<TestRec, _>::open(file, 0, max_version)
+                .await
+                .unwrap_or_else(|e| panic!("max_version {max_version} must accept v1: {e:?}"));
+            assert_eq!(iter.version(), 1);
+            // one record only: the iterator reads to eof, so a second call would try to decode
+            // the clean-close sentinel as a record
+            let rec = iter.next().await.expect("one record").expect("record reads");
+            assert_eq!(rec.idx, 1);
+        }
+    }
+
     #[test]
     fn test_read_bytes_rejects_out_of_range() {
         let tmp_path = TempDir::with_prefix("test_read_bytes_oob").expect("temp dir");

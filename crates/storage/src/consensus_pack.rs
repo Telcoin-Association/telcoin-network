@@ -10706,6 +10706,79 @@ pub(crate) mod test {
         );
     }
 
+    /// A peer source stamped newer than `PACK_VERSION` is refused at its header, before anything
+    /// is written, instead of being parsed with this build's record layout. The control imports
+    /// the same bytes at `PACK_VERSION`, so the version stamp is the only thing that changes the
+    /// outcome.
+    #[tokio::test]
+    async fn test_stream_import_refuses_a_newer_pack_version() {
+        let source = TempDir::with_prefix("test_import_newer_src").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&source, &committee, &chain, &previous_epoch, 3, PACK_VERSION)
+            .await;
+        let data_file = source.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut logical = std::fs::read(&data_file).expect("read pack");
+        logical.truncate(logical.len() - crate::archive::data_file::SENTINEL_LEN as usize);
+
+        // the uid derives from the uid index and the compression is the same, so a header-only
+        // pack stamped one version ahead differs from the source header only in the version and
+        // the crc over it
+        let scratch = TempDir::with_prefix("test_import_newer_hdr").expect("temp dir");
+        let header_path = scratch.path().join("newer_header");
+        let newer_version = PACK_VERSION + 1;
+        let header_only =
+            Pack::<PackRecord>::open(&header_path, 0, false, PackCompression::ZStd, newer_version)
+                .expect("open header-only pack");
+        drop(header_only);
+        let newer_header = std::fs::read(&header_path).expect("read header-only pack");
+        let mut newer = logical.clone();
+        newer[..DATA_HEADER_BYTES].copy_from_slice(&newer_header[..DATA_HEADER_BYTES]);
+        assert_eq!(newer[..6], logical[..6], "type id must match");
+        assert_ne!(newer[6..8], logical[6..8], "version must differ");
+        assert_eq!(newer[8..24], logical[8..24], "uid, appnum and compression must match");
+
+        let control = TempDir::with_prefix("test_import_newer_ctl").expect("temp dir");
+        let imported = ConsensusPack::stream_import(
+            control.path(),
+            std::io::Cursor::new(logical),
+            0,
+            &previous_epoch,
+            3,
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the unmodified source must import, got {e:?}"));
+        imported.close().await;
+
+        let target = TempDir::with_prefix("test_import_newer_dst").expect("temp dir");
+        let Err(err) = ConsensusPack::stream_import(
+            target.path(),
+            std::io::Cursor::new(newer),
+            0,
+            &previous_epoch,
+            3,
+            Duration::from_secs(5),
+        )
+        .await
+        else {
+            panic!("a source newer than PACK_VERSION must be refused");
+        };
+        assert!(
+            matches!(
+                &err,
+                super::PackError::ReadError(msg) if msg.contains("unsupported pack file version")
+            ),
+            "got {err:?}"
+        );
+        assert!(
+            !target.path().join("epoch-0").join(Inner::DATA_NAME).exists(),
+            "nothing is written for a refused newer source"
+        );
+    }
+
     /// The v1/v2 import streams each output's batches straight into the pack instead of buffering
     /// the whole output, so the (committee-scaled) per-output decode budget never applies to it:
     /// with that budget forced down to a single byte, a multi-batch epoch still imports.
