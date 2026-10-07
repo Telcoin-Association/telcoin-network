@@ -35,11 +35,11 @@ use libp2p::{
     swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
-#[cfg(test)]
-use std::num::NonZeroUsize;
+use lru::LruCache;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
+    num::NonZeroUsize,
     time::{Duration, Instant},
 };
 use tn_config::{

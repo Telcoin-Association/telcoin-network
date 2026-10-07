@@ -12168,6 +12168,7 @@ dependencies = [
  "eyre",
  "futures",
  "libp2p",
+ "lru",
  "metrics",
  "metrics-util",
  "rand 0.9.2",
