@@ -569,11 +569,10 @@ pub async fn spawn_fetch_consensus(
                     // real record.
                     if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
                         let current = request.epoch_record().final_consensus.number;
-                        if fresh.final_consensus.number > current {
+                        let fresh_number = fresh.final_consensus.number;
+                        if fresh_number > current && request.set_epoch_record(fresh) {
                             info!(target: "state-sync",
-                                "refreshed epoch {epoch} record for retry: final_consensus {current} -> {}",
-                                fresh.final_consensus.number);
-                            request.set_epoch_record(fresh);
+                                "refreshed epoch {epoch} record for retry: final_consensus {current} -> {fresh_number}");
                         }
                     }
                     // this worker is about to wait; offer the requests it holds back first so they

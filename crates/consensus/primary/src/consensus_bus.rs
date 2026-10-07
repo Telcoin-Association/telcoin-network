@@ -442,6 +442,8 @@ pub struct EpochPackRequest {
     epoch_record: EpochRecord,
     /// This request's claim on its epoch.
     claim: EpochPackClaim,
+    /// Counts records [`Self::set_epoch_record`] drops for a different epoch.
+    metrics: PrimaryMetrics,
 }
 
 impl EpochPackRequest {
@@ -461,11 +463,20 @@ impl EpochPackRequest {
     }
 
     /// Replace the record of the requested epoch, for example with a newer one that arrived after
-    /// the request was queued. A record for a different epoch is ignored.
-    pub fn set_epoch_record(&mut self, record: EpochRecord) {
-        if record.epoch == self.claim.epoch {
-            self.epoch_record = record;
+    /// the request was queued.
+    ///
+    /// Returns whether the record was applied. A record for a different epoch is dropped, counted
+    /// and logged, since only a caller bug can offer one.
+    pub fn set_epoch_record(&mut self, record: EpochRecord) -> bool {
+        let requested = self.claim.epoch;
+        if record.epoch != requested {
+            self.metrics.epoch_pack_record_epoch_mismatch_total.increment(1);
+            warn!(target: "primary", requested, offered = record.epoch,
+                "dropped an epoch record offered to the pack request of a different epoch");
+            return false;
         }
+        self.epoch_record = record;
+        true
     }
 }
 
@@ -1023,7 +1034,12 @@ impl ConsensusBusApp {
         let Some(claim) = self.inner.epoch_pack_claims.claim(epoch_record.epoch) else {
             return;
         };
-        let request = EpochPackRequest { previous_epoch_record, epoch_record, claim };
+        let request = EpochPackRequest {
+            previous_epoch_record,
+            epoch_record,
+            claim,
+            metrics: self.inner.metrics.clone(),
+        };
         let _ = self.inner.epoch_request_queue_tx.send(request).await;
     }
 
@@ -1409,10 +1425,11 @@ mod tests {
         ConsensusBusApp, EpochPackRequest, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
         EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
     };
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
     use std::{collections::VecDeque, task::Poll, time::Duration};
     use tn_types::{
-        CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord,
-        TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
+        CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
     };
 
     /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
@@ -1606,6 +1623,38 @@ mod tests {
 
         bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
         assert_eq!(next_epoch(&bus).await, 7, "the panicked fetch released its epoch");
+    }
+
+    /// A record for another epoch is dropped and counted, while a record for the requested epoch
+    /// replaces the queued one.
+    #[tokio::test]
+    async fn set_epoch_record_drops_and_counts_a_record_for_another_epoch() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the bus registers its metrics with the recorder that is active while it is built
+        let bus = metrics::with_local_recorder(&recorder, ConsensusBusApp::new);
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let mut request = next_request(&bus).await;
+        let queued = request.epoch_record().clone();
+        let newer = |epoch| EpochRecord {
+            final_consensus: ConsensusNumHash { number: 42, ..Default::default() },
+            ..epoch_record(epoch)
+        };
+
+        assert!(!request.set_epoch_record(newer(8)), "a record for another epoch is dropped");
+        assert_eq!(request.epoch_record(), &queued, "the dropped record leaves the queued one");
+        let mismatches =
+            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == "tn_primary.epoch_pack_record_epoch_mismatch_total")
+                    .then_some(value)
+            });
+        assert!(
+            matches!(mismatches, Some(DebugValue::Counter(1))),
+            "the dropped record is counted once, got {mismatches:?}"
+        );
+
+        assert!(request.set_epoch_record(newer(7)), "a record for the requested epoch is applied");
+        assert_eq!(request.epoch_record(), &newer(7));
     }
 
     /// A bounded que channel queues exactly its capacity, then makes the producer wait.
