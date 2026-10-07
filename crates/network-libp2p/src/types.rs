@@ -75,6 +75,9 @@ pub(crate) trait NetworkTypeExt {
     /// back to the variant embedded in the consensus request enums when the peer has not
     /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
     fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+
+    /// Current-record retrieval protocol. See [`NetworkType::record_exchange_protocol_name`].
+    fn record_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
 }
 
 impl NetworkTypeExt for NetworkType {
@@ -92,6 +95,11 @@ impl NetworkTypeExt for NetworkType {
 
     fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         owned_protocol(self.peer_exchange_protocol_name(chain_id))
+    }
+
+    /// Build the stream-protocol form of the current-record retrieval capability.
+    fn record_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.record_exchange_protocol_name(chain_id))
     }
 }
 

@@ -62,7 +62,7 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
         let child = if i == 0 {
             start_validator_with_args(
                 i,
-                &bin,
+                bin,
                 &temp_path,
                 rpc_port,
                 "metrics_endpoint",
@@ -70,7 +70,7 @@ fn test_metrics_endpoint_serves_tn_and_reth_metrics() -> eyre::Result<()> {
                 &["--metrics", &metrics_addr],
             )
         } else {
-            start_validator(i, &bin, &temp_path, rpc_port, "metrics_endpoint", 0)
+            start_validator(i, bin, &temp_path, rpc_port, "metrics_endpoint", 0)
         };
         guard.push(child);
     }

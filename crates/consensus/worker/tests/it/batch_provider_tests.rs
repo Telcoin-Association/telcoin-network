@@ -18,7 +18,7 @@ use tn_storage::{
 };
 use tn_types::{
     error::BlockSealError, test_chain_spec_arc, Batch, Database, NoopTxnForwarder, SealedBatch,
-    TaskManager, TaskSpawner,
+    ShutdownNotifier, TaskManager, TaskSpawner,
 };
 use tn_worker::{
     quorum_waiter::{QuorumWaiterError, QuorumWaiterTrait},
@@ -88,6 +88,49 @@ async fn observer_empty_seal_is_noop() {
     assert_empty_seal_is_noop(None);
 }
 
+/// A committee validator refuses to seal once this epoch's consensus shutdown has begun.
+///
+/// The refusal comes before quorum, so no peer is asked to vote and the batch cache stays empty.
+#[tokio::test]
+async fn validator_refuses_seal_after_consensus_shutdown() {
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let quorum_waiter = RecordingQuorumWaiter::default();
+    let client = LocalNetwork::new_with_empty_id();
+    client
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
+    let shutdown = ShutdownNotifier::new();
+    let batch_provider = Worker::new(
+        0,
+        Some(quorum_waiter.clone()),
+        client,
+        store.clone(),
+        Duration::from_secs(5),
+        WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+        Arc::new(NoopTxnForwarder),
+        Vec::new(),
+    )
+    .with_consensus_shutdown(shutdown.clone());
+    let tx = transaction(test_chain_spec_arc());
+
+    // control: the same worker seals through quorum before shutdown
+    let before = Batch { transactions: vec![tx.clone()], ..Default::default() }.seal_slow();
+    batch_provider.seal(before).await.expect("seal before consensus shutdown");
+    assert_eq!(quorum_waiter.calls.load(Ordering::SeqCst), 1);
+
+    shutdown.notify();
+    let after = Batch { transactions: vec![tx.clone(), tx], ..Default::default() }.seal_slow();
+    let digest = after.digest();
+    let res = batch_provider.seal(after).await;
+    assert!(
+        matches!(res, Err(BlockSealError::ConsensusShuttingDown)),
+        "unexpected seal result: {res:?}"
+    );
+    assert_eq!(quorum_waiter.calls.load(Ordering::SeqCst), 1, "no quorum request after shutdown");
+    assert!(store.get::<OurNodeBatchesCache>(&digest).is_ok_and(|batch| batch.is_none()));
+}
+
 #[tokio::test]
 async fn make_batch() {
     let client = LocalNetwork::new_with_empty_id();
@@ -144,6 +187,10 @@ async fn make_batch() {
 /// admitted to a forward task. The test network handle discovers no validator RPC endpoints
 /// and `NoopTxnForwarder` admits nothing, so `seal` returns `NotValidator` and never writes
 /// the batch cache. An empty batch stays a success because there is nothing to forward.
+///
+/// The worker's consensus shutdown has already fired. The result is still `NotValidator`, not
+/// `ConsensusShuttingDown`, because the shutdown refusal guards only the quorum path and must not
+/// hold up forwarding.
 #[tokio::test]
 async fn observer_seal_without_admission_returns_not_validator() {
     let client = LocalNetwork::new_with_empty_id();
@@ -160,6 +207,8 @@ async fn observer_seal_without_admission_returns_not_validator() {
     let id = 0;
     let timeout = Duration::from_secs(5);
     let task_manager = TaskManager::default();
+    let consensus_shutdown = ShutdownNotifier::new();
+    consensus_shutdown.notify();
     let batch_provider = Worker::new(
         id,
         None::<TestMakeBlockQuorumWaiter>,
@@ -169,7 +218,8 @@ async fn observer_seal_without_admission_returns_not_validator() {
         WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
         Arc::new(NoopTxnForwarder),
         Vec::new(),
-    );
+    )
+    .with_consensus_shutdown(consensus_shutdown);
 
     // Seal a batch with transactions.
     let chain = test_chain_spec_arc();
@@ -178,7 +228,7 @@ async fn observer_seal_without_admission_returns_not_validator() {
     let digest = new_batch.digest();
 
     let res = batch_provider.seal(new_batch.seal_slow()).await;
-    assert!(matches!(res, Err(BlockSealError::NotValidator)));
+    assert!(matches!(res, Err(BlockSealError::NotValidator)), "unexpected seal result: {res:?}");
 
     // The observer path refuses before the batch cache write.
     assert!(store.get::<NodeBatchesCache>(&digest).unwrap().is_none());
@@ -186,4 +236,76 @@ async fn observer_seal_without_admission_returns_not_validator() {
     // An empty batch is still a success.
     let empty_batch = Batch { transactions: vec![], ..Default::default() };
     assert!(batch_provider.seal(empty_batch.seal_slow()).await.is_ok());
+}
+
+/// The batch metrics count a batch only once its report to the primary succeeds (issue #1444).
+///
+/// The first seal reaches quorum but no primary handler is registered, so the report fails
+/// with `FailedToReport`, as it does on a node whose proposer is not running, so nothing accepts
+/// the report. The batch builder keeps the transactions and re-seals the same batch, which
+/// reaches quorum again and is reported this time. Recording at quorum would count both attempts.
+#[tokio::test]
+async fn seal_records_batch_metrics_only_after_report() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    let client = LocalNetwork::new_with_empty_id();
+    let store = MemDatabase::default();
+    let task_manager = TaskManager::default();
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // metric handles bind to the recorder active at construction, so seals awaited outside
+    // this closure still record into the debugging recorder
+    let batch_provider = metrics::with_local_recorder(&recorder, || {
+        Worker::new(
+            0,
+            Some(RecordingQuorumWaiter::default()),
+            client.clone(),
+            store.clone(),
+            Duration::from_secs(5),
+            WorkerNetworkHandle::new_for_test(task_manager.get_spawner()),
+            Arc::new(NoopTxnForwarder),
+            Vec::new(),
+        )
+    });
+    let tx = transaction(test_chain_spec_arc());
+    let sealed_batch =
+        Batch { transactions: vec![tx.clone(), tx], ..Default::default() }.seal_slow();
+
+    // the worker records `Batch::size()`, which excludes the sealed digest
+    let expected_size = sealed_batch.batch().size() as f64;
+    // each snapshot swaps the counters to zero and drains the histograms, so every call returns
+    // only what the worker recorded since the previous call
+    let drain = || {
+        let (mut sealed, mut sizes, mut txs) = (None, None, None);
+        for (key, _, _, value) in snapshotter.snapshot().into_vec() {
+            if !key.key().labels().any(|l| l.key() == "worker" && l.value() == "0") {
+                continue;
+            }
+            match (key.key().name(), value) {
+                ("tn_worker.batches_sealed_total", DebugValue::Counter(n)) => sealed = Some(n),
+                ("tn_worker.batch_size_bytes", DebugValue::Histogram(xs)) => {
+                    sizes = Some(xs.into_iter().map(|x| x.0).collect::<Vec<f64>>())
+                }
+                ("tn_worker.batch_transactions", DebugValue::Histogram(xs)) => {
+                    txs = Some(xs.into_iter().map(|x| x.0).collect::<Vec<f64>>())
+                }
+                _ => {}
+            }
+        }
+        (
+            sealed.expect("tn_worker.batches_sealed_total registered for worker 0"),
+            sizes.expect("tn_worker.batch_size_bytes registered for worker 0"),
+            txs.expect("tn_worker.batch_transactions registered for worker 0"),
+        )
+    };
+
+    let res = batch_provider.seal(sealed_batch.clone()).await;
+    assert!(matches!(res, Err(BlockSealError::FailedToReport)), "first seal: {res:?}");
+    assert_eq!(drain(), (0, vec![], vec![]), "a seal whose report fails records nothing");
+
+    client
+        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .expect("register mock primary handler");
+    batch_provider.seal(sealed_batch).await.expect("re-seal reports to the primary");
+    assert_eq!(drain(), (1, vec![expected_size], vec![2.0]), "the reported seal is recorded once");
 }
