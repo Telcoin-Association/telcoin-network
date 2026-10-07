@@ -349,12 +349,114 @@ jobs:
         if: steps.scope.outputs.changed == 'true'
         run: cargo +1.94 clippy --locked --workspace --all-targets --keep-going -- -D warnings
 
-      - name: Confirm compiling Rust mutations
-        if: steps.scope.outputs.changed == 'true'
-        run: python3 -B -I tools/hub-capacity/mutate-rust.py --output target/debug/hub-capacity-mutations
+  # Each shard has its own checkout and target directory; mutations never race in one tree.
+  hub-capacity-mutation-shards:
+    needs: hub-capacity
+    if: needs.hub-capacity.outputs.qualification_required == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
 
-      - name: Retain mutation diagnostics
-        if: always() && steps.scope.outputs.changed == 'true'
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - name: Restore test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+
+      - name: Confirm compiling Rust mutations in this shard
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 -B -I tools/hub-capacity/mutate-rust.py
+          --output target/debug/hub-capacity-mutations
+          --shard-index ${{ matrix.shard }} --shard-count 2
+          --source "$EXPECTED_SOURCE" --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }}
+
+      - name: Retain mutation shard diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-${{ matrix.shard }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: target/debug/hub-capacity-mutations
+
+  hub-capacity-mutations:
+    needs: [hub-capacity, hub-capacity-mutation-shards]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Require complete mutation shard outcomes
+        env:
+          CODE_RESULT: ${{ needs.hub-capacity.result }}
+          REQUIRED: ${{ needs.hub-capacity.outputs.qualification_required }}
+          SHARDS_RESULT: ${{ needs.hub-capacity-mutation-shards.result }}
+        run: |
+          set -euo pipefail
+          test "$CODE_RESULT" = success
+          case "$REQUIRED" in
+            true) test "$SHARDS_RESULT" = success ;;
+            false) test "$SHARDS_RESULT" = skipped ;;
+            *) echo "::error::missing mutation scope decision"; exit 1 ;;
+          esac
+
+      - name: Download first mutation shard
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-0
+          path: ${{ runner.temp }}/hub-capacity-mutation-shards/0
+
+      - name: Download second mutation shard
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-1
+          path: ${{ runner.temp }}/hub-capacity-mutation-shards/1
+
+      - name: Reconcile every mutation case and raw command log
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          SHARDS_RESULT: ${{ needs.hub-capacity-mutation-shards.result }}
+        run: >-
+          python3 -B -I tools/hub-capacity/aggregate-mutations.py
+          --input "${{ runner.temp }}/hub-capacity-mutation-shards/0"
+          --input "${{ runner.temp }}/hub-capacity-mutation-shards/1"
+          --output target/debug/hub-capacity-mutations
+          --source "$EXPECTED_SOURCE" --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }}
+          --shards-result "$SHARDS_RESULT"
+
+      - name: Retain complete mutation evidence
+        if: always() && needs.hub-capacity.outputs.qualification_required == 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: hub-capacity-mutations-${{ github.event.pull_request.head.sha || github.sha }}
@@ -364,7 +466,7 @@ jobs:
 
   # A measured qualification is required whenever the capacity source scope changes.
   hub-capacity-qualification:
-    needs: hub-capacity
+    needs: [hub-capacity, hub-capacity-mutations]
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
@@ -583,7 +685,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, hub-capacity, hub-capacity-qualification, transport-evidence]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, hub-capacity, hub-capacity-mutations, hub-capacity-qualification, transport-evidence]
     steps:
       - name: Check all jobs passed
         env:
@@ -610,7 +712,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt hub-capacity hub-capacity-qualification test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt hub-capacity hub-capacity-mutations hub-capacity-qualification test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -638,8 +740,8 @@ jobs:
                 echo "::error::attest: ${result} on ${EVENT_NAME}"
                 failed=1
                 ;;
-              *:connection-limits-patch:success|*:hub-capacity:success|*:hub-capacity-qualification:success|*:transport-evidence:success) echo "  ok       ${job}" ;;
-              *:connection-limits-patch:*|*:hub-capacity:*|*:hub-capacity-qualification:*|*:transport-evidence:*)
+              *:connection-limits-patch:success|*:hub-capacity:success|*:hub-capacity-mutations:success|*:hub-capacity-qualification:success|*:transport-evidence:success) echo "  ok       ${job}" ;;
+              *:connection-limits-patch:*|*:hub-capacity:*|*:hub-capacity-mutations:*|*:hub-capacity-qualification:*|*:transport-evidence:*)
                 echo "::error::${job}: ${result}"
                 failed=1
                 ;;

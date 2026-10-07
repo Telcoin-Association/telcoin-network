@@ -17,6 +17,7 @@ import tomllib
 
 
 ROOT = Path(__file__).resolve().parents[2]
+MAX_LOG_BYTES = 64 * 1024**2
 CASES = [
     ("catchup_demotion_verified_target", "crates/consensus/primary/src/network/handler.rs",
      "self.consensus_bus\n                                .publish_consensus_num_hash_if_newer(epoch, number, hash);",
@@ -229,7 +230,7 @@ def execute(argv, directory, label):
     """Retain finite compiler/test logs, without accepting a compiler failure as a killed mutant."""
     result = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800)
     raw = result.stdout + result.stderr
-    if len(raw) > 64 * 1024**2:
+    if len(raw) > MAX_LOG_BYTES:
         raise ValueError("mutation command log exceeds 64 MiB")
     path = directory / (label + ".log")
     path.write_bytes(raw)
@@ -270,14 +271,52 @@ def mutation_commands(relative, regression):
     return package, compile_argv, test_argv
 
 
+def select_cases(shard_index=0, shard_count=1):
+    """Partition the unchanged ordered registry without omitting or duplicating a control."""
+    if not 1 <= shard_count <= len(CASES) or not 0 <= shard_index < shard_count:
+        raise ValueError("invalid mutation shard index/count")
+    names = [case[0] for case in CASES]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate mutation registry identity")
+    return [case for index, case in enumerate(CASES) if index % shard_count == shard_index]
+
+
+def provenance(source, run_id, run_attempt):
+    """Bind receipts to the clean checked-out source and the caller's current CI execution."""
+    if not re.fullmatch(r"[0-9a-f]{40}", source or "") or any(
+            not re.fullmatch(r"[1-9][0-9]{0,19}", value or "") for value in (run_id, run_attempt)):
+        raise ValueError("invalid mutation source/run provenance")
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT).decode().strip()
+    tree = subprocess.check_output(["git", "rev-parse", "HEAD^{tree}"], cwd=ROOT).decode().strip()
+    if head != source or subprocess.run(["git", "diff", "--quiet", "HEAD", "--"], cwd=ROOT).returncode:
+        raise ValueError("mutation checkout must match the clean expected source")
+    return {"source": head, "tree": tree, "run_id": run_id, "run_attempt": run_attempt,
+            "registry_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            "case_set_sha256": hashlib.sha256(json.dumps(CASES, separators=(",", ":")).encode()).hexdigest()}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--shard-index", type=int, default=0)
+    parser.add_argument("--shard-count", type=int, default=1)
+    parser.add_argument("--source")
+    parser.add_argument("--run-id")
+    parser.add_argument("--run-attempt")
     args = parser.parse_args()
+    selected = select_cases(args.shard_index, args.shard_count)
+    supplied = (args.source, args.run_id, args.run_attempt)
+    if (args.shard_count > 1 or any(supplied)) and not all(supplied):
+        raise ValueError("sharded mutation execution requires source/run provenance")
+    identity = provenance(*supplied) if all(supplied) else None
     args.output.mkdir(parents=True, exist_ok=False)
+    manifest = {"version": 1, "provenance": identity, "shard_index": args.shard_index,
+                "shard_count": args.shard_count, "cases": [case[0] for case in selected],
+                "complete": False}
+    (args.output / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
     reports = []
     try:
-        for name, relative, before, after, regression in CASES:
+        for name, relative, before, after, regression in selected:
             path = ROOT / relative
             original = path.read_bytes()
             text = original.decode()
@@ -291,6 +330,7 @@ def main():
                       "source_sha256": hashlib.sha256(original).hexdigest(), "control": control}
             try:
                 path.write_text(text.replace(before, after))
+                report["mutated_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
                 compiler, _, compilation = execute(compile_argv, args.output, name + "-compile")
                 report["compilation"] = compilation
                 if compiler:
@@ -304,7 +344,13 @@ def main():
                 path.write_bytes(original)
                 report["restored_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
                 reports.append(report)
+                if report["restored_sha256"] != report["source_sha256"]:
+                    raise ValueError(f"{name}: mutation source was not restored")
             print(json.dumps({"mutation": name, "detected": True}, sort_keys=True), flush=True)
+        if identity is not None and provenance(*supplied) != identity:
+            raise ValueError("mutation source provenance changed during execution")
+        manifest["complete"] = True
+        (args.output / "manifest.json").write_text(json.dumps(manifest, sort_keys=True) + "\n")
     finally:
         with (args.output / "report.json").open("x") as output:
             json.dump(reports, output, allow_nan=False, sort_keys=True, indent=2)

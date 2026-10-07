@@ -23,7 +23,7 @@ def execute(event, run_lanes, transport, script=None, capacity=None, connection_
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
                     "transport-evidence": {"result": transport}})
     results.update({name: {"result": "success"} for name in (
-        "connection-limits-patch", "hub-capacity", "hub-capacity-qualification")})
+        "connection-limits-patch", "hub-capacity", "hub-capacity-mutations", "hub-capacity-qualification")})
     results["connection-limits-patch"] = {"result": connection_limits}
     if capacity:
         results.update({name: {"result": outcome} for name, outcome in capacity.items()})
@@ -35,7 +35,7 @@ def execute(event, run_lanes, transport, script=None, capacity=None, connection_
 class TransportGate(unittest.TestCase):
     def test_capacity_lanes_remain_required(self):
         for event, run_lanes in (("pull_request", False), ("merge_group", True)):
-            for lane in ("connection-limits-patch", "hub-capacity", "hub-capacity-qualification"):
+            for lane in ("connection-limits-patch", "hub-capacity", "hub-capacity-mutations", "hub-capacity-qualification"):
                 for outcome in ("skipped", "cancelled", "failure"):
                     with self.subTest(event=event, lane=lane, outcome=outcome):
                         self.assertNotEqual(execute(event, run_lanes, "success",
