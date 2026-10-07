@@ -149,7 +149,7 @@ telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-arg
 
 ### Advertising a JSON-RPC endpoint
 
-A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.workers[0].rpc` (worker 0's entry) and advertised by the worker network when the node runs.
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so observers can forward transactions to it and the `node-record-api` daemon can list it on a public site. The endpoint is stored in `node-info.yaml` under `p2p_info.workers[0].rpc` (worker 0's entry) and advertised by the worker network when the node runs.
 
 `keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
 
