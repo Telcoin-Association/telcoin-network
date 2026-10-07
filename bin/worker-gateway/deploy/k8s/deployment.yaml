@@ -84,7 +84,12 @@ spec:
               memory: 64Mi
             limits:
               cpu: "1"
-              memory: 256Mi
+              # Sized for the gateway's defaults: every open connection can
+              # hold one request body plus its read buffer, about
+              # 1.5 x --max-request-bytes, so 1.5 x 500 x 1 MiB + 64 MiB for the
+              # process is about 814 MiB. Recompute it if you change either flag
+              # (see deploy/README.md, "Memory limit").
+              memory: 1Gi
           securityContext:
             runAsNonRoot: true
             # Matches the non-root uid baked into the image.

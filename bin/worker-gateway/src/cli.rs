@@ -133,9 +133,11 @@ pub(crate) struct Cli {
     )]
     pub(crate) max_connection_duration: Duration,
 
-    /// Maximum request body the gateway will accept, in bytes. Requests whose
-    /// body exceeds this are rejected with a JSON-RPC "request too large" error
-    /// before being forwarded.
+    /// Maximum request body the gateway will accept, in bytes (default 1 MiB).
+    /// Requests whose body exceeds this are rejected with a JSON-RPC "request
+    /// too large" error before being forwarded. Each open connection can buffer
+    /// one body this large, so keep `--max-connections` times this value well
+    /// under the process memory limit.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_REQUEST_BYTES",
@@ -571,7 +573,7 @@ mod tests {
     #[test]
     fn edge_protection_defaults() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
-        assert_eq!(settings.max_request_bytes, 26_214_400);
+        assert_eq!(settings.max_request_bytes, 1_048_576);
         let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
         assert_eq!(per_ip.rate().get(), 100);
         // A zero burst flag derives twice the sustained rate.

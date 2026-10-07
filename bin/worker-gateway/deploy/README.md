@@ -61,6 +61,14 @@ gateway's 1s join margin, so the process has room to drain in-flight proxied
 requests before the kubelet escalates to SIGKILL. If you raise the gateway's
 drain timeout or the preStop sleep, raise this too.
 
+## Memory limit
+
+The gateway buffers each request body whole before it forwards it, and every open connection can hold one body.
+A held body costs more than its size, because the connection's read buffer (up to about 400 KiB) stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB.
+Size the container's memory limit as 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB for the process baseline and response streaming.
+At the defaults that is 1.5 × 500 × 1 MiB + 64 MiB, about 814 MiB, and the Deployment's 1Gi limit leaves about 300 MiB over the measured peak.
+If you raise either flag, raise the limit with it; if the limit has to stay lower, lower one of the flags until the product fits (`--max-connections 256` needs about 448 MiB).
+
 ## Metrics scraping (ServiceMonitor)
 
 `servicemonitor.yaml` uses `monitoring.coreos.com/v1`, which is provided by the

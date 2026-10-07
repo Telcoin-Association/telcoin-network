@@ -40,8 +40,13 @@ use crate::{
 /// Default maximum request body the gateway will buffer before forwarding.
 ///
 /// A guard against unbounded memory use; the effective limit is configurable
-/// via `--max-request-bytes` (this value is that flag's default).
-pub(crate) const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
+/// via `--max-request-bytes` (this value is that flag's default). 1 MiB is four
+/// times the largest admissible submission: the worker's pool admits at most
+/// 128 KiB of raw transaction (reth's `DEFAULT_MAX_TX_INPUT_BYTES`), about
+/// 256 KiB once hex-encoded. Each open connection can buffer one body this
+/// large, so peak request memory is roughly `--max-connections` times this value
+/// (see the README's "Request size" section).
+pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// The one JSON-RPC method whose payload the gateway inspects before
 /// forwarding (a raw-transaction submission).

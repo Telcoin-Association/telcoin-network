@@ -107,7 +107,7 @@ Every flag has an environment-variable fallback.
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
-| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `26214400` | Max request body size, in bytes. |
+| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
@@ -220,8 +220,26 @@ limit.
 
 ### Request size
 
-`--max-request-bytes` (default 25 MiB) caps the buffered request body; a larger
-body is rejected with a JSON-RPC "request too large" error before forwarding.
+`--max-request-bytes` (default 1 MiB) caps the buffered request body; a larger
+body is rejected with a JSON-RPC "request too large" error (`413`, `-32003`)
+before forwarding.
+
+Size it from both ends:
+
+- **Large enough for a submission.** The worker's transaction pool admits at
+  most 128 KiB of raw transaction (reth's `DEFAULT_MAX_TX_INPUT_BYTES`, which
+  the node does not override). Hex-encoded inside an `eth_sendRawTransaction`
+  call that is about 256 KiB, so the 1 MiB default fits the largest admissible
+  submission with room to spare, or a batch of three. If the node raises
+  `--txpool.max-tx-input-bytes`, raise this flag to at least twice that value
+  plus a little for the JSON envelope. There is no point going above the
+  worker's own request cap, 15 MiB (the node's `--rpc.max-request-size`
+  default of `15`, in MiB): the worker rejects anything larger anyway.
+- **Small enough for memory.** The whole body is buffered before it is forwarded, and every open connection can hold one, so peak request memory is about `--max-connections` × `--max-request-bytes` plus per-connection and runtime overhead.
+  Keep that well under the container's memory limit.
+  A held body costs more than its size, because the connection's read buffer stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB, so budget about 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB.
+  With the defaults that is about 814 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
+  If you raise either flag, raise the limit with it, or lower one of the two flags until the product fits, for example `--max-connections 128` for about 128 MiB.
 
 ### Transaction screening
 
