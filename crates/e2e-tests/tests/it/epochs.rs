@@ -445,8 +445,14 @@ async fn test_epoch_sync_inner(
         for epoch in 0..=latest_epoch {
             let val_name = committee[i].0;
             let file_test = epoch_pack_path(&temp_path.join(val_name), epoch);
-            let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
-            assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
+            // Observing current_epoch on validator 0 does not mean every node has finished
+            // creating or importing its packs, especially the restarted validator.
+            wait_until(
+                Duration::from_secs((EPOCH_DURATION * 6).max(60)),
+                &format!("epoch pack for validator {val_name} on epoch {epoch}"),
+                || async { file_test.try_exists().map_err(Into::into) },
+            )
+            .await?;
             // A node was killed and restarted earlier in this test, so it must back-fill the
             // epoch certificates it missed while down. That recovery is a fixed async cost:
             // the restarted node re-collects each missing cert from its peers via the
