@@ -29,15 +29,21 @@ use tokio::{
     },
     time::error::Elapsed,
 };
-use tracing::error;
+use tracing::{error, warn};
 
-/// Capacity for the `sync_output` broadcast.
+/// Depth of the bounded `sync_output` queue.
 ///
-/// Items are full [`ConsensusOutput`]s (subdag + batches), so a deep buffer costs hundreds of
-/// MB when a follower lags. The state-sync producer waits for execution to catch up before each
-/// send and fails fast on a digest-chain mismatch, so a deep buffer buys nothing: 1_000 bounds
-/// worst-case memory while still absorbing bursts.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 1_000;
+/// `sync_output` is a bounded mpsc: once this many outputs are queued, the state-sync producer's
+/// `send().await` blocks until the subscriber takes one. The producer's `wait_for_execution` only
+/// throttles non-empty outputs (an empty output produces no block to wait for), so while it
+/// replays empty outputs from a local pack this queue is its only throttle. A broadcast here would
+/// drop the oldest outputs once the producer ran a buffer ahead, and the subscriber cannot recover
+/// an output it never received.
+///
+/// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
+/// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
+/// 2.5 s of subscriber work at 7-13 ms per saved output.
+const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
 /// Capacity for the `exex_certificates` broadcast.
 ///
 /// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
@@ -92,18 +98,33 @@ pub struct QueChannel<T> {
 impl<T> QueChannel<T> {
     /// Create a new QueChannel.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let receiver = Arc::new(Mutex::new(Some(rx)));
-        let subscribed = Arc::new(AtomicBool::new(false));
-        Self { channel: tx, receiver, subscribed, always_subscribed: false }
+        Self::build(CHANNEL_CAPACITY, false)
     }
 
     /// Create a new QueChannel that will que messages even when no subscribers.
     pub fn new_always_subscribed() -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        Self::build(CHANNEL_CAPACITY, true)
+    }
+
+    /// Create a new QueChannel that queues at most `capacity` messages.
+    ///
+    /// Once `capacity` messages are queued, `send().await` waits for the subscriber to receive
+    /// one and `try_send` returns [`tn_types::TrySendError::Full`], so a slow subscriber
+    /// backpressures the producer instead of losing messages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0, like [`tokio::sync::mpsc::channel`].
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::build(capacity, false)
+    }
+
+    /// Build the channel. With `always_subscribed` it queues messages even with no subscriber.
+    fn build(capacity: usize, always_subscribed: bool) -> Self {
+        let (tx, rx) = mpsc::channel(capacity);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        let subscribed = Arc::new(AtomicBool::new(true));
-        Self { channel: tx, receiver, subscribed, always_subscribed: true }
+        let subscribed = Arc::new(AtomicBool::new(always_subscribed));
+        Self { channel: tx, receiver, subscribed, always_subscribed }
     }
 
     /// Subscribe to receive messages on this channel.
@@ -117,6 +138,38 @@ impl<T> QueChannel<T> {
         let receiver = self.receiver.lock().take();
         if receiver.is_none() {
             panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+            always_subscribed: self.always_subscribed,
+        }
+    }
+
+    /// Subscribe like [`Self::subscribe`], first discarding anything a previous subscriber left
+    /// queued.
+    ///
+    /// For channels whose messages only mean something to the subscriber that was live when they
+    /// were sent. The drain happens here rather than when the old receiver drops: a receiver can
+    /// drop while its producer is still blocked in `send().await`, and that send would land after
+    /// a drain-on-drop. By the time the next subscriber subscribes, the old producer has been
+    /// aborted with its epoch's tasks and the new producer is not spawned yet (callers subscribe
+    /// before spawning it), so nothing races this drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another subscription is in use, like [`Self::subscribe`].
+    pub fn subscribe_fresh(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let mut receiver = self.receiver.lock().take();
+        let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
+        let discarded = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        if discarded > 0 {
+            warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
@@ -261,8 +314,9 @@ pub struct ConsensusBusAppInner {
 
     /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
     /// subscriber for execution. Filled by the state-sync forward drain; used only by
-    /// non-active nodes.
-    sync_output: broadcast::Sender<ConsensusOutput>,
+    /// non-active nodes. A bounded queue (`SYNC_OUTPUT_CHANNEL_CAPACITY`), so a subscriber that
+    /// falls behind blocks the producer instead of losing outputs.
+    sync_output: QueChannel<ConsensusOutput>,
     /// Broadcast the latest output from consensus after committing to the subdag.
     /// Engine consumes and executes to extend canonical chain.
     consensus_output: broadcast::Sender<ConsensusOutput>,
@@ -378,7 +432,7 @@ impl ConsensusBusApp {
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
-        let (sync_output, _rx_sync_output) = broadcast::channel(SYNC_OUTPUT_CHANNEL_CAPACITY);
+        let sync_output = QueChannel::with_capacity(SYNC_OUTPUT_CHANNEL_CAPACITY);
         let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
 
         let (exex_certificates, _) = broadcast::channel(EXEX_CERTIFICATES_CHANNEL_CAPACITY);
@@ -565,8 +619,10 @@ impl ConsensusBusApp {
         &self.inner.consensus_output
     }
 
-    /// Broadcast channel delivering verified consensus OUTPUTs (header + batches) to a
+    /// Bounded queue delivering verified consensus OUTPUTs (header + batches) to a
     /// following/catching-up subscriber for execution. Used when not participating in consensus.
+    /// `send().await` waits while the subscriber is a full queue behind; with no subscriber a
+    /// send is a no-op.
     pub fn sync_output(&self) -> &impl TnSender<ConsensusOutput> {
         &self.inner.sync_output
     }
@@ -656,8 +712,15 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscription(Receiver) to verified sync consensus outputs.
+    ///
+    /// Outputs a previous subscriber left queued are discarded, so the new subscriber only sees
+    /// what its own producer sends. Only one subscription can be live at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the previous subscription has not been dropped yet.
     pub fn subscribe_sync_output(&self) -> impl TnReceiver<ConsensusOutput> {
-        self.inner.sync_output.subscribe()
+        self.inner.sync_output.subscribe_fresh()
     }
 
     /// Broadcast sender for verified certificates (ExEx).
@@ -1186,5 +1249,131 @@ mod exex_receiver_count_tests {
         drop(output);
         assert_eq!(bus.exex_certificates().receiver_count(), 0);
         assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ConsensusBusApp, QueChannel, SYNC_OUTPUT_CHANNEL_CAPACITY};
+    use std::{collections::VecDeque, task::Poll, time::Duration};
+    use tn_types::{
+        CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, TnReceiver as _, TnSender as _,
+        TryRecvError, TrySendError,
+    };
+
+    /// The smallest output that can sit in `sync_output`; only its number matters here.
+    fn output(number: u64) -> ConsensusOutput {
+        ConsensusOutput::new(
+            CommittedSubDag::default(),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            VecDeque::new(),
+            vec![],
+        )
+    }
+
+    /// A bounded que channel queues exactly its capacity, then makes the producer wait.
+    #[tokio::test]
+    async fn que_channel_with_capacity_applies_backpressure() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let mut rx = channel.subscribe();
+        for item in 0..4 {
+            assert!(channel.send(item).await.is_ok(), "a send within capacity completes");
+        }
+        assert!(matches!(channel.try_send(4), Err(TrySendError::Full(4))));
+
+        // a fifth send waits for room instead of dropping or overwriting anything
+        let fifth = channel.send(4);
+        tokio::pin!(fifth);
+        assert!(futures::poll!(fifth.as_mut()).is_pending(), "a send into a full queue waits");
+
+        // one recv frees a slot and the waiting send completes
+        assert_eq!(rx.recv().await, Some(0));
+        assert!(matches!(futures::poll!(fifth.as_mut()), Poll::Ready(Ok(()))));
+        for expected in 1..=4 {
+            assert_eq!(rx.try_recv(), Ok(expected));
+        }
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A burst of three times the capacity against a slow consumer arrives complete and in
+    /// order.
+    #[tokio::test]
+    async fn que_channel_burst_loses_nothing() {
+        const CAPACITY: usize = 8;
+        const ITEMS: u64 = CAPACITY as u64 * 3;
+        let channel = QueChannel::<u64>::with_capacity(CAPACITY);
+        let mut rx = channel.subscribe();
+        let producer = tokio::spawn({
+            let channel = channel.clone();
+            async move {
+                for item in 0..ITEMS {
+                    assert!(channel.send(item).await.is_ok(), "send failed");
+                }
+            }
+        });
+
+        for expected in 0..ITEMS {
+            let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the next item arrives")
+                .expect("the channel stays open");
+            assert_eq!(item, expected);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("the producer finishes");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// `sync_output` is a bounded queue: once full it reports `Full`, which a broadcast never
+    /// does. A new subscription starts empty even though the previous one left the queue full.
+    #[test]
+    fn sync_output_is_bounded_backpressured_queue() {
+        let bus = ConsensusBusApp::new();
+        let rx = bus.subscribe_sync_output();
+        for number in 1..=SYNC_OUTPUT_CHANNEL_CAPACITY as u64 {
+            assert!(bus.sync_output().try_send(output(number)).is_ok(), "output {number} fits");
+        }
+        assert!(matches!(
+            bus.sync_output().try_send(output(SYNC_OUTPUT_CHANNEL_CAPACITY as u64 + 1)),
+            Err(TrySendError::Full(_))
+        ));
+
+        drop(rx);
+        let mut rx = bus.subscribe_sync_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// `subscribe_fresh` drops what a previous subscriber left unread and then delivers what is
+    /// sent to it.
+    #[test]
+    fn subscribe_fresh_discards_previous_subscriber_leftovers() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let rx = channel.subscribe();
+        assert!(channel.try_send(1).is_ok());
+        assert!(channel.try_send(2).is_ok());
+        drop(rx);
+
+        let mut rx = channel.subscribe_fresh();
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert!(channel.try_send(3).is_ok());
+        assert_eq!(rx.try_recv(), Ok(3));
+    }
+
+    /// Plain `subscribe` still hands leftovers to the next subscriber; `primary_network_events`
+    /// relies on messages surviving a resubscribe.
+    #[test]
+    fn subscribe_keeps_previous_subscriber_leftovers() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let rx = channel.subscribe();
+        assert!(channel.try_send(1).is_ok());
+        assert!(channel.try_send(2).is_ok());
+        drop(rx);
+
+        let mut rx = channel.subscribe();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

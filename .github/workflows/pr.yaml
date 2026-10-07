@@ -241,6 +241,24 @@ jobs:
       - name: Check formatting
         run: ./etc/ci-lanes.sh fmt
 
+  # This carried dependency is outside the workspace, so workspace test lanes do not
+  # exercise its accounting regressions. Run them for maintainer PRs as well.
+  #
+  # No cache step: main warms no entry for this package (cache-deps.yaml) and the
+  # policy above lets no lane save one, so a restore would find nothing. The cold
+  # dependency build takes about 75 s, inside the lane's 15-minute budget.
+  connection-limits-patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+
+      - name: Test connection accounting
+        run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
+
   # Clippy - replaces cargo check, catches more issues.
   #
   # Two passes, default features and then --all-features (see etc/ci-lanes.sh for why one
@@ -397,7 +415,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, transport-evidence]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, transport-evidence]
     steps:
       - name: Check all jobs passed
         env:
@@ -424,7 +442,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy fmt test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -450,6 +468,11 @@ jobs:
               merge_group:attest:skipped) echo "  skipped  ${job} (verified at queue entry)" ;;
               *:attest:*)
                 echo "::error::attest: ${result} on ${EVENT_NAME}"
+                failed=1
+                ;;
+              *:connection-limits-patch:success) echo "  ok       ${job}" ;;
+              *:connection-limits-patch:*)
+                echo "::error::connection-limits-patch: ${result}"
                 failed=1
                 ;;
               *:transport-evidence:success) echo "  ok       ${job}" ;;
