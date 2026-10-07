@@ -66,6 +66,8 @@ class ObservationTests(unittest.TestCase):
         path = mock.Mock()
         path.open.return_value = stream
         path.stat.side_effect = [SimpleNamespace(st_size=len(partial)),
+                                 SimpleNamespace(st_size=len(partial) + 1),
+                                 SimpleNamespace(st_size=len(partial) + 1),
                                  SimpleNamespace(st_size=len(partial) + 1), OSError("fixture complete")]
 
         def complete_line(delay):
@@ -108,15 +110,16 @@ class ObservationTests(unittest.TestCase):
         observations = OBSERVATIONS.Observations(["hub-1", "hub-2"])
         def entry(ended, success):
             return {"target": "network::capacity", "fields": {
-                "event": "committee_request", "unix_us": str(ended), "latency_us": "10", "success": success}}
+                "event": "committee_request", "unix_us": str(ended), "latency_us": "10", "success": success,
+                "generation": "a" * 32, "request_id": ended, "allocated_request_count": ended,
+                "process_id": 1, "started_unix_us": ended - 10}}
         observations.ingest("hub-1", entry(100, True))
         observations.ingest("hub-1", entry(200, False))
         observations.ingest("hub-1", entry(300, True))
         request = {"scenario": "committee_progress", "identity": "hub-1", "not_before_unix_us": 150}
         batch = observations.query(request)["trace"]["observations"]
         self.assertEqual([entry["record"]["fields"]["success"] for entry in batch], [False, True])
-        with self.assertRaises(TimeoutError):
-            observations.query(request, timeout=0)
+        self.assertEqual(observations.query(request, timeout=0)["collector_status"], "empty")
         for _ in range(1024):
             observations.ingest("hub-2", entry(200, True))
         observations.ingest("hub-2", entry(300, False))

@@ -74,7 +74,7 @@ def select(metrics, name, labels=None):
 def capacity_metrics(raw, progress_name):
     """Parse capacity and progress series while preserving the full response in raw telemetry."""
     selected = "\n".join(line for line in raw.splitlines()
-                         if line.startswith(("tn_network_", progress_name)))
+                         if line.startswith(("tn_network_", "tn_primary_vote_observation_allocated", progress_name)))
     return parse_metrics(selected)
 
 
@@ -232,10 +232,10 @@ def read_operations(path):
             scenario = entry.pop("scenario")
             if scenario not in result:
                 raise ValueError("unknown workload scenario")
+            if entry.get("kind") == "collector_telemetry":
+                continue
             # Full command output and protocol traces remain in the hashed operations artifact.
-            result[scenario].append({key: value for key, value in entry.items() if key in {
-                "id", "success", "rejection_reason", "latency_ms", "elapsed_seconds", "hops", "cancelled",
-            }})
+            result[scenario].append({key: value for key, value in entry.items() if key in QUALIFY.OPERATION_FIELDS})
     return result
 
 
@@ -289,12 +289,14 @@ def collect(frozen, bindings, phase, output):
             raise ValueError(f"{hub}: running executable digest mismatch")
         _, identities[hub], _ = process_sample(pid)
     started = time.monotonic()
+    started_unix_us = time.time_ns() // 1000
     samples = []
     child = None
     try:
         with workload_log.open("xb") as log:
             # The driver writes operation observations with timestamps relative to this origin.
             environment = {**os.environ, "HUB_CAPACITY_ORIGIN": str(started),
+                           "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(started_unix_us),
                            "HUB_CAPACITY_OPERATIONS": str(operations.resolve()),
                            "HUB_CAPACITY_PHASE": phase, "HUB_CAPACITY_PLAN_SHA256": QUALIFY.digest(plan)}
             child = subprocess.Popen(bindings["workload"], stdout=log, stderr=log, env=environment)
@@ -312,7 +314,8 @@ def collect(frozen, bindings, phase, output):
                         raise ValueError("metrics response exceeds 4 MiB")
                     text = body.decode()
                     raw.append({"hub": hub, "elapsed_seconds": elapsed,
-                                "pid": binding["pid"], "stat": stat, "metrics": text})
+                                "pid": binding["pid"], "stat": stat, "metrics": text,
+                                "workload_completed_before_sample": completed_before_sample})
                     hubs[hub] = {**process, **observations(capacity_metrics(text, binding["progress"]["name"]), binding, phase)}
                 samples.append({"elapsed_seconds": elapsed, "hubs": hubs})
                 if elapsed >= plan["envelope"]["duration_seconds"] and completed_before_sample:
@@ -331,12 +334,16 @@ def collect(frozen, bindings, phase, output):
             "phase": phase, "plan_sha256": QUALIFY.digest(plan), "revision": plan[phase]["revision"],
             "profile_sha256": QUALIFY.digest(plan[phase]["profile"]),
             "binary_sha256": plan[phase]["binary_sha256"], "envelope": plan["envelope"],
+            "measurement_start_unix_us": started_unix_us,
+            "committee_sources": {hub: node["bls_key"] for hub, node in zip(
+                plan["hubs"], QUALIFY.read_json(topology)["population"]["validators"][:2])},
             "samples": samples, "operations": read_operations(operations),
             "artifacts": raw.artifacts() + protocol_artifacts + [
                 {"path": path.name, "sha256": file_hash(path)} for path in (operations, workload_log, topology)
             ],
         }
         QUALIFY.validate_evidence(plan, result, phase)
+        QUALIFY.verify_artifacts(result, output)
         with (output / "evidence.json").open("x") as stream:
             json.dump(result, stream, allow_nan=False)
         return result

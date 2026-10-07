@@ -3,6 +3,7 @@
 
 import argparse
 import importlib.util
+import hashlib
 import os
 from collections import OrderedDict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -24,21 +25,26 @@ class Observations:
         self.publications = OrderedDict()
         self.committee = {hub: deque() for hub in hubs}
         self.measuring = set()
+        self.positions = {}
         self.error = None
 
-    def ingest(self, source, record):
+    def ingest(self, source, record, *, offset=0, line_sha256=None):
         if record.get("target") != "network::capacity":
             return
         fields = record["fields"]
         with self.condition:
-            observation = {"source": source, "record": record}
+            observation = {"source": source, "record": record, "offset": offset,
+                           "line_sha256": line_sha256}
+            if fields["event"] == "committee_observation_error":
+                raise ValueError("native committee observation identity failed")
             if fields["event"] == "gossip_publish":
                 key = (fields["message_id"], fields["source"])
                 self.publications[key] = observation
                 self.publications.move_to_end(key)
                 if len(self.publications) > 8192:
                     self.publications.popitem(last=False)
-            elif fields["event"] == "committee_request" and source in self.committee:
+            elif fields["event"] in {"committee_request_start", "committee_request"} and source in self.committee:
+                QUALIFY.committee_identity(fields)
                 queue = self.committee[source]
                 if len(queue) >= 1024:
                     if source in self.measuring:
@@ -67,16 +73,25 @@ class Observations:
                     while queue and len(entries) < 32:
                         observation = queue.popleft()
                         fields = observation["record"]["fields"]
-                        if int(fields["unix_us"]) - int(fields["latency_us"]) >= request["not_before_unix_us"]:
+                        if int(fields["started_unix_us"]) >= request["not_before_unix_us"]:
                             entries.append(observation)
                     if entries:
-                        return {"success": True, "trace": {"observations": entries}}
+                        return {"success": True, "collector_status": "batch",
+                                "trace": {"observations": entries, **self.position(request["identity"])}}
                 else:
                     raise ValueError("unsupported observation scenario")
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if request["scenario"] == "committee_progress":
+                        return {"success": True, "collector_status": "empty",
+                                "trace": {"observations": [], **self.position(request["identity"])}}
                     raise TimeoutError("no matching production observation before deadline")
                 self.condition.wait(remaining)
+
+    def position(self, source):
+        offset, size = self.positions.get(source, (0, -1))
+        return {"offset": offset, "size": size, "caught_up": offset == size,
+                "queued": len(self.committee[source])}
 
 
 def follow(observations, source, path):
@@ -97,8 +112,15 @@ def follow(observations, source, path):
                         record = json.loads(line)
                     except (UnicodeError, json.JSONDecodeError):
                         # Other process output remains in the retained raw log.
-                        continue
-                    observations.ingest(source, record)
+                        if b"committee_" in line:
+                            raise ValueError("invalid native committee log record")
+                        record = None
+                    if record is not None:
+                        observations.ingest(source, record, offset=position,
+                                            line_sha256=hashlib.sha256(line).hexdigest())
+                with observations.condition:
+                    observations.positions[source] = (stream.tell(), path.stat().st_size)
+                    observations.condition.notify_all()
     except (OSError, ValueError, KeyError, TypeError) as error:
         with observations.condition:
             observations.error = f"{source}: {error}"
@@ -115,7 +137,7 @@ def handler_for(observations):
                 request = json.loads(self.rfile.read(length))
                 response = observations.query(request)
             except (OSError, ValueError, KeyError, TypeError, TimeoutError) as error:
-                response = {"success": False, "rejection_reason": str(error)}
+                response = {"success": False, "collector_status": "error", "rejection_reason": str(error)}
             data = json.dumps(response, allow_nan=False, separators=(",", ":")).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")

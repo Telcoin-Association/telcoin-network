@@ -208,6 +208,12 @@ Commands for peers outside the shared-NAT group enter their native bounded comma
 servers concurrently, with sixteen slots per client. Commands for a shared-NAT
 peer are serialized with its restart, so a command cannot contact the stopped
 process. Restarts stop the old process before checking the replacement's connections.
+An ordinary join also holds its client's lifecycle lease: existing commands drain
+before disconnecting, and new commands wait until the native join acknowledges
+completion. Admission consumes the existing command deadline. An uncertain join
+transport failure quarantines that client and attempts to stop its process before
+releasing the lease; failed cleanup leaves the client quarantined. Other clients
+continue their concurrent workloads.
 Protocol failures remain failed operations. The frozen driver allows 32 concurrent
 gossip commands and 60 commands across all declared scenarios, within 64 active
 driver slots and 72 private control handlers. Saturation remains a failed attempt.
@@ -254,6 +260,14 @@ event. Successful routes require three distinct identities and publication
 after measurement starts. Committee observations come from every validator's
 production JSON log, with the measured hubs' actual vote-request latency,
 completion, failure and cancellation data.
+Each native vote request has a process generation and monotonically allocated ID,
+retained on both its start and terminal observation. A bounded consumer per hub
+collects these events against one fixed measurement interval and drains in-window
+requests within the existing final collection deadline. Empty polls are telemetry;
+native failures and cancellations retain their original outcomes and latencies.
+Offline scoring reconciles raw starts, terminals and scored request identities,
+then checks the allocated-ID prefix against an independent post-drain metrics
+watermark. Missing, duplicate or conflicting evidence fails qualification.
 
 `workload.py` schedules all eight scenarios concurrently with bounded command
 concurrency. The declared scenarios overlap at 60 commands; the driver allows

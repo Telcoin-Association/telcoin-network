@@ -79,8 +79,10 @@ def control_arguments(argv):
     return argparse.Namespace(**values)
 
 
-def execute(agent, scenario, operation_id, origin, timeout):
+def execute(agent, scenario, operation_id, origin, timeout, measurement_unix_us=None):
     """Measure one command, keeping timeouts and refusals in the operation population."""
+    if scenario == "committee_progress":
+        raise ValueError("committee observations require the dedicated bounded consumer")
     started = time.monotonic()
     result = {"scenario": scenario, "id": operation_id, "success": False,
               "rejection_reason": None, "agent": agent["identity"], "argv": agent["argv"],
@@ -88,7 +90,7 @@ def execute(agent, scenario, operation_id, origin, timeout):
               "driver_execution_mode": "subprocess"}
     environment = {**os.environ, "HUB_CAPACITY_OPERATION_ID": operation_id,
                    "HUB_CAPACITY_SCENARIO": scenario,
-                   "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(time.time_ns() // 1000 - int((started - origin) * 1_000_000))}
+                    "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(measurement_unix_us if measurement_unix_us is not None else time.time_ns() // 1000 - int((started - origin) * 1_000_000))}
     child = None
     try:
         with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
@@ -155,27 +157,6 @@ def execute(agent, scenario, operation_id, origin, timeout):
                     if publication["event"] != "gossip_publish" or publication["message_id"] != receipt["message_id"] or publication["source"] != result["route"][0] or receipt["propagation_source"] != result["route"][1] or published < int(environment["HUB_CAPACITY_MEASUREMENT_UNIX_US"]) or received < published:
                         raise ValueError("gossip receipt does not match its measured production publication")
                     result["latency_ms"] = (received - published) / 1000
-                if scenario == "committee_progress" and result["trace"]:
-                    entries = result["trace"]["observations"]
-                    if not isinstance(entries, list) or not 1 <= len(entries) <= 1024:
-                        raise ValueError("committee observation batches must be bounded and nonempty")
-                    measured = []
-                    for index, observation in enumerate(entries):
-                        fields = observation["record"]["fields"]
-                        latency = int(fields["latency_us"])
-                        ended = int(fields["unix_us"])
-                        measurement = int(environment["HUB_CAPACITY_MEASUREMENT_UNIX_US"])
-                        if fields["event"] != "committee_request" or observation["source"] != agent["identity"] or type(fields["success"]) is not bool or type(fields["completed"]) is not bool or (fields["success"] and not fields["completed"]) or latency < 0 or ended - latency < measurement or ended > time.time_ns() // 1000:
-                            raise ValueError("committee observation does not belong to the measured request population")
-                        measured.append({"scenario": scenario, "id": f"{operation_id}-{index}",
-                                         "agent": agent["identity"], "argv": agent["argv"],
-                                         "driver_execution_mode": result["driver_execution_mode"],
-                                         "success": fields["success"], "latency_ms": latency / 1000,
-                                         "cancelled": not fields["completed"],
-                                         "rejection_reason": None if fields["success"] else "committee request failed or was cancelled",
-                                         "elapsed_seconds": (ended - measurement) / 1_000_000,
-                                         "trace": {"observation": observation}})
-                    result["committee_observations"] = measured
     except TimeoutError:
         result["success"] = False
         result["rejection_reason"] = "timeout"
@@ -216,31 +197,96 @@ def validate_bulk_trace(trace):
             expected = set(digests)
 
 
-def run(plan, manifest, output, origin):
+def consume_committee(agent, origin, measurement_unix_us, duration, record):
+    """One consumer owns each hub queue, with bounded pending state and the existing tail budget."""
+    args = control_arguments(agent["argv"])
+    if args is None or args.identity != agent["identity"] or not args.observations:
+        raise ValueError("committee consumer must bind the native observation adapter and hub")
+    end = origin + duration
+    deadline = end + 30
+    pending = {}
+    started_count = terminal_count = 0
+    poll = 0
+    while time.monotonic() < deadline:
+        response = CONTROL.post(args.observations, {
+            "scenario": "committee_progress", "identity": agent["identity"],
+            "not_before_unix_us": measurement_unix_us,
+        }, deadline=min(deadline, time.monotonic() + 30))
+        if response.get("success") is not True or response.get("collector_status") not in {"empty", "batch"}:
+            raise ValueError(f"committee collector failed: {response.get('rejection_reason', 'invalid acknowledgement')}")
+        trace = response["trace"]
+        entries = trace["observations"]
+        if not isinstance(entries, list) or len(entries) > 32 or bool(entries) != (response["collector_status"] == "batch"):
+            raise ValueError("invalid bounded committee batch")
+        for observation in entries:
+            if observation["source"] != agent["identity"]:
+                raise ValueError("committee observation source mismatch")
+            fields = observation["record"]["fields"]
+            identity = QUALIFY.committee_identity(fields)
+            started = QUALIFY.native_integer(fields, "started_unix_us", 1)
+            if not measurement_unix_us <= started < measurement_unix_us + duration * 1_000_000:
+                continue
+            if fields["event"] == "committee_request_start":
+                if identity in pending or len(pending) >= 1024:
+                    raise ValueError("committee pending start duplicate or capacity exhausted")
+                pending[identity] = (started, fields["process_id"], fields["header"], fields["peer"])
+                started_count += 1
+            elif fields["event"] == "committee_request":
+                expected = (started, fields["process_id"], fields["header"], fields["peer"])
+                if pending.pop(identity, None) != expected:
+                    raise ValueError("committee terminal has no matching native start")
+                record(QUALIFY.committee_operation(observation, measurement_unix_us, duration))
+                terminal_count += 1
+            else:
+                raise ValueError("unknown committee observation event")
+        QUALIFY.integer(trace["offset"], "follower offset", 0)
+        QUALIFY.integer(trace["size"], "follower size", 0)
+        QUALIFY.integer(trace["queued"], "follower queue", 0)
+        if type(trace["caught_up"]) is not bool or trace["caught_up"] != (trace["offset"] == trace["size"]):
+            raise ValueError("invalid follower position")
+        complete = time.monotonic() >= end and not pending and trace["queued"] == 0 and trace["caught_up"]
+        record({"kind": "collector_telemetry", "scenario": "committee_progress",
+                "source": agent["identity"], "poll": poll,
+                "state": "complete" if complete else response["collector_status"],
+                "elapsed_seconds": time.monotonic() - origin,
+                "measurement_start_unix_us": measurement_unix_us,
+                "started": started_count, "terminals": terminal_count,
+                "pending": len(pending), "follower": {key: trace[key] for key in ("offset", "size", "queued", "caught_up")}})
+        poll += 1
+        if complete:
+            return
+    raise ValueError("committee observation drain incomplete within thirty seconds")
+
+
+def run(plan, manifest, output, origin, measurement_unix_us=None):
     validate_manifest(plan, manifest)
     duration = plan["envelope"]["duration_seconds"]
+    if measurement_unix_us is None:
+        measurement_unix_us = time.time_ns() // 1000 - int((time.monotonic() - origin) * 1_000_000)
     write_lock = threading.Lock()
     command_slots = threading.BoundedSemaphore(MAX_ACTIVE_COMMANDS)
     with output.open("x") as stream:
         def record(entry):
             with write_lock:
-                entries = entry.pop("committee_observations", None) if entry["success"] else None
-                if entries is not None:
-                    # Final scrapes retain drain completions only for requests started in the window.
-                    entries = [measured for measured in entries
-                               if 0 <= round(measured["elapsed_seconds"] * 1_000_000)
-                               - round(measured["latency_ms"] * 1000) < duration * 1_000_000]
-                else:
-                    entries = [entry]
-                for measured in entries:
-                    stream.write(json.dumps(measured, allow_nan=False, separators=(",", ":")) + "\n")
+                stream.write(json.dumps(entry, allow_nan=False, separators=(",", ":")) + "\n")
                 stream.flush()
 
         def scenario_run(scenario):
             definition = manifest["scenarios"][scenario]
-            target = plan["thresholds"]["scenarios"][scenario]["minimum_attempts"]
             if scenario == "committee_progress":
-                target = max(target, duration * 4)
+                agents = definition["agents"]
+                if len(agents) != 2 or len({agent["identity"] for agent in agents}) != 2 or not 2 <= definition["concurrency"] <= 4:
+                    raise ValueError("committee collection requires two distinct hub consumers under cap four")
+                def consume(agent):
+                    with command_slots:
+                        consume_committee(agent, origin, measurement_unix_us, duration, record)
+                with ThreadPoolExecutor(max_workers=definition["concurrency"]) as executor:
+                    consumers = [executor.submit(consume, agent)
+                                 for agent in agents]
+                    for future in consumers:
+                        future.result()
+                return
+            target = plan["thresholds"]["scenarios"][scenario]["minimum_attempts"]
             # Commands are not queued when their bounded execution slots are all occupied.
             slots = threading.BoundedSemaphore(definition["concurrency"])
             with ThreadPoolExecutor(max_workers=definition["concurrency"]) as executor:
@@ -265,7 +311,7 @@ def run(plan, manifest, output, origin):
 
                     def attempt(agent=agent, operation_id=operation_id):
                         try:
-                            record(execute(agent, scenario, operation_id, origin, 30))
+                            record(execute(agent, scenario, operation_id, origin, 30, measurement_unix_us))
                         finally:
                             command_slots.release()
                             slots.release()
@@ -273,11 +319,6 @@ def run(plan, manifest, output, origin):
                     futures.append(executor.submit(attempt))
                 for future in futures:
                     future.result()
-                if scenario == "committee_progress":
-                    time.sleep(max(0, origin + duration - time.monotonic()))
-                    for index, agent in enumerate(definition["agents"]):
-                        with command_slots:
-                            record(execute(agent, scenario, f"committee_progress-final-{index}", origin, 30))
 
         with ThreadPoolExecutor(max_workers=len(QUALIFY.SCENARIOS)) as executor:
             list(executor.map(scenario_run, sorted(QUALIFY.SCENARIOS)))
@@ -302,7 +343,7 @@ def main():
         raise ValueError("workload plan identity mismatch")
     QUALIFY.validate_plan(plan)
     run(plan, QUALIFY.read_json(args.manifest), Path(os.environ["HUB_CAPACITY_OPERATIONS"]),
-        float(os.environ["HUB_CAPACITY_ORIGIN"]))
+        float(os.environ["HUB_CAPACITY_ORIGIN"]), int(os.environ["HUB_CAPACITY_MEASUREMENT_UNIX_US"]))
 
 
 if __name__ == "__main__":

@@ -30,7 +30,8 @@ class SupervisorTests(unittest.TestCase):
 
         def transport(request, timeout):
             payload = json.loads(request.data)
-            self.assertEqual(timeout, 29)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 29)
             entered.wait()
             response = mock.MagicMock()
             response.__enter__.return_value.read.return_value = json.dumps({
@@ -126,7 +127,8 @@ class SupervisorTests(unittest.TestCase):
             peer.generation = 1
 
         def transport(request, timeout):
-            self.assertEqual(timeout, 29)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 29)
             payload = json.loads(request.data)
             if payload["operation_id"] == "hung":
                 entered.set()
@@ -164,6 +166,158 @@ class SupervisorTests(unittest.TestCase):
         self.assertEqual(peer.active_forwards, 0)
         self.assertFalse(peer.restarting)
 
+    def test_public_join_drains_only_its_peer_and_excludes_new_transfers(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                              Path("unused"), Path("unused"))
+        other = SUPERVISE.Peer({"identity": "other-peer", "ip": "10.147.1.2", "nat": False},
+                               Path("unused"), Path("unused"))
+        peer.process = mock.Mock(pid=123)
+        peer.process.poll.return_value = None
+        peer.generation = 0
+        sync_entered, release_sync = threading.Event(), threading.Event()
+        join_entered, release_join = threading.Event(), threading.Event()
+        draining, ordinary_waiting, ordinary_entered = (threading.Event() for _ in range(3))
+        operation = threading.local()
+
+        class OperationCondition(threading.Condition):
+            def wait(self, timeout=None):
+                if operation.scenario == "public_join":
+                    draining.set()
+                else:
+                    ordinary_waiting.set()
+                return super().wait(timeout)
+
+        peer.condition = OperationCondition()
+
+        def command(scenario):
+            operation.scenario = scenario
+            return peer.command({"operation_id": scenario, "scenario": scenario})
+
+        def forward(request, forwarded, restart, timeout=29):
+            if request["scenario"] == "concurrent_sync":
+                sync_entered.set()
+                if not release_sync.wait(2):
+                    raise TimeoutError("test did not release active sync")
+            elif request["scenario"] == "public_join":
+                join_entered.set()
+                if not release_join.wait(2):
+                    raise TimeoutError("test did not release public join")
+            else:
+                ordinary_entered.set()
+            return {"success": True}
+
+        with mock.patch.object(peer, "forward", side_effect=forward), \
+                mock.patch.object(peer, "start") as start, \
+                mock.patch.object(peer, "stop") as stop, \
+                mock.patch.object(other, "forward", return_value={"success": True}), \
+                ThreadPoolExecutor(max_workers=3) as executor:
+            sync = executor.submit(command, "concurrent_sync")
+            try:
+                self.assertTrue(sync_entered.wait(1))
+                join = executor.submit(command, "public_join")
+                self.assertTrue(draining.wait(1))
+                self.assertFalse(join_entered.is_set())
+                ordinary = executor.submit(command, "record_lookup")
+                self.assertTrue(ordinary_waiting.wait(1))
+                self.assertTrue(other.command({"operation_id": "other", "scenario": "record_lookup"})["success"])
+                release_sync.set()
+                self.assertTrue(sync.result(timeout=1)["success"])
+                self.assertTrue(join_entered.wait(1))
+                self.assertFalse(ordinary_entered.is_set())
+                release_join.set()
+                self.assertTrue(join.result(timeout=1)["success"])
+                self.assertTrue(ordinary.result(timeout=1)["success"])
+            finally:
+                release_sync.set()
+                release_join.set()
+            start.assert_not_called()
+            stop.assert_not_called()
+        self.assertEqual(peer.active_forwards, 0)
+        self.assertFalse(peer.restarting)
+        self.assertEqual(peer.generation, 0)
+
+    def test_expired_public_join_never_enters_transport(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                              Path("unused"), Path("unused"))
+        now = [0]
+
+        def drain(predicate, timeout=None):
+            now[0] = 30_000_000_000
+            return True
+
+        with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                mock.patch.object(peer.condition, "wait_for", side_effect=drain), \
+                mock.patch.object(peer, "forward") as forward:
+            with self.assertRaises(TimeoutError):
+                peer.command({"operation_id": "expired", "scenario": "public_join"})
+            forward.assert_not_called()
+        self.assertEqual(peer.active_forwards, 0)
+        self.assertFalse(peer.restarting)
+        self.assertTrue(peer.lock.acquire(blocking=False))
+        peer.lock.release()
+
+    def test_acknowledged_failed_public_join_releases_lifecycle_and_command_capacity(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                              Path("unused"), Path("unused"))
+        with mock.patch.object(peer, "forward", side_effect=[{"success": False}, {"success": True}]):
+            self.assertFalse(peer.command({"operation_id": "join", "scenario": "public_join"})["success"])
+            self.assertFalse(peer.restarting)
+            self.assertEqual(peer.active_forwards, 0)
+            self.assertTrue(peer.lock.acquire(blocking=False))
+            peer.lock.release()
+            self.assertTrue(peer.command({"operation_id": "after", "scenario": "record_lookup"})["success"])
+        leases = [peer.command_slots.acquire(blocking=False) for _ in range(72)]
+        self.assertTrue(all(leases))
+        self.assertFalse(peer.command_slots.acquire(blocking=False))
+        for _ in leases:
+            peer.command_slots.release()
+
+    def test_public_join_transport_timeout_quarantines_before_releasing_lease(self):
+        for cleanup_error in (None, TimeoutError("child termination failed")):
+            with self.subTest(cleanup_error=cleanup_error):
+                peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                                      Path("unused"), Path("unused"))
+
+                def stop():
+                    self.assertTrue(peer.stopping)
+                    self.assertTrue(peer.restarting)
+                    self.assertEqual(peer.active_forwards, 1)
+                    self.assertFalse(peer.lock.acquire(blocking=False))
+                    with self.assertRaisesRegex(ValueError, "shutting down"):
+                        peer.command({"operation_id": "during", "scenario": "concurrent_sync"})
+                    if cleanup_error:
+                        raise cleanup_error
+
+                with mock.patch.object(peer, "forward", side_effect=TimeoutError("join timed out")) as forward, \
+                        mock.patch.object(peer, "stop", side_effect=stop) as stopped:
+                    with self.assertRaises(TimeoutError):
+                        peer.command({"operation_id": "join", "scenario": "public_join"})
+                    stopped.assert_called_once()
+                    with self.assertRaisesRegex(ValueError, "shutting down"):
+                        peer.command({"operation_id": "after", "scenario": "record_lookup"})
+                    forward.assert_called_once()
+                self.assertEqual(peer.active_forwards, 0)
+                self.assertFalse(peer.restarting)
+                self.assertTrue(peer.lock.acquire(blocking=False))
+                peer.lock.release()
+
+    def test_public_join_drain_consumes_the_existing_transport_budget(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": False},
+                              Path("unused"), Path("unused"))
+        now = [0]
+
+        def drain(predicate, timeout=None):
+            self.assertEqual(timeout, 29)
+            now[0] = 5_000_000_000
+            return True
+
+        request = {"operation_id": "join", "scenario": "public_join"}
+        with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                mock.patch.object(peer.condition, "wait_for", side_effect=drain), \
+                mock.patch.object(peer, "forward", return_value={"success": True}) as forward:
+            self.assertTrue(peer.command(request)["success"])
+            forward.assert_called_once_with(request, request, None, timeout=24)
+
     def test_command_admission_is_bounded_without_queued_transport(self):
         peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
                               Path("unused"), Path("unused"))
@@ -173,7 +327,8 @@ class SupervisorTests(unittest.TestCase):
 
         def transport(request, timeout):
             nonlocal count
-            self.assertEqual(timeout, 29)
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 29)
             with lock:
                 count += 1
                 if count == 72:

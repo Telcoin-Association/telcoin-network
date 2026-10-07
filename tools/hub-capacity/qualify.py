@@ -30,6 +30,67 @@ TASK_LIMITS = {
     "worker-1": {"batch_stream": 5, "worker_shed": 8, "prefetch": 8},
 }
 
+OPERATION_FIELDS = {"id", "success", "rejection_reason", "latency_ms", "elapsed_seconds",
+                    "hops", "cancelled", "committee_request"}
+
+
+def native_integer(fields, name, minimum=0):
+    value = fields[name]
+    if type(value) is not int and (not isinstance(value, str) or re.fullmatch(r"[0-9]{1,20}", value) is None):
+        fail(f"invalid native {name}")
+    value = int(value)
+    if not minimum <= value <= 2**64 - 1:
+        fail(f"invalid native {name}")
+    return value
+
+
+def committee_identity(fields):
+    generation = fields["generation"]
+    if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+        fail("invalid native process generation")
+    request_id = native_integer(fields, "request_id", 1)
+    if request_id > native_integer(fields, "allocated_request_count", 1):
+        fail("request identity exceeds producer allocation watermark")
+    native_integer(fields, "process_id", 1)
+    native_integer(fields, "started_unix_us", 1)
+    return generation, request_id
+
+
+def committee_operation(observation, measurement, duration):
+    """Project a real terminal while preserving its exact request and raw-log provenance."""
+    fields = observation["record"]["fields"]
+    generation, request_id = committee_identity(fields)
+    started = native_integer(fields, "started_unix_us", 1)
+    ended = native_integer(fields, "unix_us", 1)
+    latency = native_integer(fields, "latency_us")
+    outcome = fields["outcome"]
+    if fields["event"] != "committee_request" or observation["record"]["target"] != "network::capacity":
+        fail("committee operation must reference a native terminal")
+    if not measurement <= started < measurement + duration * 1_000_000 or ended < started:
+        fail("committee request started outside measurement interval")
+    if type(fields["success"]) is not bool or type(fields["completed"]) is not bool:
+        fail("native committee outcome flags must be boolean")
+    if outcome not in {"vote", "missing_parents", "rpc_retryable", "rpc_error", "network_error", "cancelled"}:
+        fail("unknown native committee outcome")
+    if fields["success"] != (outcome in {"vote", "missing_parents"}) or fields["completed"] != (outcome != "cancelled"):
+        fail("inconsistent native committee outcome")
+    native_integer(fields, "retry_count")
+    integer(observation["offset"], "terminal log offset", 0)
+    if re.fullmatch(r"[0-9a-f]{64}", observation["line_sha256"]) is None:
+        fail("native terminal requires raw line digest")
+    source = observation["source"]
+    if not isinstance(source, str) or not source:
+        fail("native terminal requires a hub identity")
+    return {"scenario": "committee_progress", "id": f"committee-{source}-{generation}-{request_id}",
+            "success": fields["success"], "cancelled": not fields["completed"],
+            "rejection_reason": None if fields["success"] else fields.get("error") or outcome,
+            "latency_ms": latency / 1000, "elapsed_seconds": (ended - measurement) / 1_000_000,
+            "committee_request": {"source": source, "generation": generation, "request_id": request_id,
+                                  "process_id": native_integer(fields, "process_id", 1),
+                                  "started_unix_us": started, "terminal_offset": observation["offset"],
+                                  "terminal_line_sha256": observation["line_sha256"]},
+            "trace": {"observation": observation}}
+
 
 def read_json(path):
     """Bound input size and reject duplicate keys and nonfinite JSON numbers."""
@@ -156,6 +217,8 @@ def validate_evidence(plan, evidence, phase):
         fail("deployed binary mismatch")
     if evidence.get("envelope") != plan["envelope"]:
         fail("baseline and candidate must use the declared envelope")
+    if "committee_sources" in evidence and list(evidence["committee_sources"]) != plan["hubs"]:
+        fail("committee source order must match the declared hub order")
     if not evidence.get("artifacts"):
         fail("raw telemetry and workload logs must be retained")
     for artifact in evidence["artifacts"]:
@@ -228,7 +291,8 @@ def validate_evidence(plan, evidence, phase):
                 fail("operation lies outside captured interval")
             # Native committee observations declare cancellation state; failed queries do not.
             if scenario == "committee_progress" and (operation["success"] or "cancelled" in operation):
-                started_us = round(at * 1_000_000) - round(latency * 1000)
+                started_us = (operation["committee_request"]["started_unix_us"] - evidence["measurement_start_unix_us"]
+                              if "committee_request" in operation else round(at * 1_000_000) - round(latency * 1000))
                 if not 0 <= started_us < plan["envelope"]["duration_seconds"] * 1_000_000:
                     fail("committee request started outside measurement interval")
             if scenario == "gossip_two_hops" and operation["success"]:
@@ -318,6 +382,175 @@ def raw_artifact_limit(path):
     return MAX_PROTOCOL_LOG_BYTES if re.fullmatch(r"protocol-[0-9]{2}\.jsonl", path) else MAX_RAW_ARTIFACT_BYTES
 
 
+def raw_records(path, expected_hash, maximum_line):
+    """Scan bounded hash-bound records and retain their exact byte provenance."""
+    hasher = hashlib.sha256()
+    offset = 0
+    with path.open("rb") as stream:
+        while line := stream.readline(maximum_line + 1):
+            if len(line) > maximum_line:
+                fail(f"raw line exceeds bounded input size: {path.name}")
+            hasher.update(line)
+            try:
+                record = json.loads(line)
+            except (ValueError, UnicodeError):
+                if b"committee_" in line or path.name == "operations.jsonl":
+                    fail(f"invalid retained committee record: {path.name}")
+            else:
+                yield offset, hashlib.sha256(line).hexdigest(), record
+            offset += len(line)
+    if hasher.hexdigest() != expected_hash:
+        fail(f"raw artifact changed during reconciliation: {path.name}")
+
+
+def reconcile_committee(evidence, directory):
+    """Require exact raw start, terminal, and scored-row equality for each measured hub."""
+    artifacts = {entry["path"]: entry["sha256"] for entry in evidence["artifacts"]}
+    if len(artifacts) != len(evidence["artifacts"]):
+        fail("duplicate raw artifact path")
+    measurement = integer(evidence.get("measurement_start_unix_us"), "measurement origin", 1)
+    duration = evidence["envelope"]["duration_seconds"]
+    required = {"topology.json", "operations.jsonl"} | {
+        f"protocol-{index:02}.jsonl" for index in range(evidence["envelope"]["committee_peers"])}
+    if not required <= artifacts.keys():
+        fail("committee reconciliation requires retained topology, operations and every validator log")
+    topology = read_json(directory / "topology.json")
+    validators = topology["population"]["validators"]
+    if len(validators) != evidence["envelope"]["committee_peers"] or [node["hub"] for node in validators] != [True, True, False, False]:
+        fail("retained topology does not bind the two measured hub log indices")
+    sources = [node["bls_key"] for node in validators[:2]]
+    if len(set(sources)) != 2:
+        fail("retained topology must bind distinct measured hub identities")
+    if list(evidence.get("committee_sources", {}).values()) != sources:
+        fail("committee sources do not match the retained topology log mapping")
+    starts, terminals, raw_terminals = {}, {}, {}
+    allocated, generation_sources = {}, {}
+    for index, source in enumerate(sources):
+        name = f"protocol-{index:02}.jsonl"
+        for offset, line_hash, record in raw_records(directory / name, artifacts[name], 65536):
+            if not isinstance(record, dict) or record.get("target") != "network::capacity":
+                continue
+            fields = record["fields"]
+            event = fields["event"]
+            if event == "committee_observation_error":
+                fail("native committee identity allocation failed")
+            if event not in {"committee_request_start", "committee_request"}:
+                continue
+            generation, request_id = committee_identity(fields)
+            key = (source, generation, request_id)
+            owner = generation_sources.setdefault(generation, source)
+            if owner != source:
+                fail("native process generation aliases another hub")
+            allocated.setdefault((source, generation), {"ids": set(), "watermark": 0})
+            state = allocated[(source, generation)]
+            state["watermark"] = max(state["watermark"], native_integer(fields, "allocated_request_count", 1))
+            if event == "committee_request_start":
+                if key in starts:
+                    fail("duplicate native committee start")
+                starts[key] = fields
+                state["ids"].add(request_id)
+            else:
+                if key in raw_terminals:
+                    fail("duplicate native committee terminal")
+                raw_terminals[key] = (offset, line_hash, record)
+    snapshots = {}
+    producer_pids = {}
+    previous_snapshots = {}
+    watermark_pattern = re.compile(r'^tn_primary_vote_observation_allocated\{generation="([0-9a-f]{32})"\} ([0-9]+)$', re.MULTILINE)
+    for name, artifact_hash in sorted(artifacts.items()):
+        if re.fullmatch(r"telemetry-[0-9]{3}\.jsonl", name) is None:
+            continue
+        for _, _, sample in raw_records(directory / name, artifact_hash, 8 * 1024**2):
+            source = evidence["committee_sources"].get(sample["hub"])
+            if source is None:
+                fail("producer snapshot has an undeclared hub")
+            pid = integer(sample["pid"], "producer process ID", 1)
+            if producer_pids.setdefault(source, pid) != pid:
+                fail("producer process changed during measurement")
+            matches = watermark_pattern.findall(sample["metrics"])
+            if matches:
+                if len(matches) != 1:
+                    fail("native producer watermark is ambiguous")
+                generation, count = matches[0]
+                count = integer(int(count), "producer allocation watermark", 0)
+                if count > 2**53:
+                    fail("producer watermark exceeds exact native gauge integer range")
+                previous = previous_snapshots.get(source)
+                if previous is not None and (generation != previous[0] or count < previous[1]):
+                    fail("native producer generation changed or watermark regressed")
+                previous_snapshots[source] = generation, count
+            if sample.get("workload_completed_before_sample") is True and sample["elapsed_seconds"] >= duration:
+                if len(matches) != 1:
+                    fail("post-drain native producer watermark missing or ambiguous")
+                generation, count = matches[0]
+                count = integer(int(count), "producer allocation watermark", 0)
+                if count > 2**53:
+                    fail("producer watermark exceeds exact native gauge integer range")
+                snapshots[source] = (generation, count)
+    if set(snapshots) != set(sources):
+        fail("post-drain producer watermark missing for a measured hub")
+    for source, (generation, count) in snapshots.items():
+        state = allocated.get((source, generation))
+        ids = set() if state is None else {identity for identity in state["ids"] if identity <= count}
+        if len(ids) != count or (ids and (min(ids) != 1 or max(ids) != count)):
+            fail("native producer allocation gap in retained starts")
+    for key, (_, _, terminal) in raw_terminals.items():
+        start = starts.get(key)
+        if start is None:
+            fail("native committee terminal has no start")
+        fields = terminal["fields"]
+        if native_integer(fields, "process_id", 1) != producer_pids[key[0]]:
+            fail("native request generation is not bound to the sampled process")
+        if any(fields[field] != start[field] for field in ("started_unix_us", "process_id", "header", "peer")):
+            fail("native start and terminal binding mismatch")
+    selected_starts = {key for key, fields in starts.items()
+                       if measurement <= native_integer(fields, "started_unix_us", 1) < measurement + duration * 1_000_000}
+    if any(key[1] != snapshots[key[0]][0] or key[2] > snapshots[key[0]][1] for key in selected_starts):
+        fail("native in-window start exceeds the independent post-drain producer snapshot")
+    if selected_starts != (selected_starts & raw_terminals.keys()):
+        fail("native in-window committee start missing terminal after drain")
+    for key in selected_starts:
+        offset, line_hash, record = raw_terminals[key]
+        terminals[key] = committee_operation({"source": key[0], "record": record, "offset": offset,
+                                             "line_sha256": line_hash}, measurement, duration)
+    actual, complete = {}, {}
+    for _, _, operation in raw_records(directory / "operations.jsonl", artifacts["operations.jsonl"], MAX_RAW_ARTIFACT_BYTES):
+        if operation.get("scenario") != "committee_progress":
+            continue
+        if operation.get("kind") == "collector_telemetry":
+            if operation["source"] not in sources or operation["measurement_start_unix_us"] != measurement:
+                fail("collector telemetry source or measurement binding mismatch")
+            if operation["state"] not in {"empty", "batch", "complete"}:
+                fail("collector telemetry records an evidence error")
+            if operation["state"] == "complete":
+                if operation["source"] in complete or operation["pending"] != 0 or not operation["follower"]["caught_up"] or operation["follower"]["queued"] != 0:
+                    fail("duplicate or incomplete committee final drain")
+                if not duration <= operation["elapsed_seconds"] <= duration + 30:
+                    fail("committee final drain lies outside its existing budget")
+                complete[operation["source"]] = operation
+            continue
+        request = operation["committee_request"]
+        key = (request["source"], request["generation"], request["request_id"])
+        if key in actual or key not in terminals:
+            fail("duplicate, orphan, or extra scored committee request")
+        expected = terminals[key]
+        if operation.get("trace") != expected["trace"] or any(operation.get(field) != expected.get(field) for field in OPERATION_FIELDS):
+            fail("scored committee request differs from its raw native terminal")
+        actual[key] = {field: value for field, value in operation.items() if field in OPERATION_FIELDS}
+    if set(actual) != selected_starts or set(complete) != set(sources):
+        fail("missing scored committee request or final hub drain")
+    for source, observation in complete.items():
+        count = sum(key[0] == source for key in selected_starts)
+        if observation["started"] != count or observation["terminals"] != count:
+            fail("collector native population count mismatch")
+    projected = evidence["operations"]["committee_progress"]
+    if len(projected) != len(actual) or {entry["id"] for entry in projected} != {entry["id"] for entry in actual.values()}:
+        fail("committee summary and raw operation sets differ")
+    by_id = {entry["id"]: entry for entry in actual.values()}
+    if any(entry != by_id[entry["id"]] for entry in projected):
+        fail("committee summary differs from hash-bound raw operations")
+
+
 def verify_artifacts(evidence, directory):
     """Verify retained raw files without loading whole logs into memory."""
     if len(evidence["artifacts"]) > 64:
@@ -335,6 +568,8 @@ def verify_artifacts(evidence, directory):
                 hasher.update(chunk)
         if hasher.hexdigest() != artifact["sha256"]:
             fail(f"raw artifact digest mismatch: {artifact['path']}")
+    if "operations" in evidence:
+        reconcile_committee(evidence, directory)
 
 
 def main():

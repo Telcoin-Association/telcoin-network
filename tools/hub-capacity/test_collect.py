@@ -126,7 +126,7 @@ class CollectorTests(unittest.TestCase):
             topology = root / "topology.json"
             protocol_log = root / "validator.jsonl"
             profile.write_text("{}")
-            topology.write_text("{}")
+            topology.write_text(json.dumps({"population": {"validators": [{"bls_key": "synthetic"}]}}))
             protocol_log.write_bytes(b"synthetic production log\n")
             phase = {"revision": "a" * 40, "profile": {},
                      "binary_sha256": {"telcoin-network": "b" * 64}}
@@ -165,6 +165,7 @@ class CollectorTests(unittest.TestCase):
             # collection loop and retained operation timestamps, without qualifying capacity.
             with mock.patch.object(COLLECT.QUALIFY, "validate_plan"), \
                  mock.patch.object(COLLECT.QUALIFY, "validate_evidence"), \
+                 mock.patch.object(COLLECT.QUALIFY, "verify_artifacts"), \
                  mock.patch.object(COLLECT, "validate_process"), \
                  mock.patch.object(COLLECT, "file_hash", return_value="b" * 64), \
                  mock.patch.object(COLLECT, "process_sample", return_value=(

@@ -473,6 +473,88 @@ async fn test_dial_peer_already_dialing_error() {
 }
 
 #[tokio::test]
+async fn queued_duplicate_dial_preserves_first_reply() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let multiaddr = create_multiaddr(None);
+    let (first_sender, mut first_reply) = oneshot::channel();
+    let (second_sender, second_reply) = oneshot::channel();
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(first_sender));
+    peer_manager.dial_peer(peer_id, vec![multiaddr.clone()], Some(second_sender));
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert_matches!(
+        peer_manager.poll(&mut cx),
+        std::task::Poll::Ready(libp2p::swarm::ToSwarm::Dial { .. })
+    );
+    assert!(peer_manager.poll(&mut cx).is_pending());
+    assert_matches!(
+        timeout(Duration::from_millis(500), second_reply).await??,
+        Err(NetworkError::AlreadyDialing(_))
+    );
+    assert_matches!(first_reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+    assert!(peer_manager.dial_attempt_already_registered(&peer_id));
+    assert!(peer_manager
+        .register_peer_connection(&peer_id, ConnectionType::IncomingConnection { multiaddr }));
+    assert!(timeout(Duration::from_millis(500), first_reply).await??.is_ok());
+    Ok(())
+}
+
+#[tokio::test]
+async fn queued_dial_defers_to_kademlia_pending_connection() -> eyre::Result<()> {
+    let mut peer_manager = create_test_peer_manager(None);
+    let peer_id = PeerId::random();
+    let (sender, reply) = oneshot::channel();
+    peer_manager.dial_peer(peer_id, vec![create_multiaddr(None)], Some(sender));
+    peer_manager.register_dial_attempt(peer_id, None);
+    let mut cx = Context::from_waker(futures::task::noop_waker_ref());
+    assert!(peer_manager.poll(&mut cx).is_pending());
+    assert_matches!(
+        timeout(Duration::from_millis(500), reply).await??,
+        Err(NetworkError::AlreadyDialing(_))
+    );
+    assert!(peer_manager.dial_attempt_already_registered(&peer_id));
+    assert!(peer_manager.next_dial_request().is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn redundant_condition_failure_preserves_pending_dial_completion() -> eyre::Result<()> {
+    futures::future::try_join_all(
+        [PeerCondition::NotDialing, PeerCondition::DisconnectedAndNotDialing]
+            .into_iter()
+            .flat_map(|condition| {
+                [false, true].into_iter().map(move |connected| (condition, connected))
+            })
+            .map(|(condition, connected)| async move {
+                let mut peer_manager = create_test_peer_manager(None);
+                let peer_id = PeerId::random();
+                let (sender, mut reply) = oneshot::channel();
+                peer_manager.register_dial_attempt(peer_id, Some(sender));
+                peer_manager
+                    .on_dial_failure(Some(peer_id), &DialError::DialPeerConditionFalse(condition));
+                assert!(peer_manager.dial_attempt_already_registered(&peer_id));
+                assert_matches!(reply.try_recv(), Err(oneshot::error::TryRecvError::Empty));
+                if connected {
+                    assert!(peer_manager.register_peer_connection(
+                        &peer_id,
+                        ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) }
+                    ));
+                    assert!(timeout(Duration::from_millis(500), reply).await??.is_ok());
+                } else {
+                    let native = DialError::Aborted;
+                    peer_manager.on_dial_failure(Some(peer_id), &native);
+                    assert_matches!(timeout(Duration::from_millis(500), reply).await??,
+                        Err(NetworkError::Dial(detail)) if detail == native.to_string());
+                    assert!(!peer_manager.dial_attempt_already_registered(&peer_id));
+                }
+                Ok::<_, eyre::Report>(())
+            }),
+    )
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_dial_peer_already_connected() {
     let mut peer_manager = create_test_peer_manager(None);
     let peer_id = PeerId::random();
@@ -567,8 +649,6 @@ async fn non_disconnected_dial_failures_preserve_native_errors() -> eyre::Result
                     "controlled transport refusal",
                 )),
             )]),
-            DialError::DialPeerConditionFalse(PeerCondition::NotDialing),
-            DialError::DialPeerConditionFalse(PeerCondition::DisconnectedAndNotDialing),
             DialError::Aborted,
         ]
         .into_iter()

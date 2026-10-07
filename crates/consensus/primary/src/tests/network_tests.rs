@@ -8,7 +8,7 @@ mod vote_observation_tests {
         NetworkCommand, NetworkError, NetworkResponseMessage, NetworkResult, PrimaryNetworkHandle,
         PrimaryRPCError, PrimaryRequest, PrimaryResponse, RequestVoteResult, StdRng,
     };
-    use futures::StreamExt as _;
+    use futures::{FutureExt as _, StreamExt as _};
     use rand::SeedableRng as _;
     use std::{collections::BTreeMap, fmt, sync::Arc, time::Duration};
     use tn_types::Vote;
@@ -22,6 +22,8 @@ mod vote_observation_tests {
     struct VoteEventCapture {
         /// Events emitted while the request future is polled or dropped.
         events: Arc<parking_lot::Mutex<Vec<VoteEventFields>>>,
+        /// Every actual outer request has one start, including a cancelled retry.
+        starts: Arc<parking_lot::Mutex<Vec<VoteEventFields>>>,
     }
 
     /// Preserve string fields as text and numeric fields in their debug representation.
@@ -66,6 +68,10 @@ mod vote_observation_tests {
             event.record(&mut visitor);
             if visitor.fields.get("event").map(String::as_str) == Some("committee_request") {
                 self.events.lock().push(visitor.fields);
+            } else if visitor.fields.get("event").map(String::as_str)
+                == Some("committee_request_start")
+            {
+                self.starts.lock().push(visitor.fields);
             }
         }
 
@@ -94,11 +100,65 @@ mod vote_observation_tests {
         let mut events = capture.events.lock();
         assert_eq!(events.len(), 1, "one request must emit exactly one retained event");
         let event = events.pop().expect("the request event must be present");
+        let mut starts = capture.starts.lock();
+        assert_eq!(starts.len(), 1, "inner retries must retain one outer request start");
+        let start = starts.pop().expect("the request start must be present");
+        ["generation", "request_id", "process_id", "started_unix_us", "header", "peer"]
+            .into_iter()
+            .for_each(|field| {
+                assert_eq!(
+                    event.get(field),
+                    start.get(field),
+                    "start and terminal binding {field}"
+                );
+            });
+        assert_eq!(event["generation"].len(), 32);
+        assert!(event["request_id"].parse::<u64>().is_ok_and(|value| value > 0));
         assert_eq!(event.get("header"), Some(&header.digest().to_string()));
         assert_eq!(event.get("peer"), Some(&peer.to_string()));
         assert!(event.get("latency_us").and_then(|value| value.parse::<u64>().ok()).is_some());
         assert!(event.get("unix_us").and_then(|value| value.parse::<u64>().ok()).is_some());
         event
+    }
+
+    #[tokio::test]
+    async fn vote_observation_identity_survives_cloned_and_recreated_handles() {
+        let (header, peer, _) = vote_fixture();
+        let (commands_tx, _commands_rx) = tokio::sync::mpsc::channel(10);
+        let original = PrimaryNetworkHandle::new_for_test(commands_tx.clone());
+        let cloned = original.clone();
+        let recreated = PrimaryNetworkHandle::new_for_test(commands_tx);
+        let capture = VoteEventCapture::default();
+        let _subscriber = tracing::subscriber::set_default(capture.clone());
+        let mut requests = [
+            Box::pin(original.request_vote(peer, header.clone(), Vec::new())),
+            Box::pin(cloned.request_vote(peer, header.clone(), Vec::new())),
+            Box::pin(recreated.request_vote(peer, header.clone(), Vec::new())),
+        ];
+        requests.iter_mut().for_each(|request| {
+            assert!(request.as_mut().now_or_never().is_none());
+        });
+        drop(requests);
+        let starts = capture.starts.lock();
+        let terminals = capture.events.lock();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(terminals.len(), 3);
+        let generation = &starts[0]["generation"];
+        let ids = starts
+            .iter()
+            .map(|event| &event["request_id"])
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(ids.len(), 3, "cloning or epoch recreation must not alias request IDs");
+        starts.iter().for_each(|start| {
+            assert_eq!(&start["generation"], generation);
+            let terminal = terminals
+                .iter()
+                .find(|event| event["request_id"] == start["request_id"])
+                .expect("every dropped outer request has its matching terminal");
+            assert_eq!(terminal["generation"], start["generation"]);
+            assert_eq!(terminal["outcome"], "cancelled");
+            assert_eq!(terminal["completed"], "false");
+        });
     }
 
     /// Answer public SendRequest commands and capture their actual observation.

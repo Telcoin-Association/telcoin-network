@@ -88,13 +88,38 @@ class Peer:
         if not self.command_slots.acquire(blocking=False):
             raise ValueError("peer control admission exhausted")
         entered = time.monotonic_ns()
+        deadline = entered + 29_000_000_000
         leased = False
+        join_locked = False
         started = None
         generation = None
         process = None
+
+        def remaining():
+            timeout = (deadline - time.monotonic_ns()) / 1_000_000_000
+            if timeout <= 0:
+                raise TimeoutError("peer control operation deadline exceeded")
+            return timeout
+
         try:
             restart = None
-            if request["scenario"] == "shared_nat_reconnect":
+            if request["scenario"] == "public_join":
+                if not self.lock.acquire(timeout=remaining()):
+                    raise TimeoutError("peer lifecycle admission deadline exceeded")
+                join_locked = True
+                with self.condition:
+                    self.restarting = True
+                    if not self.condition.wait_for(lambda: not self.active_forwards or self.stopping,
+                                                   timeout=remaining()):
+                        raise TimeoutError("peer lifecycle drain deadline exceeded")
+                    if self.stopping:
+                        raise ValueError("peer supervisor is shutting down")
+                    remaining()
+                    self.active_forwards += 1
+                    leased = True
+                    generation, process = self.generation, self.process
+                forwarded = request
+            elif request["scenario"] == "shared_nat_reconnect":
                 with self.lock:
                     with self.condition:
                         self.restarting = True
@@ -125,16 +150,30 @@ class Peer:
                 forwarded = {**request, "scenario": "dao_connectivity"}
             else:
                 with self.condition:
-                    self.condition.wait_for(lambda: not self.restarting or self.stopping)
+                    if not self.condition.wait_for(lambda: not self.restarting or self.stopping,
+                                                   timeout=remaining()):
+                        raise TimeoutError("peer control admission deadline exceeded")
                     if self.stopping:
                         raise ValueError("peer supervisor is shutting down")
+                    remaining()
                     self.active_forwards += 1
                     leased = True
                     generation, process = self.generation, self.process
                 forwarded = request
             started = time.monotonic_ns()
             self.diagnostic(request, "forward_start", generation, process, entered, started)
-            result = self.forward(request, forwarded, restart)
+            timeout = 29 if request["scenario"] == "shared_nat_reconnect" else remaining()
+            try:
+                result = self.forward(request, forwarded, restart, timeout=timeout)
+            except Exception:
+                if join_locked:
+                    # A transport failure cannot prove that the native rejoin has stopped.
+                    # Quarantine this client before releasing its exclusive lifecycle lease.
+                    with self.condition:
+                        self.stopping = True
+                        self.condition.notify_all()
+                    self.stop()
+                raise
             with self.condition:
                 if self.stopping or self.generation != generation or self.process is not process:
                     raise ValueError("peer generation changed during control operation")
@@ -151,7 +190,11 @@ class Peer:
                 with self.condition:
                     if leased:
                         self.active_forwards -= 1
+                    if join_locked:
+                        self.restarting = False
                     self.condition.notify_all()
+                if join_locked:
+                    self.lock.release()
                 self.command_slots.release()
 
     def diagnostic(self, request, event, generation, process, entered, started):
@@ -167,11 +210,11 @@ class Peer:
         except (OSError, ValueError):
             pass
 
-    def forward(self, request, forwarded, restart):
+    def forward(self, request, forwarded, restart, timeout=29):
         url = f"http://{self.declaration['ip']}:9500/"
         control = urllib.request.Request(url, data=json.dumps(forwarded).encode(),
                                          headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(control, timeout=29) as response:
+        with urllib.request.urlopen(control, timeout=timeout) as response:
             data = response.read(65537)
         if len(data) > 65536:
             raise ValueError("peer acknowledgement exceeds 64 KiB")

@@ -3,7 +3,14 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
 
 use crate::{
     proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
@@ -13,7 +20,7 @@ use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
 use parking_lot::Mutex;
-use rand::{seq::SliceRandom as _, Rng};
+use rand::{seq::SliceRandom as _, Rng, TryRngCore as _};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
     capacity::{
@@ -78,11 +85,100 @@ impl VoteRequestOutcome {
     }
 }
 
+/// Process-wide identity, independent of handle clones and epoch recreation.
+#[derive(Clone, Copy)]
+struct VoteRequestIdentity {
+    generation: &'static str,
+    request_id: u64,
+}
+
+#[derive(Clone, Copy)]
+enum VoteIdentityError {
+    EntropyUnavailable,
+    CounterExhausted,
+}
+
+impl VoteIdentityError {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::EntropyUnavailable => "generation entropy unavailable",
+            Self::CounterExhausted => "request identity counter exhausted",
+        }
+    }
+}
+
+static VOTE_OBSERVATION_GENERATION: OnceLock<Result<String, VoteIdentityError>> = OnceLock::new();
+static VOTE_OBSERVATION_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Independent producer snapshot for the existing native metrics sampler.
+#[derive(Clone, Copy, Debug)]
+pub struct VoteObservationWatermark {
+    /// Random generation shared by every handle in this process.
+    pub generation: &'static str,
+    /// Highest allocated request ID, including an allocated but unlogged request.
+    pub allocated_request_count: u64,
+}
+
+/// Read the exact producer counter without allocating an ID or emitting another request.
+pub fn vote_observation_watermark() -> Option<VoteObservationWatermark> {
+    VOTE_OBSERVATION_GENERATION.get().and_then(|generation| generation.as_ref().ok()).map(
+        |generation| VoteObservationWatermark {
+            generation,
+            allocated_request_count: VOTE_OBSERVATION_NEXT_ID
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
+        },
+    )
+}
+
+fn allocate_vote_request_id(counter: &AtomicU64) -> Result<u64, VoteIdentityError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .map_err(|_| VoteIdentityError::CounterExhausted)
+}
+
+impl VoteRequestIdentity {
+    fn allocate() -> Result<Self, VoteIdentityError> {
+        let generation = VOTE_OBSERVATION_GENERATION
+            .get_or_init(|| {
+                let mut bytes = [0_u8; 16];
+                rand::rngs::OsRng
+                    .try_fill_bytes(&mut bytes)
+                    .map_err(|_| VoteIdentityError::EntropyUnavailable)
+                    .map(|()| format!("{:032x}", u128::from_le_bytes(bytes)))
+            })
+            .as_ref()
+            .map_err(|error| *error)?;
+        allocate_vote_request_id(&VOTE_OBSERVATION_NEXT_ID)
+            .map(|request_id| Self { generation, request_id })
+    }
+}
+
+#[cfg(test)]
+mod vote_identity_tests {
+    use super::{allocate_vote_request_id, AtomicU64, Ordering, VoteIdentityError};
+
+    #[test]
+    fn request_identity_exhaustion_preserves_the_final_watermark() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_vote_request_id(&counter).ok(), Some(u64::MAX - 1));
+        assert!(matches!(
+            allocate_vote_request_id(&counter),
+            Err(VoteIdentityError::CounterExhausted)
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+}
+
 /// Observe a real vote request, including errors and cancellation, when capacity tracing is
 /// enabled.
 struct VoteObservation {
     /// Monotonic request start for its complete duration, including retries.
     started: std::time::Instant,
+    /// Wall-clock start used to select the fixed measurement population.
+    started_unix_us: u128,
+    /// Telemetry failure does not change the production RPC result.
+    identity: Option<VoteRequestIdentity>,
     /// Signed header being voted on.
     header: HeaderDigest,
     /// Authenticated committee destination.
@@ -102,6 +198,10 @@ struct VoteObservation {
 impl Drop for VoteObservation {
     fn drop(&mut self) {
         debug!(target: "network::capacity", event = "committee_request",
+            generation = self.identity.map_or("", |identity| identity.generation),
+            request_id = self.identity.map_or(0, |identity| identity.request_id),
+            process_id = std::process::id(), started_unix_us = %self.started_unix_us,
+            allocated_request_count = VOTE_OBSERVATION_NEXT_ID.load(Ordering::Relaxed).saturating_sub(1),
             header = %self.header, peer = %self.peer, completed = self.completed,
             success = self.success, latency_us = %self.started.elapsed().as_micros(),
             outcome = self.outcome.label(), error = self.error.as_deref().unwrap_or_default(),
@@ -717,6 +817,12 @@ impl PrimaryNetworkHandle {
     ) -> NetworkResult<RequestVoteResult> {
         let mut observation = VoteObservation {
             started: std::time::Instant::now(),
+            identity: VoteRequestIdentity::allocate().inspect_err(|error| {
+                debug!(target: "network::capacity", event = "committee_observation_error", reason = error.label(),
+                    process_id = std::process::id(), "capacity observation identity unavailable");
+            }).ok(),
+            started_unix_us: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_micros()),
             header: header.digest(),
             peer,
             completed: false,
@@ -725,6 +831,13 @@ impl PrimaryNetworkHandle {
             error: None,
             retry_count: 0,
         };
+        if let Some(identity) = observation.identity {
+            debug!(target: "network::capacity", event = "committee_request_start",
+                generation = identity.generation, request_id = identity.request_id,
+                process_id = std::process::id(), started_unix_us = %observation.started_unix_us,
+                allocated_request_count = VOTE_OBSERVATION_NEXT_ID.load(Ordering::Relaxed).saturating_sub(1),
+                header = %observation.header, peer = %observation.peer, "capacity request start");
+        }
         let result = async {
             let header = Arc::new(header);
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };

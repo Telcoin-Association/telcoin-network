@@ -3,6 +3,7 @@
 import argparse
 from contextlib import contextmanager, redirect_stdout
 import gc
+import hashlib
 import importlib.util
 import io
 import json
@@ -264,23 +265,43 @@ class ControlTests(unittest.TestCase):
                 self.assertIn(reason, result["rejection_reason"])
                 self.assertGreater(result["command_latency_ms"], 0)
 
-    def test_flattened_committee_rows_keep_cancellation_latency_and_execution_mode(self):
+    def test_native_committee_rows_keep_cancellation_latency_and_identity(self):
+        measurement = time.time_ns() // 1000 - 600_000_000
+        fields = {"generation": "a" * 32, "request_id": 1, "allocated_request_count": 1,
+                  "process_id": 11, "started_unix_us": str(measurement + 10),
+                  "header": "native-header", "peer": "voter"}
+        observations = []
+        for terminal in (False, True):
+            native = {**fields, "event": "committee_request" if terminal else "committee_request_start"}
+            if terminal:
+                native.update(success=False, completed=False, outcome="cancelled", error="",
+                              latency_us="1000", unix_us=str(measurement + 1010), retry_count=3)
+            record = {"target": "network::capacity", "fields": native}
+            line = (json.dumps(record) + "\n").encode()
+            observations.append({"source": "peer", "record": record, "offset": 0,
+                                 "line_sha256": hashlib.sha256(line).hexdigest()})
+
         def reply(connection, payload):
             time.sleep(0.003)
-            observation = {"source": "peer", "record": {"fields": {
-                "event": "committee_request", "success": False, "completed": False,
-                "latency_us": 1000, "unix_us": time.time_ns() // 1000}}}
-            send(connection, acknowledgement(payload, trace={"observations": [observation]}))
+            send(connection, {"success": True, "collector_status": "batch",
+                              "trace": {"observations": observations, "offset": 10,
+                                        "size": 10, "queued": 0, "caught_up": True}})
 
         with server(reply) as (url, _):
-            result = WORKLOAD.execute(agent(url, "--identity", "peer", "--observations", url),
-                                      "committee_progress", "nonce", time.monotonic(), 2)
-        self.assertTrue(result["success"])
-        measured = result["committee_observations"][0]
+            rows = []
+            WORKLOAD.consume_committee(agent(url, "--identity", "peer", "--observations", url),
+                                       time.monotonic() - 600.1, measurement, 600, rows.append)
+        native_rows = [row for row in rows if row.get("kind") != "collector_telemetry"]
+        self.assertEqual(len(native_rows), 1)
+        measured = native_rows[0]
         self.assertFalse(measured["success"])
         self.assertTrue(measured["cancelled"])
         self.assertEqual(measured["latency_ms"], 1)
-        self.assertEqual(measured["driver_execution_mode"], "in_process_control")
+        self.assertEqual(measured["committee_request"]["generation"], fields["generation"])
+        self.assertEqual(measured["committee_request"]["request_id"], 1)
+        self.assertEqual(measured["trace"]["observation"], observations[1])
+        self.assertEqual(rows[-1]["state"], "complete")
+        self.assertNotIn("driver_execution_mode", measured)
 
     def test_response_and_serialized_output_limits_remain_bounded(self):
         for text, reason in [("x" * 65536, "64 KiB"), ("€" * 12000, "agent_output_limit")]:
@@ -321,16 +342,44 @@ class ControlTests(unittest.TestCase):
                 self.assertIn("driver_adapter_completed_unix_us", result)
 
     def test_second_gossip_request_shares_original_deadline(self):
+        release = threading.Event()
+
         def reply(connection, payload):
-            time.sleep(0.07)
+            if "trace" in payload:
+                release.wait(timeout=2)
             send(connection, acknowledgement(payload))
 
+        first_completed = threading.Event()
+        deadlines = []
+        second_timeouts = []
+        native_post = CONTROL.post
+        remaining_timeout = CONTROL.remaining_timeout
+
+        def remaining(deadline):
+            value = remaining_timeout(deadline)
+            if first_completed.is_set():
+                second_timeouts.append(value)
+            return value
+
+        def post(*args, **kwargs):
+            deadlines.append(args[3] if len(args) > 3 else kwargs["deadline"])
+            result = native_post(*args, **kwargs)
+            first_completed.set()
+            return result
+
         with server(reply) as (url, requests):
-            started = time.monotonic()
-            result = WORKLOAD.execute(agent(url, "--observations", url), "gossip_two_hops", "nonce", started, 0.11)
+            try:
+                with patch.object(CONTROL.time, "monotonic", side_effect=lambda: 1000.4 if first_completed.is_set() else 1000.0), \
+                     patch.object(CONTROL, "post", side_effect=post), \
+                     patch.object(CONTROL, "remaining_timeout", side_effect=remaining):
+                    result = WORKLOAD.execute(agent(url, "--observations", url), "gossip_two_hops", "nonce", 1000.0, 0.5)
+            finally:
+                release.set()
             self.assertEqual(result["rejection_reason"], "timeout")
             self.assertEqual(len(requests), 2)
-            self.assertLess(time.monotonic() - started, 0.3)
+            self.assertEqual(deadlines, [1000.5, 1000.5])
+            self.assertTrue(second_timeouts)
+            self.assertTrue(all(0 < value <= 0.10001 for value in second_timeouts))
 
     def test_connect_timeout_uses_original_deadline_and_closes_socket(self):
         with patch.object(CONTROL.socket, "socket") as socket_factory:

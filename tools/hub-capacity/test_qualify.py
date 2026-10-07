@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("qualify", ROOT / "qualify.py")
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
+COMMITTEE_SPEC = importlib.util.spec_from_file_location("committee_fixture", ROOT / "test_committee.py")
+COMMITTEE_FIXTURE = importlib.util.module_from_spec(COMMITTEE_SPEC)
+COMMITTEE_SPEC.loader.exec_module(COMMITTEE_FIXTURE)
 
 
 def declaration():
@@ -33,7 +36,7 @@ def declaration():
                      "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 4,
                      "workers_per_hub": 2, "duration_seconds": 600,
                      "hardware": "synthetic", "network_setup": "synthetic"},
-        "hubs": ["hub-0"], "threshold_owner": "synthetic fixture",
+        "hubs": ["hub-0", "hub-1"], "threshold_owner": "synthetic fixture",
         "adapter_command": "synthetic fixture",
         "thresholds": {"max_rss_bytes": 4 * 1024**3, "max_cpu_cores": 3,
                        "max_queue_occupancy": 100, "max_progress_stall_seconds": 15,
@@ -66,7 +69,7 @@ def evidence(plan, phase="candidate"):
         observation = copy.deepcopy(hub)
         observation["cpu_seconds"] = second
         observation["progress"] = 1 + second
-        samples.append({"elapsed_seconds": second, "hubs": {"hub-0": observation}})
+        samples.append({"elapsed_seconds": second, "hubs": {name: copy.deepcopy(observation) for name in plan["hubs"]}})
     return {"phase": phase, "plan_sha256": QUALIFY.digest(plan),
             "revision": plan[phase]["revision"],
             "profile_sha256": QUALIFY.digest(plan[phase]["profile"]),
@@ -178,8 +181,16 @@ class QualificationTests(unittest.TestCase):
             paths = {name: Path(directory) / (name + ".json")
                      for name in ("declaration", "plan", "baseline", "candidate", "report")}
             paths["declaration"].write_text(json.dumps(self.plan))
-            paths["baseline"].write_text(json.dumps(evidence(self.plan, "baseline")))
-            paths["candidate"].write_text(json.dumps(self.run))
+            for phase in ("baseline", "candidate"):
+                phase_root = Path(directory) / phase
+                phase_root.mkdir()
+                raw = COMMITTEE_FIXTURE.fixture(phase_root, phase, request_count=5, successes_only=True)
+                fixture = evidence(self.plan, phase)
+                fixture.update({key: raw[key] for key in ("measurement_start_unix_us", "committee_sources", "artifacts")})
+                fixture["operations"]["committee_progress"] = raw["operations"]["committee_progress"]
+                fixture["samples"].append({"elapsed_seconds": 600.5, "hubs": copy.deepcopy(fixture["samples"][-1]["hubs"])})
+                paths[phase] = phase_root / "evidence.json"
+                paths[phase].write_text(json.dumps(fixture))
             for arguments in (
                 ["freeze", str(paths["declaration"]), "--output", str(paths["plan"])],
                 ["score", str(paths["plan"]), str(paths["baseline"]), str(paths["candidate"]),

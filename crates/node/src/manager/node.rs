@@ -948,7 +948,16 @@ where
         if let Some(addr) = self.builder.metrics {
             let db = self.reth_db.clone();
             let hooks = tn_metrics::MetricsHooks::default()
-                .with_hook(move || tn_reth::report_db_metrics(&db));
+                .with_hook(move || tn_reth::report_db_metrics(&db))
+                .with_hook(|| {
+                    if let Some(snapshot) = tn_primary::network::vote_observation_watermark() {
+                        metrics::gauge!(
+                            "tn_primary_vote_observation_allocated",
+                            "generation" => snapshot.generation
+                        )
+                        .set(snapshot.allocated_request_count as f64);
+                    }
+                });
             tn_metrics::start_metrics_server(
                 addr,
                 &node_task_manager.get_spawner(),
