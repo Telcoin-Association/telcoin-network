@@ -13,7 +13,8 @@ One gateway can fill the worker's 500-request permit pool, which every gateway s
 One request with a large JSON `id` OOMs a gateway (WG-02), the global rate budget is spent before the per-IP check (WG-08), a batch costs one token however long it is (WG-03), one host can hold every connection slot (WG-06), the health probes queue behind clients (WG-07), and reads and submissions share every limit (WG-09).
 The reference manifest never becomes ready (WG-19), every method including `tn_*` reaches the worker (WG-11), and the gateway-to-worker hop is plaintext only (WG-04).
 This PR fixes the manifest's readiness URL, adds a `preStop` hook, logs the cause of upstream transport errors with the URL redacted, lowers the default request body cap to 1 MiB, and adds `--redirect-queries`, which takes every non-submission call off the worker and refuses upstream HTTP redirects.
-With `--redirect-queries` set, WG-11 is closed, reads survive a worker outage (WG-14), and the cheap path to WG-01 is gone.
+With `--redirect-queries` set, WG-11 is closed, the gateway keeps serving reads while the worker is down (WG-14, as long as nothing in front of it acts on `/ready`), and slow reads no longer reach the worker (WG-01).
+The post-change review found that this moves the shared failure point rather than removing it: a public RPC that stalls holds every gateway's connection slots and starves submissions on all of them until the follow-up for WG-01 and WG-09 lands, and a resolver that hangs on the public RPC's name can make readiness flap (see [Post-change review](#post-change-review)).
 Every other finding of Medium or higher has a follow-up issue or operator guidance in the plan below.
 WG-02 and WG-08 are small fixes and are recommended before any public deployment.
 The remaining High findings should be closed before general availability.
@@ -108,62 +109,62 @@ Calibration rules: a mechanism that works per replica stays High even when it ca
 
 ## Summary
 
-Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P25).
+Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P27), which name the commit in this PR or the follow-up issue.
 
 | ID | Title | Severity | Status | Effort |
 | --- | --- | --- | --- | --- |
-| WG-01 | One gateway can fill the worker's shared 500-request permit pool | Critical | mostly closed in this PR when `--redirect-queries` is set (P1); issue TBD (P2) | M |
-| WG-02 | Reject paths build an attacker-sized `id` as a `Value`; one request OOMs a gateway | High | issue TBD (P3), recommended before any public deployment | S |
-| WG-03 | A batch costs one token, skips the screen and has no length cap | High | issue TBD (P10) | M |
-| WG-04 | The gateway-to-worker hop is plaintext only | High | issue TBD (P11) | M-L |
-| WG-05 | Request bodies up to 25 MiB are buffered whole on up to 500 connections | High | partly fixed in this PR (P6); issue TBD (P7) | S + M |
-| WG-06 | No per-IP connection cap; one host holds every slot | High | issue TBD (P9) | M |
-| WG-07 | Health probes share the client connection permits | High | issue TBD (P8) | M |
-| WG-08 | The global token is spent before the per-IP check | High | issue TBD (P4), recommended before any public deployment | S |
-| WG-09 | Reads and submissions share every limit | High | issue TBD (P2) | M |
-| WG-10 | Upstream clients follow HTTP redirects and honour proxy variables | High | fixed for the proxy client in this PR (P5); rest in issue TBD (P25) | S |
-| WG-11 | Every method reaches the worker, including `tn_*` | Medium | closed in this PR when `--redirect-queries` is set (P1); issue TBD (P15) | S |
-| WG-12 | Readiness has no hysteresis | Medium | issue TBD (P18) | S |
+| WG-01 | One gateway can fill the worker's shared 500-request permit pool | Critical | mostly closed in this PR when `--redirect-queries` is set (P1); #1594 (P2) | M |
+| WG-02 | Reject paths build an attacker-sized `id` as a `Value`; one request OOMs a gateway | High | #1595 (P3), recommended before any public deployment | S |
+| WG-03 | A batch costs one token, skips the screen and has no length cap | High | #1600 (P10) | M |
+| WG-04 | The gateway-to-worker hop is plaintext only | High | #1601 (P11) | M-L |
+| WG-05 | Request bodies up to 25 MiB are buffered whole on up to 500 connections | High | partly fixed in this PR (P6); #1597 (P7) | S + M |
+| WG-06 | No per-IP connection cap; one host holds every slot | High | #1599 (P9) | M |
+| WG-07 | Health probes share the client connection permits | High | #1598 (P8) | M |
+| WG-08 | The global token is spent before the per-IP check | High | #1596 (P4), recommended before any public deployment | S |
+| WG-09 | Reads and submissions share every limit | High | #1594 (P2) | M |
+| WG-10 | Upstream clients follow HTTP redirects and honour proxy variables | High | fixed for the proxy client in this PR (P5); rest in #1612 (P25) | S |
+| WG-11 | Every method reaches the worker, including `tn_*` | Medium | closed in this PR when `--redirect-queries` is set (P1); #1602 (P15) | S |
+| WG-12 | Readiness has no hysteresis | Medium | #1605 (P18) | S |
 | WG-13 | The node health listener is serial and unauthenticated | Medium | documented in this PR (P14) | S |
-| WG-14 | Readiness gates reads as well as submissions | Medium | closed for reads in this PR when `--redirect-queries` is set (P1) | S |
-| WG-15 | Readiness is measured on the health listener, not on the RPC path | Medium | issue TBD (P18) | M |
+| WG-14 | Readiness gates reads as well as submissions | Medium | closed for reads at the gateway in this PR when `--redirect-queries` is set (P1); fronts that act on `/ready` in #1613 (P26) | S |
+| WG-15 | Readiness is measured on the health listener, not on the RPC path | Medium | #1605 (P18) | M |
 | WG-16 | The reference HPA multiplies the worker-facing budget | Medium | documented in this PR (P14) | S |
 | WG-17 | Every budget is per process | Medium | documented in this PR (P14) | S |
-| WG-18 | Client identity is the TCP peer | Medium | issue TBD (P20) | M |
+| WG-18 | Client identity is the TCP peer | Medium | #1607 (P20) | M |
 | WG-19 | The reference manifest polls the wrong readiness URL | Medium | fixed in this PR (P12) | S |
-| WG-20 | Shutdown does not drain | Medium | partly fixed in this PR (P12); issue TBD (P19) | S + M |
+| WG-20 | Shutdown does not drain | Medium | partly fixed in this PR (P12); #1606 (P19) | S + M |
 | WG-21 | Round-robin DNS has no health feedback | Medium | documented in this PR (P14) | S |
-| WG-22 | Non-JSON upstream errors are relayed and counted as forwarded | Medium | issue TBD (P16) | S |
-| WG-23 | Pending-state reads miss the worker's pool under the redirect | Medium | documented in this PR (P14); issue TBD (P21) | M |
-| WG-24 | Redirected reads leave from one egress IP with a spoofable XFF | Medium | documented in this PR (P14); issue TBD (P22) | M |
+| WG-22 | Non-JSON upstream errors are relayed and counted as forwarded | Medium | #1603 (P16) | S |
+| WG-23 | Pending-state reads miss the worker's pool under the redirect | Medium | documented in this PR (P14); #1608 (P21) | M |
+| WG-24 | Redirected reads leave from one egress IP with a spoofable XFF | Medium | documented in this PR (P14); #1609 (P22) | M |
 | WG-25 | The upstream transport error cause is dropped | Medium | fixed in this PR (P13) | S |
-| WG-26 | No access log or client dimension | Medium | issue TBD (P23) | M |
-| WG-27 | CORS cannot work | Medium | issue TBD (P17) | S |
-| WG-28 | The readiness poller polls serially and reads the body unbounded | Low | issue TBD (P25) | S |
-| WG-29 | The per-IP table fails open when full; IPv6 /64 keys | Low | issue TBD (P25) | S |
-| WG-30 | The 408 rewrite misreports | Low | issue TBD (P25) | S |
-| WG-31 | The lifetime cap cuts an in-flight request | Low | issue TBD (P25) | S |
-| WG-32 | The screen skips the Sync method, escaped names and other param shapes | Low | issue TBD (P25) | S |
-| WG-33 | A mid-stream upstream failure gives a truncated `200` | Low | issue TBD (P25) | S |
-| WG-34 | The binary hop marker breaks gateway chaining and is client-settable | Low | redirect hop addressed in this PR (P1); rest in issue TBD (P25) | S |
-| WG-35 | Upstream URLs with credentials in debug logs and startup errors | Low | issue TBD (P25) | S |
-| WG-36 | The shipped feature set and image are never built in CI | Low | issue TBD (P25) | S |
-| WG-37 | Image build not `--locked`, unpinned base images, `:latest` tag | Low | issue TBD (P25) | S |
-| WG-38 | Large transitive dependency graph | Low | issue TBD (P25) | M |
-| WG-39 | TLS pitfalls: an empty root store builds silently | Low | issue TBD (P25) | S |
-| WG-40 | CLI validation gaps (zero durations, duplicate ids, mapped IPv6) | Low | issue TBD (P25) | S |
-| WG-41 | The screen's rejected types match the pool by convention only | Low | issue TBD (P25) | S |
-| WG-42 | Not every error is a JSON-RPC envelope; every HTTP method is forwarded | Low | issue TBD (P25) | S |
-| WG-43 | Errors use non-200 statuses | Low | issue TBD (P25) | S |
-| WG-44 | Batch errors come back as one object with `id: null` | Low | issue TBD (P25) | S |
-| WG-45 | XFF appended to the client's value; XFP hard-coded | Low | issue TBD (P25) | S |
-| WG-46 | `upstream_ready{worker_id}` collides; in-flight gauge misses streaming | Low | issue TBD (P25) | S |
-| WG-47 | Unthrottled warns on some rejects; none on others | Low | issue TBD (P25) | S |
-| WG-48 | A never-ready gateway logs no reason at info | Low | issue TBD (P25) | S |
-| WG-49 | Docs contradict the code in several places | Low | issue TBD (P25) | S |
-| WG-50 | ANSI escapes in non-TTY logs; no structured format | Low | issue TBD (P25) | S |
-| WG-51 | The Grafana datasource uid is hard-coded | Low | issue TBD (P25) | S |
-| WG-52 | An EIP-7702 rejection is reported as "EIP-4844 blob" | Low | issue TBD (P25) | S |
+| WG-26 | No access log or client dimension | Medium | #1610 (P23) | M |
+| WG-27 | CORS cannot work | Medium | #1604 (P17) | S |
+| WG-28 | The readiness poller polls serially and reads the body unbounded | Low | #1612 (P25) | S |
+| WG-29 | The per-IP table fails open when full; IPv6 /64 keys | Low | #1612 (P25) | S |
+| WG-30 | The 408 rewrite misreports | Low | #1612 (P25) | S |
+| WG-31 | The lifetime cap cuts an in-flight request | Low | #1612 (P25) | S |
+| WG-32 | The screen skips the Sync method, escaped names and other param shapes | Low | #1612 (P25) | S |
+| WG-33 | A mid-stream upstream failure gives a truncated `200` | Low | #1612 (P25) | S |
+| WG-34 | The binary hop marker breaks gateway chaining and is client-settable | Low | redirect hop addressed in this PR (P1); rest in #1612 (P25) | S |
+| WG-35 | Upstream URLs with credentials in debug logs and startup errors | Low | #1612 (P25) | S |
+| WG-36 | The shipped feature set and image are never built in CI | Low | #1612 (P25) | S |
+| WG-37 | Image build not `--locked`, unpinned base images, `:latest` tag | Low | #1612 (P25) | S |
+| WG-38 | Large transitive dependency graph | Low | #1612 (P25) | M |
+| WG-39 | TLS pitfalls: an empty root store builds silently | Low | #1612 (P25) | S |
+| WG-40 | CLI validation gaps (zero durations, duplicate ids, mapped IPv6) | Low | #1612 (P25) | S |
+| WG-41 | The screen's rejected types match the pool by convention only | Low | #1612 (P25) | S |
+| WG-42 | Not every error is a JSON-RPC envelope; every HTTP method is forwarded | Low | #1612 (P25) | S |
+| WG-43 | Errors use non-200 statuses | Low | #1612 (P25) | S |
+| WG-44 | Batch errors come back as one object with `id: null` | Low | #1612 (P25) | S |
+| WG-45 | XFF appended to the client's value; XFP hard-coded | Low | #1612 (P25) | S |
+| WG-46 | `upstream_ready{worker_id}` collides; in-flight gauge misses streaming | Low | #1612 (P25) | S |
+| WG-47 | Unthrottled warns on some rejects; none on others | Low | #1612 (P25) | S |
+| WG-48 | A never-ready gateway logs no reason at info | Low | #1612 (P25) | S |
+| WG-49 | Docs contradict the code in several places | Low | #1612 (P25) | S |
+| WG-50 | ANSI escapes in non-TTY logs; no structured format | Low | #1612 (P25) | S |
+| WG-51 | The Grafana datasource uid is hard-coded | Low | #1612 (P25) | S |
+| WG-52 | An EIP-7702 rejection is reported as "EIP-4844 blob" | Low | #1612 (P25) | S |
 | WG-53 | No WebSocket, HTTP/2, TLS termination or auth, by design | Info | no action | - |
 
 ## Findings
@@ -187,7 +188,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** cap concurrent upstream requests per route, keep the fleet's total below the worker's `--rpc.max-connections`, and fail fast with a `503` envelope over the cap.
   Until then, size the fleet as described in Operator guidance.
 - **Effort:** M.
-- **Status:** mostly closed in this PR when `--redirect-queries` is set (P1); the cap is issue TBD (P2).
+- **Status:** mostly closed in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` when `--redirect-queries` is set (P1); the cap is #1594 (P2).
 
 ### WG-02 Reject paths build an attacker-sized `id` as a `Value`; one request OOMs a gateway — High
 
@@ -203,10 +204,10 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   The same body forwarded normally peaked at 33,740 kB.
 - **Impact:** one request reaches about 3.2× the reference 256Mi limit, so one host OOM-kills a gateway with one request, repeatably; any client can force the reject path by sending the hop header.
   The redirect does not help, because the hop-marker check runs before routing.
-  At this PR's 1 MiB default a request is bounded near 34 MiB (the measured ratio is about 34× the `id` size), so about two dozen concurrent requests still exceed the reference limit of 768Mi.
+  At this PR's 1 MiB default a request costs about 34 MiB while its `id` is built (the measured ratio is about 34× the `id` size), and as many requests build at once as the runtime has worker threads: 50 concurrent requests peaked at 613 MB with 17 threads and at 89 MB on one CPU.
 - **Recommendation:** recover the `id` with a visitor that accepts only `null`, numbers and strings up to a small length, and echoes `null` otherwise, without building a `Value`.
 - **Effort:** S.
-- **Status:** issue TBD (P3); recommended before any public deployment.
+- **Status:** #1595 (P3); recommended before any public deployment.
 
 ### WG-03 A batch costs one token, skips the screen and has no length cap — High
 
@@ -225,7 +226,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   `--redirect-queries` sends read and mixed batches to the public RPC, but an all-submission batch still reaches the worker for one token; at the 1 MiB default that is still thousands of submissions.
 - **Recommendation:** charge one token per element, cap batch length with `413` / `-32003`, and screen every element of an all-submission batch.
 - **Effort:** M.
-- **Status:** issue TBD (P10).
+- **Status:** #1600 (P10).
 
 ### WG-04 The gateway-to-worker hop is plaintext only — High
 
@@ -245,7 +246,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   Capped at High because it needs an on-path position.
 - **Recommendation:** accept `https` worker URLs (optionally with a client certificate), or require a tunnel when the hop leaves a private network.
 - **Effort:** M for TLS, L for mTLS.
-- **Status:** issue TBD (P11); until then see Operator guidance.
+- **Status:** #1601 (P11); until then see Operator guidance.
 
 ### WG-05 Request bodies up to 25 MiB are buffered whole on up to 500 connections — High
 
@@ -261,7 +262,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   The gateway accepts bodies the worker would refuse anyway.
 - **Recommendation:** default to 1 MiB, document the sizing rule, size the reference manifest to match, and budget total in-flight request bytes.
 - **Effort:** S for the default, M for the byte budget.
-- **Status:** partly fixed in this PR (P6): the default is 1 MiB, the README states the sizing rule, and the reference memory limit is 768Mi; the byte budget is issue TBD (P7).
+- **Status:** partly fixed in this PR by `fix(worker-gateway): lower the default request body cap to 1 MiB` (P6): the default is 1 MiB, the README states the sizing rule, and the reference memory limit is 1Gi; the byte budget is #1597 (P7).
 
 ### WG-06 No per-IP connection cap; one host holds every slot — High
 
@@ -280,7 +281,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   It works per replica and can be repeated against all N; the redirect does not change it.
 - **Recommendation:** cap concurrent connections per client prefix at accept time.
 - **Effort:** M.
-- **Status:** issue TBD (P9).
+- **Status:** #1599 (P9).
 
 ### WG-07 Health probes share the client connection permits — High
 
@@ -292,7 +293,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   This holds when gateways are exposed at L4 or by DNS; a front that terminates TCP breaks the chain.
 - **Recommendation:** serve the probes on a separate listener or from reserved permits, and point the manifest's probes there.
 - **Effort:** M.
-- **Status:** issue TBD (P8).
+- **Status:** #1598 (P8).
 
 ### WG-08 The global token is spent before the per-IP check — High
 
@@ -316,7 +317,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   Exceeding its own per-IP limit alone is not enough.
 - **Recommendation:** run the per-IP check first and spend a global token only for requests it admits.
 - **Effort:** S.
-- **Status:** issue TBD (P4); recommended before any public deployment.
+- **Status:** #1596 (P4); recommended before any public deployment.
 
 ### WG-09 Reads and submissions share every limit — High
 
@@ -327,7 +328,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   With the redirect, the semaphore and the bucket are still shared, and a slow public RPC holds slots for up to the 30 s upstream timeout.
 - **Recommendation:** per-route in-flight caps and a budget reserved for submissions (the same change as WG-01).
 - **Effort:** M.
-- **Status:** issue TBD (P2).
+- **Status:** #1594 (P2).
 
 ### WG-10 Upstream clients follow HTTP redirects and honour proxy variables — High
 
@@ -339,7 +340,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   With `--redirect-queries` the query upstream is a third party, and one `307` from it, malicious or intercepted, replays reads onto the private worker or any internal host: it defeats the read shield and is a server-side request forgery.
 - **Recommendation:** `redirect(Policy::none())` and `no_proxy()` on both clients.
 - **Effort:** S.
-- **Status:** fixed for the proxy client in this PR (P5); the readiness client and `no_proxy` are in issue TBD (P25).
+- **Status:** fixed for the proxy client in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` (P5); the readiness client and `no_proxy` are in #1612 (P25).
 
 ### WG-11 Every method reaches the worker, including `tn_*` — Medium
 
@@ -355,7 +356,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   Public `tn_*` calls can churn the consensus-pack cache the node shares with state sync, under a tight bound; no consensus impact was shown.
 - **Recommendation:** set `--redirect-queries` on validators; without it, refuse `tn_*`, `debug_*`, `trace_*` and `admin_*` by default.
 - **Effort:** S.
-- **Status:** closed in this PR when `--redirect-queries` is set (P1); the allowlist is issue TBD (P15).
+- **Status:** closed in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` when `--redirect-queries` is set (P1); the allowlist is #1602 (P15).
 
 ### WG-12 Readiness has no hysteresis — Medium
 
@@ -364,7 +365,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** all gateways poll the same listener, so one slow poll drops all of them together, with no cause at the default log level.
 - **Recommendation:** flip to not-ready after several consecutive failures and back after several successes, and log the cause at info on each transition.
 - **Effort:** S.
-- **Status:** issue TBD (P18).
+- **Status:** #1605 (P18).
 
 ### WG-13 The node health listener is serial and unauthenticated — Medium
 
@@ -375,7 +376,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   The node source says to firewall it; the gateway docs did not.
 - **Recommendation:** firewall the port to the gateway hosts; on the node side, consider serving it concurrently.
 - **Effort:** S (docs).
-- **Status:** documented in this PR (P14).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14).
 
 ### WG-14 Readiness gates reads as well as submissions — Medium
 
@@ -391,7 +392,8 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** a short worker outage fails every read on all N gateways together.
 - **Recommendation:** serve reads from a public RPC that does not depend on this worker's readiness.
 - **Effort:** S.
-- **Status:** closed for reads in this PR when `--redirect-queries` is set (P1); `/ready` keeps meaning "can take submissions" by design.
+- **Status:** closed for reads at the gateway in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` when `--redirect-queries` is set (P1).
+  `/ready` keeps meaning "can take submissions" by design, so a front that acts on `/ready` (the reference `readinessProbe`, a health-checked DNS record) still drops every gateway, and their reads, while the shared worker is down; the deploy README documents probing `/health` instead (P14), and a probe that reflects both routes is #1613 (P26).
 
 ### WG-15 Readiness is measured on the health listener, not on the RPC path — Medium
 
@@ -401,7 +403,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** readiness says the gateway can take submissions while every submission fails; a health-checked front keeps routing to it.
 - **Recommendation:** mark an upstream not ready after consecutive connection failures on the RPC path, and try the next ready upstream only when the request was never sent.
 - **Effort:** M.
-- **Status:** issue TBD (P18).
+- **Status:** #1605 (P18).
 
 ### WG-16 The reference HPA multiplies the worker-facing budget — Medium
 
@@ -418,7 +420,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   The HPA needs a prometheus-adapter rule that is not shipped.
 - **Recommendation:** size `--rate-limit-global` for `maxReplicas`, not `minReplicas`.
 - **Effort:** S (docs).
-- **Status:** documented in this PR (P14).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14).
 
 ### WG-17 Every budget is per process — Medium
 
@@ -427,7 +429,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** N gateways pass N × `--rate-limit-global` to the worker.
 - **Recommendation:** document the rule: the worker-facing budget is the per-gateway global limit times the largest number of gateways that can run.
 - **Effort:** S (docs).
-- **Status:** documented in this PR (P14).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14).
 
 ### WG-18 Client identity is the TCP peer — Medium
 
@@ -437,7 +439,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** behind a TCP-terminating front every client shares the front's buckets, so operators choose between per-client limits with a reachable origin and a front that merges every client into a few keys.
 - **Recommendation:** take the client address from `X-Forwarded-For` or PROXY protocol v2 only when the peer is in a configured set of trusted CIDRs.
 - **Effort:** M.
-- **Status:** issue TBD (P20).
+- **Status:** #1607 (P20).
 
 ### WG-19 The reference manifest polls the wrong readiness URL — Medium
 
@@ -451,7 +453,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** deployed as shipped, every replica stays unready; it fails closed, so the mistake is visible.
 - **Recommendation:** poll `http://<node>:<healthcheck port>/health/workers`.
 - **Effort:** S.
-- **Status:** fixed in this PR (P12).
+- **Status:** fixed in this PR by `fix(worker-gateway): poll the node healthcheck in the reference manifest` (P12).
 
 ### WG-20 Shutdown does not drain — Medium
 
@@ -466,7 +468,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** rollouts and scale-downs refuse new connections while endpoints and load balancers still route to the pod; DNS clients are refused for the record's TTL.
 - **Recommendation:** a `preStop` sleep now; later, a shutdown delay during which `/ready` returns `503` while the listener keeps accepting.
 - **Effort:** S for `preStop`, M for drain-aware shutdown.
-- **Status:** partly fixed in this PR (P12: `preStop` sleeps 5 s, inside the 40 s grace period); drain-aware shutdown is issue TBD (P19).
+- **Status:** partly fixed in this PR by `fix(worker-gateway): poll the node healthcheck in the reference manifest` (P12: `preStop` sleeps 5 s, inside the 40 s grace period); drain-aware shutdown is #1606 (P19).
 
 ### WG-21 Round-robin DNS has no health feedback — Medium
 
@@ -475,7 +477,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** with plain round-robin A records, a dead gateway keeps receiving 1/N of DNS answers until someone edits the zone.
 - **Recommendation:** publish the gateways behind health-checked DNS or a load balancer that probes `/ready`.
 - **Effort:** S (docs).
-- **Status:** documented in this PR (P14).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14).
 
 ### WG-22 Non-JSON upstream errors are relayed and counted as forwarded — Medium
 
@@ -484,7 +486,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Impact:** clients get non-JSON bodies, and worker saturation (WG-01) looks like success on the dashboard.
 - **Recommendation:** wrap non-JSON error responses in a JSON-RPC envelope with the request's `id`, and count them under their own outcome.
 - **Effort:** S.
-- **Status:** issue TBD (P16).
+- **Status:** #1603 (P16).
 
 ### WG-23 Pending-state reads miss the worker's pool under the redirect — Medium
 
@@ -495,7 +497,7 @@ New with `--redirect-queries`.
 - **Impact:** `eth_getTransactionCount(.., "pending")`, `eth_getTransactionByHash`, receipts right after a submission and calls at `pending` are answered by a node that has not seen the worker's pool, so clients that send several transactions quickly reuse nonces; fee quotes from the public node may lag an epoch boundary.
 - **Recommendation:** document it; later, route pending-tag and by-hash reads to the worker, or keep them consistent another way.
 - **Effort:** M.
-- **Status:** documented in this PR (P14); issue TBD (P21).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14); #1608 (P21).
 
 ### WG-24 Redirected reads leave from one egress IP with a spoofable XFF — Medium
 
@@ -516,7 +518,7 @@ New with `--redirect-queries`.
   Reads only.
 - **Recommendation:** agree an authentication header with the public RPC operator so it can exempt or meter gateways, and warn at startup when the redirect's `eth_chainId` differs from the worker's.
 - **Effort:** M.
-- **Status:** documented in this PR (P14); issue TBD (P22).
+- **Status:** documented in this PR by `docs(worker-gateway): document query redirect topology and record post-change review` (P14); #1609 (P22).
 
 ### WG-25 The upstream transport error cause is dropped — Medium
 
@@ -535,7 +537,7 @@ New with `--redirect-queries`.
 - **Impact:** `502` and `504` cannot be diagnosed from the logs, and a naive fix would leak any key in the URL.
 - **Recommendation:** log `without_url()` with its `source()` chain, and the upstream's origin only.
 - **Effort:** S.
-- **Status:** fixed in this PR (P13).
+- **Status:** fixed in this PR by `fix(worker-gateway): log the upstream transport error cause` (P13).
 
 ### WG-26 No access log or client dimension — Medium
 
@@ -544,7 +546,7 @@ New with `--redirect-queries`.
 - **Impact:** operators cannot attribute the floods in WG-05 to WG-09 to their sources; a CDN front, if any, may keep its own logs.
 - **Recommendation:** an optional sampled access log (client prefix, method class, route, status, latency) and a bounded per-prefix rejection view.
 - **Effort:** M.
-- **Status:** issue TBD (P23).
+- **Status:** #1610 (P23).
 
 ### WG-27 CORS cannot work — Medium
 
@@ -553,7 +555,7 @@ New with `--redirect-queries`.
 - **Impact:** browser dApps cannot use the advertised endpoint unless a front adds CORS.
 - **Recommendation:** an optional allowed-origins flag, with preflights answered by the gateway.
 - **Effort:** S.
-- **Status:** issue TBD (P17).
+- **Status:** #1604 (P17).
 
 ### WG-28 The readiness poller polls serially and reads the body unbounded — Low
 
@@ -562,7 +564,7 @@ New with `--redirect-queries`.
 - **Impact:** needs a malicious health endpoint or a man-in-the-middle, which already has WG-04.
 - **Recommendation:** cap the body size and poll upstreams concurrently.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-29 The per-IP table fails open when full; IPv6 /64 keys — Low
 
@@ -571,7 +573,7 @@ New with `--redirect-queries`.
 - **Impact:** amplifies WG-08 and WG-09; the global bucket still caps load.
 - **Recommendation:** refuse or share a bucket for untracked clients when the table is full, and document it.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-30 The 408 rewrite misreports — Low
 
@@ -580,7 +582,7 @@ New with `--redirect-queries`.
 - **Impact:** a delivered transaction can be reported as "did not complete"; reth never sends `408`, and the case needs a slow upload plus a slow worker.
 - **Recommendation:** rewrite only the timeout layer's own `408`, and say in the error that delivery is unknown.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-31 The lifetime cap cuts an in-flight request — Low
 
@@ -589,7 +591,7 @@ New with `--redirect-queries`.
 - **Impact:** a busy pooled connection can lose a response for a delivered call; documented in `--help`.
 - **Recommendation:** at the cap, stop accepting new requests on the connection and let the current one finish.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-32 The screen skips the Sync method, escaped names and other param shapes — Low
 
@@ -599,7 +601,7 @@ New with `--redirect-queries`.
 - **Impact:** the pool still refuses EIP-4844 and EIP-7702, so the cost is a worker round trip; the Sync call can race the gateway's timeout.
 - **Recommendation:** screen the Sync method and the other param shapes, and set the gateway's timeout above reth's sync timeout.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-33 A mid-stream upstream failure gives a truncated `200` — Low
 
@@ -608,7 +610,7 @@ New with `--redirect-queries`.
 - **Impact:** the client sees a framing error; metrics overcount success.
 - **Recommendation:** log and count body-stream failures; preserve the upstream's `Content-Length`.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-34 The binary hop marker breaks gateway chaining and is client-settable — Low
 
@@ -617,7 +619,7 @@ New with `--redirect-queries`.
 - **Impact:** a public RPC fronted by a gateway would reject redirected reads if the redirect carried the marker; client-set markers only reject the client's own request, with log noise capped by the rate limits.
 - **Recommendation:** use a distinct marker on the redirect hop; consider a hop count instead of a flag.
 - **Effort:** S.
-- **Status:** the redirect hop is addressed in this PR (P1: the query route sends `X-TN-Gateway-Redirect` and never `X-TN-Gateway`); the rest is issue TBD (P25).
+- **Status:** the redirect hop is addressed in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` (P1: the query route sends `X-TN-Gateway-Redirect` and never `X-TN-Gateway`); the rest is #1612 (P25).
 
 ### WG-35 Upstream URLs with credentials in debug logs and startup errors — Low
 
@@ -626,7 +628,7 @@ New with `--redirect-queries`.
 - **Impact:** needs debug level or a bad URL.
 - **Recommendation:** print origins only.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-36 The shipped feature set and image are never built in CI — Low
 
@@ -635,7 +637,7 @@ New with `--redirect-queries`.
 - **Impact:** the shipped dependency graph is untested; this PR adds a compile-time guard for the TLS backend.
 - **Recommendation:** a CI step that builds the gateway alone with `--locked`, and optionally the image.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-37 Image build not `--locked`, unpinned base images, `:latest` tag — Low
 
@@ -644,7 +646,7 @@ New with `--redirect-queries`.
 - **Impact:** replicas can run different builds.
 - **Recommendation:** `--locked`, pinned digests and a versioned tag.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-38 Large transitive dependency graph — Low
 
@@ -653,7 +655,7 @@ New with `--redirect-queries`.
 - **Impact:** about 3× the build and audit surface; whether the advisories are reachable at runtime was not checked.
 - **Recommendation:** depend on narrower crates for the few types the gateway uses.
 - **Effort:** M.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-39 TLS pitfalls: an empty root store builds silently — Low
 
@@ -662,7 +664,7 @@ New with `--redirect-queries`.
 - **Impact:** with this PR's TLS support, a host without CA certificates fails every `https` call at runtime, not at startup.
 - **Recommendation:** check at startup that the root store is not empty when an `https` URL is configured.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-40 CLI validation gaps — Low
 
@@ -671,7 +673,7 @@ New with `--redirect-queries`.
 - **Impact:** operator misconfiguration only.
 - **Recommendation:** reject zero durations and duplicate ids; normalise mapped IPv6 in the self check.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-41 The screen's rejected types match the pool by convention only — Low
 
@@ -680,7 +682,7 @@ New with `--redirect-queries`.
 - **Impact:** the sets match today, and drift fails closed.
 - **Recommendation:** a test that pins the two sets together.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-42 Not every error is a JSON-RPC envelope; every HTTP method is forwarded — Low
 
@@ -689,7 +691,7 @@ New with `--redirect-queries`.
 - **Impact:** the README's "always a JSON-RPC error" promise does not hold, and the worker answers forwarded non-POST requests with text/plain `405` or `415`; the request's own path and query are dropped, so nothing reaches other worker paths.
 - **Recommendation:** answer non-POST requests locally with an envelope, and correct the README.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-43 Errors use non-200 statuses — Low
 
@@ -698,7 +700,7 @@ New with `--redirect-queries`.
 - **Impact:** some clients treat these as transport failures and never read the body.
 - **Recommendation:** document it, or offer HTTP `200` for JSON-RPC errors.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-44 Batch errors come back as one object with `id: null` — Low
 
@@ -707,7 +709,7 @@ New with `--redirect-queries`.
 - **Impact:** clients expecting an array mis-parse the answer.
 - **Recommendation:** return an array with one error per element, or document the single object.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-45 XFF appended to the client's value; XFP hard-coded — Low
 
@@ -716,7 +718,7 @@ New with `--redirect-queries`.
 - **Impact:** latent today; matters to any upstream that trusts the header (see WG-24).
 - **Recommendation:** replace a client-supplied value unless the peer is trusted (with WG-18).
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-46 `upstream_ready{worker_id}` collides; the in-flight gauge misses streaming — Low
 
@@ -725,7 +727,7 @@ New with `--redirect-queries`.
 - **Impact:** dashboards and the HPA cannot see streaming load.
 - **Recommendation:** label by upstream index or origin; hold the in-flight guard until the body finishes.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-47 Unthrottled warns on some rejects; none on others — Low
 
@@ -734,7 +736,7 @@ New with `--redirect-queries`.
 - **Impact:** log volume capped by the rate limits at about 0.5 MB/s.
 - **Recommendation:** rate-limit the warns and count every reject kind.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-48 A never-ready gateway logs no reason at info — Low
 
@@ -743,7 +745,7 @@ New with `--redirect-queries`.
 - **Impact:** a never-ready gateway cannot be diagnosed at the default level.
 - **Recommendation:** log the first failure's cause at info.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-49 Docs contradict the code in several places — Low
 
@@ -752,7 +754,7 @@ New with `--redirect-queries`.
 - **Impact:** misleads sizing; the underlying issues have their own ids.
 - **Recommendation:** correct each item.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-50 ANSI escapes in non-TTY logs; no structured format — Low
 
@@ -761,7 +763,7 @@ New with `--redirect-queries`.
 - **Impact:** log hygiene; `NO_COLOR=1` works around it.
 - **Recommendation:** disable colour off a TTY and add a JSON log format.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-51 The Grafana datasource uid is hard-coded — Low
 
@@ -770,7 +772,7 @@ New with `--redirect-queries`.
 - **Impact:** the dashboard needs editing to import; operability only.
 - **Recommendation:** a datasource template variable.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-52 An EIP-7702 rejection is reported as "EIP-4844 blob" — Low
 
@@ -779,7 +781,7 @@ New with `--redirect-queries`.
 - **Impact:** cosmetic.
 - **Recommendation:** name the rejected type in the message.
 - **Effort:** S.
-- **Status:** issue TBD (P25).
+- **Status:** #1612 (P25).
 
 ### WG-53 No WebSocket, HTTP/2, TLS termination or auth, by design — Info
 
@@ -826,39 +828,42 @@ New with `--redirect-queries`.
 | Reads survive a worker outage | no | added in this PR: `worker_down_serves_queries_and_refuses_submissions` (WG-14) |
 | A failing query upstream never falls back to the worker | n/a | added in this PR: `query_upstream_down_never_falls_back_to_the_worker`, `slow_query_upstream_times_out_without_falling_back` |
 | Transport error cause logged without the URL | no | added in this PR: `forwarding_failure_log_fields_hide_the_url` (WG-25) |
+| Redirect startup errors name the URL by origin only | n/a | added in this PR: `redirect_errors_name_the_url_by_origin_only` (post-rev-3) |
 
 ## Plan to address Medium and above
 
-Rows are ordered by severity, then by the size of the change.
+Rows are ordered by severity, then by the size of the change; P26 and P27 come from the [post-change review](#post-change-review).
 WG-02 and WG-08 (P3, P4) are small and are recommended before any public deployment.
 
 | # | WG-IDs | Change | Acceptance criteria (testable) | This PR (commit) or follow-up (issue) |
 | --- | --- | --- | --- | --- |
 | P1 | WG-01, WG-11, WG-14 | `--redirect-queries <URL>`: the two submission methods go to the first ready worker, every other call and every mixed batch to the URL, with no readiness gate and no fallback to the worker | `redirect_sends_each_method_to_its_upstream`, `redirect_sends_only_all_submission_batches_to_the_worker`, `worker_down_serves_queries_and_refuses_submissions` and `query_upstream_down_never_falls_back_to_the_worker` pass; with the option set, a `tn_*` call never reaches the worker | this PR: `feat(worker-gateway): serve non-submission calls from --redirect-queries` |
-| P2 | WG-01, WG-09 | Per-route in-flight caps that fail fast with a `503` envelope, a global rate budget reserved for submissions, and a cap on concurrent upstream requests to the worker below its `--rpc.max-connections` | in a test, submissions succeed while the query route is saturated by a slow mock; the worker mock never sees more concurrent requests than the configured cap | follow-up: worker-gateway: isolate submission capacity from query traffic — issue TBD |
-| P3 | WG-02 | Recover the `id` as `null`, a number or a short string only, without a `Value` tree | a request with a 1 MiB array `id` and the hop header gets `508` with `id: null`; 500 such concurrent requests keep peak RSS under the reference limit | follow-up: worker-gateway: bound the recovered request id on reject paths — issue TBD; recommended before any public deployment |
-| P4 | WG-08 | Spend a global token only for requests the per-IP check admits | with global 1/s burst 3 and per-IP 1/s burst 1, after one IP sends 3 requests (1 admitted, 2 refused) a second IP's first request is admitted | follow-up: worker-gateway: charge the global rate budget only after the per-IP check — issue TBD; recommended before any public deployment |
+| P2 | WG-01, WG-09 | Per-route in-flight caps that fail fast with a `503` envelope, a global rate budget reserved for submissions, and a cap on concurrent upstream requests to the worker below its `--rpc.max-connections` | in a test, submissions succeed while the query route is saturated by a slow mock; the worker mock never sees more concurrent requests than the configured cap | follow-up: worker-gateway: isolate submission capacity from query traffic — #1594 |
+| P3 | WG-02 | Recover the `id` as `null`, a number or a short string only, without a `Value` tree | a request with a 1 MiB array `id` and the hop header gets `508` with `id: null`; 500 such concurrent requests keep peak RSS under the reference limit | follow-up: worker-gateway: bound the recovered request id on reject paths — #1595; recommended before any public deployment |
+| P4 | WG-08 | Spend a global token only for requests the per-IP check admits | with global 1/s burst 3 and per-IP 1/s burst 1, after one IP sends 3 requests (1 admitted, 2 refused) a second IP's first request is admitted | follow-up: worker-gateway: charge the global rate budget only after the per-IP check — #1596; recommended before any public deployment |
 | P5 | WG-10 | The proxy client follows no HTTP redirects | `query_upstream_redirects_are_not_followed` (307 and 308) passes, and fails with the redirect policy removed | this PR: `feat(worker-gateway): serve non-submission calls from --redirect-queries` |
-| P6 | WG-05 | Default `--max-request-bytes` 1 MiB, the sizing rule in the README, and a reference memory limit of 768Mi | `edge_protection_defaults` pins 1,048,576; the manifest's memory limit is at least `--max-connections` × `--max-request-bytes` plus overhead at the defaults | this PR: `fix(worker-gateway): lower the default request body cap to 1 MiB` |
-| P7 | WG-05 | A global budget on in-flight request bytes | peak RSS stays under the budget plus a constant for N parallel maximum-size bodies | follow-up: worker-gateway: global in-flight request-byte budget — issue TBD |
-| P8 | WG-07 | Serve `/health` and `/ready` outside the client connection cap | with `--max-connections 4` and four held connections, `curl -m 1` to `/health` and `/ready` returns `200` | follow-up: worker-gateway: serve health probes outside the client connection cap — issue TBD |
-| P9 | WG-06 | A per-IP concurrent connection cap | one IP holding the cap's worth of idle sockets does not stop a second IP from getting `200` | follow-up: worker-gateway: per-IP concurrent connection cap — issue TBD |
-| P10 | WG-03 | Charge one token per batch element, cap batch length, screen every element of an all-submission batch | an over-length batch gets `413` / `-32003`; a batch of K costs K tokens; a bad element inside an all-submission batch is refused | follow-up: worker-gateway: per-element batch charging, max batch length, per-element submission screening — issue TBD |
-| P11 | WG-04 | TLS (optionally mTLS) for worker upstreams, or a documented tunnel | an `https` worker URL is accepted, and forwarding and readiness work against a test server with a custom CA | follow-up: worker-gateway: TLS/mTLS or tunnel for worker upstreams — issue TBD |
+| P6 | WG-05 | Default `--max-request-bytes` 1 MiB, the sizing rule in the README, and a reference memory limit of 1Gi | `edge_protection_defaults` pins 1,048,576; the manifest's memory limit is at least 1.5 × `--max-connections` × `--max-request-bytes` + 64 MiB at the defaults (500 held 1 MiB bodies peaked at about 712 MiB) | this PR: `fix(worker-gateway): lower the default request body cap to 1 MiB` |
+| P7 | WG-05 | A global budget on in-flight request bytes | peak RSS stays under the budget plus a constant for N parallel maximum-size bodies | follow-up: worker-gateway: global in-flight request-byte budget — #1597 |
+| P8 | WG-07 | Serve `/health` and `/ready` outside the client connection cap | with `--max-connections 4` and four held connections, `curl -m 1` to `/health` and `/ready` returns `200` | follow-up: worker-gateway: serve health probes outside the client connection cap — #1598 |
+| P9 | WG-06 | A per-IP concurrent connection cap | one IP holding the cap's worth of idle sockets does not stop a second IP from getting `200` | follow-up: worker-gateway: per-IP concurrent connection cap — #1599 |
+| P10 | WG-03 | Charge one token per batch element, cap batch length, screen every element of an all-submission batch | an over-length batch gets `413` / `-32003`; a batch of K costs K tokens; a bad element inside an all-submission batch is refused | follow-up: worker-gateway: per-element batch charging, max batch length, per-element submission screening — #1600 |
+| P11 | WG-04 | TLS (optionally mTLS) for worker upstreams, or a documented tunnel | an `https` worker URL is accepted, and forwarding and readiness work against a test server with a custom CA | follow-up: worker-gateway: TLS/mTLS or tunnel for worker upstreams — #1601 |
 | P12 | WG-19, WG-20 | The reference manifest polls `/health/workers` on the node's healthcheck port and gains a 5 s `preStop` sleep | the manifest's readiness URL path is `/health/workers`; the unedited port placeholder fails at startup; `preStop` + drain + join margin (36 s) fits the 40 s grace period | this PR: `fix(worker-gateway): poll the node healthcheck in the reference manifest` |
 | P13 | WG-25 | Log the transport error cause and the upstream origin, never the URL | `upstream_origin_drops_userinfo_path_and_query`, `error_chain_joins_every_source` and `forwarding_failure_log_fields_hide_the_url` pass | this PR: `fix(worker-gateway): log the upstream transport error cause` |
 | P14 | WG-13, WG-16, WG-17, WG-21, WG-23, WG-24 | Operator guidance: firewall the health listener, size budgets for N gateways and the HPA maximum, use health-checked DNS, state the split-routing caveats | the README states each rule with the numbers to plug in | this PR: `docs(worker-gateway): document query redirect topology and record post-change review` |
-| P15 | WG-11 | Without `--redirect-queries`, refuse `tn_*`, `debug_*`, `trace_*` and `admin_*` by default | by default those calls get a JSON-RPC method-not-allowed error and never reach the worker mock | follow-up: worker-gateway: method allowlist when no redirect is configured — issue TBD |
-| P16 | WG-22 | Wrap non-JSON upstream errors in an envelope and count them separately | a mock `429` text/plain reaches the client as a JSON-RPC error with the request's `id`, counted under its own outcome | follow-up: worker-gateway: wrap non-JSON upstream errors and count them — issue TBD |
-| P17 | WG-27 | Optional CORS | the preflight is answered by the gateway, and `Access-Control-Allow-Origin` comes back on POST | follow-up: worker-gateway: optional CORS — issue TBD |
-| P18 | WG-12, WG-15 | Readiness hysteresis, and passive health from forwarding errors | one slow poll does not flip `/ready`; consecutive connection failures on the RPC path mark the upstream not ready and the next ready one is used; the cause is logged at info | follow-up: worker-gateway: readiness hysteresis and passive upstream health — issue TBD |
-| P19 | WG-20 | Drain-aware shutdown | after SIGTERM, `/ready` returns `503` for `--shutdown-delay` while the listener still accepts; tested | follow-up: worker-gateway: drain-aware shutdown — issue TBD |
-| P20 | WG-18 | Trusted proxy CIDRs and PROXY protocol for client identity | the per-IP key uses the forwarded client address only when the peer is in a configured CIDR | follow-up: worker-gateway: trusted proxy / PROXY protocol for client identity — issue TBD |
-| P21 | WG-23 | Consistent pending-state reads under the redirect | `eth_getTransactionCount(.., "pending")` through the gateway counts a submission made through it immediately before | follow-up: worker-gateway: pending-state reads under redirect — issue TBD |
-| P22 | WG-24 | An authentication header for the query upstream and a chain-id consistency check | the header reaches the query mock and never the worker mock; startup warns when the redirect's `eth_chainId` differs from the worker's | follow-up: worker-gateway: public RPC auth header + chain-id consistency warning — issue TBD |
-| P23 | WG-26 | An optional sampled access log | with the option on, a sampled request logs one structured line with client prefix, method class, route, status and latency | follow-up: worker-gateway: sampled access log — issue TBD |
-| P24 | (design) | Split mixed batches between the two upstreams and merge the answers in order | a mixed batch's submissions reach the worker, its reads the query mock, and the client gets one array in request order | follow-up: worker-gateway: split-and-merge mixed batches — issue TBD; only if `tn_worker_gateway_mixed_batches_total` shows real use |
-| P25 | WG-28 to WG-52 | The Low findings, as one checklist | each item's recommendation above | follow-up: worker-gateway: low-severity hardening — issue TBD |
+| P15 | WG-11 | Without `--redirect-queries`, refuse `tn_*`, `debug_*`, `trace_*` and `admin_*` by default | by default those calls get a JSON-RPC method-not-allowed error and never reach the worker mock | follow-up: worker-gateway: method allowlist when no redirect is configured — #1602 |
+| P16 | WG-22 | Wrap non-JSON upstream errors in an envelope and count them separately | a mock `429` text/plain reaches the client as a JSON-RPC error with the request's `id`, counted under its own outcome | follow-up: worker-gateway: wrap non-JSON upstream errors and count them — #1603 |
+| P17 | WG-27 | Optional CORS | the preflight is answered by the gateway, and `Access-Control-Allow-Origin` comes back on POST | follow-up: worker-gateway: optional CORS — #1604 |
+| P18 | WG-12, WG-15 | Readiness hysteresis, and passive health from forwarding errors | one slow poll does not flip `/ready`; consecutive connection failures on the RPC path mark the upstream not ready and the next ready one is used; the cause is logged at info | follow-up: worker-gateway: readiness hysteresis and passive upstream health — #1605 |
+| P19 | WG-20 | Drain-aware shutdown | after SIGTERM, `/ready` returns `503` for `--shutdown-delay` while the listener still accepts; tested | follow-up: worker-gateway: drain-aware shutdown — #1606 |
+| P20 | WG-18 | Trusted proxy CIDRs and PROXY protocol for client identity | the per-IP key uses the forwarded client address only when the peer is in a configured CIDR | follow-up: worker-gateway: trusted proxy / PROXY protocol for client identity — #1607 |
+| P21 | WG-23 | Consistent pending-state reads under the redirect | `eth_getTransactionCount(.., "pending")` through the gateway counts a submission made through it immediately before | follow-up: worker-gateway: pending-state reads under redirect — #1608 |
+| P22 | WG-24 | An authentication header for the query upstream and a chain-id consistency check | the header reaches the query mock and never the worker mock; startup warns when the redirect's `eth_chainId` differs from the worker's | follow-up: worker-gateway: public RPC auth header + chain-id consistency warning — #1609 |
+| P23 | WG-26 | An optional sampled access log | with the option on, a sampled request logs one structured line with client prefix, method class, route, status and latency | follow-up: worker-gateway: sampled access log — #1610 |
+| P24 | (design) | Split mixed batches between the two upstreams and merge the answers in order | a mixed batch's submissions reach the worker, its reads the query mock, and the client gets one array in request order | follow-up: worker-gateway: split-and-merge mixed batches — #1611; only if `tn_worker_gateway_mixed_batches_total` shows real use |
+| P25 | WG-28 to WG-52 | The Low findings, as one checklist | each item's recommendation above | follow-up: worker-gateway: low-severity hardening — #1612 |
+| P26 | WG-14, post-rev-1 | A probe that keeps a redirecting gateway in rotation while its worker is down | with the worker down and the query upstream up, the new probe returns `200` while `/ready` returns `503`; the reference `readinessProbe` uses it | follow-up: worker-gateway: probe that keeps redirecting gateways in rotation while the worker is down — #1613 |
+| P27 | post-dos-2 | Cache upstream addresses and cap concurrent DNS lookups | with a resolver that delays the query host by 10 s and 100 reads per second, `/ready` and submissions stay `200` | follow-up: worker-gateway: bound and cache DNS lookups for upstream hosts — #1614 |
 
 ## Operator guidance
 
@@ -872,7 +877,10 @@ Point it at an `https` public RPC that serves the same chain.
 - `/ready` means "this gateway can take submissions"; a gateway whose worker is down returns `503` even though it still serves reads.
 - Lock the domain at the registrar, enable DNSSEC where the provider supports it, and use a DNS provider with its own DDoS protection; a hijacked name serves forged state to every client.
 - Keep TTLs short enough to drain a gateway in minutes, but not so short that resolver load becomes the attack surface.
-- The gateway resolves the redirect host itself; when that lookup fails, reads get `502` and submissions are unaffected.
+- The gateway resolves upstream names through the system resolver on the runtime's blocking threads.
+  A lookup that fails fast gives reads a `502` and leaves submissions alone, but a resolver that hangs on the public RPC's name ties up those threads and can make readiness polls time out on every gateway (post-dos-2, #1614 (P27)).
+  Use a resolver close to the gateways, and an IP literal for the readiness URL where you can.
+- `/ready` means "this gateway can take submissions", and every gateway shares the worker, so a front that acts on `/ready` drops all of them, reads included, while the worker is down; probe `/health` instead if reads must survive a worker outage (WG-14, #1613 (P26)).
 
 **DDoS front.**
 
@@ -894,9 +902,11 @@ Point it at an `https` public RPC that serves the same chain.
   Size `--rate-limit-global` as the worker's budget divided by the largest N that can run, which is the HPA's `maxReplicas` if the HPA is installed (WG-16).
 - Connections: until P2 lands, N × `--max-connections` can exceed the worker's `--rpc.max-connections` (500 by default).
   With `--redirect-queries` only submissions reach the worker, and they are fast except `eth_sendRawTransactionSync`, which can hold a worker permit for up to 30 s; raise the worker's limit above N × `--max-connections` or accept that a flood of Sync calls through one gateway can make the worker refuse submissions from the others.
-- Memory: peak buffered request memory is about `--max-connections` × `--max-request-bytes` plus overhead.
-  At the defaults that is 500 × 1 MiB = 500 MiB, so the reference manifest sets a 768Mi limit.
+- Memory: each held body costs about 1.4 × its size, because the connection's read buffer stays allocated while the request is in flight (500 held 1 MiB bodies peaked at about 712 MiB).
+  Budget 1.5 × `--max-connections` × `--max-request-bytes` + 64 MiB, about 814 MiB at the defaults, so the reference manifest sets a 1Gi limit.
   The limit does not cover WG-02, whose amplification is about 34× the request size; that needs P3.
+- Query upstream: until P2 lands, a public RPC that accepts requests and never answers holds a gateway's connection slots for up to `--upstream-request-timeout` (30 s) each, and about 17 reads per second fill the default 500 slots, starving submissions on every gateway that uses it (post-dos-1).
+  Alert on `tn_worker_gateway_routed_requests_total{route="query",result="timeout"}` and agree on availability with the public RPC's operator.
 
 **Split routing (with `--redirect-queries`).**
 
@@ -904,6 +914,7 @@ Point it at an `https` public RPC that serves the same chain.
   Clients that send several transactions in a row should track their own nonces.
 - A submission inside a mixed batch goes to the public RPC with the rest of the batch and enters the network there.
 - Every redirected read reaches the public RPC from the gateway's address, so its per-IP limits apply to all of the gateway's clients together (WG-24); agree limits with its operator.
+- Each redirected call carries the client's address in `X-Forwarded-For`, so the public RPC's operator sees your clients' addresses.
 
 ## Appendix: unconfirmed findings
 
@@ -921,3 +932,67 @@ These parts of the original claims were refuted or could not be checked, and are
 - WG-01: the worker's permit is held per in-flight request, so a client reading the response slowly does not hold it; the attacker needs calls that are slow on the worker.
   WG-01 was confirmed from code, arithmetic and a mock, not against a running worker.
 - WG-48: a failure to bind the metrics port exits the process at startup, so that half of the claim (a silent metrics failure) was refuted.
+
+## Post-change review
+
+After the fixes and the feature landed, the branch diff (`02fe2a1e...HEAD -- bin/worker-gateway`) had two more passes: a correctness, docs and tests review, and a denial-of-service review with measurements on a debug build.
+Their findings are numbered post-rev-N and post-dos-N; line numbers in them are at the branch head, not at `02fe2a1e`.
+Every Medium finding was fixed in this PR or given an issue, and the Low findings joined the Low checklist.
+
+What came out clean:
+
+- No Critical or High finding, and no way around the shield.
+  The classifier was checked against the worker's own JSON-RPC parser (jsonrpsee 0.26): case variants, escaped names, a byte-order mark, trailing bytes, nested arrays, non-object elements and empty batches all go to the query route.
+  A duplicated `method` key is routed by its last occurrence, but the worker's parser refuses duplicated fields, so such a call can only be rejected there as an invalid request; nothing runs.
+- The query route follows no redirects and relays no `Location` header; the hop markers, the `508` rules, the readiness and fallback matrix and the new metrics behave as documented.
+- The rustls compile guard holds when the gateway is built alone, and `Cargo.lock` is unchanged.
+- Metric labels are bounded, the upstream connection pool and the TLS session cache are bounded, and the classifier's cost is linear in the body with no recursion path.
+
+| ID | Title | Severity | Resolution |
+| --- | --- | --- | --- |
+| post-rev-1 | With the reference probes, reads still stop while the worker is down, though the report called WG-14 closed | Medium | report corrected (WG-14 and the verdict); the README and the deploy README's "Readiness and reads" section document probing `/health`; issue #1613 (P26) |
+| post-rev-2 | The reference manifest never set `--redirect-queries` | Medium | fixed in `feat(worker-gateway): serve non-submission calls from --redirect-queries`: the manifest sets `WORKER_GATEWAY_REDIRECT_QUERIES` to a placeholder that stops the gateway at startup until it is replaced, and the deploy README lists it |
+| post-dos-1 | A stalled query upstream fills every connection slot and starves submissions on every gateway | Medium | issue #1594 (P2: a cap on in-flight query forwards and a shorter query timeout); operator guidance |
+| post-dos-2 | A resolver that hangs on the redirect host uses up the blocking threads, so readiness flaps and submissions get `503` | Medium | operator guidance corrected; issue #1614 (P27) |
+| post-dos-3 | The first sizing rule undercounted each held body by about 42% | Medium | fixed in `fix(worker-gateway): lower the default request body cap to 1 MiB`: the reference limit is 1Gi and the rule uses the measured cost; bounding the read buffer is in issue #1597 (P7) |
+| post-rev-3 | A `--redirect-queries` startup error printed the full URL, credentials included | Low | fixed in `feat(worker-gateway): serve non-submission calls from --redirect-queries`: startup errors name upstream URLs by origin only (test `redirect_errors_name_the_url_by_origin_only`); clap's echo of an unparseable value is in issue #1612 |
+| post-rev-7 | README and doc comments still said every call goes to the worker | Low | fixed: doc comments in `feat(worker-gateway): serve non-submission calls from --redirect-queries`, README in `docs(worker-gateway): document query redirect topology and record post-change review` |
+| post-rev-8 | The README's Query redirect section omitted the split-routing caveats | Low | fixed in `docs(worker-gateway): document query redirect topology and record post-change review` |
+| post-rev-4 | The redaction test does not exercise the log line itself | Low | issue #1612 |
+| post-rev-5 | No test checks the classifier against the worker's parser | Low | issue #1612 |
+| post-rev-6 | The two new metrics are untested | Low | issue #1612 |
+| post-rev-9 | The query upstream chooses the `Content-Type` served on the validator's origin | Low | issue #1612 |
+| post-dos-4 | The classifier repeats the screen's parse and allocates per key and per element | Low | issue #1612 |
+| post-dos-5 | Every failed query forward logs an unthrottled warning | Low | issue #1612 |
+| post-rev-10 | The redirect's worker-origin check compares host literals only | Info | issue #1612 |
+| post-rev-11 | `tn_worker_gateway_mixed_batches_total` misses a submission batched with a non-object element | Info | issue #1612 |
+
+### post-rev-1 Reads still stop with the worker behind the reference probes — Medium
+
+- **Evidence:** `/ready` reports whether a worker is ready (`src/server.rs`, `fn readiness`), and the reference Deployment's `readinessProbe` uses it; the Service does not publish not-ready addresses.
+- **Reproduction:** `server::tests::worker_down_serves_queries_and_refuses_submissions` shows the gateway serving `eth_chainId` from the query upstream while `/ready` returns `503`; every replica polls the same worker, so with the manifest's probe (period 5 s, failure threshold 3) all of them leave the Service about 15 s into a worker outage.
+- **Impact:** in the reference deployment, and behind any front that acts on `/ready`, a worker restart still fails every read on every gateway.
+
+### post-rev-2 The reference manifest never set `--redirect-queries` — Medium
+
+- **Evidence:** at the feature commit, nothing under `deploy/` mentioned the redirect, while the operator guidance says to always set it on a validator's gateways.
+- **Impact:** an operator following the deploy README got no read shield.
+
+### post-dos-1 A stalled query upstream starves submissions on every gateway — Medium
+
+- **Evidence:** the query route shares the connection semaphore, the client and the 30 s request timeout with submissions, and every gateway uses the same query URL.
+- **Reproduction:** with a query upstream that read each request and never answered, 500 concurrent `eth_getBalance` calls held every slot; a submission then took 27.04 s (it took 0.00 s before the load), and the queries ended as `504` after 30-31 s.
+  At 30 s per stalled request, about 17 reads per second fill 500 slots.
+- **Impact:** one slowdown at the public RPC, attacker-driven or not, stops submissions on every gateway at once; WG-09 describes the mechanism for one gateway, and the shared query URL extends it to the fleet.
+
+### post-dos-2 A hanging resolver for the redirect host makes readiness flap — Medium
+
+- **Evidence:** reqwest resolves names through hyper-util's `GaiResolver`, which runs each lookup with `spawn_blocking`; tokio caps the blocking pool at 512 threads, a started lookup keeps its thread past the 2 s connect timeout, and the readiness client shares the pool and needs a lookup on every poll when its URL is a hostname.
+- **Reproduction:** with a resolver shim that answered names containing "slow" after 10 s, `--redirect-queries http://rpc.slow.test:23003/` and 100 reads per second, the thread count rose from 18 to 529 in 6 s; `/ready` and submissions returned `503` twice in 25 s, and the gateway recovered within 5 s after the load stopped.
+- **Impact:** a slow resolver for one third-party name takes submissions down on every gateway that uses it; the first version of this report said submissions were unaffected.
+
+### post-dos-3 The first sizing rule undercounted held bodies — Medium
+
+- **Evidence:** hyper's per-connection read buffer can grow to 408 KiB (`DEFAULT_MAX_BUFFER_SIZE`), and the gateway does not lower it.
+- **Reproduction:** 500 complete 1 MiB queries held by a stalled upstream peaked at 728,904 kB (about 712 MiB; the idle process uses about 11 MB), about 1.42 MiB per connection, against the 500 MiB the first rule assumed.
+- **Impact:** at the defaults the first proposed limit of 768Mi would have left about 56 MiB of headroom instead of 268 MiB.
