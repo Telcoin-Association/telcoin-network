@@ -124,8 +124,9 @@ pub fn vote_observation_watermark() -> Option<VoteObservationWatermark> {
     VOTE_OBSERVATION_GENERATION.get().and_then(|generation| generation.as_ref().ok()).map(
         |generation| VoteObservationWatermark {
             generation,
+            // RMW observes the preceding allocation without allocating an ID or flushing logs.
             allocated_request_count: VOTE_OBSERVATION_NEXT_ID
-                .load(Ordering::Relaxed)
+                .fetch_add(0, Ordering::Relaxed)
                 .saturating_sub(1),
         },
     )

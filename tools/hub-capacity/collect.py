@@ -3,22 +3,29 @@
 
 import argparse
 import hashlib
+import http.client
 import importlib.util
+import ipaddress
 import json
 import math
 import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import time
 import urllib.request
+import urllib.parse
 
 
 ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("hub_qualify", ROOT / "qualify.py")
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
+CONTROL_SPEC = importlib.util.spec_from_file_location("hub_control", ROOT / "control.py")
+CONTROL = importlib.util.module_from_spec(CONTROL_SPEC)
+CONTROL_SPEC.loader.exec_module(CONTROL)
 SWARMS = ("primary", "worker-0", "worker-1")
 CLASSES = {
     "primary": ("epoch_stream", "epoch_record", "primary_shed"),
@@ -27,6 +34,61 @@ CLASSES = {
 }
 SAMPLE = re.compile(r'([a-zA-Z_:][a-zA-Z0-9_:]*)(\{.*\})?\s+(\S+)(?:\s+\S+)?')
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="((?:[^"\\]|\\.)*)"(?:,|$)')
+WATERMARK = re.compile(r'tn_primary_vote_observation_allocated\{generation="([0-9a-f]{32})"\} ([0-9]+)')
+
+
+def metrics_get(url, deadline):
+    """Keep the existing scrape bound across connect, response headers and body."""
+    if not CONTROL.direct_http_url(url):
+        raise ValueError("bounded metrics require a declared numeric HTTP endpoint")
+    parsed = urllib.parse.urlsplit(url)
+    address = ipaddress.ip_address(parsed.hostname)
+    connection = http.client.HTTPConnection(parsed.hostname, parsed.port)
+    raw = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
+                        socket.SOCK_STREAM)
+    try:
+        raw.settimeout(CONTROL.remaining_timeout(deadline))
+        raw.connect((str(address), parsed.port or 80))
+        connection.sock = CONTROL.DeadlineSocket(raw, deadline)
+        path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
+        connection.request("GET", path)
+        with connection.getresponse() as response:
+            if not 200 <= response.status < 300:
+                raise ValueError(f"metrics HTTP status {response.status}")
+            body = response.read(4 * 1024**2 + 1)
+        CONTROL.remaining_timeout(deadline)
+        if len(body) > 4 * 1024**2:
+            raise ValueError("metrics response exceeds 4 MiB")
+        return body
+    finally:
+        connection.close()
+        raw.close()
+
+
+def producer_watermark(metrics):
+    lines = [line for line in metrics.splitlines()
+             if line.startswith("tn_primary_vote_observation_allocated")]
+    if not lines:
+        return None
+    if len(lines) != 1 or (match := WATERMARK.fullmatch(lines[0])) is None:
+        raise ValueError("native producer watermark missing or ambiguous")
+    generation, count = match.groups()
+    count = int(count)
+    if count > 2**53:
+        raise ValueError("producer watermark exceeds exact native gauge integer range")
+    return generation, count, lines[0]
+
+
+def write_committee_fences(path, measurement, duration, fences):
+    body = json.dumps({"version": 1, "measurement_start_unix_us": measurement,
+                       "window_end_unix_us": measurement + duration * 1_000_000,
+                       "fences": fences}, allow_nan=False, sort_keys=True).encode()
+    if len(body) > 32 * 1024 or len(fences) > 2:
+        raise ValueError("committee producer fences exceed bounded storage")
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("wb") as stream:
+        stream.write(body)
+    os.replace(temporary, path)
 
 
 def parse_metrics(raw):
@@ -273,9 +335,12 @@ def collect(frozen, bindings, phase, output):
     protocol_logs = bindings.get("protocol_logs", [])
     if not isinstance(protocol_logs, list) or len(protocol_logs) != plan["envelope"]["committee_peers"] or len(set(protocol_logs)) != len(protocol_logs):
         raise ValueError("retain a distinct production log for every declared committee validator")
-    raw = RawLog(output, maximum_segments=64 - 3 - len(protocol_logs))
+    raw = RawLog(output, maximum_segments=64 - 4 - len(protocol_logs))
     operations = output / "operations.jsonl"
     workload_log = output / "workload.log"
+    fence_path = output / "committee-fences.json"
+    committee_sources = {hub: node["bls_key"] for hub, node in zip(
+        plan["hubs"], QUALIFY.read_json(topology)["population"]["validators"][:2])}
     identities = {}
     for hub, binding in bindings["hubs"].items():
         if binding["revision"] != plan[phase]["revision"]:
@@ -290,6 +355,10 @@ def collect(frozen, bindings, phase, output):
         _, identities[hub], _ = process_sample(pid)
     started = time.monotonic()
     started_unix_us = time.time_ns() // 1000
+    duration = plan["envelope"]["duration_seconds"]
+    drain_deadline = started + duration + 30
+    fences, previous_watermarks = {}, {}
+    write_committee_fences(fence_path, started_unix_us, duration, fences)
     samples = []
     child = None
     try:
@@ -298,6 +367,7 @@ def collect(frozen, bindings, phase, output):
             environment = {**os.environ, "HUB_CAPACITY_ORIGIN": str(started),
                            "HUB_CAPACITY_MEASUREMENT_UNIX_US": str(started_unix_us),
                            "HUB_CAPACITY_OPERATIONS": str(operations.resolve()),
+                           "HUB_CAPACITY_COMMITTEE_FENCES": str(fence_path.resolve()),
                            "HUB_CAPACITY_PHASE": phase, "HUB_CAPACITY_PLAN_SHA256": QUALIFY.digest(plan)}
             child = subprocess.Popen(bindings["workload"], stdout=log, stderr=log, env=environment)
             while True:
@@ -308,16 +378,45 @@ def collect(frozen, bindings, phase, output):
                     process, identity, stat = process_sample(binding["pid"])
                     if identity != identities[hub]:
                         raise ValueError(f"{hub}: process restarted during qualification")
-                    with urllib.request.urlopen(binding["metrics_url"], timeout=2) as response:
-                        body = response.read(4 * 1024**2 + 1)
-                    if len(body) > 4 * 1024**2:
-                        raise ValueError("metrics response exceeds 4 MiB")
+                    scrape_started = time.monotonic()
+                    scrape_started_unix_us = time.time_ns() // 1000
+                    body = metrics_get(binding["metrics_url"], min(scrape_started + 2, drain_deadline))
                     text = body.decode()
+                    scrape_completed = time.monotonic()
+                    if scrape_completed >= drain_deadline:
+                        raise ValueError("metrics scrape exceeded workload drain deadline")
+                    watermark = producer_watermark(text)
+                    if watermark is not None:
+                        generation, count, metric_line = watermark
+                        previous = previous_watermarks.get(hub)
+                        if previous is not None and (generation != previous[0] or count < previous[1]):
+                            raise ValueError("native producer generation changed or watermark regressed")
+                        previous_watermarks[hub] = generation, count
+                        source = committee_sources[hub]
+                        if (source not in fences and scrape_started >= started + duration and
+                                scrape_started_unix_us >= started_unix_us + duration * 1_000_000):
+                            fences[source] = {
+                                "source": source, "hub": hub, "generation": generation,
+                                "allocated_request_count": count, "process_id": binding["pid"],
+                                "process_identity": identity, "metrics_url": binding["metrics_url"],
+                                "scrape_started_elapsed_seconds": scrape_started - started,
+                                "scrape_completed_elapsed_seconds": scrape_completed - started,
+                                "scrape_started_unix_us": scrape_started_unix_us,
+                                "metric_line": metric_line,
+                                "metric_line_sha256": hashlib.sha256(metric_line.encode()).hexdigest(),
+                            }
+                            write_committee_fences(fence_path, started_unix_us, duration, fences)
                     raw.append({"hub": hub, "elapsed_seconds": elapsed,
                                 "pid": binding["pid"], "stat": stat, "metrics": text,
-                                "workload_completed_before_sample": completed_before_sample})
+                                "workload_completed_before_sample": completed_before_sample,
+                                "scrape_started_unix_us": scrape_started_unix_us,
+                                "scrape_started_elapsed_seconds": scrape_started - started,
+                                "scrape_completed_elapsed_seconds": scrape_completed - started,
+                                "committee_fence": fences.get(committee_sources[hub])})
                     hubs[hub] = {**process, **observations(capacity_metrics(text, binding["progress"]["name"]), binding, phase)}
                 samples.append({"elapsed_seconds": elapsed, "hubs": hubs})
+                if time.monotonic() >= drain_deadline:
+                    raise ValueError("sample processing exceeded workload drain deadline")
                 if elapsed >= plan["envelope"]["duration_seconds"] and completed_before_sample:
                     break
                 if elapsed >= plan["envelope"]["duration_seconds"] + 30:
@@ -326,7 +425,8 @@ def collect(frozen, bindings, phase, output):
                     raise ValueError("workload driver failed")
                 if workload_log.stat().st_size > 64 * 1024**2:
                     raise ValueError("workload log exceeds artifact budget")
-                time.sleep(max(0, 2 - (time.monotonic() - started - elapsed)))
+                sleep_now = time.monotonic()
+                time.sleep(max(0, min(2 - (sleep_now - started - elapsed), drain_deadline - sleep_now)))
             if child.wait(timeout=30) != 0:
                 raise ValueError("workload driver failed")
         protocol_artifacts = retain_protocol_logs(protocol_logs, output)
@@ -335,11 +435,10 @@ def collect(frozen, bindings, phase, output):
             "profile_sha256": QUALIFY.digest(plan[phase]["profile"]),
             "binary_sha256": plan[phase]["binary_sha256"], "envelope": plan["envelope"],
             "measurement_start_unix_us": started_unix_us,
-            "committee_sources": {hub: node["bls_key"] for hub, node in zip(
-                plan["hubs"], QUALIFY.read_json(topology)["population"]["validators"][:2])},
+            "committee_sources": committee_sources,
             "samples": samples, "operations": read_operations(operations),
             "artifacts": raw.artifacts() + protocol_artifacts + [
-                {"path": path.name, "sha256": file_hash(path)} for path in (operations, workload_log, topology)
+                {"path": path.name, "sha256": file_hash(path)} for path in (operations, workload_log, topology, fence_path)
             ],
         }
         QUALIFY.validate_evidence(plan, result, phase)

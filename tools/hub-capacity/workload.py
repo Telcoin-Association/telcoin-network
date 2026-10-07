@@ -7,8 +7,10 @@ import hashlib
 import http.client
 import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -197,6 +199,52 @@ def validate_bulk_trace(trace):
             expected = set(digests)
 
 
+def committee_fence(path, source, measurement, duration):
+    """Read an independent bounded fence, never an observed-log maximum."""
+    try:
+        with path.open("rb") as stream:
+            body = stream.read(32 * 1024 + 1)
+    except FileNotFoundError:
+        return None
+    if len(body) > 32 * 1024:
+        raise ValueError("committee producer fences exceed bounded storage")
+    document = json.loads(body)
+    cutoff = measurement + duration * 1_000_000
+    if (type(document.get("version")) is not int or document.get("version") != 1 or
+            document.get("measurement_start_unix_us") != measurement or
+            document.get("window_end_unix_us") != cutoff):
+        raise ValueError("committee producer fence measurement binding mismatch")
+    fences = document["fences"]
+    if not isinstance(fences, dict) or len(fences) > 2:
+        raise ValueError("committee producer fences exceed bounded storage")
+    fence = fences.get(source)
+    if fence is None:
+        return None
+    if fence["source"] != source:
+        raise ValueError("committee producer fence source mismatch")
+    generation = fence["generation"]
+    if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+        raise ValueError("invalid committee producer fence generation")
+    count = QUALIFY.integer(fence["allocated_request_count"], "producer fence allocation count", 0)
+    if count > 2**53:
+        raise ValueError("producer watermark exceeds exact native gauge integer range")
+    QUALIFY.integer(fence["process_id"], "producer fence process", 1)
+    QUALIFY.integer(fence["process_identity"], "producer fence process identity", 1)
+    if not CONTROL.direct_http_url(fence["metrics_url"]) or not isinstance(fence["hub"], str):
+        raise ValueError("invalid committee producer fence binding")
+    scrape_start = fence["scrape_started_elapsed_seconds"]
+    scrape_end = fence["scrape_completed_elapsed_seconds"]
+    if (type(scrape_start) not in (int, float) or type(scrape_end) not in (int, float) or
+            not math.isfinite(scrape_start) or not math.isfinite(scrape_end) or
+            not duration <= scrape_start <= scrape_end < duration + 30 or
+            QUALIFY.integer(fence["scrape_started_unix_us"], "producer fence scrape time", 1) < cutoff):
+        raise ValueError("committee producer fence was not sampled within the post-cutoff drain")
+    line = f'tn_primary_vote_observation_allocated{{generation="{generation}"}} {count}'
+    if fence["metric_line"] != line or fence["metric_line_sha256"] != hashlib.sha256(line.encode()).hexdigest():
+        raise ValueError("committee producer fence metric provenance mismatch")
+    return fence
+
+
 def consume_committee(agent, origin, measurement_unix_us, duration, record):
     """One consumer owns each hub queue, with bounded pending state and the existing tail budget."""
     args = control_arguments(agent["argv"])
@@ -205,6 +253,8 @@ def consume_committee(agent, origin, measurement_unix_us, duration, record):
     end = origin + duration
     deadline = end + 30
     pending = {}
+    fence_path = Path(os.environ["HUB_CAPACITY_COMMITTEE_FENCES"])
+    fence = None
     started_count = terminal_count = 0
     poll = 0
     while time.monotonic() < deadline:
@@ -244,14 +294,39 @@ def consume_committee(agent, origin, measurement_unix_us, duration, record):
         QUALIFY.integer(trace["queued"], "follower queue", 0)
         if type(trace["caught_up"]) is not bool or trace["caught_up"] != (trace["offset"] == trace["size"]):
             raise ValueError("invalid follower position")
-        complete = time.monotonic() >= end and not pending and trace["queued"] == 0 and trace["caught_up"]
+        allocation = trace["allocation"]
+        through = QUALIFY.integer(allocation["started_through"], "native start coverage", 0)
+        holes = QUALIFY.integer(trace["allocation_holes"], "native out-of-order start count", 0)
+        if holes > 1024:
+            raise ValueError("committee start coverage allocation exhausted")
+        if allocation["generation"] is None:
+            if allocation["process_id"] is not None or through or holes:
+                raise ValueError("unbound committee start coverage")
+        elif (not isinstance(allocation["generation"], str) or
+              re.fullmatch(r"[0-9a-f]{32}", allocation["generation"]) is None):
+            raise ValueError("invalid committee coverage generation")
+        else:
+            QUALIFY.integer(allocation["process_id"], "native coverage process", 1)
+        candidate = committee_fence(fence_path, agent["identity"], measurement_unix_us, duration)
+        if fence is not None and candidate != fence:
+            raise ValueError("frozen committee producer fence changed or disappeared")
+        if candidate is not None:
+            fence = candidate
+            if allocation["generation"] is not None and (allocation["generation"], allocation["process_id"]) != (fence["generation"], fence["process_id"]):
+                raise ValueError("committee producer fence generation or process mismatch")
+        now = time.monotonic()
+        if now >= deadline:
+            break
+        covered = fence is not None and through >= fence["allocated_request_count"]
+        complete = now >= end and covered and not pending and trace["queued"] == 0 and trace["caught_up"]
         record({"kind": "collector_telemetry", "scenario": "committee_progress",
                 "source": agent["identity"], "poll": poll,
                 "state": "complete" if complete else response["collector_status"],
                 "elapsed_seconds": time.monotonic() - origin,
                 "measurement_start_unix_us": measurement_unix_us,
                 "started": started_count, "terminals": terminal_count,
-                "pending": len(pending), "follower": {key: trace[key] for key in ("offset", "size", "queued", "caught_up")}})
+                "pending": len(pending), "follower": {key: trace[key] for key in ("offset", "size", "queued", "caught_up")},
+                "allocation": allocation, "allocation_holes": holes, "producer_fence": fence})
         poll += 1
         if complete:
             return

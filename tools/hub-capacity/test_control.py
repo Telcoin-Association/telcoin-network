@@ -284,13 +284,27 @@ class ControlTests(unittest.TestCase):
         def reply(connection, payload):
             time.sleep(0.003)
             send(connection, {"success": True, "collector_status": "batch",
-                              "trace": {"observations": observations, "offset": 10,
-                                        "size": 10, "queued": 0, "caught_up": True}})
+                               "trace": {"observations": observations, "offset": 10,
+                                         "size": 10, "queued": 0, "caught_up": True,
+                                         "allocation": {"generation": fields["generation"],
+                                                        "process_id": 11, "started_through": 1},
+                                         "allocation_holes": 0}})
 
-        with server(reply) as (url, _):
+        with tempfile.TemporaryDirectory() as directory, server(reply) as (url, _):
+            line = f'tn_primary_vote_observation_allocated{{generation="{fields["generation"]}"}} 1'
+            fence_path = Path(directory) / "fences.json"
+            fence_path.write_text(json.dumps({"version": 1, "measurement_start_unix_us": measurement,
+                "window_end_unix_us": measurement + 600_000_000, "fences": {"peer": {
+                    "source": "peer", "hub": "hub", "generation": fields["generation"],
+                    "allocated_request_count": 1, "process_id": 11, "process_identity": 1,
+                    "metrics_url": url, "scrape_started_elapsed_seconds": 600,
+                    "scrape_completed_elapsed_seconds": 600.01,
+                    "scrape_started_unix_us": measurement + 600_000_000,
+                    "metric_line": line, "metric_line_sha256": hashlib.sha256(line.encode()).hexdigest()}}}))
             rows = []
-            WORKLOAD.consume_committee(agent(url, "--identity", "peer", "--observations", url),
-                                       time.monotonic() - 600.1, measurement, 600, rows.append)
+            with patch.dict(os.environ, {"HUB_CAPACITY_COMMITTEE_FENCES": str(fence_path)}):
+                WORKLOAD.consume_committee(agent(url, "--identity", "peer", "--observations", url),
+                                           time.monotonic() - 600.1, measurement, 600, rows.append)
         native_rows = [row for row in rows if row.get("kind") != "collector_telemetry"]
         self.assertEqual(len(native_rows), 1)
         measured = native_rows[0]

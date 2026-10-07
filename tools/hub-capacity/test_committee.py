@@ -1,10 +1,12 @@
 """Exercise native population collection and hash-bound completeness, never live capacity."""
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 import copy
 import hashlib
 import importlib.util
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -47,10 +49,40 @@ def event(source, number, *, terminal=False, outcome="vote", started=ORIGIN + 10
             "line_sha256": hashlib.sha256(encoded).hexdigest()}
 
 
-def batch(entries=(), *, caught_up=True, queued=0):
+def batch(entries=(), *, caught_up=True, queued=0, started_through=None, source="source-0"):
+    if entries:
+        source = entries[0]["source"]
+    if started_through is None:
+        starts = {entry["record"]["fields"]["request_id"] for entry in entries
+                  if entry["record"]["fields"]["event"] == "committee_request_start"}
+        started_through = 0
+        while started_through + 1 in starts:
+            started_through += 1
     return {"success": True, "collector_status": "batch" if entries else "empty",
             "trace": {"observations": list(entries), "offset": 10,
-                      "size": 10 if caught_up else 20, "caught_up": caught_up, "queued": queued}}
+                      "size": 10 if caught_up else 20, "caught_up": caught_up, "queued": queued,
+                      "allocation": {"generation": ("a" if source == "source-0" else "b") * 32,
+                                     "process_id": 11 if source == "source-0" else 12,
+                                     "started_through": started_through}, "allocation_holes": 0}}
+
+
+@contextmanager
+def consumer_fences(duration=600, count=4):
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "fences.json"
+        fences = {}
+        for index in range(2):
+            source, generation = f"source-{index}", ("a" if index == 0 else "b") * 32
+            line = f'tn_primary_vote_observation_allocated{{generation="{generation}"}} {count}'
+            fences[source] = {"source": source, "hub": f"hub-{index}", "generation": generation,
+                "allocated_request_count": count, "process_id": 11 + index, "process_identity": 1,
+                "metrics_url": f"http://127.0.0.1:{9000 + index}",
+                "scrape_started_elapsed_seconds": duration, "scrape_completed_elapsed_seconds": duration + 0.01,
+                "scrape_started_unix_us": ORIGIN + duration * 1_000_000,
+                "metric_line": line, "metric_line_sha256": hashlib.sha256(line.encode()).hexdigest()}
+        COLLECT.write_committee_fences(path, ORIGIN, duration, fences)
+        with patch.dict(os.environ, {"HUB_CAPACITY_COMMITTEE_FENCES": str(path)}):
+            yield
 
 
 def agent(source="source-0"):
@@ -122,9 +154,9 @@ class CommitteeTests(unittest.TestCase):
 
         def post(_url, payload, **_kwargs):
             barrier.wait(timeout=2)
-            return batch()
+            return batch(source=payload["identity"])
 
-        with patch.object(WORKLOAD.CONTROL, "post", post), patch.object(WORKLOAD.time, "monotonic", return_value=5):
+        with consumer_fences(duration=5, count=0), patch.object(WORKLOAD.CONTROL, "post", post), patch.object(WORKLOAD.time, "monotonic", return_value=5):
             with ThreadPoolExecutor(max_workers=2) as executor:
                 futures = [executor.submit(WORKLOAD.consume_committee, agent(f"source-{index}"),
                                            0, ORIGIN, 5, rows.append) for index in range(2)]
@@ -142,11 +174,12 @@ class CommitteeTests(unittest.TestCase):
         late = event("source-0", 4, started=ORIGIN + 600_000_000, watermark=4)
         rows = []
         clock = [599]
-        polls = iter([(599.9, batch(starts)), (600.2, batch()), (601, batch(ends + [late]))])
+        polls = iter([(599.9, batch(starts, started_through=3)),
+                      (600.2, batch(started_through=3)), (601, batch(ends + [late], started_through=4))])
         def post(*_args, **_kwargs):
             clock[0], response = next(polls)
             return response
-        with patch.object(WORKLOAD.CONTROL, "post", post), \
+        with consumer_fences(), patch.object(WORKLOAD.CONTROL, "post", post), \
                 patch.object(WORKLOAD.time, "monotonic", side_effect=lambda: clock[0]):
             WORKLOAD.consume_committee(agent(), 0, ORIGIN, 600, rows.append)
         outcomes = [row for row in rows if row.get("kind") != "collector_telemetry"]
@@ -164,11 +197,11 @@ class CommitteeTests(unittest.TestCase):
                  {"success": False, "collector_status": "error", "rejection_reason": "follower failed"},
                  {"success": False, "collector_status": "error", "rejection_reason": "queue overflow"}]
         for response in cases:
-            with self.subTest(response=response), patch.object(WORKLOAD.CONTROL, "post", return_value=response), \
+            with self.subTest(response=response), consumer_fences(), patch.object(WORKLOAD.CONTROL, "post", return_value=response), \
                     patch.object(WORKLOAD.time, "monotonic", return_value=601):
                 with self.assertRaises(ValueError):
                     WORKLOAD.consume_committee(agent(), 0, ORIGIN, 600, lambda _row: None)
-        with patch.object(WORKLOAD.CONTROL, "post", side_effect=OSError("HTTP unavailable")), \
+        with consumer_fences(), patch.object(WORKLOAD.CONTROL, "post", side_effect=OSError("HTTP unavailable")), \
                 patch.object(WORKLOAD.time, "monotonic", return_value=601):
             with self.assertRaises(OSError):
                 WORKLOAD.consume_committee(agent(), 0, ORIGIN, 600, lambda _row: None)
@@ -178,7 +211,7 @@ class CommitteeTests(unittest.TestCase):
             clock[0] = 630
             return batch([event("source-0", 1, started=ORIGIN + 599_000_000)])
 
-        with patch.object(WORKLOAD.CONTROL, "post", missing), patch.object(WORKLOAD.time, "monotonic", side_effect=lambda: clock[0]):
+        with consumer_fences(), patch.object(WORKLOAD.CONTROL, "post", missing), patch.object(WORKLOAD.time, "monotonic", side_effect=lambda: clock[0]):
             with self.assertRaisesRegex(ValueError, "drain incomplete"):
                 WORKLOAD.consume_committee(agent(), 0, ORIGIN, 600, lambda _row: None)
 

@@ -150,7 +150,8 @@ class CollectorTests(unittest.TestCase):
                                  "success": False, "latency_ms": 500,
                                  "elapsed_seconds": clock["time"], "rejection_reason": "fixture"}
                     (output / "operations.jsonl").write_text(json.dumps(operation) + "\n")
-                return b""
+                return (f'tn_primary_vote_observation_allocated{{generation="{"a" * 32}"}} '
+                        f'{max(0, clock["reads"] - 3)}\n').encode()
 
             def sleep(seconds):
                 clock["time"] += seconds
@@ -172,8 +173,9 @@ class CollectorTests(unittest.TestCase):
                      {"rss_bytes": 1, "cpu_seconds": 0}, 1, "synthetic proc stat")), \
                  mock.patch.object(COLLECT, "observations", return_value={}), \
                  mock.patch.object(COLLECT.subprocess, "Popen", return_value=child), \
-                 mock.patch.object(COLLECT.urllib.request, "urlopen", return_value=response), \
+                 mock.patch.object(COLLECT, "metrics_get", side_effect=lambda _url, _deadline: metrics_read(4 * 1024**2 + 1)), \
                  mock.patch.object(COLLECT.time, "monotonic", side_effect=lambda: clock["time"]), \
+                 mock.patch.object(COLLECT.time, "time_ns", side_effect=lambda: 1_700_000_000_000_000_000 + int(clock["time"] * 1_000_000_000)), \
                  mock.patch.object(COLLECT.time, "sleep", side_effect=sleep):
                 evidence = COLLECT.collect(frozen, bindings, "baseline", output)
             operation = evidence["operations"]["record_lookup"][0]
@@ -181,6 +183,13 @@ class CollectorTests(unittest.TestCase):
             self.assertFalse(operation["success"])
             self.assertGreaterEqual(evidence["samples"][-1]["elapsed_seconds"], operation["elapsed_seconds"])
             self.assertEqual(clock["reads"], 4)
+            fence_file = json.loads((output / "committee-fences.json").read_text())
+            producer_fence = fence_file["fences"]["synthetic"]
+            self.assertEqual(producer_fence["allocated_request_count"], 0)
+            self.assertEqual(producer_fence["scrape_started_elapsed_seconds"], 4)
+            self.assertEqual(producer_fence["scrape_started_unix_us"], evidence["measurement_start_unix_us"] + 4_000_000)
+            self.assertIn({"path": "committee-fences.json", "sha256": "b" * 64}, evidence["artifacts"])
+            self.assertLessEqual(len(evidence["artifacts"]), 64)
             self.assertEqual((output / "protocol-00.jsonl").read_bytes(), protocol_log.read_bytes())
             self.assertIn({"path": "protocol-00.jsonl", "sha256": "b" * 64}, evidence["artifacts"])
 

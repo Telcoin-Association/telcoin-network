@@ -26,6 +26,9 @@ class Observations:
         self.committee = {hub: deque() for hub in hubs}
         self.measuring = set()
         self.positions = {}
+        # Track all starts, including warmup rows evicted from the bounded delivery queue.
+        self.allocations = {hub: {"generation": None, "process_id": None,
+                                  "started_through": 0, "ahead": set()} for hub in hubs}
         self.error = None
 
     def ingest(self, source, record, *, offset=0, line_sha256=None):
@@ -44,7 +47,28 @@ class Observations:
                 if len(self.publications) > 8192:
                     self.publications.popitem(last=False)
             elif fields["event"] in {"committee_request_start", "committee_request"} and source in self.committee:
-                QUALIFY.committee_identity(fields)
+                generation, request_id = QUALIFY.committee_identity(fields)
+                allocation = self.allocations[source]
+                process_id = QUALIFY.native_integer(fields, "process_id", 1)
+                if allocation["generation"] is None:
+                    allocation["generation"], allocation["process_id"] = generation, process_id
+                if (generation, process_id) != (allocation["generation"], allocation["process_id"]):
+                    raise ValueError("committee producer generation or process changed")
+                if fields["event"] == "committee_request_start":
+                    through, ahead = allocation["started_through"], allocation["ahead"]
+                    if request_id <= through or request_id in ahead:
+                        raise ValueError("duplicate native committee start")
+                    if request_id == through + 1:
+                        through = request_id
+                        while through + 1 in ahead:
+                            ahead.remove(through + 1)
+                            through += 1
+                        allocation["started_through"] = through
+                    else:
+                        # Bound stored out-of-order IDs, never allocate a range from a watermark.
+                        if len(ahead) >= 1024:
+                            raise ValueError("committee start coverage allocation exhausted")
+                        ahead.add(request_id)
                 queue = self.committee[source]
                 if len(queue) >= 1024:
                     if source in self.measuring:
@@ -90,8 +114,12 @@ class Observations:
 
     def position(self, source):
         offset, size = self.positions.get(source, (0, -1))
+        allocation = self.allocations[source]
         return {"offset": offset, "size": size, "caught_up": offset == size,
-                "queued": len(self.committee[source])}
+                "queued": len(self.committee[source]),
+                "allocation": {key: allocation[key] for key in
+                               ("generation", "process_id", "started_through")},
+                "allocation_holes": len(allocation["ahead"])}
 
 
 def follow(observations, source, path):
