@@ -4,7 +4,7 @@
 
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
-    error::NetworkError,
+    error::{normalize_outbound_failure, NetworkError},
     kad::{node_record_key, KadStore},
     metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
@@ -21,6 +21,7 @@ use crate::{
 use futures::StreamExt as _;
 use libp2p::{
     connection_limits::{self, ConnectionLimits},
+    core::upgrade::Version,
     gossipsub::{
         self, Event as GossipEvent, IdentTopic, Message as GossipMessage, MessageAcceptance,
         PublishError, Topic, TopicHash,
@@ -708,9 +709,16 @@ where
             .with_behaviour(|_| behavior)
             .map_err(|_| NetworkError::BuildSwarm)?
             .with_swarm_config(|c| {
+                // request-response proposes one protocol per substream, so `V1Lazy` sends the
+                // proposal and the request in one flight. strict `V1` waits a round trip for the
+                // listener's confirmation first, which made every vote request cost two round
+                // trips on a 10-region bench while gossiped certificates arrived in half of one.
+                // gossipsub proposes two protocol ids, so its first proposal stays strict. a
+                // lazy rejection surfaces as an io error: see `normalize_outbound_failure`.
                 c.with_idle_connection_timeout(
                     network_config.libp2p_config().max_idle_connection_timeout,
                 )
+                .with_substream_upgrade_protocol_override(Version::V1Lazy)
             })
             .build();
 
@@ -1550,6 +1558,7 @@ where
             }
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for req/res");
+                let error = normalize_outbound_failure(error);
                 // handle px disconnects
                 //
                 // px attempts to support peer discovery, but failures are okay
@@ -1718,6 +1727,7 @@ where
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, connection_id: _ } => {
                 debug!(target: "network", ?peer, ?error, "Outbound failure for peer exchange");
+                let error = normalize_outbound_failure(error);
                 if let Some(pending) = self.pending_goodbyes.remove(&request_id) {
                     match &error {
                         // Not penalized: honest version skew, the same class the main
