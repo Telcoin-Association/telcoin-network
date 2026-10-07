@@ -24,6 +24,7 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod record_exchange;
 pub mod stream;
 mod sync;
 pub mod types;
