@@ -762,20 +762,15 @@ fn zstd_error(code: usize) -> io::Error {
     io::Error::other(zstd::zstd_safe::get_error_name(code))
 }
 
-/// The payload end of a record write: everything written goes straight into the data file, and
-/// the running CRC and length of the payload are kept for the frame.
+/// The payload end of a record write: everything written goes straight into the data file (the
+/// frame's length and CRC are taken from the written bytes afterwards).
 struct RecordSink<'a> {
     file: &'a mut MmapDataFile,
-    crc: crc32fast::Hasher,
-    len: u64,
 }
 
 impl Write for RecordSink<'_> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        let n = self.file.write(buf)?;
-        self.crc.update(&buf[..n]);
-        self.len += n as u64;
-        Ok(n)
+        self.file.write(buf)
     }
 
     /// A no-op: the bytes are in the mapping as soon as they are written, and durability is the
@@ -823,8 +818,8 @@ fn write_payload<V: Serialize, W: Write>(
 /// writing the payload straight into the mapping: a value is encoded into the reused `stage` buffer
 /// (see [`write_payload`]) and, with `zstd`, compressed from there directly into the file, so the
 /// compressed bytes are never staged. The length is known only once the
-/// payload is written, so its prefix is reserved as zeros and patched in after, and the CRC over
-/// `len | payload` is the prefix's CRC combined with the payload's running one.
+/// payload is written, so its prefix is reserved as zeros and patched in after; the CRC over the
+/// then-contiguous `len | payload` is one pass over those written bytes in the mapping.
 ///
 /// Until the prefix is patched the record reads as nothing (a zero length prefix, like capacity
 /// padding), and the append is acked only after the CRC is written, so an interrupted append is an
@@ -837,7 +832,7 @@ fn frame_record<V: Serialize>(
 ) -> Result<(), AppendError> {
     let record_pos = file.len();
     file.write_all(&[0; 4])?;
-    let mut sink = RecordSink { file, crc: crc32fast::Hasher::new(), len: 0 };
+    let mut sink = RecordSink { file };
     match zstd {
         None => write_payload(&mut sink, stage, payload)?,
         Some(ctx) => {
@@ -848,20 +843,22 @@ fn frame_record<V: Serialize>(
             encoder.finish()?;
         }
     }
-    let RecordSink { file, crc, len } = sink;
+    let RecordSink { file } = sink;
+    // Pack data files append, so the payload is everything written past the prefix.
+    let len = file.len() - record_pos - 4;
     // Every read path refuses a framed record larger than `MAX_RECORD_SIZE` (and a payload past
     // `u32::MAX` would silently truncate the size prefix), so such a record is refused here.
     if len > MAX_RECORD_SIZE as u64 {
         return Err(AppendError::RecordTooLarge { size: len as usize, max: MAX_RECORD_SIZE });
     }
-    let len_le = (len as u32).to_le_bytes();
     file.slice_mut(record_pos, 4)
         .ok_or_else(|| io::Error::other("record length prefix is not mapped"))?
-        .copy_from_slice(&len_le);
-    let mut record_crc = crc32fast::Hasher::new();
-    record_crc.update(&len_le);
-    record_crc.combine(&crc);
-    file.write_all(&record_crc.finalize().to_le_bytes())?;
+        .copy_from_slice(&(len as u32).to_le_bytes());
+    let crc = crc32fast::hash(
+        file.slice(record_pos, 4 + len as usize)
+            .ok_or_else(|| io::Error::other("record is not mapped"))?,
+    );
+    file.write_all(&crc.to_le_bytes())?;
     Ok(())
 }
 
