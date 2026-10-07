@@ -33,7 +33,20 @@ The runner refuses version drift for libp2p-tls, rustls, aws-lc-rs, aws-lc-sys a
 rustls-webpki. The required `CI Success` check runs `run.py --check-versions` on
 every pull request and merge group, so a node lockfile change that moves one of
 these crates must move its `=` pin in `Cargo.toml` and refresh this lockfile in
-the same pull request: run `prepare.py`, then build once without `--locked`.
+the same pull request.
+To re-pin, set each moved crate's `=` pin to the node's version, then refresh this lockfile from the repository root without building anything:
+
+```sh
+python3 -P testing/quic-handshake/prepare.py
+cargo +1.94 update --workspace --manifest-path testing/quic-handshake/Cargo.toml
+cargo +1.94 update --manifest-path testing/quic-handshake/Cargo.toml \
+  -p <crate> --precise <node version>
+python3 -P testing/quic-handshake/run.py --check-versions
+```
+
+Cargo reads the patched libp2p-tls from the copy that `prepare.py` generates.
+The first update moves the pinned crates and resolves any crate they newly need to its newest release.
+Run the second update for every other crate that the first one added or moved and that the node's lockfile also contains, so the refreshed lockfile depends only on the node's.
 
 A lockfile update, including a forced re-pin, may land without new measurements.
 Each profile report in `evidence/` is a dated snapshot: its `versions` field names the crates it measured and its source hashes identify the files it ran from, so later changes to this harness leave both behind by design.
