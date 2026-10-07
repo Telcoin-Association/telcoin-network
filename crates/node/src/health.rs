@@ -1,12 +1,15 @@
 //! Simple TCP health/readiness endpoints for monitoring service availability.
 //!
-//! Implements a minimal HTTP/1.1 server with two routes on a single port:
-//! - any path except `/health/workers` -> liveness: a fixed `200 OK` (the process is up), matching
-//!   the original unconditional behavior.
+//! Implements a minimal HTTP/1.1 server with three routes on a single port:
+//! - `GET /health/network` -> cached reachability for the primary and every configured worker
+//!   swarm, returning `503` while not-ready and `200` when all swarms have established peers. This
+//!   applies to validators, hubs and observers, and does not certify consensus or sync.
+//! - any path except the readiness routes -> liveness: a fixed `200 OK` (the process is up),
+//!   matching the original unconditional behavior.
 //! - `GET /health/workers` -> readiness: a `200 OK` carrying a JSON envelope that reports, per
 //!   worker, whether the worker is accepting transactions.
 //!
-//! The readiness route is the contract a stateless worker gateway polls to
+//! The `/health/workers` readiness route is the contract a stateless worker gateway polls to
 //! decide whether to forward RPC traffic to this node (see issue #712). The
 //! endpoint always answers `200`; the JSON body is the machine-readable signal,
 //! so the gateway (not the node) is responsible for translating "not accepting"
@@ -14,12 +17,14 @@
 
 use std::{future::Future, net::SocketAddr, time::Duration};
 
+use crate::network_readiness::NetworkReadiness;
 use futures::{Stream, StreamExt};
 use serde::Serialize;
 use tn_types::{TaskSpawner, WorkerId};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
+    sync::watch,
     time::timeout,
 };
 use tokio_stream::wrappers::TcpListenerStream;
@@ -27,6 +32,9 @@ use tracing::{debug, info};
 
 /// Request path that serves the per-worker readiness envelope.
 const WORKERS_PATH: &str = "/health/workers";
+
+/// Request path that serves cached network reachability without querying a swarm.
+const NETWORK_PATH: &str = "/health/network";
 
 /// Version of the `/health/workers` payload envelope. Bump when the shape
 /// changes so the gateway parser can stay forward-compatible.
@@ -46,8 +54,8 @@ const REQUEST_READ_TIMEOUT: Duration = Duration::from_secs(2);
 /// timeout an empty worker list is reported (fail-closed).
 const READINESS_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Fixed liveness response: the process is up. Returned for every path other
-/// than the readiness route (and for empty or malformed requests).
+/// Fixed liveness response: the process is up. Returned for paths other than
+/// `/health/workers` and `/health/network` (and for empty or malformed requests).
 const LIVENESS_RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK";
 
 /// Fallback body used only if the readiness payload (impossibly) fails to
@@ -110,14 +118,16 @@ where
 
 /// Minimal HTTP health/readiness responder for service monitoring.
 ///
-/// Binds to a TCP port and serves the liveness and `/health/workers` readiness
-/// routes. Uses raw TCP sockets for minimal overhead and dependencies.
+/// Binds to a TCP port and serves liveness, `/health/workers` transaction readiness,
+/// and `/health/network` cached swarm reachability. Uses raw TCP sockets for minimal
+/// overhead and dependencies.
 ///
 /// # Security Considerations
 ///
 /// This endpoint accepts connections from any source. Liveness responds
-/// unconditionally; readiness reports only worker-id and an accepting flag (no
-/// sensitive internals).
+/// unconditionally. Worker readiness reports worker id and transaction acceptance;
+/// network readiness exposes aggregate reachability, configured worker ids, each swarm's
+/// probe status and established-peer count. Neither route certifies consensus or sync readiness.
 ///
 /// Node operators must ensure the endpoint is protected by a firewall.
 /// This service is off by default, but can be enabled through the CLI node
@@ -150,13 +160,18 @@ impl HealthcheckServer {
     ///
     /// # Protocol
     ///
-    /// Implements minimal HTTP/1.1 with two routes:
+    /// Implements minimal HTTP/1.1 with three routes:
     /// - liveness (any other path): `200 OK`, body `"OK"`.
     /// - `GET /health/workers`: `200 OK`, `application/json` readiness envelope.
+    /// - `GET /health/network`: cached network-only readiness, `200` reachable or `503` not-ready.
+    ///
+    /// `network_readiness` is published by the process-lifetime swarm monitor. Serving its
+    /// snapshot never waits for a network command or implies consensus/sync readiness.
     pub(crate) async fn spawn<F, Fut>(
         task_spawner: TaskSpawner,
         port: u16,
         worker_ready: F,
+        network_readiness: watch::Receiver<NetworkReadiness>,
     ) -> eyre::Result<SocketAddr>
     where
         F: Fn() -> Fut + Send + 'static,
@@ -172,7 +187,7 @@ impl HealthcheckServer {
         // (`serve` below): production feeds it the real `TcpListenerStream`, and
         // tests feed it a stream that injects a failing accept.
         task_spawner.spawn_critical_task("healthcheck", async move {
-            serve(TcpListenerStream::new(listener), worker_ready).await;
+            serve(TcpListenerStream::new(listener), worker_ready, network_readiness).await;
             Ok(())
         });
 
@@ -183,7 +198,8 @@ impl HealthcheckServer {
 /// Drive the accept loop over a stream of accepted connections.
 ///
 /// Serves each connection synchronously (bounded per-connection read timeout),
-/// routing the workers path to readiness and everything else to liveness.
+/// routing `/health/workers` to transaction readiness, `/health/network` to cached
+/// swarm reachability, and other paths to liveness.
 ///
 /// A transient `accept()` error (fd exhaustion `EMFILE`/`ENFILE`,
 /// `ECONNABORTED`, `EINTR`, `ENOBUFS`) is logged and skipped: the loop must
@@ -191,8 +207,11 @@ impl HealthcheckServer {
 /// loop would resolve the task `Ok` and notify a whole-node shutdown - exactly
 /// the outage this endpoint is supposed to warn about. This mirrors the metrics
 /// server (`tn_metrics::server`), whose accept loop swallows the same errors.
-async fn serve<S, F, Fut>(mut incoming: S, worker_ready: F)
-where
+async fn serve<S, F, Fut>(
+    mut incoming: S,
+    worker_ready: F,
+    network_readiness: watch::Receiver<NetworkReadiness>,
+) where
     S: Stream<Item = std::io::Result<TcpStream>> + Unpin,
     F: Fn() -> Fut,
     Fut: Future<Output = Vec<WorkerReadiness>>,
@@ -215,9 +234,10 @@ where
                     .and_then(Result::ok)
                     .unwrap_or(0);
 
-                // route on the request-line path; readiness for the workers
-                // path, liveness for everything else (preserves prior behavior)
-                if request_path(&buf[..n]).is_some_and(|path| path == WORKERS_PATH) {
+                // Route workers to transaction readiness, network to cached reachability,
+                // and other request-line paths to liveness.
+                let path = buf.get(..n).and_then(request_path);
+                if path.is_some_and(|path| path == WORKERS_PATH) {
                     // bound the readiness probe too: if it cannot resolve
                     // quickly (e.g. the engine lock is held during an epoch
                     // transition) report not-ready rather than stalling the loop
@@ -228,6 +248,19 @@ where
                         body,
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
+                } else if path.is_some_and(|path| path == NETWORK_PATH) {
+                    let readiness = network_readiness.borrow().clone();
+                    let status =
+                        if readiness.is_reachable() { "200 OK" } else { "503 Service Unavailable" };
+                    let body = serde_json::to_string(&readiness)
+                        .unwrap_or_else(|_| r#"{"version":1,"status":"not_ready"}"#.to_string());
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        body.len(),
+                        body,
+                    );
+                    let _ =
+                        timeout(REQUEST_READ_TIMEOUT, socket.write_all(response.as_bytes())).await;
                 } else {
                     // write liveness response, ignore errors (client disconnect)
                     let _ = socket.write_all(LIVENESS_RESPONSE).await;
@@ -279,14 +312,20 @@ mod tests {
         .await?
     }
 
+    /// Liveness responds without polling the worker readiness probe.
     #[tokio::test]
     async fn test_tcp_healthcheck() -> eyre::Result<()> {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
         // liveness path never polls the readiness probe
-        let addr =
-            HealthcheckServer::spawn(task_spawner.clone(), 0, futures::future::pending).await?;
+        let addr = HealthcheckServer::spawn(
+            task_spawner.clone(),
+            0,
+            futures::future::pending,
+            tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
+        )
+        .await?;
 
         let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;
 
@@ -303,14 +342,18 @@ mod tests {
         Ok(())
     }
 
+    /// Worker readiness preserves the transaction rejection snapshot.
     #[tokio::test]
     async fn test_health_workers_reports_not_ready() -> eyre::Result<()> {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
-        let addr = HealthcheckServer::spawn(task_spawner.clone(), 0, || async {
-            vec![WorkerReadiness::new(0, false)]
-        })
+        let addr = HealthcheckServer::spawn(
+            task_spawner.clone(),
+            0,
+            || async { vec![WorkerReadiness::new(0, false)] },
+            tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
+        )
         .await?;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
@@ -331,14 +374,69 @@ mod tests {
         Ok(())
     }
 
+    /// Cached reachability fails closed, preserves liveness, and publishes subsequent recovery.
+    #[tokio::test]
+    async fn network_health_serves_cached_readiness_and_recovery() -> eyre::Result<()> {
+        use crate::network_readiness::{monitor, NetworkReadiness};
+        use std::{
+            future::{pending, ready},
+            time::Duration,
+        };
+        let tasks = tn_types::TaskManager::new("network-health-test");
+        let (publisher, mut readiness) = tokio::sync::watch::channel(NetworkReadiness::pending());
+        let addr = HealthcheckServer::spawn(
+            tasks.get_spawner(),
+            0,
+            futures::future::pending,
+            readiness.clone(),
+        )
+        .await?;
+        let disconnected =
+            roundtrip(addr, b"GET /health/network HTTP/1.1\r\nHost: localhost\r\n\r\n").await?;
+        assert!(disconnected.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(disconnected.contains("\"status\":\"not_ready\""));
+        let delayed =
+            tokio::spawn(monitor(publisher.clone(), pending::<Result<usize, ()>>, || {
+                vec![(7, pending::<Result<usize, ()>>())]
+            }));
+        tokio::task::yield_now().await;
+        let live = tokio::time::timeout(
+            Duration::from_secs(1),
+            roundtrip(addr, b"GET /health HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+        )
+        .await??;
+        assert!(live.starts_with("HTTP/1.1 200 OK"));
+        delayed.abort();
+        assert!(delayed.await.is_err());
+        readiness.borrow_and_update();
+        let monitor = tokio::spawn(monitor(
+            publisher,
+            || ready(Ok::<_, ()>(1)),
+            || vec![(7, ready(Ok::<_, ()>(1)))],
+        ));
+        readiness.changed().await?;
+        let connected =
+            roundtrip(addr, b"GET /health/network HTTP/1.1\r\nHost: localhost\r\n\r\n").await?;
+        assert!(connected.starts_with("HTTP/1.1 200 OK"));
+        assert!(connected.contains("\"status\":\"reachable\""));
+        assert!(connected.contains("\"worker_id\":7"));
+        monitor.abort();
+        assert!(monitor.await.is_err());
+        Ok(())
+    }
+
+    /// Worker readiness reports each worker's independent transaction acceptance state.
     #[tokio::test]
     async fn test_health_workers_reports_ready() -> eyre::Result<()> {
         let task_manager = TaskManager::default();
         let task_spawner = task_manager.get_spawner();
 
-        let addr = HealthcheckServer::spawn(task_spawner.clone(), 0, || async {
-            vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)]
-        })
+        let addr = HealthcheckServer::spawn(
+            task_spawner.clone(),
+            0,
+            || async { vec![WorkerReadiness::new(0, true), WorkerReadiness::new(1, false)] },
+            tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending()).1,
+        )
         .await?;
 
         let response = roundtrip(addr, b"GET /health/workers HTTP/1.1\r\n\r\n").await?;
@@ -372,7 +470,15 @@ mod tests {
             })
             .chain(tokio_stream::wrappers::TcpListenerStream::new(listener)),
         );
-        let handle = tokio::spawn(async move { serve(incoming, || async { Vec::new() }).await });
+        let handle = tokio::spawn(async move {
+            serve(
+                incoming,
+                || async { Vec::new() },
+                tokio::sync::watch::channel(crate::network_readiness::NetworkReadiness::pending())
+                    .1,
+            )
+            .await
+        });
 
         // the loop logged+skipped the injected error and kept serving
         let response = roundtrip(addr, b"GET / HTTP/1.1\r\n\r\n").await?;

@@ -11,7 +11,6 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
-    score::init_peer_score_config,
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
@@ -28,6 +27,7 @@ use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
+    sync::Arc,
     task::Context,
     time::Duration,
 };
@@ -39,6 +39,10 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/listen_failure.rs"]
+mod listen_failure_tests;
 
 #[path = "admission.rs"]
 mod admission;
@@ -285,14 +289,12 @@ impl PeerManager {
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,
+            Arc::new(config.score_config),
         );
         let temporarily_banned = BannedPeerCache::new(
             config.excess_peers_reconnection_timeout,
             config.max_temporarily_banned_peers,
         );
-
-        // initialize global score config
-        init_peer_score_config(config.score_config);
 
         Self {
             operator_retries: Default::default(),
@@ -616,9 +618,12 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
-    /// Whether a peer belongs to any tracked committee slot, for membership regression tests.
-    #[cfg(test)]
-    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+    /// Returns a boolean if the peer is a known validator.
+    ///
+    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
+    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
+    /// work.)
+    pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
 

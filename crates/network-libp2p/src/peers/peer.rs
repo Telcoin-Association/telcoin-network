@@ -12,7 +12,8 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     PeerId,
 };
-use std::{collections::HashSet, net::IpAddr, time::Instant};
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
+use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tracing::{debug, error};
 
@@ -91,7 +92,7 @@ pub(crate) const MAX_OBSERVED_IPS_PER_PEER: usize = 16;
 /// It is possible we need to track a peer before we have network settings.
 /// These are only used for peer exchange and if not set then this peer will not
 /// be exchaged (which is fine since we don't have this info yet).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct Peer {
     /// The peers Bls public key.
     bls_public_key: Option<BlsPublicKey>,
@@ -144,11 +145,15 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new operator-allowlisted peer.
-    pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
+    pub(super) fn new_trusted(
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        score_config: Arc<ScoreConfig>,
+    ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::new_max(),
+            score: Score::new_max(score_config),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: true,
             multiaddrs: Default::default(),
@@ -164,11 +169,12 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addrs: Vec<Multiaddr>,
+        score_config: Arc<ScoreConfig>,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::default(),
+            score: Score::new(score_config),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
@@ -179,6 +185,23 @@ impl Peer {
         }
     }
 
+    /// Create an unidentified peer using the owning network instance's scoring policy.
+    pub(super) fn new_unidentified(score_config: Arc<ScoreConfig>) -> Self {
+        Self {
+            bls_public_key: None,
+            network_key: None,
+            score: Score::new(score_config),
+            penalty_history: PenaltyHistory::default(),
+            multiaddrs: Default::default(),
+            observed_ip_addresses: Default::default(),
+            connection_status: Default::default(),
+            operator_allowlisted: false,
+            connection_direction: None,
+            routable: false,
+        }
+    }
+
+    /// Create a non-allowlisted peer at the default policy's maximum score for tests.
     #[cfg(test)]
     pub(super) fn default_for_test() -> Self {
         use rand::{rngs::StdRng, SeedableRng as _};
@@ -189,7 +212,7 @@ impl Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::new_max(),
+            score: Score::new_max(Arc::new(ScoreConfig::default())),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: Default::default(),
@@ -507,7 +530,7 @@ impl Peer {
     /// forgiveness, including during a later committee rotation or rediscovery.
     pub(super) fn reset_score_to_max(&mut self) {
         if self.permits_load_forgiveness() {
-            self.score = Score::new_max();
+            self.score.reset_to_max();
         }
     }
 
@@ -532,15 +555,12 @@ impl Peer {
 mod tests {
     use super::*;
     use crate::common::create_multiaddr;
-    use tn_config::ScoreConfig;
 
     /// Regression (GHSA-29v6-gvv5-45gx): a flood of distinct addresses must not grow the stored set
     /// past the cap, and the most recent address must always survive so the ban path keeps
     /// recording the address a peer is currently presenting (a rotated key or a live connection).
     #[test]
     fn note_multiaddr_caps_the_set_and_keeps_the_newest() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more distinct addresses than the cap
@@ -569,8 +589,6 @@ mod tests {
     /// endpoint. The cap is exact: two forms of one endpoint would fill a cap of two.
     #[test]
     fn honest_address_forms_replace_each_other_within_the_cap() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
         // the suffix a dial carries is this peer's own id (libp2p-swarm appends it to every dial)
         let peer_id = peer.peer_id();
@@ -608,8 +626,6 @@ mod tests {
     /// instead of panicking or wrapping. This test would panic on the 256th call before the fix.
     #[test]
     fn register_incoming_saturates_and_never_panics() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more inbound connections than `u8::MAX`; a plain `+= 1` panics here in a debug build
@@ -631,7 +647,6 @@ mod tests {
     /// at `u8::MAX` rather than panic (debug) or wrap (release).
     #[test]
     fn register_outgoing_saturates_and_never_panics() {
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         (0..300).for_each(|_| peer.register_outgoing(create_multiaddr(None)));
@@ -655,8 +670,6 @@ mod tests {
     #[test]
     fn observed_ips_clamp_at_the_cap() {
         use std::net::Ipv4Addr;
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more distinct genuine source IPs than the cap (TEST-NET-3)
@@ -698,8 +711,6 @@ mod tests {
     #[test]
     fn observed_ips_refuse_new_entries_instead_of_evicting() {
         use std::net::Ipv4Addr;
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // admit exactly cap-many IPs (TEST-NET-3)
