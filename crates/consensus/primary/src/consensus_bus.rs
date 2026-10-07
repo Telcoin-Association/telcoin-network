@@ -435,6 +435,8 @@ impl std::fmt::Debug for EpochPackClaim {
 #[derive(Debug)]
 pub struct EpochPackRequest {
     /// The record of the epoch before the requested one, which verifies the requested epoch.
+    ///
+    /// It has no setter because a stored epoch record is final.
     previous_epoch_record: EpochRecord,
     /// The record of the requested epoch.
     epoch_record: EpochRecord,

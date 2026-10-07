@@ -560,6 +560,13 @@ pub async fn spawn_fetch_consensus(
                     // The epoch record may have been a dummy (final_consensus.number=0)
                     // when first queued at startup. Refresh from DB so subsequent
                     // retries use the real signed cert if it has since arrived.
+                    // The previous epoch's record is never refreshed: epoch records are
+                    // checkpoints, final on this node once stored. A stored record could only
+                    // differ from its peers' copies through malicious nodes or a
+                    // state-determinism bug, and a stall is preferred over a fork, so a stored
+                    // record is never replaced. The epoch 0 dummy does not matter here: epoch 0's
+                    // previous record takes only the committee, which the dummy shares with the
+                    // real record.
                     if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
                         let current = request.epoch_record().final_consensus.number;
                         if fresh.final_consensus.number > current {
