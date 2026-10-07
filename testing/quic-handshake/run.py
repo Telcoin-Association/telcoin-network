@@ -158,16 +158,21 @@ def run(binary, output, samples):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/tn-quic-handshake-profile")
+    # No defaults: --check-versions must be able to tell that these two were given.
+    parser.add_argument("--binary", type=Path, help="with --output (default: target/release/tn-quic-handshake-profile)")
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output", type=Path)
     mode.add_argument("--check-versions", action="store_true",
                       help="only check the pinned crates against the node's lockfile and Cargo.toml, as CI Success does")
-    parser.add_argument("--samples", type=int, default=1000)
+    parser.add_argument("--samples", type=int, help="with --output, 2..100000 (default: 1000)")
     args = parser.parse_args()
     if args.check_versions:
+        if args.binary is not None or args.samples is not None:
+            parser.error("--binary and --samples apply only to --output")
         print(json.dumps(validate_versions()))
     else:
-        if not 2 <= args.samples <= 100_000:
+        samples = 1000 if args.samples is None else args.samples
+        if not 2 <= samples <= 100_000:
             parser.error("samples must be 2..100000")
-        run(args.binary.resolve(), args.output.resolve(), args.samples)
+        binary = ROOT / "target/release/tn-quic-handshake-profile" if args.binary is None else args.binary
+        run(binary.resolve(), args.output.resolve(), samples)
