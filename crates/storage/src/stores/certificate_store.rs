@@ -1,11 +1,6 @@
 //! NOTE: tests for this module are in test-utils storage_tests.rs to avoid circular dependancies.
 
-use std::{
-    cmp::{max, Ordering},
-    collections::BTreeMap,
-    future::Future,
-    sync::LazyLock,
-};
+use std::{cmp::Ordering, collections::BTreeMap, future::Future, sync::LazyLock};
 
 use crate::{
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
@@ -117,6 +112,15 @@ pub trait CertificateStore {
         round: Round,
     ) -> StoreResult<Option<Round>>;
 
+    /// Deletes certificates for rounds strictly below
+    /// `committed_round.saturating_sub(ROUNDS_TO_KEEP)`.
+    ///
+    /// Store GC is keyed by the **commit** watermark (not the newest written round) so the
+    /// retained window stays aligned with DAG rebuild after a commit stall (issue #1518).
+    /// Call after the commit round advances, and once on recovery after reading
+    /// `last_committed_round`.
+    fn gc_to_commit_round(&self, committed_round: Round) -> StoreResult<()>;
+
     /// Clears both the main storage of the certificates and the secondary index
     fn clear(&self) -> StoreResult<()>;
 
@@ -146,7 +150,10 @@ fn save_cert<TX: DbTxMut>(
     Ok(())
 }
 
-/// Deletes all certs for a round before round.
+/// Deletes all certificates with round strictly below `target_round - ROUNDS_TO_KEEP`.
+///
+/// `target_round` is the commit watermark (or equivalent). Callers that key GC on the
+/// newest *written* round recreate the store-vs-rebuild gap in issue #1518.
 fn gc_rounds<DB: Database>(db: &DB, target_round: Round) -> StoreResult<()> {
     if target_round <= ROUNDS_TO_KEEP {
         return Ok(());
@@ -177,11 +184,11 @@ impl<DB: Database> CertificateStore for DB {
         let mut txn = self.write_txn()?;
 
         let id = certificate.digest();
-        let round = certificate.round();
         save_cert(&mut txn, id, &certificate)?;
 
         txn.commit()?;
-        gc_rounds(self, round)?;
+        // Do not GC on write keyed by newest written round — that deletes rounds the
+        // rebuild still needs after a commit stall (#1518). GC via `gc_to_commit_round`.
         Ok(())
     }
 
@@ -193,10 +200,8 @@ impl<DB: Database> CertificateStore for DB {
         certificates: impl IntoIterator<Item = &'a Certificate>,
     ) -> StoreResult<()> {
         let mut txn = self.write_txn()?;
-        let mut round = 0;
         for certificate in certificates {
             let digest = certificate.digest();
-            round = max(round, certificate.round());
             if let Err(e) = save_cert(&mut txn, digest, certificate) {
                 tracing::error!("Failed to write certificate for {digest} due to error {e}.");
                 return Err(e);
@@ -204,8 +209,12 @@ impl<DB: Database> CertificateStore for DB {
         }
 
         txn.commit()?;
-        gc_rounds(self, round)?;
+        // Do not GC on write keyed by newest written round — see `write` / issue #1518.
         Ok(())
+    }
+
+    fn gc_to_commit_round(&self, committed_round: Round) -> StoreResult<()> {
+        gc_rounds(self, committed_round)
     }
 
     /// Retrieves a certificate from the store. If not found

@@ -14,7 +14,7 @@ use tn_storage::{
     mem_db::MemDatabase,
     open_db,
     tables::{CertificateDigestByOrigin, CertificateDigestByRound, Certificates},
-    CertificateStore, ProposerStore,
+    CertificateStore, ProposerStore, ROUNDS_TO_KEEP,
 };
 use tn_test_utils_committee::CommitteeFixture;
 use tn_types::{
@@ -501,4 +501,45 @@ async fn test_certificate_store_delete_store() {
     assert!(store.read(to_delete[1]).unwrap().is_none());
 
     assert!(store.get::<CertificateDigestByOrigin>(&key_0).unwrap().is_none());
+}
+
+/// #1518: store GC is keyed by the commit round, not by writes.
+/// Writing high rounds must not delete; `gc_to_commit_round` deletes below C - ROUNDS_TO_KEEP.
+#[tokio::test]
+async fn test_certificate_store_gc_to_commit_round() {
+    let store = MemDatabase::default();
+    // Need more than ROUNDS_TO_KEEP rounds so GC actually deletes.
+    let rounds = ROUNDS_TO_KEEP + 20;
+    let certs = certificates(rounds);
+    store.write_all(certs.iter()).unwrap();
+
+    let highest = store.highest_round_number();
+    assert!(
+        highest > ROUNDS_TO_KEEP,
+        "fixture must produce rounds above ROUNDS_TO_KEEP; highest={highest}"
+    );
+
+    // Writes alone must not prune (old write-keyed GC would have deleted here).
+    let after_write = store.after_round(1).unwrap();
+    let min_after_write =
+        after_write.iter().map(|c| c.round()).min().expect("store should have certificates");
+    assert!(
+        min_after_write <= 1,
+        "write_all must not GC by newest written round; min round was {min_after_write}"
+    );
+
+    let committed_round = highest;
+    store.gc_to_commit_round(committed_round).unwrap();
+
+    let expected_floor = committed_round - ROUNDS_TO_KEEP; // first retained round
+    let retained = store.after_round(1).unwrap();
+    let min_retained = retained.iter().map(|c| c.round()).min().expect("retained certs");
+    assert_eq!(
+        min_retained, expected_floor,
+        "gc_to_commit_round should delete rounds < C - ROUNDS_TO_KEEP ({expected_floor})"
+    );
+    assert!(
+        retained.iter().all(|c| c.round() >= expected_floor),
+        "no certificate below commit GC floor should remain"
+    );
 }

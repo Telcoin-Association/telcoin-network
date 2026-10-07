@@ -111,19 +111,29 @@ impl ConsensusState {
         seed_chain: EpochSeedChainValue,
         epoch_commit_floor: Option<TimestampMs>,
         cert_store: DB,
-    ) -> Self {
+    ) -> Result<Self, ConsensusError> {
         let last_round = ConsensusRound::new_with_gc_depth(last_committed_round, gc_depth);
+
+        // The header for this round is already durable. Prune to it in case the process
+        // stopped after that write and before the store GC.
+        if let Err(e) = cert_store.gc_to_commit_round(last_committed_round) {
+            tracing::error!(
+                target: "telcoin::consensus_state",
+                ?e,
+                last_committed_round,
+                "certificate store GC on recovery failed"
+            );
+        }
 
         let dag = Self::construct_dag_from_cert_store(
             &cert_store,
             &recovered_last_committed,
             last_round.gc_round,
-        )
-        .expect("error when recovering DAG from store");
+        )?;
 
         let last_committed_sub_dag = latest_sub_dag.clone();
 
-        Self {
+        Ok(Self {
             gc_depth,
             last_round,
             last_committed: recovered_last_committed,
@@ -131,7 +141,7 @@ impl ConsensusState {
             dag,
             seed_chain,
             epoch_commit_floor,
-        }
+        })
     }
 
     #[instrument(level = "info", skip_all)]
@@ -144,9 +154,26 @@ impl ConsensusState {
 
         info!("Recreating dag from last GC round: {}", gc_round);
 
-        // get all certificates at rounds > gc_round
-        let certificates = cert_store.after_round(gc_round + 1).expect("database available");
+        let expected_min_round = gc_round.saturating_add(1);
 
+        // get all certificates at rounds > gc_round
+        let certificates = cert_store.after_round(expected_min_round).expect("database available");
+
+        // Completeness gate (#1518): if the store retained any certificates above the GC
+        // floor but the lowest of those is still above `gc_round + 1`, there is a hole in
+        // the window the rebuild needs. Never silently assemble a partial DAG over that
+        // hole with `check_parents = false` — that is how a restarted node can diverge.
+        if let Some(actual_min_round) = certificates.iter().map(|c| c.round()).min() {
+            if actual_min_round > expected_min_round {
+                return Err(ConsensusError::IncompleteCertificateStore {
+                    expected_min_round,
+                    actual_min_round,
+                });
+            }
+        }
+
+        // Window is contiguous from expected_min_round (or empty): safe to skip parent
+        // checks during restore.
         let mut num_certs = 0;
         for cert in &certificates {
             if Self::try_insert_in_dag(&mut dag, last_committed, gc_round, cert, false)? {
@@ -484,7 +511,7 @@ impl<DB: Database> Consensus<DB> {
             seed_chain,
             epoch_commit_floor,
             consensus_config.node_storage().clone(),
-        );
+        )?;
 
         consensus_bus
             .app()
@@ -568,6 +595,10 @@ impl<DB: Database> Consensus<DB> {
         // Process the certificate using the selected consensus protocol.
         let (outcome, committed_sub_dags) =
             self.protocol.process_certificate(&mut self.state, certificate)?;
+
+        // Certificate GC waits until the subscriber has persisted this commit. Pruning to
+        // the in-memory round here deletes rounds a crash would still need (#1518).
+
         if self.active {
             let mut own_rounds_committed = Vec::new();
             let mut leader_commit_round = 0;
