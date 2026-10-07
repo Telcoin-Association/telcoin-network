@@ -59,7 +59,7 @@ fn population_endpoint(seed: u8) -> ConnectedPoint {
 fn create_population_manager() -> PeerManager {
     let mut manager = PeerManager::new(
         population_keys(0).primary_network_public_key().into(),
-        tn_config::PeerConfig { target_num_peers: 86, ..Default::default() },
+        &tn_config::PeerConfig { target_num_peers: 86, ..Default::default() },
         crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
     );
     manager.set_public_peer_limit(std::num::NonZeroUsize::new(64));
@@ -84,7 +84,7 @@ fn establish_population_peer(
         )
         .is_ok());
     manager.on_swarm_event(libp2p::swarm::FromSwarm::ConnectionEstablished(
-        libp2p::swarm::ConnectionEstablished {
+        libp2p::swarm::behaviour::ConnectionEstablished {
             peer_id,
             connection_id,
             endpoint: &endpoint,
@@ -364,7 +364,7 @@ fn population_source_budget(maximum: u64) -> crate::source_admission::SourceAdmi
 async fn protected_arrival_prunes_immediately_and_retains_physical_leases() {
     use libp2p::{
         connection_limits::{Behaviour, ConnectionLimits},
-        swarm::{ConnectionClosed, ConnectionEstablished, FromSwarm},
+        swarm::{behaviour::ConnectionEstablished, ConnectionClosed, FromSwarm},
     };
     let budget = population_source_budget(87);
     let mut manager = create_population_manager();
