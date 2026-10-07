@@ -144,7 +144,7 @@ async fn committee_seeding_replaces_stale_restored_record() -> eyre::Result<()> 
     Ok(())
 }
 
-/// Seeding keeps a restored signed record that already carries the launch binding.
+/// Seeding preserves a restored record's signed metadata and rejects older relayed records.
 #[tokio::test]
 async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> {
     let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
@@ -154,14 +154,27 @@ async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> 
     let mut restored = launch_peer_info(&peer.primary);
     restored.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
     restored.timestamp = 1_000;
+    let rpc = RpcInfo {
+        http: "https://validator.example.com:8545/".parse()?,
+        ws: Some("wss://validator.example.com:8546/".parse()?),
+    };
+    restored.rpc = Some(rpc.clone());
     let signed = restored.timestamp;
     manager.add_restored_peer(*key, restored);
     manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
     let cached = manager.known_peers.get(key).ok_or_else(|| eyre::eyre!("missing record"))?;
     assert_eq!(cached.timestamp, signed);
+    assert_eq!(cached.rpc.as_ref(), Some(&rpc));
     assert_eq!(cached.multiaddrs, vec![peer.primary.network_address.clone()]);
     assert!(!manager.stub_records.contains(key));
     assert!(manager.pinned_peers.contains(key));
+    let mut stale = cached.clone();
+    stale.timestamp = signed.saturating_sub(1);
+    stale.rpc = None;
+    manager.add_self_advertised_peer(PeerId::random(), *key, stale);
+    let cached = manager.known_peers.get(key).ok_or_else(|| eyre::eyre!("missing record"))?;
+    assert_eq!(cached.timestamp, signed);
+    assert_eq!(cached.rpc.as_ref(), Some(&rpc));
     Ok(())
 }
 
