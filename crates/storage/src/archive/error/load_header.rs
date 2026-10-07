@@ -15,8 +15,13 @@ pub enum LoadHeaderError {
     CrcFailed,
     /// The data file does not match the config.
     InvalidAppNum,
-    /// The data file version invalid (not supported).
-    InvalidVersion,
+    /// The data file is stamped `got`, newer than the `max` this reader supports.
+    InvalidVersion {
+        /// The newest version this reader supports.
+        max: u16,
+        /// The version stamped in the file header.
+        got: u16,
+    },
     /// The Data file UUID did not match the expected value.
     InvalidDataUID,
     /// The HDX index file version was wrong.
@@ -59,7 +64,9 @@ impl fmt::Display for LoadHeaderError {
             Self::InvalidType => write!(f, "invalid type id"),
             Self::IO(e) => write!(f, "io: {e}"),
             Self::CrcFailed => write!(f, "invalid crc32 checksum"),
-            Self::InvalidVersion => write!(f, "unsupported pack file version"),
+            Self::InvalidVersion { max, got } => {
+                write!(f, "unsupported pack file version {got} (this reader supports up to {max})")
+            }
             Self::InvalidDataUID => write!(f, "invalid data file uid"),
             Self::InvalidAppNum => write!(f, "invalid appnum"),
             Self::InvalidIndexVersion => write!(f, "invalid index version"),

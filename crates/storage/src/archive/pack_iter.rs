@@ -251,16 +251,21 @@ where
         max_version: u16,
     ) -> Result<Self, LoadHeaderError> {
         let header = DataHeader::load_header_async(&mut reader, uid_idx).await?;
-        // This is a peer-facing parser: reject a foreign `appnum`, and reject a pack-format version
-        // newer than the caller understands, UP FRONT — so no caller can forget to bound the
-        // version and end up parsing an unknown future format with current-format logic.
+        // This is a peer-facing parser: reject a pack-format version newer than the caller
+        // understands, and a foreign `appnum`, UP FRONT — so no caller can forget to bound the
+        // version and end up parsing an unknown future format with current-format logic. The
+        // version is checked first, in the same order as `PackInner::init_header`, so a newer file
+        // is reported the same way on both paths.
         // `max_version` is the caller's supported ceiling (e.g. `PACK_VERSION`); pass
         // `u16::MAX` to accept any version.
+        if header.version() > max_version {
+            return Err(LoadHeaderError::InvalidVersion {
+                max: max_version,
+                got: header.version(),
+            });
+        }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
-        }
-        if header.version() > max_version {
-            return Err(LoadHeaderError::InvalidVersion);
         }
         Ok(AsyncPackIter {
             _val: PhantomData,

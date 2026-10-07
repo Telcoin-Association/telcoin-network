@@ -526,7 +526,7 @@ where
         let header = DataHeader::load_header(data_file, uid_idx)?;
         if header.version() > version {
             // Do not allow a newer version than we request but allow an older.
-            return Err(LoadHeaderError::InvalidVersion);
+            return Err(LoadHeaderError::InvalidVersion { max: version, got: header.version() });
         }
         if header.appnum() != 1 {
             return Err(LoadHeaderError::InvalidAppNum);
@@ -1559,10 +1559,13 @@ mod tests {
         }
 
         let file = tokio::fs::File::open(&path).await.expect("open file");
-        let res = AsyncPackIter::<TestRec, _>::open(file, 0, 0).await;
-        assert!(
-            matches!(res, Err(LoadHeaderError::InvalidVersion)),
-            "a v1 file must be refused by a reader that supports only v0, got {res:?}"
+        let err = AsyncPackIter::<TestRec, _>::open(file, 0, 0)
+            .await
+            .expect_err("a v1 file must be refused by a reader that supports only v0");
+        assert!(matches!(err, LoadHeaderError::InvalidVersion { max: 0, got: 1 }), "got {err:?}");
+        assert_eq!(
+            err.to_string(),
+            "unsupported pack file version 1 (this reader supports up to 0)"
         );
 
         for max_version in [1, 2] {

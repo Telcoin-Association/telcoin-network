@@ -3156,9 +3156,10 @@ impl Inner {
     /// The imported epoch is always written in the CURRENT format (`PACK_VERSION`): v2 is the only
     /// writable format, so an import never lands on disk as a legacy pack that a later read would
     /// have to migrate. A v1/v2 (header-first) source is streamed into the pack record by record
-    /// ([`Self::import_streamed_output`]). A v0 (batches-first) source is refused
-    /// (`InvalidVersion`, no penalty): v0 is only ever migrated on disk, and an upgraded peer
-    /// serves its v0 epochs migrated.
+    /// ([`Self::import_streamed_output`]). A source newer than `PACK_VERSION` and a v0
+    /// (batches-first) source are both refused as `InvalidVersion`, which charges the peer no
+    /// penalty: a newer build's bytes are honest but unreadable here, and v0 is only ever
+    /// migrated on disk (an upgraded peer serves its v0 epochs migrated).
     ///
     /// Nothing in the stream is authenticated until the chain reaches the certified final (checked
     /// by the caller), so an output's header is only parent-linked here. Streaming keeps the
@@ -3183,10 +3184,12 @@ impl Inner {
         let mut floor = DiskFloor { dir: base_dir.clone(), min_free, checked_at: None };
         floor.check(0)?;
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
-        // A header that does not read (transport) or is from a newer build is no fault of the
-        // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
-        // foreign app number), or a stream that ends before its header is complete (see
-        // `next_output_record`), is.
+        // That is a newer build's honest bytes, so it maps to `InvalidVersion` with both numbers,
+        // the same no-penalty variant as the v0 refusal below. A header that does not read
+        // (transport) is a `ReadError`, also no fault of the sender's bytes. A header that reads
+        // but is wrong (a failed CRC, another epoch's uid, a foreign app number), or a stream that
+        // ends before its header is complete (see `next_output_record`), is the sender's fault
+        // and maps to `UndecodableRecord`.
         let mut stream_iter =
             AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
                 .await
@@ -3194,8 +3197,9 @@ impl Inner {
                     LoadHeaderError::IO(err) if err.kind() == io::ErrorKind::UnexpectedEof => {
                         PackError::UndecodableRecord(format!("stream header truncated: {err}"))
                     }
-                    LoadHeaderError::IO(_) | LoadHeaderError::InvalidVersion => {
-                        PackError::ReadError(e.to_string())
+                    LoadHeaderError::IO(_) => PackError::ReadError(e.to_string()),
+                    LoadHeaderError::InvalidVersion { got, .. } => {
+                        PackError::InvalidVersion(PACK_VERSION, got)
                     }
                     _ => PackError::UndecodableRecord(format!("stream header: {e}")),
                 })?;
@@ -10706,10 +10710,10 @@ pub(crate) mod test {
         );
     }
 
-    /// A peer source stamped newer than `PACK_VERSION` is refused at its header, before anything
-    /// is written, instead of being parsed with this build's record layout. The control imports
-    /// the same bytes at `PACK_VERSION`, so the version stamp is the only thing that changes the
-    /// outcome.
+    /// A peer source stamped newer than `PACK_VERSION` is refused at its header as
+    /// `InvalidVersion`, carrying both versions, before anything is written, instead of being
+    /// parsed with this build's record layout. The control imports the same bytes at
+    /// `PACK_VERSION`, so the version stamp is the only thing that changes the outcome.
     #[tokio::test]
     async fn test_stream_import_refuses_a_newer_pack_version() {
         let source = TempDir::with_prefix("test_import_newer_src").expect("temp dir");
@@ -10768,8 +10772,9 @@ pub(crate) mod test {
         };
         assert!(
             matches!(
-                &err,
-                super::PackError::ReadError(msg) if msg.contains("unsupported pack file version")
+                err,
+                super::PackError::InvalidVersion(expected, got)
+                    if expected == PACK_VERSION && got == newer_version
             ),
             "got {err:?}"
         );
