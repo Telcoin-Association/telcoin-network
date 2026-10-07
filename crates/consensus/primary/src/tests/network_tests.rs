@@ -3411,6 +3411,57 @@ fn signed_consensus_gossip(
     GossipMessage { source: None, data, sequence_number: None, topic }
 }
 
+/// A verified result must survive demotion, without letting invalid or repeated signers seed it.
+#[tokio::test]
+async fn test_consensus_result_demotion_preserves_verified_catchup_target() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, consensus_bus, task_manager: _task_manager, .. } =
+        create_test_types_at_epoch(temp_dir.path(), 1).await;
+    let (epoch, round, number) = (1, 1, 10);
+    let hash = ConsensusHeaderDigest::from(B256::random());
+    let default_target = (0, 0, ConsensusHeaderDigest::default());
+    assert_eq!(committee.committee().size() / 3 + 1, 2);
+    let mut authorities = committee.authorities();
+    let first = signed_consensus_gossip(
+        authorities.next().expect("first signer"),
+        epoch,
+        round,
+        number,
+        hash,
+    );
+    let second = signed_consensus_gossip(
+        authorities.next().expect("second signer"),
+        epoch,
+        round,
+        number,
+        hash,
+    );
+
+    let mut wrong_topic = first.clone();
+    wrong_topic.topic = TopicHash::from_raw("invalid-consensus-topic");
+    assert!(matches!(
+        handler.process_gossip(&wrong_topic).await,
+        Err(PrimaryNetworkError::InvalidTopic)
+    ));
+    let PrimaryGossip::Consensus(mut invalid_result) = try_decode(&first.data)? else {
+        panic!("consensus fixture");
+    };
+    invalid_result.signature = BlsSignature::default();
+    let mut wrong_signature = first.clone();
+    wrong_signature.data = encode(&PrimaryGossip::Consensus(invalid_result));
+    assert!(handler.process_gossip(&wrong_signature).await.is_err());
+    assert_eq!(consensus_bus.published_consensus_num_hash(), default_target);
+
+    handler.process_gossip(&first).await?;
+    handler.process_gossip(&first).await?;
+    assert_eq!(consensus_bus.published_consensus_num_hash(), default_target);
+    assert!(consensus_bus.is_active_cvv(), "one distinct signer must not demote");
+    handler.process_gossip(&second).await?;
+    assert!(matches!(*consensus_bus.node_mode().borrow(), NodeMode::CvvInactive));
+    assert_eq!(consensus_bus.published_consensus_num_hash(), (epoch, number, hash));
+    Ok(())
+}
+
 /// A quorum (`1/3 + 1`) of distinct validators signing the same consensus result must cause
 /// the handler to publish it, and not before. This also pins the entry-creation path: the
 /// very first signature must be recorded (a regression here would mean a quorum is never

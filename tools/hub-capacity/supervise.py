@@ -91,6 +91,7 @@ class Peer:
         deadline = entered + 29_000_000_000
         leased = False
         join_locked = False
+        restart_started = False
         started = None
         generation = None
         process = None
@@ -103,7 +104,7 @@ class Peer:
 
         try:
             restart = None
-            if request["scenario"] == "public_join":
+            if request["scenario"] in ("public_join", "shared_nat_reconnect"):
                 if not self.lock.acquire(timeout=remaining()):
                     raise TimeoutError("peer lifecycle admission deadline exceeded")
                 join_locked = True
@@ -114,40 +115,28 @@ class Peer:
                         raise TimeoutError("peer lifecycle drain deadline exceeded")
                     if self.stopping:
                         raise ValueError("peer supervisor is shutting down")
+                remaining()
+                if request["scenario"] == "shared_nat_reconnect":
+                    if not self.declaration["nat"] or self.process is None or self.process.poll() is not None:
+                        raise ValueError("shared-NAT restart requires the existing declared NAT peer")
+                    old_pid = self.process.pid
+                    restart_started = True
+                    self.stop()
+                    remaining()
+                    self.start()
+                    public = self.wait_ready(timeout=min(12, remaining()))
+                    restart = {"old_pid": old_pid, "new_pid": self.process.pid,
+                               "generation": self.generation, "public_ready": public}
+                    forwarded = {**request, "scenario": "dao_connectivity"}
+                else:
+                    forwarded = request
+                with self.condition:
+                    if self.stopping:
+                        raise ValueError("peer supervisor is shutting down")
                     remaining()
                     self.active_forwards += 1
                     leased = True
                     generation, process = self.generation, self.process
-                forwarded = request
-            elif request["scenario"] == "shared_nat_reconnect":
-                with self.lock:
-                    with self.condition:
-                        self.restarting = True
-                    try:
-                        with self.condition:
-                            self.condition.wait_for(lambda: not self.active_forwards or self.stopping)
-                            if self.stopping:
-                                raise ValueError("peer supervisor is shutting down")
-                        if not self.declaration["nat"] or self.process is None or self.process.poll() is not None:
-                            raise ValueError("shared-NAT restart requires the existing declared NAT peer")
-                        old_pid = self.process.pid
-                        self.stop()
-                        self.start()
-                        public = self.wait_ready()
-                        restart = {"old_pid": old_pid, "new_pid": self.process.pid,
-                                   "generation": self.generation, "public_ready": public}
-                        # Lease the replacement before admitting other commands or another restart.
-                        with self.condition:
-                            if self.stopping:
-                                raise ValueError("peer supervisor is shutting down")
-                            self.active_forwards += 1
-                            leased = True
-                            generation, process = self.generation, self.process
-                    finally:
-                        with self.condition:
-                            self.restarting = False
-                            self.condition.notify_all()
-                forwarded = {**request, "scenario": "dao_connectivity"}
             else:
                 with self.condition:
                     if not self.condition.wait_for(lambda: not self.restarting or self.stopping,
@@ -162,8 +151,8 @@ class Peer:
                 forwarded = request
             started = time.monotonic_ns()
             self.diagnostic(request, "forward_start", generation, process, entered, started)
-            timeout = 29 if request["scenario"] == "shared_nat_reconnect" else remaining()
             try:
+                timeout = remaining()
                 result = self.forward(request, forwarded, restart, timeout=timeout)
             except Exception:
                 if join_locked:
@@ -182,6 +171,14 @@ class Peer:
             result["supervisor"] = {"generation": generation,
                                     "pid": process.pid if process is not None else None}
             return result
+        except Exception:
+            if restart_started and not leased:
+                # An incomplete replacement must not serve later commands.
+                with self.condition:
+                    self.stopping = True
+                    self.condition.notify_all()
+                self.stop()
+            raise
         finally:
             try:
                 if started is not None:

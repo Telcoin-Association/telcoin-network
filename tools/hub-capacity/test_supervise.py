@@ -67,7 +67,9 @@ class SupervisorTests(unittest.TestCase):
             peer.process.poll.return_value = None
             peer.generation = 1
 
-        def ready():
+        def ready(timeout):
+            self.assertGreater(timeout, 0)
+            self.assertLessEqual(timeout, 12)
             restarting.set()
             if not release.wait(timeout=2):
                 raise TimeoutError("test did not release restart")
@@ -253,6 +255,129 @@ class SupervisorTests(unittest.TestCase):
             forward.assert_not_called()
         self.assertEqual(peer.active_forwards, 0)
         self.assertFalse(peer.restarting)
+        self.assertTrue(peer.lock.acquire(blocking=False))
+        peer.lock.release()
+
+    def test_nat_admission_expiry_preserves_the_existing_process(self):
+        for stage in ("lock", "drain", "expired_drain"):
+            with self.subTest(stage=stage):
+                peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                                      Path("unused"), Path("unused"))
+                peer.process = mock.Mock(pid=101)
+                peer.process.poll.return_value = None
+                peer.lock = mock.Mock()
+                peer.lock.acquire.return_value = stage != "lock"
+                now = [0]
+
+                def drain(predicate, timeout=None):
+                    self.assertEqual(timeout, 29)
+                    now[0] = 30_000_000_000
+                    return stage == "expired_drain"
+
+                with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                        mock.patch.object(peer.condition, "wait_for", side_effect=drain), \
+                        mock.patch.object(peer, "stop") as stop, \
+                        mock.patch.object(peer, "start") as start, \
+                        mock.patch.object(peer, "forward") as forward:
+                    with self.assertRaises(TimeoutError):
+                        peer.command({"operation_id": "expired-nat", "scenario": "shared_nat_reconnect"})
+                    peer.lock.acquire.assert_called_once_with(timeout=29)
+                    stop.assert_not_called()
+                    start.assert_not_called()
+                    forward.assert_not_called()
+                self.assertFalse(peer.stopping)
+                self.assertFalse(peer.restarting)
+                self.assertEqual(peer.active_forwards, 0)
+                self.assertEqual(peer.lock.release.call_count, int(stage != "lock"))
+
+    def test_nat_restart_consumes_one_admission_and_transport_budget(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        peer.process = mock.Mock(pid=101)
+        peer.process.poll.return_value = None
+        now = [0]
+
+        def drain(predicate, timeout=None):
+            self.assertEqual(timeout, 29)
+            now[0] = 20_000_000_000
+            return True
+
+        def stop():
+            now[0] = 22_000_000_000
+
+        def ready(timeout):
+            self.assertEqual(timeout, 7)
+            now[0] = 24_000_000_000
+            return {"identity": "declared-peer"}
+
+        with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                mock.patch.object(peer.condition, "wait_for", side_effect=drain), \
+                mock.patch.object(peer, "stop", side_effect=stop), \
+                mock.patch.object(peer, "start"), \
+                mock.patch.object(peer, "wait_ready", side_effect=ready), \
+                mock.patch.object(peer, "forward", return_value={"success": True}) as forward:
+            result = peer.command({"operation_id": "bounded-nat", "scenario": "shared_nat_reconnect"})
+            self.assertEqual(forward.call_args.kwargs["timeout"], 5)
+            self.assertEqual(forward.call_args.args[1]["scenario"], "dao_connectivity")
+            self.assertTrue(result["success"])
+        self.assertFalse(peer.stopping)
+        self.assertFalse(peer.restarting)
+        self.assertEqual(peer.active_forwards, 0)
+
+    def test_incomplete_nat_replacement_is_quarantined(self):
+        for stage in ("stop", "ready"):
+            with self.subTest(stage=stage):
+                peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                                      Path("unused"), Path("unused"))
+                peer.process = mock.Mock(pid=101)
+                peer.process.poll.return_value = None
+                now = [0]
+
+                def stop():
+                    if stage == "stop":
+                        now[0] = 30_000_000_000
+
+                with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                        mock.patch.object(peer, "stop", side_effect=stop) as stopped, \
+                        mock.patch.object(peer, "start") as start, \
+                        mock.patch.object(peer, "wait_ready", side_effect=TimeoutError("startup expired")), \
+                        mock.patch.object(peer, "forward") as forward:
+                    with self.assertRaises(TimeoutError):
+                        peer.command({"operation_id": "incomplete-nat", "scenario": "shared_nat_reconnect"})
+                    self.assertEqual(stopped.call_count, 2)
+                    self.assertEqual(start.call_count, int(stage == "ready"))
+                    forward.assert_not_called()
+                self.assertTrue(peer.stopping)
+                self.assertFalse(peer.restarting)
+                self.assertEqual(peer.active_forwards, 0)
+                self.assertTrue(peer.lock.acquire(blocking=False))
+                peer.lock.release()
+                with self.assertRaisesRegex(ValueError, "shutting down"):
+                    peer.command({"operation_id": "after-timeout", "scenario": "record_lookup"})
+
+    def test_nat_expiry_after_replacement_lease_quarantines_without_forwarding(self):
+        peer = SUPERVISE.Peer({"identity": "declared-peer", "ip": "10.147.1.1", "nat": True},
+                              Path("unused"), Path("unused"))
+        peer.process = mock.Mock(pid=101)
+        peer.process.poll.return_value = None
+        now = [0]
+
+        def diagnostic(*args):
+            now[0] = 30_000_000_000
+
+        with mock.patch.object(SUPERVISE.time, "monotonic_ns", side_effect=lambda: now[0]), \
+                mock.patch.object(peer, "stop") as stop, \
+                mock.patch.object(peer, "start"), \
+                mock.patch.object(peer, "wait_ready", return_value={"identity": "declared-peer"}), \
+                mock.patch.object(peer, "diagnostic", side_effect=diagnostic), \
+                mock.patch.object(peer, "forward") as forward:
+            with self.assertRaises(TimeoutError):
+                peer.command({"operation_id": "leased-expiry", "scenario": "shared_nat_reconnect"})
+            forward.assert_not_called()
+            self.assertEqual(stop.call_count, 2)
+        self.assertTrue(peer.stopping)
+        self.assertFalse(peer.restarting)
+        self.assertEqual(peer.active_forwards, 0)
         self.assertTrue(peer.lock.acquire(blocking=False))
         peer.lock.release()
 

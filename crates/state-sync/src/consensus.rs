@@ -452,21 +452,24 @@ pub(crate) async fn spawn_track_recent_consensus<DB: TNDatabase>(
     // Get the epoch of our last executed consensus.
     let mut rx_gossip_update = consensus_bus.last_published_consensus_num_hash().subscribe();
     let rx_shutdown = config.shutdown().subscribe();
-    // This loop will track current consensus as well as try to backfill from current.
-    // This task backfills the current epoch records as well as requesting entire pack files
-    // be downloaded for missing historic epochs.
-    loop {
-        tokio::select! {
-            _ = rx_gossip_update.changed() => {
+    // A verified target may predate this tracker, especially after demotion. Mark the
+    // snapshot seen before awaiting queue capacity so a concurrent update stays unseen.
+    let initial_target = *rx_gossip_update.borrow_and_update();
+    tokio::select! {
+        _ = async {
+            if initial_target.1 > 0 {
+                let _ = consensus_bus.consensus_request_queue().send(initial_target).await;
+            }
+            // Track verified gossip and backfill current or historic consensus. Shutdown
+            // cancels this future even when either queue send is waiting for capacity.
+            loop {
+                let _ = rx_gossip_update.changed().await;
                 let (epoch, number, hash) = *rx_gossip_update.borrow_and_update();
                 let _ = consensus_bus.consensus_request_queue().send((epoch, number, hash)).await;
                 debug!(target: "state-sync", ?number, ?hash, "tracking recent consensus and detected change through gossip - requesting consensus from peer");
             }
-
-            _ = &rx_shutdown => {
-                return;
-            }
-        }
+        } => {},
+        _ = &rx_shutdown => {},
     }
 }
 
@@ -902,6 +905,104 @@ mod tests {
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
     type NetworkRx = mpsc::Receiver<NetworkCommand<PrimaryRequest, PrimaryResponse>>;
+
+    /// A tracker started after verified gossip must request that exact target once.
+    #[tokio::test]
+    async fn track_recent_consensus_replays_preexisting_verified_target_once() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let config = fixture.first_authority().consensus_config();
+        let consensus_bus = ConsensusBusApp::new();
+        let mut requests = consensus_bus.subscribe_consensus_request_queue();
+        let target = (3, 46, ConsensusHeaderDigest::from(tn_types::B256::from([7; 32])));
+        assert!(consensus_bus.publish_consensus_num_hash_if_newer(target.0, target.1, target.2));
+
+        let tracker = spawn_track_recent_consensus(config, consensus_bus.clone());
+        tokio::pin!(tracker);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert_eq!(requests.try_recv().expect("startup target"), target);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert!(requests.try_recv().is_err(), "startup target must not be duplicated");
+    }
+
+    /// An update arriving during a blocked startup send must follow the snapshot.
+    #[tokio::test]
+    async fn track_recent_consensus_preserves_update_during_startup_backpressure() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let config = fixture.first_authority().consensus_config();
+        let consensus_bus = ConsensusBusApp::new();
+        let mut requests = consensus_bus.subscribe_consensus_request_queue();
+        let filler = (0, 0, ConsensusHeaderDigest::default());
+        (0..tn_types::CHANNEL_CAPACITY).for_each(|_| {
+            consensus_bus.consensus_request_queue().try_send(filler).expect("fill request queue");
+        });
+        let initial = (3, 45, ConsensusHeaderDigest::from(tn_types::B256::from([8; 32])));
+        let newer = (4, 46, ConsensusHeaderDigest::from(tn_types::B256::from([9; 32])));
+        assert!(consensus_bus.publish_consensus_num_hash_if_newer(initial.0, initial.1, initial.2));
+
+        let tracker = spawn_track_recent_consensus(config, consensus_bus.clone());
+        tokio::pin!(tracker);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert!(consensus_bus.publish_consensus_num_hash_if_newer(newer.0, newer.1, newer.2));
+        (0..tn_types::CHANNEL_CAPACITY).for_each(|_| {
+            assert_eq!(requests.try_recv().expect("queued filler"), filler);
+        });
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert_eq!(requests.try_recv().expect("initial target"), initial);
+        assert_eq!(requests.try_recv().expect("intervening update"), newer);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert!(requests.try_recv().is_err(), "targets must be requested only once");
+    }
+
+    /// A fresh watch has no authenticated target to request.
+    #[tokio::test]
+    async fn track_recent_consensus_does_not_request_default_target() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let config = fixture.first_authority().consensus_config();
+        let consensus_bus = ConsensusBusApp::new();
+        let mut requests = consensus_bus.subscribe_consensus_request_queue();
+        let tracker = spawn_track_recent_consensus(config, consensus_bus);
+        tokio::pin!(tracker);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        assert!(requests.try_recv().is_err(), "default watch must not seed a fetch");
+    }
+
+    /// Polling a full queue makes cancellation deterministic without scheduler deadlines.
+    async fn assert_tracker_shutdown_under_backpressure(startup: bool) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let config = fixture.first_authority().consensus_config();
+        let consensus_bus = ConsensusBusApp::new();
+        let mut requests = consensus_bus.subscribe_consensus_request_queue();
+        let filler = (0, 0, ConsensusHeaderDigest::default());
+        (0..tn_types::CHANNEL_CAPACITY).for_each(|_| {
+            consensus_bus.consensus_request_queue().try_send(filler).expect("fill request queue");
+        });
+        let target = (4, 46, ConsensusHeaderDigest::from(tn_types::B256::from([10; 32])));
+        if startup {
+            assert!(consensus_bus.publish_consensus_num_hash_if_newer(target.0, target.1, target.2));
+        }
+        let tracker = spawn_track_recent_consensus(config.clone(), consensus_bus.clone());
+        tokio::pin!(tracker);
+        assert!(futures::poll!(tracker.as_mut()).is_pending());
+        if !startup {
+            assert!(consensus_bus.publish_consensus_num_hash_if_newer(target.0, target.1, target.2));
+            assert!(futures::poll!(tracker.as_mut()).is_pending());
+        }
+        config.shutdown().notify();
+        assert!(
+            futures::poll!(tracker.as_mut()).is_ready(),
+            "shutdown must cancel the blocked send"
+        );
+        (0..tn_types::CHANNEL_CAPACITY).for_each(|_| {
+            assert_eq!(requests.try_recv().expect("queued filler"), filler);
+        });
+        assert!(requests.try_recv().is_err(), "cancelled target must not enter the queue");
+    }
+
+    #[tokio::test]
+    async fn track_recent_consensus_shutdown_cancels_full_queue() {
+        assert_tracker_shutdown_under_backpressure(true).await;
+        assert_tracker_shutdown_under_backpressure(false).await;
+    }
 
     /// A fresh chain whose only pack is the (current) epoch-0 pack.
     async fn test_chain(dir: &TempDir, fixture: &CommitteeFixture<MemDatabase>) -> ConsensusChain {

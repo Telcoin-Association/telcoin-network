@@ -486,6 +486,10 @@ where
                     }
                     if sigs >= enough_sigs {
                         if self.behind_consensus(epoch, round, Some(number)).await {
+                            // Keep the authenticated catchup target after the lag check, which
+                            // reads the previously published number when deciding to demote.
+                            self.consensus_bus
+                                .publish_consensus_num_hash_if_newer(epoch, number, hash);
                             warn!(target: "primary", "consensus result indicates we are behind, go to catchup mode!");
                             self.consensus_certs.lock().clear();
                             return Ok(());
