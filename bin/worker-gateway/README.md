@@ -17,6 +17,8 @@ and the PR3 edge protections.
 
 ## Scope (v1)
 
+The [production-readiness review](docs/production-readiness.md) evaluates this gateway as the public endpoint of a validator, lists its findings by severity, and gives the plan for each one.
+
 - HTTP-only. WebSocket (`eth_subscribe`) pass-through is deliberately out of
   scope: subscriptions are per-connection stateful and cannot survive a replica
   dying, which breaks the stateless-scaling invariant. Point subscription
@@ -310,3 +312,5 @@ ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
 `tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
 turnkey install: see `deploy/README.md` for the placeholders to replace and the
 prometheus-adapter rule the autoscaler needs.
+
+Before putting gateways in front of a validator, read the [production-readiness review](docs/production-readiness.md), in particular its operator guidance on DNS, the DDoS front, firewalling and sizing for N gateways.
