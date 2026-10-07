@@ -126,7 +126,7 @@ where
     /// the view's published bytes and borrow its payload. Log records never change once appended,
     /// so a published record is safe to read with no lock.
     pub(crate) fn record_bytes_in(view: &MapView, pos: u64) -> Result<&[u8], FetchError> {
-        checked_payload_in(|o, l| view.slice(o, l), pos)
+        checked_payload_in(view.tail(pos))
     }
 
     /// Read the record size (with crc32) at position.
@@ -625,14 +625,6 @@ where
         Ok(header)
     }
 
-    fn record_size_bytes<'a>(
-        &'a self,
-        position: u64,
-        crc32_hasher: &mut crc32fast::Hasher,
-    ) -> Result<(usize, &'a [u8]), FetchError> {
-        record_size_bytes_in(|o, l| self.data_file.slice(o, l), position, crc32_hasher)
-    }
-
     /// Read the record at position.
     /// Returns the (key, value) tuple
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
@@ -644,7 +636,7 @@ where
     /// stored value bytes (before any decompression), borrowed straight from the mmap. Shared
     /// by [`Self::read_record_into`] and [`Self::record_bytes`].
     fn checked_payload(&self, position: u64) -> Result<&[u8], FetchError> {
-        checked_payload_in(|o, l| self.data_file.slice(o, l), position)
+        checked_payload_in(self.data_file.tail(position))
     }
 
     /// Decode the record at `position`, decompressing first if the pack is compressed. The value
@@ -682,17 +674,7 @@ where
     /// Read the record size (with crc32) at position.
     /// Will produce an error for IO or or for a failed CRC32 integrity check.
     fn record_size(&self, position: u64) -> Result<u32, FetchError> {
-        let mut crc32_hasher = crc32fast::Hasher::new();
-        let (val_size, bytes) = self.record_size_bytes(position, &mut crc32_hasher)?;
-        crc32_hasher.update(&bytes[0..val_size]);
-        let calc_crc32 = crc32_hasher.finalize();
-        let mut buf_u32 = [0_u8; 4];
-        buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
-        let read_crc32 = u32::from_le_bytes(buf_u32);
-        if calc_crc32 != read_crc32 {
-            return Err(FetchError::CrcFailed);
-        }
-        Ok(val_size as u32 + 8)
+        Ok(self.checked_payload(position)?.len() as u32 + 8)
     }
 
     /// Close and destroy the Pack (remove it's file).
@@ -720,51 +702,33 @@ where
     }
 }
 
-/// Read the record size prefix at `position` (feeding it to `crc32_hasher`) and borrow the
-/// `[payload | crc]` bytes that follow, reading through `slice`: the data file's own mapping, or a
-/// lock-free [`MapView`].
-fn record_size_bytes_in<'a>(
-    slice: impl Fn(u64, usize) -> Option<&'a [u8]>,
-    position: u64,
-    crc32_hasher: &mut crc32fast::Hasher,
-) -> Result<(usize, &'a [u8]), FetchError> {
-    let Some(prefix) = slice(position, 4) else {
+/// CRC-check the record at the start of `tail` (every readable byte from the record's position on:
+/// the data file's own mapping, or a lock-free [`MapView`]) and return its payload (the raw stored
+/// value bytes, before any decompression) borrowed in place.
+///
+/// A record is `[len u32 | payload | crc u32]` with the CRC over the contiguous `[len | payload]`,
+/// so it is checked with one bounds-checked borrow and one CRC call over those bytes.
+fn checked_payload_in(tail: Option<&[u8]>) -> Result<&[u8], FetchError> {
+    let Some(tail) = tail.filter(|tail| tail.len() >= 4) else {
         return Err(FetchError::IO(io::Error::other("Unable to get mmap slice.")));
     };
-    let mut val_size_buf = [0_u8; 4];
-    val_size_buf.copy_from_slice(&prefix[0..4]);
-    crc32_hasher.update(&val_size_buf);
-    let val_size = u32::from_le_bytes(val_size_buf);
+    let val_size = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
     if val_size > MAX_RECORD_SIZE {
         return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
     }
-    match slice(position + 4, val_size as usize + 4) {
-        Some(bytes) => Ok((val_size as usize, bytes)),
-        None => Err(FetchError::IO(io::Error::new(
+    let crc_at = 4 + val_size as usize;
+    let Some(stored) = tail.get(crc_at..crc_at + 4) else {
+        return Err(FetchError::IO(io::Error::new(
             io::ErrorKind::UnexpectedEof,
             "Unable to read the full record and CRC",
-        ))),
-    }
-}
-
-/// CRC-check the record at `position`, reading through `slice`, and return its payload (the raw
-/// stored value bytes, before any decompression) borrowed in place.
-fn checked_payload_in<'a>(
-    slice: impl Fn(u64, usize) -> Option<&'a [u8]>,
-    position: u64,
-) -> Result<&'a [u8], FetchError> {
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    let (val_size, bytes) = record_size_bytes_in(slice, position, &mut crc32_hasher)?;
-    crc32_hasher.update(&bytes[0..val_size]);
-    let calc_crc32 = crc32_hasher.finalize();
-    let mut buf_u32 = [0_u8; 4];
-    buf_u32.copy_from_slice(&bytes[val_size..val_size + 4]);
-    let read_crc32 = u32::from_le_bytes(buf_u32);
-    if calc_crc32 != read_crc32 {
+        )));
+    };
+    if crc32fast::hash(&tail[..crc_at])
+        != u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]])
+    {
         return Err(FetchError::CrcFailed);
     }
-    // The value bytes only — `bytes` is `[value | crc]`, so drop the trailing 4-byte CRC.
-    Ok(&bytes[0..val_size])
+    Ok(&tail[4..crc_at])
 }
 
 /// What one append writes: a value to encode through the pack's codec, or bytes the caller has
@@ -1118,6 +1082,40 @@ mod tests {
         let payload = pack.inner.data_file.slice_mut(pos_small + 4, 1).expect("payload slice");
         payload[0] ^= 0xFF;
         assert!(matches!(pack.record_bytes(pos_small), Err(FetchError::CrcFailed)));
+    }
+
+    /// A damaged length prefix never yields a payload: a small change mis-frames the CRC
+    /// (`CrcFailed`), a huge one trips the size cap, and one reaching past the end is an EOF.
+    #[test]
+    fn record_bytes_rejects_damaged_length() {
+        let tmp = TempDir::with_prefix("pack_damaged_len").expect("temp dir");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("raw"), 0, false, PackCompression::None, 1).expect("open");
+        let first = pack.append_raw(b"first record").expect("append");
+        let last = pack.append_raw(b"last record").expect("append");
+        let mut set_len = |pos: u64, len: u32| {
+            pack.inner
+                .data_file
+                .slice_mut(pos, 4)
+                .expect("prefix")
+                .copy_from_slice(&len.to_le_bytes());
+        };
+        set_len(first, 11); // was 12
+        set_len(last, 11 + 8); // past the end of the log
+        assert!(matches!(pack.record_bytes(first), Err(FetchError::CrcFailed)));
+        assert!(
+            matches!(pack.record_bytes(last), Err(FetchError::IO(e)) if e.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        let mut set_len = |pos: u64, len: u32| {
+            pack.inner
+                .data_file
+                .slice_mut(pos, 4)
+                .expect("prefix")
+                .copy_from_slice(&len.to_le_bytes());
+        };
+        set_len(first, u32::MAX);
+        assert!(matches!(pack.record_bytes(first), Err(FetchError::RequestedSizeTooLarge(..))));
+        assert!(pack.record_bytes(pack.file_len()).is_err(), "no record at the end of the log");
     }
 
     /// Regression test for the failed-state guard: a failed pack replays the error that

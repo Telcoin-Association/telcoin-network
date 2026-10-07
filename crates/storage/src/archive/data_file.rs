@@ -233,11 +233,14 @@ impl MapView {
 
     /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
-        let end = offset.checked_add(len as u64)?;
-        if end > self.published.load(Ordering::Acquire) || end > self.mapped.load(Ordering::Acquire)
-        {
-            return None;
-        }
+        self.tail(offset)?.get(..len)
+    }
+
+    /// Borrow every published byte from `offset` on (`None` past the published end): one bounds
+    /// check for a reader that learns a record's length from its own prefix.
+    pub(crate) fn tail(&self, offset: u64) -> Option<&[u8]> {
+        let end = self.published.load(Ordering::Acquire).min(self.mapped.load(Ordering::Acquire));
+        let len = end.checked_sub(offset)?;
         let base = self.base.load(Ordering::Acquire);
         if base.is_null() {
             return None;
@@ -246,7 +249,7 @@ impl MapView {
         // file open while readers can reach the view, and replaced mappings stay mapped until the
         // file drops), and `[offset, end)` lies within it and within the published bytes, which
         // the owner never modifies while readers can see them.
-        Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
+        Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len as usize) })
     }
 }
 
@@ -700,8 +703,7 @@ impl MmapDataFile {
     /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
     /// returned slice borrows `&self`, so no concurrent write/remap (which needs `&mut self`)
     /// can invalidate it while it is held. A caller that does not know a record's length up
-    /// front reads the size prefix with one `slice` call and the value with another; passing
-    /// `len = self.len() - offset` gives an offset-to-end view.
+    /// front takes [`Self::tail`] and parses the prefix from it.
     pub fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         let range_end = offset.checked_add(len as u64)?;
         if range_end > self.end {
@@ -715,6 +717,12 @@ impl MmapDataFile {
             Backing::Empty if len == 0 => Some(&[]),
             Backing::Empty => None,
         }
+    }
+
+    /// Borrow the logical data from `offset` to the end (`None` past the end): see
+    /// [`Self::slice`].
+    pub fn tail(&self, offset: u64) -> Option<&[u8]> {
+        self.slice(offset, usize::try_from(self.end.checked_sub(offset)?).ok()?)
     }
 
     /// Borrow the mapped bytes `[offset, offset + len)` directly, without copying — the building
@@ -1741,6 +1749,13 @@ mod tests {
         let old = view.slice(0, 1_000).expect("published slice");
         assert_eq!(old, &pattern(1_000)[..]);
         assert_eq!(view.slice(900, 101), None, "past the published length");
+        assert_eq!(
+            view.tail(900).map(<[u8]>::len),
+            Some(100),
+            "the tail stops at the published end"
+        );
+        assert_eq!(view.tail(1_000).map(<[u8]>::len), Some(0));
+        assert_eq!(view.tail(1_001), None);
 
         df.write_all(&pattern(40_000)[1_000..]).expect("grow past the reservation");
         assert!(df.reserved >= 40_000, "re-reserved larger (reserved {})", df.reserved);
