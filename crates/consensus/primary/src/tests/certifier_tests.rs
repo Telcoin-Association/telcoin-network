@@ -392,7 +392,7 @@ fn start_proposal<DB: Database>(
     header: Header,
 ) -> JoinHandle<DagResult<Certificate>> {
     let certifier = certifier.clone();
-    tokio::spawn(async move { certifier.propose_header(header).await })
+    tokio::spawn(async move { certifier.propose_header(header, &Notify::new()).await })
 }
 
 /// The result of a proposal started with [`start_proposal`].
@@ -817,6 +817,92 @@ async fn identical_header_keeps_inflight_votes() {
     );
     let gossip = cx.network.next_publish("gossip of the certificate").await;
     assert!(gossip == certificate_gossip(expected).await, "the gossip must carry the certificate");
+}
+
+/// The identical header sent again while its proposal is in flight asks again only the peer whose
+/// vote request ended in an error, and the certificate forms from that peer's vote and the votes
+/// kept from before the re-send.
+///
+/// In a 4-authority committee the proposer and two peers are exactly a quorum. The first peer's
+/// request fails with the fatal `NetworkError::RPCError` that a responder sends while it cannot yet
+/// map the requester's network key, which it does not cache. The second peer votes, and the third
+/// peer's request is held, as for a peer that is offline and retried forever. The proposal is one
+/// vote short and cannot end on its own, so before the re-send nothing more is asked and no
+/// certificate forms. The re-send must ask the failed peer, and no other, once more; its vote then
+/// completes the quorum.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn identical_header_reissues_failed_vote_requests() {
+    let mut cx = CertifierContext::new();
+    let committee = cx.fixture.committee();
+    let header = cx.proposer_header();
+    let digest = header.digest();
+    let votes = cx.peer_votes(&header);
+    assert_eq!(
+        committee.quorum_threshold(),
+        3,
+        "precondition: the proposer and two voters are exactly a quorum"
+    );
+    let (expected, failed, voter) = {
+        let mut peers = cx.peers();
+        let failed = peers.next().expect("committee has a first peer");
+        let voter = peers.next().expect("committee has a second peer");
+        let expected = certificate_over(&committee, &header, [failed, voter, cx.proposer()]);
+        (expected, *failed.authority().protocol_key(), *voter.authority().protocol_key())
+    };
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    cx.consensus_bus.headers().send(header.clone()).await.unwrap();
+    let first = cx
+        .network
+        .respond(
+            votes.len(),
+            "first send: one peer fails fatally, one votes, one is held",
+            |peer, _| {
+                if *peer == failed {
+                    Reply::Fail(NetworkError::RPCError("requesting peer unknown".to_string()))
+                } else if *peer == voter {
+                    Reply::Vote(votes[peer].clone())
+                } else {
+                    Reply::Hold
+                }
+            },
+        )
+        .await;
+    cx.network.assert_quiet("first send: a fatal error is not retried").await;
+    if let Ok(result) = tokio::time::timeout(Duration::ZERO, cert_rx.recv()).await {
+        panic!("first send: expected no certificate one vote short of quorum, got {result:?}");
+    }
+
+    cx.consensus_bus.headers().send(header).await.unwrap();
+    let reissued = cx
+        .network
+        .respond(1, "identical re-send: the failed peer is asked again", |peer, _| {
+            Reply::Vote(votes[peer].clone())
+        })
+        .await;
+    assert_eq!(
+        reissued.requests_per_peer(),
+        HashMap::from([(failed, 1)]),
+        "identical re-send: only the peer whose request failed is asked again"
+    );
+    assert_eq!(reissued.requests[0].header, digest, "the re-issued request is for the header");
+
+    let certificate = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("a certificate forms from the re-issued vote and the kept vote")
+        .expect("certificate channel open");
+    assert!(
+        encode(&certificate) == encode(&expected),
+        "expected the certificate over the proposer's, the re-asked peer's and the voter's votes \
+         {expected:?}, got {certificate:?}"
+    );
+    let gossip = cx.network.next_publish("gossip of the certificate").await;
+    assert!(gossip == certificate_gossip(expected).await, "the gossip must carry the certificate");
+    cx.network.assert_quiet("after the certificate: no peer is asked again").await;
+    assert!(
+        first.held.iter().all(|reply| !reply.is_closed()),
+        "the held peer's request stays in flight across the re-send"
+    );
 }
 
 /// The identical header sent again after its proposal has ended starts a new proposal.
@@ -1594,7 +1680,10 @@ async fn already_certified_header_is_republished() {
         .expect("record the header's certificate before it is proposed");
 
     let cancel = certifier.new_proposal.subscribe();
-    let proposal = tokio::spawn(certifier.clone().spawn_header_proposal(header, cancel));
+    let certifier = certifier.clone();
+    let proposal = tokio::spawn(async move {
+        certifier.spawn_header_proposal(header, cancel, &Notify::new()).await
+    });
     let gossip = cx.network.next_publish("already-certified header: first network command").await;
     assert!(
         gossip == certificate_gossip(stored).await,
@@ -1784,7 +1873,9 @@ async fn barrier_round(
     let votes = cx.peer_votes(&header);
     let cert_rx = cx.subscribe_new_certificates();
     let cancel = certifier.new_proposal.subscribe();
-    let proposal = tokio::spawn(certifier.spawn_header_proposal(header, cancel));
+    let proposal = tokio::spawn(async move {
+        certifier.spawn_header_proposal(header, cancel, &Notify::new()).await
+    });
     cx.network
         .respond(votes.len(), &format!("{context}: every peer votes"), |peer, _| {
             Reply::Vote(votes[peer].clone())
