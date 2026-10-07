@@ -105,13 +105,24 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
     };
 
-    match forward(&state.http, method, &headers, body.clone(), rpc_url, peer).await {
+    match forward(&state.http, method, &headers, body.clone(), rpc_url.clone(), peer).await {
         Ok(response) => {
             telemetry::record_forwarded();
             response
         }
-        Err(err) => {
-            warn!(target: "gateway::proxy", ?err, "forwarding to upstream failed");
+        Err(source) => {
+            let err = classify_error(&source);
+            // reqwest's `Display` appends the full request url, whose userinfo,
+            // path or query can carry a credential, so the log names the
+            // upstream by origin and renders the cause with the url removed.
+            let source = source.without_url();
+            warn!(
+                target: "gateway::proxy",
+                ?err,
+                upstream = %UpstreamOrigin(&rpc_url),
+                cause = %ErrorChain(&source),
+                "forwarding to upstream failed"
+            );
             error_response(&err, body.as_ref())
         }
     }
@@ -135,6 +146,9 @@ fn reject_body(rejection: &BytesRejection) -> Response {
 
 /// Forward one request to `rpc_url` and adapt the upstream response back into an
 /// axum response, preserving the status, body, and content type.
+///
+/// A transport failure is returned as the raw `reqwest` error so the caller can
+/// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
     client: &Client,
     method: Method,
@@ -142,7 +156,7 @@ async fn forward(
     body: Bytes,
     rpc_url: Url,
     peer: SocketAddr,
-) -> Result<Response, GatewayError> {
+) -> Result<Response, reqwest::Error> {
     // JSON-RPC is content-type `application/json`; preserve the client's header
     // when present, default to it otherwise.
     let content_type = headers
@@ -158,8 +172,7 @@ async fn forward(
         .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
         .body(body)
         .send()
-        .await
-        .map_err(classify_error)?;
+        .await?;
 
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
@@ -195,11 +208,50 @@ fn forwarded_for(headers: &HeaderMap, peer: SocketAddr) -> HeaderValue {
 }
 
 /// Classify a `reqwest` forwarding failure into a client-facing gateway error.
-fn classify_error(err: reqwest::Error) -> GatewayError {
+fn classify_error(err: &reqwest::Error) -> GatewayError {
     if err.is_timeout() {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
+    }
+}
+
+/// Renders only a URL's origin, `scheme://host:port`, for logs.
+///
+/// An upstream URL can carry a credential in its userinfo, path or query (a
+/// hosted RPC provider's API key, for example), so log lines name an upstream
+/// by origin alone. The port is always written, falling back to the scheme's
+/// default, so two upstreams on one host stay distinguishable.
+struct UpstreamOrigin<'a>(&'a Url);
+
+impl fmt::Display for UpstreamOrigin<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        write!(f, "{}://{}", url.scheme(), url.host_str().unwrap_or_default())?;
+        if let Some(port) = url.port_or_known_default() {
+            write!(f, ":{port}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Renders an error followed by every [`std::error::Error::source`] beneath it,
+/// joined with `": "`.
+///
+/// A `reqwest` error's own message is only its kind ("error sending request");
+/// the reason a forward failed (connection refused, DNS failure, reset) sits
+/// further down the source chain.
+struct ErrorChain<'a>(&'a dyn std::error::Error);
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(err) = source {
+            write!(f, ": {err}")?;
+            source = err.source();
+        }
+        Ok(())
     }
 }
 
@@ -806,5 +858,69 @@ mod tests {
     #[test]
     fn unrelated_body_skips_parsing() {
         assert!(screen_raw_transaction(br#"{"method":"net_version","id":1}"#).is_none());
+    }
+
+    #[test]
+    fn upstream_origin_drops_userinfo_path_and_query() {
+        for (url, origin) in [
+            ("http://user:secret@10.0.0.7:8545/key/abc?token=xyz#frag", "http://10.0.0.7:8545"),
+            ("https://rpc.example.com/v1/0123456789abcdef", "https://rpc.example.com:443"),
+            ("http://worker.internal/", "http://worker.internal:80"),
+            ("http://[::1]:8545/", "http://[::1]:8545"),
+        ] {
+            let url = Url::parse(url).expect("url");
+            assert_eq!(UpstreamOrigin(&url).to_string(), origin);
+        }
+    }
+
+    /// One link of a hand-built error chain.
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl fmt::Display for Link {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|link| link as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_joins_every_source() {
+        let refused = Link("connection refused", None);
+        let connect = Link("client error (Connect)", Some(Box::new(refused)));
+        let err = Link("error sending request", Some(Box::new(connect)));
+        assert_eq!(
+            ErrorChain(&err).to_string(),
+            "error sending request: client error (Connect): connection refused"
+        );
+        assert_eq!(ErrorChain(&Link("alone", None)).to_string(), "alone");
+    }
+
+    /// A real transport failure: the raw error's `Display` carries the url, the
+    /// fields the proxy logs do not, and the cause reaches below reqwest's own
+    /// message.
+    #[tokio::test]
+    async fn forwarding_failure_log_fields_hide_the_url() {
+        // nothing listens on port 1, as in the server's unreachable-upstream test
+        let url = Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
+        let err =
+            Client::new().post(url.clone()).send().await.expect_err("nothing listens on port 1");
+        assert!(matches!(classify_error(&err), GatewayError::UpstreamUnreachable));
+        assert!(err.to_string().contains("apikey123"), "raw display should carry the url: {err}");
+
+        let cause = ErrorChain(&err.without_url()).to_string();
+        for secret in ["secret", "apikey123", "xyz"] {
+            assert!(!cause.contains(secret), "cause leaks {secret:?}: {cause}");
+        }
+        assert!(
+            cause.starts_with("error sending request: "),
+            "cause should have a source: {cause}"
+        );
+        assert_eq!(UpstreamOrigin(&url).to_string(), "http://127.0.0.1:1");
     }
 }
