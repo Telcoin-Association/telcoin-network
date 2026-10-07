@@ -35,6 +35,10 @@
 //! - `write_bulk` — `N_BULK` inserts then **one** durability barrier (bulk-load throughput).
 //! - `write_each_dur` — `N_EACH` inserts, a durability barrier **after each** (per-commit fsync).
 //! - `read_rand` — `N_READ` random point-gets over the bulk-loaded keys.
+//!
+//! Values are [`ByteVec`] byte strings, encoded the way production stored byte fields are (one
+//! length prefix and a copy). A plain `Vec<u8>` would go through serde one byte per call, and that
+//! per-byte codec cost, not the storage engine, would dominate every row.
 //! - `scan_all` / `range_scan` (sorted table) — full ascending scan / middle-half range scan, each
 //!   visiting values in key order.
 //!
@@ -58,7 +62,7 @@ use std::{
 };
 
 use tempfile::TempDir;
-use tn_types::{Database, DbTx as _, DbTxMut as _, Table, TableHint, B256};
+use tn_types::{ByteVec, Database, DbTx as _, DbTxMut as _, Table, TableHint, B256};
 
 use crate::{
     archive::{
@@ -84,9 +88,9 @@ const PACK_VERSION: u16 = 1;
 const VALUE_SIZES: &[(&str, usize)] = &[("64B", 64), ("1KB", 1024)];
 
 /// A deterministic, non-trivial value of `size` bytes.
-fn value(size: usize, seed: u64) -> Vec<u8> {
+fn value(size: usize, seed: u64) -> ByteVec {
     let s = seed.to_le_bytes();
-    (0..size).map(|i| s[i % 8].wrapping_add((i & 0xff) as u8)).collect()
+    ByteVec((0..size).map(|i| s[i % 8].wrapping_add((i & 0xff) as u8)).collect())
 }
 
 /// A well-distributed 64-bit mix (splitmix64) of `x` — used to spread keys and randomize read
@@ -112,9 +116,9 @@ fn key(i: u64) -> B256 {
 /// The common point-KV surface. Batch-level so the MDBX side needs no long-lived transaction.
 trait KvStore {
     /// Insert every item, then apply ONE durability barrier.
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]);
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]);
     /// Insert each item under its OWN durability barrier (per-op fsync/commit).
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]);
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]);
     /// Random point-get every key in `keys`; return the number found.
     fn read_rand(&mut self, keys: &[B256]) -> usize;
 }
@@ -134,14 +138,14 @@ trait SortedKvStore: KvStore {
 // ---- pack-file KV: append-only data log keyed by a hash digest index ----
 
 struct PackKv {
-    data: Pack<Vec<u8>>,
+    data: Pack<ByteVec>,
     index: HdxIndex,
 }
 
 impl PackKv {
     fn open(dir: &Path) -> Self {
         let data =
-            Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
+            Pack::<ByteVec>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
                 .expect("open pack data");
         let index = HdxIndex::open_hdx_file(
             dir.join("idx"),
@@ -162,7 +166,7 @@ impl PackKv {
 }
 
 impl KvStore for PackKv {
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let pos = self.data.append(v).expect("append");
             self.index.save(*k, pos).expect("save");
@@ -170,7 +174,7 @@ impl KvStore for PackKv {
         self.barrier();
     }
 
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let pos = self.data.append(v).expect("append");
             self.index.save(*k, pos).expect("save");
@@ -194,14 +198,14 @@ impl KvStore for PackKv {
 // ---- pack-file KV: the same data log keyed by the sorted B+tree index ----
 
 struct PackBtreeKv {
-    data: Pack<Vec<u8>>,
+    data: Pack<ByteVec>,
     index: BtreeIndex,
 }
 
 impl PackBtreeKv {
     fn open(dir: &Path) -> Self {
         let data =
-            Pack::<Vec<u8>>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
+            Pack::<ByteVec>::open(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION)
                 .expect("open pack data");
         let index = BtreeIndex::open_btx_file(dir.join("btx"), data.header(), 32, false)
             .expect("open btree index");
@@ -216,7 +220,7 @@ impl PackBtreeKv {
 }
 
 impl KvStore for PackBtreeKv {
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let pos = self.data.append(v).expect("append");
             self.index.save_digest(*k, pos).expect("save");
@@ -224,7 +228,7 @@ impl KvStore for PackBtreeKv {
         self.barrier();
     }
 
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let pos = self.data.append(v).expect("append");
             self.index.save_digest(*k, pos).expect("save");
@@ -279,7 +283,7 @@ struct KvTable;
 
 impl Table for KvTable {
     type Key = B256;
-    type Value = Vec<u8>;
+    type Value = ByteVec;
     const NAME: &'static str = "kv";
     const HINT: TableHint = TableHint::Epoch;
 }
@@ -299,7 +303,7 @@ impl TnKv {
 }
 
 impl KvStore for TnKv {
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         let mut txn = self.db.write_txn().expect("write_txn");
         for (k, v) in items {
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -307,7 +311,7 @@ impl KvStore for TnKv {
         txn.commit().expect("commit"); // durably syncs the value log + the index
     }
 
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let mut txn = self.db.write_txn().expect("write_txn");
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -356,7 +360,7 @@ impl MemKv {
 }
 
 impl KvStore for MemKv {
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         let mut txn = self.db.write_txn().expect("write_txn");
         for (k, v) in items {
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -364,7 +368,7 @@ impl KvStore for MemKv {
         txn.commit().expect("commit");
     }
 
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let mut txn = self.db.write_txn().expect("write_txn");
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -420,7 +424,7 @@ impl MdbxKv {
 
 #[cfg(feature = "reth-libmdbx")]
 impl KvStore for MdbxKv {
-    fn write_bulk(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         let mut txn = self.db.write_txn().expect("write_txn");
         for (k, v) in items {
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -428,7 +432,7 @@ impl KvStore for MdbxKv {
         txn.commit().expect("commit"); // fsyncs iff durable
     }
 
-    fn write_each_durable(&mut self, items: &[(B256, Vec<u8>)]) {
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
         for (k, v) in items {
             let mut txn = self.db.write_txn().expect("write_txn");
             txn.insert::<KvTable>(k, v).expect("insert");
@@ -474,7 +478,7 @@ fn timed(f: impl FnOnce()) -> Duration {
 /// Store A (bulk + reads) and store B (per-op durable) are fresh so the per-op barrier isn't
 /// inflated by a huge pre-existing index.
 fn run_size<S: KvStore>(open: impl Fn(&Path) -> S, size: usize) -> [Duration; 3] {
-    let items: Vec<(B256, Vec<u8>)> = (0..N_BULK).map(|i| (key(i), value(size, i))).collect();
+    let items: Vec<(B256, ByteVec)> = (0..N_BULK).map(|i| (key(i), value(size, i))).collect();
     let read_keys: Vec<B256> = (0..N_READ).map(|m| key(mix(m) % N_BULK)).collect();
 
     let dir_a = TempDir::with_prefix("packkv_a").expect("temp dir");
@@ -531,7 +535,7 @@ fn run_size_sorted<S: SortedKvStore>(
     lo: B256,
     hi: B256,
 ) -> [Duration; 2] {
-    let items: Vec<(B256, Vec<u8>)> = (0..N_BULK).map(|i| (key(i), value(size, i))).collect();
+    let items: Vec<(B256, ByteVec)> = (0..N_BULK).map(|i| (key(i), value(size, i))).collect();
     let dir = TempDir::with_prefix("packkv_sorted").expect("temp dir");
     let mut s = open(dir.path());
     s.write_bulk(&items);
@@ -682,7 +686,7 @@ macro_rules! kv_tables {
 
         impl Table for $ty {
             type Key = B256;
-            type Value = Vec<u8>;
+            type Value = ByteVec;
             const NAME: &'static str = $name;
             const HINT: TableHint = TableHint::Epoch;
         }
@@ -737,7 +741,7 @@ fn open_mt_tables<D: Database>(db: &D) {
 }
 
 /// Bulk-load `items` into table `T` with one commit.
-fn load<D: Database, T: Table<Key = B256, Value = Vec<u8>>>(db: &D, items: &[(B256, Vec<u8>)]) {
+fn load<D: Database, T: Table<Key = B256, Value = ByteVec>>(db: &D, items: &[(B256, ByteVec)]) {
     let mut txn = db.write_txn().expect("write_txn");
     for (k, v) in items {
         txn.insert::<T>(k, v).expect("insert");
@@ -746,7 +750,7 @@ fn load<D: Database, T: Table<Key = B256, Value = Vec<u8>>>(db: &D, items: &[(B2
 }
 
 /// Load `items` into the shared table and every per-thread table.
-fn load_mt_tables<D: Database>(db: &D, items: &[(B256, Vec<u8>)]) {
+fn load_mt_tables<D: Database>(db: &D, items: &[(B256, ByteVec)]) {
     load::<D, KvTable>(db, items);
     load::<D, KvT0>(db, items);
     load::<D, KvT1>(db, items);
@@ -759,7 +763,7 @@ fn load_mt_tables<D: Database>(db: &D, items: &[(B256, Vec<u8>)]) {
 }
 
 /// Point-get every key from table `T` in one read transaction; return the number found.
-fn read_keys<D: Database, T: Table<Key = B256, Value = Vec<u8>>>(db: &D, keys: &[B256]) -> usize {
+fn read_keys<D: Database, T: Table<Key = B256, Value = ByteVec>>(db: &D, keys: &[B256]) -> usize {
     let txn = db.read_txn().expect("read_txn");
     keys.iter().filter(|k| txn.get::<T>(k).expect("get").is_some()).count()
 }
@@ -842,7 +846,7 @@ fn concurrent_column<D: Database>(open: impl Fn(&Path) -> D) -> Vec<f64> {
     for (_, size) in VALUE_SIZES {
         let dir = TempDir::with_prefix("packkv_mt").expect("temp dir");
         let db = open(dir.path());
-        let items: Vec<(B256, Vec<u8>)> = (0..N_BULK).map(|i| (key(i), value(*size, i))).collect();
+        let items: Vec<(B256, ByteVec)> = (0..N_BULK).map(|i| (key(i), value(*size, i))).collect();
         load_mt_tables(&db, &items);
         for mode in ReadMode::ALL {
             for &threads in READ_THREADS {

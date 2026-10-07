@@ -201,8 +201,9 @@ pub enum StateEntry {
 enum ExecStateRecord {
     /// Snapshot metadata; always the first record.
     Meta(ExecStateMeta),
-    /// An RLP-encoded [`ExecHeader`] (canonical, lossless form).
-    Header(Vec<u8>),
+    /// An RLP-encoded [`ExecHeader`] (canonical, lossless form). Encoded as one byte string
+    /// (byte-identical to a sequence of `u8`), not byte by byte.
+    Header(#[serde(with = "tn_types::byte_vec")] Vec<u8>),
     /// An account header (address/nonce/balance/code); storage follows as `Storage` chunks.
     Account(AccountRecord),
     /// A chunk of the preceding account's storage slots (bounded by [`STORAGE_CHUNK_SLOTS`]).
@@ -822,6 +823,33 @@ impl From<FetchError> for ExecStatePackError {
 mod test {
     use super::*;
     use tempfile::TempDir;
+
+    /// The `Header` record is a byte string, byte-identical to the plain `Vec<u8>` it was before,
+    /// so existing exec-state packs read unchanged (and the mirror shows the variant indices
+    /// hold).
+    #[test]
+    fn header_record_encodes_as_before() {
+        #[derive(Serialize, Deserialize)]
+        enum OldRecord {
+            Meta(ExecStateMeta),
+            Header(Vec<u8>),
+        }
+        let meta = ExecStateMeta {
+            state_root: B256::from([1_u8; 32]),
+            block_number: 7,
+            block_hash: B256::from([2_u8; 32]),
+            header_count: 1,
+        };
+        let rlp = encode_header(&header(7, B256::from([3_u8; 32])));
+        let old_meta = tn_types::encode(&OldRecord::Meta(meta.clone()));
+        let old_header = tn_types::encode(&OldRecord::Header(rlp.clone()));
+        assert_eq!(tn_types::encode(&ExecStateRecord::Meta(meta)), old_meta);
+        assert_eq!(tn_types::encode(&ExecStateRecord::Header(rlp.clone())), old_header);
+        match tn_types::decode::<ExecStateRecord>(&old_header) {
+            ExecStateRecord::Header(bytes) => assert_eq!(bytes, rlp),
+            other => panic!("decoded {other:?}"),
+        }
+    }
 
     fn header(number: u64, state_root: B256) -> ExecHeader {
         ExecHeader { number, state_root, ..Default::default() }

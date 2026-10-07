@@ -15,11 +15,11 @@
 //!
 //! ## What it models
 //!
-//! Values are sized `Vec<u8>` **proxies** for the real serialized records — the KV backends measure
-//! bytes, so a 1.5 KB blob stresses them exactly like a 1.5 KB `Certificate` without the heavy
-//! committee/BLS construction. Sizes: ~48 B index rows, ~1.5 KB certificates, ~256 KB batch bodies.
-//! Two tables exercise both `CompositeDatabase` routes: [`BenchEpoch`] (`Epoch` hint — the durable
-//! hot path) and [`BenchCache`] (`Cache` hint — the batch cache).
+//! Values are sized [`ByteVec`] **proxies** for the real serialized records — the KV backends
+//! measure bytes, so a 1.5 KB blob stresses them exactly like a 1.5 KB `Certificate` without the
+//! heavy committee/BLS construction. Sizes: ~48 B index rows, ~1.5 KB certificates, ~256 KB batch
+//! bodies. Two tables exercise both `CompositeDatabase` routes: [`BenchEpoch`] (`Epoch` hint — the
+//! durable hot path) and [`BenchCache`] (`Cache` hint — the batch cache).
 //!
 //! ## Caveats (printed with the results too)
 //!
@@ -38,7 +38,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use tn_types::{Database, DbTx as _, DbTxMut as _, Table, TableHint};
+use tn_types::{ByteVec, Database, DbTx as _, DbTxMut as _, Table, TableHint};
 
 use tokio::runtime::Runtime;
 
@@ -47,7 +47,7 @@ use tokio::runtime::Runtime;
 struct BenchEpoch;
 impl Table for BenchEpoch {
     type Key = u64;
-    type Value = Vec<u8>;
+    type Value = ByteVec;
     const NAME: &'static str = "BenchEpoch";
     const HINT: TableHint = TableHint::Epoch;
 }
@@ -57,7 +57,7 @@ impl Table for BenchEpoch {
 struct BenchCache;
 impl Table for BenchCache {
     type Key = u64;
-    type Value = Vec<u8>;
+    type Value = ByteVec;
     const NAME: &'static str = "BenchCache";
     const HINT: TableHint = TableHint::Cache;
 }
@@ -83,9 +83,9 @@ const MIXED_N: u64 = 1_000;
 
 /// A deterministic, non-trivial value of `size` bytes (so we aren't measuring an all-zero fast
 /// path).
-fn make_value(size: usize, seed: u64) -> Vec<u8> {
+fn make_value(size: usize, seed: u64) -> ByteVec {
     let s = seed.to_le_bytes();
-    (0..size).map(|i| s[i % 8].wrapping_add(i as u8)).collect()
+    ByteVec((0..size).map(|i| s[i % 8].wrapping_add(i as u8)).collect())
 }
 
 /// Drive the production async `persist::<T>()` durability barrier to completion. Raw backends'

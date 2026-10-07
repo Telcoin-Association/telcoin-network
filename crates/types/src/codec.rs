@@ -214,6 +214,39 @@ mod tests {
         assert_eq!(&buf[2..], &encode_key(key)[..]);
     }
 
+    /// A byte string (`byte_vec` on a field, `ByteVec`, `ByteSlice`) encodes exactly like a plain
+    /// `Vec<u8>` in bcs, and each decodes the other's bytes, across the ULEB128 length-prefix
+    /// boundaries: switching a stored byte vector to a byte string changes no stored bytes, CRC or
+    /// digest.
+    #[test]
+    fn byte_strings_encode_like_vec_u8() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Plain {
+            tag: u8,
+            bytes: Vec<u8>,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct WithHelper {
+            tag: u8,
+            #[serde(with = "byte_vec")]
+            bytes: Vec<u8>,
+        }
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384, 100_000] {
+            let v: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let plain = encode(&v);
+            assert_eq!(encode(&ByteVec(v.clone())), plain, "ByteVec, len {len}");
+            assert_eq!(encode(&ByteSlice(&v)), plain, "ByteSlice, len {len}");
+            assert_eq!(decode::<ByteVec>(&plain), ByteVec(v.clone()), "len {len}");
+            assert_eq!(decode::<Vec<u8>>(&encode(&ByteVec(v.clone()))), v, "len {len}");
+
+            let old = Plain { tag: 9, bytes: v.clone() };
+            let new = WithHelper { tag: 9, bytes: v.clone() };
+            assert_eq!(encode(&new), encode(&old), "field helper, len {len}");
+            assert_eq!(decode::<WithHelper>(&encode(&old)), new, "len {len}");
+            assert_eq!(decode::<Plain>(&encode(&new)), old, "len {len}");
+        }
+    }
+
     #[test]
     fn key_into_buffer_matches_encode_key() {
         assert_key_into_matches(&42_u64);
