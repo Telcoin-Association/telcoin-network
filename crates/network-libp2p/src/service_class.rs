@@ -18,11 +18,16 @@ pub enum ServiceClass {
     EpochRecord,
     /// Certificate catch-up for a peer that is behind.
     CertificateSync,
-    /// A batch report between workers.
+    /// A worker's `ReportBatch` request, the 2f+1 quorum-ack request for a new batch.
+    ///
+    /// The reporting worker waits for a quorum of these acks, so this class is critical on
+    /// worker swarms.
     Batch,
     /// Gossip that the swarm forwards to the application.
     Gossip,
-    /// All other inbound work.
+    /// All other inbound work, including stream catch-up and batch fetch.
+    ///
+    /// This class is not low priority: a node that falls behind needs this work to catch up.
     Other,
 }
 
@@ -55,16 +60,24 @@ impl ServiceClass {
 pub(crate) enum ShedReason {
     /// The bounded application event queue was full.
     QueueFull,
+    /// The application queue had no subscriber, so the message was dropped instead of queued.
+    Unsubscribed,
+    /// The primary dropped an epoch-record request at its admission cap before serving it. The
+    /// dropped response channel then also counts the request as an `omitted` failure in
+    /// `inbound_requests_failed_total`.
+    Admission,
 }
 
 impl ShedReason {
     /// Every reason, in label order.
-    pub(crate) const ALL: [Self; 1] = [Self::QueueFull];
+    pub(crate) const ALL: [Self; 3] = [Self::QueueFull, Self::Unsubscribed, Self::Admission];
 
     /// The metric label value for this reason.
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::QueueFull => "queue_full",
+            Self::Unsubscribed => "unsubscribed",
+            Self::Admission => "admission",
         }
     }
 }

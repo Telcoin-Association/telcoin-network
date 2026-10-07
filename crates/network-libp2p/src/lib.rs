@@ -32,6 +32,7 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
+pub use metrics::AdmissionShed;
 pub use peers::{PeerExchangeMap, Penalty};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;

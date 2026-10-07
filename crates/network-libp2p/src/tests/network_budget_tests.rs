@@ -76,9 +76,20 @@ fn process_budget_caps_each_swarm_and_releases_closed_connections() -> Result<()
         failed_addresses: &[],
         other_established: 0,
     }));
-    assert!(primary
+    // the total ceiling refuses the third connection, and the refusal text names that bound
+    let total_refusal = primary
         .handle_established_inbound_connection(third, PeerId::random(), &addr, &addr)
-        .is_err());
+        .err()
+        .and_then(|denied| {
+            denied
+                .downcast_ref::<libp2p::connection_limits::Exceeded>()
+                .map(crate::metrics::ConnectionLimitReason::from_exceeded)
+        });
+    assert_eq!(total_refusal, Some(crate::metrics::ConnectionLimitReason::EstablishedTotal));
+    assert_eq!(
+        total_refusal.map(crate::metrics::InboundDenial::from_reason),
+        Some(crate::metrics::InboundDenial::EstablishedTotalLimit)
+    );
     assert!(primary
         .handle_established_outbound_connection(
             third,

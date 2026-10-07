@@ -6,13 +6,14 @@ import json
 import math
 from pathlib import Path
 
-from capture import CRITICAL_CLASSES, SERVICE, SHED
+from capture import CRITICAL_CLASSES, FAILED, REJECTIONS, SERVICE, SHED, expected_down
 
 PHASES = ("steady", "catch-up", "reconnect", "hostile", "mixed")
 ACCEPTANCE = "pending maintainer decision"
 ESTABLISHED = "tn_network_established_connections"
 LIMIT = "tn_network_established_connection_limit"
-REJECTIONS = "tn_network_connection_limit_rejections_total"
+# Hostile pressure on established connections shows up under these rejection reasons only.
+ESTABLISHED_REASONS = ("established_total", "established_per_peer", "established_incoming")
 RSS = "reth_process_resident_memory_bytes"
 CPU = "reth_process_cpu_seconds_total"
 
@@ -22,19 +23,67 @@ def load_run(root, build, phase):
     directory = Path(root) / build / phase
     if not (directory / "observations.jsonl").is_file():
         return None
-    extra = directory / "phase.json"
+    extra, result = directory / "phase.json", directory / "result.json"
+    manifest = json.loads((directory / "manifest.json").read_text())["manifest"]
     return {
         "records": [json.loads(line) for line in (directory / "observations.jsonl").read_text().splitlines() if line],
-        "topology": json.loads((directory / "manifest.json").read_text())["manifest"]["topology"],
+        "topology": manifest["topology"],
+        "nodes": [node["name"] for node in manifest["nodes"]],
         "phase": json.loads(extra.read_text()) if extra.is_file() else {},
+        "result": json.loads(result.read_text()) if result.is_file() else None,
     }
 
 
+def gap(run, label):
+    """Name the first evidence gap in one captured phase, or None. Gaps inside expected-down windows do not count.
+
+    Every (node, network) pair from the manifest needs a sample. A scrape error, a missing metric or swarm,
+    a failed scrape, or a nonzero capture_exit without reported failures makes the phase pending.
+    """
+    windows = run["phase"].get("expected_down", [])
+    counted = [record for record in run["records"] if not expected_down(record, windows)]
+    broken = [record for record in counted if record.get("error") or record.get("missing_metrics") or record.get("missing_networks")]
+    networks = {"primary", *(f"worker-{worker}" for worker in range(run["topology"]["workers_per_node"]))}
+    seen = {(record["node"], item["labels"].get("network")) for record in counted for item in record.get("observations", [])}
+    absent = sorted({(node, network) for node in run["nodes"] for network in networks} - seen)
+    result = run["result"]
+    failures = [] if result is None else result.get("failures", [])
+    unexpected = [failure for failure in failures if not expected_down(failure, windows)]
+    checks = (
+        (broken, lambda: f"incomplete scrape of {broken[0]['node']} at sample {broken[0]['sample']} in {label}"),
+        (absent, lambda: f"no samples for {absent[0][0]} {absent[0][1]} in {label}"),
+        (result is None, lambda: f"{label} capture did not finish"),
+        (result is not None and (unexpected or result["failed_scrapes"] > len(failures)),
+         lambda: f"failed scrapes outside expected-down windows in {label}"),
+        (run["phase"].get("capture_exit", 0) != 0 and not failures,
+         lambda: f"capture exited {run['phase']['capture_exit']} without reported scrape failures in {label}"),
+    )
+    return next((message() for failed, message in checks if failed), None)
+
+
 def captured(root, build, phases):
-    """Load every phase, and name the first phase that was not captured."""
+    """Load every phase, and name the first phase that was not captured or has an evidence gap."""
     loaded = {phase: load_run(root, build, phase) for phase in phases}
-    missing = [phase for phase, run in loaded.items() if run is None]
-    return loaded, (f"{build} {missing[0]} not captured" if missing else None)
+    missing = [f"{build} {phase} not captured" for phase, run in loaded.items() if run is None]
+    gaps = [found for found in (gap(run, f"{build} {phase}") for phase, run in loaded.items() if run is not None) if found]
+    return loaded, next(iter([*missing, *gaps]), None)
+
+
+def both_builds(root, phase):
+    """Load one phase for the baseline and the candidate, or name the first gap in either."""
+    runs = [captured(root, build, (phase,)) for build in ("baseline", "candidate")]
+    return [loaded[phase] for loaded, _ in runs], next((missing for _, missing in runs if missing), None)
+
+
+def process_runs(root, metric):
+    """Every captured candidate phase, or a pending reason: an evidence gap or a node without this metric."""
+    loaded, _ = captured(root, "candidate", PHASES)
+    runs = {phase: run for phase, run in loaded.items() if run is not None}
+    gaps = [found for found in (gap(run, f"candidate {phase}") for phase, run in runs.items()) if found]
+    nodes = {node for run in runs.values() for node in run["nodes"]}
+    absent = sorted(nodes - {node for run in runs.values() for node, *_ in samples(run, metric)})
+    empty = [] if runs else ["no candidate phase captured"]
+    return list(runs.values()), next(iter([*gaps, *(f"no candidate {metric} samples for {node}" for node in absent), *empty]), None)
 
 
 def samples(run, metric, **labels):
@@ -67,20 +116,19 @@ def verdict(passed):
 
 
 def bucket_p99(run, service_class):
-    """Estimate p99 as the upper bucket bound from bucket increases over the run."""
+    """Estimate p99 per (node, network) pair as the upper bucket bound from bucket increases. Keep the worst pair."""
     counts = {}
-    for (_, labels), value in (increases(run, f"{SERVICE}_bucket", **{"class": service_class}) or {}).items():
-        bound = float(dict(labels)["le"])
-        counts[bound] = counts.get(bound, 0) + value
-    total = counts.get(math.inf, 0)
-    if total <= 0:
-        return None
-    rank = math.ceil(0.99 * total)
-    return min(bound for bound, count in counts.items() if count >= rank)
+    for (node, labels), value in (increases(run, f"{SERVICE}_bucket", **{"class": service_class}) or {}).items():
+        found = dict(labels)
+        pair = counts.setdefault((node, found["network"]), {})
+        pair[float(found["le"])] = pair.get(float(found["le"]), 0) + value
+    estimates = [min(bound for bound, count in pair.items() if count >= math.ceil(0.99 * pair[math.inf]))
+                 for pair in counts.values() if pair.get(math.inf, 0) > 0]
+    return max(estimates, default=None)
 
 
 def service_p99(threshold, root):
-    """Worst class p99 over the phases, from summary quantiles or from buckets."""
+    """Worst (node, network) pair p99 for the class over the phases, from summary quantiles or from buckets."""
     runs, missing = captured(root, "candidate", threshold["phases"])
     if missing:
         return "pending", missing
@@ -100,16 +148,26 @@ def service_p99(threshold, root):
 
 
 def critical_sheds(threshold, root):
-    """Total vote and epoch record sheds. An absent counter is pending, not zero."""
+    """Vote, epoch record and batch sheds summed over every shed reason: queue_full, unsubscribed and admission."""
+    return critical_total(threshold, root, SHED, "shed")
+
+
+def critical_failures(threshold, root):
+    """Vote, epoch record and batch requests that failed after admission, summed over every outcome."""
+    return critical_total(threshold, root, FAILED, "failure")
+
+
+def critical_total(threshold, root, metric, noun):
+    """Sum counter increases over the critical classes and phases. An absent counter is pending, not zero."""
     runs, missing = captured(root, "candidate", threshold["phases"])
     if missing:
         return "pending", missing
     total = 0
     for phase, run in runs.items():
         for service_class in sorted(CRITICAL_CLASSES):
-            found = increases(run, SHED, **{"class": service_class})
+            found = increases(run, metric, **{"class": service_class})
             if found is None:
-                return "pending", f"no {service_class} shed counter in candidate {phase}"
+                return "pending", f"no {service_class} {noun} counter in candidate {phase}"
             total += sum(found.values())
     return verdict(total <= threshold["limit"]), total
 
@@ -137,7 +195,9 @@ def hostile_recovery(threshold, root):
     runs, missing = captured(root, "candidate", ("steady", "hostile"))
     if missing:
         return "pending", missing
-    rejections = increases(runs["hostile"], REJECTIONS)
+    # pending_* rejections are handshake state; only established-stage reasons show pressure on the allocation.
+    found = [increases(runs["hostile"], REJECTIONS, reason=reason) for reason in ESTABLISHED_REASONS]
+    rejections = None if None in found else {key: value for part in found for key, value in part.items()}
     ceiling, final = {}, {}
     for node, found, _, value in samples(runs["steady"], ESTABLISHED):
         ceiling[(node, found["network"])] = max(ceiling.get((node, found["network"]), 0), value)
@@ -170,7 +230,10 @@ def persistence_ratio(threshold, root):
     """Lowest candidate/baseline block rate ratio over the phases."""
     ratios = []
     for phase in threshold["phases"]:
-        rates = [block_rate(run) if run else None for run in (load_run(root, "baseline", phase), load_run(root, "candidate", phase))]
+        runs, problem = both_builds(root, phase)
+        if problem:
+            return "pending", problem
+        rates = [block_rate(run) for run in runs]
         if None in rates or rates[0] <= 0:
             return "pending", f"block rate for {phase} not captured for both builds"
         ratios.append(rates[1] / rates[0])
@@ -195,8 +258,10 @@ def catch_up_seconds(run):
 
 def catch_up_ratio(threshold, root):
     """Candidate/baseline catch-up time ratio from the same starting state."""
-    times = [catch_up_seconds(run) if run else None
-             for run in (load_run(root, "baseline", "catch-up"), load_run(root, "candidate", "catch-up"))]
+    runs, problem = both_builds(root, "catch-up")
+    if problem:
+        return "pending", problem
+    times = [catch_up_seconds(run) for run in runs]
     if None in times or times[0] <= 0:
         return "pending", "catch-up completion not captured for both builds"
     return verdict(times[1] / times[0] <= threshold["limit"]), times[1] / times[0]
@@ -204,7 +269,9 @@ def catch_up_ratio(threshold, root):
 
 def rss_fraction(threshold, root):
     """Peak RSS as a fraction of host RAM over every captured candidate phase."""
-    runs = [run for run in (load_run(root, "candidate", phase) for phase in PHASES) if run]
+    runs, problem = process_runs(root, RSS)
+    if problem:
+        return "pending", problem
     peaks = [value / run["topology"]["ram_bytes_per_node"] for run in runs for *_, value in samples(run, RSS)]
     if not peaks:
         return "pending", "no candidate RSS samples"
@@ -213,10 +280,13 @@ def rss_fraction(threshold, root):
 
 def cpu_fraction(threshold, root):
     """Process CPU p95 as a fraction of host CPUs. The network share needs a profiler trace."""
+    runs, problem = process_runs(root, CPU)
+    if problem:
+        return "pending", problem
     shares = []
-    for run in (load_run(root, "candidate", phase) for phase in PHASES):
+    for run in runs:
         series = {}
-        for node, _, time, value in (samples(run, CPU) if run else ()):
+        for node, _, time, value in samples(run, CPU):
             series.setdefault(node, []).append((time, value))
         shares += [(later[1] - earlier[1]) / (later[0] - earlier[0]) / run["topology"]["cpus_per_node"]
                    for points in series.values() for earlier, later in zip(points, points[1:])
@@ -230,6 +300,7 @@ def cpu_fraction(threshold, root):
 CHECKS = {
     "service_p99": service_p99,
     "critical_sheds": critical_sheds,
+    "critical_failures": critical_failures,
     "within_allocation": within_allocation,
     "hostile_recovery": hostile_recovery,
     "persistence_ratio": persistence_ratio,

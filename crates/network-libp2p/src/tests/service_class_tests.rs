@@ -13,7 +13,7 @@ fn label_sets_are_bounded() {
     let classes: Vec<_> = ServiceClass::ALL.iter().map(|class| class.label()).collect();
     assert_eq!(classes, ["vote", "epoch_record", "certificate_sync", "batch", "gossip", "other"]);
     let reasons: Vec<_> = ShedReason::ALL.iter().map(|reason| reason.label()).collect();
-    assert_eq!(reasons, ["queue_full"]);
+    assert_eq!(reasons, ["queue_full", "unsubscribed", "admission"]);
 }
 
 /// Add and release change only the named class, by exactly one.

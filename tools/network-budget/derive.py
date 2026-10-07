@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 
 from capture import file_record
-from evaluate import ACCEPTANCE, ESTABLISHED, load_run, samples
+from evaluate import ACCEPTANCE, ESTABLISHED, gap, load_run, samples
 
 HONEST_PHASES = ("steady", "catch-up", "reconnect")
 TRANSPORT_FIELDS = ("peak_connections_per_peer", "peak_inbound_streams_per_connection", "peak_receive_credit_bytes_per_connection")
@@ -40,6 +40,10 @@ def derive(root, transport_path, headroom):
     missing = [phase for phase, run in runs.items() if run is None]
     if missing:
         raise ValueError(f"baseline phases not captured: {', '.join(missing)}")
+    # The evidence gaps that keep evaluate.py pending refuse the derivation, so both agree on a missing swarm.
+    gaps = [found for found in (gap(run, f"baseline {phase}") for phase, run in runs.items()) if found]
+    if gaps:
+        raise ValueError(gaps[0])
     topology = runs["steady"]["topology"]
     swarms = 1 + topology["workers_per_node"]
     peaks = {}

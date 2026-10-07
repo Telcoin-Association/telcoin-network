@@ -8,7 +8,8 @@ import tempfile
 import unittest
 
 import derive
-from test_evaluate import item, record, write_run
+import evaluate
+from test_evaluate import everywhere, item, record, write_run
 
 TRANSPORT = {"peak_connections_per_peer": 2, "peak_inbound_streams_per_connection": 10,
              "peak_receive_credit_bytes_per_connection": 1000, "source": "fixture trace"}
@@ -26,8 +27,8 @@ class DeriveTests(unittest.TestCase):
 
     def honest(self, phases=derive.HONEST_PHASES):
         for phase in phases:
-            write_run(self.root, "baseline", phase, [record(0, "node-0", 0, [
-                item(derive.ESTABLISHED, 3), {"metric": derive.ESTABLISHED, "labels": {"network": "worker-0"}, "value": 5}])])
+            write_run(self.root, "baseline", phase, everywhere(0, 0, [
+                item(derive.ESTABLISHED, 3), {"metric": derive.ESTABLISHED, "labels": {"network": "worker-0"}, "value": 5}]))
 
     def test_allocation_matches_the_node_rule(self):
         self.assertEqual(derive.allocate({"swarm_count": 3, "max_established_connections": 10,
@@ -57,9 +58,16 @@ class DeriveTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reconnect"):
             derive.derive(self.root, self.transport, 1.5)
         for phase in derive.HONEST_PHASES:
-            write_run(self.root, "baseline", phase, [record(0, "node-0", 0, [item(derive.ESTABLISHED, 3)])])
+            write_run(self.root, "baseline", phase, everywhere(0, 0, [item(derive.ESTABLISHED, 3)]))
         with self.assertRaisesRegex(ValueError, "worker-0"):
             derive.derive(self.root, self.transport, 1.5)
+        # derive.py and evaluate.py name the same gap when a node has no samples.
+        partial = self.root / "partial"
+        for phase in derive.HONEST_PHASES:
+            write_run(partial, "baseline", phase, [record(0, "node-0", 0, [item(derive.ESTABLISHED, 3)])])
+        with self.assertRaisesRegex(ValueError, "no samples for node-1"):
+            derive.derive(partial, self.transport, 1.5)
+        self.assertIn("no samples for node-1", evaluate.gap(evaluate.load_run(partial, "baseline", derive.HONEST_PHASES[0]), "baseline"))
         for headroom in (0.5, float("inf")):
             with self.subTest(headroom=headroom), self.assertRaises(ValueError):
                 derive.derive(self.root, self.transport, headroom)

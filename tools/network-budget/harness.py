@@ -2,12 +2,16 @@
 """Run baseline and candidate calibration phases over ssh from a JSON inventory."""
 
 import argparse
+import itertools
 import json
 from pathlib import Path
 import shlex
 import subprocess
 import sys
 import time
+from urllib.request import urlopen
+
+from capture import expected_down
 
 BUILDS = ("baseline", "candidate")
 PHASES = ("steady", "catch-up", "reconnect", "hostile", "mixed")
@@ -21,6 +25,15 @@ CAPTURE = Path(__file__).resolve().with_name("capture.py")
 def spawn(argv):
     """Start one local command. Remote work goes through ssh and scp."""
     return subprocess.Popen(argv, stdout=subprocess.PIPE, text=True)
+
+
+def metrics_ready(url):
+    """True when the metrics endpoint answers HTTP 200 within two seconds."""
+    try:
+        with urlopen(url, timeout=2) as response:
+            return response.status == 200
+    except OSError:
+        return False
 
 
 class Planned:
@@ -38,9 +51,10 @@ def printing(argv):
 
 
 class Harness:
-    """Build every command from the inventory. The runner, sleep and writer are injectable for tests."""
+    """Build every command from the inventory. The runner, sleep, writer, reader, clock and probe are injectable for tests."""
 
-    def __init__(self, inventory, path, runner=spawn, sleep=time.sleep, write=lambda target, text: Path(target).write_text(text)):
+    def __init__(self, inventory, path, runner=spawn, sleep=time.sleep, write=lambda target, text: Path(target).write_text(text),
+                 read=lambda target: Path(target).read_text(), clock=time.time, probe=metrics_ready):
         names = [host["name"] for host in inventory["hosts"]]
         generator = inventory.get("generator")
         if (not names or len(set(names)) != len(names) or inventory["catch_up_node"] not in names
@@ -48,7 +62,10 @@ class Harness:
                                                or not set(inventory["hostile_targets"]) <= set(names)))):
             raise ValueError("inventory needs unique hosts and a known catch_up_node; "
                              "a generator needs {target} and known hostile_targets")
+        if any(type(inventory.get(field, 60)) is not int or inventory.get(field, 60) <= 0 for field in ("ready_timeout_secs", "stop_timeout_secs")):
+            raise ValueError("ready_timeout_secs and stop_timeout_secs must be positive integers")
         self.inventory, self.path, self.runner, self.sleep, self.write = inventory, Path(path).resolve(), runner, sleep, write
+        self.read, self.clock, self.probe = read, clock, probe
         self.base = self.path.parent
         self.hosts = {host["name"]: host for host in inventory["hosts"]}
 
@@ -99,14 +116,40 @@ class Harness:
         return text.rstrip("\n") + "\nprocess_budget:\n" + "".join(f"  {field}: {budget[field]}\n" for field in BUDGET_FIELDS)
 
     def begin(self, host, binary):
+        """Start the node in the background. Refuse when the pid file names a live process. Append to node.log
+        after a start marker, so the log of an earlier start in the same phase stays readable."""
         node = shlex.join([binary, "node", "--datadir", host["datadir"], *host.get("node_args", self.inventory["node_args"])])
         log, pid = shlex.quote(f"{host['datadir']}/node.log"), shlex.quote(f"{host['datadir']}/node.pid")
-        self.ssh(host, f"nohup {node} > {log} 2>&1 < /dev/null & echo $! > {pid}")
+        self.ssh(host, f'if [ -f {pid} ] && kill -0 "$(cat {pid})" 2>/dev/null; then echo "node already running" >&2; exit 1; fi; '
+                       f'echo "=== harness start $(date -u +%Y-%m-%dT%H:%M:%SZ) ===" >> {log}; '
+                       f"nohup {node} >> {log} 2>&1 < /dev/null & echo $! > {pid}")
 
     def stop(self, host):
+        """Stop the node: SIGTERM, wait up to stop_timeout_secs, then SIGKILL. Keep the pid file until the process
+        is gone. A process that survives SIGKILL fails the harness."""
         pid = shlex.quote(f"{host['datadir']}/node.pid")
-        self.ssh(host, f'if [ -f {pid} ]; then p="$(cat {pid})"; kill "$p"; '
-                       f'for _ in $(seq 60); do kill -0 "$p" 2>/dev/null || break; sleep 1; done; rm -f {pid}; fi')
+        wait = self.inventory.get("stop_timeout_secs", 60)
+        self.ssh(host, f'if [ -f {pid} ]; then p="$(cat {pid})"; kill "$p" 2>/dev/null; '
+                       f'for _ in $(seq {wait}); do kill -0 "$p" 2>/dev/null || break; sleep 1; done; '
+                       f'if kill -0 "$p" 2>/dev/null; then kill -9 "$p"; sleep 1; fi; '
+                       f'if kill -0 "$p" 2>/dev/null; then echo "node $p survived SIGKILL" >&2; exit 1; fi; rm -f {pid}; fi')
+
+    def await_metrics(self, host):
+        """Poll the metrics_url until it answers. Past ready_timeout_secs the harness stops."""
+        timeout = self.inventory.get("ready_timeout_secs", 60)
+        deadline = self.clock() + timeout
+        polls = itertools.takewhile(lambda _: self.clock() < deadline, itertools.count())
+        if not any(self.probe(host["metrics_url"]) or self.sleep(1) for _ in polls):
+            raise RuntimeError(f"{host['name']} metrics not ready in {timeout} s: {host['metrics_url']}")
+
+    def restart(self, host, binary):
+        """Restart one node during the capture. Return the window in which its scrapes are expected to fail."""
+        self.sleep(self.inventory["reconnect_gap_secs"])
+        start = self.clock()
+        self.stop(host)
+        self.begin(host, binary)
+        self.await_metrics(host)
+        return {"node": host["name"], "start_unix_seconds": start, "end_unix_seconds": self.clock()}
 
     def generator(self, host):
         return shlex.split(self.inventory["generator"].format(target=host["multiaddr"]))
@@ -150,15 +193,15 @@ class Harness:
             self.sleep(self.inventory["catch_up_pause_secs"])
             self.begin(lagging, binary)
             extra["catch_up_node"] = lagging["name"]
+        # Every endpoint answers before the capture starts, so no scrape failure is startup noise.
+        for host in hosts:
+            self.await_metrics(host)
         manifest = target.parent / f"{phase}.capture.json"
         self.write(manifest, json.dumps(self.capture_manifest(build, phase), indent=2) + "\n")
         capture = self.runner([sys.executable, str(CAPTURE), str(manifest), str(target), "--phase", phase,
                                "--samples", str(self.inventory["samples"]), "--interval", str(self.inventory["interval"])])
         if phase == "reconnect":
-            for host in hosts:
-                self.sleep(self.inventory["reconnect_gap_secs"])
-                self.stop(host)
-                self.begin(host, binary)
+            extra["expected_down"] = [self.restart(host, binary) for host in hosts]
         if phase in GENERATOR_PHASES:
             extra["generator"] = [json.loads(self.call(self.generator(self.hosts[name]))) for name in self.inventory["hostile_targets"]]
         capture.communicate()
@@ -166,7 +209,13 @@ class Harness:
         for host in hosts:
             self.stop(host)
         self.write(target / "phase.json", json.dumps(extra, indent=2, sort_keys=True) + "\n")
-        return capture.returncode
+        # capture.py exits nonzero on any failed scrape. Failures inside an expected-down window are planned.
+        return int(capture.returncode != 0 and len(self.unexpected_failures(target, extra.get("expected_down", []))) > 0)
+
+    def unexpected_failures(self, target, windows):
+        """The scrape failures in result.json that fall outside every expected-down window."""
+        failures = json.loads(self.read(target / "result.json")).get("failures", [])
+        return [failure for failure in failures if not expected_down(failure, windows)]
 
 
 def main(argv=None):
@@ -186,7 +235,8 @@ def main(argv=None):
         inventory = json.loads(args.inventory.read_text())
         if args.command == "plan":
             harness = Harness(inventory, args.inventory, runner=printing,
-                              sleep=lambda seconds: print(f"sleep {seconds}"), write=lambda target, _: print(f"write {target}"))
+                              sleep=lambda seconds: print(f"sleep {seconds}"), write=lambda target, _: print(f"write {target}"),
+                              probe=lambda url: print(f"probe {url}") is None)
             harness.setup()
             return max(harness.run(build, phase, args.output) for build in BUILDS for phase in harness.phases())
         harness = Harness(inventory, args.inventory)

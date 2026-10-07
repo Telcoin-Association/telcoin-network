@@ -6,7 +6,10 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::{node_record_key, KadStore},
-    metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
+    metrics::{
+        ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
+        SwarmMetrics,
+    },
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     send_or_log_error,
@@ -47,7 +50,7 @@ use tn_config::{
 };
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender, WorkerId,
+    TnSender, TrySendOutcome, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -978,13 +981,6 @@ where
         &mut self,
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
-        if matches!(&event,
-            SwarmEvent::IncomingConnectionError { error: libp2p::swarm::ListenError::Denied { cause }, .. }
-            | SwarmEvent::OutgoingConnectionError { error: libp2p::swarm::DialError::Denied { cause }, .. }
-            if cause.downcast_ref::<connection_limits::Exceeded>().is_some()
-        ) {
-            self.metrics.record_connection_limit_rejection();
-        }
         match event {
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
@@ -1035,32 +1031,46 @@ where
                 }
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling or the per-peer established ceiling); count it, and log only the configured
-            // limit and the fixed limit description, never peer-supplied data
+            // ceiling, the per-peer established ceiling or the total established ceiling); count
+            // it by the bound that the refusal names, and log only the configured limit and the
+            // fixed limit description, never peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
-                peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
-                    // the pending hook runs before the remote is authenticated, so only a
-                    // refusal at establishment (the per-peer ceiling) carries a peer id
-                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                        InboundDenial::EstablishedPerPeerLimit
-                    });
-                    self.metrics.record_inbound_denied(&denial);
-                    self.inbound_denial_warning
-                        .record(tokio::time::Instant::now())
-                        .into_iter()
-                        .for_each(|denied| {
-                            warn!(
-                                target: "network",
-                                denied,
-                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                "inbound connections keep being refused by connection limits"
-                            );
-                        });
-                });
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        // classify by the refusal text, not by the peer id: both established
+                        // ceilings refuse after authentication, so a peer id cannot tell them apart
+                        let reason = ConnectionLimitReason::from_exceeded(exceeded);
+                        self.metrics.record_connection_limit_rejection(reason);
+                        let denial = InboundDenial::from_reason(reason);
+                        self.metrics.record_inbound_denied(&denial);
+                        self.inbound_denial_warning
+                            .record(tokio::time::Instant::now())
+                            .into_iter()
+                            .for_each(|denied| {
+                                warn!(
+                                    target: "network",
+                                    denied,
+                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                    "inbound connections keep being refused by connection limits"
+                                );
+                            });
+                    },
+                );
+            }
+            SwarmEvent::OutgoingConnectionError {
+                error: libp2p::swarm::DialError::Denied { cause },
+                ..
+            } => {
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        self.metrics.record_connection_limit_rejection(
+                            ConnectionLimitReason::from_exceeded(exceeded),
+                        );
+                    },
+                );
             }
             // other events handled by peer manager and other behaviors
             _ => {}
@@ -1420,13 +1430,15 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
-                        // forward gossip to handler
-                        if let Err(e) = self
+                        // forward gossip to handler; a full queue or a queue with no
+                        // subscriber counts as shed
+                        let forwarded = self
                             .event_stream
-                            .try_send(accepted_gossip_event(message, relayer, author))
-                        {
+                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
+                        if forwarded.inspect_err(|e| {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
-                            self.metrics.record_forward_failure(ServiceClass::Gossip, &e);
+                        }).is_err() {
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1536,16 +1548,19 @@ where
                             let class = request.service_class();
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
-                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer: bls,
-                                request,
-                                channel: ResponseChannel::new(peer, channel),
-                                cancel,
-                            }) {
+                            let forwarded =
+                                self.event_stream.try_send_outcome(NetworkEvent::Request {
+                                    peer: bls,
+                                    request,
+                                    channel: ResponseChannel::new(peer, channel),
+                                    cancel,
+                                });
+                            self.metrics.record_forward(class, &forwarded);
+                            // Only queued requests become pending. An unsubscribed queue
+                            // drops the response channel, and epoch-boundary errors are ignored.
+                            if !forwarded.inspect_err(|e| {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                                self.metrics.record_forward_failure(class, &e);
-                                // ignore failures at the epoch boundary
-                                // During epoch change the event_stream reciever can be closed.
+                            }).is_ok_and(|outcome| outcome == TrySendOutcome::Queued) {
                                 return Ok(());
                             }
 
@@ -1602,14 +1617,7 @@ where
                     return Ok(());
                 }
 
-                let failure_kind = match &error {
-                    ReqResOutboundFailure::DialFailure => "dial",
-                    ReqResOutboundFailure::ConnectionClosed => "connection",
-                    ReqResOutboundFailure::Io(_) => "io",
-                    ReqResOutboundFailure::Timeout => "timeout",
-                    ReqResOutboundFailure::UnsupportedProtocols => "unsupported",
-                };
-                self.metrics.record_outbound_failure(failure_kind);
+                self.metrics.record_outbound_failure(&error);
 
                 // Differentiate transport-level failures (peer disconnect, dial fail) from
                 // protocol-level violations. Transport failures are common on WAN and should
@@ -1665,6 +1673,13 @@ where
                 });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                // Dropped, unforwarded requests have no tracked class or occupancy. Ignore
+                // their failures, including ResponseOmission after an unsubscribed queue.
+                if !self.inbound_requests.contains_key(&request_id) {
+                    return Ok(());
+                }
+                // classify before the match below takes `error` apart
+                let outcome = InboundFailureOutcome::from_failure(&error);
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match &error {
@@ -1704,10 +1719,12 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler and release the class occupancy
-                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                // count the failure under the class of the forwarded request, then forward
+                // cancelation to handler and release the class occupancy
+                self.inbound_requests.remove(&request_id).into_iter().for_each(|entry| {
+                    self.metrics.record_inbound_failure(entry.class, outcome);
                     self.close_inbound(entry);
-                }
+                });
             }
 
             ReqResEvent::ResponseSent { request_id, .. } => {
@@ -2085,17 +2102,18 @@ where
                 );
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
-                if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
-                    {
-                        error!(target: "network", ?e, "failed to forward inbound stream");
-                        self.metrics.record_forward_failure(ServiceClass::Other, &e);
-                    }
-                } else {
-                    warn!(target: "network", ?peer, "received inbound stream from unknown peer");
-                }
+                self.swarm.behaviour().peer_manager.peer_to_bls(&peer).map_or_else(
+                    || warn!(target: "network", ?peer, "received inbound stream from unknown peer"),
+                    |bls| {
+                        let forwarded = self
+                            .event_stream
+                            .try_send_outcome(NetworkEvent::InboundStream { peer: bls, stream });
+                        self.metrics.record_forward(ServiceClass::Other, &forwarded);
+                        forwarded.err().into_iter().for_each(|e| {
+                            error!(target: "network", ?e, "failed to forward inbound stream");
+                        });
+                    },
+                );
             }
             StreamEvent::OutboundFailure { peer, failure }
             | StreamEvent::InboundFailure { peer, failure } => {

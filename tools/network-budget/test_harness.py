@@ -2,6 +2,7 @@
 
 import contextlib
 import io
+import itertools
 import json
 from pathlib import Path
 import tempfile
@@ -44,15 +45,18 @@ class HarnessTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         (self.root / "network-config.yaml").write_text("peer_limits: {}\n")
         self.calls, self.sleeps, self.writes = [], [], {}
+        self.result = {"failed_scrapes": 0, "failures": []}
         self.harness = self.make(inventory_fixture())
 
     def tearDown(self):
         self.directory.cleanup()
 
-    def make(self, inventory, code=0):
-        runner = lambda argv: (self.calls.append(argv), Finished('{"opened": 64}', code))[1]
+    def make(self, inventory, code=0, capture_code=0, clock=None, probe=lambda url: True):
+        runner = lambda argv: (self.calls.append(argv),
+                               Finished('{"opened": 64}', capture_code if str(harness.CAPTURE) in argv else code))[1]
         return harness.Harness(inventory, self.root / "inventory.json", runner=runner,
-                               sleep=self.sleeps.append, write=lambda target, text: self.writes.__setitem__(Path(target).name, text))
+                               sleep=self.sleeps.append, write=lambda target, text: self.writes.__setitem__(Path(target).name, text),
+                               read=lambda target: json.dumps(self.result), clock=clock or itertools.count().__next__, probe=probe)
 
     def test_only_the_candidate_sets_process_budget(self):
         self.assertEqual(self.harness.network_config("baseline"), "peer_limits: {}\n")
@@ -92,7 +96,7 @@ class HarnessTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.make(inventory_fixture(), code=255).setup()
         for key, value in (("catch_up_node", "node-9"), ("hostile_targets", ["node-9"]), ("hostile_targets", []),
-                           ("generator", "pressure")):
+                           ("generator", "pressure"), ("ready_timeout_secs", 0), ("stop_timeout_secs", "60")):
             with self.subTest(key=key, value=value), self.assertRaises(ValueError):
                 self.make({**inventory_fixture(), key: value})
 
@@ -129,6 +133,39 @@ class HarnessTests(unittest.TestCase):
         self.assertIn("steady", text)
         self.assertNotIn("hostile", text)
         self.assertNotIn("pressure", text)
+
+    def test_reconnect_waits_for_metrics_and_records_expected_down_windows(self):
+        probes = []
+        armed = self.make(inventory_fixture(), probe=lambda url: probes.append(url) is None)
+        self.assertEqual(armed.run("baseline", "reconnect", self.root / "results"), 0)
+        windows = json.loads(self.writes["phase.json"])["expected_down"]
+        self.assertEqual([window["node"] for window in windows], ["node-0", "node-1"])
+        self.assertTrue(all(window["start_unix_seconds"] < window["end_unix_seconds"] for window in windows))
+        self.assertEqual(probes, ["http://10.0.0.0:9101/metrics", "http://10.0.0.1:9101/metrics"] * 2)
+        self.assertEqual(self.sleeps, [5, 5])
+        with self.assertRaisesRegex(RuntimeError, "not ready"):
+            self.make(inventory_fixture(), probe=lambda url: False).await_metrics(inventory_fixture()["hosts"][0])
+
+    def test_run_fails_only_for_scrape_failures_outside_expected_down_windows(self):
+        self.result = {"failed_scrapes": 1, "failures": [
+            {"node": "node-1", "sample": 1, "started_unix_seconds": 7, "finished_unix_seconds": 7, "error": "refused"}]}
+        flaky = self.make(inventory_fixture(), capture_code=1, clock=lambda: 7)
+        self.assertEqual(flaky.run("baseline", "steady", self.root / "results"), 1)
+        self.assertEqual(flaky.run("baseline", "reconnect", self.root / "results"), 0)
+        self.assertEqual(json.loads(self.writes["phase.json"])["capture_exit"], 1)
+
+    def test_stop_escalates_to_sigkill_and_begin_refuses_a_live_pid(self):
+        host = inventory_fixture()["hosts"][0]
+        self.make({**inventory_fixture(), "stop_timeout_secs": 5}).stop(host)
+        self.harness.begin(host, "/opt/base/telcoin-network")
+        stop, begin = (argv[2] for argv in self.calls[-2:])
+        self.assertIn("seq 5", stop)
+        self.assertLess(stop.index("kill -9"), stop.index("survived SIGKILL"))
+        self.assertLess(stop.index("survived SIGKILL"), stop.index("rm -f"))
+        self.assertLess(begin.index("node already running"), begin.index("nohup"))
+        self.assertIn(">> /data/node-0/node.log", begin)
+        with self.assertRaises(RuntimeError):
+            self.make(inventory_fixture(), code=1).stop(host)
 
 
 if __name__ == "__main__":

@@ -25,18 +25,27 @@ PROCESS_METRICS = frozenset({"reth_process_resident_memory_bytes", "reth_process
 PENDING = "tn_network_inbound_requests_pending"
 SHED = "tn_network_inbound_requests_shed_total"
 SERVICE = "tn_network_inbound_request_service_seconds"
+FAILED = "tn_network_inbound_requests_failed_total"
+REJECTIONS = "tn_network_connection_limit_rejections_total"
+DENIALS = "tn_network_inbound_connections_denied_total"
 # The service histogram renders as a summary (quantile) or as buckets (le), with _sum and _count.
 CLASS_METRICS = {
     PENDING: frozenset({"network", "class"}),
     SHED: frozenset({"network", "class", "reason"}),
+    FAILED: frozenset({"network", "class", "outcome"}),
     SERVICE: frozenset({"network", "class", "quantile"}),
     f"{SERVICE}_bucket": frozenset({"network", "class", "le"}),
     f"{SERVICE}_sum": frozenset({"network", "class"}),
     f"{SERVICE}_count": frozenset({"network", "class"}),
 }
 SERVICE_CLASSES = frozenset({"vote", "epoch_record", "certificate_sync", "batch", "gossip", "other"})
-CRITICAL_CLASSES = frozenset({"vote", "epoch_record"})
-SHED_REASONS = frozenset({"queue_full"})
+# batch carries ReportBatch, the 2f+1 quorum-ack request, so it is critical on worker swarms.
+CRITICAL_CLASSES = frozenset({"vote", "epoch_record", "batch"})
+SHED_REASONS = frozenset({"queue_full", "unsubscribed", "admission"})
+FAILURE_OUTCOMES = frozenset({"timeout", "omitted", "closed", "io", "unsupported"})
+REJECTION_REASONS = frozenset({"pending_incoming", "pending_outgoing", "established_incoming", "established_outgoing",
+                               "established_per_peer", "established_total", "unknown"})
+DENIAL_REASONS = frozenset({"pending_incoming_limit", "established_per_peer_limit", "established_total_limit", "other_limit"})
 SAMPLE = re.compile(r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+(\S+)(?:\s+\S+)?$')
 LABEL = re.compile(r'([a-zA-Z_][a-zA-Z0-9_]*)="([^"\\]*)"(?:,|$)')
 FAILURE_KINDS = frozenset({"dial", "timeout", "connection", "unsupported", "io"})
@@ -55,17 +64,36 @@ def bounded(text, upper):
 LABEL_SETS = {
     **{name: frozenset({"network"}) for name in NETWORK_METRICS},
     "tn_network_outbound_request_failures_total": frozenset({"network", "kind"}),
+    REJECTIONS: frozenset({"network", "reason"}),
+    DENIALS: frozenset({"network", "reason"}),
     **CLASS_METRICS,
     **{name: frozenset() for name in PROCESS_METRICS},
 }
 LABEL_VALUES = {
     "kind": FAILURE_KINDS.__contains__,
     "class": SERVICE_CLASSES.__contains__,
-    "reason": SHED_REASONS.__contains__,
+    "outcome": FAILURE_OUTCOMES.__contains__,
     "quantile": lambda text: bounded(text, 1),
     "le": lambda text: bounded(text, math.inf),
 }
-REQUIRED_METRICS = NETWORK_METRICS | PROCESS_METRICS | {PENDING, SHED, SERVICE, f"{SERVICE}_sum", f"{SERVICE}_count"}
+# The reason label is a different closed set on each metric that carries it.
+REASON_VALUES = {SHED: SHED_REASONS, REJECTIONS: REJECTION_REASONS, DENIALS: DENIAL_REASONS}
+REQUIRED_METRICS = NETWORK_METRICS | PROCESS_METRICS | {PENDING, SHED, FAILED, DENIALS, SERVICE, f"{SERVICE}_sum", f"{SERVICE}_count"}
+
+
+def label_allowed(name, key, text):
+    """Check one label value against its closed set. The reason set depends on the metric."""
+    if key == "reason":
+        return text in REASON_VALUES.get(name, frozenset())
+    return key not in LABEL_VALUES or LABEL_VALUES[key](text)
+
+
+def expected_down(entry, windows):
+    """True when a scrape of entry["node"] overlaps an expected-down window recorded for that node."""
+    started = entry["started_unix_seconds"]
+    finished = entry.get("finished_unix_seconds", started)
+    return any(window["node"] == entry["node"] and started <= window["end_unix_seconds"]
+               and finished >= window["start_unix_seconds"] for window in windows)
 
 
 def missing_metrics(selected):
@@ -97,7 +125,7 @@ def observations(text, workers):
             raise ValueError(f"duplicate labels on {name}")
         if set(values) != LABEL_SETS[name] or ("network" in values and values["network"] not in networks):
             raise ValueError(f"unexpected label set or swarm on {name}")
-        rejected = sorted(key for key, text in values.items() if key in LABEL_VALUES and not LABEL_VALUES[key](text))
+        rejected = sorted(key for key, text in values.items() if not label_allowed(name, key, text))
         if rejected:
             raise ValueError(f"unexpected {rejected[0]} label value on {name}")
         value = float(raw_value)
@@ -174,7 +202,7 @@ def capture(args):
               "collector_sha256": file_record(Path(__file__))["sha256"],
               "acceptance": "pending: requires workload outcomes and maintainer threshold review"}
     (args.output / "manifest.json").write_text(json.dumps(record, indent=2) + "\n")
-    failures = 0
+    failures = []
     with (args.output / "observations.jsonl").open("w") as output:
         for sample in range(args.samples):
             started = time.monotonic()
@@ -189,16 +217,19 @@ def capture(args):
                     entry["missing_metrics"] = missing_metrics(entry["observations"])
                     entry["missing_networks"] = sorted({"primary", *(f"worker-{i}" for i in range(topology["workers_per_node"]))} - {item["labels"].get("network") for item in entry["observations"]})
                 except (OSError, ValueError) as error:
-                    failures += 1
                     entry["error"] = str(error)
                 entry["block"] = block_number(node["rpc_url"]) if "rpc_url" in node else {"missing": "no rpc_url"}
                 entry["finished_unix_seconds"] = time.time()
+                if "error" in entry:
+                    failures.append({key: entry[key] for key in ("sample", "node", "started_unix_seconds", "finished_unix_seconds", "error")})
                 output.write(json.dumps(entry, sort_keys=True) + "\n")
                 output.flush()
             if sample + 1 < args.samples:
                 time.sleep(max(0, args.interval - (time.monotonic() - started)))
-    (args.output / "result.json").write_text(json.dumps({"failed_scrapes": failures, "acceptance": "pending"}) + "\n")
-    return int(failures != 0)
+    # Each failure names its node and scrape interval, so evaluate.py can drop the ones inside expected-down windows.
+    result = {"failed_scrapes": len(failures), "failures": failures, "acceptance": "pending"}
+    (args.output / "result.json").write_text(json.dumps(result) + "\n")
+    return int(len(failures) != 0)
 
 
 def main():

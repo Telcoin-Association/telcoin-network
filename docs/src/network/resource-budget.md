@@ -55,15 +55,18 @@ puts each inbound message in one service class:
 | `vote` | Primary vote requests (critical) |
 | `epoch_record` | Primary epoch record requests (critical) |
 | `certificate_sync` | Certificate catch-up requests on the request-response protocol (bulk) |
-| `batch` | Worker batch reports (bulk) |
+| `batch` | Worker batch reports. `ReportBatch` is the 2f+1 quorum-ack request, so it is critical on worker swarms |
 | `gossip` | Gossip messages |
-| `other` | Peer exchange, stream protocol requests and all other requests |
+| `other` | Peer exchange, stream catch-up, batch fetch and all other requests |
 
 No current primary request uses `certificate_sync`. Certificate catch-up and batch fetch use the
 stream protocol, and the swarm cannot see their class before it forwards them, so they are `other`.
+Thus `other` is not a low-priority class.
 
 The classes only label the metrics below. They do not change admission, queue space or scheduling.
-When the queue is full, the swarm sheds the message, whatever its class (reason `queue_full`). A
+A message is shed, whatever its class, for one of three reasons. `queue_full`: the queue is full.
+`unsubscribed`: no application task receives from a regular queue. The primary network event queue
+does not use this reason. `admission`: the application drops the request at its admission check. A
 shed request gets no response: the swarm drops the response channel, libp2p closes the stream, and
 the requester gets a stream error at once. It does not wait for its request timeout. The swarm does
 not schedule by priority, so unanswered requests of any class can fill the queue and make the swarm
@@ -71,7 +74,8 @@ shed votes.
 
 ## Observations
 
-The connection metrics below have only the configured `network` label (`primary`, `worker-0`, etc.):
+The connection metrics below have the configured `network` label (`primary`, `worker-0`, etc.). The
+rejection and denial counters also have a `reason` label:
 
 | Metric | Meaning |
 | --- | --- |
@@ -79,7 +83,8 @@ The connection metrics below have only the configured `network` label (`primary`
 | `tn_network_established_connection_limit` | Per-swarm ceiling; zero means the legacy unbounded total |
 | `tn_network_inbound_streams_per_connection_limit` | Effective incoming stream capacity per connection |
 | `tn_network_receive_credit_per_connection_bytes` | Effective advertised credit per connection |
-| `tn_network_connection_limit_rejections_total` | Rejections by the total or per-peer connection ceiling |
+| `tn_network_connection_limit_rejections_total` | Connections refused by a connection limit. `reason`: `pending_incoming`, `pending_outgoing`, `established_incoming`, `established_outgoing`, `established_per_peer`, `established_total` or `unknown` |
+| `tn_network_inbound_connections_denied_total` | Inbound connections denied by a limit. `reason`: `pending_incoming_limit`, `established_per_peer_limit`, `established_total_limit` or `other_limit` |
 
 Connection occupancy updates after swarm event processing. Scrapes can miss short peaks, so record
 the sampling interval and use transport tracing when measuring peak streams or retained buffers.
@@ -88,18 +93,21 @@ connections, not bytes currently retained. Sum that product over every swarm on 
 Never interpret missing samples as zero. The connection gauges do not give active-stream occupancy.
 
 The service class metrics also have a `class` label with the six values above. The shed counter also
-has a `reason` label. Its only value is `queue_full`. The node registers every class and reason
-series at zero when the swarm starts, so a missing series means that the metric is not exported, not
-zero.
+has a `reason` label (`queue_full`, `unsubscribed` or `admission`). The failure counter also has an
+`outcome` label (`timeout`, `omitted`, `closed`, `io` or `unsupported`). The node registers every
+class, reason and outcome series at zero when the swarm starts, so a missing series means that the
+metric is not exported, not zero.
 
 | Metric | Meaning |
 | --- | --- |
 | `tn_network_inbound_requests_pending` | Inbound requests sent to the application that wait for a response |
-| `tn_network_inbound_request_service_seconds` | Time from sending a request to the application to sending its response |
-| `tn_network_inbound_requests_shed_total` | Inbound messages dropped before the application received them |
+| `tn_network_inbound_request_service_seconds` | Time from sending a request to the application to sending its response. Answered requests only |
+| `tn_network_inbound_requests_shed_total` | Inbound messages dropped before service, by the swarm or at application admission |
+| `tn_network_inbound_requests_failed_total` | Inbound requests sent to the application that got no response |
 
 The exporter can render the service time as a summary (quantiles with `_sum` and `_count`) or as
 buckets. These metrics give queue occupancy and service time by class, not network round-trip time.
+An `admission` shed also counts as an `omitted` failure, so do not add the shed and failure counters.
 
 ## Reproducible calibration record
 
@@ -154,11 +162,22 @@ phases need a load generator command in the inventory: `generator`, with a `{tar
 and `hostile_targets`. The generator must print one JSON object. No generator ships with this tool.
 Without one, the harness does not run these phases, and their thresholds stay pending.
 
+Before the capture starts, `run` polls each `metrics_url` until it answers, for at most
+`ready_timeout_secs` (default 60). `stop` sends SIGTERM and waits for at most `stop_timeout_secs`
+(default 60). Then it sends SIGKILL. It keeps the pid file until the process exits, and it fails if
+the process is still alive. `begin` refuses a pid file that names a live process, and it appends to
+`node.log` after a start marker. In the reconnect phase, `phase.json` records an expected-down
+window for each restarted node. `run` exits nonzero only for scrape failures outside those windows.
+
 `evaluate.py` gives pass, fail or pending for each threshold. Missing data is pending, never zero.
+A phase is pending when a manifest node has no samples for a swarm, when a record has a scrape error,
+missing metrics or missing swarms, or when a scrape failed outside an expected-down window. Each
+service p99 is the worst (node, network) pair. `critical-failures` does not include the reconnect
+phase, because planned restarts close in-flight streams. `critical-sheds` includes it.
 It exits nonzero on any fail, and acceptance always stays "pending maintainer decision".
 `derive.py` proposes a `process_budget` from the baseline honest phases: the peak times the headroom,
 divided like the node allocation. Its transport input is a JSON file with peaks from tracing. It
-refuses to run when an input is missing. `thresholds.proposed.json` holds the proposed thresholds.
+refuses to run when an input is missing or has a gap that keeps `evaluate.py` pending. `thresholds.proposed.json` holds the proposed thresholds.
 Each threshold has the status "proposed" and a rationale that cites the `Parameters` defaults.
 Maintainers accept or change them in review.
 

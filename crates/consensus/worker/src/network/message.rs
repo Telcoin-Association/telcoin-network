@@ -23,6 +23,8 @@ impl TNMessage for WorkerRequest {
         }
     }
 
+    /// `ReportBatch` is the 2f+1 quorum-ack request, so it is critical on worker swarms.
+    /// `PeerExchange` is discovery work.
     fn service_class(&self) -> ServiceClass {
         match self {
             Self::ReportBatch { .. } => ServiceClass::Batch,
@@ -41,6 +43,9 @@ impl TNMessage for WorkerResponse {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum WorkerRequest {
     /// Send a new batch to a peer.
+    ///
+    /// This is the 2f+1 quorum-ack request for the batch: the reporting worker waits for a quorum
+    /// of acks. Its service class is [`ServiceClass::Batch`], which is critical on worker swarms.
     ReportBatch {
         /// The sealed batch that this worker is reporting.
         sealed_batch: SealedBatch,
