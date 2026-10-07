@@ -565,7 +565,6 @@ impl Peer {
     }
 
     /// Snapshot the exact multiaddrs currently retained for this peer.
-    #[cfg(test)]
     pub(super) fn multiaddrs_snapshot(&self) -> HashSet<Multiaddr> {
         self.multiaddrs.clone()
     }

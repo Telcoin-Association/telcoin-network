@@ -1268,7 +1268,14 @@ impl PeerManager {
         info: NetworkInfo,
     ) {
         if self.can_confirm_expired_public_identity(&source, &bls_key) {
-            self.peers.upsert_peer(bls_key, info.pubkey, Vec::new());
+            // This confirms identity only. Preserve retained transport endpoints without
+            // learning the expired record's advertised addresses or RPC metadata.
+            let retained_addresses = self
+                .peers
+                .get_peer(&source)
+                .map(|peer| peer.multiaddrs_snapshot().into_iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);
         }
     }
 

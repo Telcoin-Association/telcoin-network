@@ -3824,7 +3824,7 @@ async fn expired_kad_relay_cannot_replace_pinned_or_own_record() -> eyre::Result
     peer1.network.process_kad_put_request(source, baseline.clone())?;
     let mut info = publisher.network.node_record.info.clone();
     info.timestamp += 100;
-    info.multiaddrs = vec![create_multiaddr(None)];
+    info.multiaddrs = vec![record_endpoint()];
     let chain_id = publisher.config.network_config().libp2p_config().chain_id;
     let bytes = encode(&(b"telcoin-network/node-record/v1".as_slice(), chain_id, 0u8, 0u16, &info));
     let signature = publisher.config.key_config().request_signature_direct(&bytes);
