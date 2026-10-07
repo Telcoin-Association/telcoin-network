@@ -169,7 +169,13 @@ if __name__ == "__main__":
     if args.check_versions:
         if args.binary is not None or args.samples is not None:
             parser.error("--binary and --samples apply only to --output")
-        print(json.dumps(validate_versions()))
+        try:
+            versions = validate_versions()
+        except ValueError as err:
+            # A workflow command on stdout shows the drift as an annotation on the PR.
+            print(f"::error::{err}")
+            raise SystemExit(1)
+        print(json.dumps(versions))
     else:
         samples = 1000 if args.samples is None else args.samples
         if not 2 <= samples <= 100_000:
