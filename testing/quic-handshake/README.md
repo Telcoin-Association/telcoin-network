@@ -34,9 +34,12 @@ rustls-webpki. The required `CI Success` check runs `run.py --check-versions` on
 every pull request and merge group, so a node lockfile change that moves one of
 these crates must move its `=` pin in `Cargo.toml` and refresh this lockfile in
 the same pull request: run `prepare.py`, then build once without `--locked`.
-Commit any intentional lockfile update with new measurements and updated source
-hashes. The profile workflow builds and checks this harness, runs every scenario,
-and retains raw samples. It has no timing threshold.
+
+A lockfile update, including a forced re-pin, may land without new measurements.
+Each profile report in `evidence/` is a dated snapshot: its `versions` field names the crates it measured and its source hashes identify the files it ran from, so later changes to this harness leave both behind by design.
+Before a decision relies on measurements of newly pinned versions, run every scenario again and commit the new report under `evidence/`.
+The profile workflow builds and checks this harness, runs every scenario, and retains raw samples.
+It has no timing threshold.
 
 ## Experiments and measurements
 
