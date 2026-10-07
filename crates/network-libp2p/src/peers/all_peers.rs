@@ -6,6 +6,7 @@
 use super::{
     banned::BannedPeers,
     peer::Peer,
+    retry::DialBackoff,
     score::ReputationUpdate,
     status::ConnectionStatus,
     types::{ConnectionDirection, PeerIdentity, TrustBasis},
@@ -69,6 +70,8 @@ pub(super) struct AllPeers {
     disconnected_peers: usize,
     /// The collection of pending dials.
     pending_dials: HashMap<PeerId, oneshot::Sender<NetworkResult<()>>>,
+    /// Bounded outage memory, independent of discovery and disconnected-peer eviction.
+    dial_backoff: DialBackoff<PeerId>,
     /// The timeout for dialing peers.
     dial_timeout: Duration,
     /// The maximum number of banned peers to maintain before pruning.
@@ -93,6 +96,7 @@ impl AllPeers {
             banned_peers: Default::default(),
             disconnected_peers: 0,
             pending_dials: Default::default(),
+            dial_backoff: DialBackoff::new(max_disconnected_peers),
             dial_timeout,
             max_banned_peers,
             max_disconnected_peers,
@@ -372,12 +376,18 @@ impl AllPeers {
     /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
     /// dialing peers are counted towards the limit on inbound connections.
     pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
+        self.heartbeat_maintenance_at(Instant::now())
+    }
+
+    /// Maintain peers at an explicit clock instant, including dial timeouts and idle expiry.
+    pub(super) fn heartbeat_maintenance_at(&mut self, now: Instant) -> Vec<(PeerId, PeerAction)> {
+        self.dial_backoff.prune(now);
         let peers_to_disconnect: Vec<PeerId> = self
             .peers
             .iter()
             .filter_map(|(id, info)| {
                 if let ConnectionStatus::Dialing { instant } = info.connection_status() {
-                    if (*instant) + self.dial_timeout < Instant::now() {
+                    if (*instant) + self.dial_timeout < now {
                         return Self::peer_id_for(id, info);
                     }
                 }
@@ -387,6 +397,7 @@ impl AllPeers {
 
         // disconnect peers
         for peer_id in peers_to_disconnect {
+            self.record_dial_failure(peer_id);
             self.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
 
             // these peers exceeded `dial_timeout` while still `Dialing`, so the genuine cause
@@ -508,6 +519,7 @@ impl AllPeers {
         match new_status {
             // Group transitions by the new status
             NewConnectionStatus::Connected { multiaddr, direction } => {
+                self.reset_dial_backoff(peer_id);
                 let action = self.handle_connected_transition(
                     peer_id,
                     &current_status,
@@ -947,15 +959,20 @@ impl AllPeers {
     }
 
     /// Collect connected peers to exchange with disconnecting peer.
-    pub(super) fn peer_exchange(&self) -> PeerExchangeMap {
+    pub(super) fn peer_exchange(
+        &self,
+        permitted: impl Fn(&BlsPublicKey, &PeerId) -> bool,
+    ) -> PeerExchangeMap {
         self.peers
-            .values()
-            .filter_map(|peer| {
-                if peer.connection_status().is_connected() {
-                    peer.bls_public_key().and_then(|key| peer.exchange_info().map(|ei| (key, ei)))
-                } else {
-                    None
-                }
+            .iter()
+            .filter_map(|(identity, peer)| {
+                peer.connection_status().is_connected().then_some(()).and_then(|()| {
+                    peer.bls_public_key().and_then(|key| {
+                        Self::peer_id_for(identity, peer)
+                            .filter(|id| permitted(&key, id))
+                            .and_then(|_| peer.exchange_info().map(|ei| (key, ei)))
+                    })
+                })
             })
             .collect::<HashMap<_, _>>()
             .into()
@@ -1247,7 +1264,28 @@ impl AllPeers {
     /// of being banned (connected/disconnecting).
     pub(super) fn can_dial(&self, peer_id: &PeerId) -> bool {
         // unknown peers are eligible for dial attempts
-        self.get_peer(peer_id).map(|peer| peer.can_dial()).unwrap_or(true)
+        self.dial_retry_after(peer_id).is_none()
+            && self.get_peer(peer_id).is_none_or(|peer| peer.can_dial())
+    }
+
+    /// Remaining cooldown for this transport identity, including bounded-cache saturation.
+    pub(super) fn dial_retry_after(&self, peer_id: &PeerId) -> Option<Duration> {
+        self.dial_backoff.retry_after(peer_id, tokio::time::Instant::now().into_std())
+    }
+
+    /// Remember a real failed attempt without changing admission or reputation.
+    pub(super) fn record_dial_failure(&mut self, peer_id: PeerId) {
+        self.dial_backoff.failed(peer_id, tokio::time::Instant::now().into_std());
+    }
+
+    /// An authenticated connection or accepted mapping change permits immediate recovery.
+    pub(super) fn reset_dial_backoff(&mut self, peer_id: &PeerId) {
+        self.dial_backoff.reset(peer_id);
+    }
+
+    /// Reserve retry capacity for an accepted committee or explicitly configured mapping.
+    pub(super) fn recover_dial_mapping(&mut self, peer_id: &PeerId) {
+        self.dial_backoff.recover_mapping(peer_id, tokio::time::Instant::now().into_std());
     }
 
     /// Update a peer's status in the routing table.

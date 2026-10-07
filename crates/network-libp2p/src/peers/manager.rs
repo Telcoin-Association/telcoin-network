@@ -510,9 +510,20 @@ impl PeerManager {
             }
         }
         // schedule swarm to dial peer
-        debug!(target: "peer-manager", ?peer_id, "sending dial request to swarm");
-        let request = DialRequest { peer_id, multiaddrs, reply };
-        self.dial_requests.push_back(request);
+        let delay = self.peers.dial_retry_after(&peer_id);
+        if delay.is_some() {
+            reply.zip(delay).into_iter().for_each(|(reply, delay)| {
+                send_or_log_error!(
+                    reply,
+                    Err(NetworkError::DialBackoff(delay)),
+                    "DialPeer- Backoff"
+                );
+            });
+        } else {
+            debug!(target: "peer-manager", ?peer_id, "sending dial request to swarm");
+            let request = DialRequest { peer_id, multiaddrs, reply };
+            self.dial_requests.push_back(request);
+        }
     }
 
     /// Check if this peer is already registered as dialing.
@@ -521,6 +532,16 @@ impl PeerManager {
     /// connections.
     pub(super) fn dial_attempt_already_registered(&self, peer_id: &PeerId) -> bool {
         self.peers.get_peer(peer_id).is_some_and(|peer| peer.connection_status().is_dialing())
+    }
+
+    /// Remaining retry delay shared by manager and Kademlia dials.
+    pub(super) fn dial_retry_after(&self, peer_id: &PeerId) -> Option<Duration> {
+        self.peers.dial_retry_after(peer_id)
+    }
+
+    /// Record a genuine failed transport attempt without affecting reputation.
+    pub(super) fn record_dial_failure(&mut self, peer_id: PeerId) {
+        self.peers.record_dial_failure(peer_id);
     }
 
     /// Push a [PeerEvent].
@@ -663,7 +684,7 @@ impl PeerManager {
                 debug!(target: "peer-manager", ?peer_id, "reputation update results in temp ban with PX");
                 // prevent immediate reconnection attempts
                 self.temporarily_ban(peer_id);
-                let exchange = self.peers.peer_exchange();
+                let exchange = self.peers_for_exchange_to(Some(&peer_id));
                 self.events.push_back(PeerEvent::DisconnectPeerX(peer_id, exchange));
             }
             PeerAction::Unban(ip_addrs) => {
@@ -827,7 +848,7 @@ impl PeerManager {
     pub(crate) fn disconnect_peer(&mut self, peer_id: PeerId, support_discovery: bool) {
         // include peer exchange or not
         let event = if support_discovery {
-            let exchange = self.peers.peer_exchange();
+            let exchange = self.peers_for_exchange_to(Some(&peer_id));
             PeerEvent::DisconnectPeerX(peer_id, exchange)
         } else {
             PeerEvent::DisconnectPeer(peer_id)
@@ -969,6 +990,9 @@ impl PeerManager {
     /// kademlia are prioritized over peer exchange by only processing up to the missing target
     /// number of discovery peers from exchange map.
     pub(crate) fn process_peer_exchange(&mut self, peers: PeerExchangeMap) {
+        let (status, authorized) = self.evaluate_admission();
+        let committee_recipient =
+            self.local_bls_key.is_some_and(|key| self.peers.is_committee_member(&key));
         // check if discovery peers needed
         let max_discovery_peers = self.config.max_discovery_peers();
         let current_count = self.discovery_peers.len();
@@ -982,18 +1006,39 @@ impl PeerManager {
             let mut rng = rand::rng();
             let peers = peers
                 .into_iter()
-                .filter_map(|(_, (net_key, addrs))| {
-                    let info =
-                        PeerInfo { peer_id: net_key.into(), addrs: addrs.into_iter().collect() };
-
-                    // filter out ineligible peers
-                    if self.eligible_for_discovery(&info) {
-                        debug!(target: "peer-manager", ?info, "peer exchange eligible");
-                        Some(info)
-                    } else {
-                        debug!(target: "peer-manager", peer=?self.peers.get_peer(&info.peer_id), ?info, "peer exchange ineligible");
-                        None
-                    }
+                .filter_map(|(key, (net_key, addrs))| {
+                    let peer_id = PeerId::from(net_key);
+                    // Unsigned claims cannot grant membership. Check committee bindings
+                    // against authenticated records before allocating address buffers.
+                    let verified = self
+                        .known_peers
+                        .get(&key)
+                        .filter(|_| !self.stub_records.contains(&key))
+                        .is_some_and(|info| PeerId::from(info.pubkey.clone()) == peer_id);
+                    let committee = self.peers.is_committee_member(&key)
+                        || self
+                            .peers
+                            .get_peer(&peer_id)
+                            .and_then(|peer| peer.bls_public_key())
+                            .is_some_and(|key| self.peers.is_committee_member(&key));
+                    let permitted = (status.effective() != AdmissionMode::Closed
+                        || authorized.contains(&peer_id))
+                        && (!committee || (verified && committee_recipient))
+                        && self.peers.dial_retry_after(&peer_id).is_none()
+                        && addrs.len() <= MAX_MULTIADDRS_PER_PEER;
+                    permitted
+                        .then(|| PeerInfo {
+                            peer_id,
+                            addrs: if committee {
+                                self.known_peers
+                                    .get(&key)
+                                    .map(|info| info.multiaddrs.clone())
+                                    .unwrap_or_default()
+                            } else {
+                                addrs.into_iter().collect()
+                            },
+                        })
+                        .filter(|info| self.eligible_for_discovery(info))
                 })
                 .choose_multiple(&mut rng, peers_to_take);
 
@@ -1009,7 +1054,22 @@ impl PeerManager {
 
     /// Create [PeerExchangeMap] for exchange with peers.
     pub(crate) fn peers_for_exchange(&self) -> PeerExchangeMap {
-        self.peers.peer_exchange()
+        self.peers_for_exchange_to(None)
+    }
+
+    /// Produce hints for an authenticated recipient. Unknown recipients receive hubs and
+    /// observers only: a committee record does not prove a validator is open to them.
+    fn peers_for_exchange_to(&self, recipient: Option<&PeerId>) -> PeerExchangeMap {
+        let committee_recipient = recipient
+            .and_then(|id| self.peers.get_peer(id))
+            .and_then(|peer| peer.bls_public_key())
+            .is_some_and(|key| self.peers.is_committee_member(&key));
+        let (status, authorized) = self.evaluate_admission();
+        self.peers.peer_exchange(|key, id| {
+            recipient != Some(id)
+                && (status.effective() != AdmissionMode::Closed || authorized.contains(id))
+                && (!self.peers.is_committee_member(key) || committee_recipient)
+        })
     }
 
     /// Return the score for a peer if they exist.
@@ -1373,6 +1433,24 @@ impl PeerManager {
             }
         }
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
+        let peer_id = PeerId::from(info.pubkey.clone());
+        let changed = self
+            .known_peers
+            .get(&bls_key)
+            .is_none_or(|old| old.pubkey != info.pubkey || old.multiaddrs != info.multiaddrs);
+        let had_failure = self.peers.dial_retry_after(&peer_id).is_some()
+            || self.known_peers.get(&bls_key).is_some_and(|old| {
+                self.peers.dial_retry_after(&PeerId::from(old.pubkey.clone())).is_some()
+            });
+        let recovery = (changed && had_failure).then(|| info.multiaddrs.clone());
+        if changed {
+            self.known_peers
+                .get(&bls_key)
+                .map(|old| PeerId::from(old.pubkey.clone()))
+                .into_iter()
+                .for_each(|old_id| self.peers.reset_dial_backoff(&old_id));
+            self.peers.recover_dial_mapping(&peer_id);
+        }
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
         self.stub_records.remove(&bls_key);
@@ -1382,6 +1460,11 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        recovery.filter(|_| self.check_admission(Some(&peer_id)).is_ok()).into_iter().for_each(
+            |addrs| {
+                self.dial_peer(peer_id, addrs, None);
+            },
+        );
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
@@ -1488,6 +1571,7 @@ impl PeerManager {
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
         !self.is_local_peer(&info.peer_id)
+            && self.discovery_identity_permitted(&info.peer_id)
             // reject entries with more addresses than an honest peer can share. An honest
             // exchange entry is a copy of a sender's stored set for that peer, which holds the
             // one address the peer most recently presented (MAX_MULTIADDRS_PER_PEER, see its
@@ -1500,6 +1584,16 @@ impl PeerManager {
             && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
             && self.has_valid_unbanned_ips(&info.addrs)
             && self.peers.can_dial(&info.peer_id)
+    }
+
+    /// Recheck role at selection time so hints retained before a policy update cannot bypass it.
+    fn discovery_identity_permitted(&self, peer: &PeerId) -> bool {
+        self.local_bls_key.is_some_and(|key| self.peers.is_committee_member(&key))
+            || self
+                .peers
+                .get_peer(peer)
+                .and_then(|peer| peer.bls_public_key())
+                .is_none_or(|key| !self.peers.is_committee_member(&key))
     }
 
     /// Process newly discovered peers for potential dial attempts.
@@ -1536,8 +1630,10 @@ impl PeerManager {
         // take discovery peers and filter ineligble peers
         let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
         discovery_peers.retain(|peer_id, addrs| {
-            let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
-            self.eligible_for_discovery(&peer_info)
+            self.discovery_identity_permitted(peer_id) && {
+                let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
+                self.eligible_for_discovery(&peer_info)
+            }
         });
 
         // calculate dial attempts needed for target connection limits
