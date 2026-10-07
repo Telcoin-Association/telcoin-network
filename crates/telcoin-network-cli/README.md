@@ -521,7 +521,7 @@ Set it to `true` only when every committee member is under the same operator as 
 EVM credits this account on every transaction, so its balance enters the state root and every node
 on the network must hold the same value. A parameters file that omits the key fails to parse, so
 the node refuses to start rather than falling back in silence. The `genesis` commands write the
-key for you, and the `mainnet` and `adiri` chain presets carry their own value.
+key for you, and the `main-net` and `adiri` chain presets carry their own value.
 
 Example, the testnet preset (`chain-configs/testnet/parameters.yaml`). It leaves `vote_timeout` at the 5 s default:
 
@@ -568,7 +568,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
 | `vote_timeout` below 10 s                                                | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires                                                        |
 
-With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
+With `--chain adiri` or `--chain main-net`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.
 The testnet preset's `max_header_delay` is 3 s, which leaves room for a tolerance of up to 2 s; the mainnet preset's is 1 s, which leaves room for up to 4 s.
 The default `250ms` and a legacy `1` pass with both.
