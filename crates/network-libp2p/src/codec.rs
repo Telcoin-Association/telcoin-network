@@ -50,7 +50,7 @@ where
 
     // validate uncompressed length
     if uncompressed_len > max_message_size {
-        return Err(std::io::Error::other("prefix indicates message size is too large"));
+        return Err(invalid_data("prefix indicates message size is too large"));
     }
 
     // read 4-byte compressed length prefix
@@ -61,9 +61,7 @@ where
     // validate compressed length against max possible compression size
     let max_compress_len = snap::raw::max_compress_len(uncompressed_len);
     if compressed_len > max_compress_len {
-        return Err(std::io::Error::other(
-            "compressed size exceeds max for reported uncompressed size",
-        ));
+        return Err(invalid_data("compressed size exceeds max for reported uncompressed size"));
     }
 
     // Stream the compressed body in bounded chunks so committed memory tracks the bytes that
@@ -91,17 +89,20 @@ where
     let decode_limit = u64::try_from(uncompressed_len).map_err(std::io::Error::other)?;
     let reader = std::io::Cursor::new(&*compressed_buffer);
     let mut decoder = FrameDecoder::new(reader).take(decode_limit);
-    decoder.read_to_end(decode_buffer)?;
+    decoder.read_to_end(decode_buffer).map_err(invalid_data)?;
 
     // the decompressed output must match the reported uncompressed length
     if decode_buffer.len() != uncompressed_len {
-        return Err(std::io::Error::other(
-            "decompressed size does not match reported uncompressed size",
-        ));
+        return Err(invalid_data("decompressed size does not match reported uncompressed size"));
     }
 
     // deserialize
-    bcs::from_bytes(decode_buffer).map_err(std::io::Error::other)
+    bcs::from_bytes(decode_buffer).map_err(invalid_data)
+}
+
+/// Mark malformed peer bytes without reclassifying transport or local encoding failures.
+fn invalid_data(error: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
 }
 
 /// Encode a single BCS message with snappy compression and length prefixes to an async writer.

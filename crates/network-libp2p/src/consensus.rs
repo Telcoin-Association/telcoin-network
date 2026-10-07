@@ -133,6 +133,14 @@ const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("1
 /// records reach the store, whose larger value limit is not the effective wire bound.
 const MAX_KAD_PACKET_SIZE: usize = 16 * 1024;
 
+/// Whether inbound record processing was completed or deferred by the shared PUT budget.
+enum PutOutcome {
+    /// The record was handled, including ordinary validation or ban rejection.
+    Processed,
+    /// The shared rate limiter shed the record before validation.
+    Shed,
+}
+
 pub(crate) use tn_node_record::MAX_ADVERTISED_MULTIADDRS;
 
 /// Freshness of a validated incoming record relative to the locally stored value.
@@ -451,6 +459,9 @@ where
     /// Folded into every [NodeRecord] signature so a record signed for one
     /// network never verifies on another (GHSA-cc64-wfq5-56ph).
     record_domain: RecordDomain,
+    /// Signature-verified bytes for this process and domain, bounded by the live-peer budget.
+    /// Persisted records alone never authorize skipping signature verification.
+    verified_peer_records: LruCache<kad::RecordKey, Vec<u8>>,
     /// Peers we have already pushed our [NodeRecord] to.
     ///
     /// A peer connecting for the first time needs our record before it can resolve
@@ -599,13 +610,13 @@ where
             vec![(network_type.peer_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default(),
         );
-        // Reuse the kad wire ceiling in both codec directions. Retrieval gets one
-        // stream per connection and the existing dial timeout, outside consensus RPCs.
+        // Reuse the kad wire ceiling in both codec directions. Two shared stream slots allow
+        // simultaneous inbound and outbound retrievals, with the existing dial timeout.
         let record_exchange = request_response::Behaviour::with_codec(
             RecordCodec::new(MAX_KAD_PACKET_SIZE),
             vec![(network_type.record_exchange_protocol(chain_id)?, ProtocolSupport::Full)],
             request_response::Config::default()
-                .with_max_concurrent_streams(1)
+                .with_max_concurrent_streams(2)
                 .with_request_timeout(network_config.peer_config().dial_timeout),
         );
         let record_retry_interval =
@@ -773,6 +784,10 @@ where
             node_record,
             external_addr,
             record_domain,
+            verified_peer_records: LruCache::new(
+                NonZeroUsize::new(network_config.peer_config().max_peers())
+                    .unwrap_or(NonZeroUsize::MIN),
+            ),
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             record_exchange: RecordExchange::new(
                 MAX_PUBLISHED_TO_PEERS,
@@ -842,8 +857,15 @@ where
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
-        let (pubkey, node_record) =
-            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
+        let cached = self
+            .verified_peer_records
+            .peek(&record.key)
+            .is_some_and(|value| *value == record.value);
+        let (pubkey, node_record) = if cached {
+            (key, NodeRecord::try_decode_compat(&record.value)?)
+        } else {
+            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?
+        };
 
         // reject records advertising an implausible number of addresses: a legitimate record
         // carries a single address, so a large set is only ever an attempt to inflate the
@@ -968,6 +990,8 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            let (pending, deferred) = self.record_exchange.counts();
+            self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
         }
     }
@@ -1726,15 +1750,28 @@ where
             if self.record_exchange.allow_request(peer) {
                 let request = self.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
                 self.record_exchange.track(peer, request);
+                self.metrics.record_exchange("sent");
             } else {
-                self.record_exchange.defer(peer);
+                self.defer_record_request(peer);
             }
+        }
+    }
+
+    /// Queue a retry and count each newly deferred peer once.
+    fn defer_record_request(&mut self, peer: PeerId) {
+        if self.record_exchange.defer(peer) {
+            self.metrics.record_exchange("deferred");
         }
     }
 
     /// Retry only connected peers, at most one bounded batch per heartbeat.
     fn retry_record_requests(&mut self) {
         self.record_exchange.take_deferred().into_iter().for_each(|peer| {
+            if self.swarm.is_connected(&peer)
+                && !self.swarm.behaviour().peer_manager.peer_banned(&peer)
+            {
+                self.metrics.record_exchange("retry");
+            }
             self.request_current_record(peer);
         });
     }
@@ -1751,8 +1788,13 @@ where
                     let response = (!self.swarm.behaviour().peer_manager.peer_banned(&peer)
                         && self.record_exchange.allow_response(peer))
                     .then(|| (self.key_config.primary_public_key(), self.node_record.clone()));
-                    let _ =
-                        self.swarm.behaviour_mut().record_exchange.send_response(channel, response);
+                    let outcome = if response.is_some() { "served" } else { "refused" };
+                    self.swarm
+                        .behaviour_mut()
+                        .record_exchange
+                        .send_response(channel, response)
+                        .map(|()| self.metrics.record_exchange(outcome))
+                        .unwrap_or_else(|_| self.metrics.record_exchange("response_unavailable"));
                     Ok(())
                 }
                 request_response::Message::Response { request_id, response } => {
@@ -1760,6 +1802,17 @@ where
                 }
             },
             ReqResEvent::OutboundFailure { peer, request_id, error, .. } => {
+                let kind = match &error {
+                    ReqResOutboundFailure::DialFailure => "outbound_dial_failure",
+                    ReqResOutboundFailure::Timeout => "outbound_timeout",
+                    ReqResOutboundFailure::ConnectionClosed => "outbound_connection_closed",
+                    ReqResOutboundFailure::UnsupportedProtocols => "outbound_unsupported_protocols",
+                    ReqResOutboundFailure::Io(error) if error.kind() == ErrorKind::InvalidData => {
+                        "outbound_invalid_data"
+                    }
+                    ReqResOutboundFailure::Io(_) => "outbound_io",
+                };
+                self.metrics.record_exchange(kind);
                 if self.record_exchange.finish(peer, request_id) {
                     match error {
                         ReqResOutboundFailure::UnsupportedProtocols => {
@@ -1767,17 +1820,40 @@ where
                             // use the existing deduplicated, bounded Kademlia query pipeline.
                             self.request_legacy_record(peer);
                         }
+                        ReqResOutboundFailure::Io(error)
+                            if error.kind() == ErrorKind::InvalidData =>
+                        {
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .process_penalty(peer, Penalty::Medium);
+                        }
                         ReqResOutboundFailure::DialFailure
                         | ReqResOutboundFailure::Timeout
                         | ReqResOutboundFailure::ConnectionClosed
                         | ReqResOutboundFailure::Io(_) => {
-                            self.record_exchange.defer(peer);
+                            self.defer_record_request(peer);
                         }
                     }
                 }
                 Ok(())
             }
             ReqResEvent::InboundFailure { peer, error, .. } => {
+                let kind = match &error {
+                    ReqResInboundFailure::Timeout => "inbound_timeout",
+                    ReqResInboundFailure::ConnectionClosed => "inbound_connection_closed",
+                    ReqResInboundFailure::UnsupportedProtocols => "inbound_unsupported_protocols",
+                    ReqResInboundFailure::ResponseOmission => "inbound_response_omission",
+                    ReqResInboundFailure::Io(error) if error.kind() == ErrorKind::InvalidData => {
+                        "inbound_invalid_data"
+                    }
+                    ReqResInboundFailure::Io(_) => "inbound_io",
+                };
+                self.metrics.record_exchange(kind);
+                if matches!(&error, ReqResInboundFailure::Io(error) if error.kind() == ErrorKind::InvalidData)
+                {
+                    self.swarm.behaviour_mut().peer_manager.process_penalty(peer, Penalty::Medium);
+                }
                 debug!(target: "network", ?peer, ?error, "record retrieval inbound failure");
                 Ok(())
             }
@@ -1797,7 +1873,10 @@ where
     ) -> NetworkResult<()> {
         if self.record_exchange.finish(peer, request_id) {
             if response.is_none() {
-                self.record_exchange.defer(peer);
+                self.metrics.record_exchange("remote_refused");
+                self.defer_record_request(peer);
+            } else {
+                self.metrics.record_exchange("received");
             }
             response
                 .map(|(key, record)| kad::Record {
@@ -1806,7 +1885,13 @@ where
                     publisher: Some(peer),
                     expires: std::time::Instant::now().checked_add(self.config.kad_record_ttl),
                 })
-                .map(|record| self.process_kad_put_request(peer, record))
+                .map(|record| {
+                    self.apply_put_record(peer, record).map(|outcome| {
+                        if matches!(outcome, PutOutcome::Shed) {
+                            self.defer_record_request(peer);
+                        }
+                    })
+                })
                 .transpose()
                 .map(|_| ())
         } else {
@@ -1814,20 +1899,24 @@ where
         }
     }
 
-    /// Fall back once per allowed attempt for legacy peers with an already known BLS identity.
+    /// Fall back once per allowed attempt for legacy peers in a tracked committee.
     ///
     /// A legacy peer whose identity is unknown still uses ordinary first-connect pushes and
     /// discovery. No extra consensus RPC or unsolicited push is introduced by the fallback.
+    /// Only committee query results can refresh discovery, and querying the already known key
+    /// cannot discover a legacy peer's rotated BLS key.
     fn request_legacy_record(&mut self, peer: PeerId) {
         self.swarm
             .behaviour()
             .peer_manager
             .peer_to_bls(&peer)
+            .filter(|_| self.swarm.behaviour().peer_manager.is_peer_validator(&peer))
             .filter(|key| self.kad_record_queries.values().all(|query| query.request != *key))
             .into_iter()
             .for_each(|key| {
                 let query = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                 self.kad_record_queries.insert(query, key.into());
+                self.metrics.record_exchange("legacy_fallback");
             });
     }
 
@@ -2387,8 +2476,17 @@ where
     fn process_kad_put_request(
         &mut self,
         source: PeerId,
-        mut record: kad::Record,
+        record: kad::Record,
     ) -> NetworkResult<()> {
+        self.apply_put_record(source, record).map(|_| ())
+    }
+
+    /// Apply the shared PUT checks, reporting a shed response so its requester can retry.
+    fn apply_put_record(
+        &mut self,
+        source: PeerId,
+        mut record: kad::Record,
+    ) -> NetworkResult<PutOutcome> {
         // check if source or publisher are banned
         let publisher_is_banned = record
             .publisher
@@ -2418,7 +2516,7 @@ where
             }
 
             // return early
-            return Ok(());
+            return Ok(PutOutcome::Processed);
         }
 
         // Rate limit inbound put requests per source, independent of ban state, before the
@@ -2436,26 +2534,33 @@ where
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
                 self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                Ok(PutOutcome::Processed)
             }
             PutRecordRate::Shed => {
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
+                Ok(PutOutcome::Shed)
             }
             PutRecordRate::Allowed => {
                 self.peer_record_valid(&record).map(|(key, value)| {
                     // verify record signature and ensure publisher matches record's network key
+                    if record.value.len() <= MAX_KAD_PACKET_SIZE {
+                        self.verified_peer_records.put(record.key.clone(), record.value.clone());
+                    }
 
                     let freshness = self.record_freshness(&record);
-                    if freshness == RecordFreshness::Identical {
+                    let should_store = if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
-                        record.expires =
-                            self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).map_or(
-                                record.expires,
+                        self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).map_or(
+                                true,
                                 |existing| {
-                                    existing.expires.zip(record.expires).map(|(old, new)| old.max(new))
+                                    record.expires = existing.expires.zip(record.expires).map(|(old, new)| old.max(new));
+                                    record.expires != existing.expires
                                 },
-                            );
-                    }
+                            )
+                    } else {
+                        true
+                    };
                     trace!(target: "network-kad", "Got record {key} {value:?}");
 
                     // Confirm before the fallible store write, including for equal or older records.
@@ -2474,7 +2579,8 @@ where
                         RecordFreshness::Newer | RecordFreshness::Identical => {
                             // Capacity is remotely triggerable. Match the add-provider path instead of
                             // propagating expected rejections to the run loop's per-event error log.
-                            self.swarm.behaviour_mut().kademlia.store_mut().put(record).unwrap_or_else(
+                            if should_store {
+                                self.swarm.behaviour_mut().kademlia.store_mut().put(record).unwrap_or_else(
                                 |error| match error {
                                     kad::store::Error::MaxRecords => {
                                         debug!(target: "network-kad", ?source, "dropping inbound kad record: store at capacity");
@@ -2483,7 +2589,8 @@ where
                                         warn!(target: "network-kad", ?source, ?error, "dropping inbound kad record");
                                     }
                                 },
-                            );
+                                );
+                            }
                         }
                         RecordFreshness::Older | RecordFreshness::Undecodable => {
                             // A peer republishing a slightly stale (but signature-valid) record is
@@ -2499,10 +2606,9 @@ where
                     trace!(target: "network-kad", ?source, "processing fatal penalty for invalid peer record");
                     self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Fatal);
                 });
+                Ok(PutOutcome::Processed)
             }
         }
-
-        Ok(())
     }
 
     /// Process an inbound kad add-provider request.

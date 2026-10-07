@@ -68,11 +68,18 @@ impl RecordExchange {
         self.deferred.remove(&peer);
     }
 
-    /// Coalesce a budget-limited reconnect without queuing a duplicate live request.
-    pub(crate) fn defer(&mut self, peer: PeerId) {
+    /// Coalesce a budget-limited reconnect, returning whether a new retry was queued.
+    pub(crate) fn defer(&mut self, peer: PeerId) -> bool {
         if !self.pending.contains_key(&peer) && self.deferred.len() < self.max_pending {
-            self.deferred.insert(peer);
+            self.deferred.insert(peer)
+        } else {
+            false
         }
+    }
+
+    /// Current live requests and queued retries, for the network gauges.
+    pub(crate) fn counts(&self) -> (usize, usize) {
+        (self.pending.len(), self.deferred.len())
     }
 
     /// Drain bounded deferred work for the next heartbeat, dropping disconnected peers upstream.

@@ -4384,7 +4384,7 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
 }
 
 /// A reconnect recovers a rotated BLS identity, addresses and RPC metadata despite push
-/// suppression.
+/// suppression in both directions, before any heartbeat retry can conceal a failed exchange.
 #[tokio::test]
 async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> {
     let TestTypes { mut peer1, mut peer2, _task_manager } =
@@ -4392,6 +4392,13 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
     let peer1_id = *peer1.network.swarm.local_peer_id();
     let peer2_id = *peer2.network.swarm.local_peer_id();
     let previous_key = peer2.config.key_config().primary_public_key();
+    let peer1_key = peer1.config.key_config().primary_public_key();
+    let peer1_record = encode(&peer1.network.node_record);
+    [&mut peer1.network, &mut peer2.network].into_iter().for_each(|network| {
+        network.record_retry_interval = Duration::from_secs(60);
+        network.record_exchange =
+            RecordExchange::new(MAX_PUBLISHED_TO_PEERS, 2, network.record_retry_interval);
+    });
     let rotated_fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let rotated_keys = rotated_fixture
         .authorities()
@@ -4443,10 +4450,18 @@ async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> 
         handle2.start_listening(addr2.clone()).await?;
         handle1.add_trusted_peer_and_dial(previous_key, net2, addr2).await?;
         wait_until(
-            Duration::from_secs(10),
-            "retrieve updated record despite push suppression",
+            Duration::from_secs(5),
+            "retrieve both records before retries despite push suppression",
             || async {
-                Ok(handle1.kad_store_get(key).await?.is_some_and(|record| record.value == expected))
+                let forward = handle1
+                    .kad_store_get(key)
+                    .await?
+                    .is_some_and(|record| record.value == expected);
+                let reverse = handle2
+                    .kad_store_get(peer1_key)
+                    .await?
+                    .is_some_and(|record| record.value == peer1_record);
+                Ok(forward && reverse)
             },
         )
         .await?;
@@ -4489,6 +4504,11 @@ async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
     let peer = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [peer2.config.key_config().primary_public_key()].into_iter().collect(),
+        Default::default(),
+    );
     network.process_kad_put_request(peer, peer2.network.get_peer_record())?;
     let request = network.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
     assert!(network.record_exchange.allow_request(peer));
@@ -4505,6 +4525,9 @@ async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result
     assert_eq!(network.kad_record_queries.len(), 1);
     Ok(())
 }
+
+#[path = "record_review_tests.rs"]
+mod record_review_tests;
 
 /// Regression test for issue #828: `published_to_peers` is a per-process-lifetime de-dup gate that
 /// is never cleaned on disconnect, so as an unbounded set it grew once per distinct `PeerId` ever
