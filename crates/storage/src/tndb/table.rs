@@ -16,7 +16,8 @@
 //!
 //! A scan ([`TableScan`]) owns a snapshot and a [`BtreeCursor`] over it and holds no lock, so a
 //! table can be written (and published) while it is being scanned, from any thread; the scan keeps
-//! reading the snapshot it started with.
+//! reading the snapshot it started with. Index pages a live snapshot can reach are not reused, so
+//! a long-lived scan lets the index file grow until it is dropped.
 
 use std::{ops::Bound, path::PathBuf, sync::Arc};
 
@@ -529,17 +530,24 @@ mod test {
                         assert!(generation >= floor, "read generation {generation} < {floor}");
                         assert_eq!(v, value(i, generation), "a torn or foreign value");
                         if reads.is_multiple_of(64) {
-                            // A whole scan sees one generation per key and every key.
+                            // A whole scan reads one committed state: every key, all from one
+                            // generation (each commit overwrites every key). Reader 0 dawdles
+                            // mid-scan, holding its snapshot across commits while pages the
+                            // writer replaced are reclaimed and reused.
                             let mut scan = table.scan(ScanKind::Forward);
-                            let mut n = 0;
-                            while let Some(ok) = scan.next_with(|k, v| {
+                            let mut gens = Vec::new();
+                            while let Some((ok, g)) = scan.next_with(|k, v| {
                                 let g = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
-                                v == value(key_u64(k), g).as_slice()
+                                (v == value(key_u64(k), g).as_slice(), g)
                             }) {
                                 assert!(ok, "a torn value in a scan");
-                                n += 1;
+                                gens.push(g);
+                                if t == 0 && gens.len() == KEYS as usize / 2 {
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                }
                             }
-                            assert_eq!(n, KEYS);
+                            assert_eq!(gens.len(), KEYS as usize);
+                            assert!(gens.iter().all(|&g| g == gens[0]), "a scan mixed states");
                         }
                         reads += 1;
                     }
@@ -548,17 +556,31 @@ mod test {
             })
             .collect();
 
-        for generation in 1..=40u64 {
+        let commit = |generation: u64| {
             for i in 0..KEYS {
                 table.insert(&kv(i).0, &value(i, generation)).expect("overwrite");
             }
             table.flush().expect("commit");
+        };
+        for generation in 1..=200u64 {
+            commit(generation);
             committed.store(generation, Ordering::Release);
         }
         stop.store(true, Ordering::Relaxed);
         for reader in readers {
             assert!(reader.join().expect("reader") > 0);
         }
+
+        // With the readers gone every replaced index page is reusable: more commits do not grow
+        // the index file.
+        let index_pages =
+            |table: &TnTable| table.inner.writer.lock().idx.as_ref().expect("index").page_count();
+        commit(201);
+        let pages = index_pages(&table);
+        for generation in 202..=260u64 {
+            commit(generation);
+        }
+        assert_eq!(index_pages(&table), pages, "replaced index pages are reused");
     }
 
     /// A live scan keeps the table open (it shares the table's state) even after the last handle

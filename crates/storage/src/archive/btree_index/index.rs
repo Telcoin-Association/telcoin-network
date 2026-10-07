@@ -25,11 +25,22 @@
 //! rebuilds it from the log and calls [`BtreeIndex::mark_consistent`] so the next clean close
 //! seals it. A file shorter than the pages its header names (a lost size extension) is rejected
 //! at open, as is a cleanly-sealed one whose root page fails its CRC.
+//!
+//! ## Copy-on-write and page reuse
+//! A published page is never modified: a write copies the pages it changes, and readers of a
+//! published [`IndexSnapshot`] need no lock. A replaced page is reused once no snapshot that could
+//! reach it is alive (see [`BtreeIndex::publish`]). Reuse does not wait for a sync, so between
+//! syncs the on-disk tree is not self-consistent — the rebuild-on-unclean contract above is what
+//! makes that safe. The free list lives in memory; a clean reopen recovers it by walking the tree.
 
 use std::{
+    collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        atomic::{fence, Ordering},
+        Arc, Weak,
+    },
 };
 
 use tn_types::B256;
@@ -143,12 +154,37 @@ pub struct BtreeIndex {
     /// on open, so a read-only handle trusts no zero-trailer page; drained by each publish,
     /// which stamps exactly this set.
     private: PageSet,
-    /// Published pages replaced by a copy (copy-on-write) since open. Kept for reclamation once no
-    /// reader can still see them; not reused yet, so the file grows with each replaced page.
+    /// Published pages replaced by a copy (copy-on-write) since the last publish: no longer in the
+    /// working tree, but still in the latest published state.
     superseded: Vec<u32>,
+    /// The pin shared by snapshots of the latest published state (`None` if none was taken).
+    latest_pin: Option<Weak<SnapshotPin>>,
+    /// Replaced pages per published state, oldest first, waiting until no snapshot can reach them.
+    retiring: VecDeque<Retiring>,
+    /// Pages no snapshot and not the working tree can reach: reused before the file grows.
+    free: Vec<u32>,
     /// The lock-free reader view of the index file's mapping, shared with published snapshots.
     view: Arc<MapView>,
     _index_dir: PathBuf,
+}
+
+/// Held by every [`IndexSnapshot`] of one published state; the index keeps only a `Weak` to it. Its
+/// strong count therefore drops to zero exactly when the last snapshot of that state is gone, and
+/// a reader pays nothing for it beyond holding the snapshot.
+#[derive(Debug)]
+struct SnapshotPin;
+
+/// Pages replaced after one published state, waiting until no snapshot can reach them.
+#[derive(Debug)]
+struct Retiring {
+    /// The pin of the state these pages were last visible in (`None`: no snapshot was taken).
+    pin: Option<Weak<SnapshotPin>>,
+    pages: Vec<u32>,
+}
+
+/// True while some snapshot holds the pin.
+fn pin_alive(pin: &Option<Weak<SnapshotPin>>) -> bool {
+    pin.as_ref().is_some_and(|pin| pin.strong_count() > 0)
 }
 
 /// A published, immutable view of a B-tree: its root and page count at a [`BtreeIndex::publish`],
@@ -162,6 +198,8 @@ pub(crate) struct IndexSnapshot {
     root: u32,
     page_count: u32,
     values: u64,
+    /// Keeps this state's pages (and older states') from being reused while the snapshot lives.
+    _pin: Arc<SnapshotPin>,
 }
 
 impl IndexSnapshot {
@@ -374,7 +412,7 @@ impl BtreeIndex {
         if fresh {
             private.insert(header.root_page);
         }
-        Ok(Self {
+        let mut index = Self {
             header,
             file,
             node,
@@ -383,9 +421,24 @@ impl BtreeIndex {
             remove_on_drop: false,
             private,
             superseded: Vec::new(),
+            latest_pin: None,
+            retiring: VecDeque::new(),
+            free: Vec::new(),
             view,
             _index_dir: dir.to_owned(),
-        })
+        };
+        // A cleanly-sealed tree's unreachable pages are free; an unclean one is rebuilt, not
+        // trusted, and a read-only handle never allocates.
+        if !read_only && !fresh && !index.opened_unclean() {
+            index.free = index.unreachable_pages();
+        }
+        Ok(index)
+    }
+
+    /// Pages in the file, including free ones (the allocation high-water mark).
+    #[cfg(test)]
+    pub(crate) fn page_count(&self) -> u32 {
+        self.header.page_count
     }
 
     /// Number of keys stored in this index.
@@ -486,6 +539,12 @@ impl BtreeIndex {
     /// Reset to a fresh, empty single-leaf tree, rewriting a consistent empty tree to disk so a
     /// crash mid-[`Self::rebuild_from`] reopens clean.
     fn reset_empty(&mut self) -> Result<(), io::Error> {
+        // Truncation rewrites every page: never under a live snapshot.
+        if pin_alive(&self.latest_pin) || self.retiring.iter().any(|r| pin_alive(&r.pin)) {
+            return Err(io::Error::other(
+                "cannot reset a B-tree index while snapshots of it are alive",
+            ));
+        }
         self.header.root_page = 1;
         self.header.height = 1;
         self.header.page_count = 2;
@@ -513,6 +572,9 @@ impl BtreeIndex {
         self.private.clear();
         self.private.insert(self.header.root_page);
         self.superseded.clear();
+        self.latest_pin = None;
+        self.retiring.clear();
+        self.free.clear();
         self.file.sync_all()?;
         self.synced = true;
         Ok(())
@@ -565,6 +627,19 @@ impl BtreeIndex {
     /// The page count only moves once the growth succeeded (a failed growth also poisons the file,
     /// so it never seals and is rebuilt on the next open).
     fn allocate_page(&mut self) -> Result<u32, io::Error> {
+        if self.free.is_empty() {
+            self.reclaim();
+        }
+        if let Some(p) = self.free.pop() {
+            // A reused page starts exactly like a freshly grown one: all zeros, its zero CRC
+            // trailer marking it private.
+            self.file
+                .slice_mut(Self::page_offset(p), PAGE_SIZE)
+                .ok_or_else(|| io::Error::other("free page not mapped"))?
+                .fill(0);
+            self.private.insert(p);
+            return Ok(p);
+        }
         let p = self.header.page_count;
         self.file.ensure_len((p as u64 + 1) * PAGE_SIZE as u64)?;
         self.header.page_count += 1;
@@ -576,8 +651,8 @@ impl BtreeIndex {
 
     /// The writable copy of page `p`: `p` itself if this handle created it since the last publish
     /// (no reader can see it), otherwise a fresh copy — a published page is never modified, so a
-    /// snapshot reading it is unaffected. The replaced page is kept for reclamation (not reused
-    /// yet).
+    /// snapshot reading it is unaffected. The replaced page is reused once no snapshot can reach
+    /// it.
     fn make_writable(&mut self, p: u32) -> Result<u32, AppendError> {
         if self.private.contains(p) {
             return Ok(p);
@@ -870,29 +945,116 @@ impl BtreeIndex {
     fn publish_pages(&mut self) {
         self.crc_dirty_pages();
         self.view.publish_len(self.header.page_count as u64 * PAGE_SIZE as u64);
+        // The pages replaced since the previous publish were last visible in the previous state.
+        let pin = self.latest_pin.take().filter(|pin| pin.strong_count() > 0);
+        let pages = std::mem::take(&mut self.superseded);
+        if pin.is_some() || !pages.is_empty() {
+            self.retiring.push_back(Retiring { pin, pages });
+        }
     }
 
     /// Publish the working tree: every write since the last publish becomes visible to readers of
     /// the returned snapshot (and of later ones). Durability is separate ([`Self::sync`]).
+    ///
+    /// The snapshot pins the published state: pages it can reach are not reused until it (and
+    /// every snapshot of an older state) is dropped, so a long-lived snapshot lets the file grow
+    /// meanwhile.
     pub(crate) fn publish(&mut self) -> IndexSnapshot {
         self.publish_pages();
+        let pin = Arc::new(SnapshotPin);
+        self.latest_pin = Some(Arc::downgrade(&pin));
         IndexSnapshot {
             view: Arc::clone(&self.view),
             node: self.node,
             root: self.header.root_page,
             page_count: self.header.page_count,
             values: self.header.values,
+            _pin: pin,
+        }
+    }
+
+    /// Free the pages no snapshot can reach any more: pop retiring states from the front while no
+    /// snapshot of them is alive. Front only: a state's replaced pages may be reachable from any
+    /// older state too, and each older entry was popped only once its own snapshots were gone.
+    fn reclaim(&mut self) {
+        let mut freed = false;
+        while self.retiring.front().is_some_and(|front| !pin_alive(&front.pin)) {
+            let Some(entry) = self.retiring.pop_front() else { break };
+            self.free.extend(entry.pages);
+            freed = true;
+        }
+        if freed {
+            // Pairs with the `Release` decrement of each snapshot's last `Arc` drop, so a reader's
+            // final reads of a freed page happen before this writer reuses it.
+            fence(Ordering::Acquire);
+        }
+    }
+
+    /// Every page of the tree at `root` with `height` levels. Internal pages are read (each must be
+    /// internal, with a sane entry count and in-bounds children never seen before); leaves are
+    /// taken from their parents' child pointers, and only the first is read (it must be a leaf:
+    /// the tree is balanced, so that checks `height`). `verify_crc` also checks each internal
+    /// page's full CRC.
+    fn tree_pages(&self, root: u32, height: u32, verify_crc: bool) -> Result<PageSet, FetchError> {
+        let node = self.node;
+        let corrupt = |what: String| FetchError::CorruptIndex(format!("btree walk: {what}"));
+        let mut seen = PageSet::default();
+        seen.insert(root);
+        let mut level = vec![root];
+        for _ in 1..height {
+            let mut next = Vec::new();
+            for &p in &level {
+                let buf = self.page(p)?;
+                if verify_crc && crc_state(buf) != CrcState::Valid {
+                    return Err(corrupt(format!("page {p} fails its CRC")));
+                }
+                let n = node.entry_count(buf);
+                if node.is_leaf(buf) || n > node.max_internal_keys() {
+                    return Err(corrupt(format!("page {p} is not a sane internal page")));
+                }
+                for i in 0..=n {
+                    let c = node.internal_child(buf, i);
+                    if c == 0 || c >= self.header.page_count || seen.contains(c) {
+                        return Err(corrupt(format!("page {p} has a bad child {c}")));
+                    }
+                    seen.insert(c);
+                    next.push(c);
+                }
+            }
+            level = next;
+        }
+        if !node.is_leaf(self.page(level[0])?) {
+            return Err(corrupt(format!("height {height} does not reach the leaves")));
+        }
+        Ok(seen)
+    }
+
+    /// The pages a cleanly-sealed tree does not reach (free to reuse), lowest popped first. Any
+    /// walk failure yields none: a page that might be live is never reused, and the damage
+    /// surfaces on the lookups that reach it, as before.
+    fn unreachable_pages(&self) -> Vec<u32> {
+        match self.tree_pages(self.header.root_page, self.header.height, true) {
+            Ok(reachable) => {
+                (1..self.header.page_count).rev().filter(|&p| !reachable.contains(p)).collect()
+            }
+            Err(e) => {
+                tracing::warn!(target: "btree-index", "no page reuse until rebuilt: {e}");
+                Vec::new()
+            }
         }
     }
 
     /// Reset to an empty tree without touching published pages: a fresh empty root leaf becomes the
-    /// working root (published snapshots keep reading the old tree). The old tree's pages are not
-    /// reclaimed yet.
+    /// working root (published snapshots keep reading the old tree). The old tree's pages are
+    /// retired: reused once no snapshot can reach them (at once for pages never published).
     pub fn clear(&mut self) -> Result<(), AppendError> {
         if self.read_only {
             return Err(AppendError::ReadOnly);
         }
         let node = self.node;
+        let mut old = self
+            .tree_pages(self.header.root_page, self.header.height, false)
+            .map_err(fetch_to_append)?;
         let leaf = self.allocate_page()?;
         let buf = self.page_mut(leaf).map_err(fetch_to_append)?;
         node.init_leaf(buf, NULL_PAGE, NULL_PAGE);
@@ -901,6 +1063,15 @@ impl BtreeIndex {
         self.header.height = 1;
         self.header.values = 0;
         self.synced = false;
+        for p in old.drain() {
+            if self.private.contains(p) {
+                // Never published, so no snapshot can reach it. It stays private (stamped at the
+                // next publish) until reused.
+                self.free.push(p);
+            } else {
+                self.superseded.push(p);
+            }
+        }
         Ok(())
     }
 
@@ -1522,6 +1693,267 @@ mod tests {
                 assert_eq!(snap.load(k).expect("load"), *v);
             }
         }
+    }
+
+    /// A fresh writable index in its own temp dir (the dir must outlive the index).
+    fn reclaim_index(prefix: &str) -> (TempDir, BtreeIndex) {
+        let tmp = TempDir::with_prefix(prefix).expect("temp dir");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let idx = BtreeIndex::open_btx_file(tmp.path().join("idx"), &data_header, 32, false)
+            .expect("open");
+        (tmp, idx)
+    }
+
+    /// Pages reachable from the working tree.
+    fn live_pages(idx: &BtreeIndex) -> usize {
+        idx.tree_pages(idx.header.root_page, idx.header.height, false)
+            .expect("walk")
+            .drain()
+            .count()
+    }
+
+    /// Random writes, publishes, syncs and clears while a changing set of snapshots is held and
+    /// dropped out of order: every held snapshot keeps matching the model it was published with,
+    /// so no page a live snapshot can reach is ever reused.
+    #[test]
+    fn test_archive_btx_reclaim_never_reuses_visible_pages() {
+        use std::{collections::BTreeMap, ops::Bound};
+
+        let (_tmp, mut idx) = reclaim_index("test_archive_btx_reclaim_model");
+        let mut model: BTreeMap<[u8; 32], u64> = BTreeMap::new();
+        // Each held snapshot with the entries it was published with.
+        type Rows = Vec<(Vec<u8>, u64)>;
+        let mut held: Vec<(IndexSnapshot, Rows)> = Vec::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rand = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for round in 0..80 {
+            if round % 25 == 24 {
+                idx.clear().expect("clear");
+                model.clear();
+            }
+            for _ in 0..rand() % 200 {
+                let k = key_of(rand() % 6_000);
+                if rand() % 3 == 0 {
+                    assert_eq!(idx.remove(&k).expect("remove"), model.remove(&k).is_some());
+                } else {
+                    let v = rand();
+                    model.insert(k, v);
+                    idx.save(&k, v).expect("save");
+                }
+            }
+            if rand() % 5 == 0 {
+                idx.sync().expect("sync"); // a publish with no snapshot
+            }
+            let snap = idx.publish();
+            let expect: Vec<_> = model.iter().map(|(k, v)| (k.to_vec(), *v)).collect();
+            if rand() % 2 == 0 {
+                if held.len() == 6 {
+                    held.swap_remove((rand() % 6) as usize);
+                }
+                held.push((snap, expect.clone()));
+            }
+            for _ in 0..rand() % 3 {
+                if !held.is_empty() {
+                    held.swap_remove((rand() % held.len() as u64) as usize);
+                }
+            }
+            assert_eq!(scan_src(&idx, false, Bound::Unbounded, Bound::Unbounded), expect);
+            for (snap, want) in &held {
+                assert_eq!(&scan_src(snap, false, Bound::Unbounded, Bound::Unbounded), want);
+                let mut rev = want.clone();
+                rev.reverse();
+                assert_eq!(scan_src(snap, true, Bound::Unbounded, Bound::Unbounded), rev);
+                assert_eq!(snap.len(), want.len());
+            }
+        }
+    }
+
+    /// With no snapshot held, commit-per-write keeps the file within a few pages of the live tree;
+    /// a held snapshot makes it grow until dropped, after which its pages are reused.
+    #[test]
+    fn test_archive_btx_reclaim_bounds_growth() {
+        let (_tmp, mut idx) = reclaim_index("test_archive_btx_reclaim_growth");
+        for i in 0..20_000u64 {
+            idx.save(&key_of(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)), i).expect("save");
+            drop(idx.publish());
+        }
+        let live = live_pages(&idx);
+        let pages = idx.header.page_count as usize - 1;
+        assert!(pages <= live + 16, "{pages} pages for {live} live");
+
+        let held = idx.publish();
+        for i in 0..200u64 {
+            idx.save(&key_of(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)), i + 1).expect("overwrite");
+            drop(idx.publish());
+        }
+        let grown = idx.header.page_count as usize - 1;
+        assert!(grown >= pages + 200, "a held snapshot stops reuse ({pages} -> {grown})");
+        drop(held);
+        for i in 0..2_000u64 {
+            idx.save(&key_of(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)), i + 2).expect("overwrite");
+            drop(idx.publish());
+        }
+        assert!(
+            idx.header.page_count as usize - 1 <= grown + 2,
+            "the released pages are reused ({grown} -> {})",
+            idx.header.page_count - 1
+        );
+    }
+
+    /// Snapshots released out of order. S1's pages partly survive into S2 and S3, and some are
+    /// replaced only after S2 (which is dropped first): they must stay unreused while S1 lives, as
+    /// must S3's while S3 lives, through heavy churn — byte-identical pages.
+    #[test]
+    fn test_archive_btx_reclaim_out_of_order_release() {
+        let (_tmp, mut idx) = reclaim_index("test_archive_btx_reclaim_order");
+        // Ordered keys, so a key range is a leaf range (`key_of` hashes).
+        let key_of = |i: u64| -> [u8; 32] {
+            let mut k = [0_u8; 32];
+            k[..8].copy_from_slice(&i.to_be_bytes());
+            k
+        };
+        let pages_of = |idx: &BtreeIndex, snap: &IndexSnapshot| -> Vec<(u32, Vec<u8>)> {
+            let mut walk =
+                idx.tree_pages(idx.header.root_page, idx.header.height, false).expect("walk");
+            walk.drain().map(|p| (p, snap.page(p).expect("page").to_vec())).collect()
+        };
+        let unchanged = |snap: &IndexSnapshot, pages: &[(u32, Vec<u8>)]| {
+            for (p, bytes) in pages {
+                assert_eq!(snap.page(*p).expect("page"), &bytes[..], "page {p} of a live snapshot");
+            }
+        };
+        let churn = |idx: &mut BtreeIndex, keys: std::ops::Range<u64>, v: u64| {
+            for i in keys {
+                idx.save(&key_of(i), i + v).expect("save");
+            }
+            drop(idx.publish());
+        };
+        for i in 0..3_000u64 {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        let s1 = idx.publish();
+        let s1_pages = pages_of(&idx, &s1);
+        churn(&mut idx, 0..1_000, 1); // S1's leaves for 1_000.. survive into the next state
+        let s2 = idx.publish();
+        for i in 1_000..2_000u64 {
+            idx.save(&key_of(i), i + 2).expect("save"); // replaces S1 pages only after S2
+        }
+        let s3 = idx.publish();
+        let s3_pages = pages_of(&idx, &s3);
+        drop(s2);
+        for round in 3..30u64 {
+            churn(&mut idx, 0..3_000, round * 10);
+        }
+        unchanged(&s1, &s1_pages);
+        unchanged(&s3, &s3_pages);
+        drop(s1);
+        for round in 30..60u64 {
+            churn(&mut idx, 0..3_000, round * 10);
+        }
+        unchanged(&s3, &s3_pages);
+        assert_eq!(s3.load(&key_of(1_500)).expect("load"), 1_502);
+    }
+
+    /// `clear` retires the old tree: a snapshot from before it stays intact, and once that is
+    /// dropped the old pages are reused rather than the file growing.
+    #[test]
+    fn test_archive_btx_clear_retires_old_tree() {
+        let (_tmp, mut idx) = reclaim_index("test_archive_btx_clear_reclaim");
+        for i in 0..3_000u64 {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        let before = idx.publish();
+        idx.clear().expect("clear");
+        for i in 0..50u64 {
+            idx.save(&key_of(100_000 + i), i).expect("save");
+            drop(idx.publish());
+        }
+        assert_eq!(before.len(), 3_000);
+        assert_eq!(before.load(&key_of(2_999)).expect("old snapshot intact"), 2_999);
+        drop(before);
+        let high = idx.header.page_count;
+        for i in 0..3_000u64 {
+            idx.save(&key_of(i), i).expect("refill");
+            if i % 100 == 99 {
+                drop(idx.publish());
+            }
+        }
+        assert!(
+            idx.header.page_count <= high + 4,
+            "old tree reused ({high} -> {})",
+            idx.header.page_count
+        );
+    }
+
+    /// A clean reopen recovers the unreachable pages as free (reused before the file grows); a
+    /// tree whose walk fails (a duplicated child pointer) gets no free pages at all.
+    #[test]
+    fn test_archive_btx_reopen_recovers_free_pages() {
+        let tmp = TempDir::with_prefix("test_archive_btx_reopen_free").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let garbage = {
+            let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            for round in 0..5u64 {
+                for i in 0..3_000u64 {
+                    idx.save(&key_of(i), i + round).expect("save");
+                }
+                let _held = idx.publish(); // dropped at the end of the round
+                for i in 0..3_000u64 {
+                    idx.save(&key_of(i), i + round + 1).expect("save");
+                }
+            }
+            idx.header.page_count as usize - 1 - live_pages(&idx)
+        }; // clean close
+        assert!(garbage > 10, "the workload leaves garbage ({garbage})");
+        {
+            let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen");
+            assert_eq!(idx.free.len(), garbage, "every unreachable page is free");
+            let pages = idx.header.page_count;
+            for i in 0..3_000u64 {
+                idx.save(&key_of(i), i).expect("overwrite");
+                if i % 300 == 299 {
+                    drop(idx.publish());
+                }
+            }
+            assert_eq!(idx.header.page_count, pages, "free pages are reused before the file grows");
+            assert_eq!(idx.load(&key_of(2_999)).expect("load"), 2_999);
+        }
+
+        // Duplicate the root's first child pointer (CRC re-stamped so the open accepts the root).
+        let file = dir.join("index.btx");
+        let root =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("ro").header.root_page;
+        let mut bytes = std::fs::read(&file).expect("read");
+        let node = Node::new(32);
+        {
+            let page = &mut bytes[root as usize * PAGE_SIZE..(root as usize + 1) * PAGE_SIZE];
+            assert!(!node.is_leaf(page));
+            let first = node.internal_child(page, 0);
+            node.set_internal_child(page, 1, first);
+            add_crc32_nonzero(page);
+        }
+        std::fs::write(&file, &bytes).expect("write");
+        let idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen");
+        assert!(idx.free.is_empty(), "a failed walk frees nothing");
+    }
+
+    /// A rebuild truncates every page, so it is refused while a snapshot is alive.
+    #[test]
+    fn test_archive_btx_reset_refused_with_live_snapshot() {
+        let (_tmp, mut idx) = reclaim_index("test_archive_btx_reset_pinned");
+        idx.save(&key_of(1), 1).expect("save");
+        let snap = idx.publish();
+        assert!(idx.rebuild_from(std::iter::empty::<([u8; 32], u64)>()).is_err());
+        assert_eq!(snap.load(&key_of(1)).expect("snapshot intact"), 1);
+        drop(snap);
+        idx.rebuild_from(std::iter::empty::<([u8; 32], u64)>()).expect("rebuild once released");
+        assert!(idx.is_empty());
     }
 
     /// A published snapshot never changes: later overwrites, removes, inserts, a clear and new
