@@ -68,6 +68,14 @@ async fn disconnected_request_io_does_not_score_peer() -> eyre::Result<()> {
     Ok(())
 }
 
+/// A permitted advertised endpoint for record fixtures that never bind or dial it.
+fn record_endpoint() -> Multiaddr {
+    Multiaddr::empty()
+        .with(libp2p::multiaddr::Protocol::Ip4([192, 0, 2, 1].into()))
+        .with(libp2p::multiaddr::Protocol::Udp(8000))
+        .with(libp2p::multiaddr::Protocol::QuicV1)
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
@@ -3179,7 +3187,7 @@ async fn test_kad_retention_rejects_unrelated_records() -> eyre::Result<()> {
     let unrelated = NodeRecord::build(
         domain,
         unrelated_network.public().into(),
-        create_multiaddr(None),
+        record_endpoint(),
         None,
         |data| unrelated_bls.sign(data),
     );
@@ -4049,7 +4057,7 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
             let record = NodeRecord::build(
                 domain,
                 netkey.public().into(),
-                create_multiaddr(None),
+                record_endpoint(),
                 None,
                 |data| bls.sign(data),
             );
@@ -5155,7 +5163,7 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let local_network_key = key_config.worker_network_keypair(0);
     let worker_0_key = publisher_key_config.worker_network_keypair(0);
     let worker_1_key = publisher_key_config.worker_network_keypair(1);
-    let worker_0_address = create_multiaddr(None);
+    let worker_0_address = record_endpoint();
     let worker_0_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(0)),
         worker_0_key.public().into(),
@@ -5166,7 +5174,7 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let worker_1_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(1)),
         worker_1_key.public().into(),
-        create_multiaddr(None),
+        record_endpoint(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
     );
@@ -5290,7 +5298,7 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
 
         let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let outsider_record =
-            NodeRecord::build(domain, outsider_netkey, create_multiaddr(None), None, |data| {
+            NodeRecord::build(domain, outsider_netkey, record_endpoint(), None, |data| {
                 outsider_keypair.sign(data)
             });
         kad_store.put(kad::Record {

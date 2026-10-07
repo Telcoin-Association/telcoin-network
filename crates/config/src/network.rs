@@ -15,8 +15,11 @@ use std::{
     num::NonZeroUsize,
     time::Duration,
 };
-use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tn_types::{BlsPublicKey, BootstrapServer, Multiaddr, Round, WorkerId};
 use tracing::warn;
+
+mod quic;
+pub use quic::QuicConfig;
 
 impl ConfigTrait for NetworkConfig {}
 
@@ -58,6 +61,56 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Optional local listener and advertised endpoint mappings, independent of node identities.
+    endpoints: EndpointMappings,
+}
+
+/// Independent endpoint configuration for the primary and each worker transport identity.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointMappings {
+    /// Primary mapping; absence preserves the node-info address and listener environment override.
+    primary: Option<EndpointMapping>,
+    /// Worker mappings keyed by their own worker id; unknown ids fail node startup.
+    workers: BTreeMap<WorkerId, EndpointMapping>,
+}
+
+impl EndpointMappings {
+    /// Optional primary endpoint mapping.
+    pub fn primary(&self) -> Option<&EndpointMapping> {
+        self.primary.as_ref()
+    }
+
+    /// Configured worker endpoint mappings.
+    pub fn workers(&self) -> &BTreeMap<WorkerId, EndpointMapping> {
+        &self.workers
+    }
+}
+
+/// A local bind address and an ordered list of externally reachable endpoints.
+///
+/// Advertised endpoints accept IP or operator-configured DNS over UDP/QUIC v1. Resolution is
+/// bounded and performed once at process startup, before any network task is spawned.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointMapping {
+    /// Optional local bind address; listener environment overrides retain precedence.
+    #[serde(default)]
+    listen: Option<Multiaddr>,
+    /// Preferred endpoint first, with at most four resolved IP endpoints across the list.
+    advertise: Vec<Multiaddr>,
+}
+
+impl EndpointMapping {
+    /// The configured bind address, if present.
+    pub fn listen(&self) -> Option<&Multiaddr> {
+        self.listen.as_ref()
+    }
+
+    /// Ordered operator-supplied advertised endpoints, before DNS resolution.
+    pub fn advertise(&self) -> &[Multiaddr] {
+        &self.advertise
+    }
 }
 
 impl NetworkConfig {
@@ -96,6 +149,11 @@ impl NetworkConfig {
     /// Return explicit deployment limits for source admission, when configured.
     pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
         self.source_admission.as_ref()
+    }
+
+    /// Endpoint mappings for the primary and every independently keyed worker.
+    pub fn endpoints(&self) -> &EndpointMappings {
+        &self.endpoints
     }
 
     /// Return the startup peer-readiness budget for each primary and worker network.
@@ -490,55 +548,6 @@ impl Default for SyncConfig {
             // 600 * 100ms = 60 seconds of passive polling before actively re-driving a request.
             consensus_header_catch_up_poll_interval: Duration::from_millis(100),
             consensus_header_catch_up_max_no_progress: 600,
-        }
-    }
-}
-
-/// Configure the quic transport for libp2p.
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(default)]
-pub struct QuicConfig {
-    /// Timeout for the initial handshake when establishing a connection.
-    /// The actual timeout is the minimum of this and the [`Config::max_idle_timeout`].
-    pub handshake_timeout: Duration,
-    /// Maximum duration of inactivity in ms to accept before timing out the connection.
-    pub max_idle_timeout: u32,
-    /// Period of inactivity before sending a keep-alive packet.
-    /// Must be set lower than the idle_timeout of both
-    /// peers to be effective.
-    ///
-    /// See [`quinn::TransportConfig::keep_alive_interval`] for more
-    /// info.
-    pub keep_alive_interval: Duration,
-    /// Maximum number of incoming bidirectional streams that may be open
-    /// concurrently by the remote peer.
-    pub max_concurrent_stream_limit: u32,
-    /// Max unacknowledged data in bytes that may be sent on a single stream.
-    pub max_stream_data: u32,
-    /// Max unacknowledged data in bytes that may be sent in total on all streams
-    /// of a connection.
-    pub max_connection_data: u32,
-    /// Answer every incoming QUIC connection attempt whose source address is not
-    /// validated with a QUIC Retry packet (RFC 9000 section 8.1) before the listener
-    /// creates connection state. The remote must echo the token from its address.
-    ///
-    /// Default `true`. Set `false` only as an operator rollback switch.
-    pub retry_unvalidated_incoming: bool,
-}
-
-impl Default for QuicConfig {
-    fn default() -> Self {
-        Self {
-            handshake_timeout: Duration::from_secs(65),
-            max_idle_timeout: 30 * 1_000, // 30s
-            keep_alive_interval: Duration::from_secs(5),
-            max_concurrent_stream_limit: 10_000,
-            // may need to increase these based on RTT
-            //
-            // maximum throughput = (buffer size / round-trip time)
-            max_stream_data: 50 * 1024 * 1024,      // 50MiB
-            max_connection_data: 100 * 1024 * 1024, // 100MiB
-            retry_unvalidated_incoming: true,
         }
     }
 }
