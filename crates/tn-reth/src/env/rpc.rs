@@ -318,7 +318,8 @@ impl RethEnv {
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
-        if let Err(e) = server.merge_configured(other) {
+        // `tn` is selected like reth's modules; it is in the default set and always on IPC.
+        if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
         // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
