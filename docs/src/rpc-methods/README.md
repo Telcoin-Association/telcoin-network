@@ -1,9 +1,27 @@
-# RPC Methods
+# Namespaces
 
-### Introduction
+Telcoin Network nodes serve the Ethereum JSON-RPC interface over HTTP, WebSocket and IPC, so wallets, dapps and tooling built for Ethereum can read the chain and submit transactions without changes.
 
-Telcoin Network, just like Ethereum, uses a JSON-RPC specification which allows software applications to interact with the blockchain - either by reading data or sending transactions to the blockchain.
+Methods are grouped into namespaces. A namespace is the prefix before the underscore in a method name: `eth_call` belongs to `eth`, `tn_getCurrentEpoch` to `tn`. An operator chooses which namespaces each transport serves with `--http.api` and `--ws.api`; [Enabling Namespaces](enabling-namespaces.md) explains the flags, the defaults and how to check what a node serves.
 
-Each Telcoin Network node runs code that implements a JSON-RPC specification, meaning there is a uniform set of methods users and developers can use to interact with the blockchain.
+| Namespace | On by default | Cost to serve | What it covers |
+| --- | --- | --- | --- |
+| [eth](eth/README.md) | yes | low | Ethereum-compatible chain, account, transaction, simulation and filter methods |
+| net | yes | low | Chain id, listening state and the worker network's peer count |
+| web3 | yes | low | Client version and Keccak-256 hashing |
+| rpc | yes | trivial | The namespaces the transport serves |
+| tn | yes | low to moderate (blocking reads are capped at 64 concurrent requests) | Telcoin Network consensus, epoch, validator and staking data |
+| debug | no, only when named | high | Raw block and transaction data and geth-style EVM tracing |
+| trace | no, only when named | high | Parity-style call traces, replays and trace filters |
 
-This uniform set of methods is laid out in this section. It should act as a reference point for users and developers alike.
+`debug` and `trace` re-execute historical transactions against archive state. One request can cost far more than an `eth_*` call, so they are never part of the default set or of `all`.
+
+## Recommended exposure
+
+| Node role | `--http.api` / `--ws.api` | Notes |
+| --- | --- | --- |
+| Core validator | `eth,net,web3` | Serve RPC only on a private or gateway interface; see [network topology](../getting-started/validator-operations.md#network-topology). Keep `eth`: observers forward `eth_sendRawTransaction` to a committee validator's advertised RPC endpoint. |
+| Public RPC (observer) | `eth,net,web3,rpc,tn` | The default set; no flag is needed. |
+| Private archive or indexer | `eth,net,web3,rpc,tn,debug,trace` | Keep behind authentication or a method allowlist, and size `--rpc.max-tracing-requests` for the host. |
+
+The JSON-RPC methods are documented per namespace in the sections below. Each page lists the parameters, the result, and a `curl` request with its response.
