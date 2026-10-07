@@ -30,6 +30,16 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_CONFIG` (equivalently `--config`) to a path backed by a
   ConfigMap volume. The gateway requires at least one upstream and will refuse
   to start without one.
+- **Healthcheck port** (`deployment.yaml`): the readiness URL is not on the
+  worker RPC. It is the `/health/workers` route of the node's healthcheck
+  listener, which the node opens only when started with `--healthcheck <port>`
+  (`HEALTHCHECK_TCP_PORT`); there is no default port. Replace
+  `<HEALTHCHECK_TCP_PORT>` in
+  `http://<node>:<HEALTHCHECK_TCP_PORT>/health/workers` with that port and make
+  sure the node's Service exposes it to the gateway pods. Until you do, the URL
+  does not parse and the gateway exits at startup. The listener is
+  unauthenticated and serves one connection at a time, so admit only the
+  gateways to it.
 
 ## Ports and endpoints
 
@@ -40,11 +50,16 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
   **separate** listener from the client port.
 
-The `terminationGracePeriodSeconds: 40` in the Deployment is deliberately larger
-than the gateway's own `--graceful-shutdown-timeout`
-(`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s) so the process has room
-to drain in-flight proxied requests before the kubelet escalates to SIGKILL. If
-you raise the gateway's drain timeout, raise this too.
+The container has a `preStop` hook that sleeps 5s before the kubelet sends
+SIGTERM. The gateway stops accepting connections as soon as SIGTERM arrives, so
+the sleep gives the endpoint controller and any load balancer time to stop
+routing new requests to a terminating pod. The
+`terminationGracePeriodSeconds: 40` in the Deployment covers the preStop sleep
+plus the gateway's own `--graceful-shutdown-timeout`
+(`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s), 36s in total with the
+gateway's 1s join margin, so the process has room to drain in-flight proxied
+requests before the kubelet escalates to SIGKILL. If you raise the gateway's
+drain timeout or the preStop sleep, raise this too.
 
 ## Metrics scraping (ServiceMonitor)
 

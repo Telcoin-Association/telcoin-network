@@ -21,10 +21,11 @@ spec:
         app.kubernetes.io/name: worker-gateway
         app.kubernetes.io/part-of: telcoin-network
     spec:
-      # Slightly longer than the gateway's own --graceful-shutdown-timeout
-      # (default 30s, WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT) so the process
-      # can finish draining in-flight proxied requests before the kubelet sends
-      # SIGKILL.
+      # Longer than the preStop sleep (5s) plus the gateway's own
+      # --graceful-shutdown-timeout (default 30s,
+      # WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT) so the process can finish
+      # draining in-flight proxied requests before the kubelet sends SIGKILL.
+      # The preStop hook runs inside this period.
       terminationGracePeriodSeconds: 40
       containers:
         - name: worker-gateway
@@ -43,8 +44,22 @@ spec:
             # from a ConfigMap (WORKER_GATEWAY_CONFIG / --config) instead.
             - name: WORKER_GATEWAY_UPSTREAM_RPC_URL
               value: "http://tn-worker.telcoin-network.svc.cluster.local:8545"
+            # Readiness comes from the healthcheck listener of the node that
+            # serves the RPC URL above, not from the worker RPC: the port the
+            # node was started with via --healthcheck (HEALTHCHECK_TCP_PORT),
+            # path /health/workers. The node has no default healthcheck port,
+            # so replace <HEALTHCHECK_TCP_PORT>; the gateway refuses to start
+            # until you do.
             - name: WORKER_GATEWAY_UPSTREAM_READINESS_URL
-              value: "http://tn-worker.telcoin-network.svc.cluster.local:8545/ready"
+              value: "http://tn-worker.telcoin-network.svc.cluster.local:<HEALTHCHECK_TCP_PORT>/health/workers"
+          lifecycle:
+            # Keep serving for 5s after the pod is marked for deletion so the
+            # endpoint controller and load balancers stop routing to it before
+            # SIGTERM closes the listener. Budget: 5s here plus the gateway's
+            # 30s drain (+1s join margin) = 36s, inside the 40s grace period.
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           ports:
             - name: rpc
               containerPort: 8545
