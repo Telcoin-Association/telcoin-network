@@ -58,6 +58,7 @@ use crate::archive::{
     },
     index::Index,
     pack::DataHeader,
+    page_set::PageSet,
 };
 
 /// Address space reserved for an index file's mapping (see
@@ -87,47 +88,6 @@ pub struct PageCrcReport {
     pub dirty: u64,
     /// Data pages whose non-zero CRC fails to match the payload — genuine corruption.
     pub corrupt: u64,
-}
-
-/// A set of page numbers as a dense bitset. Pages are numbered `1..page_count`, so a bit per page
-/// is compact, and the hot-path test/set is a single bit operation with no hashing.
-#[derive(Debug, Default)]
-struct PageSet {
-    words: Vec<u64>,
-}
-
-impl PageSet {
-    fn insert(&mut self, p: u32) {
-        let word = p as usize / 64;
-        if word >= self.words.len() {
-            self.words.resize(word + 1, 0);
-        }
-        self.words[word] |= 1 << (p % 64);
-    }
-
-    fn contains(&self, p: u32) -> bool {
-        self.words.get(p as usize / 64).is_some_and(|word| word & (1 << (p % 64)) != 0)
-    }
-
-    /// Empty the set, keeping its allocation.
-    fn clear(&mut self) {
-        self.words.fill(0);
-    }
-
-    /// Yield every page in ascending order, clearing each word as it is reached (consume it fully
-    /// to empty the set).
-    fn drain(&mut self) -> impl Iterator<Item = u32> + '_ {
-        self.words.iter_mut().enumerate().flat_map(|(i, word)| {
-            let mut bits = std::mem::take(word);
-            std::iter::from_fn(move || {
-                (bits != 0).then(|| {
-                    let bit = bits.trailing_zeros();
-                    bits &= bits - 1;
-                    (i * 64) as u32 + bit
-                })
-            })
-        })
-    }
 }
 
 /// A paged, mmap-backed on-disk B+tree "sortable index" over fixed `ksize`-byte keys → `u64` file
@@ -929,6 +889,7 @@ impl BtreeIndex {
     /// still flag it. Page 0 (the header) is written separately.
     fn crc_dirty_pages(&mut self) {
         for p in self.private.drain() {
+            let p = p as u32; // inserted as a u32 page number
             if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
                 if crc_is_zero(buf) {
                     // `crc_state` classifies pages, so stamp never-zero: a genuine CRC of 0 must
@@ -1064,6 +1025,7 @@ impl BtreeIndex {
         self.header.values = 0;
         self.synced = false;
         for p in old.drain() {
+            let p = p as u32; // inserted as a u32 page number
             if self.private.contains(p) {
                 // Never published, so no snapshot can reach it. It stays private (stamped at the
                 // next publish) until reused.
@@ -1401,23 +1363,6 @@ mod tests {
             short,
             "rejection leaves the file"
         );
-    }
-
-    #[test]
-    fn test_archive_btx_page_set() {
-        let mut set = PageSet::default();
-        for p in [1, 63, 64, 65, 200, 4_000] {
-            set.insert(p);
-        }
-        set.insert(64); // idempotent
-        assert!(
-            set.contains(63) && set.contains(4_000) && !set.contains(2) && !set.contains(9_999)
-        );
-        assert_eq!(set.drain().collect::<Vec<_>>(), vec![1, 63, 64, 65, 200, 4_000]);
-        assert!(!set.contains(1) && set.drain().next().is_none(), "drain empties the set");
-        set.insert(7);
-        set.clear();
-        assert!(!set.contains(7));
     }
 
     /// Overwrite `len` bytes at `offset` of a closed index file.
@@ -1820,7 +1765,7 @@ mod tests {
         let pages_of = |idx: &BtreeIndex, snap: &IndexSnapshot| -> Vec<(u32, Vec<u8>)> {
             let mut walk =
                 idx.tree_pages(idx.header.root_page, idx.header.height, false).expect("walk");
-            walk.drain().map(|p| (p, snap.page(p).expect("page").to_vec())).collect()
+            walk.drain().map(|p| (p as u32, snap.page(p as u32).expect("page").to_vec())).collect()
         };
         let unchanged = |snap: &IndexSnapshot, pages: &[(u32, Vec<u8>)]| {
             for (p, bytes) in pages {

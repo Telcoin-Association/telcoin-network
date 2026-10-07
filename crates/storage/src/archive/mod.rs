@@ -15,4 +15,5 @@ pub mod index;
 mod index_bench;
 pub mod pack;
 pub mod pack_iter;
+pub(crate) mod page_set;
 pub mod position_index;
