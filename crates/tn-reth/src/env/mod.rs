@@ -38,7 +38,7 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator},
     Address, SealedHeader, TaskManager, TaskSpawner,
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::{
     error::RestoredStateFloorError,
@@ -250,6 +250,33 @@ impl RethEnv {
                 Ok(Arc::new(forwarder))
             })
             .transpose()
+    }
+
+    /// Whether `eth_sendRawTransaction` and `eth_sendRawTransactionSync` are forwarded to the
+    /// `--forward-txs` targets instead of entering this node's pool.
+    pub fn forwards_transactions(&self) -> bool {
+        self.inner.tx_forwarder.is_some()
+    }
+
+    /// Warn, at most once per process, that `--forward-txs` is set on a committee member.
+    ///
+    /// The flag is meant for public RPC observers. On a committee member it still works, but
+    /// transactions submitted to this node's RPC skip its own pool and batches. This is never an
+    /// error. Called at the start of every epoch in which the node is a committee member, so a
+    /// node promoted after startup is warned too. Returns whether this call logged the warning.
+    pub fn warn_if_forwarding_on_committee_member(&self) -> bool {
+        let first = self
+            .inner
+            .tx_forwarder
+            .as_ref()
+            .is_some_and(|forwarder| forwarder.claim_committee_warning());
+        if first {
+            warn!(
+                target: "tn::rpc",
+                "--forward-txs is set on a committee member: RPC submissions bypass this node's pool"
+            );
+        }
+        first
     }
 
     /// Create a new Reth DB.

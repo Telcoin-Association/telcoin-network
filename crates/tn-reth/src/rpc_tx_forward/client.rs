@@ -30,7 +30,7 @@
 
 use std::{
     fmt,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
@@ -98,6 +98,8 @@ pub(crate) struct TxForwarder {
     started: Instant,
     /// When the last "all targets failed" warning was logged, in ms since `started`.
     last_unavailable_warn_ms: AtomicU64,
+    /// Whether the "set on a committee member" warning has been logged.
+    committee_warned: AtomicBool,
 }
 
 impl TxForwarder {
@@ -138,12 +140,19 @@ impl TxForwarder {
             timeouts: Timeouts::default(),
             started: Instant::now(),
             last_unavailable_warn_ms: AtomicU64::new(NEVER),
+            committee_warned: AtomicBool::new(false),
         })
     }
 
     /// The `--sanitize-txs` checks, or `None` when the precheck is the fee cap alone.
     pub(crate) const fn sanitize(&self) -> Option<SanitizeRules> {
         self.sanitize
+    }
+
+    /// Mark the committee-member warning as logged. `true` only for the first call, so the
+    /// caller logs it once however many epochs find the node in a committee.
+    pub(crate) fn claim_committee_warning(&self) -> bool {
+        !self.committee_warned.swap(true, Ordering::Relaxed)
     }
 
     /// Replace the production timeouts so tests run in milliseconds.

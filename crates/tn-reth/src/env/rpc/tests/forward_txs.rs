@@ -655,3 +655,39 @@ async fn test_fee_cap_applies_before_forward_with_sanitize() -> eyre::Result<()>
     assert_eq!(upstream.calls().len(), 1);
     Ok(())
 }
+
+/// The committee-member warning fires on the first call only, and never on a node that does
+/// not forward.
+#[tokio::test]
+async fn test_committee_member_warning_fires_once_and_only_when_forwarding() -> eyre::Result<()> {
+    let task_manager = TaskManager::default();
+    let upstream = FakeUpstream::start(Reply::Hash(B256::ZERO)).await?;
+    let forwarding_dir = TempDir::new()?;
+    let forwarding = forwarding_env(
+        Arc::new(test_genesis().into()),
+        &upstream.url,
+        0,
+        false,
+        Default::default(),
+        &task_manager,
+        &forwarding_dir,
+    )?;
+    let plain_dir = TempDir::new()?;
+    let plain = RethEnv::new_for_temp_chain_with_rpc_args(
+        Arc::new(test_genesis().into()),
+        plain_dir.path(),
+        &task_manager,
+        None,
+        Default::default(),
+    )?;
+
+    assert!(forwarding.forwards_transactions());
+    assert!(forwarding.warn_if_forwarding_on_committee_member(), "first call warns");
+    assert!(!forwarding.warn_if_forwarding_on_committee_member(), "later calls stay quiet");
+    // clones share the forwarder, so another worker's handle stays quiet too
+    assert!(!forwarding.clone().warn_if_forwarding_on_committee_member());
+
+    assert!(!plain.forwards_transactions());
+    assert!(!plain.warn_if_forwarding_on_committee_member(), "nothing to warn about");
+    Ok(())
+}
