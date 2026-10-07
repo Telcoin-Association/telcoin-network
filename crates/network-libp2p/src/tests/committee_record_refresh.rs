@@ -112,7 +112,7 @@ async fn cached_record_converges(network_type: NetworkType) -> eyre::Result<()> 
         MemDatabase::default(),
         _task_manager.get_spawner(),
         network_type,
-        create_multiaddr(None),
+        record_endpoint(),
         None,
     )?;
     let original = peer2.network.get_peer_record();

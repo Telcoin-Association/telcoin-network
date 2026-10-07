@@ -16,12 +16,13 @@ def gate_script():
     return textwrap.dedent(source.split("  ci-success:\n", 1)[1].split("        run: |\n", 1)[1])
 
 
-def execute(event, run_lanes, transport, script=None):
+def execute(event, run_lanes, transport, script=None, connection_limits="success"):
     lanes = ("adiri-test", "archive-mode-gate", "clippy", "fmt", "test")
     results = {name: {"result": "success" if run_lanes else "skipped"} for name in lanes}
     results.update({"ci-scope": {"result": "success", "outputs": {"run_lanes": str(run_lanes).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
-                    "transport-evidence": {"result": transport}})
+                    "transport-evidence": {"result": transport},
+                    "connection-limits-patch": {"result": connection_limits}})
     return subprocess.run(["bash", "-c", gate_script() if script is None else script],
                           env={"PATH": os.environ["PATH"], "EVENT_NAME": event, "RESULTS": json.dumps(results)},
                           capture_output=True)
@@ -39,6 +40,18 @@ class TransportGate(unittest.TestCase):
         for outcome in ("skipped", "cancelled", "failure"):
             with self.subTest(outcome=outcome):
                 self.assertNotEqual(execute("merge_group", True, outcome).returncode, 0)
+
+
+class ConnectionLimitsGate(unittest.TestCase):
+    def test_maintainer_keeps_patch_lane_required(self):
+        for outcome in ("skipped", "cancelled", "failure"):
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(execute("pull_request", False, "success", connection_limits=outcome).returncode, 0)
+
+    def test_merge_queue_requires_patch_lane_success(self):
+        for outcome in ("skipped", "cancelled", "failure"):
+            with self.subTest(outcome=outcome):
+                self.assertNotEqual(execute("merge_group", True, "success", connection_limits=outcome).returncode, 0)
 
 
 if __name__ == "__main__":
