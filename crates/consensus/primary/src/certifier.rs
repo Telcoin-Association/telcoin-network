@@ -440,14 +440,27 @@ impl<DB: Database> Certifier<DB> {
     /// This listens for new proposal notifications to exit early.
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
-    async fn spawn_header_proposal(self, header: Header) -> TaskResult {
-        // Grab this before the lock so quick exit after the lock if need to.
-        let new_proposal_noticer = self.new_proposal.subscribe();
+    ///
+    /// `new_proposal_noticer` must be subscribed to `new_proposal` before the task running this
+    /// method is spawned (see [`Self::run`]), so a later header's notification cannot land before
+    /// it exists.
+    async fn spawn_header_proposal(
+        self,
+        header: Header,
+        new_proposal_noticer: Noticer,
+    ) -> TaskResult {
         // Make sure other proposal's are shutdown and done before we check if
         // this header is already certified.  Any existing proposals should have been cancelled
         // before this call.
         let _guard = self.proposal_lock.lock().await;
         let header_digest = header.digest();
+        // a later header superseded this one while it waited for the lock. the select below
+        // polls its branches in random order, so without this check a superseded header could
+        // still spawn its vote requests
+        if new_proposal_noticer.noticed() {
+            debug!(target: "primary::certifier", %header_digest, "header superseded before its proposal started; skipping proposal");
+            return Ok(());
+        }
         if let Ok(Some(cert)) =
             self.config.node_storage().get::<ProposedCertificates>(&header_digest)
         {
@@ -586,6 +599,10 @@ impl<DB: Database> Certifier<DB> {
                     // cancel any outstanding proposals and vote requests
                     self.new_proposal.notify();
 
+                    // subscribe here, not in the task: `Notifier` does not latch, so the next
+                    // header's notify can land before this task is first polled
+                    let cancel = self.new_proposal.subscribe();
+
                     // spawn certifier task so new proposals can cancel
                     let certifier = self.clone();
                     self.task_spawner.spawn_task(
@@ -593,7 +610,7 @@ impl<DB: Database> Certifier<DB> {
                         async move {
                             // held until the task ends, however it ends
                             let _in_flight = in_flight;
-                            certifier.spawn_header_proposal(header).await
+                            certifier.spawn_header_proposal(header, cancel).await
                         },
                     );
                 },

@@ -678,6 +678,61 @@ async fn new_header_cancels_inflight() {
     }
 }
 
+/// A header superseded before its proposal task first runs never asks for a vote, and the header
+/// that superseded it is proposed and certified.
+///
+/// Both headers are queued before `run` starts, so `run` spawns both proposal tasks, and fires
+/// `new_proposal` for header 2, before either task runs. On the current-thread runtime tasks run in
+/// spawn order, so header 1's task takes `proposal_lock` first. A task that subscribed to
+/// `new_proposal` only once it ran would miss header 2's notification and propose header 1, whose
+/// held vote requests then keep the lock from header 2 for as long as they stay unanswered. Every
+/// vote request must instead be for header 2.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn header_superseded_before_its_task_runs_is_skipped() {
+    let (mut cx, certifier) = CertifierContext::unspawned(4);
+    let committee = cx.fixture.committee();
+    // distinct creation times give the two headers distinct digests
+    let header1 = cx.proposer().header_builder(&committee).created_at(1000).build();
+    let header2 = cx.proposer().header_builder(&committee).created_at(1001).build();
+    let h2_digest = header2.digest();
+    assert_ne!(header1.digest(), h2_digest, "precondition: two distinct headers");
+    let votes = cx.peer_votes(&header2);
+    let mut cert_rx = cx.subscribe_new_certificates();
+
+    let (tx_headers, rx_headers) = mpsc::channel(2);
+    tx_headers.send(header1).await.expect("queue header 1");
+    tx_headers.send(header2).await.expect("queue header 2");
+    let _run = tokio::spawn(certifier.run(rx_headers));
+
+    let responses = cx
+        .network
+        .respond(votes.len(), "both headers queued before run", |peer, request| {
+            let PrimaryRequest::Vote { header, .. } = request else {
+                unreachable!("respond passes only vote requests");
+            };
+            if header.digest() == h2_digest {
+                Reply::Vote(votes[peer].clone())
+            } else {
+                Reply::Hold
+            }
+        })
+        .await;
+    assert!(
+        responses.requests.iter().all(|request| request.header == h2_digest),
+        "every vote request must be for header 2: header 1 was superseded before its task ran"
+    );
+
+    let cert = tokio::time::timeout(STEP_TIMEOUT, cert_rx.recv())
+        .await
+        .expect("header 2 certified")
+        .expect("cert_rx channel open");
+    assert_eq!(cert.header().digest(), h2_digest, "the certificate must be for header 2");
+    let gossip = cx.network.next_publish("gossip of header 2's certificate").await;
+    assert!(gossip == certificate_gossip(cert).await, "the gossip must carry the certificate");
+    cx.network.assert_quiet("header 1 must never ask for a vote").await;
+    drop(tx_headers);
+}
+
 /// The identical header sent again while its proposal is in flight does not restart the proposal:
 /// no vote request is cancelled or sent again, and the certificate forms from votes received on
 /// both sides of the re-send.
@@ -1538,7 +1593,8 @@ async fn already_certified_header_is_republished() {
         .insert::<ProposedCertificates>(&header.digest(), &stored)
         .expect("record the header's certificate before it is proposed");
 
-    let proposal = tokio::spawn(certifier.clone().spawn_header_proposal(header));
+    let cancel = certifier.new_proposal.subscribe();
+    let proposal = tokio::spawn(certifier.clone().spawn_header_proposal(header, cancel));
     let gossip = cx.network.next_publish("already-certified header: first network command").await;
     assert!(
         gossip == certificate_gossip(stored).await,
@@ -1727,7 +1783,8 @@ async fn barrier_round(
     let header = cx.proposer_header();
     let votes = cx.peer_votes(&header);
     let cert_rx = cx.subscribe_new_certificates();
-    let proposal = tokio::spawn(certifier.spawn_header_proposal(header));
+    let cancel = certifier.new_proposal.subscribe();
+    let proposal = tokio::spawn(certifier.spawn_header_proposal(header, cancel));
     cx.network
         .respond(votes.len(), &format!("{context}: every peer votes"), |peer, _| {
             Reply::Vote(votes[peer].clone())
