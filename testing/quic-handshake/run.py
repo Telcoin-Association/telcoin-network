@@ -45,6 +45,8 @@ def validate_versions():
     """Do not mistake an independently resolved provider for the node's provider."""
     node = tomllib.loads((ROOT.parent.parent / "Cargo.lock").read_text())
     fixture = tomllib.loads((ROOT / "Cargo.lock").read_text())
+    # `cargo build --locked` also needs each `=` pin to name the version locked here.
+    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text()).get("dependencies", {})
     versions = {}
     for name in PINNED:
         expected = {p["version"] for p in node["package"] if p["name"] == name}
@@ -54,7 +56,16 @@ def validate_versions():
                 f"node/profile dependency drift: {name}: node {expected} != profile {actual}; "
                 "see testing/quic-handshake/README.md"
             )
-        versions[name] = next(iter(actual))
+        version = next(iter(actual))
+        requirement = manifest.get(name)
+        if isinstance(requirement, dict):
+            requirement = requirement.get("version")
+        if requirement != f"={version}":
+            raise ValueError(
+                f"profile pin drift: {name}: Cargo.toml requires {requirement!r}, lockfile has {version!r}; "
+                f"pin it as '={version}', see testing/quic-handshake/README.md"
+            )
+        versions[name] = version
     return versions
 
 
@@ -151,7 +162,7 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--output", type=Path)
     mode.add_argument("--check-versions", action="store_true",
-                      help="only compare the pinned crates with the node's lockfile, as CI Success does")
+                      help="only check the pinned crates against the node's lockfile and Cargo.toml, as CI Success does")
     parser.add_argument("--samples", type=int, default=1000)
     args = parser.parse_args()
     if args.check_versions:
