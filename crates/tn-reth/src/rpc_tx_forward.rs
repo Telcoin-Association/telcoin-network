@@ -19,8 +19,13 @@
 //!
 //! The client sees what it would see talking to the validator directly: the validator's hash,
 //! or its JSON-RPC error object with code, message and data unchanged. The node's own answers
-//! are the fee-cap error (the precheck) and, when no target answers, one fixed `-32603`
+//! are the precheck's errors and, when no target answers, one fixed `-32603`
 //! "transaction submission unavailable" error.
+//!
+//! The precheck is the `--rpc.txfeecap` guard. With `--sanitize-txs` it also decodes the
+//! transaction, recovers its signer and checks the TN type allowlist and the chain id, so junk
+//! never reaches a target. For a transaction with a single defect, each refusal is the error
+//! object reth's own submission path returns for the same bytes ([`SanitizeRules`]).
 //!
 //! Known limitation: a forwarded transaction is not in this node's pool, so
 //! `eth_getTransactionByHash` and the `pending` nonce on this node reflect it only once it is
@@ -32,12 +37,18 @@ use async_trait::async_trait;
 use futures::StreamExt as _;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_chain_state::CanonStateSubscriptions as _;
+use reth_primitives_traits::SignedTransaction;
 use reth_rpc_eth_api::{
     helpers::{EthTransactions, LoadReceipt},
     EthApiTypes,
 };
-use reth_rpc_eth_types::{block::convert_transaction_receipt, EthApiError};
-use tn_types::{Bytes, B256};
+use reth_rpc_eth_types::{
+    block::convert_transaction_receipt, EthApiError, RpcInvalidTransactionError,
+};
+use tn_types::{
+    batch_allowlisted_tx_type, Bytes, Decodable2718 as _, PooledTransaction, TransactionTrait as _,
+    B256,
+};
 
 use crate::{
     metrics::{RpcTxForwardMetrics, RpcTxForwardOutcome},
@@ -96,11 +107,16 @@ impl<Api> EthSubmitForwarded<Api> {
 
     /// The checks a submission must pass before any target sees it.
     ///
-    /// The `--rpc.txfeecap` guard, exactly as a non-forwarding node runs it: with the default
-    /// cap of 0 nothing is decoded and the client's bytes go out untouched, and with a cap the
-    /// transaction is decoded, without signer recovery, to price it.
+    /// Without `--sanitize-txs`, the `--rpc.txfeecap` guard exactly as a non-forwarding node runs
+    /// it: with the default cap of 0 nothing is decoded and the client's bytes go out untouched,
+    /// and with a cap the transaction is decoded, without signer recovery, to price it. With
+    /// `--sanitize-txs`, [`SanitizeRules::check`], which runs the same cap check on its one
+    /// decode.
     fn precheck(&self, bytes: &[u8]) -> Result<(), EthApiError> {
-        self.cap.enforce(bytes)
+        match self.forwarder.sanitize() {
+            Some(rules) => rules.check(bytes, self.cap),
+            None => self.cap.enforce(bytes),
+        }
     }
 }
 
@@ -162,6 +178,58 @@ where
                 Err(EthApiError::TransactionConfirmationTimeout { hash, duration }.into())
             }
         }
+    }
+}
+
+/// The `--sanitize-txs` checks: what a submission must be before it is forwarded.
+///
+/// The checks mirror what a non-forwarding node does to the same bytes: reth's
+/// `recover_raw_transaction` (decode, then signer recovery), the pool's transaction type gate
+/// and its chain id check. Each refusal is the error object reth returns for that case, so a
+/// client whose transaction has a single defect gets the answer a non-forwarding node gives for
+/// the same bytes. Reth's pool also checks the data size, the gas limit and the tip against the
+/// fee cap between the type gate and the chain id check, and those stay with the validator, so a
+/// transaction with several defects can get a different error here than from a validator; both
+/// refuse it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SanitizeRules {
+    /// The chain id of this node's chain. A transaction that names another chain is refused.
+    chain_id: u64,
+}
+
+impl SanitizeRules {
+    /// The checks for a node on chain `chain_id`.
+    pub(crate) const fn new(chain_id: u64) -> Self {
+        Self { chain_id }
+    }
+
+    /// Check one raw submission, decoding it once.
+    ///
+    /// The order matches reth's submission path, with the fee cap ahead of signer recovery as
+    /// the cap guard documents (`crate::rpc_fee_cap`): empty bytes, undecodable bytes, the fee
+    /// cap, an invalid or high-s signature, a type outside the batch allowlist, then a chain id
+    /// that is present and differs from this node's. A legacy transaction without a chain id
+    /// passes, as it does in reth's pool validator.
+    fn check(&self, raw: &[u8], cap: TxFeeCapWei) -> Result<(), EthApiError> {
+        if raw.is_empty() {
+            return Err(EthApiError::EmptyRawTransactionData);
+        }
+        let tx = PooledTransaction::decode_2718_exact(raw)
+            .map_err(|_| EthApiError::FailedToDecodeSignedTransaction)?;
+        cap.enforce_decoded(&tx)?;
+        let tx = SignedTransaction::try_into_recovered(tx)
+            .map_err(|_| EthApiError::InvalidTransactionSignature)?;
+        if !batch_allowlisted_tx_type(tx.inner()) {
+            return Err(EthApiError::InvalidTransaction(
+                RpcInvalidTransactionError::TxTypeNotSupported,
+            ));
+        }
+        if tx.chain_id().is_some_and(|chain_id| chain_id != self.chain_id) {
+            return Err(EthApiError::InvalidTransaction(
+                RpcInvalidTransactionError::InvalidChainId,
+            ));
+        }
+        Ok(())
     }
 }
 

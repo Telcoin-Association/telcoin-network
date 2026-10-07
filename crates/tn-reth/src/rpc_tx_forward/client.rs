@@ -47,7 +47,7 @@ use tn_types::{Bytes, B256};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::target::ForwardTargets;
+use super::{target::ForwardTargets, SanitizeRules};
 use crate::metrics::{RpcTxForwardFailure, RpcTxForwardMetrics, RpcTxForwardOutcome};
 
 /// The longest one target gets to answer one submission, including the wait for a connection
@@ -90,6 +90,8 @@ const NEVER: u64 = u64::MAX;
 pub(crate) struct TxForwarder {
     /// The targets in configured (failover) order.
     targets: Vec<Target>,
+    /// The `--sanitize-txs` checks, or `None` when the precheck is the fee cap alone.
+    sanitize: Option<SanitizeRules>,
     /// The attempt timeout, submit budget and demotion cooldown.
     timeouts: Timeouts,
     /// The zero point of the millisecond clock behind the demotion and warning timestamps.
@@ -101,11 +103,17 @@ pub(crate) struct TxForwarder {
 impl TxForwarder {
     /// Build one lazily connecting HTTP client per target.
     ///
-    /// `max_request_bytes` is the node's own `--rpc.max-request-size`, so any submission this
-    /// node accepted fits the forwarded request. Building an `https://` client installs rustls's
+    /// `sanitize` carries the `--sanitize-txs` checks the submission handler runs before
+    /// forwarding. `max_request_bytes` is the node's own `--rpc.max-request-size`; the client
+    /// allows [`REQUEST_SIZE_HEADROOM`] more, since the forwarded envelope can be a few bytes
+    /// larger than the request this node accepted. Building an `https://` client installs rustls's
     /// `ring` crypto provider as the process default when none is installed yet (jsonrpsee does
     /// this to pick one of the two providers the build enables).
-    pub(crate) fn new(targets: &ForwardTargets, max_request_bytes: u32) -> eyre::Result<Self> {
+    pub(crate) fn new(
+        targets: &ForwardTargets,
+        sanitize: Option<SanitizeRules>,
+        max_request_bytes: u32,
+    ) -> eyre::Result<Self> {
         let targets = targets
             .as_slice()
             .iter()
@@ -126,10 +134,16 @@ impl TxForwarder {
         RpcTxForwardMetrics::init(targets.len());
         Ok(Self {
             targets,
+            sanitize,
             timeouts: Timeouts::default(),
             started: Instant::now(),
             last_unavailable_warn_ms: AtomicU64::new(NEVER),
         })
+    }
+
+    /// The `--sanitize-txs` checks, or `None` when the precheck is the fee cap alone.
+    pub(crate) const fn sanitize(&self) -> Option<SanitizeRules> {
+        self.sanitize
     }
 
     /// Replace the production timeouts so tests run in milliseconds.
@@ -272,7 +286,10 @@ impl TxForwarder {
 impl fmt::Debug for TxForwarder {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // the clients' own Debug prints the target URL
-        f.debug_struct("TxForwarder").field("targets", &self.targets.len()).finish_non_exhaustive()
+        f.debug_struct("TxForwarder")
+            .field("targets", &self.targets.len())
+            .field("sanitize", &self.sanitize)
+            .finish_non_exhaustive()
     }
 }
 

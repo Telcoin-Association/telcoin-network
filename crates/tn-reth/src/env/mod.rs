@@ -43,7 +43,7 @@ use tracing::{debug, info};
 use crate::{
     error::RestoredStateFloorError,
     evm::TnEvmConfig,
-    rpc_tx_forward::{TxForwardConfig, TxForwarder},
+    rpc_tx_forward::{SanitizeRules, TxForwardConfig, TxForwarder},
     traits::TelcoinNode,
     RethConfig, RethDb, WorkerTxPool, BASEFEE_ADDRESS,
 };
@@ -234,8 +234,13 @@ impl RethEnv {
             .targets
             .as_ref()
             .map(|targets| {
-                let forwarder =
-                    TxForwarder::new(targets, node_config.rpc.rpc_max_request_size_bytes())?;
+                let sanitize =
+                    config.sanitize.then(|| SanitizeRules::new(node_config.chain.chain.id()));
+                let forwarder = TxForwarder::new(
+                    targets,
+                    sanitize,
+                    node_config.rpc.rpc_max_request_size_bytes(),
+                )?;
                 info!(
                     target: "tn::rpc",
                     targets = targets.as_slice().len(),

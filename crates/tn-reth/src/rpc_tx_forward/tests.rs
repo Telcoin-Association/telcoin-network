@@ -142,7 +142,7 @@ fn http_response(status: &str, body: &str) -> String {
 /// A forwarder over `urls` in order, with a short attempt timeout.
 fn forwarder<S: AsRef<str>>(urls: &[S]) -> eyre::Result<TxForwarder> {
     let list = urls.iter().map(AsRef::as_ref).collect::<Vec<&str>>().join(",");
-    Ok(TxForwarder::new(&parse_forward_targets(&list)?, 1024 * 1024)?.with_timeouts(
+    Ok(TxForwarder::new(&parse_forward_targets(&list)?, None, 1024 * 1024)?.with_timeouts(
         Duration::from_millis(500),
         Duration::from_secs(5),
         Duration::from_secs(30),
@@ -384,7 +384,7 @@ async fn test_forward_request_at_node_limit_is_forwarded() -> eyre::Result<()> {
         r#"{{"jsonrpc":"2.0","id":0,"method":"eth_sendRawTransaction","params":["{unprefixed}"]}}"#
     );
     let node_limit = u32::try_from(incoming.len())?;
-    let forwarder = TxForwarder::new(&parse_forward_targets(&upstream.url)?, node_limit)?;
+    let forwarder = TxForwarder::new(&parse_forward_targets(&upstream.url)?, None, node_limit)?;
 
     assert_eq!(forwarder.submit(&raw_tx()).await, Ok(hash));
     assert_eq!(upstream.calls(), vec![raw_tx_call()]);
@@ -526,6 +526,6 @@ async fn test_forward_single_probe_after_cooldown() -> eyre::Result<()> {
 #[tokio::test]
 async fn test_https_target_client_builds() -> eyre::Result<()> {
     let targets = parse_forward_targets("https://node1.telcoin.network,https://[::1]:9443")?;
-    TxForwarder::new(&targets, 1024 * 1024)?;
+    TxForwarder::new(&targets, None, 1024 * 1024)?;
     Ok(())
 }
