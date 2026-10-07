@@ -324,7 +324,7 @@ networking is TN's own libp2p; the reth payload builder and pruning are likewise
   registered on every enabled transport.
 - **Transport limits** (`src/rpc_server_args.rs`, CLI-overridable defaults): 500 max connections,
   15 MB max request, 160 MB max response, 1024 subscriptions per connection, plus reth's default
-  `eth_call` gas cap, a 1-ether (1 TEL) RPC transaction fee cap, tracing/filter/proof limits, and
+  `eth_call` gas cap, no RPC transaction fee cap, tracing/filter/proof limits, and
   an eth-proof window.
 - The RPC stack is built over the worker's pool and the `WorkerNetwork` shim (`src/worker.rs`),
   which serves `net`/`web3` info from TN's libp2p peer count. No engine/auth namespace exists.
@@ -352,6 +352,26 @@ unspecified IP literals in every spelling, plus the names reserved to resolve lo
 each refusal once at `warn` with the advertising validator's BLS key. Operators of single-host
 deployments opt back in with the `allow_private_forward_targets` parameter. The check never
 resolves DNS, so a hostname that resolves to an internal address is still dialed.
+
+### Operator-configured submission forwarding
+
+`--forward-txs` (`src/rpc_server_args.rs`) turns a node, normally a public RPC observer, into a relay for raw transaction submissions.
+`get_rpc_server` (`src/env/rpc.rs`) then installs `EthSubmitForwarded` (`src/rpc_tx_forward.rs`) in place of the fee-cap guard on every transport that serves `eth`.
+`eth_sendRawTransaction` runs the local precheck and forwards the client's bytes to an ordered list of validator RPC targets; the local pool is never touched, so the node-record path above never sees the transaction.
+`eth_sendRawTransactionSync` forwards a plain `eth_sendRawTransaction` and waits for the receipt on this node's canonical stream, so a target only ever receives `eth_sendRawTransaction`.
+Operator documentation: `docs/src/getting-started/public-rpc-nodes.md`.
+
+What the node trusts and what it guards:
+
+- The targets come from local configuration, not from a committee member, so `ForwardTargetPolicy` does not apply and a private address is a normal target.
+- The target list is private configuration. `ForwardTarget` and `TxForwardConfig` redact it in `Debug` (`src/rpc_tx_forward/target.rs`), the startup `info!` logs only the target count, and the forwarder's `debug!` lines and the `tn_reth_rpc_tx_forward_target_failures_total` metric name a target by its index. The HTTP connector underneath (hyper-util `client::legacy::connect::http`) does log each new connection's resolved `ip:port` at `debug`, which the default `--log.file.filter debug` writes to the log file; stdout logs it too when it runs at `debug` (`-vvvv` or `RUST_LOG`); adding `hyper_util::client::legacy::connect=info` to both `--log.file.filter` and `--log.stdout.filter` keeps it out. That is hygiene: the firewall in front of the target, not the secrecy of its address, is what protects it. When no target answers, the client receives one fixed error, `-32603` `transaction submission unavailable` with no `data`, which carries neither a target nor timing detail.
+- A target's reply is the client's answer. A hash or a JSON-RPC error object (code, message, raw `data`) passes through unchanged and ends the attempt; the node does not check that the hash matches the bytes it sent. A compromised target can therefore answer clients with anything an RPC endpoint could, so a node trusts its targets as far as a client trusts the validator behind them.
+- Failover happens only below the JSON-RPC layer: a failed connection, no reply within `ATTEMPT_TIMEOUT` (5 s, including the wait for a request slot), a non-2xx status other than 413, a body over `MAX_RESPONSE_BYTES` (64 KiB), or a 2xx body that is not a JSON-RPC reply. Each such failure demotes the target for `DEMOTION_COOLDOWN` (30 s); when that runs out, one submission probes the target in its configured place while the others keep trying it last. An attempt the budget cuts short of `ATTEMPT_TIMEOUT` neither demotes nor counts against its target. One submission spends at most `SUBMIT_BUDGET` (15 s), each target holds at most `MAX_INFLIGHT_PER_TARGET` (128) requests, and a list holds at most `MAX_TARGETS` (8) entries (`src/rpc_tx_forward/client.rs`, `target.rs`).
+- The forwarded request is capped at the node's own `--rpc.max-request-size` plus `REQUEST_SIZE_HEADROOM` (1 KiB), since the rebuilt envelope can be a few bytes larger than the request the node accepted. A request that is still too large (refused by that cap, or answered with HTTP 413 by a target with a lower limit) ends the submission with the oversized-request error `-32007`, counted as `upstream_error`, and charges no target, rather than being uploaded to every target in turn.
+- Transport is jsonrpsee's `HttpClient`, with rustls for `https://` targets. A plain `http://` target carries signed transactions in cleartext, and URL userinfo with a password goes out as a basic-auth header; a username without a password is refused at startup, since it would be dropped. TN adds no authentication or encryption of its own.
+- Without `--sanitize-txs`, the only local check is the `--rpc.txfeecap` guard, which with the default cap of 0 decodes nothing, so any bytes within the request size limit reach the target. With it, the precheck decodes the transaction, recovers the signer, applies the batch type allowlist (`tn_types::batch_allowlisted_tx_type`) and checks the chain id, and refuses with reth's own error objects before any target sees the transaction.
+- On a committee member the flag is not refused: the node logs one `warn` per process (`crates/node/src/manager/node/start_epoch.rs`), and that node's RPC submissions bypass its own pool.
+- One `Arc<TxForwarder>`, built in `RethEnv::new`, is shared by every worker's RPC server, so all lanes share one target order, one demotion state, one connection pool and one metrics set. Nothing is epoch-scoped, no task is spawned, and clients connect lazily, so an unreachable target does not fail startup.
 
 ### `SYSTEM_ADDRESS` is unreachable by users
 
@@ -430,9 +450,12 @@ Block production must be a pure function of certified consensus output. Concrete
 | `src/evm/tel_precompile/` | Native TEL issuance at `0x…07e1` (see its README). |
 | `src/evm/bls_precompile/` | BLS12-381 signature verification at `0x…b151`. |
 | `src/forward.rs` | `WorkerRpcForwarder`: observer → committee transaction forwarding. |
-| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected) and the epoch-close system-call gas gauges. |
+| `src/metrics.rs` | Block-building drop counters (`unrecoverable` alertable, `invalid` expected), the epoch-close system-call gas gauges, and the `--forward-txs` submission counters. |
 | `src/payload.rs` | `TNPayload` and `BuildArguments`: consensus data shaped for execution. |
 | `src/rpc_server_args.rs` | RPC CLI argument subset and transport-limit defaults. |
+| `src/rpc_tx_forward.rs` | `EthSubmitForwarded`: the `--forward-txs` handlers for `eth_sendRawTransaction` and `eth_sendRawTransactionSync` (local precheck, forward, local receipt wait for the sync method). |
+| `src/rpc_tx_forward/target.rs` | `--forward-txs` parsing (`parse_forward_targets`), `ForwardTargets` (at most 8, deduplicated after normalization, redacted `Debug`) and `TxForwardConfig`. |
+| `src/rpc_tx_forward/client.rs` | `TxForwarder`: one jsonrpsee `HttpClient` per target, ordered failover with demotion, the time, size and concurrency bounds, and the fixed unavailable error. |
 | `src/snapshot.rs` | State-pack export (`PinnedStateView`) and verified restore (`SnapshotRestorer`). |
 | `src/system_calls.rs` | `sol!` bindings for `ConsensusRegistry`/`WorkerConfigs`, `SYSTEM_ADDRESS`, registry address, `EpochState`. |
 | `src/traits.rs` | `TelcoinNode` node-type wiring and the fail-loud `TNExecution` shim. |
