@@ -434,8 +434,6 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
-    /// Configured external address retained for periodic record signing.
-    external_addr: Multiaddr,
     /// The `(chain, role)` domain this node signs and verifies records for.
     ///
     /// Folded into every [NodeRecord] signature so a record signed for one
@@ -690,14 +688,8 @@ where
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic_config(|mut config| {
-                config.handshake_timeout = network_config.quic_config().handshake_timeout;
-                config.max_idle_timeout = network_config.quic_config().max_idle_timeout;
-                config.keep_alive_interval = network_config.quic_config().keep_alive_interval;
-                config.max_concurrent_stream_limit =
-                    network_config.quic_config().max_concurrent_stream_limit;
-                config.max_stream_data = network_config.quic_config().max_stream_data;
-                config.max_connection_data = network_config.quic_config().max_connection_data;
+            .with_quic_config(|config| {
+                let mut config = network_config.quic_config().apply_to(config);
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -745,7 +737,6 @@ where
             key_config,
             task_spawner,
             node_record,
-            external_addr,
             record_domain,
             published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             metrics: SwarmMetrics::new_for(&network_type),
@@ -757,6 +748,28 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+    }
+
+    /// Configure ordered externally reachable endpoints independently of the swarm's listeners.
+    ///
+    /// Must be called before running the network. Uses the same signed schema and domain as a
+    /// single-address record and replaces the constructor's external address completely.
+    pub fn with_advertised_addresses(mut self, addresses: Vec<Multiaddr>) -> NetworkResult<Self> {
+        let record = NodeRecord::build_multi(
+            self.record_domain,
+            self.node_record.info.pubkey.clone(),
+            addresses,
+            self.node_record.info.rpc.clone(),
+            |data| self.key_config.request_signature_direct(data),
+        )?;
+        self.node_record.info.multiaddrs.iter().for_each(|address| {
+            self.swarm.remove_external_address(address);
+        });
+        record.info.multiaddrs.iter().cloned().for_each(|address| {
+            self.swarm.add_external_address(address);
+        });
+        self.node_record = record;
+        Ok(self)
     }
 
     /// Create and sign this node's [NodeRecord].
@@ -778,13 +791,8 @@ where
     /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
     /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
     fn refresh_own_record(&mut self) {
-        self.node_record = Self::create_node_record(
-            self.record_domain,
-            self.external_addr.clone(),
-            &self.key_config,
-            self.node_record.info.pubkey.clone(),
-            self.node_record.info.rpc.clone(),
-        );
+        self.node_record
+            .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
         self.provide_our_data();
     }
 
@@ -813,11 +821,7 @@ where
         let (pubkey, node_record) =
             NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?;
 
-        // reject records advertising an implausible number of addresses: a legitimate record
-        // carries a single address, so a large set is only ever an attempt to inflate the
-        // publisher's stored multiaddrs without bound (GHSA-29v6-gvv5-45gx). This bounds the
-        // attacker-chosen data admitted per record; the per-peer `MAX_MULTIADDRS_PER_PEER` cap is
-        // what bounds accumulation across repeated records.
+        // The shared decoder validates nonempty, bounded IP/QUIC endpoints before BLS verification.
         if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
             warn!(
                 target: "network-kad",
@@ -996,34 +1000,25 @@ where
                 peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
-                    |exceeded| {
-                        // the pending hook runs before the remote is authenticated, so only a
-                        // refusal at establishment (the per-peer ceiling) carries a peer id
-                        let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                            InboundDenial::EstablishedPerPeerLimit
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
+                    // the pending hook runs before the remote is authenticated, so only a
+                    // refusal at establishment (the per-peer ceiling) carries a peer id
+                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
+                        InboundDenial::EstablishedPerPeerLimit
+                    });
+                    self.metrics.record_inbound_denied(&denial);
+                    self.inbound_denial_warning
+                        .record(tokio::time::Instant::now())
+                        .into_iter()
+                        .for_each(|denied| {
+                            warn!(
+                                target: "network",
+                                denied,
+                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                "inbound connections keep being refused by connection limits"
+                            );
                         });
-                        self.metrics.record_inbound_denied(&denial);
-                        debug!(
-                            target: "network",
-                            ?denial,
-                            limit = exceeded.limit(),
-                            %exceeded,
-                            "inbound connection refused by connection limit"
-                        );
-                        self.inbound_denial_warning
-                            .record(tokio::time::Instant::now())
-                            .into_iter()
-                            .for_each(|denied| {
-                                warn!(
-                                    target: "network",
-                                    denied,
-                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                    "inbound connections keep being refused by connection limits"
-                                );
-                            });
-                    },
-                );
+                });
             }
             // other events handled by peer manager and other behaviors
             _ => {}
