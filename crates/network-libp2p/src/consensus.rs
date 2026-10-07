@@ -731,13 +731,8 @@ where
         // create swarm
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
-            .with_quic_config(|mut config| {
-                config.handshake_timeout = quic_config.handshake_timeout;
-                config.max_idle_timeout = quic_config.max_idle_timeout;
-                config.keep_alive_interval = quic_config.keep_alive_interval;
-                config.max_concurrent_stream_limit = quic_config.max_concurrent_stream_limit;
-                config.max_stream_data = quic_config.max_stream_data;
-                config.max_connection_data = quic_config.max_connection_data;
+            .with_quic_config(|config| {
+                let mut config = quic_config.apply_to(config);
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -1047,34 +1042,25 @@ where
                 peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
-                    |exceeded| {
-                        // the pending hook runs before the remote is authenticated, so only a
-                        // refusal at establishment (the per-peer ceiling) carries a peer id
-                        let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                            InboundDenial::EstablishedPerPeerLimit
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
+                    // the pending hook runs before the remote is authenticated, so only a
+                    // refusal at establishment (the per-peer ceiling) carries a peer id
+                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
+                        InboundDenial::EstablishedPerPeerLimit
+                    });
+                    self.metrics.record_inbound_denied(&denial);
+                    self.inbound_denial_warning
+                        .record(tokio::time::Instant::now())
+                        .into_iter()
+                        .for_each(|denied| {
+                            warn!(
+                                target: "network",
+                                denied,
+                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                "inbound connections keep being refused by connection limits"
+                            );
                         });
-                        self.metrics.record_inbound_denied(&denial);
-                        debug!(
-                            target: "network",
-                            ?denial,
-                            limit = exceeded.limit(),
-                            %exceeded,
-                            "inbound connection refused by connection limit"
-                        );
-                        self.inbound_denial_warning
-                            .record(tokio::time::Instant::now())
-                            .into_iter()
-                            .for_each(|denied| {
-                                warn!(
-                                    target: "network",
-                                    denied,
-                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                    "inbound connections keep being refused by connection limits"
-                                );
-                            });
-                    },
-                );
+                });
             }
             // other events handled by peer manager and other behaviors
             _ => {}
