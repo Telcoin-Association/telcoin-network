@@ -998,7 +998,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         network_events: mut cvv_network_events,
         network,
     } = peer1;
-    let _ = tokio::spawn(async move { network.run().await });
+    drop(tokio::spawn(async move { network.run().await }));
 
     // start honest nvv network
     let NetworkPeer {
@@ -1007,7 +1007,7 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         network_events: mut nvv_network_events,
         network,
     } = peer2;
-    let _ = tokio::spawn(async move { network.run().await });
+    drop(tokio::spawn(async move { network.run().await }));
 
     // start swarm listening on default any address
     cvv.start_listening(config_1.primary_address()).await?;
