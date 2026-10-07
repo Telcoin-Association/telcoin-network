@@ -616,7 +616,18 @@ async fn public_population_admission_preserves_protocol_and_ip_bans() {
                 endpoint.get_remote_address(),
             )
             .is_err());
-        let other: PeerId = population_keys(202).primary_network_public_key().into();
+        manager.register_disconnected(&peer_id);
+
+        // An IP ban requires completed bans for two distinct peers from that address.
+        let second_peer: PeerId = population_keys(202).primary_network_public_key().into();
+        let connection =
+            ConnectionType::IncomingConnection { multiaddr: endpoint.get_remote_address().clone() };
+        assert!(manager.register_peer_connection(&second_peer, connection));
+        manager.process_penalty(second_peer, Penalty::Fatal);
+        manager.register_disconnected(&second_peer);
+
+        let other: PeerId = population_keys(203).primary_network_public_key().into();
+        assert!(!manager.peer_banned(&other));
         assert!(manager
             .handle_pending_inbound_connection(
                 ConnectionId::new_unchecked(203),
