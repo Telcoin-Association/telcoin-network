@@ -7,6 +7,7 @@ use crate::{
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
     types::RecordDomain,
+    StreamError,
 };
 use assert_matches::assert_matches;
 use eyre::eyre;
@@ -981,6 +982,144 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     assert_eq!(
         score_before, score_after,
         "unsupported-protocol failures must not change the peer's score (before={score_before}, after={score_after})"
+    );
+
+    Ok(())
+}
+
+/// Build and run `config`'s network for `role`, keyed and addressed for that role, and
+/// start it listening. Returns the network's handle and its event receiver.
+async fn spawn_listening_network(
+    config: &ConsensusConfig<MemDatabase>,
+    role: NetworkType,
+    task_manager: &TaskManager,
+) -> eyre::Result<(
+    NetworkHandle<TestWorkerRequest, TestWorkerResponse>,
+    mpsc::Receiver<NetworkEvent<TestWorkerRequest, TestWorkerResponse>>,
+)> {
+    let (keypair, address) = match role {
+        NetworkType::Primary => {
+            (config.key_config().primary_network_keypair().clone(), config.primary_address())
+        }
+        NetworkType::Worker(id) => (
+            config.key_config().worker_network_keypair(id),
+            config.worker_address(id).ok_or_else(|| eyre!("no address for worker {id}"))?,
+        ),
+    };
+    let (tx, events) = mpsc::channel(10);
+    let network = ConsensusNetworkMemoryDB::<TestWorkerRequest, TestWorkerResponse>::new(
+        config.network_config(),
+        tx,
+        config.key_config().clone(),
+        keypair,
+        MemDatabase::default(),
+        task_manager.get_spawner(),
+        role,
+        address.clone(),
+        None,
+    )?;
+    let handle = network.network_handle();
+    tokio::spawn(async move {
+        network.run().await.expect("network run failed!");
+    });
+    handle.start_listening(address).await?;
+    Ok((handle, events))
+}
+
+/// A sync stream opened to a peer that does not serve the opener's sync protocol fails at
+/// open under the swarm's lazy substream negotiation (`V1Lazy`).
+///
+/// `V1Lazy` hands an outbound substream back before the listener confirms the protocol, so
+/// a rejection would otherwise surface only on the caller's first read, after the open had
+/// "succeeded". `TNStreamProtocol::upgrade_outbound` finishes the negotiation with a
+/// zero-length read; the rejection then reaches `classify_outbound` as an `Apply` error and
+/// is classified `(StreamFailure::UnsupportedProtocol, StreamError::UpgradeFailed)`, the
+/// penalty-exempt pair. The caller observes the `UpgradeFailed` half (callers read it as
+/// "this peer does not speak sync") and the connection is neither dropped nor scored.
+///
+/// A primary and a worker connect at the transport but serve different per-role sync
+/// protocols (`/tn-primary-sync-*` vs `/tn-worker-0-sync-*`). An open from the same primary
+/// to another primary is the positive control.
+#[tokio::test]
+async fn lazy_negotiation_sync_stream_to_wrong_role_fails_at_open() -> eyre::Result<()> {
+    let mut network_config = NetworkConfig::default();
+    network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    let all_nodes =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(network_config).build();
+    let mut authorities = all_nodes.authorities();
+    let config_1 = authorities.next().expect("first authority").consensus_config();
+    let config_2 = authorities.next().expect("second authority").consensus_config();
+    let config_3 = authorities.next().expect("third authority").consensus_config();
+    let task_manager = TaskManager::default();
+
+    // the opener and the same-role target are primaries. the cross-role target is a worker
+    // of a third authority: a validator's primary and worker share one BLS key, and the
+    // open addresses its target by BLS key.
+    let (opener, _opener_events) =
+        spawn_listening_network(&config_1, NetworkType::Primary, &task_manager).await?;
+    let (primary, mut primary_events) =
+        spawn_listening_network(&config_2, NetworkType::Primary, &task_manager).await?;
+    let (worker, _worker_events) =
+        spawn_listening_network(&config_3, NetworkType::Worker(DEFAULT_WORKER_ID), &task_manager)
+            .await?;
+    let opener_bls = config_1.key_config().primary_public_key();
+    let primary_bls = config_2.key_config().primary_public_key();
+    let worker_bls = config_3.key_config().primary_public_key();
+    let worker_peer_id = worker.local_peer_id().await?;
+    let worker_addr = worker.listeners().await?.first().expect("worker listen addr").clone();
+
+    opener
+        .add_explicit_peer(primary_bls, config_2.primary_networkkey(), config_2.primary_address())
+        .await?;
+    opener
+        .add_explicit_peer(
+            worker_bls,
+            config_3.key_config().worker_network_public_key(DEFAULT_WORKER_ID),
+            worker_addr,
+        )
+        .await?;
+    opener.dial_by_bls(primary_bls).await?;
+    opener.dial_by_bls(worker_bls).await?;
+
+    // the same-role listener hands an inbound stream up only once it resolves the opener's
+    // BLS key; the cross-role connection is transport-only (no kad across roles)
+    let max_time = Duration::from_secs(5);
+    wait_for_peer_discovery(&primary, opener_bls, max_time).await?;
+    wait_until(max_time, "transport connection across roles establishes", || async {
+        Ok(opener.connected_peer_ids().await?.contains(&worker_peer_id))
+    })
+    .await?;
+
+    // the worker does not serve the primary's sync protocol: the open itself fails, as an
+    // unsupported protocol, instead of returning a stream that fails on its first read
+    let score_before = opener.peer_score(worker_peer_id).await?.expect("worker tracked");
+    let rejected = timeout(max_time, opener.open_stream(worker_bls)).await??;
+    assert_matches!(
+        rejected,
+        Err(NetworkError::Stream(StreamError::UpgradeFailed)),
+        "a cross-role sync open must fail at open with UpgradeFailed"
+    );
+
+    // unsupported protocol is honest role skew: the worker stays connected and unscored
+    assert!(
+        opener.connected_peer_ids().await?.contains(&worker_peer_id),
+        "a rejected sync open must not drop the connection"
+    );
+    assert_eq!(
+        opener.peer_score(worker_peer_id).await?,
+        Some(score_before),
+        "a rejected sync open must not change the peer's score"
+    );
+
+    // positive control: the same-role open negotiates and the listener receives the stream
+    let _stream = timeout(max_time, opener.open_stream(primary_bls))
+        .await??
+        .expect("same-role sync open must succeed");
+    let inbound = timeout(max_time, primary_events.recv()).await?;
+    assert_matches!(
+        inbound,
+        Some(NetworkEvent::InboundStream { peer, .. }) if peer == opener_bls,
+        "the same-role listener must receive the opener's stream"
     );
 
     Ok(())
