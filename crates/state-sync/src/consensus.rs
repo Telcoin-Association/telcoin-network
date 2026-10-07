@@ -31,10 +31,10 @@ const RETRY_WARN_EVERY: u64 = 20;
 /// Seconds between attempts at the current epoch's partial pack while no local pack can decode that
 /// epoch (see [`PartialPackGate`]).
 ///
-/// Fixed, with no growth: each attempt opens at most `MAX_EPOCH_SYNC_PROBES` (3) sync streams, a
-/// peer that refuses is cached unsyncable for the epoch, and a peer that fails moves to the back of
-/// the probe order (`order_probe_peers`), so successive attempts work through the peer set until
-/// they reach one that serves. A growing backoff would only delay reaching that peer.
+/// Fixed, with no growth: each attempt walks every connected peer not cached unsyncable by a
+/// full-pack probe, one at a time, and stops at the first that serves; a peer that failed is
+/// probed after every fresh peer on the next attempt (`order_probe_peers`). A growing backoff
+/// would only delay reaching the serving peer.
 const PARTIAL_PACK_RETRY_SECS: u64 = 30;
 
 enum ConsensusHeaderResult {
