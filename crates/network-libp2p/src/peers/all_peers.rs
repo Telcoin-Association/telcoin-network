@@ -896,6 +896,16 @@ impl AllPeers {
         self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
     }
 
+    /// Confirm that the current stored identity belongs to this transport peer.
+    /// A reverse-index entry alone is insufficient if its record was lost or rotated.
+    pub(super) fn peer_has_confirmed_identity(&self, peer_id: &PeerId) -> bool {
+        self.bls_by_peer_id.get(peer_id).is_some_and(|bls_key| {
+            self.peers.get(&PeerIdentity::Confirmed(*bls_key)).is_some_and(|peer| {
+                peer.bls_public_key() == Some(*bls_key) && peer.peer_id() == Some(*peer_id)
+            })
+        })
+    }
+
     /// Boolean indicating if this peer is a validator in the previous, current, or next committee.
     ///
     /// Membership spans all three tracked committees so peers from the just-completed epoch are not
@@ -1288,5 +1298,49 @@ impl AllPeers {
     #[cfg(test)]
     pub(super) fn insert_unidentified(&mut self, peer_id: PeerId, peer: Peer) {
         self.peers.insert(PeerIdentity::Unidentified(peer_id), peer);
+    }
+}
+#[cfg(test)]
+mod admission_identity_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_config::KeyConfig;
+    use tn_types::BlsKeypair;
+
+    #[test]
+    fn confirmed_admission_identity_requires_matching_stored_record() {
+        let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed(
+            [211; 32],
+        )));
+        let other = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed(
+            [212; 32],
+        )));
+        let bls_key = keys.primary_public_key();
+        let peer_id: PeerId = keys.primary_network_public_key().into();
+        let mut peers =
+            AllPeers::new(Duration::from_secs(15), 100, 100, Arc::new(ScoreConfig::default()));
+        peers.bls_by_peer_id.insert(peer_id, bls_key);
+        assert!(!peers.peer_has_confirmed_identity(&peer_id), "an index entry is not a record");
+        peers.upsert_peer(bls_key, keys.primary_network_public_key(), Vec::new());
+        assert!(peers.peer_has_confirmed_identity(&peer_id));
+        peers.peers.remove(&PeerIdentity::Confirmed(bls_key));
+        assert_eq!(peers.bls_for_peer(&peer_id), Some(bls_key));
+        assert!(!peers.peer_has_confirmed_identity(&peer_id));
+        peers.upsert_peer(bls_key, keys.primary_network_public_key(), Vec::new());
+        peers
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_key))
+            .expect("confirmed fixture record exists")
+            .update_net(bls_key, other.primary_network_public_key(), Vec::new());
+        assert!(
+            !peers.peer_has_confirmed_identity(&peer_id),
+            "a rotated record is not this transport"
+        );
+        peers
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_key))
+            .expect("confirmed fixture record exists")
+            .update_net(other.primary_public_key(), keys.primary_network_public_key(), Vec::new());
+        assert!(!peers.peer_has_confirmed_identity(&peer_id), "the stored BLS key must match");
     }
 }

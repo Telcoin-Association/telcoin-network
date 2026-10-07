@@ -501,6 +501,8 @@ impl PeerManager {
 
         // Emit peer metrics via tracing for OpenTelemetry export.
         let connected_count = self.peers.connected_peer_ids().count();
+        // Keep this conservative qualification gauge: unresolved identities are nonimportant.
+        // Admission counts confirmed ordinary identities separately, within the aggregate target.
         let ordinary =
             self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count();
         let observers = self
@@ -654,7 +656,7 @@ impl PeerManager {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
-    /// Check whether a newly registered connection exceeds the ordinary population ceiling.
+    /// Check confirmed ordinary population and the aggregate provisional-admission bound.
     ///
     /// The established count includes this connection. Pending dials use transport budgets.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
@@ -669,10 +671,45 @@ impl PeerManager {
                 }
             },
             |limit| {
-                self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count()
-                    > limit.get()
+                self.confirmed_ordinary_peer_count() > limit.get()
+                    || self.peers.connected_peer_ids().count() > self.config.target_num_peers
             },
         )
+    }
+
+    /// Unresolved identities consume aggregate headroom until a valid record classifies them.
+    fn peer_is_confirmed_ordinary(&self, peer_id: &PeerId) -> bool {
+        self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)
+    }
+
+    fn confirmed_ordinary_peer_count(&self) -> usize {
+        self.peers.connected_peer_ids().filter(|peer| self.peer_is_confirmed_ordinary(peer)).count()
+    }
+
+    /// Enforce public limits after connection acceptance, identity promotion, or trust changes.
+    pub(super) fn enforce_public_peer_limits(&mut self) {
+        if self.public_peer_limit.is_some() {
+            self.prune_connected_peers();
+        }
+    }
+
+    pub(super) fn record_population_rejection(&self, peer_id: PeerId) {
+        if let Some(limit) = self.public_peer_limit {
+            let ordinary_count = self.confirmed_ordinary_peer_count();
+            let connected_count = self.peers.connected_peer_ids().count();
+            let decision_basis = match () {
+                () if ordinary_count > limit.get()
+                    && connected_count > self.config.target_num_peers =>
+                {
+                    "ordinary_and_aggregate"
+                }
+                () if ordinary_count > limit.get() => "ordinary",
+                () => "aggregate",
+            };
+            tracing::debug!(target: "network::identity", event = "population_rejected",
+                ?peer_id, ordinary_count, connected_count, ordinary_limit = limit.get(),
+                aggregate_target = self.config.target_num_peers, decision_basis);
+        }
     }
 
     /// Set an ordinary-peer admission ceiling while preserving aggregate connection limits.
@@ -888,15 +925,16 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
-        let public_excess = self.public_peer_limit.map_or(0, |limit| {
+        let mut public_excess = self.public_peer_limit.map_or(0, |limit| {
             connected_peers
                 .iter()
-                .filter(|(peer_id, _)| !self.peer_is_important(peer_id))
+                .filter(|(peer_id, _)| self.peer_is_confirmed_ordinary(peer_id))
                 .count()
                 .saturating_sub(limit.get())
         });
-        let mut excess_peer_count =
-            connected_peers.len().saturating_sub(self.config.target_num_peers).max(public_excess);
+        let mut aggregate_excess =
+            connected_peers.len().saturating_sub(self.config.target_num_peers);
+        let mut excess_peer_count = aggregate_excess.max(public_excess);
         if excess_peer_count == 0 {
             // no excess peers
             return;
@@ -912,14 +950,31 @@ impl PeerManager {
 
         // disconnect peers until excess_peer_count is 0 or no more peers
         for peer_id in ready_to_prune {
-            if excess_peer_count > 0 {
+            let ordinary = self.peer_is_confirmed_ordinary(&peer_id);
+            if excess_peer_count > 0 && (aggregate_excess > 0 || ordinary) {
+                let decision_basis = match () {
+                    () if aggregate_excess > 0 && public_excess > 0 && ordinary => {
+                        "ordinary_and_aggregate"
+                    }
+                    () if aggregate_excess > 0 => "aggregate",
+                    () => "ordinary",
+                };
+                tracing::debug!(target: "network::identity", event = "population_pruned",
+                    ?peer_id, ordinary_count = self.confirmed_ordinary_peer_count(),
+                    connected_count = self.peers.connected_peer_ids().count(),
+                    aggregate_target = self.config.target_num_peers, public_excess,
+                    aggregate_excess, decision_basis);
                 self.disconnect_peer(peer_id, true);
-                excess_peer_count = excess_peer_count.saturating_sub(1);
+                aggregate_excess = aggregate_excess.saturating_sub(1);
+                public_excess = public_excess.saturating_sub(usize::from(ordinary));
+                excess_peer_count = aggregate_excess.max(public_excess);
                 continue;
             }
 
             // excess peers 0 - finish pruning
-            break;
+            if excess_peer_count == 0 {
+                break;
+            }
         }
     }
 
@@ -1276,6 +1331,7 @@ impl PeerManager {
                 .map(|peer| peer.multiaddrs_snapshot().into_iter().collect::<Vec<_>>())
                 .unwrap_or_default();
             self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);
+            self.enforce_public_peer_limits();
         }
     }
 
@@ -1336,6 +1392,7 @@ impl PeerManager {
                 "confirming self-advertised connected peer identity"
             );
             self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+            self.enforce_public_peer_limits();
         } else {
             tracing::debug!(target: "network::identity", event = "advertisement_classified",
                 ?source, ?advertised, ?bls_key, outcome = "not_self_owned");
@@ -1421,6 +1478,7 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        self.enforce_public_peer_limits();
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.

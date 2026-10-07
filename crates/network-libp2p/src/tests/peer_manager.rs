@@ -37,6 +37,605 @@ fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManage
     )
 }
 
+fn population_keys(seed: u8) -> KeyConfig {
+    KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])))
+}
+
+fn population_info(keys: &KeyConfig, address: Multiaddr) -> NetworkInfo {
+    NetworkInfo {
+        pubkey: keys.primary_network_public_key(),
+        multiaddrs: vec![address],
+        timestamp: now(),
+        rpc: None,
+    }
+}
+
+fn population_endpoint(seed: u8) -> ConnectedPoint {
+    let address: Multiaddr =
+        format!("/ip4/192.0.2.{seed}/udp/9000/quic-v1").parse().expect("test QUIC endpoint");
+    ConnectedPoint::Listener { local_addr: address.clone(), send_back_addr: address }
+}
+
+fn create_population_manager() -> PeerManager {
+    let mut manager = PeerManager::new(
+        population_keys(0).primary_network_public_key().into(),
+        tn_config::PeerConfig { target_num_peers: 86, ..Default::default() },
+        crate::metrics::PeerManagerMetrics::new_for(&crate::types::NetworkType::Primary),
+    );
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(64));
+    manager
+}
+
+/// Drive established handler admission and the production swarm event, before any BLS record.
+fn establish_population_peer(
+    manager: &mut PeerManager,
+    keys: &KeyConfig,
+    seed: u8,
+) -> (PeerId, ConnectionId, ConnectedPoint) {
+    let peer_id: PeerId = keys.primary_network_public_key().into();
+    let connection_id = ConnectionId::new_unchecked(usize::from(seed));
+    let endpoint = population_endpoint(seed);
+    assert!(manager
+        .handle_established_inbound_connection(
+            connection_id,
+            peer_id,
+            endpoint.get_remote_address(),
+            endpoint.get_remote_address(),
+        )
+        .is_ok());
+    manager.on_swarm_event(libp2p::swarm::FromSwarm::ConnectionEstablished(
+        libp2p::swarm::ConnectionEstablished {
+            peer_id,
+            connection_id,
+            endpoint: &endpoint,
+            failed_addresses: &[],
+            other_established: 0,
+        },
+    ));
+    (peer_id, connection_id, endpoint)
+}
+
+fn confirm_population_peer(manager: &mut PeerManager, keys: &KeyConfig, seed: u8) {
+    manager.add_self_advertised_peer(
+        keys.primary_network_public_key().into(),
+        keys.primary_public_key(),
+        population_info(keys, population_endpoint(seed).get_remote_address().clone()),
+    );
+}
+
+/// A prelearned ordinary identity lets the quota fixture test the authenticated boundary.
+fn register_confirmed_peer(
+    manager: &mut PeerManager,
+    seed: u8,
+    address: Option<Multiaddr>,
+) -> PeerId {
+    let keys = population_keys(seed);
+    let address = address.unwrap_or_else(|| create_multiaddr(None));
+    let peer_id: PeerId = keys.primary_network_public_key().into();
+    manager.add_restored_peer(keys.primary_public_key(), population_info(&keys, address.clone()));
+    assert!(manager.register_peer_connection(
+        &peer_id,
+        ConnectionType::IncomingConnection { multiaddr: address },
+    ));
+    peer_id
+}
+
+/// Two unresolved committee transports must not displace ordinary63 below the declared64.
+#[tokio::test]
+async fn delayed_protected_identity_preserves_public_admission() {
+    let mut manager = create_population_manager();
+    let protected = [population_keys(201), population_keys(202)];
+    manager.update_committees(
+        HashSet::new(),
+        protected.iter().map(KeyConfig::primary_public_key).collect(),
+        HashSet::new(),
+    );
+    collect_all_events(&mut manager);
+    protected.iter().enumerate().for_each(|(offset, keys)| {
+        let (peer_id, _, _) = establish_population_peer(&mut manager, keys, 201 + offset as u8);
+        assert!(!manager.peer_is_important(&peer_id));
+        assert_eq!(manager.peer_to_bls(&peer_id), None);
+    });
+    (1..=63).for_each(|seed| {
+        let keys = population_keys(seed);
+        let (peer_id, _, _) = establish_population_peer(&mut manager, &keys, seed);
+        assert!(manager.is_connected(&peer_id), "ordinary{seed} was prematurely rejected");
+        assert!(!manager.peer_banned(&peer_id));
+        assert!(collect_all_events(&mut manager).iter().any(|event| {
+            matches!(event, PeerEvent::PeerConnected(id, _, _) if *id == peer_id)
+        }));
+        confirm_population_peer(&mut manager, &keys, seed);
+    });
+    assert_eq!(manager.connected_peers().len(), 65);
+    manager.heartbeat();
+    assert!(!collect_all_events(&mut manager).iter().any(|event| matches!(
+        event,
+        PeerEvent::DisconnectPeer(_) | PeerEvent::DisconnectPeerX(_, _)
+    )));
+    protected.iter().enumerate().for_each(|(offset, keys)| {
+        confirm_population_peer(&mut manager, keys, 201 + offset as u8);
+        let peer_id: PeerId = keys.primary_network_public_key().into();
+        assert!(manager.peer_is_important(&peer_id));
+        assert!(manager.is_connected(&peer_id));
+        assert!(!manager.peer_banned(&peer_id));
+        assert_eq!(manager.connected_peers().len(), 65);
+    });
+}
+
+enum PopulationConfirmation {
+    SelfOwned,
+    Expired,
+    Restored,
+}
+
+/// Ordinary identity confirmation enforces64 without waiting for a heartbeat.
+#[tokio::test]
+async fn public_identity_promotion_prunes_immediately() {
+    [
+        PopulationConfirmation::SelfOwned,
+        PopulationConfirmation::Expired,
+        PopulationConfirmation::Restored,
+    ]
+    .into_iter()
+    .for_each(|confirmation| {
+        let mut manager = create_population_manager();
+        (1..=64).for_each(|seed| {
+            let keys = population_keys(seed);
+            establish_population_peer(&mut manager, &keys, seed);
+            confirm_population_peer(&mut manager, &keys, seed);
+        });
+        collect_all_events(&mut manager);
+        let keys = population_keys(65);
+        let (peer_id, _, _) = establish_population_peer(&mut manager, &keys, 65);
+        assert!(manager.is_connected(&peer_id));
+        assert!(!manager.peer_banned(&peer_id));
+        let info = population_info(&keys, population_endpoint(65).get_remote_address().clone());
+        match confirmation {
+            PopulationConfirmation::SelfOwned => {
+                manager.add_self_advertised_peer(peer_id, keys.primary_public_key(), info);
+                assert!(manager.known_peers.is_empty());
+            }
+            PopulationConfirmation::Expired => {
+                assert!(manager
+                    .can_confirm_expired_public_identity(&peer_id, &keys.primary_public_key()));
+                manager.confirm_expired_public_identity(peer_id, keys.primary_public_key(), info);
+                assert!(manager.known_peers.is_empty());
+            }
+            PopulationConfirmation::Restored => {
+                manager.add_restored_peer(keys.primary_public_key(), info);
+            }
+        }
+        assert_eq!(manager.connected_peers().len(), 64);
+        assert_eq!(
+            collect_all_events(&mut manager)
+                .iter()
+                .filter(|event| matches!(event, PeerEvent::DisconnectPeerX(_, _)))
+                .count(),
+            1,
+        );
+    });
+}
+
+/// A preconfirmed65th ordinary peer still fails before PeerConnected below aggregate86.
+#[tokio::test]
+async fn confirmed_public_overflow_rejects_before_publication() {
+    let mut manager = create_population_manager();
+    (1..=64).for_each(|seed| {
+        let keys = population_keys(seed);
+        establish_population_peer(&mut manager, &keys, seed);
+        confirm_population_peer(&mut manager, &keys, seed);
+    });
+    collect_all_events(&mut manager);
+    let keys = population_keys(65);
+    confirm_population_peer(&mut manager, &keys, 65);
+    let (peer_id, _, _) = establish_population_peer(&mut manager, &keys, 65);
+    assert!(!manager.is_connected(&peer_id));
+    assert!(manager.peer_banned(&peer_id));
+    let events = collect_all_events(&mut manager);
+    assert!(events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::DisconnectPeerX(id, _) if *id == peer_id) }));
+    assert!(!events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::PeerConnected(id, _, _) if *id == peer_id) }));
+}
+
+/// Provisional transports share the existing finite aggregate target.
+#[tokio::test]
+async fn provisional_public_admission_is_bounded_by_aggregate_target() {
+    let mut manager = create_population_manager();
+    (1..=86).for_each(|seed| {
+        let (peer_id, _, _) = establish_population_peer(&mut manager, &population_keys(seed), seed);
+        assert!(manager.is_connected(&peer_id));
+        assert_eq!(manager.peer_to_bls(&peer_id), None);
+        assert!(!manager.peer_is_important(&peer_id));
+    });
+    assert_eq!(manager.connected_peers().len(), 86);
+    collect_all_events(&mut manager);
+    let (excess, _, _) = establish_population_peer(&mut manager, &population_keys(87), 87);
+    assert!(!manager.is_connected(&excess));
+    assert!(manager.peer_banned(&excess));
+    assert_eq!(manager.connected_peers().len(), 86);
+    assert!(!collect_all_events(&mut manager)
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::PeerConnected(id, _, _) if *id == excess) }));
+}
+
+/// Removing a provisional peer must not satisfy an authenticated ordinary deficit.
+#[tokio::test]
+async fn ordinary_pruning_skips_provisional_peers_without_aggregate_excess() {
+    let mut manager = create_population_manager();
+    let protected: Vec<_> = (100..120).map(population_keys).collect();
+    manager.update_committees(
+        HashSet::new(),
+        protected.iter().map(KeyConfig::primary_public_key).collect(),
+        HashSet::new(),
+    );
+    (1..=64).for_each(|seed| {
+        let keys = population_keys(seed);
+        establish_population_peer(&mut manager, &keys, seed);
+        confirm_population_peer(&mut manager, &keys, seed);
+        manager.update_routing_for_peer(&keys.primary_network_public_key().into(), true);
+    });
+    protected.iter().enumerate().for_each(|(offset, keys)| {
+        let seed = 100 + offset as u8;
+        establish_population_peer(&mut manager, keys, seed);
+        confirm_population_peer(&mut manager, keys, seed);
+        manager.update_routing_for_peer(&keys.primary_network_public_key().into(), true);
+    });
+    let provisional: Vec<_> = [201, 202]
+        .into_iter()
+        .map(|seed| establish_population_peer(&mut manager, &population_keys(seed), seed).0)
+        .collect();
+    assert_eq!(manager.connected_peers().len(), 86);
+    collect_all_events(&mut manager);
+    manager.update_committees(
+        HashSet::new(),
+        protected.iter().skip(1).map(KeyConfig::primary_public_key).collect(),
+        HashSet::new(),
+    );
+    assert_eq!(manager.connected_peers().len(), 85);
+    assert!(provisional
+        .iter()
+        .all(|peer| manager.is_connected(peer) && !manager.peer_banned(peer)));
+    assert_eq!(
+        manager
+            .connected_peers()
+            .iter()
+            .filter(|peer| !manager.peer_is_important(peer) && manager.peer_to_bls(peer).is_some())
+            .count(),
+        64,
+    );
+    assert!(protected
+        .iter()
+        .skip(1)
+        .all(|keys| { manager.is_connected(&keys.primary_network_public_key().into()) }));
+    assert_eq!(
+        collect_all_events(&mut manager)
+            .iter()
+            .filter(|event| matches!(event, PeerEvent::DisconnectPeerX(_, _)))
+            .count(),
+        1,
+    );
+}
+
+/// Public-mode enforcement must not remove legacy excess before its heartbeat.
+#[tokio::test]
+async fn legacy_population_admission_preserves_existing_excess_window() {
+    let mut manager = create_population_manager();
+    manager.set_public_peer_limit(None);
+    manager.config.target_num_peers = 2;
+    manager.config.peer_excess_factor = 1.0;
+    (1..=3).for_each(|seed| {
+        let (peer_id, _, _) = establish_population_peer(&mut manager, &population_keys(seed), seed);
+        assert!(manager.is_connected(&peer_id));
+    });
+    assert_eq!(manager.connected_peers().len(), 3);
+    collect_all_events(&mut manager);
+    let (excess, _, _) = establish_population_peer(&mut manager, &population_keys(4), 4);
+    assert!(!manager.is_connected(&excess));
+    assert!(manager.peer_banned(&excess));
+    manager.heartbeat();
+    assert_eq!(manager.connected_peers().len(), 2);
+}
+
+fn population_source_budget(maximum: u64) -> crate::source_admission::SourceAdmissionBudget {
+    use serde::Deserialize as _;
+    let fields = [
+        ("max_connections", maximum),
+        ("max_connections_per_peer", maximum),
+        ("max_connections_per_address", maximum),
+        ("max_connections_per_prefix", maximum),
+        ("max_sources", maximum),
+        ("ipv4_prefix_length", 24),
+        ("ipv6_prefix_length", 64),
+    ];
+    let config =
+        tn_config::SourceAdmissionConfig::deserialize(serde::de::value::MapDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(fields.into_iter()))
+        .expect("finite source test limits");
+    crate::source_admission::SourceAdmissionBudget::new(&config).expect("valid source budget")
+}
+
+/// Protected arrival displaces a logical peer, retaining physical leases and its600s cooldown.
+#[tokio::test]
+async fn protected_arrival_prunes_immediately_and_retains_physical_leases() {
+    use libp2p::{
+        connection_limits::{Behaviour, ConnectionLimits},
+        swarm::{ConnectionClosed, ConnectionEstablished, FromSwarm},
+    };
+    let budget = population_source_budget(87);
+    let mut manager = create_population_manager();
+    manager.set_source_budget(Some(budget.clone()));
+    let mut physical = Behaviour::new(ConnectionLimits::default().with_max_established(Some(87)));
+    let existing: Vec<_> = (1..=86)
+        .map(|seed| {
+            let keys = population_keys(seed);
+            let peer_id: PeerId = keys.primary_network_public_key().into();
+            let endpoint = population_endpoint(seed);
+            let connection_id = ConnectionId::new_unchecked(usize::from(seed));
+            assert!(physical
+                .handle_established_inbound_connection(
+                    connection_id,
+                    peer_id,
+                    endpoint.get_remote_address(),
+                    endpoint.get_remote_address(),
+                )
+                .is_ok());
+            let connection = establish_population_peer(&mut manager, &keys, seed);
+            physical.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+                peer_id,
+                connection_id,
+                endpoint: &endpoint,
+                failed_addresses: &[],
+                other_established: 0,
+            }));
+            connection
+        })
+        .collect();
+    assert_eq!(manager.connected_peers().len(), 86);
+    collect_all_events(&mut manager);
+    let protected = population_keys(87);
+    manager.set_dao_observers(HashSet::from([protected.primary_public_key()]));
+    confirm_population_peer(&mut manager, &protected, 87);
+    let protected_id: PeerId = protected.primary_network_public_key().into();
+    let endpoint = population_endpoint(87);
+    let connection_id = ConnectionId::new_unchecked(87);
+    assert!(physical
+        .handle_established_inbound_connection(
+            connection_id,
+            protected_id,
+            endpoint.get_remote_address(),
+            endpoint.get_remote_address(),
+        )
+        .is_ok());
+    establish_population_peer(&mut manager, &protected, 87);
+    physical.on_swarm_event(FromSwarm::ConnectionEstablished(ConnectionEstablished {
+        peer_id: protected_id,
+        connection_id,
+        endpoint: &endpoint,
+        failed_addresses: &[],
+        other_established: 0,
+    }));
+    let events = collect_all_events(&mut manager);
+    let victims: Vec<_> = events
+        .iter()
+        .filter_map(|event| {
+            if let PeerEvent::DisconnectPeerX(peer, _) = event {
+                Some(*peer)
+            } else {
+                None
+            }
+        })
+        .collect();
+    assert_eq!(victims.len(), 1);
+    let victim = victims[0];
+    assert_eq!(manager.connected_peers().len(), 86);
+    assert!(manager.is_connected(&protected_id));
+    assert!(!manager.peer_banned(&protected_id));
+    let prune_position = events
+        .iter()
+        .position(|event| matches!(event, PeerEvent::DisconnectPeerX(peer, _) if *peer == victim));
+    let publication_position = events.iter().position(
+        |event| matches!(event, PeerEvent::PeerConnected(peer, _, _) if *peer == protected_id),
+    );
+    assert!(prune_position
+        .zip(publication_position)
+        .is_some_and(|(prune, publish)| prune < publish));
+    assert!(manager.peer_banned(&victim));
+    assert!(!manager.peers.peer_banned(&victim));
+    assert_eq!(manager.config.excess_peers_reconnection_timeout, Duration::from_secs(600));
+    assert_eq!(budget.snapshot().expect("source snapshot").connections(), 87);
+    let probe: PeerId = population_keys(88).primary_network_public_key().into();
+    let probe_endpoint = population_endpoint(88);
+    let probe_connection = ConnectionId::new_unchecked(88);
+    assert!(manager
+        .handle_established_inbound_connection(
+            probe_connection,
+            probe,
+            probe_endpoint.get_remote_address(),
+            probe_endpoint.get_remote_address(),
+        )
+        .is_err());
+    assert!(physical
+        .handle_established_inbound_connection(
+            probe_connection,
+            probe,
+            probe_endpoint.get_remote_address(),
+            probe_endpoint.get_remote_address(),
+        )
+        .is_err());
+    let (_, victim_connection, victim_endpoint) = existing
+        .iter()
+        .find(|(peer, _, _)| *peer == victim)
+        .expect("the victim is an existing transport");
+    let closed = ConnectionClosed {
+        peer_id: victim,
+        connection_id: *victim_connection,
+        endpoint: victim_endpoint,
+        cause: None,
+        remaining_established: 0,
+    };
+    manager.on_swarm_event(FromSwarm::ConnectionClosed(closed));
+    physical.on_swarm_event(FromSwarm::ConnectionClosed(closed));
+    assert_eq!(budget.snapshot().expect("source snapshot").connections(), 86);
+    assert!(
+        manager.peer_banned(&victim),
+        "physical closure must not forgive the population cooldown"
+    );
+    assert!(manager
+        .handle_established_inbound_connection(
+            probe_connection,
+            probe,
+            probe_endpoint.get_remote_address(),
+            probe_endpoint.get_remote_address(),
+        )
+        .is_ok());
+    assert!(physical
+        .handle_established_inbound_connection(
+            probe_connection,
+            probe,
+            probe_endpoint.get_remote_address(),
+            probe_endpoint.get_remote_address(),
+        )
+        .is_ok());
+    assert!(manager.simulate_temporary_ban_expiry(&victim));
+    assert!(!manager.peer_banned(&victim));
+}
+
+/// Simultaneous aggregate and ordinary excess require class-aware deficit accounting.
+#[tokio::test]
+async fn aggregate_pruning_does_not_consume_ordinary_deficit() {
+    let mut manager = create_population_manager();
+    manager.set_public_peer_limit(None);
+    let protected: Vec<_> = (100..119).map(population_keys).collect();
+    manager.update_committees(
+        HashSet::new(),
+        protected.iter().map(KeyConfig::primary_public_key).collect(),
+        HashSet::new(),
+    );
+    (1..=65).for_each(|seed| {
+        let keys = population_keys(seed);
+        establish_population_peer(&mut manager, &keys, seed);
+        confirm_population_peer(&mut manager, &keys, seed);
+        manager.update_routing_for_peer(&keys.primary_network_public_key().into(), true);
+    });
+    protected.iter().enumerate().for_each(|(offset, keys)| {
+        let seed = 100 + offset as u8;
+        establish_population_peer(&mut manager, keys, seed);
+        confirm_population_peer(&mut manager, keys, seed);
+        manager.update_routing_for_peer(&keys.primary_network_public_key().into(), true);
+    });
+    let provisional: Vec<_> = (201..=203)
+        .map(|seed| establish_population_peer(&mut manager, &population_keys(seed), seed).0)
+        .collect();
+    assert_eq!(manager.connected_peers().len(), 87);
+    collect_all_events(&mut manager);
+    manager.set_public_peer_limit(std::num::NonZeroUsize::new(64));
+    manager.heartbeat();
+    assert_eq!(manager.connected_peers().len(), 85);
+    assert_eq!(provisional.iter().filter(|peer| manager.is_connected(peer)).count(), 2);
+    assert_eq!(
+        manager
+            .connected_peers()
+            .iter()
+            .filter(|peer| !manager.peer_is_important(peer) && manager.peer_to_bls(peer).is_some())
+            .count(),
+        64,
+    );
+    assert_eq!(
+        collect_all_events(&mut manager)
+            .iter()
+            .filter(|event| matches!(event, PeerEvent::DisconnectPeerX(_, _)))
+            .count(),
+        2,
+    );
+}
+
+/// The qualification gauge conservatively includes provisional identities until promotion.
+#[tokio::test]
+async fn public_population_gauge_preserves_provisional_qualification_gate() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    metrics::with_local_recorder(&recorder, || {
+        let mut manager = create_population_manager();
+        let protected: Vec<_> = (100..122).map(population_keys).collect();
+        manager.set_dao_observers(protected.iter().map(KeyConfig::primary_public_key).collect());
+        protected.iter().enumerate().for_each(|(offset, keys)| {
+            establish_population_peer(&mut manager, keys, 100 + offset as u8);
+        });
+        (1..=64).for_each(|seed| {
+            let keys = population_keys(seed);
+            establish_population_peer(&mut manager, &keys, seed);
+            confirm_population_peer(&mut manager, &keys, seed);
+        });
+        assert_eq!(manager.connected_peers().len(), 86);
+        let measured = |expected| {
+            recorder.snapshotter().snapshot().into_vec().iter().any(|(key, _, _, value)| {
+                key.key().name() == "tn_network.ordinary_peers_connected"
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "network" && label.value() == "primary")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == expected)
+            })
+        };
+        manager.heartbeat();
+        assert!(measured(86.0));
+        assert_eq!(manager.connected_peers().len(), 86);
+        protected.iter().enumerate().for_each(|(offset, keys)| {
+            confirm_population_peer(&mut manager, keys, 100 + offset as u8);
+        });
+        manager.heartbeat();
+        assert!(measured(64.0));
+        assert_eq!(manager.connected_peers().len(), 86);
+    });
+}
+
+/// Retention privileges and unresolved identity do not bypass established protocol/IP bans.
+#[tokio::test]
+async fn public_population_admission_preserves_protocol_and_ip_bans() {
+    [false, true].into_iter().for_each(|protected| {
+        let mut manager = create_population_manager();
+        let keys = population_keys(201);
+        let (peer_id, _, endpoint) = establish_population_peer(&mut manager, &keys, 201);
+        if protected {
+            manager.set_dao_observers(HashSet::from([keys.primary_public_key()]));
+            confirm_population_peer(&mut manager, &keys, 201);
+            assert!(manager.peer_is_important(&peer_id));
+        }
+        manager.process_penalty(peer_id, Penalty::Fatal);
+        assert!(manager.peer_banned(&peer_id));
+        assert!(manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(202),
+                peer_id,
+                endpoint.get_remote_address(),
+                endpoint.get_remote_address(),
+            )
+            .is_err());
+        let other: PeerId = population_keys(202).primary_network_public_key().into();
+        assert!(manager
+            .handle_pending_inbound_connection(
+                ConnectionId::new_unchecked(203),
+                endpoint.get_remote_address(),
+                endpoint.get_remote_address(),
+            )
+            .is_err());
+        assert!(manager
+            .handle_established_outbound_connection(
+                ConnectionId::new_unchecked(204),
+                other,
+                endpoint.get_remote_address(),
+                Endpoint::Dialer,
+                libp2p::core::transport::PortUse::Reuse,
+            )
+            .is_err());
+    });
+}
+
 /// Protected peers do not consume the hub profile's ordinary-peer admission slots.
 #[tokio::test]
 async fn public_peer_limit_preserves_protected_headroom() {
@@ -64,20 +663,11 @@ async fn public_peer_limit_preserves_protected_headroom() {
         &protected,
         ConnectionType::IncomingConnection { multiaddr: address.clone() },
     ));
-    assert!(manager.register_peer_connection(
-        &PeerId::random(),
-        ConnectionType::IncomingConnection { multiaddr: address.clone() },
-    ));
+    register_confirmed_peer(&mut manager, 1, Some(address.clone()));
     assert!(!manager.peer_limit_reached(&endpoint));
-    assert!(manager.register_peer_connection(
-        &PeerId::random(),
-        ConnectionType::IncomingConnection { multiaddr: address.clone() },
-    ));
+    register_confirmed_peer(&mut manager, 2, Some(address.clone()));
     assert!(!manager.peer_limit_reached(&endpoint));
-    assert!(manager.register_peer_connection(
-        &PeerId::random(),
-        ConnectionType::IncomingConnection { multiaddr: address },
-    ));
+    register_confirmed_peer(&mut manager, 3, Some(address));
     assert!(manager.peer_limit_reached(&endpoint));
     manager.set_public_peer_limit(None);
     assert!(!manager.peer_limit_reached(&endpoint));
@@ -113,7 +703,7 @@ async fn startup_committee_window_preserves_public_slots_and_cached_neighbors() 
         &current_peer,
         ConnectionType::IncomingConnection { multiaddr: address.clone() },
     ));
-    register_peer(&mut unseeded, None);
+    register_confirmed_peer(&mut unseeded, 1, None);
     assert!(!unseeded.peer_is_important(&current_peer));
     assert!(unseeded.peer_limit_reached(&endpoint));
 
@@ -135,9 +725,9 @@ async fn startup_committee_window_preserves_public_slots_and_cached_neighbors() 
         ));
         assert!(manager.peer_is_important(&peer));
     });
-    register_peer(&mut manager, None);
+    register_confirmed_peer(&mut manager, 1, None);
     assert!(!manager.peer_limit_reached(&endpoint));
-    register_peer(&mut manager, None);
+    register_confirmed_peer(&mut manager, 2, None);
     assert!(manager.peer_limit_reached(&endpoint));
 }
 
@@ -251,8 +841,8 @@ async fn public_peer_limit_prunes_after_committee_rotation() {
         &protected,
         ConnectionType::IncomingConnection { multiaddr: address },
     ));
-    register_peer(&mut manager, None);
-    register_peer(&mut manager, None);
+    register_confirmed_peer(&mut manager, 1, None);
+    register_confirmed_peer(&mut manager, 2, None);
     manager.heartbeat();
     let initial_events = collect_all_events(&mut manager);
     assert!(!initial_events.iter().any(|event| {

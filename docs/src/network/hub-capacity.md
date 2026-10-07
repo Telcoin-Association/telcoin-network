@@ -26,13 +26,35 @@ Validator validated-address and handshake qualification retains its Launch scope
 | Banned, disconnected, temporarily banned peers | 512 in each table | Three swarm allocations |
 | Gossip target / low / high / outbound floor | 12 / 8 / 16 / 4 per topic | Primary and every worker |
 
-The ordinary limit counts established peer identities and excludes peers with a
+The ordinary limit counts confirmed BLS peer identities and excludes peers with a
 current retention privilege. Each swarm allows 64 ordinary identities plus 22
 protected identities: 8 DAO observers, 12 distinct committee peers across the
 previous/current/next committees, and 2 bootstrap/hub identities. Two connections
 per identity give a finite ceiling of 172 per swarm and 516 across all three.
 This permits inbound and outbound connections during simultaneous dialing. The
 stream and receive-credit totals remain fixed as connection headroom increases.
+
+Provisional connections whose BLS identity has not been confirmed consume the
+existing aggregate target of 86 identities. They have no retention privilege and
+do not consume authenticated ordinary slots until a validated record classifies
+them. Admission, successful identity promotion, and protected arrivals enforce
+the ordinary and aggregate limits immediately. Aggregate pruning and ordinary
+pruning track separate deficits, so removing a provisional peer cannot satisfy
+an authenticated ordinary excess. A recognized protected arrival displaces
+eligible unprotected peers when the target is full. Physical connection and
+source leases remain charged until actual closure; a displaced unprotected peer
+keeps the existing 600-second population reconnection cooldown.
+
+The existing `tn_network.ordinary_peers_connected` qualification gauge remains
+conservative: it counts all connected nonimportant identities, including
+provisional peers. Startup can therefore have aggregate 86 and gauge 86 before
+protected identities resolve, then aggregate 86 and gauge 64 after promotion.
+The frozen scorer still requires this gauge to stay at or below 64 throughout
+the actual `[T0,T1)` measurement interval. Admission headroom does not relax
+that check, move the measurement window, or change startup deadlines or retries.
+Physical, source, and unfinished-handshake controls bound occupancy; they do not
+guarantee admission fairness for protected identities that are still unresolved.
+
 
 Select at most 8 DAO identities through `dao_observers`, using identities already
 present in `bootstrap_peers`. This selection reserves retention while preserving

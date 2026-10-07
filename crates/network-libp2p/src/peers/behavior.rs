@@ -341,12 +341,14 @@ impl PeerManager {
 
         // check connection limits
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
+            self.record_population_rejection(peer_id);
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers
             self.disconnect_peer(peer_id, true);
             return;
         }
 
+        self.enforce_public_peer_limits();
         self.push_event(PeerEvent::PeerConnected(peer_id, connection_id, multiaddr));
 
         // log successful connection establishment

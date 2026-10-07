@@ -150,9 +150,10 @@ CASES = [
      "let discovered = matches_requested_key", "let discovered = false",
      "authority_record_is_usable_before_lookup_finishes"),
     ("rotation_public_ceiling", "crates/network-libp2p/src/peers/manager.rs",
-     ".max(public_excess)", ".min(public_excess)", "public_peer_limit_prunes_after_committee_rotation"),
+     "let mut excess_peer_count = aggregate_excess.max(public_excess);",
+     "let mut excess_peer_count = aggregate_excess.min(public_excess);", "public_peer_limit_prunes_after_committee_rotation"),
     ("established_public_boundary", "crates/network-libp2p/src/peers/manager.rs",
-     "> limit.get()", ">= limit.get()",
+     "self.confirmed_ordinary_peer_count() > limit.get()", "self.confirmed_ordinary_peer_count() >= limit.get()",
      "public_peer_limit_preserves_protected_headroom"),
     ("dao_retention_reservation", "crates/network-libp2p/src/peers/manager.rs",
      ".filter(|key| self.dao_observers.contains(key))", ".filter(|_| false)",
@@ -225,6 +226,23 @@ CASES = [
      "local_cache_same_digest_retry_preserves_accepted_bytes"),
 ]
 
+
+# Append admission guards without removing or reordering the original58 case identities.
+PUBLIC_ADMISSION_CASES = [
+    ("public_provisional_classification", "crates/network-libp2p/src/peers/manager.rs", "self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)", "!self.peer_is_important(peer_id)", "delayed_protected_identity_preserves_public_admission"),
+    ("public_aggregate_admission_bound", "crates/network-libp2p/src/peers/manager.rs", "|| self.peers.connected_peer_ids().count() > self.config.target_num_peers", "|| (std::hint::black_box(false) && self.peers.connected_peer_ids().count() > self.config.target_num_peers)", "provisional_public_admission_is_bounded_by_aggregate_target"),
+    ("public_identity_promotion", "crates/network-libp2p/src/peers/manager.rs", "self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);\n            self.enforce_public_peer_limits();", "self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);", "public_identity_promotion_prunes_immediately"),
+    ("public_expired_identity_promotion", "crates/network-libp2p/src/peers/manager.rs", "self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);\n            self.enforce_public_peer_limits();", "self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);", "public_identity_promotion_prunes_immediately"),
+    ("public_cached_identity_promotion", "crates/network-libp2p/src/peers/manager.rs", "self.apply_unban_actions(unban_actions);\n        self.enforce_public_peer_limits();", "self.apply_unban_actions(unban_actions);", "public_identity_promotion_prunes_immediately"),
+    ("public_protected_arrival_enforcement", "crates/network-libp2p/src/peers/behavior.rs", "self.enforce_public_peer_limits();\n        self.push_event(PeerEvent::PeerConnected", "self.push_event(PeerEvent::PeerConnected", "protected_arrival_prunes_immediately_and_retains_physical_leases"),
+    ("public_ordinary_prune_eligibility", "crates/network-libp2p/src/peers/manager.rs", "(aggregate_excess > 0 || ordinary)", "std::hint::black_box(true)", "ordinary_pruning_skips_provisional_peers_without_aggregate_excess"),
+    ("public_independent_deficit_accounting", "crates/network-libp2p/src/peers/manager.rs", "public_excess.saturating_sub(usize::from(ordinary))", "public_excess.saturating_sub(1)", "aggregate_pruning_does_not_consume_ordinary_deficit"),
+    ("public_legacy_enforcement_gate", "crates/network-libp2p/src/peers/manager.rs", "pub(super) fn enforce_public_peer_limits(&mut self) {\n        if self.public_peer_limit.is_some() {", "pub(super) fn enforce_public_peer_limits(&mut self) {\n        if std::hint::black_box(true) {", "legacy_population_admission_preserves_existing_excess_window"),
+    ("public_confirmation_backing_record", "crates/network-libp2p/src/peers/all_peers.rs", "self.peers.get(&PeerIdentity::Confirmed(*bls_key)).is_some_and(|peer| {\n                peer.bls_public_key() == Some(*bls_key) && peer.peer_id() == Some(*peer_id)\n            })", "std::hint::black_box(bls_key) == bls_key", "confirmed_admission_identity_requires_matching_stored_record"),
+    ("public_confirmation_transport_binding", "crates/network-libp2p/src/peers/all_peers.rs", "peer.bls_public_key() == Some(*bls_key) && peer.peer_id() == Some(*peer_id)", "peer.bls_public_key() == Some(*bls_key)", "confirmed_admission_identity_requires_matching_stored_record"),
+    ("public_conservative_population_gauge", "crates/network-libp2p/src/peers/manager.rs", "self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count()", "self.confirmed_ordinary_peer_count()", "public_population_gauge_preserves_provisional_qualification_gate"),
+]
+CASES += PUBLIC_ADMISSION_CASES
 
 def execute(argv, directory, label):
     """Retain finite compiler/test logs, without accepting a compiler failure as a killed mutant."""

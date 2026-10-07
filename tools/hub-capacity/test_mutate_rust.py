@@ -1,7 +1,9 @@
 """Reject false mutation confirmations and bind compilation to the mutated source owner."""
 
 import importlib.util
+import hashlib
 import json
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -15,6 +17,32 @@ SPEC.loader.exec_module(MUTATIONS)
 
 
 class MutationTests(unittest.TestCase):
+
+    def test_legacy_case_ids_and_public_admission_registry_are_preserved(self):
+        legacy_ids = [case[0] for case in MUTATIONS.CASES[:58]]
+        self.assertEqual(len(MUTATIONS.CASES), 70)
+        self.assertEqual(len(MUTATIONS.PUBLIC_ADMISSION_CASES), 12)
+        self.assertEqual(
+            hashlib.sha256(json.dumps(legacy_ids, separators=(",", ":")).encode()).hexdigest(),
+            "4d72d20bbd56e32d2821fbb03cd4bd85e7a12cab3d72707bc323ecd84298b327",
+        )
+        self.assertEqual(MUTATIONS.CASES[58:], MUTATIONS.PUBLIC_ADMISSION_CASES)
+
+    def test_all_registered_rewrites_have_one_current_source_anchor(self):
+        for name, relative, before, after, regression in MUTATIONS.CASES:
+            with self.subTest(mutation=name):
+                source = (MUTATIONS.ROOT / relative).read_text()
+                self.assertEqual(source.count(before), 1, name)
+                self.assertNotEqual(before, after, name)
+        manager_tests = (MUTATIONS.ROOT / "crates/network-libp2p/src/tests/peer_manager.rs").read_text()
+        identity_tests = (MUTATIONS.ROOT / "crates/network-libp2p/src/peers/all_peers.rs").read_text()
+        for name, relative, before, after, regression in MUTATIONS.PUBLIC_ADMISSION_CASES:
+            with self.subTest(regression=regression):
+                self.assertRegex(
+                    manager_tests + identity_tests,
+                    rf"#\[(?:tokio::)?test\]\s+(?:async\s+)?fn\s+{re.escape(regression)}\s*\(",
+                )
+
     def fixture(self, root):
         source = root / "crates/owner/src/lib.rs"
         source.parent.mkdir(parents=True)
