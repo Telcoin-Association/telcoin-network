@@ -46,6 +46,13 @@ pub(crate) const MAX_TARGETS: usize = 8;
 #[derive(Clone, PartialEq, Eq)]
 pub struct ForwardTarget(Url);
 
+impl ForwardTarget {
+    /// The normalized URL the forwarding client dials.
+    pub(crate) fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
 impl fmt::Debug for ForwardTarget {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("ForwardTarget(<redacted>)")
@@ -57,6 +64,13 @@ impl fmt::Debug for ForwardTarget {
 /// Never empty, at most [`MAX_TARGETS`] long, and free of duplicates after normalization.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ForwardTargets(Vec<ForwardTarget>);
+
+impl ForwardTargets {
+    /// The targets in failover order.
+    pub(crate) fn as_slice(&self) -> &[ForwardTarget] {
+        &self.0
+    }
+}
 
 /// Why a `--forward-txs` value was refused.
 ///

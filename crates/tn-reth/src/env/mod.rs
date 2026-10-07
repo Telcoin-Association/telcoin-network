@@ -23,6 +23,7 @@ use std::{
     sync::Arc,
 };
 
+use reth::rpc::builder::config::RethRpcServerConfig as _;
 use reth_chainspec::ChainSpec as RethChainSpec;
 use reth_db::{init_db, DatabaseEnv};
 use reth_db_common::init::init_genesis;
@@ -40,8 +41,11 @@ use tn_types::{
 use tracing::{debug, info};
 
 use crate::{
-    error::RestoredStateFloorError, evm::TnEvmConfig, traits::TelcoinNode, RethConfig, RethDb,
-    WorkerTxPool, BASEFEE_ADDRESS,
+    error::RestoredStateFloorError,
+    evm::TnEvmConfig,
+    rpc_tx_forward::{TxForwardConfig, TxForwarder},
+    traits::TelcoinNode,
+    RethConfig, RethDb, WorkerTxPool, BASEFEE_ADDRESS,
 };
 
 mod epoch;
@@ -93,6 +97,11 @@ struct RethEnvInner {
     /// answer such reads `Ok(None)` per account, silently reading every account as "never
     /// written".
     restored_state_floor: Option<u64>,
+    /// The `--forward-txs` relay, `None` when RPC submissions go to the local pool.
+    ///
+    /// Built once and shared by every worker's RPC server (`get_rpc_server`), so all lanes use
+    /// one ordered target list, one connection pool per target and one metrics set.
+    tx_forwarder: Option<Arc<TxForwarder>>,
     /// TEST-ONLY: number of pending injected pre-commit persist faults.
     ///
     /// While non-zero, each call to `RethEnv::persist_executed_output` consumes one count
@@ -167,6 +176,9 @@ impl RethEnv {
     ///    whatever global metrics recorder is installed right now; the series bind to that recorder
     ///    on first use, so this must run after `tn_metrics::install_recorder` (see `metrics.rs`) or
     ///    the counters stay on the noop recorder.
+    /// 3. With `--forward-txs`, registers the forwarding metric series the same way, and building
+    ///    an `https://` target's client installs rustls's `ring` crypto provider as the process
+    ///    default when none is installed yet.
     pub fn new(
         reth_config: &RethConfig,
         task_manager: &TaskManager,
@@ -190,6 +202,7 @@ impl RethEnv {
         // baseline the block-building counters at zero now, while the recorder is known to be
         // installed, so a node that never drops a transaction still exports both series
         crate::metrics::init();
+        let tx_forwarder = Self::new_tx_forwarder(reth_config.tx_forward(), &node_config)?;
 
         Ok(Self {
             inner: Arc::new(RethEnvInner {
@@ -198,6 +211,7 @@ impl RethEnv {
                 evm_config,
                 task_spawner,
                 restored_state_floor,
+                tx_forwarder,
                 #[cfg(any(feature = "test-utils", test))]
                 persist_fault_injections: std::sync::atomic::AtomicU32::new(0),
                 #[cfg(any(feature = "test-utils", test))]
@@ -206,6 +220,31 @@ impl RethEnv {
                 persist_attempts: std::sync::atomic::AtomicU32::new(0),
             }),
         })
+    }
+
+    /// Build the shared `--forward-txs` relay, or `None` when forwarding is off.
+    ///
+    /// The clients connect lazily, so an unreachable target does not fail startup. The log
+    /// line carries the target count only: the targets are private operator configuration.
+    fn new_tx_forwarder(
+        config: &TxForwardConfig,
+        node_config: &NodeConfig<RethChainSpec>,
+    ) -> eyre::Result<Option<Arc<TxForwarder>>> {
+        config
+            .targets
+            .as_ref()
+            .map(|targets| {
+                let forwarder =
+                    TxForwarder::new(targets, node_config.rpc.rpc_max_request_size_bytes())?;
+                info!(
+                    target: "tn::rpc",
+                    targets = targets.as_slice().len(),
+                    sanitize = config.sanitize,
+                    "forwarding raw transaction submissions"
+                );
+                Ok(Arc::new(forwarder))
+            })
+            .transpose()
     }
 
     /// Create a new Reth DB.

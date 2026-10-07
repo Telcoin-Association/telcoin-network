@@ -87,7 +87,7 @@ use crate::{
     system_calls::{
         ConsensusRegistry, WorkerConfigs, CONSENSUS_REGISTRY_ADDRESS, PRECOMPILE_GENESIS_BYTECODE,
     },
-    RethConfig, RethEnv, BLS_G1_PRECOMPILE_ADDRESS,
+    RethConfig, RethEnv, TxForwardConfig, BLS_G1_PRECOMPILE_ADDRESS,
 };
 
 impl RethEnv {
@@ -137,6 +137,28 @@ impl RethEnv {
         rewards: Option<GasAccumulator>,
         rpc: RpcServerArgs,
     ) -> eyre::Result<Self> {
+        Self::new_for_temp_chain_with_tx_forward(
+            chain,
+            db_path,
+            task_manager,
+            rewards,
+            rpc,
+            TxForwardConfig::default(),
+        )
+    }
+
+    /// Create a new temp RethEnv with explicit RPC server args and `--forward-txs` settings.
+    ///
+    /// Test seam for the forwarding handler: [`Self::new_for_temp_chain_with_rpc_args`] with the
+    /// forwarding settings a parsed command would carry beside the reth args.
+    pub(crate) fn new_for_temp_chain_with_tx_forward<P: AsRef<Path>>(
+        chain: Arc<RethChainSpec>,
+        db_path: P,
+        task_manager: &TaskManager,
+        rewards: Option<GasAccumulator>,
+        rpc: RpcServerArgs,
+        tx_forward: TxForwardConfig,
+    ) -> eyre::Result<Self> {
         /// MDBX map-size ceiling for throwaway temp-chain envs. reth defaults to 8 TB per
         /// environment; `cargo test` runs a test binary as threads in ONE process, so N
         /// concurrent 8 TB virtual reservations exhaust the address space and MDBX aborts
@@ -173,7 +195,8 @@ impl RethEnv {
             rpc,
             ..NodeConfig::default()
         };
-        let reth_config = RethConfig::from_node_config(node_config);
+        let mut reth_config = RethConfig::from_node_config(node_config);
+        reth_config.1 = tx_forward;
         let database = Self::new_database(&reth_config, db_path)?;
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
