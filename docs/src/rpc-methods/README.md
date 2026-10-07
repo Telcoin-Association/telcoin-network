@@ -7,9 +7,9 @@ Methods are grouped into namespaces. A namespace is the prefix before the unders
 | Namespace | On by default | Cost to serve | What it covers |
 | --- | --- | --- | --- |
 | [eth](eth/README.md) | yes | low | Ethereum-compatible chain, account, transaction, simulation and filter methods |
-| net | yes | low | Chain id, listening state and the worker network's peer count |
-| web3 | yes | low | Client version and Keccak-256 hashing |
-| rpc | yes | trivial | The namespaces the transport serves |
+| [net](net/README.md) | yes | low | Chain id, listening state and the worker network's peer count |
+| [web3](web3/README.md) | yes | low | Client version and Keccak-256 hashing |
+| [rpc](rpc/README.md) | yes | trivial | The namespaces the transport serves |
 | tn | yes | low to moderate (blocking reads are capped at 64 concurrent requests) | Telcoin Network consensus, epoch, validator and staking data |
 | debug | no, only when named | high | Raw block and transaction data and geth-style EVM tracing |
 | trace | no, only when named | high | Parity-style call traces, replays and trace filters |
