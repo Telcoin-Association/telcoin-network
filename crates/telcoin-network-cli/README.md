@@ -380,44 +380,54 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 
 ### RPC flags
 
-| Flag                                     | Default       | Description                              |
-| ---------------------------------------- | ------------- | ---------------------------------------- |
-| `--http`                                 | disabled      | Enable the HTTP-RPC server               |
-| `--http.addr`                            | `127.0.0.1`   | HTTP listen address                      |
-| `--http.port`                            | `8545`        | HTTP listen port                         |
-| `--http.api`                             | none          | RPC modules to enable (see below)        |
-| `--http.corsdomain`                      | none          | Allowed CORS origins                     |
-| `--ws`                                   | disabled      | Enable the WebSocket-RPC server          |
-| `--ws.addr`                              | `127.0.0.1`   | WebSocket listen address                 |
-| `--ws.port`                              | `8546`        | WebSocket listen port                    |
-| `--ws.api`                               | none          | RPC modules to enable                    |
-| `--ws.origins`                           | none          | Allowed WebSocket origins                |
-| `--ipcdisable`                           | `false`       | Disable the IPC-RPC server               |
-| `--ipcpath`                              | `/tmp/tn.ipc` | IPC socket path                          |
-| `--rpc.jwtsecret`                        | none          | Hex-encoded JWT secret for RPC auth      |
-| `--rpc.max-request-size`                 | `15` (MB)     | Max request payload size                 |
-| `--rpc.max-response-size`                | `160` (MB)    | Max response payload size                |
-| `--rpc.max-subscriptions-per-connection` | `1024`        | Max subscriptions per connection         |
-| `--rpc.max-connections`                  | `500`         | Max concurrent RPC connections           |
-| `--rpc.max-tracing-requests`             | CPU-dependent | Max concurrent tracing requests          |
-| `--rpc.gascap`                           | Reth default  | Max gas for `eth_call`                   |
-| `--rpc.txfeecap`                         | `0` (no cap)  | Max transaction fee via RPC (0 = no cap) |
+| Flag                                     | Default               | Description                                                     |
+| ---------------------------------------- | --------------------- | --------------------------------------------------------------- |
+| `--http`                                 | disabled              | Enable the HTTP-RPC server                                      |
+| `--http.addr`                            | `127.0.0.1`           | HTTP listen address                                             |
+| `--http.port`                            | `8545`                | HTTP listen port                                                |
+| `--http.api`                             | `eth,net,web3,rpc,tn` | RPC namespaces to serve over HTTP (see below)                   |
+| `--http.corsdomain`                      | none                  | Allowed CORS origins                                            |
+| `--ws`                                   | disabled              | Enable the WebSocket-RPC server                                 |
+| `--ws.addr`                              | `127.0.0.1`           | WebSocket listen address                                        |
+| `--ws.port`                              | `8546`                | WebSocket listen port                                           |
+| `--ws.api`                               | `eth,net,web3,rpc,tn` | RPC namespaces to serve over WebSocket (see below)              |
+| `--ws.origins`                           | none                  | Allowed WebSocket origins                                       |
+| `--ipcdisable`                           | `false`               | Disable the IPC-RPC server                                      |
+| `--ipcpath`                              | `/tmp/tn.ipc`         | IPC socket path                                                 |
+| `--rpc.jwtsecret`                        | none                  | Hex-encoded JWT secret for RPC auth                             |
+| `--rpc.max-request-size`                 | `15` (MB)             | Max request payload size                                        |
+| `--rpc.max-response-size`                | `160` (MB)            | Max response payload size                                       |
+| `--rpc.max-subscriptions-per-connection` | `1024`                | Max subscriptions per connection                                |
+| `--rpc.max-connections`                  | `500`                 | Max concurrent RPC connections                                  |
+| `--rpc.max-tracing-requests`             | CPU-dependent         | Max concurrent tracing requests (`debug`, `trace`)              |
+| `--rpc.max-trace-filter-blocks`          | `100`                 | Max block range of one `trace_filter` request                   |
+| `--rpc.max-blocks-per-filter`            | `100000`              | Max block range for `eth_getLogs` and filters (0 = no limit)    |
+| `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |
+| `--rpc.gascap`                           | `50000000`            | Max gas for `eth_call` and the call-tracing methods             |
+| `--rpc.txfeecap`                         | `0` (no cap)          | Max transaction fee via RPC (0 = no cap)                        |
 
-### available RPC modules
+### available RPC namespaces
 
-`eth`, `net`, `web3`, `debug`, `trace`, `rpc`
+`eth`, `net`, `web3`, `rpc`, `tn`, `debug`, `trace`
 
-`--http.api all` (and `--ws.api all`) enables `eth`, `net`, `web3`, `rpc`. The `debug` and
-`trace` modules are expensive to serve on an archive node and are never part of `all`: name
-them explicitly (for example `--http.api eth,debug,trace`) to enable them, which logs a
-warning at startup. A selection whose first entry is `all` (for example `all,debug`) parses
-as plain `all` and the rest of the list is ignored, so list every module by name instead.
+With no `--http.api` flag, or with `--http.api all` (likewise `--ws.api`), a transport serves
+`eth`, `net`, `web3`, `rpc` and `tn`. An explicit list is served exactly as written, so
+`--http.api eth,net,web3` serves no `tn_*` methods; name `tn` to keep them. `none` serves
+nothing.
 
-The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the same module set as
-`all`.
+The `debug` and `trace` namespaces are expensive to serve on an archive node and are never part
+of the default set or of `all`: name them explicitly (for example
+`--http.api eth,net,web3,rpc,tn,debug,trace`) to enable them, which logs a warning at startup. A
+selection whose first entry is `all` (for example `all,debug`) parses as plain `all` and the rest
+of the list is ignored, so list every namespace by name instead. Names are case-sensitive.
 
-The `admin` and `txpool` modules are not available at this time; they are dropped from any
+The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the default set.
+
+The `admin` and `txpool` modules, and any other name not listed above, are dropped from a
 selection with a warning.
+
+See [Enabling Namespaces](../../docs/src/rpc-methods/enabling-namespaces.md) for the cost of each
+namespace, the limits, and how to check what a node serves.
 
 ### Transaction pool
 
