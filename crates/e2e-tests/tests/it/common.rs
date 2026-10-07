@@ -395,7 +395,7 @@ where
             .build()?
             .block_on(call_rpc_inner(node, command, params, retries, debug_params)),
     };
-    Ok(resp?)
+    resp
 }
 
 /// Check if the network is advancing (query all nodes).
@@ -649,7 +649,8 @@ pub(crate) fn send_and_confirm(
     }
     let bal =
         get_balance_above_with_retry(node_test, &basefee_address.to_string(), current_basefee)?;
-    let expected_bal = if nonce > 0 { current_basefee + (current_basefee / (nonce)) } else { 0 };
+    let expected_bal =
+        current_basefee.checked_div(nonce).map_or(0, |per_tx| current_basefee + per_tx);
     if nonce > 0 && bal < expected_bal {
         error!(target: "restart-test", ?bal, ?expected_bal, "basefee error!");
         return Err(Report::msg("Expected a basefee increment!".to_string()));
@@ -815,12 +816,14 @@ pub(crate) fn create_genesis_for_test_with_workers(
     let genesis = config_committee_with_workers(
         temp_path,
         &shared_genesis_dir,
-        passphrase,
-        governance_wallet,
-        accounts,
-        committee,
-        epoch_duration,
-        None,
+        GenesisConfig {
+            passphrase,
+            consensus_registry_owner: governance_wallet,
+            accounts,
+            validators: committee,
+            epoch_duration,
+            chain_id: None,
+        },
         worker_fee_configs,
     )?;
 
@@ -842,6 +845,22 @@ pub(crate) fn create_genesis_for_test_with_workers(
     Ok(genesis)
 }
 
+/// Genesis inputs for [`config_committee`].
+pub(crate) struct GenesisConfig<'a> {
+    /// Passphrase for the validators' keys.
+    pub(crate) passphrase: Option<String>,
+    /// Owner of the `ConsensusRegistry`.
+    pub(crate) consensus_registry_owner: Address,
+    /// Accounts funded in genesis.
+    pub(crate) accounts: Vec<(Address, GenesisAccount)>,
+    /// The initial committee: node name and execution address.
+    pub(crate) validators: &'a [(&'a str, Address)],
+    /// Epoch duration in seconds.
+    pub(crate) epoch_duration: u64,
+    /// Overrides the genesis ceremony's default chain id (see [`config_committee`]).
+    pub(crate) chain_id: Option<u64>,
+}
+
 /// Configure the initial committee and fund accounts for network genesis.
 ///
 /// All data is written to file.
@@ -854,39 +873,26 @@ pub(crate) fn create_genesis_for_test_with_workers(
 pub(crate) fn config_committee(
     temp_path: &Path,
     shared_genesis_dir: &Path,
-    passphrase: Option<String>,
-    consensus_registry_owner: Address,
-    accounts: Vec<(Address, GenesisAccount)>,
-    validators: &Vec<(&str, Address)>,
-    epoch_duration: u64,
-    chain_id: Option<u64>,
+    config: GenesisConfig<'_>,
 ) -> eyre::Result<Genesis> {
-    config_committee_with_workers(
-        temp_path,
-        shared_genesis_dir,
+    config_committee_with_workers(temp_path, shared_genesis_dir, config, &[])
+}
+
+/// Generate committee keys and registry state for every configured worker.
+pub(crate) fn config_committee_with_workers(
+    temp_path: &Path,
+    shared_genesis_dir: &Path,
+    config: GenesisConfig<'_>,
+    worker_fee_configs: &[&str],
+) -> eyre::Result<Genesis> {
+    let GenesisConfig {
         passphrase,
         consensus_registry_owner,
         accounts,
         validators,
         epoch_duration,
         chain_id,
-        &[],
-    )
-}
-
-/// Generate committee keys and registry state for every configured worker.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn config_committee_with_workers(
-    temp_path: &Path,
-    shared_genesis_dir: &Path,
-    passphrase: Option<String>,
-    consensus_registry_owner: Address,
-    accounts: Vec<(Address, GenesisAccount)>,
-    validators: &Vec<(&str, Address)>,
-    epoch_duration: u64,
-    chain_id: Option<u64>,
-    worker_fee_configs: &[&str],
-) -> eyre::Result<Genesis> {
+    } = config;
     // create shared genesis dir
     let copy_path = shared_genesis_dir.join("genesis/validators");
     std::fs::create_dir_all(&copy_path)?;
@@ -993,6 +999,8 @@ pub(crate) fn start_nodes(
         // Get dynamic ports for RPC - OS assigns ports, no instance compensation needed
         let rpc_port = get_available_tcp_port("127.0.0.1").expect("available tcp port");
         let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
+        // Multi-worker RPC derivation requires the WebSocket base to be at least the HTTP base.
+        let (rpc_port, ws_port) = (rpc_port.min(ws_port), rpc_port.max(ws_port));
 
         // IPC - unique path under temp dir to avoid cross-test conflicts
         let ipc_path = temp_path.join(format!("{v}.ipc"));

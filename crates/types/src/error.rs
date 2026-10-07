@@ -167,6 +167,10 @@ pub enum BlockSealError {
     NotValidator,
     #[error("Failed to report our validated batch")]
     FailedToReport,
+    /// This epoch's consensus shutdown has begun, so the proposer that receives batch reports is
+    /// exiting and a quorum-sealed batch could never be reported.
+    #[error("Consensus shutdown has begun for this epoch, refusing to seal")]
+    ConsensusShuttingDown,
 }
 
 #[derive(Error, Debug)]
