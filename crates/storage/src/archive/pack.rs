@@ -1,5 +1,5 @@
-//! A data/log file of archival data.  Once written is only indended to be read and shared with
-//! other nodes.
+//! A data/log file of archival data: an append-only log of CRC-framed records, once written only
+//! intended to be read and shared with other nodes.
 
 use serde::{de::DeserializeOwned, Serialize};
 use tn_types::{encode_into_buffer, try_decode, try_decode_from_read};
@@ -20,7 +20,6 @@ use super::{
 };
 use std::{
     fmt::Debug,
-    fs,
     hash::Hasher as _,
     io::{self, Read, Seek, Write},
     marker::PhantomData,
@@ -30,8 +29,9 @@ use std::{
 /// The sequential record iterator [`Pack::raw_iter`] returns.
 pub type RawIter<V> = PackIter<V, DataFileReader>;
 
-/// An instance of a DB.
-/// Will consist of a data file (.dat), hash index (.hdx) and hash bucket overflow file (.odx).
+/// An append-only log of records, each framed `[u32 len | payload | u32 crc]`, in one
+/// memory-mapped data file. Indexes over it (digest, position, B+tree) are separate files owned by
+/// the pack's user.
 #[derive(Debug)]
 pub struct Pack<V>
 where
@@ -129,8 +129,8 @@ where
         checked_payload_in(view.tail(pos))
     }
 
-    /// Read the record size (with crc32) at position.
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
+    /// The on-disk size of the record at `pos` (its frame: payload plus 8 bytes), CRC-checked.
+    /// Errors on IO or a failed CRC32 integrity check.
     pub fn record_size(&self, pos: u64) -> Result<u32, FetchError> {
         self.inner.record_size(pos)
     }
@@ -169,18 +169,13 @@ where
             && self.inner.data_file.slice(pos, span).is_some_and(|b| b.iter().any(|&x| x != 0))
     }
 
-    /// Return a refernce to the pack files header.
+    /// Return a reference to the pack file's header.
     pub fn header(&self) -> &DataHeader {
         &self.inner.header
     }
 
-    /// Insert a new key/value pair in Db.
-    ///
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
+    /// Append `value` as one record (encoded through the `V` codec, compressed if the pack is),
+    /// returning its position: a frame `[u32 len | payload | u32 crc]` at the end of the log.
     ///
     /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
     /// and each commit returns a copy of the error that caused the failed state.  This error
@@ -230,7 +225,7 @@ where
         self.inner.uid()
     }
 
-    /// Flush any caches to disk and sync the data and index file.
+    /// Sync the data file to disk (see [`MmapDataFile::sync_all`]).
     /// All data should be safely on disk if this call succeeds.
     /// Note this is an expensive call (syncing to disk is not cheap).
     /// On a pack in the failed state this returns [`CommitError::Failed`] with a copy of the
@@ -252,12 +247,6 @@ where
     /// Note this is only a flush not a commit, it does not do a sync on the files.
     pub fn flush(&mut self) -> Result<(), FlushError> {
         self.inner.flush()
-    }
-
-    /// Close and destroy the Pack (remove it's file).
-    /// If it can not remove a file it will silently ignore this.
-    pub fn destroy(self) {
-        self.inner.destroy();
     }
 
     /// Mark the underlying data file to be removed (not sealed) when this handle drops. Used to
@@ -399,8 +388,11 @@ where
                 "read_bytes range out of bounds",
             )));
         }
-        let bytes = self.data_file.slice(start_pos, (end_pos - start_pos) as usize).unwrap_or(&[]);
-        Ok(bytes)
+        // A range validated against the logical length is always mapped; if it somehow is not,
+        // that is an error, never an (empty) answer.
+        self.data_file
+            .slice(start_pos, (end_pos - start_pos) as usize)
+            .ok_or_else(|| FetchError::IO(io::Error::other("read_bytes range is not mapped")))
     }
 
     /// Test-only injection point: fail the append the way a real io write failure fails.
@@ -457,13 +449,7 @@ where
         result
     }
 
-    /// Insert a new key/value pair in Db.
-    ///
-    /// For the data file this means inserting:
-    ///   - key size (u16) IF it is a variable width key (not needed for fixed width keys)
-    ///   - value size (u32)
-    ///   - key data
-    ///   - value data
+    /// Append `value` as one record (see [`Pack::append`]).
     ///
     /// A WriteDataError moves the DB to a failed state.  While the DB is failed, each append
     /// and each commit returns a copy of the error that caused the failed state.  This error
@@ -545,8 +531,7 @@ where
         self.header.uid()
     }
 
-    /// Flush any caches to disk and sync the data and index file.
-    /// All data should be safely on disk if this call succeeds.
+    /// Sync the data file to disk. All data should be safely on disk if this call succeeds.
     /// Note this is a very expensive call (syncing to disk is not cheap).
     fn commit(&self) -> Result<(), CommitError> {
         if self.read_only {
@@ -625,9 +610,8 @@ where
         Ok(header)
     }
 
-    /// Read the record at position.
-    /// Returns the (key, value) tuple
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
+    /// Read and decode the record at `position`.
+    /// Errors on IO, a failed CRC32 integrity check, or a decode failure.
     fn read_record(&self, position: u64) -> Result<V, FetchError> {
         self.read_record_into(position)
     }
@@ -671,18 +655,9 @@ where
         self.checked_payload(position)
     }
 
-    /// Read the record size (with crc32) at position.
-    /// Will produce an error for IO or or for a failed CRC32 integrity check.
+    /// The on-disk size of the record at `position` (see [`Pack::record_size`]).
     fn record_size(&self, position: u64) -> Result<u32, FetchError> {
         Ok(self.checked_payload(position)?.len() as u32 + 8)
-    }
-
-    /// Close and destroy the Pack (remove it's file).
-    /// If it can not remove a file it will silently ignore this.
-    fn destroy(self) {
-        let path = self.data_file.path().to_owned();
-        drop(self);
-        let _ = fs::remove_file(&path);
     }
 
     /// Rename the pack file to name.
@@ -1077,6 +1052,22 @@ mod tests {
         let payload = pack.inner.data_file.slice_mut(pos_small + 4, 1).expect("payload slice");
         payload[0] ^= 0xFF;
         assert!(matches!(pack.record_bytes(pos_small), Err(FetchError::CrcFailed)));
+    }
+
+    /// `read_bytes` never answers an in-range read it cannot serve with an empty slice: with the
+    /// mapping gone it is an error, and an out-of-range bound is still rejected.
+    #[test]
+    fn read_bytes_errors_instead_of_returning_empty() {
+        let tmp = TempDir::with_prefix("pack_read_bytes").expect("temp dir");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("raw"), 0, false, PackCompression::None, 1).expect("open");
+        let pos = pack.append_raw(b"some record bytes").expect("append");
+        let end = pack.file_len();
+        assert_eq!(pack.read_bytes(pos, end).expect("read").len() as u64, end - pos);
+        assert!(pack.read_bytes(pos, end + 1).is_err(), "past the end");
+
+        pack.inner.data_file.drop_mapping_for_test();
+        assert!(pack.read_bytes(pos, end).is_err(), "an unmapped range is an error, not empty");
     }
 
     /// A damaged length prefix never yields a payload: a small change mis-frames the CRC
@@ -1757,8 +1748,8 @@ mod tests {
         }
         // The clean close appended an 8-byte sentinel past the header; strip it so the crafted
         // record lands at the logical end (right after the header) rather than after the sentinel.
-        let pos =
-            fs::metadata(&path).expect("metadata").len() - crate::archive::data_file::SENTINEL_LEN;
+        let pos = std::fs::metadata(&path).expect("metadata").len()
+            - crate::archive::data_file::SENTINEL_LEN;
 
         let payload = vec![0u8; (MAX_RECORD_SIZE as usize) + 1];
         let mut compressed = Vec::new();

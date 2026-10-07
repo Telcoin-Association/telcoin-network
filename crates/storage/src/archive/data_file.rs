@@ -1,5 +1,6 @@
-//! The mmap-backed, append-only data file behind every [`Pack`](crate::archive::pack::Pack) (its
-//! data log and position index).
+//! The mmap-backed data file behind every [`Pack`](crate::archive::pack::Pack) (its data log and
+//! position index) and the index files written in place ([`WriteMode::Random`]: the digest index
+//! and the B+tree).
 //!
 //! Rather than buffered `read`/`write` syscalls, it maps the file into memory and does reads/writes
 //! as `memcpy` against the mapping, so there is no per-IO syscall and no read/write buffers. It
@@ -362,8 +363,8 @@ fn detect_sentinel(file: &File, disk_len: u64) -> io::Result<(u64, bool)> {
     Ok((disk_len, true))
 }
 
-/// An mmap-backed, append-only data file — the storage behind every
-/// [`Pack`](crate::archive::pack::Pack).
+/// An mmap-backed data file — the storage behind every [`Pack`](crate::archive::pack::Pack) and the
+/// in-place index files (see [`WriteMode`]).
 #[derive(Debug)]
 pub struct MmapDataFile {
     file: File,
@@ -731,9 +732,7 @@ impl MmapDataFile {
     /// Returns `None` if the range falls outside the logical data `[0, len())` (so the transient
     /// capacity padding past `end` is never exposed) or the file is currently unmapped. The
     /// returned slice borrows `&mut self`, so no concurrent write/remap (which needs `&mut self`)
-    /// can invalidate it while it is held. A caller that does not know a record's length up
-    /// front reads the size prefix with one `slice` call and the value with another; passing
-    /// `len = self.len() - offset` gives an offset-to-end view.
+    /// can invalidate it while it is held.
     pub fn slice_mut(&mut self, offset: u64, len: usize) -> Option<&mut [u8]> {
         let range_end = offset.checked_add(len as u64)?;
         if range_end > self.end {
@@ -822,15 +821,30 @@ impl MmapDataFile {
         if new_len == 0 {
             return Ok(());
         }
-        let map = if self.reserved > 0 {
+        let reserved_map = if self.reserved > 0 {
             let map_len = new_len.max(self.reserved.saturating_mul(2));
-            let len = usize::try_from(map_len)
-                .map_err(io::Error::other)
-                .inspect_err(|_| self.poison())?;
             // SAFETY: single-writer model; the file was sized to `new_len` immediately above, and
             // the pages of the reservation past it are never touched.
-            let map = unsafe { MmapOptions::new().len(len).map_mut(&self.file) }
-                .inspect_err(|_| self.poison())?;
+            match usize::try_from(map_len)
+                .map_err(io::Error::other)
+                .and_then(|len| unsafe { MmapOptions::new().len(len).map_mut(&self.file) })
+            {
+                Ok(map) => Some((map, map_len)),
+                Err(e) => {
+                    // As at open: without the address space, fall back to the classic mapping.
+                    tracing::warn!(
+                        "MmapDataFile: could not reserve {map_len} bytes of address space for {:?} \
+                         ({e}); using the classic remap-on-growth mapping",
+                        self.path
+                    );
+                    self.reserved = 0;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let map = if let Some((map, map_len)) = reserved_map {
             self.reserved = map_len;
             map
         } else {
@@ -1108,12 +1122,13 @@ impl MmapDataFile {
         }
     }
 
-    /// Clone the underlying file handle, `msync`ing `[0, end)` first. That `flush_range` is a
-    /// durability barrier (`MS_SYNC`), not merely a visibility hint: it writes the mapped region
-    /// back to the file so the cloned fd reads committed bytes even on platforms where mmap
-    /// stores and plain `read()` are not guaranteed coherent, and so a consumer copying through
-    /// the clone gets durable data; it also advances `flushed_end`. Returns the clone together
-    /// with the logical `end` at the moment of the call.
+    /// Clone the underlying file handle, `msync`ing its dirty range first (`[flushed_end, end)` for
+    /// an append file, `[0, end)` for a random-write one). That `flush_range` is a durability
+    /// barrier (`MS_SYNC`), not merely a visibility hint: it writes the mapped region back to the
+    /// file so the cloned fd reads committed bytes even on platforms where mmap stores and plain
+    /// `read()` are not guaranteed coherent, and so a consumer copying through the clone gets
+    /// durable data; it also advances `flushed_end`. Returns the clone together with the logical
+    /// `end` at the moment of the call.
     ///
     /// Unlike a clean close, this does NOT truncate the capacity padding: the physical file may be
     /// larger than `end` (and a later append re-grows and re-pads it further), so the returned
@@ -1137,13 +1152,22 @@ impl MmapDataFile {
         }
         if !self.read_only && self.end > 0 {
             if let Backing::Rw(map) = &self.backing {
-                // msync `[0, end)` back to the file: a durability barrier, and the coherence
-                // guarantee for the clone's plain `read()`/copy syscalls. Advance the watermark
-                // only when the msync actually ran -- if a prior `remap` failed and
-                // left no live mapping, the tail is NOT durable and the watermark
-                // must not claim otherwise. A failed barrier poisons the handle.
-                map.flush_range(0, self.end as usize).inspect_err(|_| self.poison())?;
-                self.flushed_end.store(self.end, Ordering::Relaxed);
+                // msync the dirty range back to the file: a durability barrier, and the coherence
+                // guarantee for the clone's plain `read()`/copy syscalls. As in `flush_dirty`, an
+                // append-mode file is already durable below `flushed_end`, so only `[flushed_end,
+                // end)` needs it (nothing when clean); a random-write file flushes `[0, end)`.
+                // Advance the watermark only when the msync actually ran -- if a prior `remap`
+                // failed and left no live mapping, the tail is NOT durable and the watermark must
+                // not claim otherwise. A failed barrier poisons the handle.
+                let start = match self.opts.write_mode {
+                    WriteMode::Append => self.flushed_end.load(Ordering::Relaxed).min(self.end),
+                    WriteMode::Random => 0,
+                };
+                if start < self.end {
+                    map.flush_range(start as usize, (self.end - start) as usize)
+                        .inspect_err(|_| self.poison())?;
+                    self.flushed_end.store(self.end, Ordering::Relaxed);
+                }
                 self.sync_size_if_grown()?;
             }
         }
@@ -1311,6 +1335,13 @@ impl MmapDataFile {
         self.end = logical_end;
         self.opened_unclean = opened_unclean;
         Ok(())
+    }
+
+    /// Test-only: release the mapping as a failed `remap` would, leaving `end` unmapped.
+    #[cfg(test)]
+    pub(crate) fn drop_mapping_for_test(&mut self) {
+        self.view.set_mapping(std::ptr::null(), 0);
+        self.backing = Backing::Empty;
     }
 
     /// Mark the file to be removed when this handle drops (instead of the flush+sync clean close).
@@ -2336,6 +2367,37 @@ mod tests {
         let mut rest = Vec::new();
         clone.read_to_end(&mut rest).expect("read padding");
         assert!(rest.iter().all(|&b| b == 0), "bytes past end are zero padding");
+    }
+
+    /// `try_clone` msyncs only the dirty tail: after a barrier it has nothing to flush, after an
+    /// append it flushes (and advances the watermark over) just that tail, and either way the clone
+    /// reads exactly the logical bytes.
+    #[test]
+    fn try_clone_flushes_only_the_dirty_tail() {
+        let tmp = TempDir::with_prefix("mmap_df_clone_tail").expect("temp dir");
+        let mut df =
+            MmapDataFile::open_with(tmp.path().join("data"), false, tiny_opts()).expect("open");
+        let first = pattern(100);
+        df.write_all(&first).expect("write");
+        df.sync_all().expect("barrier");
+        assert_eq!(df.flushed_end.load(Ordering::Relaxed), 100);
+
+        let read_all = |clone: &mut DataFileReader, len: u64| {
+            let mut buf = vec![0_u8; len as usize];
+            clone.read_exact(&mut buf).expect("read clone");
+            buf
+        };
+        let (mut clone, end) = df.try_clone().expect("clone a clean file");
+        assert_eq!(end, 100);
+        assert_eq!(read_all(&mut clone, end), first);
+        assert_eq!(df.flushed_end.load(Ordering::Relaxed), 100, "nothing was dirty");
+
+        let second = pattern(40);
+        df.write_all(&second).expect("append");
+        let (mut clone, end) = df.try_clone().expect("clone after an append");
+        assert_eq!(end, 140);
+        assert_eq!(df.flushed_end.load(Ordering::Relaxed), 140, "the dirty tail was flushed");
+        assert_eq!(read_all(&mut clone, end), [first, second].concat());
     }
 
     /// After a failed `remap` releases the mapping (`Backing::Empty`) with `end > 0`,

@@ -53,7 +53,7 @@ pub(crate) fn decompress_checked<'a>(
     Ok(out)
 }
 
-/// Iterate over a Db's key, value pairs in insert order.
+/// Iterate over a pack's records (values) in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 #[derive(Debug)]
 pub struct PackIter<V, R>
@@ -83,8 +83,7 @@ where
     R: Read + Seek,
 {
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     ///
     /// `end` is the logical data length (header + all complete records); the scan stops there
     /// instead of at physical EOF so mmap capacity padding is never decoded as a record.
@@ -131,8 +130,8 @@ where
         Ok(())
     }
 
-    /// Read the next record or return an error if an overflow bucket.
-    /// This expects the file cursor to be positioned at the records first byte.
+    /// Read and decode the next record.
+    /// This expects the file cursor to be positioned at the record's first byte.
     ///
     /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
     /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
@@ -224,7 +223,7 @@ where
     }
 }
 
-/// Async Iterate over a Db's key, value pairs in insert order.
+/// Async iteration over a pack's records (values) in insert order.
 /// This iterator is "raw", it does not use any indexes just the data file.
 ///
 /// Unlike [`PackIter`], this has **no logical-end bound** — it reads to reader EOF and stops only
@@ -253,8 +252,7 @@ where
     R: AsyncRead + Unpin,
 {
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     pub async fn open(
         mut reader: R,
         uid_idx: u64,
@@ -283,8 +281,7 @@ where
     }
 
     /// Open the iterator using reader as a data source.
-    /// Produces an iterator over all the (key, values).  All and records
-    /// are returned in insert order.
+    /// Produces an iterator over all the records, in insert order.
     /// This version only expects a chunk of records not a complete pack file (no header for
     /// instance).
     pub async fn open_partial(
@@ -307,8 +304,8 @@ where
         self.version
     }
 
-    /// Read the next record or return an error if an overflow bucket.
-    /// This expects the file cursor to be positioned at the records first byte.
+    /// Read and decode the next record.
+    /// This expects the file cursor to be positioned at the record's first byte.
     async fn read_record_file(
         file: &mut R,
         buffer: &mut Vec<u8>,

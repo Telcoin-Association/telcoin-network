@@ -1,5 +1,6 @@
-//! Wrapper function to add and check crc32s on byte buffers.  THe CRC codes are always the last
-//! four bytes in little endian format.
+//! CRC-32 helpers: the shared [`crc32`] / [`crc32_update`] (with an aarch64 PMULL fast path), and
+//! functions that add and check a CRC-32 trailer on byte buffers. The trailer is always the last
+//! four bytes, little endian.
 
 /// A CRC of exactly zero is indistinguishable from the all-zero "dirty" sentinel [`zero_crc`]
 /// writes, so buffers whose validity is classified by [`crc_state`] (the digest index's main
@@ -7,11 +8,6 @@
 /// non-zero value. Any non-zero `u32` would do; the exact constant is irrelevant as long as it is
 /// not 0.
 const NONZERO_CRC_SENTINEL: u32 = 0xFFFF_FFFF;
-
-/// Compute the crc32 of `payload`.
-fn compute_crc32(payload: &[u8]) -> u32 {
-    crc32(payload)
-}
 
 /// The CRC-32 (IEEE, the value `crc32fast` and zlib compute) of `data`.
 pub(crate) fn crc32(data: &[u8]) -> u32 {
@@ -154,9 +150,7 @@ pub(crate) fn check_crc(buffer: &[u8]) -> bool {
     if len < 5 {
         return false;
     }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let calc_crc32 = crc32_hasher.finalize();
+    let calc_crc32 = crc32(&buffer[..(len - 4)]);
     let mut buf32 = [0_u8; 4];
     buf32.copy_from_slice(&buffer[(len - 4)..]);
     let read_crc32 = u32::from_le_bytes(buf32);
@@ -175,10 +169,8 @@ pub(crate) fn add_crc32(buffer: &mut [u8]) {
     if len < 5 {
         return;
     }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let crc32 = crc32_hasher.finalize();
-    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
+    let crc = crc32(&buffer[..(len - 4)]);
+    buffer[len - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Like [`add_crc32`], but never stamps an all-zero trailer: a computed CRC of 0 is written as
@@ -199,8 +191,8 @@ pub(crate) fn add_crc32_nonzero(buffer: &mut [u8]) {
     if len < 5 {
         return;
     }
-    let crc32 = map_nonzero(compute_crc32(&buffer[..(len - 4)]));
-    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
+    let crc = map_nonzero(crc32(&buffer[..(len - 4)]));
+    buffer[len - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Overwrite the trailing 4-byte CRC of `buffer` with zeros, marking it as "dirty" — written but
@@ -252,7 +244,7 @@ fn check_crc_nonzero(buffer: &[u8]) -> bool {
     if len < 5 {
         return false;
     }
-    let calc = map_nonzero(compute_crc32(&buffer[..(len - 4)]));
+    let calc = map_nonzero(crc32(&buffer[..(len - 4)]));
     let mut buf32 = [0_u8; 4];
     buf32.copy_from_slice(&buffer[(len - 4)..]);
     calc == u32::from_le_bytes(buf32)
@@ -266,8 +258,8 @@ fn check_crc_nonzero(buffer: &[u8]) -> bool {
 /// so the dirty (all-zero) and valid states are disjoint — the recompute uses the same never-zero
 /// mapping ([`check_crc_nonzero`]) so a genuine CRC of 0 reads `Valid`, not `Dirty` or `Corrupt`.
 ///
-/// Note this recomputes the CRC for non-dirty buffers, so it is for verification/recovery, not the
-/// hot path; use [`crc_is_zero`] when you only need the cheap dirty check.
+/// Note this recomputes the CRC for non-dirty buffers (the digest index pays it on every lookup of
+/// a stamped bucket); use [`crc_is_zero`] when you only need the cheap dirty check.
 pub(crate) fn crc_state(buffer: &[u8]) -> CrcState {
     let len = buffer.len();
     if len < 5 {
