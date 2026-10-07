@@ -1,6 +1,7 @@
 //! Error types for TN network.
 
 use libp2p::{
+    core::upgrade::NegotiationError,
     gossipsub::{ConfigBuilderError, PublishError, SubscriptionError},
     kad::GetRecordError,
     request_response::OutboundFailure,
@@ -202,10 +203,59 @@ impl From<&DialError> for NetworkError {
     }
 }
 
+/// Whether an outbound request failed because the remote speaks none of the requested
+/// protocols.
+///
+/// The swarm negotiates outbound substreams with multistream-select `V1Lazy`, so a
+/// request-response dialer that proposes a single protocol does not wait for the
+/// listener's confirmation and never sees the rejection during the upgrade. The
+/// rejection surfaces when the response is read, as [`OutboundFailure::Io`] wrapping
+/// [`NegotiationError::Failed`], instead of [`OutboundFailure::UnsupportedProtocols`].
+/// Both shapes mean the peer runs a different protocol set (honest version, role, or
+/// chain skew), so both return `true`.
+pub(crate) fn is_unsupported_protocol(failure: &OutboundFailure) -> bool {
+    match failure {
+        OutboundFailure::UnsupportedProtocols => true,
+        OutboundFailure::Io(e) => is_negotiation_failure(e),
+        OutboundFailure::DialFailure
+        | OutboundFailure::Timeout
+        | OutboundFailure::ConnectionClosed => false,
+    }
+}
+
+/// Map a lazily negotiated protocol rejection to [`OutboundFailure::UnsupportedProtocols`],
+/// the shape strict negotiation reports, so failure handlers, metrics, and callers classify
+/// it the same way under either negotiation version.
+pub(crate) fn normalize_outbound_failure(failure: OutboundFailure) -> OutboundFailure {
+    if is_unsupported_protocol(&failure) {
+        OutboundFailure::UnsupportedProtocols
+    } else {
+        failure
+    }
+}
+
+/// Whether `error` is multistream-select's rejection of every proposed protocol.
+///
+/// `Negotiated` reports the rejection on read as `io::Error::other(NegotiationError::Failed)`
+/// (kind `Other`), so the typed error is the io error's inner error. Only `Failed` means the
+/// listener refused the protocol: a `NegotiationError::ProtocolError` (malformed
+/// negotiation) is converted into a plain io error, and the swarm reports it as
+/// `StreamUpgradeError::Io` under strict negotiation too.
+pub(crate) fn is_negotiation_failure(error: &io::Error) -> bool {
+    std::iter::successors(
+        error.get_ref().map(|inner| inner as &(dyn std::error::Error + 'static)),
+        |err| err.source(),
+    )
+    .any(|err| matches!(err.downcast_ref::<NegotiationError>(), Some(NegotiationError::Failed)))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{NetworkError, RpcFailure};
-    use libp2p::request_response::OutboundFailure;
+    use super::{is_unsupported_protocol, normalize_outbound_failure, NetworkError, RpcFailure};
+    use libp2p::{
+        core::upgrade::{NegotiationError, ProtocolError},
+        request_response::OutboundFailure,
+    };
     use std::io;
 
     /// Every `OutboundFailure` variant maps to the matching `RpcFailure`
@@ -233,5 +283,64 @@ mod tests {
             let wrapped = NetworkError::Outbound(mapped);
             assert_eq!(wrapped.to_string(), format!("Outbound failure: {expected}"));
         }
+    }
+
+    /// The io error multistream-select's `Negotiated` returns on read when the listener
+    /// rejects a lazily negotiated protocol (`From<NegotiationError> for io::Error`).
+    fn lazy_rejection() -> OutboundFailure {
+        OutboundFailure::Io(io::Error::from(NegotiationError::Failed))
+    }
+
+    /// A lazy rejection and strict `UnsupportedProtocols` are both unsupported-protocol
+    /// failures; transport, timeout, and malformed-negotiation failures are not.
+    #[test]
+    fn unsupported_protocol_covers_lazy_negotiation_rejection() {
+        let OutboundFailure::Io(e) = lazy_rejection() else { unreachable!() };
+        assert_eq!(e.kind(), io::ErrorKind::Other, "lazy rejection must keep its upstream shape");
+
+        assert!(is_unsupported_protocol(&lazy_rejection()));
+        assert!(is_unsupported_protocol(&OutboundFailure::UnsupportedProtocols));
+
+        let not_unsupported = [
+            OutboundFailure::Io(io::ErrorKind::ConnectionReset.into()),
+            OutboundFailure::Io(io::Error::other("boom")),
+            // a malformed negotiation is an io failure under strict negotiation too
+            OutboundFailure::Io(io::Error::from(NegotiationError::ProtocolError(
+                ProtocolError::InvalidMessage,
+            ))),
+            OutboundFailure::Io(io::Error::other(NegotiationError::ProtocolError(
+                ProtocolError::InvalidProtocol,
+            ))),
+            OutboundFailure::Timeout,
+            OutboundFailure::DialFailure,
+            OutboundFailure::ConnectionClosed,
+        ];
+        for failure in not_unsupported {
+            assert!(!is_unsupported_protocol(&failure), "{failure:?} is not a protocol rejection");
+        }
+    }
+
+    /// Normalizing turns a lazy rejection into the strict shape, so callers see the same
+    /// `RpcFailure` under either negotiation version, and leaves every other failure intact.
+    #[test]
+    fn normalize_maps_lazy_rejection_to_unsupported_protocols() {
+        assert!(matches!(
+            normalize_outbound_failure(lazy_rejection()),
+            OutboundFailure::UnsupportedProtocols
+        ));
+        assert!(matches!(
+            RpcFailure::from(normalize_outbound_failure(lazy_rejection())),
+            RpcFailure::UnsupportedProtocols
+        ));
+
+        let reset =
+            normalize_outbound_failure(OutboundFailure::Io(io::ErrorKind::ConnectionReset.into()));
+        assert!(
+            matches!(reset, OutboundFailure::Io(e) if e.kind() == io::ErrorKind::ConnectionReset)
+        );
+        assert!(matches!(
+            normalize_outbound_failure(OutboundFailure::Timeout),
+            OutboundFailure::Timeout
+        ));
     }
 }
