@@ -5501,6 +5501,190 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
 #[path = "connection_publication_tests.rs"]
 mod connection_publication_tests;
 
+/// A reconnect recovers a rotated BLS identity, addresses and RPC metadata while both physical
+/// connections have their targeted advertisements cancelled, without any heartbeat retry.
+#[tokio::test]
+async fn test_record_retrieval_recovers_suppressed_update() -> eyre::Result<()> {
+    use futures::TryStreamExt as _;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let TestTypes { mut peer1, mut peer2, _task_manager } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let peer2_id = *peer2.network.swarm.local_peer_id();
+    let previous_key = peer2.config.key_config().primary_public_key();
+    let peer1_key = peer1.config.key_config().primary_public_key();
+    let peer1_record = encode(&peer1.network.node_record);
+    [&mut peer1.network, &mut peer2.network].into_iter().for_each(|network| {
+        network.record_retry_interval = Duration::from_secs(60);
+        network.record_exchange =
+            RecordExchange::new(MAX_RECORD_EXCHANGE_HISTORY, 2, network.record_retry_interval);
+    });
+    let rotated_fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let rotated_keys = rotated_fixture
+        .authorities()
+        .nth(2)
+        .map(|authority| authority.consensus_config().key_config().clone())
+        .ok_or_else(|| eyre!("rotated authority"))?;
+    let key = rotated_keys.primary_public_key();
+    assert_ne!(key, previous_key);
+    peer2.network.key_config = rotated_keys;
+    let chain = peer2.config.network_config().libp2p_config().chain_id;
+    let mut current_info = peer2.network.node_record.info.clone();
+    current_info.rpc = Some(RpcInfo { http: "https://current.example/rpc".parse()?, ws: None });
+    let current_signature = peer2.network.key_config.request_signature_direct(&encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        chain,
+        0u8,
+        0u16,
+        &current_info,
+    )));
+    peer2.network.node_record = NodeRecord { info: current_info, signature: current_signature };
+    let expected = encode(&peer2.network.node_record);
+    let mut old_info = peer2.network.node_record.info.clone();
+    old_info.timestamp = old_info.timestamp.saturating_sub(1);
+    old_info.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
+    old_info.rpc = Some(RpcInfo { http: "https://previous.example/rpc".parse()?, ws: None });
+    let old_signature = peer2.config.key_config().request_signature_direct(&encode(&(
+        b"telcoin-network/node-record/v1".as_slice(),
+        chain,
+        0u8,
+        0u16,
+        &old_info,
+    )));
+    let mut old = peer2.network.get_peer_record();
+    old.key = node_record_key(&previous_key);
+    old.value = encode(&NodeRecord { info: old_info, signature: old_signature });
+    peer1.network.process_kad_put_request(peer2_id, old)?;
+    let addr1 = peer1.config.primary_address();
+    let addr2 = peer2.config.primary_address();
+    let net2 = peer2.config.primary_networkkey();
+    let handle1 = peer1.network_handle;
+    let handle2 = peer2.network_handle;
+    let received = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+    let tasks = [
+        (peer1.network, Arc::clone(&received[0])),
+        (peer2.network, Arc::clone(&received[1])),
+    ]
+    .map(|(mut network, received)| {
+        network.swarm.behaviour_mut().kademlia.set_mode(Some(Mode::Server));
+        // The retrieval response reads get_peer_record directly; no local publication is needed.
+        tokio::spawn(
+            futures::stream::unfold((network, received), |(mut network, received)| async move {
+                let result = tokio::select! {
+                    event = network.swarm.select_next_some() => {
+                        if matches!(&event, SwarmEvent::Behaviour(TNBehaviorEvent::RecordExchange(
+                            ReqResEvent::Message { message: libp2p::request_response::Message::Response { .. }, .. }
+                        ))) {
+                            received.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if let SwarmEvent::ConnectionEstablished { peer_id, connection_id, .. } = &event {
+                            // Mark this live connection complete before its queued PeerConnected
+                            // event can sign or publish our record. Retrieval remains independent.
+                            let kad = &mut network.swarm.behaviour_mut().kademlia;
+                            kad.queue_record_to_connection(*peer_id, *connection_id);
+                            kad.cancel_record_to_connection(*connection_id);
+                        }
+                        network.process_event(event).await
+                    }
+                    command = network.commands.recv() => command
+                        .map(|command| network.process_command(command))
+                        .unwrap_or(Ok(())),
+                };
+                assert!(network.record_exchange.counts().0 <= 2, "retrieval remains bounded");
+                Some((result, (network, received)))
+            })
+            .try_for_each(|()| futures::future::ready(Ok(()))),
+        )
+    });
+    let result = async {
+        handle1.start_listening(addr1).await?;
+        handle2.start_listening(addr2.clone()).await?;
+        handle1.add_trusted_peer_and_dial(previous_key, net2, addr2).await?;
+        wait_until(
+            Duration::from_secs(5),
+            "retrieve both records before retries despite push suppression",
+            || async {
+                let forward = handle1
+                    .kad_store_get(key)
+                    .await?
+                    .is_some_and(|record| record.value == expected);
+                let reverse = handle2
+                    .kad_store_get(peer1_key)
+                    .await?
+                    .is_some_and(|record| record.value == peer1_record);
+                Ok(forward
+                    && reverse
+                    && received.iter().all(|count| count.load(Ordering::Relaxed) > 0))
+            },
+        )
+        .await?;
+        assert!(handle1.connected_peers().await?.contains(&key), "confirm the rotated identity");
+        eyre::Ok(())
+    }
+    .await;
+    tasks.iter().for_each(tokio::task::JoinHandle::abort);
+    let [task1, task2] = tasks;
+    let _ = tokio::join!(task1, task2);
+    result
+}
+
+/// Authenticated transport identity must match the network identity in a returned record.
+#[tokio::test]
+async fn test_record_retrieval_rejects_wrong_publisher() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let wrong_peer = PeerId::random();
+    let key = peer2.config.key_config().primary_public_key();
+    let request = network.swarm.behaviour_mut().record_exchange.send_request(&wrong_peer, ());
+    assert!(network.record_exchange.allow_request(wrong_peer));
+    network.record_exchange.track(wrong_peer, request);
+    network.process_record_response(wrong_peer, request, Some((key, peer2.network.node_record)))?;
+    assert!(network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .get(&node_record_key(&key))
+        .is_none());
+    Ok(())
+}
+
+/// Unsupported retrieval is penalty-exempt and creates at most one legacy query per known key.
+#[tokio::test]
+async fn test_record_retrieval_legacy_fallback_is_deduplicated() -> eyre::Result<()> {
+    let TestTypes { peer1, peer2, .. } =
+        create_test_types::<TestWorkerRequest, TestWorkerResponse>();
+    let mut network = peer1.network;
+    let peer = *peer2.network.swarm.local_peer_id();
+    network.swarm.behaviour_mut().peer_manager.update_committees(
+        Default::default(),
+        [peer2.config.key_config().primary_public_key()].into_iter().collect(),
+        Default::default(),
+    );
+    network.process_kad_put_request(peer, peer2.network.get_peer_record())?;
+    let request = network.swarm.behaviour_mut().record_exchange.send_request(&peer, ());
+    assert!(network.record_exchange.allow_request(peer));
+    network.record_exchange.track(peer, request);
+    network.process_record_exchange_event(ReqResEvent::OutboundFailure {
+        peer,
+        connection_id: libp2p::swarm::ConnectionId::new_unchecked(1),
+        request_id: request,
+        error: ReqResOutboundFailure::UnsupportedProtocols,
+    })?;
+    assert!(!network.swarm.behaviour().peer_manager.peer_banned(&peer));
+    assert_eq!(network.kad_record_queries.len(), 1);
+    network.request_legacy_record(peer);
+    assert_eq!(network.kad_record_queries.len(), 1);
+    Ok(())
+}
+
+#[path = "record_review_tests.rs"]
+mod record_review_tests;
+
 /// Regression for issue #819: a resolved author identity is carried on the delivered gossip
 /// event so the application layer can charge an author-content fault to the author rather than
 /// the forwarding relayer.

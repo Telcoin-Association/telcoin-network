@@ -25,6 +25,7 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod record_exchange;
 mod retention;
 pub mod source_admission;
 pub mod stream;
