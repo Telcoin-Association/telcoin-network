@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::{
     cli::Settings,
+    proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
     server::{serve, AppState, ServerLimits},
@@ -23,6 +24,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     let Settings {
         listen_addr,
         upstreams,
+        query_upstream,
         readiness_poll_interval,
         readiness_poll_timeout,
         upstream_connect_timeout,
@@ -43,6 +45,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         %listen_addr,
         upstreams = upstreams.len(),
+        redirect_queries = %query_upstream
+            .as_ref()
+            .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
         "starting worker gateway"
     );
 
@@ -65,12 +70,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         "edge protections configured"
     );
 
-    // Dedicated clients: the proxy enforces connect + per-request deadlines; the
-    // poller bounds each probe with its own tokio timeout.
-    let proxy_client = Client::builder()
-        .connect_timeout(upstream_connect_timeout)
-        .timeout(upstream_request_timeout)
-        .build()?;
+    // Dedicated clients: the proxy enforces connect + per-request deadlines and
+    // never follows redirects (see `proxy_client`); the poller bounds each
+    // probe with its own tokio timeout.
+    let proxy_client = proxy_client(upstream_connect_timeout, upstream_request_timeout)?;
     let readiness_client = Client::builder().connect_timeout(upstream_connect_timeout).build()?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
@@ -116,7 +119,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client };
+    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
 
     spawner.spawn_critical_task(
         "readiness-poller",

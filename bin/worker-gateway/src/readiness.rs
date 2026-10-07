@@ -5,6 +5,13 @@
 //! transactions. The proxy consults this state to pick a ready upstream, and
 //! the gateway's own `/ready` endpoint reflects whether any upstream is ready.
 //!
+//! Readiness governs the worker route only. With `--redirect-queries` set,
+//! non-submission calls go to the query upstream whatever this state says, and
+//! that upstream is never probed: there is one query URL and no fallback, so a
+//! probe would have nothing to fail over to, while N gateways polling a shared
+//! public endpoint would add load to it. Its failures show up per request (as
+//! `502`/`504`) and in the routed-request metrics instead.
+//!
 //! Every failure mode (unreachable, timed out, malformed payload, worker absent
 //! from the payload) marks the upstream not-ready, so the gateway fails closed.
 

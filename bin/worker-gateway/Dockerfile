@@ -45,10 +45,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 # production image
 FROM debian:bookworm-slim
 
-# The gateway is HTTP-only (reqwest is built without a TLS backend, and https
-# upstreams are rejected at startup), so it links no openssl at runtime. Only
-# ca-certificates is installed, and only for parity with operator tooling; drop
-# this RUN entirely if you want the smallest possible image.
+# The gateway links rustls, not openssl, so no TLS library is installed.
+# ca-certificates is required for an https --redirect-queries URL: rustls reads
+# its trusted roots from the system store, which is empty without this package,
+# and every request to that URL would then fail. Worker upstreams stay http-only.
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates && \

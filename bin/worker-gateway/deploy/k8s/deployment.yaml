@@ -52,6 +52,13 @@ spec:
             # until you do.
             - name: WORKER_GATEWAY_UPSTREAM_READINESS_URL
               value: "http://tn-worker.telcoin-network.svc.cluster.local:<HEALTHCHECK_TCP_PORT>/health/workers"
+            # Every call except eth_sendRawTransaction and
+            # eth_sendRawTransactionSync goes to this JSON-RPC endpoint, a public
+            # RPC for the same chain, so the worker receives only submissions.
+            # Required in front of a validator: replace <PUBLIC_RPC_HOST>; the
+            # gateway refuses to start until you do.
+            - name: WORKER_GATEWAY_REDIRECT_QUERIES
+              value: "https://<PUBLIC_RPC_HOST>"
           lifecycle:
             # Keep serving for 5s after the pod is marked for deletion so the
             # endpoint controller and load balancers stop routing to it before
@@ -74,6 +81,9 @@ spec:
             periodSeconds: 10
           readinessProbe:
             # /ready is readiness: 200 when an upstream worker is ready, else 503.
+            # It reports whether submissions can be served, so a worker outage
+            # takes every replica out of the Service and reads stop too; see
+            # deploy/README.md ("Readiness and reads") for the alternative.
             httpGet:
               path: /ready
               port: rpc

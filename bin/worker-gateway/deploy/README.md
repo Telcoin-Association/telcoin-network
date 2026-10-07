@@ -40,6 +40,9 @@ A Grafana dashboard for the metrics these expose lives at
   does not parse and the gateway exits at startup. The listener is
   unauthenticated and serves one connection at a time, so admit only the
   gateways to it.
+- **Query upstream** (`deployment.yaml`): `WORKER_GATEWAY_REDIRECT_QUERIES` (equivalently `--redirect-queries`) sends every call except `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to a public JSON-RPC endpoint for the same chain, so the validator's worker receives only submissions (see the README's "Query redirect" section).
+  Replace `<PUBLIC_RPC_HOST>` with that endpoint, preferably over `https`; until you do, the URL does not parse and the gateway exits at startup.
+  Remove the variable only for a gateway that should send every call to its worker, never in front of a validator.
 
 ## Ports and endpoints
 
@@ -60,6 +63,13 @@ plus the gateway's own `--graceful-shutdown-timeout`
 gateway's 1s join margin, so the process has room to drain in-flight proxied
 requests before the kubelet escalates to SIGKILL. If you raise the gateway's
 drain timeout or the preStop sleep, raise this too.
+
+## Readiness and reads
+
+The `readinessProbe` uses `/ready`, which reports whether the gateway can take submissions.
+Every replica polls the same worker, so when the worker is down every replica leaves the Service at once, and reads stop too even though the query upstream could still serve them.
+If reads must survive a worker outage, point the `readinessProbe` at `/health` instead; while the worker is down, submissions then get `503` / `-32000` from the gateway and reads keep working.
+The same choice applies to an external load balancer or DNS health check.
 
 ## Memory limit
 

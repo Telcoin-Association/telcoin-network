@@ -28,9 +28,9 @@ use serde_json::{json, Value};
 mod code {
     /// No upstream worker is currently ready to serve the request.
     pub(super) const NO_UPSTREAM_READY: i32 = -32000;
-    /// The upstream worker could not be reached.
+    /// The upstream (a worker, or the query upstream) could not be reached.
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
-    /// The upstream worker did not answer within the request deadline.
+    /// The upstream did not answer within the request deadline.
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
     /// The request body exceeded the gateway's size limit.
     pub(super) const REQUEST_TOO_LARGE: i32 = -32003;
@@ -55,9 +55,10 @@ mod code {
 pub(crate) enum GatewayError {
     /// No upstream worker was ready per the readiness poller.
     NoUpstreamReady,
-    /// The upstream worker could not be reached (connection failure).
+    /// The upstream (a worker, or the query upstream) could not be reached
+    /// (connection failure).
     UpstreamUnreachable,
-    /// The upstream worker did not answer within the request deadline.
+    /// The upstream did not answer within the request deadline.
     UpstreamTimeout,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
@@ -113,8 +114,8 @@ impl GatewayError {
     fn message(&self) -> &'static str {
         match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
-            Self::UpstreamUnreachable => "upstream worker unreachable",
-            Self::UpstreamTimeout => "upstream worker request timed out",
+            Self::UpstreamUnreachable => "upstream unreachable",
+            Self::UpstreamTimeout => "upstream request timed out",
             Self::RequestTooLarge => "request body too large",
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"

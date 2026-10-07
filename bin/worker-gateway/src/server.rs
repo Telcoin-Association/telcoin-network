@@ -39,6 +39,7 @@ use tokio::{
 };
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, info, warn};
+use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
@@ -62,8 +63,12 @@ pub(crate) const READY_PATH: &str = "/ready";
 pub(crate) struct AppState {
     /// Live readiness view of the configured upstream workers.
     pub(crate) readiness: Arc<GatewayReadiness>,
-    /// Client used to forward requests to upstream workers.
+    /// Client used to forward requests on both routes (built by
+    /// [`crate::proxy::proxy_client`] outside tests).
     pub(crate) http: Client,
+    /// Endpoint serving every non-submission call (`--redirect-queries`), or
+    /// `None` when every call goes to the workers. It is not readiness-gated.
+    pub(crate) query_upstream: Option<Url>,
 }
 
 /// Inbound connection limits enforced by the accept loop and router (derived
@@ -155,6 +160,10 @@ async fn liveness() -> impl IntoResponse {
 
 /// Readiness probe: `200` when at least one upstream worker is ready, else
 /// `503`.
+///
+/// It means "this gateway can take submissions". With `--redirect-queries`
+/// set, reads keep working while it reports `503`, and a failing query
+/// upstream does not change it: that upstream is never probed.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     let ready = state.readiness.any_ready();
     let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
@@ -330,17 +339,23 @@ mod tests {
     use super::*;
     use crate::{
         config::UpstreamWorker,
-        proxy::MAX_REQUEST_BYTES,
+        proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
     };
-    use axum::{http::HeaderMap, routing::post};
-    use std::num::NonZeroU32;
+    use axum::{
+        http::{header, HeaderMap},
+        routing::post,
+    };
+    use reqwest::redirect::Policy;
+    use std::{
+        num::NonZeroU32,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
     use tn_types::Notifier;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
     };
-    use url::Url;
 
     /// Generous limits so only the behavior under test can trip.
     fn test_limits() -> ServerLimits {
@@ -359,7 +374,11 @@ mod tests {
     }
 
     fn test_state_with_client(upstreams: &[UpstreamWorker], client: Client) -> AppState {
-        AppState { readiness: Arc::new(GatewayReadiness::new(upstreams)), http: client }
+        AppState {
+            readiness: Arc::new(GatewayReadiness::new(upstreams)),
+            http: client,
+            query_upstream: None,
+        }
     }
 
     /// Serve `app` through the real accept loop (header timeout, nodelay,
@@ -862,5 +881,375 @@ mod tests {
         set_tcp_user_timeout(&accepted, Duration::from_secs(7)).expect("set TCP_USER_TIMEOUT");
         let armed = socket2::SockRef::from(&accepted).tcp_user_timeout().expect("read back");
         assert_eq!(armed, Some(Duration::from_secs(7)));
+    }
+
+    /// What a mock upstream has received.
+    #[derive(Clone, Debug, Default)]
+    struct Seen {
+        /// Requests received.
+        hits: Arc<AtomicUsize>,
+        /// Requests carrying `X-TN-Gateway`.
+        hop_marker: Arc<AtomicUsize>,
+        /// Requests carrying `X-TN-Gateway-Redirect`.
+        redirect_marker: Arc<AtomicUsize>,
+        /// Requests carrying the client's identity (`X-Forwarded-For`,
+        /// `X-Forwarded-Proto`) and the gateway's user agent.
+        identified: Arc<AtomicUsize>,
+    }
+
+    impl Seen {
+        fn hits(&self) -> usize {
+            self.hits.load(Ordering::SeqCst)
+        }
+
+        fn hop_marker(&self) -> usize {
+            self.hop_marker.load(Ordering::SeqCst)
+        }
+
+        fn redirect_marker(&self) -> usize {
+            self.redirect_marker.load(Ordering::SeqCst)
+        }
+
+        fn identified(&self) -> usize {
+            self.identified.load(Ordering::SeqCst)
+        }
+    }
+
+    /// A mock upstream that answers every POST with `name` as the body and
+    /// counts what it receives. The `Notifier` keeps it alive.
+    async fn named_mock(name: &'static str) -> (SocketAddr, Seen, Notifier) {
+        let seen = Seen::default();
+        let counters = seen.clone();
+        let mock = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap| {
+                let counters = counters.clone();
+                async move {
+                    let get = |name: &str| {
+                        headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+                    };
+                    counters.hits.fetch_add(1, Ordering::SeqCst);
+                    if headers.contains_key("x-tn-gateway") {
+                        counters.hop_marker.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if headers.contains_key("x-tn-gateway-redirect") {
+                        counters.redirect_marker.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if get("x-forwarded-for") == "127.0.0.1"
+                        && get("x-forwarded-proto") == "http"
+                        && get("user-agent").starts_with("tn-worker-gateway/")
+                    {
+                        counters.identified.fetch_add(1, Ordering::SeqCst);
+                    }
+                    name
+                }
+            }),
+        );
+        let (addr, shutdown) = spawn(mock).await;
+        (addr, seen, shutdown)
+    }
+
+    /// Gateway state with one worker at `worker` and, when given,
+    /// `--redirect-queries` pointing at `query`, using the production proxy
+    /// client. The worker starts not ready.
+    fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        redirect_state_with_client(worker, query, client)
+    }
+
+    fn redirect_state_with_client(
+        worker: SocketAddr,
+        query: Option<SocketAddr>,
+        client: Client,
+    ) -> AppState {
+        AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[upstream(worker)])),
+            http: client,
+            query_upstream: query
+                .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+        }
+    }
+
+    /// A JSON-RPC call to `method` with empty params and the given id.
+    fn call(method: &str, id: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":[],"id":{id}}}"#)
+    }
+
+    /// POST `body` to the gateway, with an extra request header when given.
+    async fn post_rpc(
+        gateway: SocketAddr,
+        extra_header: Option<&'static str>,
+        body: String,
+    ) -> (StatusCode, String) {
+        let request = Client::new().post(format!("http://{gateway}/")).body(body);
+        let request = match extra_header {
+            Some(name) => request.header(name, "1"),
+            None => request,
+        };
+        let response = request.send().await.expect("send");
+        (response.status(), response.text().await.expect("text"))
+    }
+
+    /// The JSON-RPC error code and id of a gateway error body.
+    fn error_code_and_id(body: &str) -> (i64, serde_json::Value) {
+        let body: serde_json::Value = serde_json::from_str(body).expect("json error body");
+        (body["error"]["code"].as_i64().expect("error code"), body["id"].clone())
+    }
+
+    #[tokio::test]
+    async fn redirect_sends_each_method_to_its_upstream() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let table = [
+            ("eth_sendRawTransaction", "worker"),
+            ("eth_sendRawTransactionSync", "worker"),
+            ("eth_sendTransaction", "query"),
+            ("eth_call", "query"),
+            ("eth_chainId", "query"),
+            ("eth_getLogs", "query"),
+            ("eth_getTransactionCount", "query"),
+            ("tn_info", "query"),
+            ("debug_traceTransaction", "query"),
+        ];
+        for (method, expected) in table {
+            let (status, text) = post_rpc(gateway, None, call(method, 1)).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, expected), "{method}");
+        }
+        let (status, text) =
+            post_rpc(gateway, None, "not json, but eth_sendRawTransaction".to_string()).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!(worker_seen.hits(), 2);
+        assert_eq!(query_seen.hits(), table.len() - 1);
+
+        // the screen still runs before routing: a junk submission is refused
+        // at the gateway and reaches neither upstream
+        let junk =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":3}"#;
+        let (status, text) = post_rpc(gateway, None, junk.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_code_and_id(&text), (-32007, serde_json::json!(3)));
+        assert_eq!(worker_seen.hits() + query_seen.hits(), table.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn redirect_sends_only_all_submission_batches_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let submission = call("eth_sendRawTransaction", 1);
+        let sync = call("eth_sendRawTransactionSync", 2);
+        let read = call("eth_getLogs", 3);
+        for (body, expected) in [
+            (format!("[{submission},{sync}]"), "worker"),
+            (format!("[{submission},{read}]"), "query"),
+            (format!("[{read},{submission}]"), "query"),
+            ("[]".to_string(), "query"),
+        ] {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, expected), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), 1);
+        assert_eq!(query_seen.hits(), 3);
+    }
+
+    #[tokio::test]
+    async fn worker_down_serves_queries_and_refuses_submissions() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        // the worker is never marked ready
+        let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, Some(query)))).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 2)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text), (-32000, serde_json::json!(2)));
+
+        let ready =
+            Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send");
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(worker_seen.hits(), 0);
+        assert_eq!(query_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_upstream_down_never_falls_back_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        // nothing listens on port 1
+        let state = redirect_state(worker, Some("127.0.0.1:1".parse().expect("addr")));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 9)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(9)));
+        assert_eq!(worker_seen.hits(), 0, "a failed query must not fall back to the worker");
+
+        // submissions and readiness are unaffected
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        let ready =
+            Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send");
+        assert_eq!(ready.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn slow_query_upstream_times_out_without_falling_back() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let slow = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (query, _query) = spawn(slow).await;
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+        let state = redirect_state_with_client(worker, Some(query), client);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_getLogs", 4)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(4)));
+        assert_eq!(worker_seen.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn markers_follow_the_route() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, call("eth_call", 1)).await;
+        assert_eq!(text, "query");
+        let (_, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 2)).await;
+        assert_eq!(text, "worker");
+
+        // the query hop carries the redirect marker and never the hop marker,
+        // which a public rpc behind its own gateway would reject as a loop
+        assert_eq!(
+            (query_seen.hits(), query_seen.redirect_marker(), query_seen.hop_marker()),
+            (1, 1, 0)
+        );
+        assert_eq!(
+            (worker_seen.hits(), worker_seen.hop_marker(), worker_seen.redirect_marker()),
+            (1, 1, 0)
+        );
+        // both hops carry the client identity and the gateway's user agent
+        assert_eq!((query_seen.identified(), worker_seen.identified()), (1, 1));
+    }
+
+    #[tokio::test]
+    async fn only_a_redirecting_gateway_rejects_the_redirect_marker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+
+        let redirecting = redirect_state(worker, Some(query));
+        redirecting.readiness.set_ready(0, true);
+        let (redirecting, _redirecting) = spawn(test_router(redirecting)).await;
+        for method in ["eth_call", "eth_sendRawTransaction"] {
+            let (status, text) =
+                post_rpc(redirecting, Some("x-tn-gateway-redirect"), call(method, 5)).await;
+            assert_eq!(status, StatusCode::LOOP_DETECTED, "{method}");
+            assert_eq!(error_code_and_id(&text), (-32004, serde_json::json!(5)));
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
+
+        // a gateway without a redirect (one fronting the public rpc, say)
+        // forwards a redirected request normally
+        let plain = redirect_state(worker, None);
+        plain.readiness.set_ready(0, true);
+        let (plain, _plain) = spawn(test_router(plain)).await;
+        let (status, text) =
+            post_rpc(plain, Some("x-tn-gateway-redirect"), call("eth_call", 6)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn hop_marker_is_still_rejected_with_the_redirect_on() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        for method in ["eth_call", "eth_sendRawTransaction"] {
+            let (status, text) = post_rpc(gateway, Some("x-tn-gateway"), call(method, 7)).await;
+            assert_eq!(status, StatusCode::LOOP_DETECTED, "{method}");
+            assert_eq!(error_code_and_id(&text), (-32004, serde_json::json!(7)));
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
+    }
+
+    #[tokio::test]
+    async fn without_a_redirect_everything_goes_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let bodies = [
+            call("eth_chainId", 1),
+            call("eth_getLogs", 2),
+            call("tn_info", 3),
+            call("eth_sendRawTransaction", 4),
+            call("eth_sendRawTransactionSync", 5),
+            format!("[{},{}]", call("eth_sendRawTransaction", 6), call("eth_call", 7)),
+        ];
+        for body in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), bodies.len());
+        assert_eq!(worker_seen.hop_marker(), bodies.len());
+        assert_eq!(worker_seen.redirect_marker(), 0);
+    }
+
+    /// The proxy client follows no redirect. A query upstream answering `307`
+    /// or `308` (which reqwest would otherwise follow, replaying the POST
+    /// body) must not bounce a read onto the worker; the status passes through
+    /// to the client like any other, without the `Location` header.
+    #[tokio::test]
+    async fn query_upstream_redirects_are_not_followed() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let location = format!("http://{worker}/");
+        for status in [StatusCode::TEMPORARY_REDIRECT, StatusCode::PERMANENT_REDIRECT] {
+            let location = location.clone();
+            let bouncer = Router::new().route(
+                "/",
+                post(move || async move { (status, [(header::LOCATION, location)], "moved") }),
+            );
+            let (query, _query) = spawn(bouncer).await;
+            let state = redirect_state(worker, Some(query));
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+            // a client that follows nothing either, so any worker hit could
+            // only have come from the gateway
+            let client = Client::builder().redirect(Policy::none()).build().expect("client");
+            let response = client
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_call", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), status);
+            assert!(response.headers().get(header::LOCATION).is_none());
+            assert_eq!(response.text().await.expect("text"), "moved");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
     }
 }

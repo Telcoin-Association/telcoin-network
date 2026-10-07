@@ -8,10 +8,12 @@ use std::{
 };
 
 use clap::Parser;
+use tracing::warn;
 use url::Url;
 
 use crate::{
     config::{GatewayConfig, UpstreamWorker},
+    proxy::UpstreamOrigin,
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
@@ -47,6 +49,16 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_WORKER_ID", default_value_t = 0)]
     pub(crate) worker_id: u16,
 
+    /// JSON-RPC endpoint (`http` or `https`) that serves every call except
+    /// transaction submissions, typically a public RPC. When set, only
+    /// `eth_sendRawTransaction` and `eth_sendRawTransactionSync`, alone or in a
+    /// batch made only of them, reach the worker; everything else, including a
+    /// batch that mixes submissions with other calls, goes here, with no
+    /// readiness gate and no fallback to the worker. Must not point at the
+    /// gateway itself or at a worker's RPC host and port.
+    #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
+    pub(crate) redirect_queries: Option<Url>,
+
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
         long,
@@ -66,7 +78,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) readiness_poll_timeout: Duration,
 
-    /// Connect timeout when forwarding a request to an upstream worker.
+    /// Connect timeout when forwarding a request to an upstream: a worker, or the
+    /// `--redirect-queries` endpoint.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT",
@@ -75,7 +88,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_connect_timeout: Duration,
 
-    /// Overall per-request deadline when forwarding to an upstream worker.
+    /// Overall per-request deadline when forwarding to an upstream: a worker, or
+    /// the `--redirect-queries` endpoint.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
@@ -219,6 +233,9 @@ pub(crate) struct Settings {
     pub(crate) listen_addr: SocketAddr,
     /// Upstream workers, in preference order.
     pub(crate) upstreams: Vec<UpstreamWorker>,
+    /// Endpoint serving every non-submission call (`--redirect-queries`), or
+    /// `None` when every call goes to the workers.
+    pub(crate) query_upstream: Option<Url>,
     /// Readiness poll interval.
     pub(crate) readiness_poll_interval: Duration,
     /// Readiness poll timeout.
@@ -265,6 +282,10 @@ impl Cli {
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        let query_upstream = self
+            .redirect_queries
+            .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
+            .transpose()?;
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
@@ -294,6 +315,7 @@ impl Cli {
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
+            query_upstream,
             readiness_poll_interval: self.readiness_poll_interval,
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
@@ -374,17 +396,87 @@ fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
         })
 }
 
-/// Reject non-`http` upstream URLs at startup. The gateway is HTTP-only (the
-/// workspace `reqwest` is built without a TLS backend), so an `https` URL would
-/// parse and boot but then fail every forward and readiness probe with an
-/// opaque runtime error; catching it here turns that into a clear startup error.
+/// Reject non-`http` worker URLs at startup. The hop to a worker is HTTP-only:
+/// the gateway carries a TLS backend for `--redirect-queries`, but TLS to
+/// workers (and to their readiness endpoints) is not supported, so an `https`
+/// worker URL is a configuration error reported here rather than a surprise at
+/// runtime.
 fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
     eyre::ensure!(
         url.scheme() == "http",
-        "unsupported URL scheme `{}` in `{url}`: the worker gateway is HTTP-only (no TLS)",
+        "unsupported URL scheme `{}` in `{url}`: worker upstreams are HTTP-only; TLS is \
+         supported only for --redirect-queries",
         url.scheme()
     );
     Ok(())
+}
+
+/// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
+/// fragment, not the gateway itself, and not on any worker's RPC host and port.
+///
+/// The last check is an error rather than a warning because reads sent to a
+/// worker land on the validator, which is the load the redirect exists to
+/// remove. It compares host and port whatever the scheme, so an `https` URL on
+/// a worker's `http` socket is caught too. Plain `http` to a host that is not a
+/// loopback or private address literal is accepted with a warning: the reads
+/// and their answers then cross the network unencrypted. Messages name the URL
+/// by origin only, since a hosted RPC URL can carry an API key in its path.
+fn ensure_query_upstream(
+    listen_addr: SocketAddr,
+    url: &Url,
+    upstreams: &[UpstreamWorker],
+) -> eyre::Result<()> {
+    eyre::ensure!(
+        matches!(url.scheme(), "http" | "https"),
+        "unsupported URL scheme `{}` in --redirect-queries: use http or https",
+        url.scheme()
+    );
+    eyre::ensure!(url.has_host(), "--redirect-queries URL has no host");
+    eyre::ensure!(
+        url.fragment().is_none(),
+        "--redirect-queries URL `{}` carries a fragment; remove it",
+        UpstreamOrigin(url)
+    );
+    ensure_not_gateway(listen_addr, url)?;
+    if let Some(worker) =
+        upstreams.iter().find(|upstream| same_host_and_port(url, &upstream.rpc_url))
+    {
+        eyre::bail!(
+            "--redirect-queries `{}` is worker {}'s RPC host and port, so reads would still \
+             reach the validator; point it at a separate JSON-RPC endpoint",
+            UpstreamOrigin(url),
+            worker.worker_id
+        );
+    }
+    if plaintext_to_public_host(url) {
+        warn!(
+            target: "gateway",
+            upstream = %UpstreamOrigin(url),
+            "--redirect-queries uses plain http to a host that is not a loopback or private \
+             address; reads and their answers cross the network unencrypted"
+        );
+    }
+    Ok(())
+}
+
+/// Whether two URLs name the same host and port, whatever their schemes.
+fn same_host_and_port(a: &Url, b: &Url) -> bool {
+    a.port_or_known_default() == b.port_or_known_default()
+        && match (url_host_ip(a), url_host_ip(b)) {
+            (Some(a), Some(b)) => a == b,
+            _ => a.host() == b.host(),
+        }
+}
+
+/// Whether `url` is plain `http` to anything but a loopback or private address
+/// literal. A domain name (other than `localhost`) counts as public, since it
+/// cannot be checked without resolving it.
+fn plaintext_to_public_host(url: &Url) -> bool {
+    let local = url_host_ip(url).is_some_and(|ip| match ip {
+        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
+        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    });
+    url.scheme() == "http" && !local
 }
 
 /// Reject an upstream URL that can only point back at the gateway itself (a
@@ -406,8 +498,9 @@ fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
         .unwrap_or(false);
     eyre::ensure!(
         !(same_port && hits_gateway),
-        "upstream URL `{url}` points at the gateway's own listen address ({listen_addr}), \
-         so forwarding to it would loop; change the upstream URL or --listen-addr"
+        "upstream URL `{}` points at the gateway's own listen address ({listen_addr}), \
+         so forwarding to it would loop; change the upstream URL or --listen-addr",
+        UpstreamOrigin(url)
     );
     Ok(())
 }
@@ -637,6 +730,103 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn no_query_redirect_by_default() -> eyre::Result<()> {
+        assert_eq!(cli_with_flags(&[]).into_settings()?.query_upstream, None);
+        Ok(())
+    }
+
+    #[test]
+    fn https_and_http_redirects_are_accepted() -> eyre::Result<()> {
+        for url in [
+            "https://rpc.example.com/v1/0123456789abcdef",
+            "http://10.0.0.9:8545/",
+            // the worker's host on another port is a different endpoint
+            "http://10.0.0.7:9545/",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let settings = cli_with_flags(&[flag.as_str()]).into_settings()?;
+            assert_eq!(settings.query_upstream, Some(Url::parse(url)?), "{url}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_http_redirect_schemes_are_rejected() {
+        for url in ["ws://rpc.example.com/", "wss://rpc.example.com/", "ftp://rpc.example.com/"] {
+            let flag = format!("--redirect-queries={url}");
+            let result = cli_with_flags(&[flag.as_str()]).into_settings();
+            assert!(result.is_err(), "{url} must be rejected");
+        }
+    }
+
+    #[test]
+    fn redirect_to_the_gateway_itself_is_rejected() {
+        // default listen address is 0.0.0.0:8545
+        let result = cli_with_flags(&["--redirect-queries=http://127.0.0.1:8545/"]).into_settings();
+        assert!(result.is_err(), "a redirect onto the gateway's own listener must be rejected");
+    }
+
+    #[test]
+    fn redirect_to_a_worker_rpc_host_and_port_is_rejected() {
+        // the worker in `cli_with_flags` serves rpc on 10.0.0.7:8545
+        for url in [
+            "http://10.0.0.7:8545",
+            "http://10.0.0.7:8545/some/path?key=1",
+            "https://10.0.0.7:8545/",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let result = cli_with_flags(&[flag.as_str()]).into_settings();
+            assert!(result.is_err(), "{url} is the worker and must be rejected");
+        }
+    }
+
+    #[test]
+    fn redirect_errors_name_the_url_by_origin_only() {
+        // the gateway itself, worker 0's RPC host and port, and a fragment
+        for url in [
+            "http://user:s3cr3t@127.0.0.1:8545/k3y?token=t0k3n",
+            "http://user:s3cr3t@10.0.0.7:8545/k3y?token=t0k3n",
+            "https://user:s3cr3t@rpc.example.com/k3y?token=t0k3n#frag",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("{url} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            for secret in ["s3cr3t", "k3y", "t0k3n"] {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn redirect_with_a_fragment_is_rejected() {
+        let result =
+            cli_with_flags(&["--redirect-queries=https://rpc.example.com/#frag"]).into_settings();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plaintext_warning_spares_loopback_and_private_hosts() -> eyre::Result<()> {
+        for (url, warns) in [
+            ("http://rpc.example.com/", true),
+            ("http://203.0.113.5:8545/", true),
+            ("http://[2001:db8::1]:8545/", true),
+            ("https://rpc.example.com/", false),
+            ("https://203.0.113.5/", false),
+            ("http://localhost:8545/", false),
+            ("http://127.0.0.1:8545/", false),
+            ("http://10.1.2.3:8545/", false),
+            ("http://192.168.1.10:8545/", false),
+            ("http://[::1]:8545/", false),
+            ("http://[fd00::7]:8545/", false),
+        ] {
+            assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
+        }
         Ok(())
     }
 }
