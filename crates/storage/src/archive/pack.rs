@@ -15,7 +15,7 @@ use crate::archive::{
 };
 
 use super::{
-    crc::add_crc32,
+    crc::{add_crc32, crc32},
     data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions},
 };
 use std::{
@@ -723,9 +723,7 @@ fn checked_payload_in(tail: Option<&[u8]>) -> Result<&[u8], FetchError> {
             "Unable to read the full record and CRC",
         )));
     };
-    if crc32fast::hash(&tail[..crc_at])
-        != u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]])
-    {
+    if crc32(&tail[..crc_at]) != u32::from_le_bytes([stored[0], stored[1], stored[2], stored[3]]) {
         return Err(FetchError::CrcFailed);
     }
     Ok(&tail[4..crc_at])
@@ -854,7 +852,7 @@ fn frame_record<V: Serialize>(
     file.slice_mut(record_pos, 4)
         .ok_or_else(|| io::Error::other("record length prefix is not mapped"))?
         .copy_from_slice(&(len as u32).to_le_bytes());
-    let crc = crc32fast::hash(
+    let crc = crc32(
         file.slice(record_pos, 4 + len as usize)
             .ok_or_else(|| io::Error::other("record is not mapped"))?,
     );

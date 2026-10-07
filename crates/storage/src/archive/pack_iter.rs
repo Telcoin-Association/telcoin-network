@@ -12,6 +12,7 @@ use tn_types::try_decode;
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
+    crc::{crc32, crc32_update},
     error::{fetch::FetchError, load_header::LoadHeaderError},
     pack::{DataHeader, PackCompression, DATA_HEADER_BYTES},
 };
@@ -147,7 +148,6 @@ where
         if *pos >= end {
             return Err(FetchError::NotFound);
         }
-        let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
             // An EOF here should be caused by no more records although it is possible there
@@ -158,7 +158,6 @@ where
             }
             return Err(FetchError::IO(err));
         }
-        crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
@@ -184,8 +183,8 @@ where
         }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer)?;
-        crc32_hasher.update(buffer);
-        let calc_crc32 = crc32_hasher.finalize();
+        // The record CRC covers `len | payload`.
+        let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32)?;
         *pos = frame_end;
@@ -316,7 +315,6 @@ where
         decompress_buffer: &mut Vec<u8>,
         compression: PackCompression,
     ) -> Result<V, FetchError> {
-        let mut crc32_hasher = crc32fast::Hasher::new();
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf).await {
             // An EOF here should be caused by no more records although it is possible there
@@ -327,15 +325,14 @@ where
             }
             return Err(FetchError::IO(err));
         }
-        crc32_hasher.update(&val_size_buf);
         let val_size = u32::from_le_bytes(val_size_buf);
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
         }
         buffer.resize(val_size as usize, 0);
         file.read_exact(buffer).await?;
-        crc32_hasher.update(buffer);
-        let calc_crc32 = crc32_hasher.finalize();
+        // The record CRC covers `len | payload`.
+        let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];
         file.read_exact(&mut buf_u32).await?;
         let read_crc32 = u32::from_le_bytes(buf_u32);
