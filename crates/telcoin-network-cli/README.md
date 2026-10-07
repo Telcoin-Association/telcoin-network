@@ -117,7 +117,7 @@ p2p_info:
   primary:
     network_address: "/ip4/34.31.250.229/udp/49590/quic-v1/p2p/12D3KooW..."
     network_key: "4XTTM1f3EZanf..."
-    rpc: ~
+    rpc: ~ # stays empty; only worker entries advertise an endpoint
   workers:
     - network_address: "/ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooW..."
       network_key: "4XTTMD3rST8E7..."
