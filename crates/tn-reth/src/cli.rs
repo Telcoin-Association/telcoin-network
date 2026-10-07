@@ -64,11 +64,15 @@ use tracing::{info, warn};
 use crate::{
     dirs::path_to_datadir,
     rpc_server_args::{RpcServerArgs, DEFAULT_IPC_ENDPOINT},
+    rpc_tx_forward::TxForwardConfig,
 };
 
 /// A wrapper abstraction around a Reth node config.
+///
+/// The second field carries TN's transaction-forwarding settings (`--forward-txs`,
+/// `--sanitize-txs`), which reth's `NodeConfig` has no place for.
 #[derive(Clone, Debug)]
-pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>);
+pub struct RethConfig(pub(crate) NodeConfig<RethChainSpec>, pub(crate) TxForwardConfig);
 
 /// Reth specific command line args.
 #[derive(Debug, Parser, Clone)]
@@ -473,6 +477,11 @@ impl RethConfig {
         // Parameters to configure block history syncing.
         let era = EraArgs { enabled: false, source: EraSourceArgs { path: None, url: None } };
 
+        // The forwarding args are TN-only: take them out before `rpc` converts into reth's args,
+        // which have no field for them.
+        let tx_forward =
+            TxForwardConfig { targets: rpc.forward_txs.take(), sanitize: rpc.sanitize_txs };
+
         let mut this = NodeConfig {
             config: None,
             chain,
@@ -498,7 +507,18 @@ impl RethConfig {
         // adjust rpc instance ports
         this.adjust_instance_ports();
 
-        Self(this)
+        Self(this, tx_forward)
+    }
+
+    /// Wrap a reth node config built without a parsed [`RethCommand`] (temp chains, snapshot
+    /// restores, tests), with transaction forwarding off.
+    pub(crate) fn from_node_config(node_config: NodeConfig<RethChainSpec>) -> Self {
+        Self(node_config, TxForwardConfig::default())
+    }
+
+    /// The node's `--forward-txs` / `--sanitize-txs` settings.
+    pub fn tx_forward(&self) -> &TxForwardConfig {
+        &self.1
     }
 
     /// Assert the archive-mode invariant that every pinned historical read depends on.
@@ -845,6 +865,32 @@ mod tests {
         assert_eq!(config.0.txpool.max_account_slots, RETH_MAX_ACCOUNT_SLOTS_PER_SENDER);
     }
 
+    /// The TN-only forwarding args reach the config beside reth's `NodeConfig`, which has no
+    /// field for them, and a command without them leaves forwarding off.
+    #[test]
+    fn forward_txs_args_survive_reth_config_new() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_command = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1,10.0.0.2:8566",
+            "--sanitize-txs",
+        ])?;
+        let expected = crate::rpc_tx_forward::parse_forward_targets("10.0.0.1,10.0.0.2:8566")?;
+
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain.clone());
+        assert_eq!(
+            config.tx_forward(),
+            &TxForwardConfig { targets: Some(expected), sanitize: true }
+        );
+
+        let reth_command = RethCommand::try_parse_from(["tn-reth"])?;
+        let config = RethConfig::new(reth_command, None, tmp_dir.path(), true, chain);
+        assert_eq!(config.tx_forward(), &TxForwardConfig::default());
+        Ok(())
+    }
+
     /// The `--instance` port offsets the CLI README documents, checked against the values reth's
     /// `adjust_instance_ports` resolves from TN's defaults: instance 1 keeps the defaults, each
     /// further instance moves HTTP down by one and WebSocket up by two, and the IPC suffix is
@@ -878,7 +924,8 @@ mod tests {
     fn config_with_pruning(enable: impl FnOnce(&mut PruningArgs)) -> RethConfig {
         init_reth_defaults();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
-        let mut config = RethConfig(NodeConfig { chain, ..NodeConfig::default() });
+        let mut config =
+            RethConfig::from_node_config(NodeConfig { chain, ..NodeConfig::default() });
         enable(&mut config.0.pruning);
         config
     }

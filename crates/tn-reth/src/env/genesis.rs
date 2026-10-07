@@ -173,7 +173,7 @@ impl RethEnv {
             rpc,
             ..NodeConfig::default()
         };
-        let reth_config = RethConfig(node_config);
+        let reth_config = RethConfig::from_node_config(node_config);
         let database = Self::new_database(&reth_config, db_path)?;
         Self::new(&reth_config, task_manager, database, None, rewards.unwrap_or_default())
     }
@@ -678,7 +678,7 @@ mod tests {
         let chain: Arc<RethChainSpec> = Arc::new(tn_types::test_genesis().into());
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::new("Archive Mode Test Task Manager");
-        let mut config = RethConfig(NodeConfig {
+        let mut config = RethConfig::from_node_config(NodeConfig {
             datadir: DatadirArgs {
                 datadir: MaybePlatformPath::from(tmp_dir.path().to_path_buf()),
                 static_files_path: None,

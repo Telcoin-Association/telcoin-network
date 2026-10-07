@@ -1662,9 +1662,9 @@ mod tests {
             chain,
             ..NodeConfig::default()
         };
-        // RethConfig's inner NodeConfig is private, but this test module is a descendant of the
-        // crate root, so the tuple constructor is in scope.
-        let reth_config = RethConfig(node_config);
+        // RethConfig's constructor from a bare NodeConfig is crate-private, but this test module is
+        // a descendant of the crate root, so it is in scope.
+        let reth_config = RethConfig::from_node_config(node_config);
         let db = RethEnv::new_database(&reth_config, path)?;
         Ok((reth_config, db))
     }
