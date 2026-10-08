@@ -83,7 +83,12 @@ the clone-time logical `end` — this is the authoritative replay source for ind
   fronts negative lookups. It stores a `data_file_length` commit marker (written *last* on sync) used
   to detect a lagging/torn index.
 
-Both index types are **fully reconstructable from the data file** and are never trusted over it.
+- **`btree_index` (`index.btx`)** — a copy-on-write, memory-mapped B+tree over fixed-size keys
+  (sorted lookup, ranges, prefixes; lock-free published snapshots), used by `tndb`. See
+  [`archive/btree_index/README.md`](src/archive/btree_index/README.md).
+
+All of these index types are **fully reconstructable from the data file** and are never trusted
+over it.
 
 ### 4. `consensus_pack` — `ConsensusPack` (one epoch of consensus output)
 
@@ -169,6 +174,10 @@ layer + a shared-txn guard; `CompositeDatabase` (the `DatabaseType`, backed by M
 feature, else redb) splits the workload into `epoch` / `kad` / `cache` sub-databases routed by a table
 hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`certificate_store`,
 `payload_store`, `proposer_store`, `vote_digest_store`) wrap the trait for primary/worker state.
+
+**`tndb`** (`TnDatabase`) is a third `Database` backend built on this crate's own pack files and
+B+tree index (lock-free snapshot reads, crash recovery by replaying its logs, physical clears). It
+is benchmarked against MDBX but not yet used by `open_db`. See [`src/tndb/README.md`](src/tndb/README.md).
 
 ### On-disk layout
 

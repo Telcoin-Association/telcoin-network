@@ -129,7 +129,9 @@ fn insert<T: Table>(store: &StoreType, key: &T::Key, value: &T::Value) -> eyre::
     .unwrap_or(Ok(()))
 }
 
-/// Remove a key (its log bytes are left as unreferenced garbage; pack compaction is a later step).
+/// Remove a key: the table logs the removal (in its removal log) and drops the key from its index.
+/// The removed row's bytes stay in the data log until the table is cleared (compaction is a later
+/// step).
 fn remove<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<()> {
     with_table(store, T::NAME, |entry| -> eyre::Result<()> {
         let mut bufs = entry.bufs.lock();
@@ -141,12 +143,13 @@ fn remove<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<()> {
     .unwrap_or(Ok(()))
 }
 
-/// Reset a table to empty (its log bytes become unreferenced garbage until compaction).
+/// Reset a table to empty: it switches to a new, empty generation and deletes the old one's files
+/// (see `table.rs`).
 fn clear_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
     with_table(store, T::NAME, |entry| entry.table.clear()).unwrap_or(Ok(()))
 }
 
-/// Durably persist a table's value log, then publish its writes to readers.
+/// Commit a table's writes (durably, at a commit record in its log), then publish them to readers.
 fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
     with_table(store, T::NAME, |entry| entry.table.flush()).unwrap_or(Ok(()))
 }
@@ -157,7 +160,7 @@ fn contains_key<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<bool>
         .unwrap_or(Ok(false))
 }
 
-/// True if the table is empty (or absent / unreadable).
+/// True if the table is open and empty (an absent or unreadable table reads as not empty).
 fn is_empty<T: Table>(store: &StoreType) -> bool {
     with_table(store, T::NAME, |entry| entry.table.is_empty().unwrap_or(false)).unwrap_or(false)
 }
