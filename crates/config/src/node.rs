@@ -245,8 +245,10 @@ pub struct Parameters {
     /// Must be at least `max_header_delay + max_header_time_drift_tolerance` (the tolerance lives
     /// in the network config's `sync_config`; while the sub-second gate is dormant for the epoch
     /// it is rounded up to whole seconds, matching the voter) and below the 10 s libp2p request
-    /// timeout. The production `ConsensusConfig` constructors reject other values, so a node
-    /// refuses to start an epoch with one. Defaults to 5 s.
+    /// timeout. `ConsensusConfig::validate_epoch_timing` rejects other values, and the node runs
+    /// it on entering any epoch it can still vote in, so it refuses to start such an epoch with
+    /// one. An epoch its committee has already closed is replayed without the check. Defaults to
+    /// 5 s.
     #[serde(with = "humantime_serde", default = "Parameters::default_vote_timeout")]
     pub vote_timeout: Duration,
 

@@ -16,6 +16,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub mod admission;
 mod codec;
 mod consensus;
 pub mod error;
@@ -23,6 +24,7 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod record_exchange;
 mod retention;
 pub mod stream;
 mod sync;

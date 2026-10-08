@@ -1,0 +1,126 @@
+{
+  "version": 1,
+  "candidate": null,
+  "measurement_started_at": null,
+  "environment": {
+    "representative_nic": null,
+    "firewall_disabled": null,
+    "host": null,
+    "kernel": null,
+    "interface": null,
+    "driver": null,
+    "offloads": null,
+    "representativeness": null,
+    "uplink_bps": null,
+    "rtt_ms": null,
+    "load_description": null
+  },
+  "acceptance": {
+    "selected_at": null,
+    "ingress_min_bps": null,
+    "ingress_max_bps": null,
+    "metrics": {
+      "cpu_percent": null,
+      "rss_bytes": null,
+      "socket_drops": null,
+      "queue_peak": null,
+      "established_p99_ms": null,
+      "established_throughput_bps": null,
+      "honest_reconnect_success": null,
+      "command_progress": null,
+      "timer_progress": null,
+      "consensus_progress": null
+    }
+  },
+  "real_sources": null,
+  "retry_completed_sources": null,
+  "swarm_roles": [
+    "primary",
+    "worker-0"
+  ],
+  "cases": [
+    {
+      "role": "primary",
+      "received_bps": null,
+      "generator_capacity_bps": null,
+      "metrics": {
+        "cpu_percent": null,
+        "rss_bytes": null,
+        "socket_drops": null,
+        "queue_peak": null,
+        "established_p99_ms": null,
+        "established_throughput_bps": null,
+        "honest_reconnect_success": null,
+        "command_progress": null,
+        "timer_progress": null,
+        "consensus_progress": null
+      }
+    },
+    {
+      "role": "worker-0",
+      "received_bps": null,
+      "generator_capacity_bps": null,
+      "metrics": {
+        "cpu_percent": null,
+        "rss_bytes": null,
+        "socket_drops": null,
+        "queue_peak": null,
+        "established_p99_ms": null,
+        "established_throughput_bps": null,
+        "honest_reconnect_success": null,
+        "command_progress": null,
+        "timer_progress": null,
+        "consensus_progress": null
+      }
+    },
+    {
+      "role": "process",
+      "received_bps": null,
+      "generator_capacity_bps": null,
+      "metrics": {
+        "cpu_percent": null,
+        "rss_bytes": null,
+        "socket_drops": null,
+        "queue_peak": null,
+        "established_p99_ms": null,
+        "established_throughput_bps": null,
+        "honest_reconnect_success": null,
+        "command_progress": null,
+        "timer_progress": null,
+        "consensus_progress": null
+      }
+    }
+  ],
+  "artifacts": [
+    {
+      "kind": "node-binary",
+      "path": null,
+      "sha256": null
+    },
+    {
+      "kind": "node-config",
+      "path": null,
+      "sha256": null
+    },
+    {
+      "kind": "host-collector",
+      "path": null,
+      "sha256": null
+    },
+    {
+      "kind": "traffic",
+      "path": null,
+      "sha256": null
+    },
+    {
+      "kind": "application-telemetry",
+      "path": null,
+      "sha256": null
+    },
+    {
+      "kind": "firewall",
+      "path": null,
+      "sha256": null
+    }
+  ]
+}
