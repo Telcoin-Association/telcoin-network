@@ -19,9 +19,8 @@ LIMIT = 4 * 1024**2
 
 
 @contextmanager
-def endpoint(body, encoding=None, drip=False, length_extra=0):
+def endpoint(body, encoding=None, length_extra=0):
     requests = []
-    stop = threading.Event()
 
     class Handler(socketserver.StreamRequestHandler):
         def handle(self):
@@ -39,13 +38,7 @@ def endpoint(body, encoding=None, drip=False, length_extra=0):
                 headers += f"Content-Encoding: {encoding}\r\n"
             try:
                 self.connection.sendall(headers.encode() + b"\r\n")
-                if drip:
-                    for byte in body:
-                        self.connection.sendall(bytes([byte]))
-                        if stop.wait(0.02):
-                            break
-                else:
-                    self.connection.sendall(body)
+                self.connection.sendall(body)
             except OSError:
                 pass
 
@@ -58,7 +51,6 @@ def endpoint(body, encoding=None, drip=False, length_extra=0):
         try:
             yield f"http://127.0.0.1:{server.server_address[1]}/metrics", requests
         finally:
-            stop.set()
             server.shutdown()
             worker.join(timeout=2)
 
@@ -127,13 +119,54 @@ class MetricsHttpTests(unittest.TestCase):
     def test_dripping_body_cannot_renew_absolute_deadline(self):
         for encoding in (None, "gzip"):
             body = gzip.compress(b"example 1\n" * 100, mtime=0) if encoding else b"a" * 100
-            with self.subTest(encoding=encoding), endpoint(body, encoding, drip=True) as (url, requests):
-                start = time.monotonic()
+            clock = [100.0]
+            deadline = clock[0] + 2
+
+            class DripSocket:
+                """Deliver headers immediately, then one byte per half-second of virtual time."""
+
+                def __init__(self):
+                    headers = (f"HTTP/1.1 200 OK\r\nContent-Length: {len(body)}\r\n"
+                               "Connection: close\r\n")
+                    if encoding:
+                        headers += f"Content-Encoding: {encoding}\r\n"
+                    self.headers = headers.encode() + b"\r\n"
+                    self.body = body
+                    self.closed = False
+
+                def settimeout(self, timeout):
+                    pass
+
+                def connect(self, address):
+                    pass
+
+                def sendall(self, request):
+                    pass
+
+                def recv_into(self, buffer):
+                    if self.headers:
+                        payload = self.headers[:len(buffer)]
+                        self.headers = self.headers[len(payload):]
+                    else:
+                        payload = self.body[:1]
+                        self.body = self.body[len(payload):]
+                        clock[0] += 0.5
+                    buffer[:len(payload)] = payload
+                    return len(payload)
+
+                def close(self):
+                    self.closed = True
+
+            raw = DripSocket()
+            with self.subTest(encoding=encoding), \
+                 mock.patch.object(COLLECT.socket, "socket", return_value=raw), \
+                 mock.patch.object(COLLECT.CONTROL, "time", mock.Mock(monotonic=lambda: clock[0])):
                 with self.assertRaises(TimeoutError) as raised:
-                    COLLECT.metrics_get(url, start + 0.12)
-                self.assertLess(time.monotonic() - start, 0.8)
+                    COLLECT.metrics_get("http://127.0.0.1:9000/metrics", deadline)
                 self.assertIn("metrics HTTP stage=body", raised.exception.__notes__)
-                self.assertEqual(len(requests), 1)
+                self.assertEqual(clock[0], deadline)
+                self.assertEqual(len(body) - len(raw.body), 4)
+                self.assertTrue(raw.closed)
 
     def test_decode_is_part_of_the_original_deadline(self):
         metrics = b"example 1\n"
