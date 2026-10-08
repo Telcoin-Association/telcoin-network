@@ -106,8 +106,8 @@ const SWEEP_EPOCHS: [Epoch; 4] = [
 #[cfg(not(feature = "adiri"))]
 const SWEEP_EPOCHS: [Epoch; 2] = [0, 5];
 
-/// Authority counts swept. Two is the floor, not a choice: `CommitteeInner::load` asserts a
-/// committee larger than one, so a single-authority committee panics before it can be encoded.
+/// Authority counts swept. Two is the floor, not a choice: `Committee::new` (builder) and
+/// `CommitteeInner::validate` (decode) both refuse a committee of one, so it cannot round-trip.
 const SWEEP_AUTHORITIES: [u8; 3] = [2, 3, 4];
 
 /// Workers per bootstrap server, which is also the committee's worker count at each grid point:
@@ -208,8 +208,8 @@ fn sweep_worker_node(authority: u8, worker: u8) -> P2pNode {
 struct SweepPoint {
     /// The committee's epoch, the only input the wire-layout gate reads.
     epoch: Epoch,
-    /// Number of authorities. At least two: `CommitteeInner::load` asserts a committee larger
-    /// than one.
+    /// Number of authorities. At least two: `Committee::new` (builder) and
+    /// `CommitteeInner::validate` (decode) both refuse a committee of one.
     authorities: u8,
     /// Number of bootstrap servers, attached to authority slots `0..bootstrap_servers`.
     ///

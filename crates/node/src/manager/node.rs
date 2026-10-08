@@ -18,6 +18,7 @@ use crate::{
         revote_uncertified_epoch_record_on_startup, spawn_epoch_vote_collector, ExecStateExporter,
     },
     metrics::EpochMetrics,
+    network_readiness::{monitor, NetworkReadiness},
 };
 use eyre::{eyre, WrapErr as _};
 use futures::TryStreamExt as _;
@@ -737,14 +738,22 @@ where
         // So we will panic for now, this will kill the node on startup for a critical error.
         let committee_zero =
             Config::load_from_path::<Committee>(tn_datadir.committee_path(), ConfigFmt::YAML)
-                .map_err(|_| {
-                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee!");
-                    eyre::eyre!("unable to load committee zero (genesis committee), this is fatal")
+                .map_err(|e| {
+                    // `{e:#}` prints the whole chain: the top-level message of a decode failure is
+                    // only the loader's "bad yaml data" context, and the reason is its cause
+                    error!(target: "epoch-manager", "Unable to load committee zero from the genesis committee: {e:#}");
+                    eyre::eyre!(
+                        "unable to load committee zero (genesis committee), this is fatal: {e:#}"
+                    )
                 })?;
         let bootstrap_servers = committee_zero.bootstrap_servers();
         let epochs_db_path = tn_datadir.epochs_db_path();
         let _ = std::fs::create_dir_all(&epochs_db_path);
         let consensus_chain = ConsensusChain::new(epochs_db_path, committee_zero)?;
+        // A power loss can leave the durable `LatestConsensus` hint ahead of the recovered pack
+        // (e.g. meta-only at an epoch boundary); reconcile it to the pack tip so the executor's
+        // re-derived output is not refused as non-monotonic on restart.
+        consensus_chain.clamp_latest_to_pack().await?;
         // shutdown long-running node components
         let node_shutdown = ShutdownNotifier::new();
 
@@ -885,14 +894,21 @@ where
             .await?;
 
         // Bind operator endpoints before any startup synchronization waits for peers.
+        let (network_readiness_tx, network_readiness_rx) =
+            watch::channel(NetworkReadiness::pending());
         if let Some(port) = self.builder.healthcheck {
             let engine = engine.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
-                async move { engine.is_worker_initialized(DEFAULT_WORKER_ID).await }
+                async move { engine.worker_readiness().await }
             };
-            let _ =
-                HealthcheckServer::spawn(node_task_manager.get_spawner(), port, worker_ready).await;
+            let _ = HealthcheckServer::spawn(
+                node_task_manager.get_spawner(),
+                port,
+                worker_ready,
+                network_readiness_rx,
+            )
+            .await;
         }
 
         // Propagate metrics bind errors because the operator requested this endpoint.
@@ -963,7 +979,7 @@ where
         )
         .await;
 
-        // Bind worker 0's RPC before either startup synchronization or epoch peer waits. Its
+        // Bind worker 0's RPC before startup synchronization and epoch network setup. Its
         // network shim reports syncing until the first epoch publishes the node's mode.
         engine
             .initialize_worker_components(
@@ -995,9 +1011,35 @@ where
             .ok_or_else(|| eyre!("no primary network handle"))?
             .clone();
 
+        // Monitor process-lifetime handles before startup issues any network commands.
+        let primary = primary_network_handle.inner_handle().clone();
+        let workers = self.worker_network_handles.clone();
+        node_task_spawner.spawn_task("network-readiness", async move {
+            monitor(
+                network_readiness_tx,
+                move || {
+                    let primary = primary.clone();
+                    async move { primary.established_peer_count().await }
+                },
+                move || {
+                    workers
+                        .iter()
+                        .map(|worker| {
+                            let worker_id = worker.worker_id();
+                            let handle = worker.inner_handle().clone();
+                            (worker_id, async move { handle.established_peer_count().await })
+                        })
+                        .collect()
+                },
+            )
+            .await;
+            Ok(())
+        });
+
         // Register bootstrap peers before per-epoch committee updates resolve known peers.
         // Listening and bootstrap dials belong to process startup, before replay can close an
-        // epoch without creating consensus. Committee membership and peer waits stay per-epoch.
+        // epoch without creating consensus. Membership stays per-epoch; readiness and reconnect
+        // work continue independently for the entire process.
         primary_network_handle
             .inner_handle()
             .add_bootstrap_peers(
@@ -1306,10 +1348,46 @@ where
             // loop through short-term epochs
             epoch_result = self.run_epochs(&engine, network_config, to_engine, gas_accumulator) => epoch_result,
         };
-        self.consensus_chain.persist_current().await?;
+        // Persist the current pack, then drain the long-lived tasks REGARDLESS of a persist error.
+        // The task-held `consensus_chain` clones are released by `node_task_manager`'s own `Drop`,
+        // which notifies `local_shutdown` (every task `select!`s on it) — this happens when `run`
+        // returns, before `shutdown()`, so those clones are gone within milliseconds; the drain
+        // below just awaits the tasks' exit. (The worker RPC servers hold one more clone
+        // that is NOT a `node_task_manager` task; it is released as the jsonrpsee task
+        // winds down after `engine` drops, which `shutdown()` waits out via
+        // `wait_until_sole_owner` before `close()` — and if it outlives that wait,
+        // `close()` now force-seals rather than leaving the pack unsealed.) Surfacing the
+        // persist error before draining (a bare `?`) would skip that drain; the `Drop`
+        // fallback is runtime-safe regardless. Persist error still takes precedence over `result`.
+        let persist_result = self.consensus_chain.persist_current().await;
         node_task_manager.wait_for_task_shutdown().await;
+        persist_result?;
 
         result
+    }
+
+    /// Gracefully close storage handles that would otherwise block a tokio worker on `Drop`.
+    ///
+    /// `ConsensusChain::close().await` shuts the pack/epoch/latest background threads down via the
+    /// async path (oneshot) instead of a blocking `handle.join()`. Call this after [`Self::run`]
+    /// returns: `run` has dropped the engine (and thus the worker RPC servers), but reth's
+    /// stop-less `RpcServerHandle` releases the servers' `EngineToPrimaryRpc` →
+    /// `ConsensusChain` clone only as the jsonrpsee task winds down. So first wait (bounded)
+    /// for that clone to drop; then `close()` holds the last reference and seals off-worker. If
+    /// it does not release in time, `close()` FORCE-seals under the surviving clone (that clone's
+    /// in-flight reads then fail — benign at shutdown) instead of leaving the pack unsealed, so the
+    /// next start skips a full WAL recovery. Either way this never stalls a worker.
+    pub(crate) async fn shutdown(self) {
+        if !self.consensus_chain.wait_until_sole_owner(std::time::Duration::from_secs(2)).await {
+            warn!(
+                target: "tn::node",
+                "consensus chain still shared at shutdown (a clone outlived run()); close() will \
+                 fall back to the runtime-safe Drop"
+            );
+        }
+        self.consensus_chain.close().await;
+        // Remaining fields (consensus_db, reth_db, network handles, …) drop here; none use the
+        // thread-backed-pack blocking-join pattern, so their `Drop` does not stall the worker.
     }
 
     /// Spawn the process-lifetime primary and worker [`ConsensusNetwork`] swarms.

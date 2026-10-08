@@ -42,8 +42,10 @@ pub(crate) struct EngineMetrics {
     /// producer's batch inside the detection window (priority-fee poaching indicator,
     /// issue #1259).
     pub(crate) cross_producer_repacked_txs_total: Counter,
-    /// EVM block timestamps clamped to the parent because the consensus commit time went
-    /// backwards; non-zero indicates a consensus bug.
+    /// EVM block timestamps clamped up to the parent's because the consensus commit time was
+    /// behind it. Non-zero indicates a consensus bug, except for the first commits of epoch 0:
+    /// epoch 0 has no commit floor, so they are clamped when validator clocks lag the genesis
+    /// timestamp.
     pub(crate) evm_timestamp_clamped_total: Counter,
 }
 
