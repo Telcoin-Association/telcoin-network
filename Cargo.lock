@@ -12436,6 +12436,7 @@ dependencies = [
  "crc32fast",
  "dashmap",
  "eyre",
+ "foldhash 0.2.0",
  "libc",
  "memmap2",
  "ouroboros",

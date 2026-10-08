@@ -224,6 +224,7 @@ prometheus = { version = "0.13.4", default-features = false }
 tonic = { version = "0.13" }
 async-trait = "0.1.61"
 arc-swap = "1"
+foldhash = "0.2"
 dashmap = "6.0.1"
 parking_lot = "0.12.3"
 scopeguard = "1.1"

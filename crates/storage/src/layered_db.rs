@@ -442,9 +442,8 @@ impl<DB: Database> Database for LayeredDatabase<DB> {
         self.db.open_table::<T>()?;
         self.mem_db.open_table::<T>()?;
         if self.full_memory {
-            for (k, v) in self.db.iter::<T>() {
-                let _ = self.mem_db.insert::<T>(&k, &v);
-            }
+            // One bulk insert under one write lock rather than a lock round trip per row.
+            self.mem_db.insert_all::<T>(self.db.iter::<T>())?;
         }
         Ok(())
     }
