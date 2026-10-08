@@ -7,7 +7,8 @@ use tn_types::TaskManager;
 #[test]
 fn epoch_change_preserves_primary_stream_peer_and_shed_permits() {
     let serve = tn_config::NetworkServeConfig::default();
-    let handle = PrimaryNetworkHandle::default();
+    let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+    let handle = PrimaryNetworkHandle::new_for_test(sender);
     let old = handle.sync_admission(&serve);
     let peer = BlsPublicKey::default();
     let peer_permits: Vec<_> = (0..MAX_PENDING_REQUESTS_PER_PEER)
