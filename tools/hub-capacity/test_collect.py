@@ -193,6 +193,119 @@ class CollectorTests(unittest.TestCase):
             self.assertEqual((output / "protocol-00.jsonl").read_bytes(), protocol_log.read_bytes())
             self.assertIn({"path": "protocol-00.jsonl", "sha256": "b" * 64}, evidence["artifacts"])
 
+    def test_final_scrapes_wake_on_exit_without_extending_drain(self):
+        for completion in (628.89, 630.1):
+            with self.subTest(completion=completion), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile = root / "profile.json"
+                topology = root / "topology.json"
+                profile.write_text("{}")
+                topology.write_text(json.dumps({"population": {"validators": [
+                    {"bls_key": "synthetic-0"}, {"bls_key": "synthetic-1"}]}}))
+                protocol_logs = [root / f"validator-{index}.jsonl" for index in range(2)]
+                for path in protocol_logs:
+                    path.write_bytes(b"synthetic production log\n")
+                phase = {"revision": "a" * 40, "profile": {},
+                         "binary_sha256": {"telcoin-network": "b" * 64}}
+                plan = {"hubs": ["hub-0", "hub-1"], "baseline": phase,
+                        "adapter_command": "synthetic-workload",
+                        "envelope": {"duration_seconds": 600, "committee_peers": 2}}
+                frozen = {"plan": plan, "plan_sha256": COLLECT.QUALIFY.digest(plan)}
+                bindings = {"hubs": {hub: {
+                    "revision": phase["revision"], "profile_path": str(profile), "pid": 42 + index,
+                    "metrics_url": f"http://synthetic.invalid/{hub}",
+                    "progress": {"name": "synthetic_progress"}}
+                    for index, hub in enumerate(plan["hubs"])},
+                    "workload": ["synthetic-workload"], "topology_artifact": str(topology),
+                    "protocol_logs": [str(path) for path in protocol_logs]}
+                output = root / "evidence"
+                clock = {"time": 0.0, "completed": False, "stopped": False, "sleeps": 0}
+                deadlines = []
+
+                def poll():
+                    if clock["stopped"]:
+                        return -9
+                    if clock["time"] >= completion and not clock["completed"]:
+                        clock["completed"] = True
+                        operation = {"scenario": "gossip_two_hops", "id": "last-gossip",
+                                     "success": False, "latency_ms": 29000,
+                                     "elapsed_seconds": completion, "rejection_reason": "timeout"}
+                        (output / "operations.jsonl").write_text(json.dumps(operation) + "\n")
+                    return 0 if clock["completed"] else None
+
+                def wait(timeout):
+                    status = poll()
+                    if status is not None:
+                        return status
+                    if completion <= clock["time"] + timeout:
+                        clock["time"] = completion
+                        return poll()
+                    clock["time"] += timeout
+                    raise COLLECT.subprocess.TimeoutExpired("synthetic-workload", timeout)
+
+                def sleep(seconds):
+                    clock["time"] += seconds
+                    # A scheduling delay puts the last ordinary scrape at 627.72s,
+                    # as in the failed run. Later sleeps preserve the normal cadence.
+                    if clock["sleeps"] == 0:
+                        clock["time"] += 1.72
+                    clock["sleeps"] += 1
+
+                def metrics(url, deadline):
+                    deadlines.append((clock["time"], deadline))
+                    end = clock["time"] + 0.5
+                    if end >= deadline:
+                        clock["time"] = deadline
+                        raise TimeoutError("synthetic metrics body deadline")
+                    clock["time"] = end
+                    generation = "a" * 32 if url.endswith("hub-0") else "c" * 32
+                    return f'tn_primary_vote_observation_allocated{{generation="{generation}"}} 0\n'.encode()
+
+                child = mock.Mock()
+                child.poll.side_effect = poll
+                child.wait.side_effect = wait
+                child.terminate.side_effect = lambda: clock.update(stopped=True)
+                child.kill.side_effect = lambda: clock.update(stopped=True)
+                # Use the real collection loop with a deterministic clock and two hubs.
+                # Hardware and capacity scoring are outside this timing regression.
+                with mock.patch.object(COLLECT.QUALIFY, "validate_plan"), \
+                     mock.patch.object(COLLECT.QUALIFY, "validate_evidence"), \
+                     mock.patch.object(COLLECT.QUALIFY, "verify_artifacts"), \
+                     mock.patch.object(COLLECT, "validate_process"), \
+                     mock.patch.object(COLLECT, "file_hash", return_value="b" * 64), \
+                     mock.patch.object(COLLECT, "process_sample", return_value=(
+                         {"rss_bytes": 1, "cpu_seconds": 0}, 1, "synthetic proc stat")), \
+                     mock.patch.object(COLLECT, "observations", return_value={}), \
+                     mock.patch.object(COLLECT.subprocess, "Popen", return_value=child), \
+                     mock.patch.object(COLLECT, "metrics_get", side_effect=metrics), \
+                     mock.patch.object(COLLECT.time, "monotonic", side_effect=lambda: clock["time"]), \
+                     mock.patch.object(COLLECT.time, "time_ns", side_effect=lambda:
+                         1_700_000_000_000_000_000 + int(clock["time"] * 1_000_000_000)), \
+                     mock.patch.object(COLLECT.time, "sleep", side_effect=sleep):
+                    if completion < 630:
+                        evidence = COLLECT.collect(frozen, bindings, "baseline", output)
+                        self.assertAlmostEqual(evidence["samples"][-1]["elapsed_seconds"], completion)
+                        self.assertLess(clock["time"], 630)
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, "synthetic metrics body deadline"):
+                            COLLECT.collect(frozen, bindings, "baseline", output)
+                        self.assertEqual(clock["time"], 630)
+                        self.assertTrue(clock["stopped"])
+                        self.assertFalse((output / "evidence.json").exists())
+                self.assertTrue(deadlines)
+                for start, deadline in deadlines:
+                    self.assertAlmostEqual(deadline, min(start + 2, 630))
+                rows = [json.loads(line) for path in sorted(output.glob("telemetry-*.jsonl"))
+                        for line in path.read_text().splitlines()]
+                completed = [row for row in rows if row["workload_completed_before_sample"]]
+                if completion < 630:
+                    self.assertEqual({row["hub"] for row in completed}, set(plan["hubs"]))
+                    self.assertEqual(len(completed), 2)
+                    self.assertTrue(all(row["scrape_started_elapsed_seconds"] >= completion
+                                        for row in completed))
+                else:
+                    self.assertEqual(completed, [])
+
     def test_full_mapping_and_worker_omission(self):
         binding = {"progress": {"name": "progress"}, "dao_connected": {"name": "dao"}}
         parsed = COLLECT.parse_metrics(telemetry())

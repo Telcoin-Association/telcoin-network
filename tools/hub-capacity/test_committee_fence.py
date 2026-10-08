@@ -381,7 +381,14 @@ class MetricsFenceTests(unittest.TestCase):
 
             child = mock.Mock()
             child.poll.side_effect = lambda: 0 if clock["reads"] >= 4 else None
-            child.wait.return_value = 0
+
+            def wait(timeout):
+                if child.poll() is None:
+                    pause(timeout)
+                    raise COLLECT.subprocess.TimeoutExpired("fixture", timeout)
+                return 0
+
+            child.wait.side_effect = wait
 
             def sample_observations(*_args):
                 if mode == "processing_deadline" and clock["reads"] == 5:

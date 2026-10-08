@@ -380,7 +380,18 @@ def collect(frozen, bindings, phase, output):
                         raise ValueError(f"{hub}: process restarted during qualification")
                     scrape_started = time.monotonic()
                     scrape_started_unix_us = time.time_ns() // 1000
-                    body = metrics_get(binding["metrics_url"], min(scrape_started + 2, drain_deadline))
+                    scrape_deadline = min(scrape_started + 2, drain_deadline)
+                    try:
+                        body = metrics_get(binding["metrics_url"], scrape_deadline)
+                    except Exception as error:
+                        error.add_note(
+                            f"metrics scrape: phase={phase} hub={hub} "
+                            f"elapsed_seconds={scrape_started - started:.6f} "
+                            f"timeout_seconds={scrape_deadline - scrape_started:.6f} "
+                            f"drain_remaining_seconds={drain_deadline - scrape_started:.6f} "
+                            f"workload_completed_before_sample={completed_before_sample}"
+                        )
+                        raise
                     text = body.decode()
                     scrape_completed = time.monotonic()
                     if scrape_completed >= drain_deadline:
@@ -426,7 +437,16 @@ def collect(frozen, bindings, phase, output):
                 if workload_log.stat().st_size > 64 * 1024**2:
                     raise ValueError("workload log exceeds artifact budget")
                 sleep_now = time.monotonic()
-                time.sleep(max(0, min(2 - (sleep_now - started - elapsed), drain_deadline - sleep_now)))
+                delay = max(0, min(2 - (sleep_now - started - elapsed), drain_deadline - sleep_now))
+                if sleep_now >= started + duration and not completed_before_sample:
+                    # Preserve the final scrape's drain budget when the workload exits
+                    # between samples or during the preceding metrics request.
+                    try:
+                        child.wait(timeout=delay)
+                    except subprocess.TimeoutExpired:
+                        pass
+                else:
+                    time.sleep(delay)
             if child.wait(timeout=30) != 0:
                 raise ValueError("workload driver failed")
         protocol_artifacts = retain_protocol_logs(protocol_logs, output)
