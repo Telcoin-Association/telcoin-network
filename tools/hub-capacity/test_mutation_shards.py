@@ -1,6 +1,7 @@
 """Exercise real shard/aggregate control flow with mocked Cargo outcomes and hostile evidence."""
 
 from contextlib import redirect_stdout
+import ast
 import hashlib
 import importlib.util
 import io
@@ -275,6 +276,104 @@ class WorkflowTests(unittest.TestCase):
                 result = subprocess.run(["bash", "-c", script], capture_output=True,
                                         env={"CODE_RESULT": "success", "REQUIRED": "true", "SHARDS_RESULT": shards})
                 self.assertNotEqual(result.returncode, 0)
+
+
+class ManualWorkflowTests(unittest.TestCase):
+    JOBS = ("hub-capacity", "hub-capacity-mutation-shards", "hub-capacity-mutations", "hub-capacity-qualification")
+
+    def workflow(self, name):
+        return (ROOT / ".github/workflows" / name).read_text()
+
+    def job(self, workflow, name):
+        return re.search(r"^  " + re.escape(name) + r":\n(.*?)(?=^  [a-z][\w-]*:\n|\Z)", workflow, re.M | re.S).group(1)
+
+    def condition(self, body, event, capacity):
+        expression = re.search(r"^    if: \$\{\{ (.*?) \}\}$", body, re.M).group(1)
+        expression = expression.replace("github.event_name", repr(event)).replace("inputs.hub_capacity", repr(capacity))
+        expression = re.sub(r"!(?!=)", "not ", expression.replace("&&", " and ").replace("||", " or "))
+        tree = ast.parse(expression, mode="eval")
+
+        def value(node):
+            if isinstance(node, ast.Constant):
+                return node.value
+            if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+                return not value(node.operand)
+            if isinstance(node, ast.BoolOp):
+                values = [value(item) for item in node.values]
+                return all(values) if isinstance(node.op, ast.And) else any(values)
+            if isinstance(node, ast.Compare) and len(node.ops) == 1:
+                equal = value(node.left) == value(node.comparators[0])
+                return equal if isinstance(node.ops[0], ast.Eq) else not equal
+            raise AssertionError("unsupported workflow routing expression")
+
+        return value(tree.body)
+
+    def test_dispatch_is_opt_in_and_schedules_keep_durable_job(self):
+        caller = self.workflow("durable-e2e.yaml")
+        self.assertRegex(caller, r"hub_capacity:\n        description: [^\n]+\n        type: boolean\n        default: false\n")
+        manual = self.job(caller, "hub-capacity-manual")
+        durable = self.job(caller, "durable-e2e")
+        self.assertIn("uses: ./.github/workflows/hub-capacity-manual.yaml", manual)
+        self.assertIn("permissions:\n      contents: read", manual)
+        self.assertNotIn("secrets:", caller)
+        for event, capacity, expected in (("schedule", False, False), ("schedule", True, False),
+                                          ("workflow_dispatch", False, False), ("workflow_dispatch", True, True)):
+            with self.subTest(event=event, capacity=capacity):
+                self.assertEqual(self.condition(manual, event, capacity), expected)
+                self.assertEqual(self.condition(durable, event, capacity), not expected)
+
+    def test_every_manual_job_runs_and_uses_distinct_check_names(self):
+        workflow = self.workflow("hub-capacity-manual.yaml")
+        self.assertIn("on:\n  workflow_call:\n  workflow_dispatch:\n", workflow)
+        self.assertIn("permissions:\n  contents: read", workflow)
+        self.assertNotIn("inputs:", workflow)
+        self.assertNotIn("CI Success", workflow)
+        self.assertEqual(tuple(re.findall(r"^  ([a-z][\w-]*):$", workflow.split("jobs:\n", 1)[1], re.M)), self.JOBS)
+        names = []
+        for job in self.JOBS:
+            body = self.job(workflow, job)
+            names.append(re.search(r"^    name: (.+)$", body, re.M).group(1))
+            for condition in re.findall(r"^\s+if: (.+)$", body, re.M):
+                self.assertEqual(condition, "always()")
+        self.assertEqual(len(set(names)), len(self.JOBS))
+        self.assertTrue(all(name.startswith("Manual hub capacity ") for name in names))
+        self.assertIn('qualification_required: "true"', workflow)
+        self.assertNotIn("steps.scope", workflow)
+        self.assertNotIn("Detect capacity source changes", workflow)
+        self.assertEqual(workflow.count("ref: ${{ github.sha }}"), 4)
+        self.assertNotIn("github.event.pull_request", workflow)
+
+    def test_manual_retains_required_commands_pins_resources_and_artifacts(self):
+        original = self.workflow("pr.yaml")
+        manual = self.workflow("hub-capacity-manual.yaml")
+        self.assertEqual(original.split("\nenv:\n", 1)[1].split("\njobs:\n", 1)[0].rstrip(),
+                         manual.split("\nenv:\n", 1)[1].split("\njobs:\n", 1)[0].rstrip())
+        for job in self.JOBS:
+            with self.subTest(job=job):
+                source = self.job(original, job)
+                copied = self.job(manual, job)
+                source = re.sub(r"      - name: Detect capacity source changes\n.*?(?=      - name:)", "", source, flags=re.S)
+                source = source.replace("${{ steps.scope.outputs.changed }}", '"true"')
+                source = source.replace("${{ github.event.pull_request.head.sha || github.sha }}", "${{ github.sha }}")
+                source = source.replace("always() && needs.hub-capacity.outputs.qualification_required == 'true'", "always()")
+                source = re.sub(r"^\s+if: (?:steps.scope.outputs.changed|needs.hub-capacity.outputs.qualification_required) == 'true'\n", "\n", source, flags=re.M)
+                copied = re.sub(r"^    name: [^\n]+\n", "", copied, count=1, flags=re.M)
+
+                def meaningful_lines(body):
+                    return [line for line in body.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+
+                self.assertEqual(meaningful_lines(copied), meaningful_lines(source))
+
+    def test_manual_reconciliation_rejects_every_incomplete_shard_outcome(self):
+        body = self.job(self.workflow("hub-capacity-manual.yaml"), "hub-capacity-mutations")
+        script = textwrap.dedent(body.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+        for code, shards, expected in (("success", "success", 0), ("failure", "success", 1),
+                                      ("success", "failure", 1), ("success", "cancelled", 1),
+                                      ("success", "skipped", 1), ("success", "", 1)):
+            with self.subTest(code=code, shards=shards):
+                result = subprocess.run(["bash", "-c", script], capture_output=True,
+                                        env={"CODE_RESULT": code, "REQUIRED": "true", "SHARDS_RESULT": shards})
+                self.assertEqual(result.returncode, expected)
 
 
 if __name__ == "__main__":

@@ -225,10 +225,26 @@ python3 -B -I tools/hub-capacity/docker-run.py \
 ```
 
 Use `--runner-envelope github-actions` for the smaller declared envelope.
-The required `hub-capacity-qualification` CI job runs this preset after workspace
-compilation, tests, Clippy and compiling mutations pass. It uses the same commit's
-attested binaries and retains raw evidence and diagnostics for ninety days.
+The `hub-capacity-qualification` job in the required main-target PR workflow runs
+this preset after workspace compilation, tests, Clippy and compiling mutations
+pass. It uses the same commit's
+source-bound binaries and retains raw evidence and diagnostics for ninety days.
 The artifact excludes generated validator key files and executable copies.
+
+For a staging-target PR, run the same qualification explicitly through the registered
+`Durable e2e` manual entry point. Set `hub_capacity=true` and select the PR branch:
+
+```sh
+gh workflow run durable-e2e.yaml --repo Telcoin-Association/telcoin-network \
+  --ref feat/1476-public-hub-capacity -f hub_capacity=true
+```
+
+This opt-in route calls `hub-capacity-manual.yaml` at the selected commit and runs
+the complete code checks, both mutation shards, their aggregation, and both live
+phases. Its checks have distinct names. Ordinary durable runs and scheduled runs
+keep their existing behavior. Verify the run's source SHA against the intended PR
+head before using its evidence; qualification does not replace the final-source
+maintainer attestation.
 
 The collector retains complete production diagnostic logs as
 `protocol-NN.jsonl`, with a 512 MiB per-file cap and a SHA-256 hash. Other raw
