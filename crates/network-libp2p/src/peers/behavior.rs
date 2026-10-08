@@ -260,6 +260,8 @@ impl NetworkBehaviour for PeerManager {
                 opts: DialOpts::peer_id(peer_id)
                     .condition(PeerCondition::Disconnected)
                     .addresses(multiaddrs)
+                    // Try signed endpoints in order, with one connection attempt at a time.
+                    .override_dial_concurrency_factor(std::num::NonZeroU8::MIN)
                     .build(),
             });
         }
