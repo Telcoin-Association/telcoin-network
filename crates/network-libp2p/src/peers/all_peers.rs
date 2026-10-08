@@ -22,8 +22,10 @@ use rand::seq::SliceRandom as _;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     net::IpAddr,
+    sync::Arc,
     time::{Duration, Instant},
 };
+use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 use tracing::{debug, error, warn};
@@ -36,6 +38,8 @@ mod peers;
 /// This keeps track of [Peer], [BannedPeers], and the number of disconnected peers.
 #[derive(Debug)]
 pub(super) struct AllPeers {
+    /// Immutable scoring policy used for every peer created by this network instance.
+    score_config: Arc<ScoreConfig>,
     /// The collection of known peers, keyed by their domain [PeerIdentity].
     ///
     /// Committee/trusted/known peers are keyed by their [BlsPublicKey] (`Confirmed`); anonymous
@@ -83,8 +87,10 @@ impl AllPeers {
         dial_timeout: Duration,
         max_banned_peers: usize,
         max_disconnected_peers: usize,
+        score_config: Arc<ScoreConfig>,
     ) -> Self {
         Self {
+            score_config,
             peers: Default::default(),
             bls_by_peer_id: Default::default(),
             previous_committee: Default::default(),
@@ -206,7 +212,10 @@ impl AllPeers {
             self.release_displaced_record(&displaced);
         }
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(confirmed, Peer::new_trusted(bls_public_key, network_key));
+        self.peers.insert(
+            confirmed,
+            Peer::new_trusted(bls_public_key, network_key, self.score_config.clone()),
+        );
     }
 
     /// Retain an operator hub while preserving existing reputation and connection accounting.
@@ -254,9 +263,9 @@ impl AllPeers {
         // connection, so it is normalized onto the new identity; a peer never seen before
         // starts fresh
         let carried = migrated.is_none();
-        let mut peer = migrated
-            .or(rotated)
-            .unwrap_or_else(|| Peer::new(bls_public_key, network_key.clone(), Vec::new()));
+        let mut peer = migrated.or(rotated).unwrap_or_else(|| {
+            Peer::new(bls_public_key, network_key.clone(), Vec::new(), self.score_config.clone())
+        });
         // apply the rotated-to keys and advertised addresses to the carried record. when the
         // record is mid-ban (`Disconnecting { banned: true }`), `normalize_carried_status` then
         // completes the ban through `add_banned_peer`, which reads `known_ip_addresses` - the IPs
@@ -357,7 +366,7 @@ impl AllPeers {
             }
 
             // add default peer
-            self.peers.insert(id, Peer::default());
+            self.peers.insert(id, Peer::new_unidentified(self.score_config.clone()));
         }
 
         // ensure peer is banned if the new state is Banned

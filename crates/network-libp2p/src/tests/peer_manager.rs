@@ -442,7 +442,7 @@ async fn trusted_hub_lookups_back_off_and_skip_bootstrap_keys() -> eyre::Result<
 #[tokio::test(start_paused = true)]
 async fn trusted_hub_protocol_ban_survives_rotation_and_reinstallation() -> eyre::Result<()> {
     let mut manager = create_test_peer_manager(None);
-    manager.peers = AllPeers::new(Duration::from_secs(5), 0, 0);
+    manager.peers = AllPeers::new(Duration::from_secs(5), 0, 0, Arc::new(ScoreConfig::default()));
     let (bls, endpoint) = configured_hub(3);
     let id: PeerId = endpoint.network_key.clone().into();
     let hubs = [(bls, endpoint.clone())].into_iter().collect::<std::collections::BTreeMap<_, _>>();
