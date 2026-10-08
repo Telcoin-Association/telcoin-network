@@ -11,9 +11,11 @@
 //! The methods in this module are thread-safe wrappers for the inner type that contains logic.
 
 use self::inner::ExecutionNodeInner;
+use crate::health::WorkerReadiness;
 use builder::ExecutionNodeBuilder;
+use readiness::WorkerReadinessState;
 use std::{collections::BTreeMap, future::Future, net::SocketAddr, num::NonZeroUsize, sync::Arc};
-use tn_config::Config;
+use tn_config::{Config, PidLock};
 use tn_exex::ExExInstallFn;
 use tn_reth::{
     error::StateReadResult, system_calls::EpochState, CanonStateNotificationStream, RethConfig,
@@ -31,6 +33,7 @@ use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
 mod builder;
 mod inner;
+mod readiness;
 pub use tn_reth::worker::*;
 
 /// The struct used to build the execution nodes.
@@ -51,8 +54,9 @@ pub struct TnBuilder {
     /// service starts.
     ///
     /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
-    /// var.
+    /// liveness route responds unconditionally; `/health/workers` reports transaction acceptance
+    /// and `/health/network` reports cached swarm reachability and established-peer counts,
+    /// returning 503 while not-ready. This reads from the `HEALTHCHECK_TCP_PORT` env var.
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
@@ -76,6 +80,10 @@ pub struct TnBuilder {
     /// Optional process-local bootstrap dial hints, taking precedence over the network config.
     /// An explicitly empty map selects the genesis fallback.
     bootstrap_peers: Option<BTreeMap<BlsPublicKey, BootstrapServer>>,
+    /// The datadir lock, when the caller took it before opening the execution database (so a
+    /// second node is refused before it touches the live node's database). The node holds it for
+    /// its lifetime; see `launch_node`.
+    pid_lock: Option<PidLock>,
 }
 
 impl TnBuilder {
@@ -96,7 +104,20 @@ impl TnBuilder {
             reth_db,
             exex_fns: Vec::new(),
             bootstrap_peers: None,
+            pid_lock: None,
         }
+    }
+
+    /// Hand the node the datadir lock the caller already holds (taken before the execution
+    /// database was opened), instead of having the node take it itself.
+    pub fn with_pid_lock(mut self, pid_lock: PidLock) -> Self {
+        self.pid_lock = Some(pid_lock);
+        self
+    }
+
+    /// Take the datadir lock handed over with [`Self::with_pid_lock`], if any.
+    pub fn take_pid_lock(&mut self) -> Option<PidLock> {
+        self.pid_lock.take()
     }
 
     /// Set the maximum completed export bundles to retain, or leave retention unlimited.
@@ -194,7 +215,10 @@ pub enum WorkerState {
 /// Wrapper for the inner execution node components.
 #[derive(Clone, Debug)]
 pub struct ExecutionNode {
+    /// Process-lifetime execution components, including initialized worker RPC servers.
     internal: Arc<RwLock<ExecutionNodeInner>>,
+    /// Current epoch membership and shutdown state for worker readiness probes.
+    worker_readiness: Arc<RwLock<WorkerReadinessState>>,
 }
 
 impl ExecutionNode {
@@ -202,7 +226,10 @@ impl ExecutionNode {
     pub fn new(tn_builder: &TnBuilder, reth_env: RethEnv) -> eyre::Result<Self> {
         let inner = ExecutionNodeBuilder::new(tn_builder, reth_env).build()?;
 
-        Ok(ExecutionNode { internal: Arc::new(RwLock::new(inner)) })
+        Ok(ExecutionNode {
+            internal: Arc::new(RwLock::new(inner)),
+            worker_readiness: Arc::new(RwLock::new(WorkerReadinessState::default())),
+        })
     }
 
     /// Execution engine to produce blocks after consensus.
@@ -330,7 +357,24 @@ impl ExecutionNode {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 
-    /// Batch maker
+    /// Set the current committee's worker range and shutdown signal before worker startup.
+    pub(crate) async fn start_worker_readiness_epoch(&self, workers: usize, shutdown: Noticer) {
+        self.worker_readiness.write().await.start_epoch(workers, shutdown);
+    }
+
+    /// Snapshot initialized workers and their current epoch's accepting state.
+    ///
+    /// Removed workers remain visible with a false accepting flag. Active workers accept only
+    /// after their RPC listeners bind and until consensus shuts down their epoch.
+    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+        let engine = self.internal.read().await;
+        self.worker_readiness
+            .read()
+            .await
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()))
+    }
+
+    /// Start the worker's batch builder for the epoch.
     pub async fn start_batch_builder(
         &self,
         worker_id: WorkerId,
@@ -339,10 +383,8 @@ impl ExecutionNode {
         base_fee: u64,
         epoch: Epoch,
     ) -> eyre::Result<()> {
-        let mut guard = self.internal.write().await;
-        guard
-            .start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
-            .await
+        let guard = self.internal.read().await;
+        guard.start_batch_builder(worker_id, block_provider_sender, task_spawner, base_fee, epoch)
     }
 
     /// Batch validator
