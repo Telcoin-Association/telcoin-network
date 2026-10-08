@@ -6,11 +6,15 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::{node_record_key, KadStore},
-    metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
+    metrics::{
+        ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
+        SwarmMetrics,
+    },
     peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
@@ -40,12 +44,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     num::NonZeroUsize,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
+use tn_config::{
+    KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
+};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender, WorkerId,
+    TnSender, TrySendOutcome, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -53,9 +59,28 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, instrument, trace, warn};
 
+/// An inbound request that the swarm forwarded to the application and has not yet answered.
+#[derive(Debug)]
+struct PendingInbound {
+    /// The cancel notice to the handler when the request ends.
+    notify: oneshot::Sender<()>,
+    /// The class that counts this request in the pending occupancy.
+    class: ServiceClass,
+    /// The time that the swarm forwarded the request, for the service time histogram.
+    received: Instant,
+}
+
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/network_budget_tests.rs"]
+mod network_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/inbound_service_tests.rs"]
+mod inbound_service_tests;
 
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
@@ -225,11 +250,15 @@ impl InboundDenialWarning {
 
 /// Build the [`connection_limits::Behaviour`] for one swarm.
 ///
-/// It sets two bounds:
-/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
-///   (issue #1010);
+/// It sets the following bounds:
+/// - at most the process allocation's per-peer ceiling, or [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]
+///   without an allocation, concurrent established connections per peer (issue #1010);
+/// - at most the process allocation's established connections in total, when configured;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Both directions and all peer classes consume the process allocation: this behaviour must never
+/// install bypass peer IDs.
 ///
 /// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
 /// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
@@ -247,16 +276,24 @@ impl InboundDenialWarning {
 /// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
 /// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
 ///
-/// The budget applies to each swarm separately. Each primary and worker network builds its own
-/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+/// The pending inbound ceiling applies to each swarm separately. Each primary and worker network
+/// builds its own [`TNBehavior`], so the host total is this ceiling times the number of swarms.
 ///
-/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
-/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
-/// exercise the identical limits.
-fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
+/// Pending outgoing and per-direction established caps stay unbounded. Established totals are
+/// unbounded without a process allocation. Shared by [`TNBehavior::new`] and the regression tests
+/// so all of them exercise the identical limits.
+fn connection_limits_behaviour(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_established_per_peer(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                    budget.connections_per_peer()
+                }),
+            ))
+            .with_max_established(budget.map(|budget| budget.connections()))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
@@ -284,8 +321,9 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
-    /// inbound connections (see [`connection_limits_behaviour`]).
+    /// Per-peer established connection ceiling (issue #1010), optional per-swarm process
+    /// allocation, and memory-only ceiling on pending inbound connections (see
+    /// [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
     /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
@@ -333,7 +371,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None);
         let (req_res, peer_exchange, record_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -429,7 +467,9 @@ where
     /// caller is responsible for decoding message bytes and reporting peers who return bad
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    inbound_requests: HashMap<InboundRequestId, PendingInbound>,
+    /// The pending inbound requests by service class. Changes only with `inbound_requests`.
+    inbound_pending: InboundOccupancy,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
@@ -452,8 +492,6 @@ where
     ///
     /// The external address is self-reported and unconfirmed.
     node_record: NodeRecord,
-    /// Configured external address retained for periodic record signing.
-    external_addr: Multiaddr,
     /// The `(chain, role)` domain this node signs and verifies records for.
     ///
     /// Folded into every [NodeRecord] signature so a record signed for one
@@ -559,6 +597,8 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -695,6 +735,8 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior.connection_limits =
+            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -728,7 +770,7 @@ where
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|config| {
-                let mut config = network_config.quic_config().apply_to(config);
+                let mut config = quic_config.apply_to(config);
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -768,6 +810,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            inbound_pending: InboundOccupancy::default(),
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
@@ -776,7 +819,6 @@ where
             key_config,
             task_spawner,
             node_record,
-            external_addr,
             record_domain,
             verified_peer_records: LruCache::new(
                 NonZeroUsize::new(network_config.peer_config().max_peers())
@@ -789,7 +831,7 @@ where
                 record_retry_interval,
             ),
             record_retry_interval,
-            metrics: SwarmMetrics::new_for(&network_type),
+            metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
@@ -798,6 +840,28 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+    }
+
+    /// Configure ordered externally reachable endpoints independently of the swarm's listeners.
+    ///
+    /// Must be called before running the network. Uses the same signed schema and domain as a
+    /// single-address record and replaces the constructor's external address completely.
+    pub fn with_advertised_addresses(mut self, addresses: Vec<Multiaddr>) -> NetworkResult<Self> {
+        let record = NodeRecord::build_multi(
+            self.record_domain,
+            self.node_record.info.pubkey.clone(),
+            addresses,
+            self.node_record.info.rpc.clone(),
+            |data| self.key_config.request_signature_direct(data),
+        )?;
+        self.node_record.info.multiaddrs.iter().for_each(|address| {
+            self.swarm.remove_external_address(address);
+        });
+        record.info.multiaddrs.iter().cloned().for_each(|address| {
+            self.swarm.add_external_address(address);
+        });
+        self.node_record = record;
+        Ok(self)
     }
 
     /// Create and sign this node's [NodeRecord].
@@ -819,13 +883,8 @@ where
     /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
     /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
     fn refresh_own_record(&mut self) {
-        self.node_record = Self::create_node_record(
-            self.record_domain,
-            self.external_addr.clone(),
-            &self.key_config,
-            self.node_record.info.pubkey.clone(),
-            self.node_record.info.rpc.clone(),
-        );
+        self.node_record
+            .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
         self.provide_our_data();
     }
 
@@ -861,11 +920,7 @@ where
             NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?
         };
 
-        // reject records advertising an implausible number of addresses: a legitimate record
-        // carries a single address, so a large set is only ever an attempt to inflate the
-        // publisher's stored multiaddrs without bound (GHSA-29v6-gvv5-45gx). This bounds the
-        // attacker-chosen data admitted per record; the per-peer `MAX_MULTIADDRS_PER_PEER` cap is
-        // what bounds accumulation across repeated records.
+        // The shared decoder validates nonempty, bounded IP/QUIC endpoints before BLS verification.
         if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
             warn!(
                 target: "network-kad",
@@ -984,6 +1039,9 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_established_connections(
+                self.swarm.network_info().connection_counters().num_established(),
+            );
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
@@ -1049,32 +1107,46 @@ where
                 }
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling or the per-peer established ceiling); count it, and log only the configured
-            // limit and the fixed limit description, never peer-supplied data
+            // ceiling, the per-peer established ceiling or the total established ceiling); count
+            // it by the bound that the refusal names, and log only the configured limit and the
+            // fixed limit description, never peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
-                peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
-                    // the pending hook runs before the remote is authenticated, so only a
-                    // refusal at establishment (the per-peer ceiling) carries a peer id
-                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                        InboundDenial::EstablishedPerPeerLimit
-                    });
-                    self.metrics.record_inbound_denied(&denial);
-                    self.inbound_denial_warning
-                        .record(tokio::time::Instant::now())
-                        .into_iter()
-                        .for_each(|denied| {
-                            warn!(
-                                target: "network",
-                                denied,
-                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                "inbound connections keep being refused by connection limits"
-                            );
-                        });
-                });
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        // classify by the refusal text, not by the peer id: both established
+                        // ceilings refuse after authentication, so a peer id cannot tell them apart
+                        let reason = ConnectionLimitReason::from_exceeded(exceeded);
+                        self.metrics.record_connection_limit_rejection(reason);
+                        let denial = InboundDenial::from_reason(reason);
+                        self.metrics.record_inbound_denied(&denial);
+                        self.inbound_denial_warning
+                            .record(tokio::time::Instant::now())
+                            .into_iter()
+                            .for_each(|denied| {
+                                warn!(
+                                    target: "network",
+                                    denied,
+                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                    "inbound connections keep being refused by connection limits"
+                                );
+                            });
+                    },
+                );
+            }
+            SwarmEvent::OutgoingConnectionError {
+                error: libp2p::swarm::DialError::Denied { cause },
+                ..
+            } => {
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        self.metrics.record_connection_limit_rejection(
+                            ConnectionLimitReason::from_exceeded(exceeded),
+                        );
+                    },
+                );
             }
             // other events handled by peer manager and other behaviors
             _ => {}
@@ -1457,12 +1529,15 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
-                        // forward gossip to handler
-                        if let Err(e) = self
+                        // forward gossip to handler; a full queue or a queue with no
+                        // subscriber counts as shed
+                        let forwarded = self
                             .event_stream
-                            .try_send(accepted_gossip_event(message, relayer, author))
-                        {
+                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
+                        if forwarded.inspect_err(|e| {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                        }).is_err() {
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1572,17 +1647,22 @@ where
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            let class = request.service_class();
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
-                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer: bls,
-                                request,
-                                channel: ResponseChannel::new(peer, channel),
-                                cancel,
-                            }) {
+                            let forwarded =
+                                self.event_stream.try_send_outcome(NetworkEvent::Request {
+                                    peer: bls,
+                                    request,
+                                    channel: ResponseChannel::new(peer, channel),
+                                    cancel,
+                                });
+                            self.metrics.record_forward(class, &forwarded);
+                            // Only queued requests become pending. An unsubscribed queue
+                            // drops the response channel, and epoch-boundary errors are ignored.
+                            if !forwarded.inspect_err(|e| {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                                // ignore failures at the epoch boundary
-                                // During epoch change the event_stream reciever can be closed.
+                            }).is_ok_and(|outcome| outcome == TrySendOutcome::Queued) {
                                 return Ok(());
                             }
 
@@ -1590,11 +1670,14 @@ where
                             //
                             // NOTE: the request id is internally generated, so this should not
                             // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
+                            self.add_inbound(class);
+                            if let Some(duplicate) = self.inbound_requests.insert(
+                                request_id,
+                                PendingInbound { notify, class, received: Instant::now() },
+                            ) {
                                 // cancel if this is a duplicate request
                                 warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
+                                self.close_inbound(duplicate);
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
@@ -1636,14 +1719,7 @@ where
                     return Ok(());
                 }
 
-                let failure_kind = match &error {
-                    ReqResOutboundFailure::DialFailure => "dial",
-                    ReqResOutboundFailure::ConnectionClosed => "connection",
-                    ReqResOutboundFailure::Io(_) => "io",
-                    ReqResOutboundFailure::Timeout => "timeout",
-                    ReqResOutboundFailure::UnsupportedProtocols => "unsupported",
-                };
-                self.metrics.record_outbound_failure(failure_kind);
+                self.metrics.record_outbound_failure(&error);
 
                 // Differentiate transport-level failures (peer disconnect, dial fail) from
                 // protocol-level violations. Transport failures are common on WAN and should
@@ -1699,6 +1775,13 @@ where
                 });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                // Dropped, unforwarded requests have no tracked class or occupancy. Ignore
+                // their failures, including ResponseOmission after an unsubscribed queue.
+                if !self.inbound_requests.contains_key(&request_id) {
+                    return Ok(());
+                }
+                // classify before the match below takes `error` apart
+                let outcome = InboundFailureOutcome::from_failure(&error);
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match &error {
@@ -1738,20 +1821,39 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
+                // count the failure under the class of the forwarded request, then forward
+                // cancelation to handler and release the class occupancy
+                self.inbound_requests.remove(&request_id).into_iter().for_each(|entry| {
+                    self.metrics.record_inbound_failure(entry.class, outcome);
+                    self.close_inbound(entry);
+                });
             }
 
             ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.metrics.record_service_time(entry.class, entry.received.elapsed());
+                    self.close_inbound(entry);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Count one forwarded inbound request of `class` as pending and export the occupancy.
+    fn add_inbound(&mut self, class: ServiceClass) {
+        self.inbound_pending = self.inbound_pending.added(class);
+        self.metrics.set_inbound_pending(class, self.inbound_pending.pending(class));
+    }
+
+    /// End a pending inbound request: notify the handler and release the class occupancy.
+    ///
+    /// Every removal of an `inbound_requests` entry calls this once, so the swarm releases each
+    /// added request exactly once.
+    fn close_inbound(&mut self, entry: PendingInbound) {
+        let _ = entry.notify.send(());
+        self.inbound_pending = self.inbound_pending.released(entry.class);
+        self.metrics.set_inbound_pending(entry.class, self.inbound_pending.pending(entry.class));
     }
 
     /// Request the connected peer's self-record, coalescing pending and deferred work.
@@ -2283,16 +2385,18 @@ where
                 );
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
-                if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
-                    {
-                        error!(target: "network", ?e, "failed to forward inbound stream");
-                    }
-                } else {
-                    warn!(target: "network", ?peer, "received inbound stream from unknown peer");
-                }
+                self.swarm.behaviour().peer_manager.peer_to_bls(&peer).map_or_else(
+                    || warn!(target: "network", ?peer, "received inbound stream from unknown peer"),
+                    |bls| {
+                        let forwarded = self
+                            .event_stream
+                            .try_send_outcome(NetworkEvent::InboundStream { peer: bls, stream });
+                        self.metrics.record_forward(ServiceClass::Other, &forwarded);
+                        forwarded.err().into_iter().for_each(|e| {
+                            error!(target: "network", ?e, "failed to forward inbound stream");
+                        });
+                    },
+                );
             }
             StreamEvent::OutboundFailure { peer, failure }
             | StreamEvent::InboundFailure { peer, failure } => {
@@ -2566,8 +2670,7 @@ where
                     let should_store = if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
-                        self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).map_or(
-                                true,
+                        self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none_or(
                                 |existing| {
                                     record.expires = existing.expires.zip(record.expires).map(|(old, new)| old.max(new));
                                     record.expires != existing.expires

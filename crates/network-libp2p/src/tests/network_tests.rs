@@ -22,6 +22,14 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+/// A permitted advertised endpoint for record fixtures that never bind or dial it.
+fn record_endpoint() -> Multiaddr {
+    Multiaddr::empty()
+        .with(libp2p::multiaddr::Protocol::Ip4([192, 0, 2, 1].into()))
+        .with(libp2p::multiaddr::Protocol::Udp(8000))
+        .with(libp2p::multiaddr::Protocol::QuicV1)
+}
+
 /// Query both public counts while processing only commands, leaving swarm progress under the
 /// test's control so a pending dial cannot race a handshake or a dial failure.
 async fn query_peer_counts(
@@ -3013,7 +3021,7 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
             let record = NodeRecord::build(
                 domain,
                 netkey.public().into(),
-                create_multiaddr(None),
+                record_endpoint(),
                 None,
                 |data| bls.sign(data),
             );
@@ -4096,7 +4104,7 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let local_network_key = key_config.worker_network_keypair(0);
     let worker_0_key = publisher_key_config.worker_network_keypair(0);
     let worker_1_key = publisher_key_config.worker_network_keypair(1);
-    let worker_0_address = create_multiaddr(None);
+    let worker_0_address = record_endpoint();
     let worker_0_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(0)),
         worker_0_key.public().into(),
@@ -4107,7 +4115,7 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     let worker_1_record = NodeRecord::build(
         RecordDomain::new(chain_id, NetworkType::Worker(1)),
         worker_1_key.public().into(),
-        create_multiaddr(None),
+        record_endpoint(),
         None,
         |data| publisher_key_config.request_signature_direct(data),
     );
@@ -4233,7 +4241,7 @@ async fn test_restored_records_survive_only_committee_rotation() -> eyre::Result
 
         let outsider_netkey: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
         let outsider_record =
-            NodeRecord::build(domain, outsider_netkey, create_multiaddr(None), None, |data| {
+            NodeRecord::build(domain, outsider_netkey, record_endpoint(), None, |data| {
                 outsider_keypair.sign(data)
             });
         kad_store.put(kad::Record {
@@ -4740,7 +4748,7 @@ fn connection_limit_caps_established_connections_per_peer() {
     };
 
     // the behaviour installed in production; the pending inbound budget is not under test here
-    let mut limits = super::connection_limits_behaviour(u32::MAX);
+    let mut limits = super::connection_limits_behaviour(u32::MAX, None);
     let cap = usize::try_from(super::MAX_ESTABLISHED_CONNECTIONS_PER_PEER).expect("cap fits usize");
 
     let peer = PeerId::random();
@@ -4837,7 +4845,7 @@ fn connection_limit_bounds_pending_incoming_connections() {
     };
 
     const CAP: u32 = 3;
-    let mut limits = super::connection_limits_behaviour(CAP);
+    let mut limits = super::connection_limits_behaviour(CAP, None);
     let addr = create_multiaddr(None);
 
     // the swarm asks for a pending inbound slot for connection `id`
@@ -4921,16 +4929,16 @@ fn connection_limit_bounds_pending_incoming_connections() {
 /// How long the swarm-level pending slot test waits for one listener event.
 const SWARM_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1)`,
-/// so it holds at most one pending inbound connection, and `connection_timeout` bounds every
-/// handshake.
+/// Build a QUIC swarm on the tokio runtime. Its only behaviour is `connection_limits_behaviour(1,
+/// None)`, so it holds at most one pending inbound connection, and `connection_timeout` bounds
+/// every handshake.
 fn quic_connection_limits_swarm(
     connection_timeout: Duration,
 ) -> Swarm<connection_limits::Behaviour> {
     SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| super::connection_limits_behaviour(1))
+        .with_behaviour(|_| super::connection_limits_behaviour(1, None))
         .expect("the behaviour constructor is infallible")
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(30)))
         .with_connection_timeout(connection_timeout)

@@ -102,9 +102,11 @@ Fields:
 - `name`: human-readable identifier (e.g. `node-JMQq7ZqVT`)
 - `bls_public_key`: Base58-encoded BLS12-381 public key (96 bytes compressed)
 - `p2p_info.primary`: primary network multiaddr and Ed25519 public key
-- `p2p_info.worker`: worker network multiaddr and Ed25519 public key
+- `p2p_info.workers`: one entry per worker, in worker ID order, each with the worker's network multiaddr, Ed25519 public key, and optional `rpc` endpoint (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint))
 - `execution_address`: EVM address that receives block rewards
 - `proof_of_possession`: BLS signature binding the public key to the execution address
+
+Files written by v0.14.0-adiri and earlier have a single `worker:` map in place of `workers:`. The node and keytool still read that shape, and a keytool command that rewrites the file (`set-rpc`, `generate pop`) saves it as a `workers:` list.
 
 Example:
 
@@ -115,9 +117,11 @@ p2p_info:
   primary:
     network_address: "/ip4/34.31.250.229/udp/49590/quic-v1/p2p/12D3KooW..."
     network_key: "4XTTM1f3EZanf..."
-  worker:
-    network_address: "/ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooW..."
-    network_key: "4XTTMD3rST8E7..."
+    rpc: ~ # stays empty; only worker entries advertise an endpoint
+  workers:
+    - network_address: "/ip4/34.31.250.229/udp/49594/quic-v1/p2p/12D3KooW..."
+      network_key: "4XTTMD3rST8E7..."
+      rpc: ~ # set with --rpc-http at generation or with keytool set-rpc
 execution_address: "0xefaacf04b92298a88200aa50aa6bb7bfce587b17"
 proof_of_possession: "kFa9r..."
 ```
@@ -139,21 +143,21 @@ The command requires existing keys and a `node-info.yaml` under `--datadir`; it 
 After rotating, re-export the staking arguments for the new address (see [Staking registration](#staking-registration)):
 
 ```bash
-telcoin-network keytool export-staking-args \
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args \
     --node-info /var/lib/telcoin/node-info.yaml
 ```
 
 ### Advertising a JSON-RPC endpoint
 
-A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so wallets and dapps can discover where to submit transactions. The endpoint is stored in `node-info.yaml` under `p2p_info.worker.rpc` and advertised by the worker network when the node runs.
+A node can advertise an optional JSON-RPC endpoint to peers over Kademlia so observers can forward transactions to it and the `node-record-api` daemon can list it on a public site. The endpoint is stored in `node-info.yaml` under `p2p_info.workers[0].rpc` (worker 0's entry) and advertised by the worker network when the node runs.
 
 `keytool set-rpc` sets or clears that endpoint. It is a config-only edit — no keys are read and the BLS passphrase is ignored — so it requires an existing `node-info.yaml` under `--datadir`; run `keytool generate validator|observer` first (it errors with that hint otherwise).
 
 ```bash
 telcoin-network keytool set-rpc \
     --datadir /var/lib/telcoin \
-    --http https://validator.example.com:8545/ \
-    --ws wss://validator.example.com:8546/
+    --http https://rpc.validator.example.com/ \
+    --ws wss://rpc.validator.example.com/
 ```
 
 `--http` is the required HTTP/HTTPS endpoint; `--ws` is the optional WebSocket endpoint. Both are validated with the same check node startup applies — `--http` must use the `http` or `https` scheme and `--ws` must use `ws` or `wss` — so a bad scheme fails immediately instead of being advertised and rejected by peers.
@@ -165,6 +169,8 @@ telcoin-network keytool set-rpc --datadir /var/lib/telcoin --clear
 ```
 
 `--clear` conflicts with `--http`/`--ws`, and omitting all flags is an error (`--http` is required unless `--clear`).
+
+Validators should set this endpoint, because observers forward the transactions they accept to it. Advertise an `https://` URL served by a gateway or TLS reverse proxy, never the node's own RPC ports, and never a private address: observers refuse to dial one. [Validator production operations](../../docs/src/getting-started/validator-operations.md#advertising-an-rpc-endpoint) has the full rules.
 
 ## Genesis ceremony
 
@@ -264,7 +270,7 @@ telcoin-network node \
     --metrics 127.0.0.1:9101
 ```
 
-Available named chains: `adiri` (alias: `testnet`), `mainnet`.
+Available named chains: `adiri` and `test-net`, which both load the Adiri testnet config, and `main-net`.
 
 The `--chain` flag overrides local genesis files with the embedded config for that network.
 
@@ -303,7 +309,7 @@ telcoin-network node \
 
 | Flag                  | Default        | Description                                                                                    |
 | --------------------- | -------------- | ---------------------------------------------------------------------------------------------- |
-| `--chain`             | none           | Join a named network (`adiri`, `testnet`, `mainnet`)                                           |
+| `--chain`             | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                         |
 | `--instance`          | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup) |
 | `--metrics`           | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                       |
 | `--healthcheck`       | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                             |
@@ -374,44 +380,54 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 
 ### RPC flags
 
-| Flag                                     | Default       | Description                              |
-| ---------------------------------------- | ------------- | ---------------------------------------- |
-| `--http`                                 | disabled      | Enable the HTTP-RPC server               |
-| `--http.addr`                            | `127.0.0.1`   | HTTP listen address                      |
-| `--http.port`                            | `8545`        | HTTP listen port                         |
-| `--http.api`                             | none          | RPC modules to enable (see below)        |
-| `--http.corsdomain`                      | none          | Allowed CORS origins                     |
-| `--ws`                                   | disabled      | Enable the WebSocket-RPC server          |
-| `--ws.addr`                              | `127.0.0.1`   | WebSocket listen address                 |
-| `--ws.port`                              | `8546`        | WebSocket listen port                    |
-| `--ws.api`                               | none          | RPC modules to enable                    |
-| `--ws.origins`                           | none          | Allowed WebSocket origins                |
-| `--ipcdisable`                           | `false`       | Disable the IPC-RPC server               |
-| `--ipcpath`                              | `/tmp/tn.ipc` | IPC socket path                          |
-| `--rpc.jwtsecret`                        | none          | Hex-encoded JWT secret for RPC auth      |
-| `--rpc.max-request-size`                 | `15` (MB)     | Max request payload size                 |
-| `--rpc.max-response-size`                | `160` (MB)    | Max response payload size                |
-| `--rpc.max-subscriptions-per-connection` | `1024`        | Max subscriptions per connection         |
-| `--rpc.max-connections`                  | `500`         | Max concurrent RPC connections           |
-| `--rpc.max-tracing-requests`             | CPU-dependent | Max concurrent tracing requests          |
-| `--rpc.gascap`                           | Reth default  | Max gas for `eth_call`                   |
-| `--rpc.txfeecap`                         | `0` (no cap)  | Max transaction fee via RPC (0 = no cap) |
+| Flag                                     | Default               | Description                                                     |
+| ---------------------------------------- | --------------------- | --------------------------------------------------------------- |
+| `--http`                                 | disabled              | Enable the HTTP-RPC server                                      |
+| `--http.addr`                            | `127.0.0.1`           | HTTP listen address                                             |
+| `--http.port`                            | `8545`                | HTTP listen port                                                |
+| `--http.api`                             | `eth,net,web3,rpc,tn` | RPC namespaces to serve over HTTP (see below)                   |
+| `--http.corsdomain`                      | none                  | Allowed CORS origins                                            |
+| `--ws`                                   | disabled              | Enable the WebSocket-RPC server                                 |
+| `--ws.addr`                              | `127.0.0.1`           | WebSocket listen address                                        |
+| `--ws.port`                              | `8546`                | WebSocket listen port                                           |
+| `--ws.api`                               | `eth,net,web3,rpc,tn` | RPC namespaces to serve over WebSocket (see below)              |
+| `--ws.origins`                           | none                  | Allowed WebSocket origins                                       |
+| `--ipcdisable`                           | `false`               | Disable the IPC-RPC server                                      |
+| `--ipcpath`                              | `/tmp/tn.ipc`         | IPC socket path                                                 |
+| `--rpc.jwtsecret`                        | none                  | Hex-encoded JWT secret for RPC auth                             |
+| `--rpc.max-request-size`                 | `15` (MB)             | Max request payload size                                        |
+| `--rpc.max-response-size`                | `160` (MB)            | Max response payload size                                       |
+| `--rpc.max-subscriptions-per-connection` | `1024`                | Max subscriptions per connection                                |
+| `--rpc.max-connections`                  | `500`                 | Max concurrent RPC connections                                  |
+| `--rpc.max-tracing-requests`             | CPU-dependent         | Max concurrent tracing requests (`debug`, `trace`)              |
+| `--rpc.max-trace-filter-blocks`          | `100`                 | Max block range of one `trace_filter` request                   |
+| `--rpc.max-blocks-per-filter`            | `100000`              | Max block range for `eth_getLogs` and filters (0 = no limit)    |
+| `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |
+| `--rpc.gascap`                           | `50000000`            | Max gas for `eth_call` and the call-tracing methods             |
+| `--rpc.txfeecap`                         | `0` (no cap)          | Max transaction fee via RPC (0 = no cap)                        |
 
-### available RPC modules
+### available RPC namespaces
 
-`eth`, `net`, `web3`, `debug`, `trace`, `rpc`
+`eth`, `net`, `web3`, `rpc`, `tn`, `debug`, `trace`
 
-`--http.api all` (and `--ws.api all`) enables `eth`, `net`, `web3`, `rpc`. The `debug` and
-`trace` modules are expensive to serve on an archive node and are never part of `all`: name
-them explicitly (for example `--http.api eth,debug,trace`) to enable them, which logs a
-warning at startup. A selection whose first entry is `all` (for example `all,debug`) parses
-as plain `all` and the rest of the list is ignored, so list every module by name instead.
+With no `--http.api` flag, or with `--http.api all` (likewise `--ws.api`), a transport serves
+`eth`, `net`, `web3`, `rpc` and `tn`. An explicit list is served exactly as written, so
+`--http.api eth,net,web3` serves no `tn_*` methods; name `tn` to keep them. `none` serves
+nothing.
 
-The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the same module set as
-`all`.
+The `debug` and `trace` namespaces are expensive to serve on an archive node and are never part
+of the default set or of `all`: name them explicitly (for example
+`--http.api eth,net,web3,rpc,tn,debug,trace`) to enable them, which logs a warning at startup. A
+selection whose first entry is `all` (for example `all,debug`) parses as plain `all` and the rest
+of the list is ignored, so list every namespace by name instead. Names are case-sensitive.
 
-The `admin` and `txpool` modules are not available at this time; they are dropped from any
+The IPC endpoint (`--ipcpath`, enabled unless `--ipcdisable`) serves the default set.
+
+The `admin` and `txpool` modules, and any other name not listed above, are dropped from a
 selection with a warning.
+
+See [Enabling Namespaces](../../docs/src/rpc-methods/enabling-namespaces.md) for the cost of each
+namespace, the limits, and how to check what a node serves.
 
 ### Transaction pool
 
@@ -425,10 +441,12 @@ selection with a warning.
 
 All peer-to-peer communication uses QUIC (v1) over UDP, managed by libp2p. Each node runs two QUIC endpoints:
 
-| Endpoint | Default port | Purpose                                |
-| -------- | ------------ | -------------------------------------- |
-| Primary  | UDP 49590    | Consensus headers, certificates, votes |
-| Worker   | UDP 49595    | Transaction batches                    |
+| Endpoint | Conventional port | Purpose                                |
+| -------- | ----------------- | -------------------------------------- |
+| Primary  | UDP 49590         | Consensus headers, certificates, votes |
+| Worker   | UDP 49594         | Transaction batches                    |
+
+The node has no default for these ports. It takes them from the addresses recorded in `node-info.yaml` at key generation (see [External address configuration](#external-address-configuration)), or from `PRIMARY_LISTENER_MULTIADDR` and `WORKER_LISTENER_MULTIADDR` (worker 0) when set. Validators use the ports above by convention; other free UDP ports work if peers can reach them.
 
 ### External address configuration
 
@@ -439,7 +457,7 @@ telcoin-network keytool generate validator \
     --datadir /var/lib/telcoin \
     --address 0xYOUR_ADDRESS \
     --external-primary-addr /ip4/YOUR_PUBLIC_IP/udp/49590/quic-v1 \
-    --external-worker-addrs /ip4/YOUR_PUBLIC_IP/udp/49595/quic-v1
+    --external-worker-addrs /ip4/YOUR_PUBLIC_IP/udp/49594/quic-v1
 ```
 
 If not set, addresses default to `127.0.0.1` with a random port (only useful for local testing).
@@ -466,12 +484,12 @@ Nodes discover each other through Kademlia DHT (libp2p). Bootstrap peers are loa
 
 ### Firewall requirements
 
-Inbound (must be open):
+Inbound (must be open; the P2P rows use the conventional ports, so substitute the ports in your `node-info.yaml` if you chose others):
 
 | Port  | Protocol | Service                                                       |
 | ----- | -------- | ------------------------------------------------------------- |
 | 49590 | UDP      | Primary consensus P2P                                         |
-| 49595 | UDP      | Worker consensus P2P                                          |
+| 49594 | UDP      | Worker consensus P2P                                          |
 | 8545  | TCP      | HTTP RPC (if enabled; restrict to trusted sources)            |
 | 8546  | TCP      | WebSocket RPC (if enabled; restrict to trusted sources)       |
 | 9101  | TCP      | Prometheus metrics (if enabled; restrict to monitoring infra) |
@@ -513,7 +531,7 @@ Set it to `true` only when every committee member is under the same operator as 
 EVM credits this account on every transaction, so its balance enters the state root and every node
 on the network must hold the same value. A parameters file that omits the key fails to parse, so
 the node refuses to start rather than falling back in silence. The `genesis` commands write the
-key for you, and the `mainnet` and `adiri` chain presets carry their own value.
+key for you, and the `main-net` and `adiri` chain presets carry their own value.
 
 Example, the testnet preset (`chain-configs/testnet/parameters.yaml`). It leaves `vote_timeout` at the 5 s default:
 
@@ -560,7 +578,7 @@ The only input to these checks that changes between epochs is whether the sub-se
 | `vote_timeout` at least `max_header_delay` plus the voter's longest drift wait | A vote request must stay open for a full header cadence plus the time the voter may spend waiting out a future-dated header. The drift wait is `max_header_time_drift_tolerance` once the sub-second timestamp fork is active for the epoch, and the tolerance rounded up to whole seconds before it (1 s for the 250 ms default) |
 | `vote_timeout` below 10 s                                                | The libp2p request timeout is 10 s and covers the whole exchange; at or above it the transport cancels a slow vote before `vote_timeout` fires                                                        |
 
-With `--chain adiri` or `--chain mainnet`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
+With `--chain adiri` or `--chain main-net`, the node takes these parameters from the preset built into the binary and does not read the datadir's `parameters.yaml`, so the drift tolerance in `network-config` is the only value in these checks an operator sets.
 Neither preset sets `vote_timeout`, so it is 5 s.
 The testnet preset's `max_header_delay` is 3 s, which leaves room for a tolerance of up to 2 s; the mainnet preset's is 1 s, which leaves room for up to 4 s.
 The default `250ms` and a legacy `1` pass with both.
@@ -778,17 +796,17 @@ Validators are accessible on host ports 8545-8542 (mapped from container port 85
 After key generation, export the staking arguments needed to call `ConsensusRegistry.stake()` on-chain.
 
 ```bash
-telcoin-network keytool export-staking-args \
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args \
     --node-info /var/lib/telcoin/node-info.yaml
 ```
 
-This command reads only public data from `node-info.yaml`. No private key, passphrase, or data directory is needed.
+This command reads only public data from `node-info.yaml` and never reads the BLS private key or the data directory. The binary still resolves a passphrase source before every keytool command except `set-rpc`, and with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required", so pass `--bls-passphrase-source no-passphrase` as above.
 
 ### Output formats
 
 Default (human-readable):
 
-Prints the three arguments with byte lengths and `0x`-prefixed hex values.
+Prints the two arguments with byte lengths and `0x`-prefixed hex values.
 
 JSON (`--json`):
 
@@ -803,13 +821,20 @@ Raw calldata (`--calldata`):
 
 Single `0x`-prefixed hex string containing ABI-encoded calldata ready to submit as transaction data to `ConsensusRegistry.stake()`.
 
+`keytool` writes log lines to stdout, so a script that captures the `--json` or `--calldata` output must add the global `-q` flag, or the capture also holds a log line:
+
+```bash
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase \
+    keytool export-staking-args --node-info /var/lib/telcoin/node-info.yaml --calldata)
+```
+
 ### Contract function signature
 
 ```solidity
 function stake(
     bytes calldata blsPubkey,
     ProofOfPossession calldata proofOfPossession
-) public
+) external payable
 
 struct ProofOfPossession {
     bytes signature; // 48 bytes (compressed G1)
@@ -817,6 +842,8 @@ struct ProofOfPossession {
 ```
 
 The compressed BLS public key is 96 bytes and the proof-of-possession signature is 48 bytes. The proof of possession binds the BLS key to the validator's execution address; the native precompile verifies the signature directly against the compressed `blsPubkey`.
+
+The transaction value must equal the `stakeAmount` of the current epoch's stake version: read the version with `getCurrentStakeVersion()`, then the config with `stakeConfig(uint8)`. See [How to Stake](../../docs/src/staking/how-to-stake.md) for the full sequence.
 
 ## Observer mode
 
@@ -872,10 +899,10 @@ chmod 600 /var/lib/telcoin/node-keys/*
 
 ### Network security
 
-- RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting.
+- RPC endpoints: Bind to `127.0.0.1` (the default) unless you need external access. If exposing RPC, use a reverse proxy with authentication and rate limiting. The endpoint a validator advertises is the exception: observers call it without credentials, so serve it over HTTPS with rate limiting only (see [Advertising a JSON-RPC endpoint](#advertising-a-json-rpc-endpoint)).
 - Health check: The `--healthcheck` endpoint has no rate limiting (see [Health check endpoint](#health-check-endpoint)). Keep it behind a firewall.
 - Metrics: Restrict Prometheus metrics to your monitoring infrastructure. Do not expose port 9101 publicly.
-- P2P ports: UDP 49590 and 49595 must be reachable by other validators. All other ports should be firewalled.
+- P2P ports: the primary and worker UDP ports from `node-info.yaml` (49590 and 49594 by convention) must be reachable by other validators. All other ports should be firewalled.
 
 ### Proof of possession
 

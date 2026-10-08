@@ -1,13 +1,16 @@
 //! Configuration for network variables.
 
-use crate::{ConfigFmt, ConfigTrait, TelcoinDirs};
+use crate::{
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
+    TelcoinDirs,
+};
 use libp2p::kad::K_VALUE;
 use serde::{
     de::{self, Visitor},
     Deserialize, Deserializer, Serialize,
 };
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
-use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tn_types::{BlsPublicKey, BootstrapServer, Multiaddr, Round, WorkerId};
 use tracing::warn;
 
 mod quic;
@@ -27,6 +30,8 @@ pub struct NetworkConfig {
     sync_config: SyncConfig,
     /// The configurations for quic protocol.
     quic_config: QuicConfig,
+    /// Optional process-wide allocation. Omission preserves the existing transport defaults.
+    process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
@@ -42,9 +47,76 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Optional local listener and advertised endpoint mappings, independent of node identities.
+    endpoints: EndpointMappings,
+}
+
+/// Independent endpoint configuration for the primary and each worker transport identity.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointMappings {
+    /// Primary mapping; absence preserves the node-info address and listener environment override.
+    primary: Option<EndpointMapping>,
+    /// Worker mappings keyed by their own worker id; unknown ids fail node startup.
+    workers: BTreeMap<WorkerId, EndpointMapping>,
+}
+
+impl EndpointMappings {
+    /// Optional primary endpoint mapping.
+    pub fn primary(&self) -> Option<&EndpointMapping> {
+        self.primary.as_ref()
+    }
+
+    /// Configured worker endpoint mappings.
+    pub fn workers(&self) -> &BTreeMap<WorkerId, EndpointMapping> {
+        &self.workers
+    }
+}
+
+/// A local bind address and an ordered list of externally reachable endpoints.
+///
+/// Advertised endpoints accept IP or operator-configured DNS over UDP/QUIC v1. Resolution is
+/// bounded and performed once at process startup, before any network task is spawned.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointMapping {
+    /// Optional local bind address; listener environment overrides retain precedence.
+    #[serde(default)]
+    listen: Option<Multiaddr>,
+    /// Preferred endpoint first, with at most four resolved IP endpoints across the list.
+    advertise: Vec<Multiaddr>,
+}
+
+impl EndpointMapping {
+    /// The configured bind address, if present.
+    pub fn listen(&self) -> Option<&Multiaddr> {
+        self.listen.as_ref()
+    }
+
+    /// Ordered operator-supplied advertised endpoints, before DNS resolution.
+    pub fn advertise(&self) -> &[Multiaddr] {
+        &self.advertise
+    }
 }
 
 impl NetworkConfig {
+    /// Validate the process budget against the primary plus every configured worker swarm.
+    pub fn validate_process_budget(&self, swarm_count: usize) -> Result<(), NetworkBudgetError> {
+        self.process_budget
+            .as_ref()
+            .map_or(Ok(()), |budget| budget.validate_swarm_count(swarm_count))
+    }
+
+    /// Derive one swarm's resource allocation, or preserve legacy limits when not configured.
+    pub fn swarm_budget(&self) -> Result<Option<SwarmNetworkBudget>, NetworkBudgetError> {
+        self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
+    }
+
+    /// Endpoint mappings for the primary and every independently keyed worker.
+    pub fn endpoints(&self) -> &EndpointMappings {
+        &self.endpoints
+    }
+
     /// Return the legacy startup peer-readiness budget.
     ///
     /// Defaults to 120 seconds for configuration compatibility. Continuous network
@@ -439,6 +511,27 @@ impl Default for SyncConfig {
             consensus_header_catch_up_poll_interval: Duration::from_millis(100),
             consensus_header_catch_up_max_no_progress: 600,
         }
+    }
+}
+
+impl QuicConfig {
+    /// Apply an allocation as an upper bound without increasing explicitly lower QUIC settings.
+    pub fn with_budget(&self, budget: Option<SwarmNetworkBudget>) -> Self {
+        budget.map_or_else(
+            || self.clone(),
+            |budget| {
+                let max_connection_data =
+                    self.max_connection_data.min(budget.receive_credit_per_connection());
+                Self {
+                    max_concurrent_stream_limit: self
+                        .max_concurrent_stream_limit
+                        .min(budget.streams_per_connection()),
+                    max_connection_data,
+                    max_stream_data: self.max_stream_data.min(max_connection_data),
+                    ..self.clone()
+                }
+            },
+        )
     }
 }
 
@@ -1144,6 +1237,41 @@ hostname: "my-validator"
         // A negative halflife flips exponential decay into unbounded growth.
         let config = ScoreConfig { score_halflife: -1.0, ..Default::default() };
         assert!(config.validate().is_err(), "a negative score_halflife must be rejected");
+    }
+
+    /// Process allocations cap transport values and preserve lower operator settings.
+    #[test]
+    fn process_budget_caps_quic_without_raising_lower_settings() -> Result<(), std::io::Error> {
+        let config: NetworkConfig = serde_json::from_value(serde_json::json!({
+            "process_budget": {
+                "swarm_count": 2,
+                "max_established_connections": 4,
+                "max_established_connections_per_peer": 1,
+                "max_inbound_streams": 40,
+                "max_receive_credit_bytes": 4000
+            }
+        }))?;
+        config.validate_process_budget(2).map_err(std::io::Error::other)?;
+        assert!(config.validate_process_budget(3).is_err());
+        let budget = config.swarm_budget().map_err(std::io::Error::other)?;
+        let capped = config.quic_config().with_budget(budget);
+        assert_eq!(capped.max_concurrent_stream_limit, 10);
+        assert_eq!(capped.max_connection_data, 1000);
+        assert_eq!(capped.max_stream_data, 1000);
+        let lower = QuicConfig {
+            max_concurrent_stream_limit: 3,
+            max_connection_data: 500,
+            max_stream_data: 100,
+            ..Default::default()
+        }
+        .with_budget(budget);
+        assert_eq!(lower.max_concurrent_stream_limit, 3);
+        assert_eq!(lower.max_connection_data, 500);
+        assert_eq!(lower.max_stream_data, 100);
+        let legacy: NetworkConfig = serde_json::from_str("{}")?;
+        assert_eq!(legacy.swarm_budget(), Ok(None));
+        assert_eq!(legacy.quic_config().with_budget(None).max_connection_data, 100 * 1024 * 1024);
+        Ok(())
     }
 
     #[test]
