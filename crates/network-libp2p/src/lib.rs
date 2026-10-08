@@ -27,6 +27,7 @@ mod peers;
 mod quic_incoming;
 mod record_exchange;
 mod retention;
+mod service_class;
 pub mod source_admission;
 pub mod stream;
 mod sync;
@@ -35,7 +36,9 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
+pub use metrics::AdmissionShed;
 pub use peers::{LoadPenalty, PeerExchangeMap, Penalty};
+pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
