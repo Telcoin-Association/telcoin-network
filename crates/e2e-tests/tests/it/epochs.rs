@@ -32,7 +32,11 @@ use tn_reth::{
     test_utils::TransactionFactory,
     RethChainSpec,
 };
-use tn_storage::pack_validate::{validate_pack_file, Verdict};
+use tn_storage::{
+    archive::pack::{Pack, PackCompression},
+    consensus_pack::{PackRecord, PACK_VERSION},
+    pack_validate::{validate_pack_file, Verdict},
+};
 use tn_test_utils::wait_until;
 use tn_types::{
     forks::{
@@ -441,8 +445,14 @@ async fn test_epoch_sync_inner(
         for epoch in 0..=latest_epoch {
             let val_name = committee[i].0;
             let file_test = epoch_pack_path(&temp_path.join(val_name), epoch);
-            let pack_file_exists = std::fs::exists(file_test).unwrap_or_default();
-            assert!(pack_file_exists, "Missing an epoch pack file for {val_name} on epoch {epoch}");
+            // Observing current_epoch on validator 0 does not mean every node has finished
+            // creating or importing its packs, especially the restarted validator.
+            wait_until(
+                Duration::from_secs((EPOCH_DURATION * 6).max(60)),
+                &format!("epoch pack for validator {val_name} on epoch {epoch}"),
+                || async { file_test.try_exists().map_err(Into::into) },
+            )
+            .await?;
             // A node was killed and restarted earlier in this test, so it must back-fill the
             // epoch certificates it missed while down. That recovery is a fixed async cost:
             // the restarted node re-collects each missing cert from its peers via the
@@ -902,6 +912,73 @@ async fn change_worker_count_across_epoch_boundary<P: Provider>(
     Ok(())
 }
 
+/// Submit traffic to worker 1 and find that transaction in a sealed worker-1 batch.
+///
+/// Worker RPC listeners are derived from worker 0's configured port even when keytool has not
+/// advertised them. Check every epoch spanned by confirmation so crossing a boundary is harmless.
+async fn assert_worker_one_commits_batch(
+    endpoint: &NodeEndpoints,
+    datadir: &Path,
+    governance: &mut TransactionFactory,
+    chain: Arc<RethChainSpec>,
+) -> eyre::Result<()> {
+    // Reth assigns worker 1 the HTTP port 200 below worker 0 (worker_rpc_server_args).
+    let port = endpoint
+        .http_url
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .and_then(|port| port.checked_sub(200))
+        .ok_or_else(|| eyre::eyre!("worker 0 URL cannot yield a worker 1 port"))?;
+    let worker = ProviderBuilder::new().connect_http(format!("http://127.0.0.1:{port}").parse()?);
+    wait_for_rpc(&worker).await?;
+    let registry = ConsensusRegistry::new(CONSENSUS_REGISTRY_ADDRESS, &worker);
+    let first_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    let recipient = governance.address();
+    let tx = governance.create_eip1559_encoded(
+        chain,
+        None,
+        100,
+        Some(recipient),
+        U256::ZERO,
+        Bytes::new(),
+    );
+    let pending = worker.send_raw_transaction(&tx).await?;
+    timeout(Duration::from_secs(EPOCH_DURATION * 2 + 11), pending.watch()).await??;
+    let last_epoch = registry.getCurrentEpochInfo().call().await?.epochId;
+    wait_until(
+        Duration::from_secs(EPOCH_DURATION * 8),
+        "worker 1's transaction epoch to close",
+        || async { Ok(registry.getCurrentEpochInfo().call().await?.epochId > last_epoch) },
+    )
+    .await?;
+    let records = futures::future::try_join_all(
+        (first_epoch..=last_epoch)
+            .map(|epoch| fetch_verified_epoch_record(&endpoint.http_url, epoch, 60)),
+    )
+    .await?;
+    let expected_tx = tx.to_vec();
+    let found = records.iter().try_fold(false, |found, record| {
+        let pack = Pack::<PackRecord>::open(
+            epoch_pack_path(datadir, record.epoch),
+            u64::from(record.epoch),
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )?;
+        pack.raw_iter()?.try_fold(found, |found, record| {
+            let contains_tx = match record? {
+                PackRecord::Batch(batch) => {
+                    batch.worker_id == 1 && batch.transactions.contains(&expected_tx)
+                }
+                PackRecord::EpochMeta(_) | PackRecord::Consensus(_) => false,
+            };
+            Ok::<_, eyre::Report>(found || contains_tx)
+        })
+    })?;
+    eyre::ensure!(found, "confirmed transaction is absent from sealed worker 1 batches");
+    Ok(())
+}
+
 /// Provision worker 1 and its bootstrap addresses without changing the one-worker genesis.
 ///
 /// Preserve the identities in the one-worker genesis while adding local capacity for worker 1.
@@ -1070,7 +1147,8 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
 ///
 /// Every node provisions two workers while genesis activates only one. The original processes
 /// must start worker 1 at epoch entry, close epochs with both workers, and accept a decrease
-/// back to one worker without restarting. A local capacity shortfall is covered by node tests.
+/// back to one worker without restarting. A confirmed transaction must appear in a sealed batch
+/// from worker 1. A local capacity shortfall is covered by node tests.
 #[ignore = "only run independently from all other it tests"]
 #[tokio::test(flavor = "multi_thread")]
 async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()> {
@@ -1130,6 +1208,13 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         chain.clone(),
         &endpoints,
         2,
+    )
+    .await?;
+    assert_worker_one_commits_batch(
+        first,
+        &temp_dir.path().join("validator-1"),
+        &mut governance,
+        chain.clone(),
     )
     .await?;
     change_worker_count_across_epoch_boundary(&provider, &mut governance, chain, &endpoints, 1)

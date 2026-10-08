@@ -21,7 +21,6 @@ use std::{
     process::Child,
     time::{Duration, Instant},
 };
-use tn_config::NetworkConfig;
 use tn_test_utils::wait_until_blocking;
 use tn_types::{get_available_tcp_port, NodeMode};
 use tracing::{error, info};
@@ -707,8 +706,33 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// A validator starting alone at genesis must serve RPC through startup timeouts and join consensus
-/// when the rest of its committee starts. The name includes `test_epoch` for the Durable MDBX lane.
+/// Read the versioned network readiness snapshot with bounded connection and response waits.
+fn network_health_snapshot(addr: std::net::SocketAddr) -> eyre::Result<(u16, serde_json::Value)> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(
+        b"GET /health/network HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| eyre::eyre!("network health response has no body separator"))?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| eyre::eyre!("network health response has no status code"))?
+        .parse::<u16>()?;
+    serde_json::from_str(body).map(|snapshot| (status, snapshot)).map_err(Into::into)
+}
+
+/// A validator starting alone at genesis must serve RPC while reporting not-ready and join
+/// consensus when the rest of its committee starts. The name includes `test_epoch` for the Durable
+/// MDBX lane.
 #[test]
 #[ignore = "run with make test-epochs"]
 fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
@@ -717,11 +741,10 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs/cold_genesis");
     let startup_sync_wait = Duration::from_secs(30);
     config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
-    let alone_dir = temp.path().join("validator-1");
-    let mut network_config = NetworkConfig::read_config(&alone_dir)?;
-    network_config.set_peer_readiness_timeout(Duration::from_secs(2));
-    network_config.write_config(&alone_dir)?;
-    let peer_readiness_wait = NetworkConfig::read_config(&alone_dir)?.peer_readiness_timeout();
+    let health_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no health port available for cold-genesis validator"))?;
+    let health_addr = std::net::SocketAddr::from(([127, 0, 0, 1], health_port));
+    let health_port_arg = health_port.to_string();
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
         get_available_tcp_port("127.0.0.1")
@@ -737,7 +760,15 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let [alone_port, ..] = rpc_ports;
     let [alone_url, peer_url, ..] = &client_urls;
     let mut guard = ProcessGuard::empty();
-    guard.push(start_validator(0, bin, temp.path(), alone_port, "cold_genesis", 0));
+    guard.push(start_validator_with_args(
+        0,
+        bin,
+        temp.path(),
+        alone_port,
+        "cold_genesis",
+        0,
+        &["--healthcheck", &health_port_arg],
+    ));
 
     {
         let child = RefCell::new(
@@ -748,10 +779,10 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                 eyre::bail!("cold-genesis validator exited: {status} ({})", log_dir.display())
             })
         };
-        // Startup sync and primary-network readiness run before the worker creates its RPC
-        // server. With no peers, allow both waits to expire plus process-startup headroom.
+        // Startup sync runs before the worker creates its RPC server. Peerless networks
+        // report not-ready through the monitor without adding another startup wait.
         wait_until_blocking(
-            startup_sync_wait + peer_readiness_wait + Duration::from_secs(45),
+            startup_sync_wait + Duration::from_secs(45),
             &format!("cold-genesis RPC ready without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
@@ -766,25 +797,37 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
             },
         )?;
 
-        // Observe both actual timeout continuations before introducing peers. Keep checking RPC
-        // and process liveness, with headroom derived from this node's persisted readiness budget.
-        let observation = peer_readiness_wait * 2 + startup_sync_wait;
+        // Keep observing disconnected primary and worker swarms across a monitor retry
+        // while RPC and the original process remain alive, then introduce the peers.
+        let observation = Duration::from_secs(5);
+        let started = Instant::now();
         wait_until_blocking(
             observation + Duration::from_secs(30),
             &format!("cold-genesis RPC stays available without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
-                let logs = format!(
-                    "{}\n{}",
-                    std::fs::read_to_string(log_dir.join("node0-run0.log"))?,
-                    std::fs::read_to_string(log_dir.join("node0-run0.stderr.log"))?,
-                );
-                let timed_out = [
-                    "primary network has no connected peers; continuing startup",
-                    "worker swarm has no established peers at epoch entry; continuing while dials retry",
-                ]
-                .iter()
-                .all(|message| logs.contains(message));
+                let (status, snapshot) = network_health_snapshot(health_addr)?;
+                let disconnected = status == 503
+                    && snapshot.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                    && snapshot.get("status").and_then(serde_json::Value::as_str)
+                        == Some("not_ready")
+                    && snapshot
+                        .get("primary")
+                        .and_then(|primary| primary.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("disconnected")
+                    && snapshot.get("workers").and_then(serde_json::Value::as_array).is_some_and(
+                        |workers| {
+                            !workers.is_empty()
+                                && workers.iter().all(|worker| {
+                                    worker
+                                        .get("connectivity")
+                                        .and_then(|connectivity| connectivity.get("status"))
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("disconnected")
+                                })
+                        },
+                    );
                 call_rpc::<String, _, _>(
                     alone_url,
                     "eth_blockNumber",
@@ -793,7 +836,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                     "cold-genesis liveness",
                 )
                 .wrap_err("cold-genesis RPC stopped responding while alone")?;
-                Ok(timed_out)
+                Ok(disconnected && started.elapsed() >= observation)
             },
         )?;
     }
@@ -803,6 +846,12 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     });
     network_advancing(&client_urls)?;
     wait_for_node_mode(alone_url, NodeMode::CvvActive)?;
+    wait_until_blocking(Duration::from_secs(30), "cold-genesis network becomes reachable", || {
+        network_health_snapshot(health_addr).map(|(status, snapshot)| {
+            status == 200
+                && snapshot.get("status").and_then(serde_json::Value::as_str) == Some("reachable")
+        })
+    })?;
 
     // Active mode is optimistic. Require a transaction submitted by the original process to be
     // confirmed by a peer, then applied locally, to prove that consensus actually formed.

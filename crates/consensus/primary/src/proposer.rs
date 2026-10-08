@@ -999,7 +999,10 @@ impl<DB: Database> Proposer<DB> {
                     // that the network is experiencing periods of asynchrony
                     //
                     // periods of asynchrony possibly caused by misconfigured `max_header_delay`
-                    warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "max delay interval expired for round {}", self.round);
+                    //
+                    // the interval's period stays at the configured delay; the delay in force is
+                    // the one it was last reset to, which is halved when this node leads next round
+                    warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "max delay interval expired for round {}", self.round);
                 }
 
                 // obtain reason for logging
@@ -1019,7 +1022,7 @@ impl<DB: Database> Proposer<DB> {
                 min_delay_timed_out = false;
             } else if should_repropose_header {
                 if let Ok(Some(last_proposed)) = self.proposer_store.get_last_proposed() {
-                    warn!(target: "primary::proposer", interval=?self.max_delay_interval.period(), "re-proposing last header after max delay interval expired for round {}", self.round);
+                    warn!(target: "primary::proposer", interval=?self.calc_max_delay(), "re-proposing last header after max delay interval expired for round {}", self.round);
                     let (tx, rx) = oneshot::channel();
                     let consensus_bus = self.consensus_bus.clone();
                     let proposer_store = self.proposer_store.clone();
