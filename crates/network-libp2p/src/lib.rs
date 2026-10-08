@@ -16,6 +16,7 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub mod admission;
 mod codec;
 mod consensus;
 pub mod error;
@@ -23,6 +24,8 @@ pub mod kad;
 mod metrics;
 mod peers;
 mod quic_incoming;
+mod record_exchange;
+mod service_class;
 pub mod stream;
 mod sync;
 pub mod types;
@@ -30,12 +33,15 @@ pub mod types;
 // export types
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
+pub use metrics::AdmissionShed;
 pub use peers::{PeerExchangeMap, Penalty};
+pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
     WorkerSyncRequest,
 };
+pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
 pub use types::ResponseChannel;
 
 // re-export specific libp2p types
