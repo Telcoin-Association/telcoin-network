@@ -16,7 +16,7 @@ use tn_types::{
     AuthorityIdentifier, BlsPublicKey, Certificate, Committee, Database, Header, HeaderDigest,
     Noticer, Notifier, TaskError, TaskManager, TaskResult, TaskSpawner, TnReceiver, Vote,
 };
-use tokio::sync::{oneshot, Mutex};
+use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{debug, enabled, error, info, instrument, warn};
 
 #[cfg(test)]
@@ -53,12 +53,18 @@ pub(crate) struct Certifier<DB> {
     network: PrimaryNetworkHandle,
     /// Spawn epoch-related tasks.
     task_spawner: TaskSpawner,
-    /// Notifier to cancel pending proposals and vote requests if new header is received.
+    /// Notifier to cancel pending proposals and vote requests if a different header is received.
     new_proposal: Notifier,
     /// Lock to make sure we are only in one header proposal at a time.
     /// Should not generally happen but can lead to leader cert equivocation
     /// if it does so be really sure.
     proposal_lock: Arc<Mutex<()>>,
+    /// The digest of the header whose proposal task is still running, if any, and the signal that
+    /// asks that proposal to re-issue the vote requests that ended in an error.
+    ///
+    /// Set by [`Self::run`] before it spawns a proposal and cleared when that task ends, however
+    /// it ends (see [`InFlightProposal`]).
+    in_flight: InFlightMarker,
     /// Prometheus metrics for vote collection and certificate formation.
     metrics: crate::PrimaryMetrics,
 }
@@ -116,6 +122,7 @@ impl<DB: Database> Certifier<DB> {
                 task_spawner,
                 new_proposal: Notifier::new(),
                 proposal_lock: Arc::new(Mutex::new(())),
+                in_flight: Arc::default(),
                 metrics,
             }
             .run(rx_headers)
@@ -279,8 +286,15 @@ impl<DB: Database> Certifier<DB> {
     }
 
     /// Propose a header produced by this authority.
+    ///
+    /// Each wake of `reissue_failed` asks again every peer whose vote request has ended in an error
+    /// since the last wake. The requests still in flight and the votes already received are kept.
     #[instrument(level = "debug", skip_all, fields(round = header.round(), epoch = header.epoch()))]
-    async fn propose_header(&self, header: Header) -> DagResult<Certificate> {
+    async fn propose_header(
+        &self,
+        header: Header,
+        reissue_failed: &Notify,
+    ) -> DagResult<Certificate> {
         debug!(target: "primary::certifier", auth=?self.authority_id, "proposing header");
         let proposal_start = std::time::Instant::now();
 
@@ -306,56 +320,35 @@ impl<DB: Database> Certifier<DB> {
         let vote = Vote::new(&header, self.authority_id.clone(), &self.signature_service);
         let mut certificate = votes_aggregator.append(vote, &self.committee, &header)?;
 
-        // create a channel for receiving votes from peers
-        let (tx_votes, mut rx_votes) = tokio::sync::mpsc::unbounded_channel();
-
-        // create network requests for votes from peers
-        let peers = self.committee.others_primaries_by_id(Some(&self.authority_id)).into_iter();
-        for (name, target) in peers {
-            let header_clone = header.clone();
-            let tx_votes = tx_votes.clone();
-            let network = self.network.clone();
-            let certificate_store = self.certificate_store.clone();
-            let committee = self.committee.clone();
-            let cancel_proposal = self.new_proposal.subscribe();
-            let task_name = format!("vote-{header:?}-{name}");
-            self.task_spawner.spawn_task(task_name, async move {
-                // process request for vote
-                let _ = tx_votes.send(
-                    // this will exit early on cancel_proposal
-                    Self::request_vote(
-                        name,
-                        header_clone,
-                        target,
-                        certificate_store,
-                        network,
-                        committee,
-                        cancel_proposal,
-                    )
-                    .await,
-                );
-                Ok(())
-            });
+        // create a channel for receiving votes from peers. this method keeps a sender to re-issue
+        // failed requests, so the channel never closes: `outstanding` counts the vote tasks that
+        // have not reported yet
+        let (tx_votes, mut rx_votes) = mpsc::unbounded_channel();
+        let mut outstanding = 0usize;
+        for (name, target) in self.committee.others_primaries_by_id(Some(&self.authority_id)) {
+            self.spawn_vote_request(&header, name, target, &tx_votes);
+            outstanding += 1;
         }
 
-        // drop sender so channel closes when all vote tasks complete
-        drop(tx_votes);
+        // the peers whose vote request ended in an error since the last re-issue
+        let mut failed = Vec::new();
 
         // loop through requests until complete or cancelled
         loop {
-            // certificate created - no more votes needed
-            if certificate.is_some() {
+            // certificate created - no more votes needed, or every vote task has reported
+            if certificate.is_some() || outstanding == 0 {
                 break;
             }
 
             // receive votes or exit early if new proposal replaces this header before certification
             tokio::select! {
-                result = rx_votes.recv() => {
+                Some((name, target, result)) = rx_votes.recv() => {
                     debug!(target: "primary::certifier", auth=?self.authority_id, ?result, "next request in unordered futures");
+                    outstanding -= 1;
 
                     match result {
                         // happy path
-                        Some(Ok(vote)) => {
+                        Ok(vote) => {
                             let authority_id = vote.author.clone();
                             self.metrics.votes_received_total.increment(1);
                             // prevent invalid votes from derailing certification process
@@ -374,19 +367,30 @@ impl<DB: Database> Certifier<DB> {
                         },
 
                         // handle vote error
-                        Some(Err(e)) => {
+                        Err(e) => {
                             error!(
                                 target: "primary::certifier",
                                 auth=?self.authority_id,
                                 "failed to get vote for header {header:?}: {e:?}"
                             );
                             self.metrics.vote_request_failures_total.increment(1);
+                            // a cancelled request belongs to a proposal that is being replaced
+                            if !matches!(e, DagError::Canceled) {
+                                failed.push((name, target));
+                            }
                         }
+                    }
+                },
 
-                        // all sending channels have dropped
-                        None => {
-                            break;
-                        }
+                // the identical header was re-sent: a peer whose request ended in an error may
+                // answer differently now, for example once it can map this node's network key
+                _ = reissue_failed.notified() => {
+                    if !failed.is_empty() {
+                        debug!(target: "primary::certifier", auth=?self.authority_id, peers = failed.len(), "re-issuing failed vote requests");
+                    }
+                    for (name, target) in failed.drain(..) {
+                        self.spawn_vote_request(&header, name, target, &tx_votes);
+                        outstanding += 1;
                     }
                 },
 
@@ -429,19 +433,68 @@ impl<DB: Database> Certifier<DB> {
         Ok(certificate)
     }
 
+    /// Spawn a task that asks the peer `name`, at network key `target`, for its vote on `header`.
+    ///
+    /// The task reports the outcome on `tx_votes` together with the peer, so a request that ended
+    /// in an error can be issued again.
+    fn spawn_vote_request(
+        &self,
+        header: &Header,
+        name: AuthorityIdentifier,
+        target: BlsPublicKey,
+        tx_votes: &mpsc::UnboundedSender<(AuthorityIdentifier, BlsPublicKey, DagResult<Vote>)>,
+    ) {
+        let header = header.clone();
+        let tx_votes = tx_votes.clone();
+        let network = self.network.clone();
+        let certificate_store = self.certificate_store.clone();
+        let committee = self.committee.clone();
+        let cancel_proposal = self.new_proposal.subscribe();
+        let task_name = format!("vote-{header:?}-{name}");
+        self.task_spawner.spawn_task(task_name, async move {
+            // this will exit early on cancel_proposal
+            let result = Self::request_vote(
+                name.clone(),
+                header,
+                target,
+                certificate_store,
+                network,
+                committee,
+                cancel_proposal,
+            )
+            .await;
+            let _ = tx_votes.send((name, target, result));
+            Ok(())
+        });
+    }
+
     /// The method to spawn tasks related to a header proposal.
     ///
     /// This listens for new proposal notifications to exit early.
     /// The method returns once enough votes are processed to certify the proposal,
     /// or if a new proposal arrives.
-    async fn spawn_header_proposal(self, header: Header) -> TaskResult {
-        // Grab this before the lock so quick exit after the lock if need to.
-        let new_proposal_noticer = self.new_proposal.subscribe();
+    ///
+    /// `new_proposal_noticer` must be subscribed to `new_proposal` before the task running this
+    /// method is spawned (see [`Self::run`]), so a later header's notification cannot land before
+    /// it exists. `reissue_failed` is passed on to [`Self::propose_header`].
+    async fn spawn_header_proposal(
+        self,
+        header: Header,
+        new_proposal_noticer: Noticer,
+        reissue_failed: &Notify,
+    ) -> TaskResult {
         // Make sure other proposal's are shutdown and done before we check if
         // this header is already certified.  Any existing proposals should have been cancelled
         // before this call.
         let _guard = self.proposal_lock.lock().await;
         let header_digest = header.digest();
+        // a later header superseded this one while it waited for the lock. the select below
+        // polls its branches in random order, so without this check a superseded header could
+        // still spawn its vote requests
+        if new_proposal_noticer.noticed() {
+            debug!(target: "primary::certifier", %header_digest, "header superseded before its proposal started; skipping proposal");
+            return Ok(());
+        }
         if let Ok(Some(cert)) =
             self.config.node_storage().get::<ProposedCertificates>(&header_digest)
         {
@@ -464,7 +517,7 @@ impl<DB: Database> Certifier<DB> {
             },
 
             // receive enough votes for certification (or exit early)
-            proposal_result = self.propose_header(header) => {
+            proposal_result = self.propose_header(header, reissue_failed) => {
                 match proposal_result {
                     Ok(mut certificate) => {
                         if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
@@ -560,36 +613,49 @@ impl<DB: Database> Certifier<DB> {
     async fn run(self, mut rx_headers: impl TnReceiver<Header>) -> TaskResult {
         info!(target: "primary::certifier", "Certifier on node {} has started successfully.", &self.authority_id);
         let shutdown = &self.config.shutdown().subscribe();
-        let mut active_proposal: Option<(HeaderDigest, oneshot::Receiver<()>)> = None;
         loop {
             tokio::select! {
                 // receive headers from proposer
                 Some(header) = rx_headers.recv() => {
                     debug!(target: "primary::certifier", ?header, "{:?} received header!", &self.authority_id);
 
-                    // Preserve pending votes when the proposer retransmits the same header.
-                    // Completed proposals still run again to republish their stored certificate.
-                    let collecting_same_header = active_proposal.as_mut().is_some_and(|(digest, completed)| {
-                        *digest == header.digest()
-                            && matches!(completed.try_recv(), Err(oneshot::error::TryRecvError::Empty))
-                    });
-                    if !collecting_same_header {
-                        // cancel any outstanding proposals and vote requests
-                        self.new_proposal.notify();
+                    // the proposer re-sends its last header unchanged while it waits for parents.
+                    // restarting that proposal would cancel its vote requests and discard the votes
+                    // already received, so a header whose votes take longer than the re-send
+                    // interval to reach quorum could never be certified. the vote requests in
+                    // flight retry on their own until answered; only the requests that already
+                    // ended in an error are issued again
+                    let digest = header.digest();
+                    let in_flight = match InFlightProposal::start(&self.in_flight, digest) {
+                        Ok(in_flight) => in_flight,
+                        Err(reissue_failed) => {
+                            debug!(target: "primary::certifier", %digest, "identical re-proposal while certification is in flight; keeping vote collection and re-issuing failed vote requests");
+                            // stores a permit if the proposal is not waiting yet, so the wake is
+                            // not lost
+                            reissue_failed.notify_one();
+                            continue;
+                        }
+                    };
 
-                        // spawn certifier task so new proposals can cancel
-                        let certifier = self.clone();
-                        let (completed, completion) = oneshot::channel();
-                        active_proposal = Some((header.digest(), completion));
-                        self.task_spawner.spawn_task(
-                            format!("propose-header-{:?}", header.digest()),
-                            async move {
-                                let result = certifier.spawn_header_proposal(header).await;
-                                let _ = completed.send(());
-                                result
-                            }
-                        );
-                    }
+                    // cancel any outstanding proposals and vote requests
+                    self.new_proposal.notify();
+
+                    // subscribe here, not in the task: `Notifier` does not latch, so the next
+                    // header's notify can land before this task is first polled
+                    let cancel = self.new_proposal.subscribe();
+
+                    // spawn certifier task so new proposals can cancel
+                    let certifier = self.clone();
+                    self.task_spawner.spawn_task(
+                        format!("propose-header-{digest:?}"),
+                        async move {
+                            // held until the task ends, however it ends
+                            let in_flight = in_flight;
+                            certifier
+                                .spawn_header_proposal(header, cancel, &in_flight.reissue_failed)
+                                .await
+                        },
+                    );
                 },
 
                 // listen for consensus shutdown
@@ -604,3 +670,49 @@ impl<DB: Database> Certifier<DB> {
         }
     }
 }
+
+/// Marks a header as the certifier's proposal in flight for as long as this guard lives.
+///
+/// [`Certifier::run`] moves one into each proposal task it spawns, so the mark clears however the
+/// task ends: a certificate, a cancellation, an error, the already-certified republish, or the task
+/// being dropped before it runs. A later copy of the same header then starts a new proposal.
+struct InFlightProposal {
+    /// The certifier's record of the header in flight and its re-issue signal.
+    marker: InFlightMarker,
+    /// The digest this guard marked.
+    digest: HeaderDigest,
+    /// Asks this proposal to re-issue the vote requests that ended in an error.
+    ///
+    /// Each proposal gets its own, so a wake meant for one header never reaches the next.
+    reissue_failed: Arc<Notify>,
+}
+
+impl InFlightProposal {
+    /// Mark `digest` as in flight with a new re-issue signal, or, if it already is, return the
+    /// re-issue signal of the proposal in flight.
+    fn start(marker: &InFlightMarker, digest: HeaderDigest) -> Result<Self, Arc<Notify>> {
+        let mut current = marker.lock();
+        if let Some((_, reissue_failed)) =
+            current.as_ref().filter(|(in_flight, _)| *in_flight == digest)
+        {
+            return Err(reissue_failed.clone());
+        }
+        let reissue_failed = Arc::new(Notify::new());
+        *current = Some((digest, reissue_failed.clone()));
+        Ok(Self { marker: marker.clone(), digest, reissue_failed })
+    }
+}
+
+impl Drop for InFlightProposal {
+    fn drop(&mut self) {
+        let mut current = self.marker.lock();
+        // a different header may have replaced this one; its mark is not ours to clear
+        if current.as_ref().is_some_and(|(in_flight, _)| *in_flight == self.digest) {
+            *current = None;
+        }
+    }
+}
+
+/// The certifier's record of its proposal in flight: the header's digest and the signal that asks
+/// that proposal to re-issue the vote requests that ended in an error.
+type InFlightMarker = Arc<parking_lot::Mutex<Option<(HeaderDigest, Arc<Notify>)>>>;

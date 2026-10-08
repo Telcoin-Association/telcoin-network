@@ -1,4 +1,4 @@
-"""Execute the real CI aggregation script against transport lane outcomes."""
+"""Execute the real CI aggregation script against transport and QUIC profile pin lane outcomes."""
 
 import json
 import os
@@ -16,12 +16,13 @@ def gate_script():
     return textwrap.dedent(source.split("  ci-success:\n", 1)[1].split("        run: |\n", 1)[1])
 
 
-def execute(event, run_lanes, transport, script=None, capacity=None, connection_limits="success"):
+def execute(event, run_lanes, transport, script=None, capacity=None, connection_limits="success", pins="success"):
     lanes = ("adiri-test", "archive-mode-gate", "clippy", "fmt", "test")
     results = {name: {"result": "success" if run_lanes else "skipped"} for name in lanes}
     results.update({"ci-scope": {"result": "success", "outputs": {"run_lanes": str(run_lanes).lower()}},
                     "attest": {"result": "success" if event == "pull_request" else "skipped"},
-                    "transport-evidence": {"result": transport}})
+                    "transport-evidence": {"result": transport},
+                    "quic-profile-pins": {"result": pins}})
     results.update({name: {"result": "success"} for name in (
         "connection-limits-patch", "hub-capacity", "hub-capacity-mutations", "hub-capacity-qualification")})
     results["connection-limits-patch"] = {"result": connection_limits}
@@ -64,6 +65,15 @@ class ConnectionLimitsGate(unittest.TestCase):
         for outcome in ("skipped", "cancelled", "failure"):
             with self.subTest(outcome=outcome):
                 self.assertNotEqual(execute("merge_group", True, "success", connection_limits=outcome).returncode, 0)
+
+
+class QuicProfilePinsGate(unittest.TestCase):
+    def test_every_author_and_event_requires_success(self):
+        for event, run_lanes in (("pull_request", False), ("pull_request", True), ("merge_group", True)):
+            self.assertEqual(execute(event, run_lanes, "success").returncode, 0)
+            for outcome in ("skipped", "cancelled", "failure"):
+                with self.subTest(event=event, run_lanes=run_lanes, outcome=outcome):
+                    self.assertNotEqual(execute(event, run_lanes, "success", pins=outcome).returncode, 0)
 
 
 if __name__ == "__main__":
