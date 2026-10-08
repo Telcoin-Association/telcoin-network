@@ -14,10 +14,11 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
@@ -31,7 +32,7 @@ use tn_network_libp2p::{
         GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
         NetworkResult,
     },
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, Penalty, StreamError, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -3351,7 +3352,7 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
     failed.insert(peers[1], 7);
     failed.insert(peers[2], 6);
 
-    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, &mut rng);
+    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, None, &mut rng);
 
     // Same set, no drops.
     assert_eq!(
@@ -3372,6 +3373,246 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
         ordered[..3].contains(&peers[2]),
         "a failure recorded for another epoch must not de-prioritise the peer"
     );
+}
+
+/// Stand in for the swarm behind a [`PrimaryNetworkHandle`] in the sync probe tests.
+///
+/// The spawned task answers `ConnectedPeers` with `peers` and fails every `OpenStream`: a peer in
+/// `unsupported` gets `UpgradeFailed` (it does not speak the sync protocol), every other peer gets
+/// `Timeout` (a transient failure). Each opened peer is recorded in order. Any other command
+/// panics, which closes the command channel and fails the probe.
+fn spawn_scripted_swarm(
+    peers: Vec<BlsPublicKey>,
+    unsupported: HashSet<BlsPublicKey>,
+) -> (PrimaryNetworkHandle, Arc<Mutex<Vec<BlsPublicKey>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&opened);
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    // the prober awaits this reply, so the send cannot fail
+                    let _ = reply.send(peers.clone());
+                }
+                NetworkCommand::OpenStream { peer, reply } => {
+                    recorder.lock().push(peer);
+                    let error = if unsupported.contains(&peer) {
+                        StreamError::UpgradeFailed
+                    } else {
+                        StreamError::Timeout
+                    };
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+                other => panic!("unexpected command from a sync probe: {other:?}"),
+            }
+        }
+    });
+    (handle, opened)
+}
+
+/// Sixteen connected peers and a consensus chain holding a fresh epoch-0 pack.
+///
+/// Returns the temp dir so the chain's files outlive the test body.
+async fn sync_probe_peers_and_chain() -> (Vec<BlsPublicKey>, ConsensusChain, TempDir) {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers = (0..16).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let temp_dir = TempDir::new().unwrap();
+    let chain = ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+        .await
+        .unwrap();
+    (peers, chain, temp_dir)
+}
+
+/// One full-pack fetch walks every connected peer before it gives up, so a single server among
+/// many peers is always reached, and the peers that failed are probed again on the next call.
+#[tokio::test]
+async fn test_request_epoch_pack_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    let all: BTreeSet<BlsPublicKey> = peers.iter().copied().collect();
+    let record = EpochRecord::default();
+
+    for call in 1..=2 {
+        let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+        assert!(result.await.is_err(), "no peer serves, so call {call} must fail");
+        let opens = std::mem::take(&mut *opened.lock());
+        assert_eq!(opens.len(), 16, "call {call} must open one stream to every peer");
+        assert_eq!(
+            opens.into_iter().collect::<BTreeSet<_>>(),
+            all,
+            "call {call} must probe each connected peer once"
+        );
+    }
+}
+
+/// One consensus-output fetch walks every connected peer before it gives up.
+#[tokio::test]
+async fn test_request_consensus_output_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the fetch must open one stream to every peer");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "the fetch must probe each connected peer once"
+    );
+}
+
+/// A full-pack fetch caches the peers that do not speak the sync protocol as unsyncable and the
+/// next call walks only the peers that do, still without a cap.
+#[tokio::test]
+async fn test_request_epoch_pack_skips_cached_unsyncable_peers() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let unsupported: HashSet<BlsPublicKey> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    let record = EpochRecord::default();
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the first call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the first call must open one stream to every peer");
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the second call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the second call must skip the four cached unsyncable peers");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers[4..].iter().copied().collect::<BTreeSet<_>>(),
+        "the second call must probe exactly the sync-capable peers"
+    );
+}
+
+/// `order_probe_peers` puts the last peer that served first while it is fresh, first among the
+/// failed peers once it has failed this epoch, and ignores a preferred key that is not connected.
+#[test]
+fn test_order_probe_peers_puts_last_server_first() {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers: Vec<BlsPublicKey> =
+        (0..6).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let none_failed = HashMap::new();
+
+    // whichever peer served last, it is probed first while it has not failed this epoch
+    for &preferred in &peers {
+        let ordered = crate::network::order_probe_peers(
+            peers.clone(),
+            &none_failed,
+            7,
+            Some(preferred),
+            &mut rng,
+        );
+        assert_eq!(ordered[0], preferred, "a fresh preferred peer must be probed first");
+    }
+
+    // the preferred peer and one other both failed epoch 7: both sit behind the four fresh peers,
+    // the preferred one first
+    let failed: HashMap<BlsPublicKey, Epoch> = [(peers[0], 7), (peers[1], 7)].into();
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &failed, 7, Some(peers[0]), &mut rng);
+    assert_eq!(ordered[4], peers[0], "a failed preferred peer must lead the failed group");
+    assert_eq!(ordered[5], peers[1], "the other failed peer must be probed last");
+
+    // a failure recorded for another epoch does not cost the preference
+    let stale: HashMap<BlsPublicKey, Epoch> = [(peers[0], 6)].into();
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &stale, 7, Some(peers[0]), &mut rng);
+    assert_eq!(ordered[0], peers[0], "a failure in another epoch must not demote the peer");
+
+    // a preferred key that is not connected changes nothing: same rng state, same order as `None`
+    let stranger = *BlsKeypair::generate(&mut rng).public();
+    let with_stranger = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        7,
+        Some(stranger),
+        &mut rng.clone(),
+    );
+    let without = crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, &mut rng);
+    assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
+    assert_eq!(
+        with_stranger.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "ordering must be a permutation of the input"
+    );
+}
+
+/// Both probe loops open the last peer that served first, failed and unsupported probes leave the
+/// preference in place, and a preferred peer that already failed this epoch is opened after every
+/// fresh peer.
+#[tokio::test]
+async fn test_probe_loops_open_last_server_first() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let record = EpochRecord::default();
+
+    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); neither
+    // outcome may move the preference
+    let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    handle.record_sync_served(peers[9]);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        Some(peers[9]),
+        "failed and unsupported probes must not move the preference"
+    );
+
+    // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
+    // epoch 0 above, and the preferred peer leads that group
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the output fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the output fetch must skip the peers cached unsyncable");
+    assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        Some(peers[9]),
+        "failed probes must not move the preference"
+    );
+
+    // a preferred peer that already failed this epoch goes behind every fresh peer
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    handle.record_sync_served(peers[9]);
+    handle.epoch_sync_failed.lock().insert(peers[9], 0);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens.last(), Some(&peers[9]), "a failed preferred peer must be opened last");
+}
+
+/// `clear_sync_capability` empties the per-epoch caches but keeps the last peer that served.
+#[test]
+fn test_clear_sync_capability_keeps_last_server() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peer = *BlsKeypair::generate(&mut rng).public();
+    let other = *BlsKeypair::generate(&mut rng).public();
+
+    handle.epoch_sync_failed.lock().insert(peer, 3);
+    handle.epoch_sync_failed.lock().insert(other, 3);
+    handle.record_sync_served(peer);
+    assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+    assert!(
+        !handle.epoch_sync_failed.lock().contains_key(&peer),
+        "serving must clear the peer's failure for this epoch"
+    );
+
+    handle.clear_sync_capability();
+    assert!(handle.sync_capability.lock().is_empty(), "capability cache must be cleared");
+    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure map must be cleared");
+    assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
 }
 
 /// F40 + F2 (penalty half): `import_fault_is_peer_caused` admits ONLY faults attributable solely to

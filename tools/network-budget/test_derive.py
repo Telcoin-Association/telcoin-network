@@ -28,7 +28,8 @@ class DeriveTests(unittest.TestCase):
     def honest(self, phases=derive.HONEST_PHASES):
         for phase in phases:
             write_run(self.root, "baseline", phase, everywhere(0, 0, [
-                item(derive.ESTABLISHED, 3), {"metric": derive.ESTABLISHED, "labels": {"network": "worker-0"}, "value": 5}]))
+                item(derive.ESTABLISHED, 3), {"metric": derive.ESTABLISHED, "labels": {"network": "worker-0"}, "value": 5}],
+                complete_swarms=False))
 
     def test_allocation_matches_the_node_rule(self):
         self.assertEqual(derive.allocate({"swarm_count": 3, "max_established_connections": 10,
@@ -58,7 +59,7 @@ class DeriveTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "reconnect"):
             derive.derive(self.root, self.transport, 1.5)
         for phase in derive.HONEST_PHASES:
-            write_run(self.root, "baseline", phase, everywhere(0, 0, [item(derive.ESTABLISHED, 3)]))
+            write_run(self.root, "baseline", phase, everywhere(0, 0, [item(derive.ESTABLISHED, 3)], complete_swarms=False))
         with self.assertRaisesRegex(ValueError, "worker-0"):
             derive.derive(self.root, self.transport, 1.5)
         # derive.py and evaluate.py name the same gap when a node has no samples.

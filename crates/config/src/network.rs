@@ -34,7 +34,9 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
-    /// The startup wait for an established peer on each primary and worker network.
+    /// Legacy startup peer-wait budget, retained for configuration compatibility.
+    ///
+    /// Network readiness is sampled continuously and no longer delays epoch startup.
     peer_readiness_timeout: PeerReadinessTimeout,
     /// The hostname for the validator.
     hostname: String,
@@ -60,17 +62,17 @@ impl NetworkConfig {
         self.process_budget.as_ref().map(NetworkProcessBudget::allocate).transpose()
     }
 
-    /// Return the startup peer-readiness budget for each primary and worker network.
+    /// Return the legacy startup peer-readiness budget.
     ///
-    /// Defaults to 120 seconds. Expiry continues startup so a node started alone can
-    /// serve RPC and join consensus when its peers arrive.
+    /// Defaults to 120 seconds for configuration compatibility. Continuous network
+    /// readiness monitoring does not use this budget or delay startup.
     pub fn peer_readiness_timeout(&self) -> Duration {
         self.peer_readiness_timeout.0
     }
 
-    /// Set the startup peer-readiness budget for each primary and worker network.
+    /// Set the legacy startup peer-readiness budget stored in configuration.
     ///
-    /// A zero budget skips waiting; it does not disable discovery or later connections.
+    /// This value no longer affects startup, discovery, or continuous readiness monitoring.
     pub fn set_peer_readiness_timeout(&mut self, timeout: Duration) {
         self.peer_readiness_timeout = PeerReadinessTimeout(timeout);
     }
@@ -185,7 +187,7 @@ impl NetworkConfig {
     }
 }
 
-/// A per-network startup budget that preserves the production default in legacy configs.
+/// A legacy peer-wait budget retained for configuration serialization compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(transparent)]
 struct PeerReadinessTimeout(Duration);

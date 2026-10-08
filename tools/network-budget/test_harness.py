@@ -40,6 +40,10 @@ class Finished:
 
 
 class HarnessTests(unittest.TestCase):
+    def test_capture_failure_without_failure_details_is_not_success(self):
+        self.result = {"failed_scrapes": 0, "failures": []}
+        self.assertEqual(self.make(inventory_fixture(), capture_code=2).run("candidate", "steady", self.root), 1)
+
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
         self.root = Path(self.directory.name)

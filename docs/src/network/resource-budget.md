@@ -167,11 +167,14 @@ Before the capture starts, `run` polls each `metrics_url` until it answers, for 
 (default 60). Then it sends SIGKILL. It keeps the pid file until the process exits, and it fails if
 the process is still alive. `begin` refuses a pid file that names a live process, and it appends to
 `node.log` after a start marker. In the reconnect phase, `phase.json` records an expected-down
-window for each restarted node. `run` exits nonzero only for scrape failures outside those windows.
+window for each restarted node. `run` ignores scrape failures only when all failures are accounted
+for inside those windows. An unexplained nonzero collector exit remains a failure.
 
 `evaluate.py` gives pass, fail or pending for each threshold. Missing data is pending, never zero.
-A phase is pending when a manifest node has no samples for a swarm, when a record has a scrape error,
-missing metrics or missing swarms, or when a scrape failed outside an expected-down window. Each
+A threshold is pending when any manifest node or swarm lacks the metric and class it needs in a
+phase. Counter deltas and CPU rates require at least two samples per series. A record with a scrape
+error, missing metrics or missing swarms also makes the phase pending outside an expected-down
+window. Scrapes overlapping those windows are excluded from measurements. Each
 service p99 is the worst (node, network) pair. `critical-failures` does not include the reconnect
 phase, because planned restarts close in-flight streams. `critical-sheds` includes it.
 It exits nonzero on any fail, and acceptance always stays "pending maintainer decision".

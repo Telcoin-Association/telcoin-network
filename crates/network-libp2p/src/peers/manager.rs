@@ -569,7 +569,7 @@ impl PeerManager {
     /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
     /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
     /// work.)
-    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
 

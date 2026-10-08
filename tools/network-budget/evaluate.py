@@ -80,15 +80,36 @@ def process_runs(root, metric):
     loaded, _ = captured(root, "candidate", PHASES)
     runs = {phase: run for phase, run in loaded.items() if run is not None}
     gaps = [found for found in (gap(run, f"candidate {phase}") for phase, run in runs.items()) if found]
-    nodes = {node for run in runs.values() for node in run["nodes"]}
-    absent = sorted(nodes - {node for run in runs.values() for node, *_ in samples(run, metric)})
+    absent = [f"candidate {phase}: {missing}" for phase, run in runs.items()
+              if (missing := metric_gap(run, metric, networked=False, minimum=2 if metric == CPU else 1))]
     empty = [] if runs else ["no candidate phase captured"]
-    return list(runs.values()), next(iter([*gaps, *(f"no candidate {metric} samples for {node}" for node in absent), *empty]), None)
+    return list(runs.values()), next(iter([*gaps, *absent, *empty]), None)
+
+
+def measured_records(run):
+    """Exclude scrapes that overlap an explicitly recorded expected-down interval."""
+    windows = run["phase"].get("expected_down", [])
+    return (record for record in run["records"] if not expected_down(record, windows))
+
+
+def metric_gap(run, metric, networked=True, minimum=1, **labels):
+    """Require this metric and label selection on every expected node or (node, swarm) pair."""
+    networks = {"primary", *(f"worker-{worker}" for worker in range(run["topology"]["workers_per_node"]))}
+    expected = {(node, network) for node in run["nodes"] for network in networks} if networked else set(run["nodes"])
+    seen, series = {}, {}
+    for node, found, time, _ in samples(run, metric, **labels):
+        key = (node, found.get("network")) if networked else node
+        seen.setdefault(key, set()).add(time)
+        series.setdefault((node, tuple(sorted(found.items()))), set()).add(time)
+    missing = sorted(key for key in expected if len(seen.get(key, ())) < minimum)
+    incomplete = sorted(key for key, times in series.items() if len(times) < minimum)
+    problem = next(iter([*missing, *incomplete]), None)
+    return f"fewer than {minimum} {metric} {labels} samples for {problem}" if problem is not None else None
 
 
 def samples(run, metric, **labels):
     """Yield (node, labels, time, value) for each observation with this metric and these labels."""
-    for record in run["records"]:
+    for record in measured_records(run):
         for item in record.get("observations", []):
             if item["metric"] == metric and all(item["labels"].get(key) == value for key, value in labels.items()):
                 yield record["node"], item["labels"], record["started_unix_seconds"], item["value"]
@@ -134,11 +155,17 @@ def service_p99(threshold, root):
         return "pending", missing
     estimates = []
     for phase, run in runs.items():
+        service_class = {"class": threshold["class"]}
+        count_gap = metric_gap(run, f"{SERVICE}_count", **service_class)
+        summary_gap = metric_gap(run, SERVICE, quantile="0.99", **service_class)
+        bucket_gap = metric_gap(run, f"{SERVICE}_bucket", minimum=2, le="+Inf", **service_class)
+        if count_gap or (summary_gap and bucket_gap):
+            return "pending", f"candidate {phase}: {count_gap or summary_gap}"
         # An empty summary renders its quantiles as 0, so a class with no requests is pending, not a pass.
         if max((value for *_, value in samples(run, f"{SERVICE}_count", **{"class": threshold["class"]})), default=0) <= 0:
             return "pending", f"no {threshold['class']} requests served in candidate {phase}"
         quantiles = [value for *_, value in samples(run, SERVICE, **{"class": threshold["class"], "quantile": "0.99"})]
-        estimate = max(quantiles) if quantiles else bucket_p99(run, threshold["class"])
+        estimate = max(quantiles) if summary_gap is None else bucket_p99(run, threshold["class"])
         if estimate is None:
             return "pending", f"no {threshold['class']} service samples in candidate {phase}"
         estimates.append(estimate)
@@ -165,6 +192,9 @@ def critical_total(threshold, root, metric, noun):
     total = 0
     for phase, run in runs.items():
         for service_class in sorted(CRITICAL_CLASSES):
+            missing = metric_gap(run, metric, minimum=2, **{"class": service_class})
+            if missing:
+                return "pending", f"candidate {phase}: {missing}"
             found = increases(run, metric, **{"class": service_class})
             if found is None:
                 return "pending", f"no {service_class} {noun} counter in candidate {phase}"
@@ -179,6 +209,9 @@ def within_allocation(threshold, root):
         return "pending", missing
     worst = None
     for phase, run in runs.items():
+        missing = metric_gap(run, LIMIT) or metric_gap(run, ESTABLISHED)
+        if missing:
+            return "pending", f"candidate {phase}: {missing}"
         limits = {(node, found["network"]): value for node, found, _, value in samples(run, LIMIT)}
         for node, found, _, value in samples(run, ESTABLISHED):
             limit = limits.get((node, found["network"]))
@@ -196,6 +229,11 @@ def hostile_recovery(threshold, root):
     if missing:
         return "pending", missing
     # pending_* rejections are handshake state; only established-stage reasons show pressure on the allocation.
+    missing = (metric_gap(runs["steady"], ESTABLISHED) or metric_gap(runs["hostile"], ESTABLISHED)
+               or next((gap for reason in ESTABLISHED_REASONS
+                        if (gap := metric_gap(runs["hostile"], REJECTIONS, minimum=2, reason=reason))), None))
+    if missing:
+        return "pending", missing
     found = [increases(runs["hostile"], REJECTIONS, reason=reason) for reason in ESTABLISHED_REASONS]
     rejections = None if None in found else {key: value for part in found for key, value in part.items()}
     ceiling, final = {}, {}
@@ -213,7 +251,7 @@ def hostile_recovery(threshold, root):
 def heights(run):
     """Map each node to its (time, block) polls. Missing polls are skipped, never read as zero."""
     found = {}
-    for record in run["records"]:
+    for record in measured_records(run):
         if "number" in record.get("block", {}):
             found.setdefault(record["node"], []).append((record["started_unix_seconds"], record["block"]["number"]))
     return found
@@ -221,8 +259,11 @@ def heights(run):
 
 def block_rate(run):
     """Mean blocks per second over the nodes with at least two polls."""
+    polls = heights(run)
+    if set(run["nodes"]) - set(polls) or any(len(points) < 2 for points in polls.values()):
+        return None
     rates = [(points[-1][1] - points[0][1]) / (points[-1][0] - points[0][0])
-             for points in heights(run).values() if points[-1][0] > points[0][0]]
+             for points in polls.values() if points[-1][0] > points[0][0]]
     return sum(rates) / len(rates) if rates else None
 
 
@@ -244,14 +285,14 @@ def catch_up_seconds(run):
     """Seconds from the first poll until the lagging node reaches the lowest peer height in one sample."""
     node = run["phase"].get("catch_up_node")
     by_sample = {}
-    for record in run["records"]:
+    for record in measured_records(run):
         if "number" in record.get("block", {}):
             by_sample.setdefault(record["sample"], {})[record["node"]] = (record["started_unix_seconds"], record["block"]["number"])
     if node is None or not by_sample:
         return None
     start = min(time for polls in by_sample.values() for time, _ in polls.values())
     reached = [polls[node][0] - start for _, polls in sorted(by_sample.items())
-               if node in polls and len(polls) > 1
+               if node in polls and len(polls) > 1 and set(run["nodes"]) <= set(polls)
                and polls[node][1] >= min(height for name, (_, height) in polls.items() if name != node)]
     return reached[0] if reached else None
 

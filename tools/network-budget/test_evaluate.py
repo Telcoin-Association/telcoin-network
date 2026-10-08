@@ -25,16 +25,19 @@ def plain(metric, value):
     return {"metric": metric, "labels": {}, "value": value}
 
 
-def record(sample, node, time, observations=(), block=None):
+def record(sample, node, time, observations=(), block=None, *, complete_swarms=True):
     """One scrape. A stream limit sample on every swarm keeps the (node, network) coverage complete."""
+    observations = [copy for observation in observations
+                    for copy in ([{**observation, "labels": {**observation["labels"], "network": network}}
+                                  for network in NETWORKS] if complete_swarms and "network" in observation["labels"] else [observation])]
     return {"sample": sample, "node": node, "started_unix_seconds": time, "finished_unix_seconds": time,
             "observations": [*observations, *(item(STREAMS, 1, network=network) for network in NETWORKS)],
             "block": {"number": block} if block is not None else {"missing": "no rpc_url"}}
 
 
-def everywhere(sample, time, observations=(), block=None):
+def everywhere(sample, time, observations=(), block=None, *, complete_swarms=True):
     """The same scrape from every node in the topology."""
-    return [record(sample, node, time, observations, block) for node in NODES]
+    return [record(sample, node, time, observations, block, complete_swarms=complete_swarms) for node in NODES]
 
 
 def write_run(root, build, phase, records, extra=None, result=COMPLETE):
@@ -141,14 +144,14 @@ class EvaluateTests(unittest.TestCase):
         write_run(self.root, "candidate", "hostile", [*sheds(0, 0), *sheds(1, 0)])
         write_run(self.root, "candidate", "mixed", [*sheds(0, 1), *sheds(1, 3)])
         self.assertEqual(evaluate.critical_sheds({**threshold, "phases": ["hostile"]}, self.root), ("pass", 0))
-        self.assertEqual(evaluate.critical_sheds({**threshold, "phases": ["mixed"]}, self.root), ("fail", 4))
+        self.assertEqual(evaluate.critical_sheds({**threshold, "phases": ["mixed"]}, self.root), ("fail", 8))
         failures = lambda sample, vote: everywhere(sample, sample, [
             *(item(evaluate.FAILED, 0, **{"class": name, "outcome": "timeout"}) for name in CRITICAL),
             item(evaluate.FAILED, vote, **{"class": "vote", "outcome": "closed"})])
         write_run(self.root, "candidate", "catch-up", [*failures(0, 0), *failures(1, 0)])
         write_run(self.root, "candidate", "reconnect", [*failures(0, 0), *failures(1, 1)])
         self.assertEqual(evaluate.critical_failures({**threshold, "phases": ["catch-up"]}, self.root), ("pass", 0))
-        self.assertEqual(evaluate.critical_failures({**threshold, "phases": ["reconnect"]}, self.root), ("fail", 2))
+        self.assertEqual(evaluate.critical_failures({**threshold, "phases": ["reconnect"]}, self.root), ("fail", 4))
 
     def test_allocation_and_hostile_recovery_count_established_rejections_only(self):
         steady = everywhere(0, 0, [item(evaluate.ESTABLISHED, 5), item(evaluate.LIMIT, 8)])
@@ -161,7 +164,7 @@ class EvaluateTests(unittest.TestCase):
         write_run(self.root, "candidate", "mixed", everywhere(0, 0, [item(evaluate.ESTABLISHED, 3), item(evaluate.LIMIT, 0)]))
         self.assertEqual(evaluate.within_allocation({"phases": ["steady", "hostile"]}, self.root), ("pass", 1.0))
         self.assertEqual(evaluate.within_allocation({"phases": ["mixed"]}, self.root)[0], "fail")
-        self.assertEqual(evaluate.hostile_recovery({}, self.root), ("pass", {"rejections": 6, "recovered": True}))
+        self.assertEqual(evaluate.hostile_recovery({}, self.root), ("pass", {"rejections": 12, "recovered": True}))
         pending_only = self.root / "pending-only"
         write_run(pending_only, "candidate", "steady", steady)
         write_run(pending_only, "candidate", "hostile", [*hostile(0, 0, 0, 8), *hostile(1, 7, 0, 5)])
@@ -190,6 +193,59 @@ class EvaluateTests(unittest.TestCase):
         status, measured = evaluate.cpu_fraction({"limit": 0.75}, self.root)
         self.assertEqual((status, measured["cpu_p95_fraction"]), ("pass", 0.5))
         self.assertTrue(measured["network_share"].startswith("pending"))
+
+    def test_missing_metric_on_one_swarm_is_pending(self):
+        counters = [item(evaluate.SHED, 0, **{"class": name, "reason": "queue_full"}) for name in CRITICAL]
+        records = [*everywhere(0, 0, counters), *everywhere(1, 1, counters)]
+        records = [{**entry, "observations": [observation for observation in entry["observations"]
+                   if not (entry["node"] == "node-1" and observation["metric"] == evaluate.SHED)]}
+                   for entry in records]
+        write_run(self.root, "candidate", "steady", records)
+        self.assertEqual(evaluate.critical_sheds({"phases": ["steady"], "limit": 0}, self.root)[0], "pending")
+
+    def test_each_threshold_requires_its_metric_on_every_swarm(self):
+        observations = [item(evaluate.ESTABLISHED, 1), item(evaluate.LIMIT, 2),
+                        item(SERVICE, 0.4, **{"class": "vote", "quantile": "0.99"}),
+                        item(f"{SERVICE}_count", 1, **{"class": "vote"}),
+                        *(item(evaluate.FAILED, 0, **{"class": name, "outcome": "timeout"}) for name in CRITICAL)]
+        cases = [(evaluate.within_allocation, {"phases": ["steady"]}, evaluate.ESTABLISHED),
+                 (evaluate.service_p99, {"phases": ["steady"], "class": "vote", "limit_seconds": 1}, SERVICE),
+                 (evaluate.critical_failures, {"phases": ["steady"], "limit": 0}, evaluate.FAILED)]
+        for check, threshold, metric in cases:
+            with self.subTest(metric=metric):
+                complete = self.root / check.__name__ / "complete"
+                partial = self.root / check.__name__ / "partial"
+                records = [*everywhere(0, 0, observations), *everywhere(1, 1, observations)]
+                write_run(complete, "candidate", "steady", records)
+                self.assertEqual(check(threshold, complete)[0], "pass")
+                records = [{**entry, "observations": [observation for observation in entry["observations"]
+                           if not (entry["node"] == "node-1" and observation["metric"] == metric
+                                   and observation["labels"].get("network") == "worker-0")]}
+                           for entry in records]
+                write_run(partial, "candidate", "steady", records)
+                self.assertEqual(check(threshold, partial)[0], "pending")
+
+    def test_process_metric_missing_in_one_phase_is_pending(self):
+        write_run(self.root, "candidate", "steady", everywhere(0, 0, [plain(evaluate.RSS, 400)]))
+        write_run(self.root, "candidate", "mixed", [record(0, "node-0", 0, [plain(evaluate.RSS, 400)]),
+                                                   record(0, "node-1", 0)])
+        self.assertEqual(evaluate.rss_fraction({"limit": 0.5}, self.root)[0], "pending")
+
+    def test_counter_outcomes_each_need_two_samples(self):
+        counters = [item(evaluate.FAILED, 0, **{"class": name, "outcome": "timeout"}) for name in CRITICAL]
+        records = [*everywhere(0, 0, counters), *everywhere(1, 1, [
+            *counters, item(evaluate.FAILED, 1, **{"class": "vote", "outcome": "closed"})])]
+        write_run(self.root, "candidate", "steady", records)
+        self.assertEqual(evaluate.critical_failures({"phases": ["steady"], "limit": 0}, self.root)[0], "pending")
+
+    def test_expected_down_samples_are_excluded_from_measurements(self):
+        windows = {"expected_down": [{"node": node, "start_unix_seconds": 4, "end_unix_seconds": 6}
+                                    for node in NODES]}
+        records = [*everywhere(0, 0, [plain(evaluate.RSS, 400)]),
+                   *everywhere(1, 5, [plain(evaluate.RSS, 900)]),
+                   *everywhere(2, 10, [plain(evaluate.RSS, 400)])]
+        write_run(self.root, "candidate", "reconnect", records, windows)
+        self.assertEqual(evaluate.rss_fraction({"limit": 0.5}, self.root), ("pass", 0.4))
 
 
 if __name__ == "__main__":

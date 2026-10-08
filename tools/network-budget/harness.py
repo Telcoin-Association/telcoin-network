@@ -214,7 +214,10 @@ class Harness:
 
     def unexpected_failures(self, target, windows):
         """The scrape failures in result.json that fall outside every expected-down window."""
-        failures = json.loads(self.read(target / "result.json")).get("failures", [])
+        result = json.loads(self.read(target / "result.json"))
+        failures = result.get("failures", [])
+        if not failures or result.get("failed_scrapes", 0) != len(failures):
+            return [{"error": "capture failed without a complete list of scrape failures"}]
         return [failure for failure in failures if not expected_down(failure, windows)]
 
 

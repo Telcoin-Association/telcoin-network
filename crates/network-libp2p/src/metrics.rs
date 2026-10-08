@@ -52,6 +52,10 @@ struct SwarmMetricHandles {
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
     outbound_requests_pending: Gauge,
+    /// Record retrievals awaiting a response or terminal failure.
+    record_exchange_pending: Gauge,
+    /// Peers queued for another record retrieval attempt.
+    record_exchange_deferred: Gauge,
     /// Incoming QUIC attempts answered with a Retry (source address not validated).
     quic_incoming_retried_total: Counter,
     /// Incoming QUIC attempts accepted into a handshake.
@@ -645,6 +649,8 @@ impl AdmissionShed {
 /// Swarm-level metrics owned by `ConsensusNetwork`.
 #[derive(Clone, Debug)]
 pub(crate) struct SwarmMetrics {
+    /// The configured swarm label for record-exchange events.
+    network: String,
     /// The derive-backed handles.
     handles: SwarmMetricHandles,
     /// The labeled handles, resolved at construction.
@@ -686,6 +692,7 @@ impl SwarmMetrics {
         Self {
             handles: SwarmMetricHandles::new_with_labels(&[("network", network.clone())]),
             labeled: LabeledHandles::new(&network),
+            network,
         }
     }
 
@@ -723,6 +730,22 @@ impl SwarmMetrics {
         self.handles.quic_incoming_refused_total.absolute(stats.refused());
         self.handles.quic_incoming_ignored_total.absolute(stats.ignored());
         self.handles.quic_incoming_budget_yields_total.absolute(stats.budget_yields());
+    }
+
+    /// Record a retrieval event with a fixed, peer-independent outcome label.
+    pub(crate) fn record_exchange(&self, outcome: &'static str) {
+        metrics::counter!(
+            "tn_network.record_exchange_total",
+            "network" => self.network.clone(),
+            "outcome" => outcome,
+        )
+        .increment(1);
+    }
+
+    /// Publish the bounded live-request and deferred-retry set sizes.
+    pub(crate) fn set_record_exchange_pending(&self, pending: usize, deferred: usize) {
+        self.handles.record_exchange_pending.set(u32::try_from(pending).unwrap_or(u32::MAX));
+        self.handles.record_exchange_deferred.set(u32::try_from(deferred).unwrap_or(u32::MAX));
     }
 
     /// Record an outbound request failure by failure kind.
@@ -1019,6 +1042,8 @@ mod tests {
             swarm.record_gossip_rejected();
             swarm.set_pending(1, 2);
             swarm.record_outbound_failure(&OutboundFailure::Timeout);
+            swarm.record_exchange("deferred");
+            swarm.set_record_exchange_pending(2, 3);
             swarm.record_inbound_denied(&InboundDenial::PendingIncomingLimit);
 
             let peers = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
@@ -1063,6 +1088,14 @@ mod tests {
                     .any(|l| l.key() == "reason" && l.value() == "pending_incoming_limit")
         });
         assert!(matches!(denied, Some((_, _, _, DebugValue::Counter(1)))));
+
+        let (key, _, _, value) = find("tn_network.record_exchange_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key.key().labels().any(|l| l.key() == "outcome" && l.value() == "deferred"));
+        let (_, _, _, pending) = find("tn_network.record_exchange_pending");
+        assert!(matches!(pending, DebugValue::Gauge(g) if g.0 == 2.0));
+        let (_, _, _, deferred) = find("tn_network.record_exchange_deferred");
+        assert!(matches!(deferred, DebugValue::Gauge(g) if g.0 == 3.0));
 
         let (key, _, _, _) = find("tn_network.peer_penalties_total");
         assert!(key.key().labels().any(|l| l.key() == "severity" && l.value() == "severe"));
