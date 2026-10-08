@@ -36,6 +36,10 @@ struct SwarmMetricHandles {
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
     outbound_requests_pending: Gauge,
+    /// Record retrievals awaiting a response or terminal failure.
+    record_exchange_pending: Gauge,
+    /// Peers queued for another record retrieval attempt.
+    record_exchange_deferred: Gauge,
     /// Incoming QUIC attempts answered with a Retry (source address not validated).
     quic_incoming_retried_total: Counter,
     /// Incoming QUIC attempts accepted into a handshake.
@@ -113,6 +117,22 @@ impl SwarmMetrics {
         self.handles.quic_incoming_budget_yields_total.absolute(stats.budget_yields());
     }
 
+    /// Record a retrieval event with a fixed, peer-independent outcome label.
+    pub(crate) fn record_exchange(&self, outcome: &'static str) {
+        metrics::counter!(
+            "tn_network.record_exchange_total",
+            "network" => self.network.clone(),
+            "outcome" => outcome,
+        )
+        .increment(1);
+    }
+
+    /// Publish the bounded live-request and deferred-retry set sizes.
+    pub(crate) fn set_record_exchange_pending(&self, pending: usize, deferred: usize) {
+        self.handles.record_exchange_pending.set(u32::try_from(pending).unwrap_or(u32::MAX));
+        self.handles.record_exchange_deferred.set(u32::try_from(deferred).unwrap_or(u32::MAX));
+    }
+
     /// Record an outbound request failure by failure kind.
     pub(crate) fn record_outbound_failure(&self, kind: &'static str) {
         metrics::counter!(
@@ -171,6 +191,16 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Record one failed inbound attempt with a fixed reason label, never a peer or address.
+    pub(crate) fn record_listen_failure(&self, reason: &'static str) {
+        metrics::counter!(
+            "tn_network.listen_failures_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
     /// Create the peer manager metric handles for `network_type`.
     pub(crate) fn new_for(network_type: &NetworkType) -> Self {
         let network = network_label(network_type);
@@ -281,6 +311,8 @@ mod tests {
             swarm.record_gossip_rejected();
             swarm.set_pending(1, 2);
             swarm.record_outbound_failure("timeout");
+            swarm.record_exchange("deferred");
+            swarm.set_record_exchange_pending(2, 3);
             swarm.record_inbound_denied(&InboundDenial::PendingIncomingLimit);
 
             let peers = PeerManagerMetrics::new_for(&NetworkType::Worker(0));
@@ -312,6 +344,14 @@ mod tests {
 
         let (key, _, _, _) = find("tn_network.outbound_request_failures_total");
         assert!(key.key().labels().any(|l| l.key() == "kind" && l.value() == "timeout"));
+
+        let (key, _, _, value) = find("tn_network.record_exchange_total");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        assert!(key.key().labels().any(|l| l.key() == "outcome" && l.value() == "deferred"));
+        let (_, _, _, pending) = find("tn_network.record_exchange_pending");
+        assert!(matches!(pending, DebugValue::Gauge(g) if g.0 == 2.0));
+        let (_, _, _, deferred) = find("tn_network.record_exchange_deferred");
+        assert!(matches!(deferred, DebugValue::Gauge(g) if g.0 == 3.0));
 
         let (key, _, _, value) = find("tn_network.inbound_connections_denied_total");
         assert!(matches!(value, DebugValue::Counter(1)));

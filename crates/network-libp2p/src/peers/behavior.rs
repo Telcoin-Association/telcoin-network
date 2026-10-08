@@ -9,12 +9,47 @@ use libp2p::{
         dial_opts::{DialOpts, PeerCondition},
         dummy::ConnectionHandler,
         ConnectionClosed, ConnectionDenied, ConnectionId, DialError, DialFailure, FromSwarm,
-        NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
+        ListenError, ListenFailure, NetworkBehaviour, THandler, THandlerInEvent, ToSwarm,
     },
     Multiaddr, PeerId,
 };
 use std::task::{Context, Poll};
 use tracing::{debug, error, info, trace};
+
+/// A policy denial owned by the peer manager, preserved through libp2p's error wrapper.
+#[derive(Debug, Clone, Copy)]
+enum PeerAdmissionDenied {
+    /// The remote identity is this swarm's own identity.
+    LocalPeer,
+    /// The authenticated remote peer is banned.
+    BannedPeer,
+    /// The remote address has no supported, unbanned IP address.
+    InvalidIp,
+}
+
+impl PeerAdmissionDenied {
+    /// The bounded metric reason for this policy denial.
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::LocalPeer => "peer_manager_local_peer",
+            Self::BannedPeer => "peer_manager_banned_peer",
+            Self::InvalidIp => "peer_manager_invalid_ip",
+        }
+    }
+}
+
+impl std::fmt::Display for PeerAdmissionDenied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let message = match self {
+            Self::LocalPeer => "self-connection: remote peer id is our own",
+            Self::BannedPeer => "peer is banned",
+            Self::InvalidIp => "Connection denied: peer has no valid unbanned IP addresses",
+        };
+        f.write_str(message)
+    }
+}
+
+impl std::error::Error for PeerAdmissionDenied {}
 
 impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
@@ -86,7 +121,6 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        debug!(target: "network", ?remote_addr, "handle pending inbound connection");
         self.sanitize_ip_addr(remote_addr)
     }
 
@@ -95,19 +129,17 @@ impl NetworkBehaviour for PeerManager {
         _connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
-        remote_addr: &Multiaddr,
+        _remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        trace!(target: "peer-manager", ?peer, ?remote_addr, "inbound connection established");
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
         // the earliest point an inbound self-connection can be rejected.
         if self.is_local_peer(&peer) {
-            debug!(target: "peer-manager", ?peer, ?remote_addr, "denying inbound self-connection");
-            return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::LocalPeer));
         }
         // ensure banned peers are not accepted
         if self.peer_banned(&peer) {
-            return Err(ConnectionDenied::new("peer is banned"));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
 
         Ok(ConnectionHandler)
@@ -161,6 +193,23 @@ impl NetworkBehaviour for PeerManager {
             FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
+            }
+            FromSwarm::ListenFailure(ListenFailure { error, .. }) => {
+                // Inbound hooks reserve no peer-manager state. Peers are registered only on
+                // ConnectionEstablished, after every behaviour has accepted. The swarm and
+                // connection_limits own pending slots and clean them up on this same event.
+                // Do not disconnect the peer or complete a concurrent outbound dial here.
+                // Counters replace per-attempt logs on this remotely driven failure path.
+                let reason = match error {
+                    ListenError::Denied { cause } => cause
+                        .downcast_ref::<PeerAdmissionDenied>()
+                        .map_or("other_behaviour_denied", PeerAdmissionDenied::reason),
+                    ListenError::Transport(_) => "transport",
+                    ListenError::WrongPeerId { .. } => "wrong_peer_id",
+                    ListenError::LocalPeerId { .. } => "local_peer_id",
+                    ListenError::Aborted => "aborted",
+                };
+                self.metrics.record_listen_failure(reason);
             }
             FromSwarm::ExternalAddrConfirmed(_) => {
                 // The external address was confirmed: possible to support NAT traversal
@@ -225,9 +274,7 @@ impl PeerManager {
     fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
         // only support ipv4 and ipv6
         if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
-            return Err(ConnectionDenied::new(
-                "Connection denied: peer has no valid unbanned IP addresses".to_string(),
-            ));
+            return Err(ConnectionDenied::new(PeerAdmissionDenied::InvalidIp));
         }
         Ok(())
     }
