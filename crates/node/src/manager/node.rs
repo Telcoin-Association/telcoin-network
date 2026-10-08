@@ -1421,6 +1421,9 @@ where
         // so a zero replication interval fails here instead of panicking a critical network task.
         network_config.libp2p_config().validate()?;
 
+        // Include inactive configured workers: their swarms also live for the whole process.
+        network_config.validate_process_budget(workers.len().saturating_add(1))?;
+
         // Resolve operator mappings before any network task starts. Each worker is validated
         // against its own transport key, and retired endpoints are absent from the next record.
         network_config
