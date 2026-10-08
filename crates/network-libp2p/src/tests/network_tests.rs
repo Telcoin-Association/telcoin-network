@@ -5214,7 +5214,7 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
     assert_eq!(persisted.len(), 2);
 
     let (tx, _network_events) = mpsc::channel(10);
-    let network = ConsensusNetwork::<
+    let mut network = ConsensusNetwork::<
         TestWorkerRequest,
         TestWorkerResponse,
         MemDatabase,
@@ -5230,9 +5230,12 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
         worker_0_address,
         None,
     )?;
-    // Startup applies ownership only to worker-0; worker-1's persisted row remains intact.
-    assert_eq!(db.iter::<KadWorkerRecords>().count(), 1);
-    assert_eq!(store_0.get(&key).map(|record| record.value.clone()), None);
+    // Startup defers ownership pruning until the first authoritative committee update.
+    assert_eq!(db.iter::<KadWorkerRecords>().count(), 2);
+    assert_eq!(
+        store_0.get(&key).map(|record| record.value.clone()),
+        Some(encode(&worker_0_record))
+    );
     assert_eq!(
         store_1.get(&key).map(|record| record.value.clone()),
         Some(encode(&worker_1_record))
@@ -5241,6 +5244,38 @@ async fn test_worker_startup_preserves_sibling_kad_records() -> eyre::Result<()>
         network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).map(|(peer_id, _)| peer_id),
         Some(worker_0_key.public().into()),
     );
+
+    // Authoritative membership retains worker-0 after startup.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([owner_bls]),
+        next: HashSet::new(),
+    })?;
+    assert_eq!(db.iter::<KadWorkerRecords>().count(), 2);
+    assert_eq!(
+        network
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&key)
+            .map(|record| record.value.clone()),
+        Some(encode(&worker_0_record))
+    );
+
+    // Rotating the owner out deletes only worker-0's row; the sibling namespace survives.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::new(),
+        next: HashSet::new(),
+    })?;
+    assert_eq!(db.iter::<KadWorkerRecords>().count(), 1);
+    assert_eq!(store_0.get(&key).map(|record| record.value.clone()), None);
+    assert_eq!(
+        store_1.get(&key).map(|record| record.value.clone()),
+        Some(encode(&worker_1_record))
+    );
+    assert!(network.swarm.behaviour().peer_manager.auth_to_peer(owner_bls).is_none());
     Ok(())
 }
 
