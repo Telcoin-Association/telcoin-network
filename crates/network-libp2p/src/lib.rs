@@ -41,6 +41,7 @@ pub use sync::{
     read_frame, write_frame, DenyReason, PrimarySyncRequest, SyncFrame, SyncFrameError,
     WorkerSyncRequest,
 };
+pub use tn_node_record::{validate_advertised_addresses, MAX_ADVERTISED_MULTIADDRS};
 pub use types::ResponseChannel;
 
 // re-export specific libp2p types
