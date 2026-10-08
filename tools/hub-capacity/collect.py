@@ -17,6 +17,7 @@ import subprocess
 import time
 import urllib.request
 import urllib.parse
+import zlib
 
 
 ROOT = Path(__file__).resolve().parent
@@ -38,7 +39,7 @@ WATERMARK = re.compile(r'tn_primary_vote_observation_allocated\{generation="([0-
 
 
 def metrics_get(url, deadline):
-    """Keep the existing scrape bound across connect, response headers and body."""
+    """Bound the full scrape, including lossless decoding, by its original deadline."""
     if not CONTROL.direct_http_url(url):
         raise ValueError("bounded metrics require a declared numeric HTTP endpoint")
     parsed = urllib.parse.urlsplit(url)
@@ -46,20 +47,45 @@ def metrics_get(url, deadline):
     connection = http.client.HTTPConnection(parsed.hostname, parsed.port)
     raw = socket.socket(socket.AF_INET6 if address.version == 6 else socket.AF_INET,
                         socket.SOCK_STREAM)
+    stage = "connect"
     try:
         raw.settimeout(CONTROL.remaining_timeout(deadline))
         raw.connect((str(address), parsed.port or 80))
         connection.sock = CONTROL.DeadlineSocket(raw, deadline)
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        connection.request("GET", path)
+        stage = "request"
+        connection.request("GET", path, headers={"Accept-Encoding": "gzip"})
+        stage = "headers"
         with connection.getresponse() as response:
             if not 200 <= response.status < 300:
                 raise ValueError(f"metrics HTTP status {response.status}")
+            encoding = response.getheader("Content-Encoding", "identity").strip().lower()
+            if encoding not in ("identity", "gzip"):
+                raise ValueError(f"unsupported metrics content encoding: {encoding}")
+            stage = "body"
             body = response.read(4 * 1024**2 + 1)
+            incomplete = response.length not in (None, 0)
         CONTROL.remaining_timeout(deadline)
         if len(body) > 4 * 1024**2:
-            raise ValueError("metrics response exceeds 4 MiB")
+            raise ValueError("metrics wire response exceeds 4 MiB")
+        if incomplete:
+            raise ValueError("incomplete metrics HTTP response")
+        if encoding == "gzip":
+            stage = "decode"
+            decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            try:
+                body = decoder.decompress(body, 4 * 1024**2 + 1)
+            except zlib.error as error:
+                raise ValueError("invalid metrics gzip response") from error
+            if len(body) > 4 * 1024**2 or decoder.unconsumed_tail:
+                raise ValueError("decoded metrics response exceeds 4 MiB")
+            if not decoder.eof or decoder.unused_data:
+                raise ValueError("incomplete or trailing metrics gzip response")
+        CONTROL.remaining_timeout(deadline)
         return body
+    except Exception as error:
+        error.add_note(f"metrics HTTP stage={stage}")
+        raise
     finally:
         connection.close()
         raw.close()

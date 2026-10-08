@@ -282,7 +282,7 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
         run: |
           set -euo pipefail
-          if git diff --quiet "${BASE_SHA}" HEAD -- .github/workflows/pr.yaml tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
+          if git diff --quiet "${BASE_SHA}" HEAD -- .github/workflows/pr.yaml Cargo.toml Cargo.lock tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/tn-metrics crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"

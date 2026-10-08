@@ -511,6 +511,8 @@ class MetricsFenceTests(unittest.TestCase):
              mock.patch.object(COLLECT.http.client, "HTTPConnection") as connections:
             response = connections.return_value.getresponse.return_value.__enter__.return_value
             response.status = 200
+            response.getheader.return_value = "identity"
+            response.length = 0
             response.read.return_value = b"x" * (4 * 1024**2 + 1)
             with self.assertRaisesRegex(ValueError, "exceeds 4 MiB"):
                 COLLECT.metrics_get("http://127.0.0.1:9000", time.monotonic() + 2)

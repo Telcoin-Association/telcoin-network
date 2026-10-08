@@ -11,6 +11,7 @@ description = "Prometheus metrics recorder and scrape endpoint for telcoin-netwo
 
 [dependencies]
 eyre = { workspace = true }
+flate2 = { workspace = true }
 metrics = { workspace = true }
 metrics-exporter-prometheus = { workspace = true }
 metrics-process = { workspace = true }

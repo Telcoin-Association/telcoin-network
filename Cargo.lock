@@ -12150,6 +12150,7 @@ name = "tn-metrics"
 version = "0.1.0"
 dependencies = [
  "eyre",
+ "flate2",
  "metrics",
  "metrics-exporter-prometheus",
  "metrics-process",
