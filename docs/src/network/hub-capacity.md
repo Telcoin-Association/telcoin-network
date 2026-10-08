@@ -26,6 +26,16 @@ Validator validated-address and handshake qualification retains its Launch scope
 | Banned, disconnected, temporarily banned peers | 512 in each table | Three swarm allocations |
 | Gossip target / low / high / outbound floor | 12 / 8 / 16 / 4 per topic | Primary and every worker |
 
+When both the public peer limit and process budget are configured, each gossip
+heartbeat announces cached message IDs to all eligible subscribed peers outside
+the mesh. The process connection allocation bounds this metadata fanout to at
+most 172 connections per swarm in this profile. Proactive payload forwarding
+keeps the configured mesh. More announcements can cause additional requests for
+cached payloads, subject to gossipsub's control limits and the transport allocation.
+Deployments without both bounds retain the library's default sampled announcements.
+The qualification measures the resulting traffic under the same CPU, memory,
+link, and latency limits.
+
 The ordinary limit counts confirmed BLS peer identities and excludes peers with a
 current retention privilege. Each swarm allows 64 ordinary identities plus 22
 protected identities: 8 DAO observers, 12 distinct committee peers across the
@@ -103,6 +113,13 @@ preserve the existing defaults; zero limits are rejected. The shipped profile
 pins all six values explicitly. Each primary and worker exports its allocation
 and occupancy, including idle swarms. A reserved task counts before its first
 poll and releases its measurement on completion, failure, or cancellation.
+
+Admitted sync streams and bounded rejection responses retain the node's task
+owner across epoch changes. Their stream, per-peer, and rejection-task admission
+pools are shared by consecutive epoch handlers, so an old response still consumes
+the same capacity after a new epoch starts. Existing transfer timeouts and node
+shutdown still end these tasks. This protects admitted transfers; the event
+receiver handoff can still reject a stream before admission.
 
 Concurrent committee vote requests can arrive after the receiver has processed a later round or
 collected the requested round. These requests are rejected without lowering the author's peer

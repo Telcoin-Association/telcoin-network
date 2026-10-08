@@ -608,7 +608,16 @@ where
             network_config.serve_limits(),
         );
         mesh.validate().map_err(std::io::Error::other)?;
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
+        let mut gossipsub_config = gossipsub::ConfigBuilder::default();
+        if network_config.public_peer_limit().is_some() && budget.is_some() {
+            // The public and transport populations are bounded. Announce cached messages to every
+            // eligible non-mesh peer each heartbeat so relay delivery does not depend on
+            // repeatedly winning the default random gossip sample. Proactive forwarding
+            // keeps the configured mesh; additional cached-payload requests remain subject
+            // to gossipsub's control limits and the transport allocation.
+            gossipsub_config.gossip_factor(1.0);
+        }
+        let gossipsub_config = gossipsub_config
             .mesh_n(mesh.target())
             .mesh_n_low(mesh.low())
             .mesh_n_high(mesh.high())
@@ -856,7 +865,7 @@ where
 
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_sync_task_spawner(self.task_spawner.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.

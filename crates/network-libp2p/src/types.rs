@@ -538,6 +538,8 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// Persistent swarm owner for bounded sync serving, absent on command-only test handles.
+    sync_task_spawner: Option<tn_types::TaskSpawner>,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -547,13 +549,24 @@ where
 {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, sync_task_spawner: None }
+    }
+
+    /// Attach the persistent swarm's owner so admitted sync work survives epoch changes.
+    pub(crate) fn with_sync_task_spawner(mut self, spawner: tn_types::TaskSpawner) -> Self {
+        self.sync_task_spawner = Some(spawner);
+        self
+    }
+
+    /// Return the persistent owner of this swarm's sync serving tasks.
+    pub fn sync_task_spawner(&self) -> Option<&tn_types::TaskSpawner> {
+        self.sync_task_spawner.as_ref()
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not

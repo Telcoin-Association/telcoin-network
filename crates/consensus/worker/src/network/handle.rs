@@ -84,6 +84,8 @@ pub struct WorkerNetworkHandle {
     handle: NetworkHandle<Req, Res>,
     /// The type to spawn tasks.
     task_spawner: TaskSpawner,
+    /// One stream and shed admission pool, retained when epoch ownership changes.
+    sync_admission: Arc<std::sync::OnceLock<super::WorkerSyncAdmission>>,
     /// The current epoch for this node.
     epoch: Epoch,
     /// Per-peer sync-protocol capability, learned by probing.
@@ -118,6 +120,7 @@ impl WorkerNetworkHandle {
             chain_id,
             worker_id,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -129,6 +132,19 @@ impl WorkerNetworkHandle {
     /// Return a reference to the task spawner.
     pub fn get_task_spawner(&self) -> &TaskSpawner {
         &self.task_spawner
+    }
+
+    /// Retain the persistent swarm owner for sync work; synthetic handles use their caller.
+    pub(super) fn get_sync_task_spawner(&self) -> &TaskSpawner {
+        self.handle.sync_task_spawner().unwrap_or(&self.task_spawner)
+    }
+
+    /// Reuse the startup serving limits while responses finish across an epoch boundary.
+    pub(super) fn sync_admission(
+        &self,
+        serve: &tn_config::NetworkServeConfig,
+    ) -> &super::WorkerSyncAdmission {
+        self.sync_admission.get_or_init(|| super::WorkerSyncAdmission::new(serve, self.worker_id))
     }
 
     /// Return a reference to the inner handle.
@@ -588,6 +604,7 @@ impl WorkerNetworkHandle {
             chain_id: 0,
             worker_id: tn_types::DEFAULT_WORKER_ID,
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 

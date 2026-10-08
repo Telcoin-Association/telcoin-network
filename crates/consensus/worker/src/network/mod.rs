@@ -31,6 +31,8 @@ use tn_types::{
 use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
+#[cfg(test)]
+mod epoch_sync_tests;
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
@@ -270,6 +272,32 @@ pub struct WorkerNetwork<DB, Events> {
     consensus_chain: ConsensusChain,
 }
 
+/// Admission shared by every epoch using the same persistent worker handle.
+#[derive(Clone, Debug)]
+struct WorkerSyncAdmission {
+    stream_semaphore: Arc<Semaphore>,
+    peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    shed_semaphore: Arc<Semaphore>,
+}
+
+impl WorkerSyncAdmission {
+    fn new(serve: &tn_config::NetworkServeConfig, id: WorkerId) -> Self {
+        Self {
+            stream_semaphore: Arc::new(Semaphore::new_for(
+                serve.batch_stream(),
+                ServeClass::BatchStream,
+                &NetworkType::Worker(id),
+            )),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            shed_semaphore: Arc::new(Semaphore::new_for(
+                serve.worker_shed(),
+                ServeClass::WorkerShed,
+                &NetworkType::Worker(id),
+            )),
+        }
+    }
+}
+
 impl<DB, Events> WorkerNetwork<DB, Events>
 where
     DB: Database,
@@ -287,21 +315,14 @@ where
         let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
+        let sync_admission = network_handle.sync_admission(&serve).clone();
         Self {
             network_events,
             network_handle,
             request_handler,
-            batch_stream_semaphore: Arc::new(Semaphore::new_for(
-                serve.batch_stream(),
-                ServeClass::BatchStream,
-                &NetworkType::Worker(id),
-            )),
-            sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
-            shed_task_semaphore: Arc::new(Semaphore::new_for(
-                serve.worker_shed(),
-                ServeClass::WorkerShed,
-                &NetworkType::Worker(id),
-            )),
+            batch_stream_semaphore: sync_admission.stream_semaphore,
+            sync_stream_peers: sync_admission.peers,
+            shed_task_semaphore: sync_admission.shed_semaphore,
             metrics: WorkerMetrics::new_for_worker(id),
             consensus_chain,
         }
@@ -455,7 +476,7 @@ where
         let consensus_chain = self.consensus_chain.clone();
         let epoch = self.network_handle.epoch();
         let task_name = format!("sync-batches-{peer}");
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+        self.network_handle.get_sync_task_spawner().spawn_task(task_name, async move {
             // hold the admission permit for the lifetime of the exchange
             let _permit = permit;
             let mut stream = stream;
@@ -551,7 +572,7 @@ where
         shed_sync_stream(
             &self.shed_task_semaphore,
             &self.metrics,
-            self.network_handle.get_task_spawner(),
+            self.network_handle.get_sync_task_spawner(),
             self.network_handle.epoch(),
             peer,
             stream,

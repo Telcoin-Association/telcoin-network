@@ -50,6 +50,8 @@ use tn_types::{
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+#[cfg(test)]
+mod epoch_sync_tests;
 pub mod handler;
 mod message;
 mod sync_codec;
@@ -712,6 +714,34 @@ pub struct PrimaryNetworkHandle {
     /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe.
     /// [`Self::clear_sync_capability`] deliberately leaves it in place.
     last_sync_server: Arc<Mutex<Option<BlsPublicKey>>>,
+    /// One admission pool for sync transfers across every epoch served by this handle.
+    sync_admission: Arc<std::sync::OnceLock<PrimarySyncAdmission>>,
+}
+
+/// Node-lifetime admission for streams that may finish after their admitting epoch.
+#[derive(Clone, Debug)]
+struct PrimarySyncAdmission {
+    stream_semaphore: Arc<Semaphore>,
+    peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    shed_semaphore: Arc<Semaphore>,
+}
+
+impl PrimarySyncAdmission {
+    fn new(serve: &tn_config::NetworkServeConfig) -> Self {
+        Self {
+            stream_semaphore: Arc::new(Semaphore::new_for(
+                serve.epoch_stream(),
+                ServeClass::EpochStream,
+                &NetworkType::Primary,
+            )),
+            peers: Arc::new(Mutex::new(HashMap::default())),
+            shed_semaphore: Arc::new(Semaphore::new_for(
+                serve.primary_shed(),
+                ServeClass::PrimaryShed,
+                &NetworkType::Primary,
+            )),
+        }
+    }
 }
 
 // Test-only conversion that defaults the chain id to 0. Gated to tests so the only
@@ -727,11 +757,22 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
 
 impl PrimaryNetworkHandle {
+    /// Select the persistent swarm owner, retaining support for command-only test handles.
+    fn sync_task_spawner<'a>(&'a self, fallback: &'a TaskSpawner) -> &'a TaskSpawner {
+        self.handle.sync_task_spawner().unwrap_or(fallback)
+    }
+
+    /// Share admission across epochs without resetting permits held by older transfers.
+    fn sync_admission(&self, serve: &tn_config::NetworkServeConfig) -> &PrimarySyncAdmission {
+        self.sync_admission.get_or_init(|| PrimarySyncAdmission::new(serve))
+    }
+
     /// Create a new instance of Self.
     pub fn new(handle: NetworkHandle<Req, Res>, chain_id: u64) -> Self {
         Self {
@@ -740,6 +781,7 @@ impl PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -751,6 +793,7 @@ impl PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -1883,24 +1926,16 @@ where
             state_sync.clone(),
             consensus_chain.clone(),
         );
-        let epoch_stream_semaphore = Arc::new(Semaphore::new_for(
-            serve.epoch_stream(),
-            ServeClass::EpochStream,
-            &NetworkType::Primary,
-        ));
+        let sync_admission = network_handle.sync_admission(&serve).clone();
         Self {
             network_events,
             network_handle,
             request_handler,
             task_spawner,
             consensus_chain,
-            epoch_stream_semaphore,
-            sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
-            shed_task_semaphore: Arc::new(Semaphore::new_for(
-                serve.primary_shed(),
-                ServeClass::PrimaryShed,
-                &NetworkType::Primary,
-            )),
+            epoch_stream_semaphore: sync_admission.stream_semaphore,
+            sync_stream_peers: sync_admission.peers,
+            shed_task_semaphore: sync_admission.shed_semaphore,
             epoch_record_semaphore: Arc::new(Semaphore::new_for(
                 serve.epoch_record(),
                 ServeClass::EpochRecord,
@@ -1908,6 +1943,11 @@ where
             )),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
         }
+    }
+
+    /// Production handles retain the swarm owner; command-only test handles use their caller.
+    fn sync_task_spawner(&self) -> &TaskSpawner {
+        self.network_handle.sync_task_spawner(&self.task_spawner)
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -2146,7 +2186,7 @@ where
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let task_name = format!("sync-epoch-pack-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
+        self.sync_task_spawner().spawn_task(task_name, async move {
             // hold the admission permit for the lifetime of the exchange
             let _permit = permit;
             let mut stream = stream;
@@ -2270,7 +2310,7 @@ where
             },
             |shed_permit| {
                 let task_name = format!("shed-sync-epoch-pack-{peer}");
-                self.task_spawner.spawn_task(task_name, async move {
+                self.sync_task_spawner().spawn_task(task_name, async move {
                     // hold the shed budget slot for the lifetime of the task
                     let _shed_permit = shed_permit;
                     let mut stream = stream;
