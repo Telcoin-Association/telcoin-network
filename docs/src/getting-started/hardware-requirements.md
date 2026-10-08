@@ -12,7 +12,7 @@ These ensure that all nodes meet a foundational standard, contributing positivel
 ## Pre-installation review
 
 Operators are required to submit detailed specifications of their intended node setup to Telcoin Network development team for approval before installation.
-Please contact our DevOps team at grant@telcoin.org with your proposed hardware specifications.
+Please email support@telcoin.org with your proposed hardware specifications.
 
 ## Summary
 

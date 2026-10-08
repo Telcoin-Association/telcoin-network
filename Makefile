@@ -106,6 +106,12 @@ help:
 attest:
 	./etc/test-and-attest.sh ;
 
+# Run transport qualification on the attest box with explicit hardware evidence.
+.PHONY: quic-attest
+quic-attest:
+	@test -n "$(QUIC_EVIDENCE_DIR)" -a -n "$(QUIC_QUALIFICATION_REPORT)" || { echo "Set QUIC_EVIDENCE_DIR and QUIC_QUALIFICATION_REPORT"; exit 1; }
+	python3 -I testing/quic-interop/attest.py --output "$(QUIC_EVIDENCE_DIR)" --qualification "$(QUIC_QUALIFICATION_REPORT)"
+
 # check for unused dependencies
 udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
