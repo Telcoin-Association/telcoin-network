@@ -73,6 +73,9 @@ const MAX_RATE_WINDOWS: usize = 1024;
 /// reaches. With healthy routing (`R >= replication_factor`) this is ~20 and Poisson
 /// distributed; when a source's reach is small (bootstrap, partition heal, post-restart)
 /// it degrades toward `N`.
+///
+/// This node disables that job (`configure_record_jobs`), but peers on earlier releases
+/// still run it, so the bound keeps the upstream fan-in.
 pub(crate) const MAX_PUT_RECORDS_PER_WINDOW: usize = 30;
 
 /// Maximum records in an honest source's store, hence its replication fan-in per tick.

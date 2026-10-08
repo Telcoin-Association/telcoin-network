@@ -269,6 +269,11 @@ pub struct KadStore<DB> {
     /// Production ownership policy. Standalone stores exercise the underlying database;
     /// every consensus swarm enables its policy before serving records.
     retention: Option<RecordRetention<RecordKey, PeerId>>,
+    /// Rows restored from a previous run that no owner retained when retention was enabled.
+    /// They stay counted in `num_records` until the first committee prune, so `put` adds them
+    /// to the owners' capacity until then. `put` admits only retained keys, so this allowance
+    /// cannot grow the retained set.
+    startup_unretained: usize,
 }
 
 impl<DB: Database> KadStore<DB> {
@@ -297,6 +302,7 @@ impl<DB: Database> KadStore<DB> {
             last_provider_evict: None,
             kad_type,
             retention: None,
+            startup_unretained: 0,
         };
         store.num_records = store.owned_records().count();
         store.num_providers = store.owned_provider_rows().count();
@@ -312,6 +318,8 @@ impl<DB: Database> KadStore<DB> {
     /// Enable ownership with separate process allowances for required keys and connected sources.
     /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024), bounding the union to
     /// 2,048 rows across all primary and worker swarms. Excess configuration fails explicitly.
+    /// Startup rows wait for the first committee update before pruning because ownership is
+    /// not known yet. Unretained rows are not served and do not consume admission capacity.
     pub(crate) fn enable_retention(&mut self) -> libp2p::kad::store::Result<()> {
         /// Shared across database types and all primary and worker swarms.
         static BUDGET: OnceLock<Arc<RetentionBudget>> = OnceLock::new();
@@ -322,7 +330,9 @@ impl<DB: Database> KadStore<DB> {
             RecordRetention::new(self.node_key.clone(), Arc::clone(budget))
                 .map_err(|_| Error::MaxRecords)?,
         );
-        self.prune_unretained()
+        self.startup_unretained =
+            self.owned_records().filter(|(_, record)| !self.retains(&record.key)).count();
+        Ok(())
     }
 
     /// Reserve pins before granting operator-provisioned peer-manager privileges.
@@ -460,7 +470,10 @@ impl<DB: Database> KadStore<DB> {
             .filter(|(_, record)| !self.retains(&record.key))
             .map(|(_, record)| record.key)
             .collect();
-        obsolete.into_iter().try_for_each(|key| self.prune_record(&key))
+        let pruned = obsolete.into_iter().try_for_each(|key| self.prune_record(&key));
+        // Restored rows are deleted or reported now, so they no longer extend capacity.
+        self.startup_unretained = 0;
+        pruned
     }
 
     /// Mirror `num_records` into the prometheus gauge.
@@ -695,9 +708,14 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         // Startup excludes unreadable records, so repairing one is an insertion for capacity
         // accounting. Replacing a readable owned row keeps the existing count.
         let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
-        let max_records =
-            self.retention.as_ref().map_or(self.config.max_records, RecordRetention::max_records);
-        if new_record && self.num_records >= max_records {
+        // Our own key holds the slot that `RecordRetention::new` reserves, so it never competes
+        // for capacity. Restored rows that no owner retains yet extend the owners' capacity
+        // until the first committee prune deletes them.
+        let own = kr.key == self.node_key;
+        let max_records = self.retention.as_ref().map_or(self.config.max_records, |retention| {
+            retention.max_records().saturating_add(self.startup_unretained)
+        });
+        if new_record && !own && self.num_records >= max_records {
             // Try to free a slot by evicting any records whose TTL has passed.
             self.evict_expired_records();
             if self.num_records >= max_records {
@@ -2133,5 +2151,93 @@ mod test {
         assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
         assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
         assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
+    }
+
+    /// Production enumeration publishes only our row while retained remote rows stay queryable.
+    #[test]
+    fn test_kad_retained_remote_records_are_queryable_but_not_enumerated() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let mut store = KadStore::new(db, local, &key_config, NetworkType::Primary);
+        store.enable_retention()?;
+        let own = Record {
+            key: store.node_key.clone(),
+            value: vec![1],
+            publisher: Some(local),
+            expires: None,
+        };
+        let third = Record {
+            key: RecordKey::new(&remote.to_bytes()),
+            value: vec![2],
+            publisher: Some(remote),
+            expires: None,
+        };
+        store.retain_connected(remote, third.key.clone())?;
+        store.put(own.clone())?;
+        store.put(third.clone())?;
+        assert!(store.get(&third.key).is_some(), "retained remote row stays queryable");
+        let publishing: Vec<_> = store.records().map(|record| record.key.clone()).collect();
+        assert_eq!(publishing, vec![own.key], "remote row is excluded from periodic enumeration");
+        Ok(())
+    }
+
+    /// Restored rows that no owner retains yet do not block a first-seen connected peer before
+    /// the first committee prune, and the prune removes them along with their extra allowance.
+    #[test]
+    fn test_kad_restored_unretained_rows_do_not_block_first_seen_peer() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        // Rows left by a previous run. A standalone store retains every key.
+        let mut previous_run =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        (0..4).try_for_each(|_| previous_run.put(test_record(false)))?;
+
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        store.enable_retention()?;
+        assert_eq!(store.num_records, 4);
+        assert_eq!(store.startup_unretained, 4);
+
+        let peer = test_record(false);
+        store.retain_connected(PeerId::random(), peer.key.clone())?;
+        store.put(peer.clone())?;
+        assert!(
+            store.get(&peer.key).is_some(),
+            "first-seen peer record must land before the prune"
+        );
+
+        store.retain_committees(std::iter::empty::<BlsPublicKey>())?;
+        assert_eq!(store.startup_unretained, 0);
+        assert_eq!(store.persisted_record_count(), 1, "only the connected peer row survives");
+        assert_eq!(store.num_records, 1);
+        Ok(())
+    }
+
+    /// Our own row is admitted even when counted rows fill the owners' capacity.
+    #[test]
+    fn test_kad_own_record_exempt_from_capacity() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        (0..2).try_for_each(|_| store.put(test_record(false)))?;
+        // Counted rows with no startup allowance, as after a failed prune.
+        store.retention =
+            Some(RecordRetention::new(store.node_key.clone(), Arc::new(RetentionBudget::new(4)))?);
+        assert_eq!(store.num_records, 2);
+
+        let own = Record {
+            key: store.node_key.clone(),
+            value: vec![4, 5, 6],
+            publisher: None,
+            expires: None,
+        };
+        store.put(own.clone())?;
+        assert!(store.get(&own.key).is_some(), "own record must land at capacity");
+        assert_eq!(store.num_records, 3);
+        Ok(())
     }
 }

@@ -716,7 +716,7 @@ where
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
         kad_config.set_kbucket_size(libp2p.k_bucket_size);
-        configure_record_jobs(&mut kad_config, libp2p);
+        configure_record_jobs(&mut kad_config);
         kad_config
             .set_max_packet_size(MAX_KAD_PACKET_SIZE)
             .set_record_ttl(Some(libp2p.kad_record_ttl))
@@ -957,8 +957,10 @@ where
     /// Re-sign our configured network information and publish it with a fresh timestamp.
     ///
     /// `provide_our_data` replaces the local store entry before publishing, so subsequent
-    /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
-    /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
+    /// direct pushes and record lookups use the new signed value. Our local copy keeps
+    /// `expires: None`; Kademlia assigns the configured TTL to outbound copies. The libp2p-kad
+    /// record job is disabled (see [`configure_record_jobs`]), so this is the only periodic
+    /// republication of our record.
     fn refresh_own_record(&mut self) {
         self.node_record
             .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
@@ -969,10 +971,10 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = node_record_key(&self.key_config.primary_public_key());
-        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
-        // recomputes a fresh `now + kad_record_ttl` on every publication snapshot
-        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
-        // drives the wire-level expiry that remote peers store.
+        // Leave `expires: None` for our OWN record. The local row keeps the value given to
+        // `put_record`, so `None` never lapses on our read path. `put_record` and
+        // `put_record_to` fill a fresh `now + kad_record_ttl` into each outbound copy, so the
+        // configured `kad_record_ttl` still drives the wire-level expiry that remote peers store.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
@@ -2793,11 +2795,14 @@ where
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
                             // Only a matching requested key may supply a required store row. Query
                             // ownership itself is temporary and cannot admit an unrelated record.
+                            // Our own key is skipped, so a queried copy cannot replace the
+                            // `expires: None` row that `provide_our_data` keeps for it.
                             let freshness = self.record_freshness(&record);
                             if self
                                 .kad_record_queries
                                 .get(&query_id)
                                 .is_some_and(|query| query.request == key)
+                                && key != self.key_config.primary_public_key()
                                 && matches!(
                                     freshness,
                                     RecordFreshness::Newer | RecordFreshness::Identical
@@ -2808,7 +2813,18 @@ where
                                 } else {
                                     record
                                 };
-                                self.swarm.behaviour_mut().kademlia.store_mut().put(record)
+                                // Mirror libp2p's inbound-put cap, so a queried copy never
+                                // outlives `kad_record_ttl`. A responder that answers from its own
+                                // `expires: None` row sends ttl 0, which decodes back to `None`.
+                                // The cap runs after the merge, so a stored `None` cannot win.
+                                let cap = std::time::Instant::now()
+                                    .checked_add(self.config.kad_record_ttl);
+                                let expires = cap
+                                    .map(|cap| {
+                                        record.expires.map_or(cap, |expires| expires.min(cap))
+                                    })
+                                    .or(record.expires);
+                                self.swarm.behaviour_mut().kademlia.store_mut().put(kad::Record { expires, ..record })
                                     .unwrap_or_else(|error| {
                                         debug!(target: "network-kad", ?key, ?error,
                                             "queried binding could not be retained; discovery remains available");
@@ -3346,14 +3362,15 @@ where
     }
 }
 
-/// Enable own-record republication independently of third-party replication.
+/// Disable the libp2p-kad periodic record job.
 ///
-/// libp2p-kad 0.49 shares a job between publication and replication. The production store's
-/// iterator exposes only locally authored records; retained remote bindings are served on demand.
-pub(crate) fn configure_record_jobs(config: &mut kad::Config, libp2p: &LibP2pConfig) {
-    config
-        .set_publication_interval(Some(libp2p.kad_publication_interval))
-        .set_replication_interval(None);
+/// On libp2p-kad 0.49, publication and replication are one `PutRecordJob`. Each run sends every
+/// stored record that is not locally authored, so a replication interval of `None` alone does not
+/// stop third-party replication. `ConsensusNetwork::refresh_own_record` republishes our record
+/// on `kad_publication_interval`. Retained committee, pin, and connection bindings are served on
+/// demand.
+pub(crate) fn configure_record_jobs(config: &mut kad::Config) {
+    config.set_publication_interval(None).set_replication_interval(None);
 }
 
 /// Enum if the received gossip is initially accepted for further processing.
