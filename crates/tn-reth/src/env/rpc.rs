@@ -318,7 +318,8 @@ impl RethEnv {
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
-        if let Err(e) = server.merge_configured(other) {
+        // `tn` is selected like reth's modules; it is in the default set and always on IPC.
+        if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
         // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
@@ -370,6 +371,7 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
+    mod namespaces;
     mod simulation;
 
     use super::*;
@@ -390,8 +392,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         gas_accumulator::{BaseFeeContainer, GasAccumulator},
-        test_genesis, Address, Bytes, Decodable2718 as _, Encodable2718 as _, TaskManager,
-        TransactionTrait as _, WorkerId, B256, U256,
+        test_genesis, test_genesis_at, Address, Bytes, Decodable2718 as _, Encodable2718 as _,
+        TaskManager, TransactionTrait as _, WorkerId, B256, U256,
     };
     use url::Url;
 
@@ -432,8 +434,9 @@ mod tests {
     }
 
     /// The IPC transport must serve the validated allowlist, not reth's
-    /// `default_ipc_modules()` (every module, admin and txpool included). The default
-    /// `rpc_args` serve IPC only, so the methods below are exactly the IPC registration.
+    /// `default_ipc_modules()` (every module, admin and txpool included), and that set includes
+    /// `tn`. The default `rpc_args` serve IPC only, so the methods below are exactly the IPC
+    /// registration.
     #[tokio::test]
     async fn test_ipc_transport_serves_only_the_validated_modules() {
         let tmp_dir = TempDir::new().expect("temp dir");
@@ -454,7 +457,7 @@ mod tests {
                 pool,
                 network,
                 GasAccumulator::new(1).worker_base_fee(0),
-                RpcModule::new(()),
+                namespaces::probe_tn(),
             )
             .expect("rpc server");
 
@@ -473,6 +476,8 @@ mod tests {
             server.methods_by(|name| name.starts_with("eth_")).method_names().count() > 0,
             "IPC still serves the eth namespace"
         );
+        let ipc = server.ipc_methods(|_| true).expect("ipc is enabled by default");
+        assert!(ipc.method("tn_probe").is_some(), "IPC serves the tn namespace");
     }
 
     #[tokio::test]
@@ -593,20 +598,29 @@ mod tests {
         assert_eq!(pool.pool_size().pending, 0);
     }
 
+    /// Build the epoch-fee RPC fixture's chain with a reproducible genesis hash.
+    fn epoch_fee_chain_spec(header_fee: u64) -> RethChainSpec {
+        let mut genesis = test_genesis_at(0);
+        genesis.base_fee_per_gas = Some(u128::from(header_fee));
+        genesis.into()
+    }
+
     /// Return the production-registered simulation and fill methods with independently chosen epoch
     /// and header fees. Callers seed reth's defaults before constructing `rpc_args`.
+    ///
+    /// Also returns the chain spec the environment was built from, so callers can address genesis
+    /// by the hash the node actually has: a second `test_genesis()` call would be stamped with a
+    /// different second and hash to a block the node does not know.
     fn epoch_fee_methods(
         epoch_fee: u64,
         header_fee: u64,
         rpc_args: reth::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
-    ) -> eyre::Result<Methods> {
-        let mut genesis = test_genesis();
-        genesis.base_fee_per_gas = Some(u128::from(header_fee));
-        let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+    ) -> eyre::Result<(Methods, Arc<RethChainSpec>)> {
+        let chain = Arc::new(epoch_fee_chain_spec(header_fee));
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
-            chain,
+            chain.clone(),
             tmp_dir.path(),
             task_manager,
             None,
@@ -618,19 +632,15 @@ mod tests {
         accumulator.base_fee(0).set_base_fee(epoch_fee);
         let pool = reth_env.init_txn_pool(accumulator.base_fee(0))?;
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
-        reth_env
-            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))
-            .map(|server| {
-                server.methods_by(|name| {
-                    matches!(
-                        name,
-                        "eth_call"
-                            | "eth_estimateGas"
-                            | "eth_createAccessList"
-                            | "eth_fillTransaction"
-                    )
-                })
-            })
+        let methods = reth_env
+            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))?
+            .methods_by(|name| {
+                matches!(
+                    name,
+                    "eth_call" | "eth_estimateGas" | "eth_createAccessList" | "eth_fillTransaction"
+                )
+            });
+        Ok((methods, chain))
     }
 
     /// Check that a transfer's gas, chain ID, and fees agree with its raw encoding.
@@ -667,7 +677,7 @@ mod tests {
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
         // The header differs, so a matching fill proves the container is the source.
-        let methods = epoch_fee_methods(
+        let (methods, _) = epoch_fee_methods(
             12_345,
             7,
             reth::args::RpcServerArgs::default(),
@@ -697,7 +707,7 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods =
+        let (methods, _) =
             epoch_fee_methods(7, 7, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir)?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(Address::repeat_byte(0x42)),
@@ -717,7 +727,7 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods = epoch_fee_methods(
+        let (methods, _) = epoch_fee_methods(
             7,
             1_000,
             reth::args::RpcServerArgs::default(),
@@ -743,7 +753,7 @@ mod tests {
         let task_manager = TaskManager::default();
         let rpc_args =
             reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
-        let methods = epoch_fee_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
+        let (methods, _) = epoch_fee_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(TransactionFactory::new().address()),
             to: Some(Address::ZERO.into()),

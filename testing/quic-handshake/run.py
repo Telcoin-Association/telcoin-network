@@ -45,13 +45,27 @@ def validate_versions():
     """Do not mistake an independently resolved provider for the node's provider."""
     node = tomllib.loads((ROOT.parent.parent / "Cargo.lock").read_text())
     fixture = tomllib.loads((ROOT / "Cargo.lock").read_text())
+    # `cargo build --locked` also needs each `=` pin to name the version locked here.
+    manifest = tomllib.loads((ROOT / "Cargo.toml").read_text()).get("dependencies", {})
     versions = {}
     for name in PINNED:
         expected = {p["version"] for p in node["package"] if p["name"] == name}
         actual = {p["version"] for p in fixture["package"] if p["name"] == name}
         if actual != expected or len(actual) != 1:
-            raise ValueError(f"node/profile dependency drift: {name}: {expected} != {actual}")
-        versions[name] = next(iter(actual))
+            raise ValueError(
+                f"node/profile dependency drift: {name}: node {expected} != profile {actual}; "
+                "see testing/quic-handshake/README.md"
+            )
+        version = next(iter(actual))
+        requirement = manifest.get(name)
+        if isinstance(requirement, dict):
+            requirement = requirement.get("version")
+        if requirement != f"={version}":
+            raise ValueError(
+                f"profile pin drift: {name}: Cargo.toml requires {requirement!r}, lockfile has {version!r}; "
+                f"pin it as '={version}', see testing/quic-handshake/README.md"
+            )
+        versions[name] = version
     return versions
 
 
@@ -144,10 +158,27 @@ def run(binary, output, samples):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--binary", type=Path, default=ROOT / "target/release/tn-quic-handshake-profile")
-    parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--samples", type=int, default=1000)
+    # No defaults: --check-versions must be able to tell that these two were given.
+    parser.add_argument("--binary", type=Path, help="with --output (default: target/release/tn-quic-handshake-profile)")
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--output", type=Path)
+    mode.add_argument("--check-versions", action="store_true",
+                      help="only check the pinned crates against the node's lockfile and Cargo.toml, as CI Success does")
+    parser.add_argument("--samples", type=int, help="with --output, 2..100000 (default: 1000)")
     args = parser.parse_args()
-    if not 2 <= args.samples <= 100_000:
-        parser.error("samples must be 2..100000")
-    run(args.binary.resolve(), args.output.resolve(), args.samples)
+    if args.check_versions:
+        if args.binary is not None or args.samples is not None:
+            parser.error("--binary and --samples apply only to --output")
+        try:
+            versions = validate_versions()
+        except ValueError as err:
+            # A workflow command on stdout shows the drift as an annotation on the PR.
+            print(f"::error::{err}")
+            raise SystemExit(1)
+        print(json.dumps(versions))
+    else:
+        samples = 1000 if args.samples is None else args.samples
+        if not 2 <= samples <= 100_000:
+            parser.error("samples must be 2..100000")
+        binary = ROOT / "target/release/tn-quic-handshake-profile" if args.binary is None else args.binary
+        run(binary.resolve(), args.output.resolve(), samples)

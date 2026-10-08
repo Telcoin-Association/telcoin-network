@@ -393,8 +393,9 @@ impl CommitteeInner {
     /// Assemble the wire fields of a committee into a [CommitteeInner].
     ///
     /// The three derived indexes are left at their defaults: they are absent from every wire
-    /// layout in both directions, and [`Committee::deserialize`] rebuilds them by calling
-    /// [`CommitteeInner::load`].
+    /// layout in both directions. [`Committee::deserialize`] rebuilds them with
+    /// [`CommitteeInner::load`] and then checks the result with [`CommitteeInner::validate`], so
+    /// bytes from a peer that describe an unusable committee fail the decode instead of panicking.
     fn from_wire_fields(
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
@@ -412,7 +413,12 @@ impl CommitteeInner {
         }
     }
 
-    /// Updates the committee internal secondary indexes.
+    /// Rebuild the id index and the quorum and validity thresholds from `authorities`.
+    ///
+    /// Infallible for every authority set, including empty and single-member ones: the quorum
+    /// threshold `2n/3 + 1` is at least one, and the validity threshold falls back to one when
+    /// `n.div_ceil(3)` is zero. Whether the result is a usable committee is decided separately by
+    /// [`CommitteeInner::validate`].
     fn load(&mut self) {
         self.authorities_by_id = self
             .authorities
@@ -425,7 +431,43 @@ impl CommitteeInner {
 
         self.validity_threshold = self.calculate_validity_threshold().get();
         self.quorum_threshold = self.calculate_quorum_threshold().get();
-        assert!(self.authorities_by_id.len() > 1, "committee size must be larger that 1");
+    }
+
+    /// Check that a committee whose indexes [`CommitteeInner::load`] rebuilt is usable.
+    ///
+    /// Committees are decoded from bytes peers serve, most notably the `EpochMeta` records of a
+    /// consensus pack stream, so every check here guards against hostile input and reports a
+    /// [`CommitteeValidationError`] instead of panicking. The checks run in this order:
+    /// - fewer than two authorities;
+    /// - two authorities with the same id, which means the same protocol key;
+    /// - an authority filed under a map key other than its own protocol key.
+    ///
+    /// Because map keys are distinct, the last check implies the second short of a hash collision.
+    /// The id check stays as defence in depth for `authorities_by_id`, the index that signers are
+    /// resolved through.
+    fn validate(&self) -> Result<(), CommitteeValidationError> {
+        let epoch = self.epoch;
+        let size = self.authorities.len();
+        if size < 2 {
+            return Err(CommitteeValidationError::TooFewAuthorities { epoch, size });
+        }
+
+        let unique = self.authorities_by_id.len();
+        if unique != size {
+            return Err(CommitteeValidationError::DuplicateAuthorityId { epoch, unique, size });
+        }
+
+        if let Some((key, authority)) =
+            self.authorities.iter().find(|(key, authority)| *key != authority.protocol_key())
+        {
+            return Err(CommitteeValidationError::KeyMismatch {
+                epoch,
+                key: Box::new(*key),
+                protocol_key: Box::new(*authority.protocol_key()),
+            });
+        }
+
+        Ok(())
     }
 
     fn calculate_quorum_threshold(&self) -> NonZeroU64 {
@@ -649,12 +691,21 @@ impl Serialize for Committee {
 }
 
 impl<'de> Deserialize<'de> for Committee {
+    /// Decode a committee, rebuild its derived indexes and reject it unless it passes
+    /// `CommitteeInner::validate`.
+    ///
+    /// Peers serve committees inside the `EpochMeta` records of consensus pack streams, so an
+    /// unusable authority set has to come back as a decode error the caller can refuse, not as a
+    /// panic that takes the node down. The binary and human-readable layouts share this check.
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
+        use serde::de::Error;
+
         let mut inner = CommitteeInner::deserialize(deserializer)?;
         inner.load();
+        inner.validate().map_err(D::Error::custom)?;
         Ok(Self { inner: Arc::new(inner) })
     }
 }
@@ -781,9 +832,56 @@ impl FromStr for AuthorityIdentifier {
     }
 }
 
+/// The reason [`CommitteeInner::validate`] rejected a committee.
+///
+/// Raised while decoding committees from peer-served bytes, most notably the `EpochMeta` records
+/// of a consensus pack stream, and handed back to the caller as a decode error. Tests match on the
+/// fixed phrase in each message.
+#[derive(Debug, Error)]
+enum CommitteeValidationError {
+    /// The committee has fewer than two authorities.
+    #[error("committee for epoch {epoch}: expected at least 2 authorities, found {size}")]
+    TooFewAuthorities {
+        /// The committee's epoch.
+        epoch: Epoch,
+        /// The number of authorities.
+        size: usize,
+    },
+    /// Two authorities share an id, so the id index is smaller than the authority map.
+    #[error(
+        "committee for epoch {epoch}: duplicate authority id, {unique} ids for {size} authorities"
+    )]
+    DuplicateAuthorityId {
+        /// The committee's epoch.
+        epoch: Epoch,
+        /// The number of distinct authority ids.
+        unique: usize,
+        /// The number of authorities.
+        size: usize,
+    },
+    /// An authority is filed under a map key other than its own protocol key.
+    ///
+    /// The keys are boxed: inline, they would make this variant, and every `Result` carrying the
+    /// error, several hundred bytes larger than the other variants.
+    #[error("committee for epoch {epoch}: authority {protocol_key} is keyed by {key}")]
+    KeyMismatch {
+        /// The committee's epoch.
+        epoch: Epoch,
+        /// The map key the authority is filed under.
+        key: Box<BlsPublicKey>,
+        /// The authority's own protocol key.
+        protocol_key: Box<BlsPublicKey>,
+    },
+}
+
 impl Committee {
     /// Any committee should be created via the [CommitteeBuilder] - this is intentionally
     /// a private method.
+    ///
+    /// Panics if the committee fails [`CommitteeInner::validate`]. A builder committee is
+    /// assembled by this node rather than decoded from a peer, so an invalid one is a local or
+    /// chain-state bug (the epoch manager builds it from the on-chain registry set); decoded
+    /// committees go through [`Committee::deserialize`], which returns the error instead.
     fn new(
         authorities: BTreeMap<BlsPublicKey, Authority>,
         epoch: Epoch,
@@ -800,10 +898,11 @@ impl Committee {
             num_workers,
         };
         committee.load();
+        if let Err(e) = committee.validate() {
+            panic!("committee builder produced an invalid committee: {e}");
+        }
 
         // Some sanity checks to ensure that we'll not end up in invalid state
-        assert_eq!(committee.authorities_by_id.len(), committee.authorities.len());
-
         assert_eq!(committee.validity_threshold, committee.calculate_validity_threshold().get());
         assert_eq!(committee.quorum_threshold, committee.calculate_quorum_threshold().get());
 
@@ -837,7 +936,7 @@ impl Committee {
             .collect();
         committee.validity_threshold = committee.calculate_validity_threshold().get();
         committee.quorum_threshold = committee.calculate_quorum_threshold().get();
-        assert!(committee.authorities_by_id.len() > 1, "committee size must be larger that 1");
+        assert!(committee.authorities_by_id.len() > 1, "committee size must be larger than 1");
         // Some sanity checks to ensure that we'll not end up in invalid state
         assert_eq!(committee.authorities_by_id.len(), committee.authorities.len());
         committee.load();
@@ -994,7 +1093,8 @@ impl Committee {
     /// The epoch-0 committee is loaded from the committee file, whose count is a default; the
     /// epoch manager uses this to stamp the on-chain count onto it. Every other field, including
     /// the derived indexes and thresholds, is copied as-is: this does not re-run
-    /// `CommitteeInner::load`, so it is safe on a default (empty) committee as well.
+    /// `CommitteeInner::load` or `CommitteeInner::validate`, so it is safe on a default (empty)
+    /// committee as well.
     pub fn with_num_workers(&self, num_workers: NonZeroUsize) -> Committee {
         let inner = CommitteeInner {
             authorities: self.inner.authorities.clone(),
@@ -1096,7 +1196,7 @@ pub fn quorum_threshold(committee_members: u64) -> u64 {
 mod tests {
     use crate::{
         encode, try_decode, Address, Authority, AuthorityIdentifier, BlsKeypair, BlsPublicKey,
-        BootstrapServer, Committee, Epoch, Multiaddr, NetworkKeypair, P2pNode,
+        BootstrapServer, Committee, CommitteeBuilder, Epoch, Multiaddr, NetworkKeypair, P2pNode,
         ParseAuthorityIdentifierError, ReputationScores, RpcInfo, EQUAL_VOTING_POWER,
     };
     use rand::rng;
@@ -1543,8 +1643,8 @@ mod tests {
     struct CommitteeWireFixture {
         /// The committee's epoch, which is the only input the wire-layout gate reads.
         epoch: Epoch,
-        /// Number of authorities. Must be at least two: `CommitteeInner::load` asserts a committee
-        /// larger than one.
+        /// Number of authorities. Must be at least two: `CommitteeInner::validate` rejects smaller
+        /// committees and `Committee::new` panics on them.
         authorities: u8,
         /// Number of bootstrap servers, attached to authority slots `0..bootstrap_servers`.
         ///
@@ -1950,6 +2050,187 @@ mod tests {
         let read_back: CommitteeReprV1 =
             try_decode(&bytes).expect("post-fork Committee bytes decode as the post-fork repr");
         assert_eq!(read_back, repr, "post-fork Committee bytes are not the derived layout");
+    }
+
+    /// A post-fork shadow at [`V1_FIXTURE_EPOCH`] holding an authority map no valid committee
+    /// holds: the bytes a hostile peer could serve inside an `EpochMeta` record.
+    ///
+    /// Each `(key, value)` pair files the authority of fixture slot `value` under the protocol key
+    /// of fixture slot `key`. A pair with `key != value` is a mismatched entry, and two pairs that
+    /// share a `value` share an authority id. The bootstrap map is empty and the committee runs one
+    /// worker.
+    ///
+    /// # Panics
+    ///
+    /// If two pairs share a `key`: the map would keep only the last of them, and the shadow would
+    /// describe a different authority set than the test asked for.
+    fn hostile_v1_repr(entries: &[(u8, u8)]) -> CommitteeReprV1 {
+        let authorities: BTreeMap<BlsPublicKey, Authority> = entries
+            .iter()
+            .map(|&(key, value)| {
+                let protocol_key = *fixture_bls_keypair(value).public();
+                let authority = Authority::new(protocol_key, Address::repeat_byte(value));
+                (*fixture_bls_keypair(key).public(), authority)
+            })
+            .collect();
+        assert_eq!(authorities.len(), entries.len(), "hostile fixture map keys must be distinct");
+        CommitteeReprV1 {
+            authorities,
+            epoch: V1_FIXTURE_EPOCH,
+            bootstrap_servers: BTreeMap::new(),
+            num_workers: super::ONE_WORKER,
+        }
+    }
+
+    /// A committee with no authorities fails the decode instead of panicking the node.
+    #[test]
+    fn committee_bcs_rejects_empty_authorities() {
+        let bytes = encode(&hostile_v1_repr(&[]));
+        // the layout is sound, so the rejection below comes from validation
+        try_decode::<CommitteeReprV1>(&bytes).expect("the shadow decodes an empty authority map");
+
+        let err = try_decode::<Committee>(&bytes).expect_err("an empty committee must not decode");
+        assert!(err.to_string().contains("at least 2 authorities"), "wrong rejection: {err}");
+    }
+
+    /// A committee with one authority fails the decode instead of panicking the node.
+    #[test]
+    fn committee_bcs_rejects_single_authority() {
+        let bytes = encode(&hostile_v1_repr(&[(0, 0)]));
+        // the layout is sound, so the rejection below comes from validation
+        try_decode::<CommitteeReprV1>(&bytes).expect("the shadow decodes a single authority");
+
+        let err = try_decode::<Committee>(&bytes)
+            .expect_err("a single-authority committee must not decode");
+        assert!(err.to_string().contains("at least 2 authorities"), "wrong rejection: {err}");
+    }
+
+    /// Two authorities sharing a protocol key, and with it an authority id, fail the decode.
+    ///
+    /// The two-entry set collapses to a single id. The four-entry set keeps three distinct ids, so
+    /// only the id check stands between it and a committee whose id index has lost a member.
+    #[test]
+    fn committee_bcs_rejects_duplicate_protocol_keys() {
+        for entries in [&[(0, 0), (1, 0)][..], &[(0, 0), (1, 1), (2, 2), (3, 0)]] {
+            let bytes = encode(&hostile_v1_repr(entries));
+            // the layout is sound, so the rejection below comes from validation
+            try_decode::<CommitteeReprV1>(&bytes)
+                .expect("the shadow decodes a shared protocol key");
+
+            let err = try_decode::<Committee>(&bytes)
+                .expect_err("a committee with a shared protocol key must not decode");
+            assert!(
+                err.to_string().contains("duplicate authority id"),
+                "{entries:?}: wrong rejection: {err}"
+            );
+        }
+    }
+
+    /// An authority filed under a map key other than its own protocol key fails the decode, even
+    /// though its four distinct ids pass the size and id checks.
+    #[test]
+    fn committee_bcs_rejects_authority_key_mismatch() {
+        let bytes = encode(&hostile_v1_repr(&[(0, 0), (1, 1), (2, 2), (3, 4)]));
+        // the layout is sound, so the rejection below comes from validation
+        try_decode::<CommitteeReprV1>(&bytes).expect("the shadow decodes a mismatched entry");
+
+        let err = try_decode::<Committee>(&bytes)
+            .expect_err("a committee with a mismatched entry must not decode");
+        assert!(err.to_string().contains("is keyed by"), "wrong rejection: {err}");
+    }
+
+    /// The smallest committee validation accepts still decodes, so the rejections above come from
+    /// their authority sets rather than from the hostile fixture itself.
+    #[test]
+    fn committee_bcs_accepts_minimum_two_authorities() {
+        let bytes = encode(&hostile_v1_repr(&[(0, 0), (1, 1)]));
+        try_decode::<CommitteeReprV1>(&bytes).expect("the shadow decodes two authorities");
+
+        let committee: Committee = try_decode(&bytes).expect("a two-authority committee decodes");
+        assert_eq!(committee.size(), 2);
+        assert_eq!(committee.epoch(), V1_FIXTURE_EPOCH);
+    }
+
+    /// The human-readable layout runs the same validation: committee YAML cut to one authority, or
+    /// with one authority's protocol key copied over another's, fails to deserialize.
+    ///
+    /// The copied key makes its entry both a duplicate id and a mismatched key. The id check runs
+    /// first, so it is the reason reported; the bcs tests above pin each check separately.
+    #[test]
+    fn committee_yaml_rejects_invalid_authority_sets() {
+        let committee = CommitteeWireFixture::single_worker(V1_FIXTURE_EPOCH, 4, 0).committee();
+        let valid = serde_yaml::to_value(&committee).expect("YAML serialization failed");
+        let decoded: Committee =
+            serde_yaml::from_value(valid.clone()).expect("the unmodified committee YAML decodes");
+        assert_eq!(decoded, committee);
+
+        // keep only the first authority
+        let mut single = valid.clone();
+        let authorities =
+            single["authorities"].as_mapping_mut().expect("authorities serialize as a mapping");
+        *authorities = authorities
+            .iter()
+            .take(1)
+            .map(|(key, authority)| (key.clone(), authority.clone()))
+            .collect();
+        let err = serde_yaml::from_value::<Committee>(single)
+            .expect_err("single-authority committee YAML must not decode");
+        assert!(err.to_string().contains("at least 2 authorities"), "wrong rejection: {err}");
+
+        // give the second authority the first one's protocol key
+        let mut shared = valid;
+        let mut authorities = shared["authorities"]
+            .as_mapping_mut()
+            .expect("authorities serialize as a mapping")
+            .iter_mut()
+            .map(|(_, authority)| authority);
+        let donor = authorities
+            .next()
+            .and_then(|authority| authority.get("protocol_key"))
+            .cloned()
+            .expect("an authority serializes its protocol_key");
+        *authorities
+            .next()
+            .and_then(|authority| authority.get_mut("protocol_key"))
+            .expect("a second authority serializes its protocol_key") = donor;
+        let err = serde_yaml::from_value::<Committee>(shared)
+            .expect_err("committee YAML with a shared protocol key must not decode");
+        assert!(err.to_string().contains("duplicate authority id"), "wrong rejection: {err}");
+    }
+
+    /// The pre-fork layout runs the same validation: a single-authority committee in the legacy
+    /// layout fails the decode.
+    #[cfg(feature = "adiri")]
+    #[test]
+    fn committee_bcs_legacy_layout_rejects_single_authority() {
+        assert!(
+            !crate::forks::multi_workers_fork_active(LEGACY_FIXTURE_EPOCH),
+            "epoch {LEGACY_FIXTURE_EPOCH} must be pre-fork for this test to reach the legacy arm"
+        );
+        let key = *fixture_bls_keypair(0).public();
+        let repr = CommitteeReprLegacy {
+            authorities: BTreeMap::from([(key, Authority::new(key, Address::repeat_byte(0)))]),
+            epoch: LEGACY_FIXTURE_EPOCH,
+            bootstrap_servers: BTreeMap::new(),
+        };
+        let bytes = encode(&repr);
+        // the layout is sound, so the rejection below comes from validation
+        try_decode::<CommitteeReprLegacy>(&bytes)
+            .expect("the legacy shadow decodes a single authority");
+
+        let err = try_decode::<Committee>(&bytes)
+            .expect_err("a single-authority legacy committee must not decode");
+        assert!(err.to_string().contains("at least 2 authorities"), "wrong rejection: {err}");
+    }
+
+    /// A committee this node assembles itself with a single authority is a local bug, so the
+    /// builder still panics rather than handing it out.
+    #[test]
+    #[should_panic(expected = "committee builder produced an invalid committee")]
+    fn committee_builder_single_authority_panics() {
+        let mut builder = CommitteeBuilder::new(V1_FIXTURE_EPOCH);
+        builder.add_authority(*fixture_bls_keypair(0).public(), Address::repeat_byte(0));
+        builder.build();
     }
 
     #[test]
