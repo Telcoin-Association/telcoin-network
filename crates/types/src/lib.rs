@@ -29,6 +29,7 @@ mod worker;
 #[macro_use]
 pub mod error;
 pub mod forks;
+pub mod test_hooks;
 
 pub use self::serde::roaring_container_count;
 pub use canonical_reader::*;

@@ -519,8 +519,15 @@ where
     /// deterministic close-time path via [`Self::write_epoch_record`], so the re-derived record is
     /// bit-identical to the one every other node sealed - no peer fetch, no certificate.
     ///
+    /// The same kill also skipped the epoch tables clear, which every close path runs only after
+    /// the record write, so once the re-derived record is persisted this clears them too
+    /// ([`Self::clear_consensus_db_for_next_epoch`]). Without it the epoch N primary rebuilds its
+    /// DAG and its parents from epoch N-1 certificates and proposes headers no peer will vote for.
+    ///
     /// A cheap no-op whenever the record is already present (the common case), including epoch 0
     /// and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)` true).
+    /// Nothing is cleared on that path: a mid-epoch restart or a mode-change re-entry into epoch N
+    /// must keep epoch N's `Votes` and `LastProposed`, which guard against equivocation.
     pub(super) async fn recover_previous_epoch_record(
         &mut self,
         current_epoch: Epoch,
@@ -584,6 +591,29 @@ where
         // continuity check hard-errors rather than persisting a divergent record if inputs are off.
         self.last_consensus_header = Some(boundary_header);
         self.write_epoch_record(previous_epoch, engine).await?;
+
+        // every close path persists the record before it clears the epoch tables, so a missing
+        // record means the clear never ran either. clearing here deletes nothing epoch
+        // `current_epoch` needs:
+        // - every row is from `previous_epoch` or earlier. the epoch `current_epoch` primary is
+        //   only built after this function returns, and any earlier pass through here would have
+        //   persisted the record, so it has never run on this node and has written no vote or
+        //   proposal that could guard against equivocation
+        // - `previous_epoch`'s committed output lives in the consensus chain pack, which is not
+        //   cleared, and was executed through its closing block. its certificates and votes are not
+        //   read again: the epoch `current_epoch` primary neither votes on nor builds on another
+        //   epoch's headers
+        // - `OurNodeBatchesCache` is kept, so orphan recovery still re-pools our unsequenced
+        //   batches
+        // - the record was derived above from the closing block, the pack and the record before it,
+        //   none of which this touches
+        info!(
+            target: "epoch-manager",
+            previous_epoch,
+            current_epoch,
+            "re-derived epoch record written - clearing the previous epoch's consensus db tables",
+        );
+        self.clear_consensus_db_for_next_epoch()?;
         Ok(())
     }
 

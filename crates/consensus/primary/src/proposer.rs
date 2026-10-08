@@ -30,7 +30,7 @@ use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
     EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
-    TnSender, WorkerId,
+    TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -551,11 +551,44 @@ impl<DB: Database> Proposer<DB> {
     /// Process certificates received for this round.
     ///
     /// If the certificates are valid, include them as parents for the next header.
+    ///
+    /// Parents from another epoch are dropped before the round is compared: rounds restart every
+    /// epoch, so a stale certificate's round says nothing about this epoch's progress. Such parents
+    /// reach the proposer when the certificate store still holds a previous epoch's rows on
+    /// startup (the aggregator is replayed from it). Following them would jump the round past this
+    /// epoch's progress and propose a header whose parents every voter rejects.
     fn process_parents(&mut self, parents: Vec<Certificate>, round: Round) -> ProposerResult<()> {
-        // Sanity check: verify provided certs are of the correct round & epoch.
+        // Sanity check: verify provided certs are of the correct round.
         for parent in parents.iter() {
             if parent.round() != round {
                 error!(target: "primary::proposer", "received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
+            }
+        }
+
+        let epoch = self.committee.epoch();
+        let received = parents.len();
+        let parents: Vec<_> =
+            parents.into_iter().filter(|parent| parent.epoch() == epoch).collect();
+        if parents.len() < received {
+            warn!(
+                target: "primary::proposer",
+                authority=?self.authority_id,
+                epoch,
+                round=self.round,
+                parent_round=round,
+                ignored=received - parents.len(),
+                kept=parents.len(),
+                "ignoring parent certificates from another epoch",
+            );
+            // the aggregator counted the dropped certificates toward its quorum, so what is left
+            // only advances the round if it still reaches quorum on its own
+            let weight: VotingPower = parents
+                .iter()
+                .map(|parent| self.committee.voting_power_by_id(parent.origin()))
+                .sum();
+            if parents.is_empty() || (round > self.round && !self.committee.reached_quorum(weight))
+            {
+                return Ok(());
             }
         }
 
