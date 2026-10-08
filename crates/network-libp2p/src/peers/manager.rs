@@ -5,7 +5,6 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
-    score::init_peer_score_config,
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
@@ -22,6 +21,7 @@ use rand::seq::IteratorRandom as _;
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::IpAddr,
+    sync::Arc,
     task::Context,
     time::Duration,
 };
@@ -37,6 +37,10 @@ mod peer_manager;
 #[cfg(test)]
 #[path = "../tests/admission.rs"]
 mod admission_tests;
+
+#[cfg(test)]
+#[path = "../tests/listen_failure.rs"]
+mod listen_failure_tests;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -384,14 +388,12 @@ impl PeerManager {
             config.dial_timeout,
             config.max_banned_peers,
             config.max_disconnected_peers,
+            Arc::new(config.score_config),
         );
         let temporarily_banned = BannedPeerCache::new(
             config.excess_peers_reconnection_timeout,
             config.max_temporarily_banned_peers,
         );
-
-        // initialize global score config
-        init_peer_score_config(config.score_config);
 
         Self {
             local_peer_id,
@@ -692,7 +694,7 @@ impl PeerManager {
     /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
     /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
     /// work.)
-    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
 
