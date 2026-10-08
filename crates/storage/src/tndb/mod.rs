@@ -3,6 +3,7 @@
 //! Pack-file-backed `Database` implementation keyed by the sorted B+tree index (work in progress).
 
 pub mod database;
+mod layout;
 mod table;
 
 pub use database::TnDatabase;

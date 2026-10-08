@@ -1492,10 +1492,13 @@ impl Drop for MmapDataFile {
         if self.remove_on_drop {
             self.view.set_mapping(std::ptr::null(), 0);
             self.backing = Backing::Empty; // release the map before removing the file
-            if let Err(e) = std::fs::remove_file(&self.path) {
-                if !std::thread::panicking() {
+            match std::fs::remove_file(&self.path) {
+                // Already unlinked (e.g. its directory was removed while it was still mapped).
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) if !std::thread::panicking() => {
                     tracing::error!("MmapDataFile: failed to remove file on drop: {e}");
                 }
+                _ => {}
             }
             return;
         }

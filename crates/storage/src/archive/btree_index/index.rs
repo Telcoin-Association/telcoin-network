@@ -236,26 +236,6 @@ impl PageSource for BtreeIndex {
 }
 
 impl BtreeIndex {
-    /// The key length recorded in the header of the index in `dir`, or `None` when there is no
-    /// index yet (no `index.btx`, or an empty one). Lets an owner that learns the key length from
-    /// its first insert open an existing index before that insert. A header that fails its CRC or
-    /// type check is an error, as it is for [`Self::open_btx_file`].
-    pub fn stored_ksize<P: AsRef<Path>>(dir: P) -> Result<Option<u16>, LoadHeaderError> {
-        use std::io::Read as _;
-
-        let mut file = match fs::File::open(dir.as_ref().join("index.btx")) {
-            Ok(file) => file,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        if file.metadata()?.len() == 0 {
-            return Ok(None);
-        }
-        let mut page = vec![0_u8; PAGE_SIZE];
-        file.read_exact(&mut page)?;
-        Ok(Some(BtreeHeader::from_page(&page)?.ksize))
-    }
-
     /// Open (or create) a B+tree index in directory `dir` (file `index.btx`).
     ///
     /// `ksize` is the key length in bytes.  Identity (`version`/`uid`/`appnum`) and geometry

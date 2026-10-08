@@ -194,6 +194,13 @@ where
         self.inner.append_raw(value)
     }
 
+    /// [`Self::append_raw`] of the concatenation of `parts`, written as one record straight from
+    /// the slices (no joined copy): the same record, CRC and position as appending the joined
+    /// bytes. For a byte log whose records have several pieces (e.g. a key then a value).
+    pub fn append_raw_parts(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        self.inner.append_raw_parts(parts)
+    }
+
     /// Test-only failure injector: make the next append fail with
     /// [`AppendError::WriteDataError`], the same classification a real io write failure gets.
     /// The append path then marks the pack failed, which is the poisoned state the queued-save
@@ -429,6 +436,17 @@ where
         Ok(record_pos)
     }
 
+    /// Multi-slice sibling of [`Self::append_raw_inner`].
+    fn append_raw_parts_inner(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        let record_pos = self.data_file.len();
+
+        #[cfg(test)]
+        self.injected_append_failure()?;
+
+        self.write_record(Payload::RawParts(parts))?;
+        Ok(record_pos)
+    }
+
     /// Append `payload` as one framed record (see [`frame_record`]), compressing it with this
     /// pack's reused zstd context when the pack is compressed. A record that fails part-way is
     /// rolled back: whatever of it reached the file is zeroed and the logical end moves back to
@@ -473,6 +491,16 @@ where
         }
         self.failed_cause().map_err(AppendError::WriteDataError)?;
         let result = self.append_raw_inner(value);
+        self.classify_append(result)
+    }
+
+    /// [`Self::append_raw`] of `parts` written as one record (see [`Pack::append_raw_parts`]).
+    fn append_raw_parts(&mut self, parts: &[&[u8]]) -> Result<u64, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
+        let result = self.append_raw_parts_inner(parts);
         self.classify_append(result)
     }
 
@@ -709,6 +737,8 @@ fn checked_payload_in(tail: Option<&[u8]>) -> Result<&[u8], FetchError> {
 enum Payload<'a, V> {
     Value(&'a V),
     Raw(&'a [u8]),
+    /// Raw bytes in pieces, written back to back as one payload.
+    RawParts(&'a [&'a [u8]]),
 }
 
 /// The zstd compression context a pack's appends reuse, instead of allocating a fresh one per
@@ -780,6 +810,16 @@ fn write_payload<V: Serialize, W: Write>(
             &stage[..]
         }
         Payload::Raw(bytes) => bytes,
+        Payload::RawParts(parts) => {
+            let size: usize = parts.iter().map(|part| part.len()).sum();
+            if size > MAX_RECORD_SIZE as usize {
+                return Err(AppendError::RecordTooLarge { size, max: MAX_RECORD_SIZE });
+            }
+            for part in parts {
+                out.write_all(part).map_err(AppendError::WriteDataError)?;
+            }
+            return Ok(());
+        }
     };
     if bytes.len() > MAX_RECORD_SIZE as usize {
         return Err(AppendError::RecordTooLarge { size: bytes.len(), max: MAX_RECORD_SIZE });
@@ -1052,6 +1092,50 @@ mod tests {
         let payload = pack.inner.data_file.slice_mut(pos_small + 4, 1).expect("payload slice");
         payload[0] ^= 0xFF;
         assert!(matches!(pack.record_bytes(pos_small), Err(FetchError::CrcFailed)));
+    }
+
+    /// `append_raw_parts` writes exactly the record `append_raw` would for the joined bytes, and
+    /// the raw iterator yields every payload in order, ending at the first bad frame.
+    #[test]
+    fn append_raw_parts_matches_append_raw_and_iterates_raw() {
+        let tmp = TempDir::with_prefix("pack_append_parts").expect("temp dir");
+        let mut joined: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("joined"), 0, false, PackCompression::None, 1)
+                .expect("open");
+        let mut parts: Pack<Vec<u8>> =
+            Pack::open(tmp.path().join("parts"), 0, false, PackCompression::None, 1).expect("open");
+        let records: [&[&[u8]]; 4] = [
+            &[b"key1".as_slice(), b"value one".as_slice()],
+            &[b"".as_slice(), b"x".as_slice()],
+            &[b"k".as_slice(), b"".as_slice(), b"tail".as_slice()],
+            &[],
+        ];
+        for pieces in records {
+            let a = joined.append_raw(&pieces.concat()).expect("append_raw");
+            let b = parts.append_raw_parts(pieces).expect("append_raw_parts");
+            assert_eq!(a, b, "same position");
+            assert_eq!(parts.record_bytes(b).expect("read"), pieces.concat().as_slice());
+        }
+        assert_eq!(
+            joined.read_bytes(0, joined.file_len()).expect("bytes"),
+            parts.read_bytes(0, parts.file_len()).expect("bytes"),
+            "byte-identical logs"
+        );
+
+        let mut iter = parts.raw_iter().expect("raw iter");
+        for pieces in records {
+            assert_eq!(iter.next_raw().expect("record").expect("payload"), pieces.concat());
+        }
+        assert!(iter.next_raw().is_none(), "the logical end");
+
+        // A flipped payload byte is a bad frame, not a record.
+        let pos = parts.append_raw(b"last").expect("append");
+        parts.inner.data_file.slice_mut(pos + 4, 1).expect("payload")[0] ^= 0xFF;
+        let mut iter = parts.raw_iter().expect("raw iter");
+        for _ in records {
+            iter.next_raw().expect("record").expect("payload");
+        }
+        assert!(matches!(iter.next_raw(), Some(Err(FetchError::CrcFailed))));
     }
 
     /// `read_bytes` never answers an in-range read it cannot serve with an empty slice: with the

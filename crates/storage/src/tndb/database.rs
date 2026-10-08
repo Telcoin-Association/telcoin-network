@@ -10,8 +10,15 @@
 //! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
 //!
 //! Scans are lazy: each `DBIter` owns a published snapshot of its table and a B+tree cursor,
-//! decoding every row straight from the index leaf and the log.  A reopened table opens its index
-//! (and so serves reads) at once.  Not yet covered: pack compaction on clear, and
+//! decoding every row straight from the index leaf and the log.
+//!
+//! Each table is keyed (its log stores every row's key, the default: [`Database::open_table`]) or
+//! derived-key (its log stores only values, and a key function recomputes the keys on a rebuild:
+//! [`TnDatabase::open_table_with_key`]), fixed when the table is created. A table not closed
+//! cleanly rebuilds its index from its logs on open, keeping every committed write; clearing a
+//! table deletes its data from disk (see `table.rs`). Transactions commit per table: a write
+//! transaction over several tables commits each in turn, so a crash can keep one table's part and
+//! not another's. Not yet covered: compacting the logs (garbage from overwrites and removals), and
 //! durability-barrier tuning.
 
 use std::{
@@ -26,11 +33,11 @@ use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde::Serialize;
 use tn_types::{
-    decode, decode_key, encode_into_buffer, encode_key, encode_key_into, DBIter, Database, DbTx,
-    DbTxMut, Table,
+    decode, decode_key, encode_into_buffer, encode_key, encode_key_into, try_decode, DBIter,
+    Database, DbTx, DbTxMut, Table,
 };
 
-use super::table::{ScanKind, TnTable};
+use super::table::{KeyFn, ScanKind, TnTable};
 use crate::archive::fxhasher::FxHasher;
 
 /// Reusable encode buffers for a table's writes, so an insert or remove encodes without allocating.
@@ -49,6 +56,8 @@ struct EncodeBufs {
 struct TableStore {
     table: TnTable,
     bufs: Arc<Mutex<EncodeBufs>>,
+    /// Opened as a derived-key table (see [`TnDatabase::open_table_with_key`]).
+    derived: bool,
 }
 
 /// The open tables by name.
@@ -178,15 +187,72 @@ fn first_of<T: Table>(store: &StoreType, kind: ScanKind) -> Option<(T::Key, T::V
 pub struct TnDatabase {
     store: Arc<StoreType>,
     base: PathBuf,
+    /// Serializes table opens, so one table is never opened twice.
+    open_lock: Arc<Mutex<()>>,
 }
 
 impl TnDatabase {
     /// Open (creating the directory if needed) a tndb rooted at `path`.  Call
-    /// [`Database::open_table`] for each table before use.
+    /// [`Database::open_table`] (or [`Self::open_table_with_key`]) for each table before use.
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
         let base = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
-        Ok(Self { store: Arc::new(ArcSwap::from_pointee(Tables::default())), base })
+        Ok(Self {
+            store: Arc::new(ArcSwap::from_pointee(Tables::default())),
+            base,
+            open_lock: Arc::default(),
+        })
+    }
+
+    /// Open table `T` as a derived-key table: its log stores only values, and `key_of` recomputes
+    /// a row's key from its value when the index is rebuilt (e.g. a digest-keyed table hashes the
+    /// value). Every row's key must be `key_of` of its value; debug builds check each insert.
+    ///
+    /// The mode is fixed when the table is created: opening a derived-key table with
+    /// [`Database::open_table`], or a keyed one with this, is an error. Opening an already-open
+    /// table keeps it, so this can run before a wrapper (e.g. `LayeredDatabase`) opens the table
+    /// again.
+    pub fn open_table_with_key<T: Table>(
+        &self,
+        key_of: impl Fn(&T::Value) -> T::Key + Send + Sync + 'static,
+    ) -> eyre::Result<()> {
+        let key_fn: KeyFn = Arc::new(move |bytes: &[u8]| {
+            let value = try_decode::<T::Value>(bytes)?;
+            Ok(encode_key(&key_of(&value)))
+        });
+        self.open_table_in::<T>(Some(key_fn))
+    }
+
+    /// Open table `T` (keyed, or derived-key with `key_fn`) unless it is already open. An open
+    /// table is kept as it is for a plain [`Database::open_table`] (e.g. from a wrapper, after
+    /// [`Self::open_table_with_key`]); asking for derived keys on a table open as keyed is an
+    /// error.
+    fn open_table_in<T: Table>(&self, key_fn: Option<KeyFn>) -> eyre::Result<()> {
+        let derived = key_fn.is_some();
+        let _opening = self.open_lock.lock();
+        if let Some(open_derived) = with_table(&self.store, T::NAME, |entry| entry.derived) {
+            if derived && !open_derived {
+                eyre::bail!("tndb: table {} is already open as a keyed table", T::NAME);
+            }
+            return Ok(());
+        }
+        let entry = TableStore {
+            table: TnTable::open(self.base.join(T::NAME), key_fn)?,
+            bufs: Default::default(),
+            derived,
+        };
+        self.store.rcu(|tables| {
+            let mut tables = Tables::clone(tables);
+            tables.insert(T::NAME, entry.clone());
+            tables
+        });
+        Ok(())
+    }
+
+    /// True if table `T` rebuilt its index from its logs when it was opened.
+    #[cfg(test)]
+    fn rebuilt_on_open<T: Table>(&self) -> bool {
+        with_table(&self.store, T::NAME, |entry| entry.table.rebuilt_on_open()).unwrap_or(false)
     }
 }
 
@@ -271,17 +337,10 @@ impl Database for TnDatabase {
     where
         Self: 'txn;
 
+    /// Open table `T` as a keyed table (its log stores each row's key), unless it is already
+    /// open. A derived-key table must be opened with [`TnDatabase::open_table_with_key`] first.
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        // Open once, outside the read-copy-update (whose closure may run again on a race), then
-        // publish a snapshot with the table added (replacing any earlier open of the same name).
-        let entry =
-            TableStore { table: TnTable::open(self.base.join(T::NAME))?, bufs: Default::default() };
-        self.store.rcu(|tables| {
-            let mut tables = Tables::clone(tables);
-            tables.insert(T::NAME, entry.clone());
-            tables
-        });
-        Ok(())
+        self.open_table_in::<T>(None)
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
@@ -345,7 +404,7 @@ impl Database for TnDatabase {
 #[cfg(test)]
 mod test {
     use tempfile::TempDir;
-    use tn_types::Database as _;
+    use tn_types::{Database as _, DbTxMut as _};
 
     use super::TnDatabase;
     use crate::test::*;
@@ -477,7 +536,7 @@ mod test {
         }
         {
             let log = Pack::<Vec<u8>>::open(
-                tmp.path().join("TestTable").join("data"),
+                tmp.path().join("TestTable").join("gen-0").join("data"),
                 0,
                 true,
                 PackCompression::None,
@@ -488,6 +547,7 @@ mod test {
         }
         let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
         db.open_table::<TestTable>().expect("reopen table");
+        assert!(!db.rebuilt_on_open::<TestTable>(), "a clean close needs no rebuild");
         // Readable at once, before any insert: point reads, scans in both directions, seeks.
         for i in 0..100u64 {
             assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")));
@@ -527,23 +587,25 @@ mod test {
         assert_eq!(db.get::<TestTable>(&321).expect("get"), Some("v321".to_string()));
     }
 
-    /// A reopened table opens its index eagerly, so a corrupt index header fails the open (there
-    /// is no rebuild from the log yet) instead of surfacing at the first insert.
+    /// The index is derived data: a corrupt index header is discarded and the index rebuilt from
+    /// the logs.
     #[test]
-    fn test_tndb_reopen_corrupt_index_header_fails_open() {
+    fn test_tndb_reopen_corrupt_index_header_rebuilds() {
         let tmp = TempDir::with_prefix("tndb_corrupt_btx").expect("temp dir");
         {
             let db = TnDatabase::open(tmp.path()).expect("open tndb");
             db.open_table::<TestTable>().expect("open table");
             db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
         }
-        let index = tmp.path().join("TestTable").join("btx").join("index.btx");
+        let index = tmp.path().join("TestTable").join("gen-0").join("btx").join("index.btx");
         let mut bytes = std::fs::read(&index).expect("read index");
         bytes[30] ^= 0xFF; // inside the header's root-page field, under its CRC
         std::fs::write(&index, bytes).expect("write index");
 
         let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
-        assert!(db.open_table::<TestTable>().is_err(), "a corrupt index header must fail the open");
+        db.open_table::<TestTable>().expect("a corrupt index is rebuilt, not fatal");
+        assert!(db.rebuilt_on_open::<TestTable>());
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
     }
 
     /// A second table for the cross-table tests.
@@ -638,5 +700,439 @@ mod test {
     fn test_tndb_dbsimpbench() {
         let (db, _tmp) = open_db();
         db_simp_bench(db, "TnDb");
+    }
+
+    // ---- recovery ----
+
+    /// A derived-key table: its value is `"{key}:{tag}"`, so the key is derived from the value.
+    #[derive(Debug)]
+    struct DerivedTable;
+    impl tn_types::Table for DerivedTable {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "DerivedTable";
+        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+    }
+
+    // Takes `&String` to be a key function of a `String`-valued table (`Fn(&T::Value) -> T::Key`).
+    #[allow(clippy::ptr_arg)]
+    fn derived_key(value: &String) -> u64 {
+        value.split(':').next().and_then(|k| k.parse().ok()).expect("a derived-table value")
+    }
+
+    /// Simulate a crash: the database's tables are never dropped, so no file is sealed and no
+    /// index is synced (their mappings stay, as a crashed process's page cache would).
+    fn crash<D>(db: D) {
+        std::mem::forget(db);
+    }
+
+    fn gen_path(base: &std::path::Path, table: &str, generation: u64) -> std::path::PathBuf {
+        base.join(table).join(format!("gen-{generation}"))
+    }
+
+    /// The end offset of each whole record of the pack log at `path` (header excluded), read
+    /// through the log's raw iterator up to its first bad frame.
+    fn record_ends(path: &std::path::Path) -> Vec<u64> {
+        use crate::archive::pack_iter::PackIter;
+        let len = std::fs::metadata(path).expect("log").len();
+        let file = std::fs::File::open(path).expect("open log");
+        let mut iter = PackIter::<Vec<u8>, _>::open(file, 0, len).expect("log header");
+        let mut ends = Vec::new();
+        while let Some(Ok(_)) = iter.next_raw() {
+            ends.push(iter.logical_position());
+        }
+        ends
+    }
+
+    fn truncate(path: &std::path::Path, len: u64) {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open")
+            .set_len(len)
+            .expect("truncate");
+    }
+
+    /// Every row of `T` (by `get` over `0..keys` and by a full scan) matches `model`, as do the
+    /// seeks.
+    fn assert_matches<T>(db: &TnDatabase, model: &BTreeMap<u64, String>, keys: u64)
+    where
+        T: tn_types::Table<Key = u64, Value = String>,
+    {
+        for k in 0..keys {
+            assert_eq!(db.get::<T>(&k).expect("get"), model.get(&k).cloned(), "key {k}");
+        }
+        let rows: BTreeMap<u64, String> = db.iter::<T>().collect();
+        assert_eq!(&rows, model, "scan");
+        assert_eq!(db.last_record::<T>(), model.last_key_value().map(|(k, v)| (*k, v.clone())));
+        let mid = keys / 2;
+        assert_eq!(
+            db.record_prior_to::<T>(&mid),
+            model.range(..mid).next_back().map(|(k, v)| (*k, v.clone()))
+        );
+    }
+
+    use std::collections::BTreeMap;
+
+    /// A crash keeps every committed write (puts, overwrites, removes, a put after a remove) and
+    /// no part of an uncommitted transaction; the next clean close needs no rebuild.
+    #[test]
+    fn test_tndb_crash_rebuilds_committed_writes() {
+        let tmp = TempDir::with_prefix("tndb_crash").expect("temp dir");
+        let mut model = BTreeMap::new();
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            for i in 0..50u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+                model.insert(i, format!("v{i}"));
+            }
+            for i in 10..20u64 {
+                db.insert::<TestTable>(&i, &format!("w{i}")).expect("overwrite");
+                model.insert(i, format!("w{i}"));
+            }
+            for i in 0..5u64 {
+                db.remove::<TestTable>(&i).expect("remove");
+                model.remove(&i);
+            }
+            db.insert::<TestTable>(&2, &"again".to_string()).expect("insert after remove");
+            model.insert(2, "again".to_string());
+            // Written but never committed: none of it may survive.
+            let mut txn = db.write_txn().expect("txn");
+            txn.insert::<TestTable>(&100, &"uncommitted".to_string()).expect("insert");
+            txn.remove::<TestTable>(&30).expect("remove");
+            txn.insert::<TestTable>(&11, &"uncommitted".to_string()).expect("overwrite");
+            crash(txn);
+            crash(db);
+        }
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert!(db.rebuilt_on_open::<TestTable>(), "an unclean close rebuilds");
+        assert_matches::<TestTable>(&db, &model, 110);
+
+        db.insert::<TestTable>(&60, &"after".to_string()).expect("insert after recovery");
+        model.insert(60, "after".to_string());
+        drop(db);
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert!(!db.rebuilt_on_open::<TestTable>(), "a recovered table closes cleanly");
+        assert_matches::<TestTable>(&db, &model, 110);
+    }
+
+    /// A derived-key table stores only values and rebuilds its keys from them.
+    #[test]
+    fn test_tndb_derived_key_table_crash_rebuild() {
+        let tmp = TempDir::with_prefix("tndb_derived").expect("temp dir");
+        let mut model = BTreeMap::new();
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table_with_key::<DerivedTable>(derived_key).expect("open table");
+            for i in 0..40u64 {
+                let value = format!("{i}:a");
+                db.insert::<DerivedTable>(&i, &value).expect("insert");
+                model.insert(i, value);
+            }
+            for i in 5..15u64 {
+                let value = format!("{i}:b");
+                db.insert::<DerivedTable>(&i, &value).expect("overwrite");
+                model.insert(i, value);
+            }
+            for i in 20..25u64 {
+                db.remove::<DerivedTable>(&i).expect("remove");
+                model.remove(&i);
+            }
+            crash(db);
+        }
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table_with_key::<DerivedTable>(derived_key).expect("reopen table");
+        assert!(db.rebuilt_on_open::<DerivedTable>());
+        assert_matches::<DerivedTable>(&db, &model, 50);
+
+        // The log holds values only: an 8-byte key per put would make it longer.
+        let data = gen_path(tmp.path(), "DerivedTable", 0).join("data");
+        let ends = record_ends(&data);
+        let first_put = ends[0] - crate::archive::pack::DATA_HEADER_BYTES as u64;
+        assert_eq!(first_put, 4 + "0:a".len() as u64 + 1 + 4, "frame of [value] only");
+    }
+
+    /// A table's key mode is fixed when it is created; re-opening an open table keeps it.
+    #[test]
+    fn test_tndb_key_mode_fixed_and_opens_idempotent() {
+        let tmp = TempDir::with_prefix("tndb_mode").expect("temp dir");
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("keyed");
+            db.open_table::<TestTable>().expect("re-open keeps the table");
+            assert!(db.open_table_with_key::<TestTable>(derived_key).is_err(), "other mode");
+            db.open_table_with_key::<DerivedTable>(derived_key).expect("derived");
+            db.open_table::<DerivedTable>().expect("a wrapper's later open keeps it derived");
+            db.insert::<DerivedTable>(&7, &"7:x".to_string()).expect("insert");
+        }
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        assert!(db.open_table_with_key::<TestTable>(derived_key).is_err(), "keyed table");
+        assert!(db.open_table::<DerivedTable>().is_err(), "derived table opened keyed");
+        db.open_table_with_key::<DerivedTable>(derived_key).expect("derived table");
+        assert_eq!(db.get::<DerivedTable>(&7).expect("get"), Some("7:x".to_string()));
+    }
+
+    /// Debug builds check that a derived-key table's key is the key derived from its value.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "derived from its value")]
+    fn test_tndb_derived_key_mismatch_panics_in_debug() {
+        let (db, _tmp) = open_db();
+        db.open_table_with_key::<DerivedTable>(derived_key).expect("derived");
+        let _ = db.insert::<DerivedTable>(&5, &"6:wrong".to_string());
+    }
+
+    /// Clearing a table deletes its data from disk at once, while a scan started before the clear
+    /// keeps reading the rows it started on.
+    #[test]
+    fn test_tndb_clear_reclaims_disk_and_keeps_snapshots() {
+        let tmp = TempDir::with_prefix("tndb_clear").expect("temp dir");
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        let big = "x".repeat(1024);
+        let mut txn = db.write_txn().expect("txn");
+        for i in 0..2_000u64 {
+            txn.insert::<TestTable>(&i, &format!("{i}{big}")).expect("insert");
+        }
+        txn.commit().expect("commit");
+
+        let mut scan = db.iter::<TestTable>();
+        assert_eq!(scan.next().map(|(k, _)| k), Some(0));
+        db.clear_table::<TestTable>().expect("clear");
+        assert!(gen_path(tmp.path(), "TestTable", 1).exists());
+        // The old generation is deleted in the background, right after the clear.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while gen_path(tmp.path(), "TestTable", 0).exists() {
+            assert!(std::time::Instant::now() < deadline, "the old generation is deleted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(db.is_empty::<TestTable>());
+        assert_eq!(db.get::<TestTable>(&5).expect("get"), None);
+
+        // The scan's snapshot still maps the deleted files.
+        let rest: Vec<u64> = scan
+            .by_ref()
+            .map(|(k, v)| {
+                assert_eq!(v, format!("{k}{big}"));
+                k
+            })
+            .collect();
+        assert_eq!(rest, (1..2_000).collect::<Vec<_>>());
+        drop(scan);
+
+        db.insert::<TestTable>(&9, &"new".to_string()).expect("insert after clear");
+        drop(db);
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert!(!db.rebuilt_on_open::<TestTable>());
+        assert_eq!(db.iter::<TestTable>().collect::<Vec<_>>(), vec![(9, "new".to_string())]);
+    }
+
+    /// A torn tail in the data log (a crash mid-write) is cut back to the last commit.
+    #[test]
+    fn test_tndb_torn_data_tail_cut_to_last_commit() {
+        let tmp = TempDir::with_prefix("tndb_torn_data").expect("temp dir");
+        let model: BTreeMap<u64, String> = (0..20u64).map(|i| (i, format!("v{i}"))).collect();
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            for (k, v) in &model {
+                db.insert::<TestTable>(k, v).expect("insert");
+            }
+            let mut txn = db.write_txn().expect("txn");
+            for i in 20..25u64 {
+                txn.insert::<TestTable>(&i, &format!("v{i}")).expect("uncommitted");
+            }
+            crash(txn);
+            crash(db);
+        }
+        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
+        let ends = record_ends(&data);
+        // Tear the 23rd put (the 3rd uncommitted one) halfway.
+        let tear = ends[ends.len() - 3] + 5;
+        truncate(&data, tear);
+
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert!(db.rebuilt_on_open::<TestTable>());
+        assert_matches::<TestTable>(&db, &model, 30);
+        db.insert::<TestTable>(&99, &"next".to_string()).expect("write after the cut");
+        let mut model = model;
+        model.insert(99, "next".to_string());
+        drop(db);
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert!(!db.rebuilt_on_open::<TestTable>());
+        assert_matches::<TestTable>(&db, &model, 100);
+    }
+
+    /// A torn removal log keeps the committed removals and drops the uncommitted ones.
+    #[test]
+    fn test_tndb_torn_removal_tail() {
+        let tmp = TempDir::with_prefix("tndb_torn_removed").expect("temp dir");
+        let mut model: BTreeMap<u64, String> = (0..20u64).map(|i| (i, format!("v{i}"))).collect();
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            for (k, v) in &model {
+                db.insert::<TestTable>(k, v).expect("insert");
+            }
+            for i in 0..4u64 {
+                db.remove::<TestTable>(&i).expect("committed remove");
+                model.remove(&i);
+            }
+            let mut txn = db.write_txn().expect("txn");
+            for i in 10..13u64 {
+                txn.remove::<TestTable>(&i).expect("uncommitted remove");
+            }
+            crash(txn);
+            crash(db);
+        }
+        let removed = gen_path(tmp.path(), "TestTable", 0).join("removed");
+        let ends = record_ends(&removed);
+        assert_eq!(ends.len(), 7, "4 committed and 3 uncommitted removals");
+        truncate(&removed, ends[5] + 3); // tear the last removal
+
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("reopen table");
+        assert_matches::<TestTable>(&db, &model, 25);
+    }
+
+    /// A cleanly closed log must replay whole: corruption inside it fails the open, changes no
+    /// byte, and fails the same way again.
+    #[test]
+    fn test_tndb_sealed_log_corruption_fails_closed() {
+        let tmp = TempDir::with_prefix("tndb_sealed_corrupt").expect("temp dir");
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            for i in 0..10u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            }
+        }
+        let gen0 = gen_path(tmp.path(), "TestTable", 0);
+        let data = gen0.join("data");
+        let mut bytes = std::fs::read(&data).expect("read");
+        let first_payload = crate::archive::pack::DATA_HEADER_BYTES + 4;
+        bytes[first_payload + 2] ^= 0xFF;
+        std::fs::write(&data, &bytes).expect("write");
+        std::fs::remove_dir_all(gen0.join("btx")).expect("drop the index to force a rebuild");
+
+        for attempt in 0..2 {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            assert!(db.open_table::<TestTable>().is_err(), "attempt {attempt} must fail closed");
+            drop(db);
+            assert_eq!(std::fs::read(&data).expect("read"), bytes, "the log is unchanged");
+        }
+    }
+
+    /// In an unclean log, damage below the commit marker is corruption of committed data, not a
+    /// crash tail: the open fails rather than cutting committed records.
+    #[test]
+    fn test_tndb_tear_below_commit_marker_fails_closed() {
+        let tmp = TempDir::with_prefix("tndb_below_marker").expect("temp dir");
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            for i in 0..10u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            }
+            crash(db);
+        }
+        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
+        let mut bytes = std::fs::read(&data).expect("read");
+        bytes[crate::archive::pack::DATA_HEADER_BYTES + 6] ^= 0xFF; // the first record
+        std::fs::write(&data, &bytes).expect("write");
+
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        assert!(db.open_table::<TestTable>().is_err(), "committed data is damaged");
+        drop(db);
+        assert_eq!(std::fs::read(&data).expect("read"), bytes, "the log is unchanged");
+    }
+
+    /// Random puts, removes, clears and commits, with crashes and clean closes between them:
+    /// after every reopen the table holds exactly the committed state.
+    #[test]
+    fn test_tndb_randomized_crash_recovery() {
+        const KEYS: u64 = 64;
+        let tmp = TempDir::with_prefix("tndb_random_crash").expect("temp dir");
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut rand = move |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        let mut committed: BTreeMap<u64, String> = BTreeMap::new();
+        for cycle in 0..12u64 {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            assert_matches::<TestTable>(&db, &committed, KEYS);
+            let mut pending = committed.clone();
+            let mut txn = db.write_txn().expect("txn");
+            for step in 0..150u64 {
+                let k = rand(KEYS);
+                match rand(20) {
+                    0..=9 => {
+                        let v = format!("{cycle}:{step}");
+                        txn.insert::<TestTable>(&k, &v).expect("insert");
+                        pending.insert(k, v);
+                    }
+                    10..=15 => {
+                        txn.remove::<TestTable>(&k).expect("remove");
+                        pending.remove(&k);
+                    }
+                    16 => {
+                        // Durable at once; the writes before it are gone with the old generation.
+                        txn.clear_table::<TestTable>().expect("clear");
+                        committed.clear();
+                        pending.clear();
+                    }
+                    _ => {
+                        txn.commit().expect("commit");
+                        committed = pending.clone();
+                        txn = db.write_txn().expect("txn");
+                    }
+                }
+            }
+            if cycle % 3 == 2 {
+                // A clean close commits the open writes.
+                drop(txn);
+                drop(db);
+                committed = pending;
+            } else {
+                crash(txn);
+                crash(db);
+            }
+        }
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        assert_matches::<TestTable>(&db, &committed, KEYS);
+    }
+
+    /// A `LayeredDatabase` over a crashed tndb loads the rebuilt rows.
+    #[test]
+    fn test_tndb_layered_crash_reopen_loads_rows() {
+        use crate::layered_db::LayeredDatabase;
+
+        let tmp = TempDir::with_prefix("tndb_layered_crash").expect("temp dir");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        {
+            let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("open"), true);
+            db.open_table::<TestTable>().expect("open table");
+            for i in 0..300u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            }
+            rt.block_on(db.persist::<TestTable>()).expect("persist");
+            crash(db);
+        }
+        let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("reopen"), true);
+        db.open_table::<TestTable>().expect("reopen table");
+        assert_eq!(db.iter::<TestTable>().count(), 300);
+        assert_eq!(db.get::<TestTable>(&123).expect("get"), Some("v123".to_string()));
     }
 }

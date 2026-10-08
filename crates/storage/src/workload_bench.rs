@@ -141,9 +141,12 @@ bench_table!(OurBatches, B256, ByteVec, TableHint::Cache, "`OurNodeBatchesCache`
 
 /// Batches per header (the payload rows each header adds and each vote request checks).
 const BATCHES_PER_HEADER: usize = 5;
-/// Rounds in the consensus workload: enough for `ROUNDS_TO_KEEP` rounds of fill and then a long
-/// stretch of steady-state garbage collection.
+/// Timed rounds in the consensus workload: with the warm-up, enough for `ROUNDS_TO_KEEP` rounds of
+/// fill and then a long stretch of steady-state garbage collection.
 const CONSENSUS_ROUNDS: u32 = 200;
+/// Untimed rounds first, so the timed ones measure the steady state, not one-time setup (a table's
+/// first write, a backend's background preparation after open).
+const CONSENSUS_WARMUP_ROUNDS: u32 = 20;
 /// An encoded vote (`VoteInfo`).
 const VOTE_SIZE: usize = 41;
 /// The payload table's presence token.
@@ -644,8 +647,13 @@ impl Workload for ConsensusRounds {
         let (mut votes, mut own) = (Vec::new(), Vec::new());
         let mut cert_phase = Duration::ZERO;
 
+        let warmup = CONSENSUS_WARMUP_ROUNDS;
+        for r in 1..=warmup {
+            rt.block_on(self.concurrent_tasks(&db, r, &values));
+            self.store_certificates(&db, r, &values.cert);
+        }
         let start = Instant::now();
-        for r in 1..=self.rounds {
+        for r in warmup + 1..=warmup + self.rounds {
             for measured in rt.block_on(self.concurrent_tasks(&db, r, &values)) {
                 match measured {
                     Durable::Vote(d) => votes.push(d),
@@ -706,7 +714,8 @@ fn workload_consensus_rounds() {
         let cols = run_backends(&rt, &mut workload, tmp.path(), Layer::FullMemory, false);
         print_table(
             &format!(
-                "consensus rounds: N={committee}, {CONSENSUS_ROUNDS} rounds, cert {} B, header {} B",
+                "consensus rounds: N={committee}, {CONSENSUS_ROUNDS} rounds after \
+                 {CONSENSUS_WARMUP_ROUNDS} warm-up rounds, cert {} B, header {} B",
                 cert_size(committee),
                 header_size(committee)
             ),
@@ -910,8 +919,14 @@ fn count_epoch_rows<DB: Database>(db: &DB) -> usize {
 
 /// Populate a late-epoch database with `open`, close it, then time two reopens: the raw backend
 /// (open plus `open_table`) and the full-memory layer over it (which loads every row into memory).
-/// Returns the raw and layered report columns.
-fn reload<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> [Column; 2] {
+/// With `crash`, also time both reopens after a crash (a handle dropped without closing, so the
+/// next open recovers). Returns the raw and layered report columns.
+fn reload<DB: Database>(
+    name: &str,
+    dir: &Path,
+    open: impl Fn(&Path) -> DB,
+    crash: bool,
+) -> [Column; 2] {
     println!("  populating {name} ...");
     let rows = {
         let db = open(dir);
@@ -934,14 +949,41 @@ fn reload<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> [
     assert_eq!(count_epoch_rows(&db), rows, "{name}: every row loaded into the memory layer");
     drop(db);
 
-    let cells = |time: Duration| {
+    // After a crash: the files are left unclosed (the handle is leaked), so each reopen recovers.
+    let crashed = crash.then(|| {
+        let db = open(dir);
+        open_epoch_tables(&db);
+        std::mem::forget(db);
+        let start = Instant::now();
+        let db = open(dir);
+        open_epoch_tables(&db);
+        let raw = start.elapsed();
+        assert_eq!(count_epoch_rows(&db), rows, "{name}: every row recovered after a crash");
+        std::mem::forget(db);
+        let start = Instant::now();
+        let db = LayeredDatabase::open(open(dir), true);
+        open_epoch_tables(&db);
+        let layered = start.elapsed();
+        assert_eq!(count_epoch_rows(&db), rows, "{name}: every row recovered and loaded");
+        drop(db);
+        (raw, layered)
+    });
+
+    let cells = |time: Duration, crashed: Option<Duration>| {
         vec![
             Cell::ms("reopen ms", time),
+            crashed.map_or_else(
+                || Cell::new("crash reopen ms (rebuild)", Better::Lower, "-".to_string()),
+                |d| Cell::ms("crash reopen ms (rebuild)", d),
+            ),
             Cell::count("rows", rows),
             Cell::mb("disk MB", Some(disk)),
         ]
     };
-    [(name.to_string(), cells(raw)), (format!("Layered<{name}>"), cells(layered))]
+    [
+        (name.to_string(), cells(raw, crashed.map(|(raw, _)| raw))),
+        (format!("Layered<{name}>"), cells(layered, crashed.map(|(_, layered)| layered))),
+    ]
 }
 
 /// A restart late in an epoch: reopen time, raw and through the full-memory layer.
@@ -954,13 +996,19 @@ fn reload<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> [
 fn workload_startup_reload() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut cols = Vec::new();
-    cols.extend(reload("TnDb", &tmp.path().join("tndb"), |dir| {
-        TnDatabase::open(dir).expect("open tndb")
-    }));
+    cols.extend(reload(
+        "TnDb",
+        &tmp.path().join("tndb"),
+        |dir| TnDatabase::open(dir).expect("open tndb"),
+        true,
+    ));
     #[cfg(feature = "reth-libmdbx")]
-    cols.extend(reload("MDBX-prod", &tmp.path().join("mdbx_prod"), |dir| {
-        open_mdbx_prod(dir, 8, PROD_EPOCH_MAX, PROD_GROWTH)
-    }));
+    cols.extend(reload(
+        "MDBX-prod",
+        &tmp.path().join("mdbx_prod"),
+        |dir| open_mdbx_prod(dir, 8, PROD_EPOCH_MAX, PROD_GROWTH),
+        false,
+    ));
     print_table(
         &format!(
             "startup reload: N={RELOAD_COMMITTEE}, {RELOAD_ROUNDS} rounds into the epoch \

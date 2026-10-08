@@ -130,11 +130,27 @@ where
         Ok(())
     }
 
+    /// Read the next record's payload without decoding it: CRC-checked and decompressed bytes,
+    /// borrowed until the next call. The raw counterpart of `next`, for byte logs written with
+    /// [`Pack::append_raw`](crate::archive::pack::Pack::append_raw). `None` at the logical end; an
+    /// `Err` is a torn or corrupt frame (see [`Self::logical_position`] for where to cut).
+    pub fn next_raw(&mut self) -> Option<Result<&[u8], FetchError>> {
+        match Self::read_frame(
+            &mut self.reader,
+            &mut self.buffer,
+            &mut self.decompress_buffer,
+            self.compression,
+            self.end,
+            &mut self.pos,
+        ) {
+            Ok(payload) => Some(Ok(payload)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
     /// Read and decode the next record.
     /// This expects the file cursor to be positioned at the record's first byte.
-    ///
-    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
-    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
     fn read_record_file<R2: Read + Seek>(
         file: &mut R2,
         buffer: &mut Vec<u8>,
@@ -143,6 +159,23 @@ where
         end: u64,
         pos: &mut u64,
     ) -> Result<V, FetchError> {
+        let payload = Self::read_frame(file, buffer, decompress_buffer, compression, end, pos)?;
+        try_decode::<V>(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+    }
+
+    /// Read the next record's frame and return its CRC-checked (and decompressed) payload.
+    /// This expects the file cursor to be positioned at the record's first byte.
+    ///
+    /// Stops at the logical `end` (returning `NotFound`) before reading past the data into any mmap
+    /// capacity padding; `pos` is advanced by the on-disk frame size of each record read.
+    fn read_frame<'b, R2: Read + Seek>(
+        file: &mut R2,
+        buffer: &'b mut Vec<u8>,
+        decompress_buffer: &'b mut Vec<u8>,
+        compression: PackCompression,
+        end: u64,
+        pos: &mut u64,
+    ) -> Result<&'b [u8], FetchError> {
         // At (or past) the logical data end: stop cleanly rather than decode trailing padding.
         if *pos >= end {
             return Err(FetchError::NotFound);
@@ -191,11 +224,10 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let decoded: &[u8] = match compression {
-            PackCompression::None => &buffer[..],
-            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer)?,
-        };
-        try_decode::<V>(decoded).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        match compression {
+            PackCompression::None => Ok(&buffer[..]),
+            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer),
+        }
     }
 }
 
