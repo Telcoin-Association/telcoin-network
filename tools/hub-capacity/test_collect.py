@@ -38,6 +38,67 @@ def telemetry():
 
 
 class CollectorTests(unittest.TestCase):
+    def test_compact_evidence_preserves_values_order_and_semantic_digest(self):
+        evidence = {"samples": [{"elapsed_seconds": 5, "value": 2**80},
+                                {"elapsed_seconds": 0, "value": -0.125}],
+                    "operations": {"committee_progress": [
+                        {"id": "second", "reason": "snowman \u2603, astral \U0001f680, newline\n"},
+                        {"id": "first", "success": False, "reason": None}]},
+                    "phase": "candidate"}
+        expected = json.dumps(evidence, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True, allow_nan=False).encode("ascii")
+        with tempfile.TemporaryDirectory(prefix="capacity-evidence-roundtrip-") as directory:
+            path = Path(directory) / "evidence.json"
+            reordered = Path(directory) / "reordered.json"
+            COLLECT.write_evidence(path, evidence)
+            COLLECT.write_evidence(reordered, dict(reversed(list(evidence.items()))))
+            self.assertEqual(path.read_bytes(), expected)
+            self.assertEqual(reordered.read_bytes(), expected)
+            decoded = COLLECT.QUALIFY.read_json(path, maximum_bytes=COLLECT.QUALIFY.EVIDENCE_MAX_BYTES)
+            self.assertEqual(decoded, evidence)
+            self.assertEqual(COLLECT.QUALIFY.digest(decoded), COLLECT.QUALIFY.digest(evidence))
+            self.assertEqual(COLLECT.file_hash(path), COLLECT.QUALIFY.digest(evidence))
+
+    def test_evidence_writer_accepts_exact_reader_cap_and_rejects_next_byte(self):
+        self.assertEqual(COLLECT.QUALIFY.MAX_BYTES, 16 * 1024**2)
+        self.assertEqual(COLLECT.QUALIFY.EVIDENCE_MAX_BYTES, 24 * 1024**2)
+        prefix = b'{"payload":"'
+        suffix = b'"}'
+        payload = "x" * (COLLECT.QUALIFY.EVIDENCE_MAX_BYTES - len(prefix) - len(suffix))
+        with tempfile.TemporaryDirectory(prefix="capacity-evidence-boundary-") as directory:
+            root = Path(directory)
+            accepted, rejected = root / "accepted.json", root / "rejected.json"
+            evidence = {"payload": payload}
+            COLLECT.write_evidence(accepted, evidence)
+            self.assertEqual(accepted.stat().st_size, COLLECT.QUALIFY.EVIDENCE_MAX_BYTES)
+            self.assertEqual(COLLECT.QUALIFY.read_json(
+                accepted, maximum_bytes=COLLECT.QUALIFY.EVIDENCE_MAX_BYTES), evidence)
+            with self.assertRaisesRegex(ValueError, "exceeds 24 MiB"):
+                COLLECT.write_evidence(rejected, {"payload": payload + "x"})
+            self.assertFalse(rejected.exists())
+            self.assertEqual(list(root.iterdir()), [accepted])
+            with accepted.open("ab") as stream:
+                stream.write(b" ")
+            with self.assertRaisesRegex(ValueError, "exceeds 24 MiB"):
+                COLLECT.QUALIFY.read_json(accepted, maximum_bytes=COLLECT.QUALIFY.EVIDENCE_MAX_BYTES)
+
+    def test_evidence_writer_preserves_existing_destination(self):
+        with tempfile.TemporaryDirectory(prefix="capacity-evidence-existing-") as directory:
+            path = Path(directory) / "evidence.json"
+            path.write_bytes(b"existing evidence")
+            for evidence in ({"phase": "candidate"}, {"value": float("nan")}):
+                with self.subTest(evidence=evidence), self.assertRaises(FileExistsError):
+                    COLLECT.write_evidence(path, evidence)
+                self.assertEqual(path.read_bytes(), b"existing evidence")
+
+    def test_evidence_writer_removes_partial_nonfinite_output(self):
+        with tempfile.TemporaryDirectory(prefix="capacity-evidence-nonfinite-") as directory:
+            path = Path(directory) / "evidence.json"
+            for value in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(value=value), self.assertRaises(ValueError):
+                    COLLECT.write_evidence(path, {"a": "already encoded", "z": value})
+                self.assertFalse(path.exists())
+
     def test_production_log_retention_preserves_large_raw_input_and_scoped_guard(self):
         with tempfile.TemporaryDirectory(prefix="capacity-log-retention-") as directory:
             root = Path(directory)
@@ -178,6 +239,11 @@ class CollectorTests(unittest.TestCase):
                  mock.patch.object(COLLECT.time, "time_ns", side_effect=lambda: 1_700_000_000_000_000_000 + int(clock["time"] * 1_000_000_000)), \
                  mock.patch.object(COLLECT.time, "sleep", side_effect=sleep):
                 evidence = COLLECT.collect(frozen, bindings, "baseline", output)
+            evidence_path = output / "evidence.json"
+            decoded = COLLECT.QUALIFY.read_json(evidence_path, maximum_bytes=COLLECT.QUALIFY.EVIDENCE_MAX_BYTES)
+            self.assertEqual(decoded, evidence)
+            self.assertEqual(COLLECT.QUALIFY.digest(decoded), COLLECT.QUALIFY.digest(evidence))
+            self.assertEqual(COLLECT.file_hash(evidence_path), COLLECT.QUALIFY.digest(evidence))
             operation = evidence["operations"]["record_lookup"][0]
             self.assertEqual(operation["elapsed_seconds"], 4.5)
             self.assertFalse(operation["success"])

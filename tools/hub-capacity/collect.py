@@ -244,6 +244,26 @@ def file_hash(path):
     return hasher.hexdigest()
 
 
+def write_evidence(path, evidence):
+    """Write canonical evidence within the reader's cap and remove owned partial output."""
+    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"),
+                               ensure_ascii=True, allow_nan=False)
+    size = 0
+    destination = Path(path)
+    outgoing = destination.open("xb")
+    try:
+        with outgoing:
+            for chunk in encoder.iterencode(evidence):
+                encoded = chunk.encode("ascii")
+                size += len(encoded)
+                if size > QUALIFY.EVIDENCE_MAX_BYTES:
+                    raise ValueError(f"evidence exceeds {QUALIFY.EVIDENCE_MAX_BYTES // 1024**2} MiB")
+                outgoing.write(encoded)
+    except BaseException:
+        destination.unlink()
+        raise
+
+
 def retain_file(source, destination, *, maximum_bytes=QUALIFY.MAX_RAW_ARTIFACT_BYTES):
     """Copy a bounded raw artifact and remove incomplete copies on failure."""
     size = 0
@@ -489,8 +509,7 @@ def collect(frozen, bindings, phase, output):
         }
         QUALIFY.validate_evidence(plan, result, phase)
         QUALIFY.verify_artifacts(result, output)
-        with (output / "evidence.json").open("x") as stream:
-            json.dump(result, stream, allow_nan=False)
+        write_evidence(output / "evidence.json", result)
         return result
     finally:
         raw.close()

@@ -15,6 +15,9 @@ ROOT = Path(__file__).resolve().parent
 SPEC = importlib.util.spec_from_file_location("qualify", ROOT / "qualify.py")
 QUALIFY = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(QUALIFY)
+COLLECT_SPEC = importlib.util.spec_from_file_location("compact_collect", ROOT / "collect.py")
+COLLECT = importlib.util.module_from_spec(COLLECT_SPEC)
+COLLECT_SPEC.loader.exec_module(COLLECT)
 COMMITTEE_SPEC = importlib.util.spec_from_file_location("committee_fixture", ROOT / "test_committee.py")
 COMMITTEE_FIXTURE = importlib.util.module_from_spec(COMMITTEE_SPEC)
 COMMITTEE_SPEC.loader.exec_module(COMMITTEE_FIXTURE)
@@ -86,6 +89,37 @@ class QualificationTests(unittest.TestCase):
     def setUp(self):
         self.plan = declaration()
         self.run = evidence(self.plan)
+
+    def test_compact_producer_roundtrip_preserves_validation_and_score(self):
+        QUALIFY.validate_plan(self.plan)
+        QUALIFY.validate_evidence(self.plan, self.run, "candidate")
+        expected_digest = QUALIFY.digest(self.run)
+        expected_score = QUALIFY.score(self.plan, self.run)
+        with tempfile.TemporaryDirectory(prefix="capacity-compact-qualification-") as directory:
+            path = Path(directory) / "evidence.json"
+            COLLECT.write_evidence(path, self.run)
+            decoded = QUALIFY.read_json(path, maximum_bytes=QUALIFY.EVIDENCE_MAX_BYTES)
+            self.assertEqual(decoded, self.run)
+            self.assertEqual(QUALIFY.digest(decoded), expected_digest)
+            self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), expected_digest)
+            QUALIFY.validate_evidence(self.plan, decoded, "candidate")
+            self.assertEqual(QUALIFY.score(self.plan, decoded), expected_score)
+
+    def test_phase_evidence_limit_preserves_metadata_boundary(self):
+        self.assertEqual(QUALIFY.MAX_BYTES, 16 * 1024**2)
+        self.assertEqual(QUALIFY.EVIDENCE_MAX_BYTES, 24 * 1024**2)
+        overhead = len(b'{"payload":""}')
+        value = {"payload": "x" * (QUALIFY.MAX_BYTES - overhead)}
+        with tempfile.TemporaryDirectory(prefix="capacity-metadata-boundary-") as directory:
+            path = Path(directory) / "metadata.json"
+            COLLECT.write_evidence(path, value)
+            self.assertEqual(path.stat().st_size, QUALIFY.MAX_BYTES)
+            self.assertEqual(QUALIFY.read_json(path), value)
+            with path.open("ab") as stream:
+                stream.write(b" ")
+            with self.assertRaisesRegex(ValueError, "exceeds 16 MiB"):
+                QUALIFY.read_json(path)
+            self.assertEqual(QUALIFY.read_json(path, maximum_bytes=QUALIFY.EVIDENCE_MAX_BYTES), value)
 
     def test_native_committee_deadline_is_exclusive_at_microsecond_precision(self):
         sample = copy.deepcopy(self.run["samples"][-1])
@@ -190,7 +224,15 @@ class QualificationTests(unittest.TestCase):
                 fixture["operations"]["committee_progress"] = raw["operations"]["committee_progress"]
                 fixture["samples"].append({"elapsed_seconds": 600.5, "hubs": copy.deepcopy(fixture["samples"][-1]["hubs"])})
                 paths[phase] = phase_root / "evidence.json"
-                paths[phase].write_text(json.dumps(fixture))
+                fixture["serializer_fixture_padding"] = "x" * QUALIFY.MAX_BYTES
+                COLLECT.write_evidence(paths[phase], fixture)
+                self.assertGreater(paths[phase].stat().st_size, QUALIFY.MAX_BYTES)
+                self.assertLess(paths[phase].stat().st_size, QUALIFY.EVIDENCE_MAX_BYTES)
+                with self.assertRaisesRegex(ValueError, "exceeds 16 MiB"):
+                    QUALIFY.read_json(paths[phase])
+                decoded = QUALIFY.read_json(paths[phase], maximum_bytes=QUALIFY.EVIDENCE_MAX_BYTES)
+                self.assertEqual(decoded, fixture)
+                self.assertEqual(QUALIFY.digest(decoded), QUALIFY.digest(fixture))
             for arguments in (
                 ["freeze", str(paths["declaration"]), "--output", str(paths["plan"])],
                 ["score", str(paths["plan"]), str(paths["baseline"]), str(paths["candidate"]),
@@ -275,8 +317,9 @@ class QualificationTests(unittest.TestCase):
             path = Path(directory) / "invalid.json"
             for value in ('{"cpu":NaN}', '{"cpu":1,"cpu":2}'):
                 path.write_text(value)
-                with self.assertRaises(ValueError):
-                    QUALIFY.read_json(path)
+                for maximum_bytes in (QUALIFY.MAX_BYTES, QUALIFY.EVIDENCE_MAX_BYTES):
+                    with self.subTest(value=value, maximum_bytes=maximum_bytes), self.assertRaises(ValueError):
+                        QUALIFY.read_json(path, maximum_bytes=maximum_bytes)
         with self.assertRaisesRegex(ValueError, "phase"):
             QUALIFY.validate_evidence(self.plan, evidence(self.plan, "baseline"), "candidate")
         self.plan["candidate"]["profile"]["public_peer_limit"] = 64.0

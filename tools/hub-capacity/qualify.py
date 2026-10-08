@@ -16,6 +16,8 @@ import sys
 
 ROOT = Path(__file__).resolve().parent
 MAX_BYTES = 16 * 1024 * 1024
+# Compact CI107 baseline evidence reached 18,014,619 bytes; reserve finite phase headroom.
+EVIDENCE_MAX_BYTES = 24 * 1024**2
 MAX_RAW_ARTIFACT_BYTES = 64 * 1024**2
 # A CI47 baseline validator log reached 355,304,227 bytes.
 MAX_PROTOCOL_LOG_BYTES = 512 * 1024**2
@@ -92,8 +94,8 @@ def committee_operation(observation, measurement, duration):
             "trace": {"observation": observation}}
 
 
-def read_json(path):
-    """Bound input size and reject duplicate keys and nonfinite JSON numbers."""
+def read_json(path, *, maximum_bytes=MAX_BYTES):
+    """Bound input size, defaulting to metadata, and reject duplicate keys and nonfinite numbers."""
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -103,9 +105,9 @@ def read_json(path):
         return result
 
     with path.open("rb") as source:
-        raw = source.read(MAX_BYTES + 1)
-    if len(raw) > MAX_BYTES:
-        raise ValueError("input exceeds 16 MiB")
+        raw = source.read(maximum_bytes + 1)
+    if len(raw) > maximum_bytes:
+        raise ValueError(f"input exceeds {maximum_bytes // 1024**2} MiB")
     return json.loads(raw, object_pairs_hook=unique,
                       parse_constant=lambda value: fail(f"nonfinite number: {value}"))
 
@@ -629,7 +631,8 @@ def main():
         if frozen["plan_sha256"] != digest(frozen["plan"]):
             fail("frozen plan hash mismatch")
         plan = frozen["plan"]
-        baseline, candidate = read_json(args.baseline), read_json(args.candidate)
+        baseline = read_json(args.baseline, maximum_bytes=EVIDENCE_MAX_BYTES)
+        candidate = read_json(args.candidate, maximum_bytes=EVIDENCE_MAX_BYTES)
         validate_evidence(plan, baseline, "baseline")
         validate_evidence(plan, candidate, "candidate")
         verify_artifacts(baseline, args.baseline.parent)
