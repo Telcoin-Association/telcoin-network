@@ -2630,8 +2630,7 @@ where
                     let should_store = if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
-                        self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).map_or(
-                                true,
+                        self.swarm.behaviour_mut().kademlia.store_mut().get(&record.key).is_none_or(
                                 |existing| {
                                     record.expires = existing.expires.zip(record.expires).map(|(old, new)| old.max(new));
                                     record.expires != existing.expires

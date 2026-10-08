@@ -170,7 +170,7 @@ pub(crate) enum InboundDenial {
     EstablishedTotalLimit,
     /// Any other `connection_limits` bound. The swarms configure none, so this stays zero
     /// unless the refusal text is unknown.
-    OtherLimit,
+    Other,
 }
 
 impl InboundDenial {
@@ -179,7 +179,7 @@ impl InboundDenial {
         Self::PendingIncomingLimit,
         Self::EstablishedPerPeerLimit,
         Self::EstablishedTotalLimit,
-        Self::OtherLimit,
+        Self::Other,
     ];
 
     /// The inbound denial for a refusal of `reason`.
@@ -191,7 +191,7 @@ impl InboundDenial {
             ConnectionLimitReason::PendingOutgoing
             | ConnectionLimitReason::EstablishedIncoming
             | ConnectionLimitReason::EstablishedOutgoing
-            | ConnectionLimitReason::Unknown => Self::OtherLimit,
+            | ConnectionLimitReason::Unknown => Self::Other,
         }
     }
 
@@ -201,7 +201,7 @@ impl InboundDenial {
             Self::PendingIncomingLimit => "pending_incoming_limit",
             Self::EstablishedPerPeerLimit => "established_per_peer_limit",
             Self::EstablishedTotalLimit => "established_total_limit",
-            Self::OtherLimit => "other_limit",
+            Self::Other => "other_limit",
         }
     }
 }
@@ -423,7 +423,7 @@ struct PerDenial<T> {
     established_per_peer: T,
     /// The handle for [`InboundDenial::EstablishedTotalLimit`].
     established_total: T,
-    /// The handle for [`InboundDenial::OtherLimit`].
+    /// The handle for [`InboundDenial::Other`].
     other: T,
 }
 
@@ -434,7 +434,7 @@ impl<T> PerDenial<T> {
             pending_incoming: resolve(InboundDenial::PendingIncomingLimit),
             established_per_peer: resolve(InboundDenial::EstablishedPerPeerLimit),
             established_total: resolve(InboundDenial::EstablishedTotalLimit),
-            other: resolve(InboundDenial::OtherLimit),
+            other: resolve(InboundDenial::Other),
         }
     }
 
@@ -444,7 +444,7 @@ impl<T> PerDenial<T> {
             InboundDenial::PendingIncomingLimit => &self.pending_incoming,
             InboundDenial::EstablishedPerPeerLimit => &self.established_per_peer,
             InboundDenial::EstablishedTotalLimit => &self.established_total,
-            InboundDenial::OtherLimit => &self.other,
+            InboundDenial::Other => &self.other,
         }
     }
 }
