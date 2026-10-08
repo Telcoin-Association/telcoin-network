@@ -7,7 +7,7 @@ use serde::{
     Deserialize, Deserializer, Serialize,
 };
 use std::{collections::BTreeMap, fmt, num::NonZeroUsize, time::Duration};
-use tn_types::{BlsPublicKey, BootstrapServer, Round, WorkerId};
+use tn_types::{BlsPublicKey, BootstrapServer, Multiaddr, Round, WorkerId};
 use tracing::warn;
 
 mod quic;
@@ -45,12 +45,67 @@ pub struct NetworkConfig {
     /// over this map, with an explicitly empty override selecting the genesis fallback.
     /// Committee membership and gossip publisher authorization remain derived from chain state.
     bootstrap_peers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Optional local listener and advertised endpoint mappings, independent of node identities.
+    endpoints: EndpointMappings,
+}
+
+/// Independent endpoint configuration for the primary and each worker transport identity.
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct EndpointMappings {
+    /// Primary mapping; absence preserves the node-info address and listener environment override.
+    primary: Option<EndpointMapping>,
+    /// Worker mappings keyed by their own worker id; unknown ids fail node startup.
+    workers: BTreeMap<WorkerId, EndpointMapping>,
+}
+
+impl EndpointMappings {
+    /// Optional primary endpoint mapping.
+    pub fn primary(&self) -> Option<&EndpointMapping> {
+        self.primary.as_ref()
+    }
+
+    /// Configured worker endpoint mappings.
+    pub fn workers(&self) -> &BTreeMap<WorkerId, EndpointMapping> {
+        &self.workers
+    }
+}
+
+/// A local bind address and an ordered list of externally reachable endpoints.
+///
+/// Advertised endpoints accept IP or operator-configured DNS over UDP/QUIC v1. Resolution is
+/// bounded and performed once at process startup, before any network task is spawned.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointMapping {
+    /// Optional local bind address; listener environment overrides retain precedence.
+    #[serde(default)]
+    listen: Option<Multiaddr>,
+    /// Preferred endpoint first, with at most four resolved IP endpoints across the list.
+    advertise: Vec<Multiaddr>,
+}
+
+impl EndpointMapping {
+    /// The configured bind address, if present.
+    pub fn listen(&self) -> Option<&Multiaddr> {
+        self.listen.as_ref()
+    }
+
+    /// Ordered operator-supplied advertised endpoints, before DNS resolution.
+    pub fn advertise(&self) -> &[Multiaddr] {
+        &self.advertise
+    }
 }
 
 impl NetworkConfig {
     /// Return explicit deployment limits for source admission, when configured.
     pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
         self.source_admission.as_ref()
+    }
+
+    /// Endpoint mappings for the primary and every independently keyed worker.
+    pub fn endpoints(&self) -> &EndpointMappings {
+        &self.endpoints
     }
 
     /// Return the legacy startup peer-readiness budget.

@@ -16,6 +16,9 @@ use crate::StreamError;
 /// Networking error type.
 #[derive(Debug, Error)]
 pub enum NetworkError {
+    /// Configured advertised endpoints violate the signed-record constraints.
+    #[error(transparent)]
+    AdvertisedAddresses(#[from] tn_node_record::AddressError),
     /// Swarm error dialing a peer.
     #[error("{0}")]
     Dial(String),

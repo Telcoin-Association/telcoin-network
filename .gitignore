@@ -1,6 +1,8 @@
 # cargo
 debug/
 target/
+# ...but the debug RPC namespace docs are source
+!docs/src/rpc-methods/debug/
 
 # MacOS
 .DS_Store
