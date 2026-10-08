@@ -256,42 +256,138 @@ fn quantile(samples: &mut [Duration], p: f64) -> Duration {
     samples[((samples.len() - 1) as f64 * p).round() as usize]
 }
 
-fn ms(d: Duration) -> String {
-    format!("{:.2}", d.as_secs_f64() * 1e3)
+/// Which way a report row's numbers improve, for coloring its best and worst backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Better {
+    Lower,
+    Higher,
+    /// Not a measurement (e.g. a row count): never colored.
+    Unranked,
 }
 
-fn us(d: Duration) -> String {
-    format!("{:.0}", d.as_secs_f64() * 1e6)
+/// One backend's value for one report row.
+#[derive(Debug)]
+struct Cell {
+    label: String,
+    text: String,
+    better: Better,
 }
 
-fn mb(bytes: Option<u64>) -> String {
-    bytes.map_or_else(|| "-".to_string(), |b| format!("{:.1}", b as f64 / (1024.0 * 1024.0)))
+impl Cell {
+    fn new(label: &str, better: Better, text: String) -> Self {
+        Self { label: label.to_string(), text, better }
+    }
+
+    /// A time in milliseconds.
+    fn ms(label: &str, d: Duration) -> Self {
+        Self::new(label, Better::Lower, format!("{:.2}", d.as_secs_f64() * 1e3))
+    }
+
+    /// A time in microseconds.
+    fn us(label: &str, d: Duration) -> Self {
+        Self::new(label, Better::Lower, format!("{:.0}", d.as_secs_f64() * 1e6))
+    }
+
+    /// Disk use in MiB (`-` for the in-memory backend).
+    fn mb(label: &str, bytes: Option<u64>) -> Self {
+        let text = bytes
+            .map_or_else(|| "-".to_string(), |b| format!("{:.1}", b as f64 / (1024.0 * 1024.0)));
+        Self::new(label, Better::Lower, text)
+    }
+
+    /// A throughput.
+    fn rate(label: &str, per_sec: f64) -> Self {
+        Self::new(label, Better::Higher, format!("{per_sec:.1}"))
+    }
+
+    /// A count, shown but not ranked.
+    fn count(label: &str, n: usize) -> Self {
+        Self::new(label, Better::Unranked, n.to_string())
+    }
 }
 
-/// One report column: a backend name and its `(row label, cell)` pairs.
-type Column = (String, Vec<(String, String)>);
+/// One report column: a backend name and its cells, one per row.
+type Column = (String, Vec<Cell>);
 
-/// Print the columns side by side (rows labeled from the first column).
+/// The reference column: shown for scale, left out of the coloring (the comparison is tndb
+/// against MDBX).
+const REFERENCE: &str = "MemDb";
+
+const GREEN: &str = "\x1b[32m";
+const RED: &str = "\x1b[31m";
+const RESET: &str = "\x1b[0m";
+
+/// Color the report only on a terminal, and not when `NO_COLOR` is set.
+fn use_color() -> bool {
+    use std::io::IsTerminal as _;
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none()
+}
+
+/// The best and worst displayed values of `row` across the ranked columns (every column but the
+/// reference), or `None` when the row is unranked or they all tie. Compared as displayed, so
+/// values that print the same rank the same.
+fn row_extremes(cols: &[Column], row: usize) -> Option<(f64, f64)> {
+    let better = cols.first()?.1[row].better;
+    let values: Vec<f64> = cols
+        .iter()
+        .filter(|(name, _)| name != REFERENCE)
+        .filter_map(|(_, cells)| cells[row].text.parse().ok())
+        .collect();
+    let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if values.len() < 2 || min == max {
+        return None;
+    }
+    match better {
+        Better::Lower => Some((min, max)),
+        Better::Higher => Some((max, min)),
+        Better::Unranked => None,
+    }
+}
+
+/// Print the columns side by side (rows labeled from the first column). On a terminal, each row's
+/// best value among the ranked columns is green and its worst red.
 fn print_table(title: &str, legend: &str, cols: &[Column]) {
     let Some((_, first)) = cols.first() else { return };
-    let label_w = first.iter().map(|(label, _)| label.len()).max().unwrap_or(0);
+    let color = use_color();
+    let label_w = first.iter().map(|cell| cell.label.len()).max().unwrap_or(0);
     let cell_w = cols
         .iter()
-        .map(|(name, cells)| cells.iter().map(|(_, c)| c.len()).fold(name.len(), usize::max))
+        .map(|(name, cells)| cells.iter().map(|c| c.text.len()).fold(name.len(), usize::max))
         .max()
         .unwrap_or(0)
         .max(10);
     println!("\n=== {title} ===");
     println!("{legend}");
+    if color {
+        println!("{GREEN}green{RESET} / {RED}red{RESET}: each row's best / worst backend ({REFERENCE} is a reference, not ranked)");
+    }
     print!("{:<label_w$}", "");
     for (name, _) in cols {
         print!(" {name:>cell_w$}");
     }
     println!();
-    for (row, (label, _)) in first.iter().enumerate() {
-        print!("{label:<label_w$}");
-        for (_, cells) in cols {
-            print!(" {:>cell_w$}", cells[row].1);
+    for (row, cell) in first.iter().enumerate() {
+        print!("{:<label_w$}", cell.label);
+        let extremes = if color { row_extremes(cols, row) } else { None };
+        for (name, cells) in cols {
+            let text = &cells[row].text;
+            // Pad before coloring: the escape codes take no columns on screen.
+            let padded = format!("{text:>cell_w$}");
+            let shade = extremes.filter(|_| name != REFERENCE).and_then(|(best, worst)| {
+                let value = text.parse::<f64>().ok()?;
+                if value == best {
+                    Some(GREEN)
+                } else if value == worst {
+                    Some(RED)
+                } else {
+                    None
+                }
+            });
+            match shade {
+                Some(shade) => print!(" {shade}{padded}{RESET}"),
+                None => print!(" {padded}"),
+            }
         }
         println!();
     }
@@ -304,15 +400,10 @@ trait Workload {
     /// Open every table the workload uses.
     fn open_tables<DB: Database>(&self, db: &DB);
 
-    /// Run on `db` (its tables open) and return the report's `(row label, cell)` pairs. `dir` is
-    /// the backend's directory (`None` for the in-memory backend); the workload drops `db` before
+    /// Run on `db` (its tables open) and return the report's cells, one per row. `dir` is the
+    /// backend's directory (`None` for the in-memory backend); the workload drops `db` before
     /// measuring the disk it used.
-    fn run<DB: Database>(
-        &mut self,
-        rt: &Runtime,
-        db: DB,
-        dir: Option<&Path>,
-    ) -> Vec<(String, String)>;
+    fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell>;
 }
 
 /// The layer mode of the layered columns: production's epoch layer keeps every row in memory, its
@@ -543,12 +634,7 @@ impl Workload for ConsensusRounds {
         open_epoch_tables(db);
     }
 
-    fn run<DB: Database>(
-        &mut self,
-        rt: &Runtime,
-        db: DB,
-        dir: Option<&Path>,
-    ) -> Vec<(String, String)> {
+    fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell> {
         let n = self.committee;
         let values = Arc::new(RoundValues {
             header: filler(header_size(n), 1),
@@ -592,14 +678,14 @@ impl Workload for ConsensusRounds {
 
         let rounds = self.rounds;
         vec![
-            ("ms / round".to_string(), ms(elapsed / rounds)),
-            ("  cert phase ms / round".to_string(), ms(cert_phase / rounds)),
-            ("vote durable p50 us".to_string(), us(quantile(&mut votes, 0.50))),
-            ("vote durable p99 us".to_string(), us(quantile(&mut votes, 0.99))),
-            ("own header/cert durable p50 us".to_string(), us(quantile(&mut own, 0.50))),
-            ("own header/cert durable p99 us".to_string(), us(quantile(&mut own, 0.99))),
-            ("epoch clear ms (durable)".to_string(), ms(clear)),
-            ("disk MB after the epoch".to_string(), mb(dir.map(disk_bytes))),
+            Cell::ms("ms / round", elapsed / rounds),
+            Cell::ms("  cert phase ms / round", cert_phase / rounds),
+            Cell::us("vote durable p50 us", quantile(&mut votes, 0.50)),
+            Cell::us("vote durable p99 us", quantile(&mut votes, 0.99)),
+            Cell::us("own header/cert durable p50 us", quantile(&mut own, 0.50)),
+            Cell::us("own header/cert durable p99 us", quantile(&mut own, 0.99)),
+            Cell::ms("epoch clear ms (durable)", clear),
+            Cell::mb("disk MB after the epoch", dir.map(disk_bytes)),
         ]
     }
 }
@@ -646,12 +732,7 @@ impl Workload for BatchCache {
         db.open_table::<OurBatches>().expect("open OurBatches");
     }
 
-    fn run<DB: Database>(
-        &mut self,
-        rt: &Runtime,
-        db: DB,
-        dir: Option<&Path>,
-    ) -> Vec<(String, String)> {
+    fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell> {
         let batch = filler(self.size, 9);
         let keys: Vec<B256> = (0..self.count).map(|i| digest(DOMAIN_BATCH, i, 0)).collect();
         let written = AtomicU64::new(0);
@@ -709,10 +790,10 @@ impl Workload for BatchCache {
         let bytes = self.size as f64 * self.count as f64;
         let secs = write_time.as_secs_f64();
         vec![
-            ("write MB/s (to disk)".to_string(), format!("{:.1}", bytes / secs / 1e6)),
-            ("reader K gets/s".to_string(), format!("{:.1}", gets as f64 / secs / 1e3)),
-            ("epoch clear ms (durable)".to_string(), ms(clear)),
-            ("disk MB after the epoch".to_string(), mb(dir.map(disk_bytes))),
+            Cell::rate("write MB/s (to disk)", bytes / secs / 1e6),
+            Cell::rate("reader K gets/s", gets as f64 / secs / 1e3),
+            Cell::ms("epoch clear ms (durable)", clear),
+            Cell::mb("disk MB after the epoch", dir.map(disk_bytes)),
         ]
     }
 }
@@ -855,9 +936,9 @@ fn reload<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> [
 
     let cells = |time: Duration| {
         vec![
-            ("reopen ms".to_string(), ms(time)),
-            ("rows".to_string(), rows.to_string()),
-            ("disk MB".to_string(), mb(Some(disk))),
+            Cell::ms("reopen ms", time),
+            Cell::count("rows", rows),
+            Cell::mb("disk MB", Some(disk)),
         ]
     };
     [(name.to_string(), cells(raw)), (format!("Layered<{name}>"), cells(layered))]
