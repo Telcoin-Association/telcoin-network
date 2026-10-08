@@ -5501,6 +5501,9 @@ fn accepted_gossip_with_resolved_relayer_carries_identity() -> eyre::Result<()> 
 #[path = "connection_publication_tests.rs"]
 mod connection_publication_tests;
 
+#[path = "public_gossip_tests.rs"]
+mod public_gossip_tests;
+
 /// A reconnect recovers a rotated BLS identity, addresses and RPC metadata while both physical
 /// connections have their targeted advertisements cancelled, without any heartbeat retry.
 #[tokio::test]

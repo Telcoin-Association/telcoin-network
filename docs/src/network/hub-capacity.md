@@ -29,10 +29,22 @@ Validator validated-address and handshake qualification retains its Launch scope
 When both the public peer limit and process budget are configured, each gossip
 heartbeat announces cached message IDs to all eligible subscribed peers outside
 the mesh. The process connection allocation bounds this metadata fanout to at
-most 172 connections per swarm in this profile. Proactive payload forwarding
-keeps the configured mesh. More announcements can cause additional requests for
-cached payloads, subject to gossipsub's control limits and the transport allocation.
-Deployments without both bounds retain the library's default sampled announcements.
+most 172 connections per swarm in this profile. Nodes with both bounds also
+forward accepted gossip payloads directly to connected, confirmed ordinary peers
+within their public allocation, up to 64 per swarm in this profile. This policy
+applies to any node configured with both bounds, including a node with a smaller
+public allocation. Public peers retain ordinary admission and resource limits;
+direct delivery grants no committee or DAO retention privilege.
+
+Direct recipients are excluded from future gossip mesh selection; the configured
+mesh bounds govern the remaining eligible peers. Publisher authorization and validation
+still apply before forwarding. Direct public membership is removed on pruning,
+disconnect or ban and reconsidered after identity or trust changes, preventing
+persistent explicit-peer reconnects after removal. Any already queued dial remains
+subject to admission limits.
+Announcements can also cause requests for cached payloads, subject to gossipsub's
+control limits and the transport allocation. Deployments without both bounds
+retain the library's default sampled announcements and existing forwarding policy.
 The qualification measures the resulting traffic under the same CPU, memory,
 link, and latency limits.
 

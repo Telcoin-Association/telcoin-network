@@ -441,6 +441,15 @@ enum GoodbyeOutcome {
     FellBack,
 }
 
+/// Public-mode explicit recipients, with provenance retained only while current policy protects it.
+#[derive(Default)]
+struct PublicGossipPeers {
+    ordinary: HashSet<PeerId>,
+    /// Former ordinary recipients retain reconnects while committee or operator policy protects
+    /// them. Demotion, bans and identity displacement remove this bounded provenance.
+    promoted: HashSet<PeerId>,
+}
+
 /// The network type for consensus messages.
 ///
 /// The primary and workers use separate instances of this network to reliably send messages to
@@ -468,6 +477,9 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
+    /// Confirmed ordinary peers receiving direct gossip within configured public and swarm budgets.
+    /// Entries are removed before disconnect so gossipsub cannot retain public redial privileges.
+    public_gossip_peers: Option<PublicGossipPeers>,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -612,6 +624,9 @@ where
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let public_gossip_peers = (network_config.public_peer_limit().is_some()
+            && budget.is_some())
+        .then(PublicGossipPeers::default);
         let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
@@ -630,12 +645,12 @@ where
         );
         mesh.validate().map_err(std::io::Error::other)?;
         let mut gossipsub_config = gossipsub::ConfigBuilder::default();
-        if network_config.public_peer_limit().is_some() && budget.is_some() {
+        if public_gossip_peers.is_some() {
             // The public and transport populations are bounded. Announce cached messages to every
             // eligible non-mesh peer each heartbeat so relay delivery does not depend on
-            // repeatedly winning the default random gossip sample. Proactive forwarding
-            // keeps the configured mesh; additional cached-payload requests remain subject
-            // to gossipsub's control limits and the transport allocation.
+            // repeatedly winning the default random gossip sample. Mesh sizing is unchanged;
+            // confirmed ordinary peers also receive direct payloads. Cached-payload requests remain
+            // subject to gossipsub's control limits and the transport allocation.
             gossipsub_config.gossip_factor(1.0);
         }
         let gossipsub_config = gossipsub_config
@@ -857,6 +872,7 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
+            public_gossip_peers,
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             inbound_pending: InboundOccupancy::default(),
@@ -1155,6 +1171,7 @@ where
                 num_established: 0,
                 ..
             } => {
+                self.remove_public_gossip_peer(&peer_id);
                 if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
                     let (outcome, io_kind) =
                         cause.as_ref().map_or(("no_error_cause", None), |cause| match cause {
@@ -1531,6 +1548,7 @@ where
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
+                self.remove_public_gossip_peer(&peer_id);
                 // this is called after timeout for disconnected peer exchanges
                 let res = self.swarm.disconnect_peer_id(peer_id);
                 send_or_log_error!(reply, res, "DisconnectPeer");
@@ -1654,20 +1672,85 @@ where
     ///
     /// Operator trust survives rotation; committee protection ends when the final slot expires.
     fn refresh_explicit_peers(&mut self) {
-        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        let peers: HashSet<_> = self
+            .swarm
+            .connected_peers()
+            .copied()
+            .chain(
+                self.public_gossip_peers
+                    .iter()
+                    .flat_map(|peers| peers.ordinary.iter().chain(peers.promoted.iter()).copied()),
+            )
+            .collect();
         peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
     }
 
-    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    /// Reconcile direct gossip after identity, committee, trust, or connection changes.
+    /// Public delivery never changes ordinary admission or population-pruning policy.
     fn refresh_explicit_peer(&mut self, peer: &PeerId) {
         let manager = &self.swarm.behaviour().peer_manager;
-        let protected = self.swarm.is_connected(peer)
+        let promoted =
+            self.public_gossip_peers.as_ref().is_some_and(|peers| peers.promoted.contains(peer));
+        let was_public =
+            self.public_gossip_peers.as_ref().is_some_and(|peers| peers.ordinary.contains(peer));
+        let protected = (self.swarm.is_connected(peer) || promoted)
             && manager.peer_is_important(peer)
             && !manager.peer_banned(peer);
-        if protected {
+        let public = self.public_gossip_peers.is_some()
+            && self.swarm.is_connected(peer)
+            && manager.is_connected(peer)
+            && manager.peer_is_confirmed_ordinary(peer)
+            && !manager.peer_banned(peer);
+        self.public_gossip_peers.as_mut().into_iter().for_each(|peers| {
+            if protected && (was_public || promoted) {
+                peers.promoted.insert(*peer);
+            } else {
+                peers.promoted.remove(peer);
+            }
+            if public {
+                peers.ordinary.insert(*peer);
+            } else {
+                peers.ordinary.remove(peer);
+            }
+        });
+        if public || (protected && self.swarm.is_connected(peer)) {
             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
-        } else {
+        } else if !protected {
             self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
+    }
+
+    /// Remove public reconnect privileges while preserving existing important-peer reconnects.
+    fn remove_public_gossip_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let important = manager.peer_is_important(peer) && !manager.peer_banned(peer);
+        let removed = self.public_gossip_peers.as_mut().is_some_and(|peers| {
+            let removed = peers.ordinary.remove(peer);
+            if removed && important {
+                peers.promoted.insert(*peer);
+            }
+            removed
+        });
+        if removed && !important {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
+    }
+
+    /// Identity rekeys can displace another live recipient. Recheck only managed public IDs.
+    fn refresh_public_gossip_peers(&mut self) {
+        let peers: Vec<_> = self
+            .public_gossip_peers
+            .iter()
+            .flat_map(|peers| peers.ordinary.iter().chain(peers.promoted.iter()).copied())
+            .collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// New signed-record hooks affect only nodes configured to serve bounded public peers.
+    fn refresh_public_gossip_identity(&mut self, peer: &PeerId) {
+        if self.public_gossip_peers.is_some() {
+            self.refresh_public_gossip_peers();
+            self.refresh_explicit_peer(peer);
         }
     }
 
@@ -2449,6 +2532,7 @@ where
     fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
         match event {
             PeerEvent::DisconnectPeer(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
                 // remove from request-response
                 // NOTE: gossipsub handle `FromSwarm::ConnectionClosed`
@@ -2458,6 +2542,7 @@ where
                 self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
             PeerEvent::PeerDisconnected(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
 
                 // Check if there are any connections still in the pool
@@ -2495,6 +2580,7 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
 
                 // guard: skip PX if peer already disconnected
@@ -2522,6 +2608,7 @@ where
                 // refuse to register the connection with kademlia/gossipsub. Otherwise the
                 // banned peer ends up in the kad routing table and triggers a redial loop.
                 if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
+                    self.remove_public_gossip_peer(&peer_id);
                     debug!(
                         target: "network",
                         ?peer_id,
@@ -2547,12 +2634,13 @@ where
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
 
-                // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
-                if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
-                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                }
+                self.refresh_explicit_peer(&peer_id);
             }
             PeerEvent::Banned(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
+                self.public_gossip_peers.as_mut().into_iter().for_each(|peers| {
+                    peers.promoted.remove(&peer_id);
+                });
                 warn!(target: "network", ?peer_id, "peer banned");
                 self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
@@ -2978,6 +3066,7 @@ where
                                 .behaviour_mut()
                                 .peer_manager
                                 .confirm_expired_public_identity(source, key, value.info);
+                            self.refresh_public_gossip_identity(&source);
                         }
                     } else {
                     // verify record signature and ensure publisher matches record's network key
@@ -3011,10 +3100,15 @@ where
                     // freshness check waived only while the entry is still a config stub; for any
                     // other key it only confirms the sender's own identity and requires source to
                     // match the advertised one.
+                    let advertised_peer: PeerId = value.info.pubkey.clone().into();
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
                         .add_self_advertised_peer(source, key, value.info);
+                    self.refresh_public_gossip_identity(&source);
+                    if advertised_peer != source && self.public_gossip_peers.is_some() {
+                        self.refresh_explicit_peer(&advertised_peer);
+                    }
 
                     // Signature and publisher validation preceded confirmation. Only the
                     // authenticated transport source's own live binding gains connection ownership.
@@ -3190,6 +3284,7 @@ where
         discovered.into_iter().for_each(|info| {
             let peer: PeerId = info.pubkey.clone().into();
             self.swarm.behaviour_mut().peer_manager.add_discovered_peer(key, info);
+            self.refresh_public_gossip_peers();
             self.refresh_explicit_peer(&peer);
         });
         if is_last_step || application_ready {
@@ -3244,6 +3339,7 @@ where
                     .behaviour_mut()
                     .peer_manager
                     .add_discovered_peer(request, node_record.info);
+                self.refresh_public_gossip_peers();
                 self.refresh_explicit_peer(&peer);
             });
         });

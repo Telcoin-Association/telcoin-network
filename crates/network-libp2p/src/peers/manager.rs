@@ -681,7 +681,7 @@ impl PeerManager {
     }
 
     /// Unresolved identities consume aggregate headroom until a valid record classifies them.
-    fn peer_is_confirmed_ordinary(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn peer_is_confirmed_ordinary(&self, peer_id: &PeerId) -> bool {
         self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)
     }
 
