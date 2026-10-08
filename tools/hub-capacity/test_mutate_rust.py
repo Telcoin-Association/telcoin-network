@@ -43,6 +43,14 @@ class MutationTests(unittest.TestCase):
                     rf"#\[(?:tokio::)?test\]\s+(?:async\s+)?fn\s+{re.escape(regression)}\s*\(",
                 )
 
+    def test_public_classification_mutant_keeps_library_identity_reference(self):
+        case = next(case for case in MUTATIONS.CASES if case[0] == "public_provisional_classification")
+        _, relative, before, after, _ = case
+        source = (MUTATIONS.ROOT / relative).read_text()
+        mutated = source.replace(before, after, 1)
+        self.assertNotIn(before, mutated)
+        self.assertEqual(mutated.count("self.peers.peer_has_confirmed_identity(peer_id)"), 1)
+
     def fixture(self, root):
         source = root / "crates/owner/src/lib.rs"
         source.parent.mkdir(parents=True)

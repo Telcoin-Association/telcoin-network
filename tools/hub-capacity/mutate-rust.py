@@ -229,7 +229,8 @@ CASES = [
 
 # Append admission guards without removing or reordering the original58 case identities.
 PUBLIC_ADMISSION_CASES = [
-    ("public_provisional_classification", "crates/network-libp2p/src/peers/manager.rs", "self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)", "!self.peer_is_important(peer_id)", "delayed_protected_identity_preserves_public_admission"),
+    # Keep the library helper referenced while classifying provisional peers as ordinary.
+    ("public_provisional_classification", "crates/network-libp2p/src/peers/manager.rs", "self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)", "(self.peers.peer_has_confirmed_identity(peer_id) || std::hint::black_box(true)) && !self.peer_is_important(peer_id)", "delayed_protected_identity_preserves_public_admission"),
     ("public_aggregate_admission_bound", "crates/network-libp2p/src/peers/manager.rs", "|| self.peers.connected_peer_ids().count() > self.config.target_num_peers", "|| (std::hint::black_box(false) && self.peers.connected_peer_ids().count() > self.config.target_num_peers)", "provisional_public_admission_is_bounded_by_aggregate_target"),
     ("public_identity_promotion", "crates/network-libp2p/src/peers/manager.rs", "self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);\n            self.enforce_public_peer_limits();", "self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);", "public_identity_promotion_prunes_immediately"),
     ("public_expired_identity_promotion", "crates/network-libp2p/src/peers/manager.rs", "self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);\n            self.enforce_public_peer_limits();", "self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);", "public_identity_promotion_prunes_immediately"),
