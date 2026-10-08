@@ -565,9 +565,12 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
-    /// Whether a peer belongs to any tracked committee slot, for membership regression tests.
-    #[cfg(test)]
-    pub(super) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
+    /// Returns a boolean if the peer is a known validator.
+    ///
+    /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
+    /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
+    /// work.)
+    pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
         self.peers.is_peer_validator(peer_id)
     }
 
