@@ -5422,8 +5422,6 @@ dependencies = [
 [[package]]
 name = "libp2p-connection-limits"
 version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11b98b22c89fc70113a8988db523b0715e299c804e08da7eb20b8440b8249833"
 dependencies = [
  "libp2p-core",
  "libp2p-identity 0.3.0",
@@ -12179,6 +12177,7 @@ dependencies = [
  "rand 0.9.2",
  "reth-metrics",
  "serde",
+ "serde_json",
  "serde_with 2.3.3",
  "snap",
  "tempfile",

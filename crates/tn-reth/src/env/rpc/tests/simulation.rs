@@ -82,7 +82,7 @@ async fn test_rpc_simulation_epoch_fee_below_header() -> eyre::Result<()> {
     try_join_all(transports.into_iter().map(|rpc_args| async move {
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods = epoch_fee_methods(7, 1_000, rpc_args, &task_manager, &tmp_dir)?;
+        let (methods, _) = epoch_fee_methods(7, 1_000, rpc_args, &task_manager, &tmp_dir)?;
         let request = priced_transfer(7);
         try_join_all(
             tip_blocks().map(|block| assert_transfer_simulates(&methods, &request, block)),
@@ -103,7 +103,7 @@ async fn test_rpc_simulation_rejects_cap_below_epoch_fee() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(1_000, 7, Default::default(), &task_manager, &tmp_dir)?;
+    let (methods, _) = epoch_fee_methods(1_000, 7, Default::default(), &task_manager, &tmp_dir)?;
     let request = priced_transfer(7);
     try_join_all(
         tip_blocks().map(|block| assert_simulation_cap_rejected(&methods, &request, block)),
@@ -118,10 +118,8 @@ async fn test_rpc_simulation_preserves_historical_fee() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
-    let mut genesis = tn_types::test_genesis_at(0);
-    genesis.base_fee_per_gas = Some(1_000);
-    let chain: RethChainSpec = genesis.into();
+    let (methods, chain) =
+        epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
     let blocks =
         [BlockId::Number(BlockNumberOrTag::Number(0)), BlockId::from(chain.genesis_hash())];
     let request = priced_transfer(7);
@@ -138,7 +136,7 @@ async fn test_rpc_simulation_preserves_gasprice_and_state_override() -> eyre::Re
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
+    let (methods, _) = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
     let request = TransactionRequest { max_priority_fee_per_gas: Some(2), ..priced_transfer(9) };
     // Revert unless BASEFEE == 7 and GASPRICE == 9. This also proves all methods
     // execute the overridden code instead of the recipient's empty historical code.
@@ -181,7 +179,7 @@ async fn test_rpc_simulation_preserves_block_override() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
+    let (methods, _) = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
     let request = priced_transfer(1_000);
     let state = StateOverride::from_iter([(
         Address::repeat_byte(0x91),
@@ -217,7 +215,7 @@ async fn test_rpc_simulation_fill_preserves_explicit_cap() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
+    let (methods, _) = epoch_fee_methods(7, 1_000, Default::default(), &task_manager, &tmp_dir)?;
     let filled = methods.call("eth_fillTransaction", rpc_params![priced_transfer(7)]).await?;
     assert_filled_transfer(filled, 7, 0)
 }
@@ -307,7 +305,7 @@ async fn test_rpc_simulation_remaining_fee_decrease() -> eyre::Result<()> {
     try_join_all(cases.map(|(http, epoch_fee, cap)| async move {
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods = epoch_fee_methods(
+        let (methods, _) = epoch_fee_methods(
             epoch_fee,
             100,
             remaining_rpc_args(http, PendingBlockKind::Full),
@@ -332,7 +330,7 @@ async fn test_rpc_simulation_remaining_fee_increase() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         100,
         70,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -388,7 +386,7 @@ async fn test_rpc_simulation_remaining_fee_environments() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         70,
         100,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -458,7 +456,7 @@ async fn test_rpc_simulation_remaining_legacy_prices() -> eyre::Result<()> {
     request.max_fee_per_gas = None;
     request.max_priority_fee_per_gas = None;
     request.gas_price = Some(80);
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         70,
         100,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -475,7 +473,7 @@ async fn test_rpc_simulation_remaining_legacy_prices() -> eyre::Result<()> {
     )
     .await?;
     let tmp_dir = TempDir::new()?;
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         100,
         70,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -507,7 +505,7 @@ async fn test_rpc_simulation_multiple_blocks_and_validation_disabled() -> eyre::
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         70,
         100,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -571,7 +569,7 @@ async fn test_rpc_simulation_multiple_bundles() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         70,
         100,
         remaining_rpc_args(true, PendingBlockKind::Full),
@@ -628,7 +626,7 @@ async fn test_rpc_simulation_default_pending_errors() -> eyre::Result<()> {
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods(
+    let (methods, _) = epoch_fee_methods(
         70,
         100,
         remaining_rpc_args(true, PendingBlockKind::None),
@@ -720,7 +718,7 @@ async fn test_rpc_simulation_signed_bundle_fee_changes() -> eyre::Result<()> {
     try_join_all([(70, 100), (100, 70)].map(|(epoch_fee, header_fee)| async move {
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods = epoch_fee_methods_from_genesis(
+        let (methods, _) = epoch_fee_methods_from_genesis(
             epoch_fee,
             bundle_probe_genesis(header_fee)?,
             remaining_rpc_args(true, PendingBlockKind::Full),
@@ -784,7 +782,7 @@ async fn test_rpc_simulation_signed_bundle_overrides_and_history() -> eyre::Resu
     init_reth_defaults();
     let tmp_dir = TempDir::new()?;
     let task_manager = TaskManager::default();
-    let methods = epoch_fee_methods_from_genesis(
+    let (methods, _) = epoch_fee_methods_from_genesis(
         70,
         bundle_probe_genesis(100)?,
         remaining_rpc_args(true, PendingBlockKind::None),
