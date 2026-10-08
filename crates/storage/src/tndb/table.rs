@@ -74,7 +74,8 @@ struct Writer {
     /// Table directory holding the `data` log and the `btx/` index.
     dir: PathBuf,
     data: Pack<Vec<u8>>,
-    /// Created lazily on the first insert, once the encoded key length is known.
+    /// Opened with the table when it already has one (its header records the key length);
+    /// otherwise created on the first insert, once the encoded key length is known.
     idx: Option<BtreeIndex>,
 }
 
@@ -204,6 +205,10 @@ impl TnTable {
         )?;
         let data_view = data.view();
         let mut writer = Writer { dir, data, idx: None };
+        // A reopened table opens its index now, so its rows are readable before the first insert.
+        if let Some(ksize) = BtreeIndex::stored_ksize(writer.dir.join("btx"))? {
+            writer.index_mut(ksize)?;
+        }
         let published = writer.publish(&data_view);
         Ok(Self {
             inner: Arc::new(Inner {

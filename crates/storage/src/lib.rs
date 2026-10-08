@@ -47,6 +47,9 @@ pub mod pack_validate;
 /// The `redb`-backed database implementation (used by tests/benches and the `redb` feature; MDBX
 /// is the default consensus backend).
 pub mod redb;
+/// On-demand benchmarks replaying production's DB traffic (see `workload_bench.rs`).
+#[cfg(test)]
+mod workload_bench;
 
 pub mod tndb;
 
@@ -164,23 +167,21 @@ pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> Databas
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
     use tn_types::Database as _;
 
-    use crate::mdbx::database::MEGABYTE;
-
     // Test builds use smaller database sizes to allow parallel test execution.
     // These must still be large enough for long-running e2e tests (70s+ restart scenarios).
     cfg_if::cfg_if! {
         if #[cfg(any(test, feature = "test-utils"))] {
+            use crate::mdbx::database::MEGABYTE;
             const EPOCH_MAX: usize = 16 * MEGABYTE;
             const KAD_MAX: usize = 4 * MEGABYTE;
             const CACHE_MAX: usize = 32 * MEGABYTE;
             const GROWTH: usize = 4 * MEGABYTE;
             const CACHE_GROWTH: usize = 8 * MEGABYTE;
         } else {
-            const EPOCH_MAX: usize = 512 * MEGABYTE;
-            const KAD_MAX: usize = 64 * MEGABYTE;
-            const CACHE_MAX: usize = 1024 * MEGABYTE;
-            const GROWTH: usize = 8 * MEGABYTE;
-            const CACHE_GROWTH: usize = 64 * MEGABYTE;
+            use crate::mdbx::database::{
+                PROD_CACHE_GROWTH as CACHE_GROWTH, PROD_CACHE_MAX as CACHE_MAX,
+                PROD_EPOCH_MAX as EPOCH_MAX, PROD_GROWTH as GROWTH, PROD_KAD_MAX as KAD_MAX,
+            };
         }
     }
 

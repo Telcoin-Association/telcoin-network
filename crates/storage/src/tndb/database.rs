@@ -10,8 +10,9 @@
 //! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
 //!
 //! Scans are lazy: each `DBIter` owns a published snapshot of its table and a B+tree cursor,
-//! decoding every row straight from the index leaf and the log.  Not yet covered: pack compaction
-//! on clear, warm-start reads before the first insert, and durability-barrier tuning.
+//! decoding every row straight from the index leaf and the log.  A reopened table opens its index
+//! (and so serves reads) at once.  Not yet covered: pack compaction on clear, and
+//! durability-barrier tuning.
 
 use std::{
     cell::RefCell,
@@ -487,11 +488,62 @@ mod test {
         }
         let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
         db.open_table::<TestTable>().expect("reopen table");
-        // The index reopens on the first insert (reads before it are a known gap).
-        db.insert::<TestTable>(&1_000, &"new".to_string()).expect("insert after reopen");
+        // Readable at once, before any insert: point reads, scans in both directions, seeks.
         for i in 0..100u64 {
             assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")));
         }
+        assert!(!db.is_empty::<TestTable>());
+        let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
+        assert_eq!(keys, (0..100).collect::<Vec<_>>(), "a full ascending scan after reopen");
+        assert_eq!(db.reverse_iter::<TestTable>().next().map(|(k, _)| k), Some(99));
+        assert_eq!(db.last_record::<TestTable>(), Some((99, "v99".to_string())));
+        assert_eq!(db.record_prior_to::<TestTable>(&50).map(|(k, _)| k), Some(49));
+        // And writable: the reopened index takes new rows alongside the old ones.
+        db.insert::<TestTable>(&1_000, &"new".to_string()).expect("insert after reopen");
+        assert_eq!(db.get::<TestTable>(&1_000).expect("get"), Some("new".to_string()));
+        assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("v7".to_string()));
+        assert_eq!(db.iter::<TestTable>().count(), 101);
+    }
+
+    /// A full-memory `LayeredDatabase` over a reopened tndb loads every row into its memory layer
+    /// at `open_table` (its reads never reach the disk layer), so the rows must be readable from
+    /// tndb right after the reopen.
+    #[test]
+    fn test_tndb_layered_reopen_loads_rows() {
+        use crate::layered_db::LayeredDatabase;
+
+        let tmp = TempDir::with_prefix("tndb_layered_reopen").expect("temp dir");
+        {
+            let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("open tndb"), true);
+            db.open_table::<TestTable>().expect("open table");
+            for i in 0..500u64 {
+                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            }
+            // Dropping the last handle joins the background writer, so every insert is on disk.
+        }
+        let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("reopen tndb"), true);
+        db.open_table::<TestTable>().expect("reopen table");
+        assert_eq!(db.iter::<TestTable>().count(), 500, "every row loaded into the memory layer");
+        assert_eq!(db.get::<TestTable>(&321).expect("get"), Some("v321".to_string()));
+    }
+
+    /// A reopened table opens its index eagerly, so a corrupt index header fails the open (there
+    /// is no rebuild from the log yet) instead of surfacing at the first insert.
+    #[test]
+    fn test_tndb_reopen_corrupt_index_header_fails_open() {
+        let tmp = TempDir::with_prefix("tndb_corrupt_btx").expect("temp dir");
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open tndb");
+            db.open_table::<TestTable>().expect("open table");
+            db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
+        }
+        let index = tmp.path().join("TestTable").join("btx").join("index.btx");
+        let mut bytes = std::fs::read(&index).expect("read index");
+        bytes[30] ^= 0xFF; // inside the header's root-page field, under its CRC
+        std::fs::write(&index, bytes).expect("write index");
+
+        let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
+        assert!(db.open_table::<TestTable>().is_err(), "a corrupt index header must fail the open");
     }
 
     /// A second table for the cross-table tests.

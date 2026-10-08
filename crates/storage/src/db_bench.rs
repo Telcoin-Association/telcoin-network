@@ -10,7 +10,7 @@
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
 //! ```text
-//! cargo test -p tn-storage db_backend_comparison -- --ignored --nocapture --test-threads 1
+//! cargo test --release -p tn-storage db_backend_comparison -- --ignored --nocapture --test-threads 1
 //! ```
 //!
 //! ## What it models
@@ -18,20 +18,30 @@
 //! Values are sized [`ByteVec`] **proxies** for the real serialized records — the KV backends
 //! measure bytes, so a 1.5 KB blob stresses them exactly like a 1.5 KB `Certificate` without the
 //! heavy committee/BLS construction. Sizes: ~48 B index rows, ~1.5 KB certificates, ~256 KB batch
-//! bodies. Two tables exercise both `CompositeDatabase` routes: [`BenchEpoch`] (`Epoch` hint — the
-//! durable hot path) and [`BenchCache`] (`Cache` hint — the batch cache).
+//! bodies, in two tables: [`BenchEpoch`] (the durable hot path) and [`BenchCache`] (the batch
+//! cache).
 //!
 //! ## Caveats (printed with the results too)
 //!
-//! - `LayeredDatabase`/`CompositeDatabase` `commit()` is **async** — it queues the disk write and
-//!   returns. The real per-commit durability cost shows up under `durable_commits`, which awaits
-//!   the production async `persist()` barrier after each commit (the same barrier the proposer /
-//!   vote / certifier `await` before externalizing); `small_commits` is the same workload without
-//!   it, so the delta is the durability cost. (The test-only `sync_persist` — which polls with a
-//!   100 ms sleep — is deliberately NOT used here; it would measure the poll, not the barrier.)
-//! - Under `#[cfg(test)]` the MDBX env opens `SafeNoSync` (no per-commit `fsync`, see
-//!   `mdbx/database.rs`), so these numbers reflect the **test** durability mode, not production
-//!   fsync.
+//! - `LayeredDatabase` `commit()` is **async** — it queues the disk write and returns. The real
+//!   per-commit durability cost shows up under `durable_commits`, which awaits the production async
+//!   `persist()` barrier after each commit (the same barrier the proposer / vote / certifier
+//!   `await` before externalizing); `small_commits` is the same workload without it, so the delta
+//!   is the durability cost. (The test-only `sync_persist` — which polls with a 100 ms sleep — is
+//!   deliberately NOT used here; it would measure the poll, not the barrier.)
+//! - The `MDBX` columns open the way a test build does: `SafeNoSync` (no per-commit `fsync`, see
+//!   `mdbx/database.rs`) unless `TN_TEST_MDBX_SYNC` overrides it. The `MDBX-prod` columns open the
+//!   way a production binary does: `Durable` (an fsync per commit) and the production geometry (the
+//!   epoch environment's `PROD_*` sizes in `mdbx/database.rs`).
+//! - tndb and `Durable` MDBX (a `write_map` environment) make a commit durable the same way:
+//!   `msync(MS_SYNC)` (MDBX: the data pages, then the meta page), plus an `fsync` when the file
+//!   grew. A macOS `msync` doesn't flush the drive's cache, so there `Durable` costs MDBX little
+//!   over `SafeNoSync`; on Linux (production) `msync(MS_SYNC)` takes the filesystem's fsync path
+//!   and costs more, for tndb and MDBX alike. The MDBX page size follows the OS page size: 16 KiB
+//!   on Apple Silicon, 4 KiB on x86_64.
+//! - A tndb commit msyncs the value log of each table it wrote, then publishes the writes: real
+//!   durability in every build. Its `persist` is the trait's ready no-op, so raw tndb pays that
+//!   sync in `small_commits` as well as `durable_commits`.
 
 use std::{
     path::Path,
@@ -69,9 +79,9 @@ const SMALL_VAL: usize = 48; // index-row sized
 const CERT_VAL: usize = 1_536; // ~1.5 KB, certificate sized
 const BATCH_VAL: usize = 256 * 1024; // 256 KB, batch-body sized
 
-// The commit counts are kept modest because they dominate wall time on the disk backends (raw ReDB
-// is ~5 ms per durable commit — each is a full transaction). The relative signal is identical at
-// larger N — scale these up for more samples / heavier load.
+// The commit counts are kept modest because they dominate wall time on the raw disk backends (each
+// is a full, synced transaction). The relative signal is identical at larger N — scale these up
+// for more samples / heavier load.
 const SMALL_COMMITS: u64 = 500; // transactions, 3 small inserts each
 const DURABLE_COMMITS: u64 = 500; // same as SMALL_COMMITS, but + a `persist()` barrier per commit
 const CERT_ROWS: u64 = 5_000;
@@ -90,7 +100,7 @@ fn make_value(size: usize, seed: u64) -> ByteVec {
 
 /// Drive the production async `persist::<T>()` durability barrier to completion. Raw backends'
 /// default `persist` is a ready-`Ok` no-op (they are synchronously durable), so this is ~instant
-/// for them; the layered/composite backends await a real disk-commit ack. Driven on `rt` so the
+/// for them; the layered backends await a real disk-commit ack. Driven on `rt` so the
 /// sync harness can use the async production barrier — not the test-only `sync_persist`, which
 /// merely polls with a sleep.
 fn barrier<T: Table, DB: Database>(rt: &Runtime, db: &DB) {
@@ -328,10 +338,10 @@ impl BenchSuite {
     /// Print the side-by-side comparison (milliseconds; lower is better).
     fn report(&self) {
         let label_w = self.order.iter().map(|s| s.len()).max().unwrap_or(0).max("benchmark".len());
-        let cell_w = 12usize;
+        let cell_w = self.columns.iter().map(|(name, _)| name.len()).max().unwrap_or(0).max(12);
 
         println!("\n=== DB backend comparison (ms; lower is better) ===");
-        println!("legend: layered/composite commit() is async (see durable_commits); test-cfg MDBX is SafeNoSync (no fsync).");
+        println!("legend: layered commit() is async (see durable_commits); MDBX = test build (SafeNoSync, no fsync); MDBX-prod = production (Durable, prod geometry); tndb and Durable MDBX commit with msync.");
 
         // header
         print!("{:<label_w$}", "benchmark", label_w = label_w);
@@ -355,11 +365,9 @@ impl BenchSuite {
 
 // ---- backend construction (mirrors the module-local `open_*` helpers) ----
 
-use crate::{
-    composite_db::CompositeDatabase, layered_db::LayeredDatabase, mem_db::MemDatabase, ReDB,
-};
+use crate::{layered_db::LayeredDatabase, mem_db::MemDatabase, tndb::TnDatabase};
 
-/// Open both bench tables on `db`; `open_table` propagates through the layered/composite wrappers.
+/// Open both bench tables on `db`; `open_table` propagates through the layered wrapper.
 fn open_bench_tables<DB: Database>(db: &DB) {
     db.open_table::<BenchEpoch>().expect("open BenchEpoch");
     db.open_table::<BenchCache>().expect("open BenchCache");
@@ -371,30 +379,20 @@ fn build_mem() -> MemDatabase {
     db
 }
 
-fn build_redb(path: &Path) -> ReDB {
-    let db = ReDB::open(path).expect("open redb");
+fn build_tndb(path: &Path) -> TnDatabase {
+    let db = TnDatabase::open(path).expect("open tndb");
     open_bench_tables(&db);
     db
 }
 
-fn build_layered_redb(path: &Path) -> LayeredDatabase<ReDB> {
-    let db = LayeredDatabase::open(ReDB::open(path).expect("open redb"), true);
-    open_bench_tables(&db);
-    db
-}
-
-fn build_composite_redb(base: &Path) -> CompositeDatabase<ReDB> {
-    std::fs::create_dir_all(base).expect("create composite dir");
-    let epoch = ReDB::open(base.join("epoch")).expect("open redb epoch");
-    let kad = ReDB::open(base.join("kad")).expect("open redb kad");
-    let cache = ReDB::open(base.join("cache")).expect("open redb cache");
-    let db = CompositeDatabase::open(epoch, kad, cache);
+fn build_layered_tndb(path: &Path) -> LayeredDatabase<TnDatabase> {
+    let db = LayeredDatabase::open(TnDatabase::open(path).expect("open tndb"), true);
     open_bench_tables(&db);
     db
 }
 
 #[cfg(feature = "reth-libmdbx")]
-use crate::mdbx::database::{MdbxDatabase, MEGABYTE};
+use crate::mdbx::database::{MdbxDatabase, MEGABYTE, PROD_EPOCH_MAX, PROD_GROWTH};
 
 /// Generous single-env size — the bench holds ~50 MB of batch bodies plus the small/cert tables.
 #[cfg(feature = "reth-libmdbx")]
@@ -414,15 +412,36 @@ fn build_layered_mdbx(path: &Path) -> LayeredDatabase<MdbxDatabase> {
     db
 }
 
+/// Open an MDBX environment as a production binary does: `Durable` sync (MDBX's default, which
+/// `open` replaces with `SafeNoSync` in test builds), with the given geometry (pass one of the
+/// production environments' `PROD_*` sizes).
 #[cfg(feature = "reth-libmdbx")]
-fn build_composite_mdbx(base: &Path) -> CompositeDatabase<MdbxDatabase> {
-    std::fs::create_dir_all(base).expect("create composite dir");
-    let epoch =
-        MdbxDatabase::open(base.join("epoch"), 8, MDBX_SIZE, 8 * MEGABYTE).expect("mdbx epoch");
-    let kad = MdbxDatabase::open(base.join("kad"), 8, MDBX_SIZE, 8 * MEGABYTE).expect("mdbx kad");
-    let cache =
-        MdbxDatabase::open(base.join("cache"), 8, MDBX_SIZE, 8 * MEGABYTE).expect("mdbx cache");
-    let db = CompositeDatabase::open(epoch, kad, cache);
+pub(crate) fn open_mdbx_prod(
+    path: &Path,
+    max_tables: usize,
+    max_size: usize,
+    growth: usize,
+) -> MdbxDatabase {
+    MdbxDatabase::open_with_sync_mode(
+        path,
+        max_tables,
+        max_size,
+        growth,
+        reth_libmdbx::SyncMode::Durable,
+    )
+    .expect("open mdbx (durable)")
+}
+
+#[cfg(feature = "reth-libmdbx")]
+fn build_mdbx_prod(path: &Path) -> MdbxDatabase {
+    let db = open_mdbx_prod(path, 8, PROD_EPOCH_MAX, PROD_GROWTH);
+    open_bench_tables(&db);
+    db
+}
+
+#[cfg(feature = "reth-libmdbx")]
+fn build_layered_mdbx_prod(path: &Path) -> LayeredDatabase<MdbxDatabase> {
+    let db = LayeredDatabase::open(open_mdbx_prod(path, 8, PROD_EPOCH_MAX, PROD_GROWTH), true);
     open_bench_tables(&db);
     db
 }
@@ -430,7 +449,8 @@ fn build_composite_mdbx(base: &Path) -> CompositeDatabase<MdbxDatabase> {
 /// Compare every available consensus `Database` backend through the benchmark battery.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
-/// `cargo test -p tn-storage db_backend_comparison -- --ignored --nocapture --test-threads 1`.
+/// `cargo test --release -p tn-storage db_backend_comparison -- --ignored --nocapture
+/// --test-threads 1`.
 #[test]
 #[ignore = "on-demand DB performance comparison; run with --ignored --nocapture --test-threads 1"]
 fn db_backend_comparison() {
@@ -440,16 +460,19 @@ fn db_backend_comparison() {
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
 
     suite.run(&runtime, build_mem(), "MemDb");
-    suite.run(&runtime, build_redb(&base.join("redb")), "ReDB");
-    suite.run(&runtime, build_layered_redb(&base.join("redb_layered")), "Layered<ReDB>");
-    suite.run(&runtime, build_composite_redb(&base.join("redb_composite")), "Composite<ReDB>");
+    suite.run(&runtime, build_tndb(&base.join("tndb")), "TnDb");
+    suite.run(&runtime, build_layered_tndb(&base.join("tndb_layered")), "Layered<TnDb>");
 
     #[cfg(feature = "reth-libmdbx")]
     {
         suite.run(&runtime, build_mdbx(&base.join("mdbx")), "MDBX");
         suite.run(&runtime, build_layered_mdbx(&base.join("mdbx_layered")), "Layered<MDBX>");
-        // The production default: CompositeDatabase<MdbxDatabase>.
-        suite.run(&runtime, build_composite_mdbx(&base.join("mdbx_composite")), "Composite<MDBX>");
+        suite.run(&runtime, build_mdbx_prod(&base.join("mdbx_prod")), "MDBX-prod");
+        suite.run(
+            &runtime,
+            build_layered_mdbx_prod(&base.join("mdbx_prod_layered")),
+            "Layered<MDBX-prod>",
+        );
     }
 
     suite.report();
