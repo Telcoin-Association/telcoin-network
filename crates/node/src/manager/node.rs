@@ -1423,6 +1423,9 @@ where
         // so a zero replication interval fails here instead of panicking a critical network task.
         network_config.libp2p_config().validate()?;
 
+        // Include inactive configured workers: their swarms also live for the whole process.
+        network_config.validate_process_budget(workers.len().saturating_add(1))?;
+
         // Validate once before constructing any swarm. All workers and the primary
         // share this process-lifetime accounting instance, including across epochs.
         let source_budget =
