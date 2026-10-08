@@ -586,7 +586,6 @@ mod tests {
     /// A new record retires old endpoint hints without discarding real observations for bans.
     #[test]
     fn newer_record_retires_advertised_endpoints() {
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
         let old = Multiaddr::empty()
             .with(Protocol::Ip4([192, 0, 2, 1].into()))
