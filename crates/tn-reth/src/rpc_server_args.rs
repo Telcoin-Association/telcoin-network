@@ -40,10 +40,12 @@ use reth::{
         types::{MaxOr, MaxU32, ZeroAsNoneU64},
         RpcStateCacheArgs,
     },
-    rpc::builder::{constants, RethRpcModule, RpcModuleSelection},
+    rpc::builder::{constants, RpcModuleSelection},
 };
 use reth_cli_util::parse_ether_value;
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
+
+use crate::cli::SELECTABLE_MODULE_NAMES;
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -90,9 +92,10 @@ pub struct RpcServerArgs {
 
     /// Rpc Modules to be configured for the HTTP server
     ///
-    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
-    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
-    /// list every module by name instead.
+    /// `all`, or no flag, enables eth, net, web3, rpc, tn. An explicit list is served as
+    /// written, so include `tn` to keep the `tn_*` namespace, and `none` serves nothing. Name
+    /// debug and trace explicitly to enable them. A list whose first entry is `all` parses as
+    /// plain `all` and the rest is ignored, so list every module by name instead.
     #[arg(long = "http.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub http_api: Option<RpcModuleSelection>,
 
@@ -118,9 +121,10 @@ pub struct RpcServerArgs {
 
     /// Rpc Modules to be configured for the WS server
     ///
-    /// `all` enables eth, net, web3, rpc; name debug and trace explicitly to enable them.
-    /// A list whose first entry is `all` parses as plain `all` and the rest is ignored, so
-    /// list every module by name instead.
+    /// `all`, or no flag, enables eth, net, web3, rpc, tn. An explicit list is served as
+    /// written, so include `tn` to keep the `tn_*` namespace, and `none` serves nothing. Name
+    /// debug and trace explicitly to enable them. A list whose first entry is `all` parses as
+    /// plain `all` and the rest is ignored, so list every module by name instead.
     #[arg(long = "ws.api", value_parser = RpcModuleSelectionValueParser::default())]
     pub ws_api: Option<RpcModuleSelection>,
 
@@ -327,7 +331,7 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
             value.to_str().ok_or_else(|| clap::Error::new(clap::error::ErrorKind::InvalidUtf8))?;
         val.parse::<RpcModuleSelection>().map_err(|err| {
             let arg = arg.map(|a| a.to_string()).unwrap_or_else(|| "...".to_owned());
-            let possible_values = RethRpcModule::all_variant_names().to_vec().join(",");
+            let possible_values = SELECTABLE_MODULE_NAMES.join(",");
             let msg = format!(
                 "Invalid value '{val}' for {arg}: {err}.\n    [possible values: {possible_values}]"
             );
@@ -336,7 +340,7 @@ impl TypedValueParser for RpcModuleSelectionValueParser {
     }
 
     fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
-        let values = RethRpcModule::all_variant_names().iter().map(PossibleValue::new);
+        let values = SELECTABLE_MODULE_NAMES.iter().map(PossibleValue::new);
         Some(Box::new(values))
     }
 }

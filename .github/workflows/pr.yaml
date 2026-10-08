@@ -409,13 +409,32 @@ jobs:
   transport-evidence:
     uses: ./.github/workflows/transport-patches.yaml
 
+  # Guard: testing/quic-handshake profiles the node's QUIC TLS stack from a Cargo workspace of
+  # its own, so its lockfile resolves rustls and aws-lc independently of the node's. run.py
+  # refuses to measure when the two disagree, but the workflow that runs it is not behind
+  # `CI Success`: #1462 moved those crates in the merge group right after #1451 added the
+  # profile, the profile workflow failed there, and the queue merged it anyway. This lane makes
+  # the drift itself block the merge. Like transport evidence it runs for every author and on
+  # every change, not only on Cargo.lock: the merge group is where two such changes first meet,
+  # and the attested local suite does not run it.
+  # Parses two lockfiles and the profile's Cargo.toml - nothing is resolved or compiled, so no
+  # toolchain or cache is needed.
+  quic-profile-pins:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Assert the QUIC handshake profile pins the node's TLS crates
+        run: python3 -P testing/quic-handshake/run.py --check-versions
+
   # The one required status check, for branch protection and for the merge queue.
   ci-success:
     name: CI Success
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, transport-evidence]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -442,7 +461,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -478,6 +497,13 @@ jobs:
               *:transport-evidence:success) echo "  ok       ${job}" ;;
               *:transport-evidence:*)
                 echo "::error::transport-evidence: ${result}"
+                failed=1
+                ;;
+              # Never gated by ci-scope, so the maintainer bypass below must not accept a
+              # skip here either.
+              *:quic-profile-pins:success) echo "  ok       ${job}" ;;
+              *:quic-profile-pins:*)
+                echo "::error::quic-profile-pins: ${result}"
                 failed=1
                 ;;
               *:*:success) echo "  ok       ${job}" ;;
