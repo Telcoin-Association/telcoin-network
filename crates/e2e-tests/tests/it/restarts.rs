@@ -235,23 +235,30 @@ fn run_restart_tests_lagged1(
     );
     // Require state sync and a return to active consensus, even if catch-up finished before RPC
     // became available. Gate on the delayed downtime for parity with run_restart_tests1.
-    if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
-        wait_for_restart_catch_up(&client_urls[2], &metrics_addr).inspect_err(|e| {
+    let rejoined = || -> eyre::Result<()> {
+        if delay_secs >= RESTART_TEST_DOWNTIME_SECS {
+            wait_for_restart_catch_up(&client_urls[2], &metrics_addr).inspect_err(|e| {
+                error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
+            })?;
+        }
+        let bal =
+            get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
+        if expected != bal {
+            error!(target: "restart-test", "{expected} != {bal} - returning error!");
+            return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
+        }
+        wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
+            error!(target: "restart-test", ?e, "lagged validator did not rejoin active consensus");
+        })
+    };
+    // The caller only owns child2 on success, so every failure must stop it here.
+    match rejoined() {
+        Ok(()) => Ok(child2),
+        Err(e) => {
             kill_child(&mut child2);
-            error!(target: "restart-test", ?e, "restarted node did not complete state sync in restart_tests_lagged1");
-        })?;
+            Err(e)
+        }
     }
-    let bal = get_balance_above_with_retry(&client_urls[2], &to_account.to_string(), expected - 1)?;
-    if expected != bal {
-        error!(target: "restart-test", "{expected} != {bal} - returning error!");
-        return Err(Report::msg(format!("Expected a balance of {expected} got {bal}!")));
-    }
-
-    wait_for_node_mode(&client_urls[2], NodeMode::CvvActive).inspect_err(|e| {
-        error!(target: "restart-test", ?e, "lagged validator did not rejoin active consensus");
-        kill_child(&mut child2);
-    })?;
-    Ok(child2)
 }
 
 /// Run the second part of tests, broken up like this to allow more robust node shutdown.
@@ -492,7 +499,7 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
             .expect("Failed to get an ephemeral rpc port for child!");
         rpc_ports[i] = rpc_port;
         client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, test, 0));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, test, 0));
     }
 
     // Take child2 out of guard for restart testing
@@ -503,14 +510,14 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
         run_restart_tests_lagged1(
             &client_urls,
             &mut child2,
-            &bin,
+            bin,
             &temp_path,
             rpc_ports[2],
             delay,
             test,
         )
     } else {
-        run_restart_tests1(&client_urls, &mut child2, &bin, &temp_path, rpc_ports[2], delay, test)
+        run_restart_tests1(&client_urls, &mut child2, bin, &temp_path, rpc_ports[2], delay, test)
     };
     info!(target: "restart-test", "Ran restart tests 1: {res1:?}");
     let is_ok = res1.is_ok();
@@ -540,8 +547,8 @@ fn do_restarts(delay: u64, lagged: bool, test: &str) -> eyre::Result<()> {
 
     info!(target: "restart-test", "all nodes shutdown...restarting network");
     // Restart network
-    for i in 0..4 {
-        guard.replace(i, start_validator(i, &bin, &temp_path, rpc_ports[i], test, 3));
+    for (i, &rpc_port) in rpc_ports.iter().enumerate() {
+        guard.replace(i, start_validator(i, bin, &temp_path, rpc_port, test, 3));
     }
 
     info!(target: "restart-test", "Running restart tests 2");
@@ -633,20 +640,20 @@ fn test_restarts_observer() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    for (i, url) in client_urls.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
+        url.push_str(&format!(":{rpc_port}"));
         // The observer forwards accepted txns to the committee's advertised RPC
         // endpoints; without this each seal is refused with NotValidator and the txns
         // stay pending in the observer's pool until an endpoint is discoverable.
         advertise_worker_rpc(&temp_path, i, rpc_port)?;
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "observer", 0));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "observer", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for child!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "observer", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "observer", 0));
 
     // Guard cleanup handles all process shutdown on drop
     run_observer_tests(&client_urls, &obs_url)
@@ -702,17 +709,45 @@ fn test_blocks_same(client_urls: &[String; 4]) -> eyre::Result<()> {
     Ok(())
 }
 
-/// A validator starting alone at genesis must serve RPC through startup timeouts and join consensus
-/// when the rest of its committee starts. The name includes `test_epoch` for the Durable MDBX lane.
+/// Read the versioned network readiness snapshot with bounded connection and response waits.
+fn network_health_snapshot(addr: std::net::SocketAddr) -> eyre::Result<(u16, serde_json::Value)> {
+    use std::io::{Read as _, Write as _};
+
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
+    stream.set_read_timeout(Some(Duration::from_secs(5)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(1)))?;
+    stream.write_all(
+        b"GET /health/network HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+    )?;
+    let mut response = String::new();
+    stream.read_to_string(&mut response)?;
+    let (headers, body) = response
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| eyre::eyre!("network health response has no body separator"))?;
+    let status = headers
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .ok_or_else(|| eyre::eyre!("network health response has no status code"))?
+        .parse::<u16>()?;
+    serde_json::from_str(body).map(|snapshot| (status, snapshot)).map_err(Into::into)
+}
+
+/// A validator starting alone at genesis must serve RPC while reporting not-ready and join
+/// consensus when the rest of its committee starts. The name includes `test_epoch` for the Durable
+/// MDBX lane.
 #[test]
 #[ignore = "run with make test-epochs"]
 fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let temp = tempfile::TempDir::new()?;
     let log_dir = Path::new(&std::env::var("CARGO_MANIFEST_DIR")?).join("test_logs/cold_genesis");
-    let peer_readiness_wait = Duration::from_millis(500) * 240;
     let startup_sync_wait = Duration::from_secs(30);
     config_local_testnet(temp.path(), Some("restart_test".to_string()), None)?;
+    let health_port = get_available_tcp_port("127.0.0.1")
+        .ok_or_else(|| eyre::eyre!("no health port available for cold-genesis validator"))?;
+    let health_addr = std::net::SocketAddr::from(([127, 0, 0, 1], health_port));
+    let health_port_arg = health_port.to_string();
     let bin = e2e_tests::get_telcoin_network_binary();
     let rpc_ports = [
         get_available_tcp_port("127.0.0.1")
@@ -728,7 +763,15 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     let [alone_port, ..] = rpc_ports;
     let [alone_url, peer_url, ..] = &client_urls;
     let mut guard = ProcessGuard::empty();
-    guard.push(start_validator(0, bin, temp.path(), alone_port, "cold_genesis", 0));
+    guard.push(start_validator_with_args(
+        0,
+        bin,
+        temp.path(),
+        alone_port,
+        "cold_genesis",
+        0,
+        &["--healthcheck", &health_port_arg],
+    ));
 
     {
         let child = RefCell::new(
@@ -739,10 +782,10 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                 eyre::bail!("cold-genesis validator exited: {status} ({})", log_dir.display())
             })
         };
-        // Startup sync and primary-network readiness run before the worker creates its RPC
-        // server. With no peers, allow both waits to expire plus process-startup headroom.
+        // Startup sync runs before the worker creates its RPC server. Peerless networks
+        // report not-ready through the monitor without adding another startup wait.
         wait_until_blocking(
-            startup_sync_wait + peer_readiness_wait + Duration::from_secs(45),
+            startup_sync_wait + Duration::from_secs(45),
             &format!("cold-genesis RPC ready without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
@@ -757,16 +800,37 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
             },
         )?;
 
-        // Primary and worker readiness each wait 240 x 500ms. Observe beyond both waits plus the
-        // 30s startup-sync deadline, even if every stage spends its entire allowance without peers.
-        // Start this window after RPC is ready so slow process startup cannot shorten it.
-        let observation = peer_readiness_wait * 2 + startup_sync_wait;
+        // Keep observing disconnected primary and worker swarms across a monitor retry
+        // while RPC and the original process remain alive, then introduce the peers.
+        let observation = Duration::from_secs(5);
         let started = Instant::now();
         wait_until_blocking(
             observation + Duration::from_secs(30),
             &format!("cold-genesis RPC stays available without peers ({})", log_dir.display()),
             || {
                 check_alive()?;
+                let (status, snapshot) = network_health_snapshot(health_addr)?;
+                let disconnected = status == 503
+                    && snapshot.get("version").and_then(serde_json::Value::as_u64) == Some(1)
+                    && snapshot.get("status").and_then(serde_json::Value::as_str)
+                        == Some("not_ready")
+                    && snapshot
+                        .get("primary")
+                        .and_then(|primary| primary.get("status"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some("disconnected")
+                    && snapshot.get("workers").and_then(serde_json::Value::as_array).is_some_and(
+                        |workers| {
+                            !workers.is_empty()
+                                && workers.iter().all(|worker| {
+                                    worker
+                                        .get("connectivity")
+                                        .and_then(|connectivity| connectivity.get("status"))
+                                        .and_then(serde_json::Value::as_str)
+                                        == Some("disconnected")
+                                })
+                        },
+                    );
                 call_rpc::<String, _, _>(
                     alone_url,
                     "eth_blockNumber",
@@ -775,7 +839,7 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
                     "cold-genesis liveness",
                 )
                 .wrap_err("cold-genesis RPC stopped responding while alone")?;
-                Ok(started.elapsed() >= observation)
+                Ok(disconnected && started.elapsed() >= observation)
             },
         )?;
     }
@@ -785,6 +849,12 @@ fn test_epoch_cold_genesis_without_peers() -> eyre::Result<()> {
     });
     network_advancing(&client_urls)?;
     wait_for_node_mode(alone_url, NodeMode::CvvActive)?;
+    wait_until_blocking(Duration::from_secs(30), "cold-genesis network becomes reachable", || {
+        network_health_snapshot(health_addr).map(|(status, snapshot)| {
+            status == 200
+                && snapshot.get("status").and_then(serde_json::Value::as_str) == Some("reachable")
+        })
+    })?;
 
     // Active mode is optimistic. Require a transaction submitted by the original process to be
     // confirmed by a peer, then applied locally, to prove that consensus actually formed.
@@ -818,11 +888,11 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    for (i, url) in client_urls.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "late_join", 0));
+        url.push_str(&format!(":{rpc_port}"));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "late_join", 0));
     }
 
     // Wait for validators to produce blocks
@@ -850,7 +920,7 @@ fn test_observer_late_join_catchup() -> eyre::Result<()> {
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "late_join", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "late_join", 0));
 
     // Observer must catch up to at least the validator consensus height we recorded.
     // Guard cleanup handles all process shutdown on drop; on timeout the `?` surfaces the
@@ -891,16 +961,16 @@ fn test_observer_reconnect_after_pause() -> eyre::Result<()> {
         "http://127.0.0.1".to_string(),
         "http://127.0.0.1".to_string(),
     ];
-    for i in 0..4 {
+    for (i, url) in client_urls.iter_mut().enumerate() {
         let rpc_port = get_available_tcp_port("127.0.0.1")
             .expect("Failed to get an ephemeral rpc port for child!");
-        client_urls[i].push_str(&format!(":{rpc_port}"));
-        guard.push(start_validator(i, &bin, &temp_path, rpc_port, "reconnect", 0));
+        url.push_str(&format!(":{rpc_port}"));
+        guard.push(start_validator(i, bin, &temp_path, rpc_port, "reconnect", 0));
     }
     let obs_rpc_port = get_available_tcp_port("127.0.0.1")
         .expect("Failed to get an ephemeral rpc port for observer!");
     let obs_url = format!("http://127.0.0.1:{obs_rpc_port}");
-    guard.push(start_observer(4, &bin, &temp_path, obs_rpc_port, "reconnect", 0));
+    guard.push(start_observer(4, bin, &temp_path, obs_rpc_port, "reconnect", 0));
 
     // Wait for network to advance and observer to be in sync
     network_advancing(&client_urls)?;

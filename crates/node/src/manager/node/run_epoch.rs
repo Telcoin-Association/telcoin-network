@@ -12,8 +12,8 @@
 //! persist across epochs.
 //!
 //! The epoch-start setup and epoch-teardown sequences are split into the child `start` and `close`
-//! modules. This module also holds the helpers both of them call back into — `process_output`,
-//! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
+//! modules. This module also holds the helpers both of them call back into, `process_output` and
+//! `parse_listener_address_for_swarm`, plus the [`RunEpochMode`] /
 //! [`ReplayResult`] types that thread control flow through the loop.
 
 use crate::{
@@ -44,6 +44,10 @@ use tracing::{debug, error, info, warn};
 
 /// Name of the per-epoch [`TaskManager`], created fresh and torn down each epoch.
 const EPOCH_TASK_MANAGER: &str = "Epoch Task Manager";
+/// How long the epoch's tasks may take to exit on their own once the epoch's shutdown is signalled,
+/// before the rest are aborted. Matches the epoch task manager's join wait: epoch handoff must not
+/// wait long.
+const EPOCH_TASK_EXIT_GRACE: Duration = Duration::from_millis(200);
 
 /// Why `run_epoch` is being entered, and on exit what kind of transition just happened.
 ///
@@ -494,7 +498,11 @@ where
         // If the select exitted because of a join() then do not join() again- we are already
         // shutting down.
         consensus_shutdown.notify();
-        // abort all epoch-related tasks
+        // Give the epoch's tasks a short window to exit on their own first, so their graceful
+        // exits run (the consensus task seals its certificate pack and reports a queued save
+        // failure; the subscriber saves the outputs it already holds). Then abort whatever is
+        // still running.
+        epoch_task_manager.wait_for_exit(EPOCH_TASK_EXIT_GRACE).await;
         epoch_task_manager.abort_all_tasks();
         // Expect complaints from join so swallow those errors...
         // If we timeout here something is not playing nice and shutting down so return the

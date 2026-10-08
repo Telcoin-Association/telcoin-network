@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
     thread::available_parallelism,
 };
-use tn_config::{Config, KeyConfig, TelcoinDirs as _};
+use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
@@ -279,11 +279,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             Arc::new(tn_config.chain_spec()),
         );
 
+        // Refuse a second node on this datadir before opening the execution database a live node
+        // may hold; the node keeps the lock for its lifetime (handed over in the builder).
+        let pid_lock = PidLock::acquire(&tn_datadir)?;
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
             .with_state_export_keep(state_export_keep)
-            .with_bootstrap_peers(bootstrap_peers);
+            .with_bootstrap_peers(bootstrap_peers)
+            .with_pid_lock(pid_lock);
         builder.metrics = metrics;
         builder.healthcheck = healthcheck;
         builder.enable_state_export = enable_state_export;
