@@ -215,6 +215,10 @@ impl Node {
     /// Split a full leaf into `left` (rewritten in place) and `right` (fully written, minus the
     /// prev/next links which the caller fixes), inserting `(key, val)` at sorted slot `at`.
     /// Returns the separator key = right leaf's first key.  `right` may be any scratch buffer.
+    ///
+    /// The left keeps half the entries, or with `append` (the new key goes past the end of the
+    /// tree's rightmost leaf: `at` is the entry count) all of the old ones, so ascending inserts
+    /// fill leaves instead of leaving each half empty behind them.
     pub(crate) fn leaf_split(
         &self,
         left: &mut [u8],
@@ -222,6 +226,7 @@ impl Node {
         at: usize,
         key: &[u8],
         val: u64,
+        append: bool,
     ) -> Vec<u8> {
         let n = self.entry_count(left);
         let total = n + 1;
@@ -242,7 +247,8 @@ impl Node {
         }
         vals.insert(at, val);
 
-        let left_count = total.div_ceil(2);
+        debug_assert!(!append || at == n, "an append split inserts past the last entry");
+        let left_count = if append { n } else { total.div_ceil(2) };
         self.set_entry_count(left, left_count);
         for i in 0..left_count {
             self.set_leaf_key(left, i, &keys[i * z..(i + 1) * z]);
@@ -321,9 +327,27 @@ impl Node {
         self.set_entry_count(buf, n + 1);
     }
 
+    /// Remove child `ci` from an internal node, with the separator beside it: separator `ci − 1`
+    /// (or separator 0 when `ci` is 0), so the neighbouring child takes over its key range. The
+    /// node must hold at least one key (two children).
+    pub(crate) fn internal_remove_child(&self, buf: &mut [u8], ci: usize) {
+        let n = self.entry_count(buf);
+        debug_assert!(n >= 1 && ci <= n, "remove child {ci} of a node with {n} keys");
+        let z = self.ksize;
+        let k = ci.saturating_sub(1);
+        let ks = self.internal_keys_off;
+        buf.copy_within(ks + (k + 1) * z..ks + n * z, ks + k * z);
+        let cs = INTERNAL_CHILDREN_OFF;
+        buf.copy_within(cs + (ci + 1) * 4..cs + (n + 1) * 4, cs + ci * 4);
+        self.set_entry_count(buf, n - 1);
+    }
+
     /// Split a full internal node into `left` (rewritten in place) and `right` (fully written),
     /// inserting separator `sep`/right-child `rc` at key slot `at`.  Returns the median key that
     /// the caller lifts into the parent.  `right` may be any scratch buffer.
+    ///
+    /// The split is at the middle, or with `append` (on the tree's rightmost path: `sep` goes
+    /// last) just before the last key, so the left keeps all but one of the old keys.
     pub(crate) fn internal_split(
         &self,
         left: &mut [u8],
@@ -331,6 +355,7 @@ impl Node {
         at: usize,
         sep: &[u8],
         rc: u32,
+        append: bool,
     ) -> Vec<u8> {
         let n = self.entry_count(left);
         let z = self.ksize;
@@ -351,7 +376,8 @@ impl Node {
         }
         kids.insert(at + 1, rc);
 
-        let mid = total / 2;
+        debug_assert!(!append || at == n, "an append split inserts past the last key");
+        let mid = if append { total - 2 } else { total / 2 };
         let median = keys[mid * z..(mid + 1) * z].to_vec();
 
         // Left keeps keys[0..mid] and children[0..=mid], rewritten in place.

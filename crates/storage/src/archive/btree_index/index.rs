@@ -126,6 +126,9 @@ pub struct BtreeIndex {
     /// The lock-free reader view of the index file's mapping, shared with published snapshots.
     view: Arc<MapView>,
     _index_dir: PathBuf,
+    /// Test-only failure injector: the page allocation after this many more fails.
+    #[cfg(test)]
+    fail_allocs_after: Option<usize>,
 }
 
 /// Held by every [`IndexSnapshot`] of one published state; the index keeps only a `Weak` to it. Its
@@ -386,6 +389,8 @@ impl BtreeIndex {
             free: Vec::new(),
             view,
             _index_dir: dir.to_owned(),
+            #[cfg(test)]
+            fail_allocs_after: None,
         };
         // A cleanly-sealed tree's unreachable pages are free; an unclean one is rebuilt, not
         // trusted, and a read-only handle never allocates.
@@ -587,6 +592,13 @@ impl BtreeIndex {
     /// The page count only moves once the growth succeeded (a failed growth also poisons the file,
     /// so it never seals and is rebuilt on the next open).
     fn allocate_page(&mut self) -> Result<u32, io::Error> {
+        #[cfg(test)]
+        if let Some(left) = self.fail_allocs_after.as_mut() {
+            if *left == 0 {
+                return Err(io::Error::other("injected page allocation failure"));
+            }
+            *left -= 1;
+        }
         if self.free.is_empty() {
             self.reclaim();
         }
@@ -679,13 +691,15 @@ impl BtreeIndex {
     ) -> Result<(), AppendError> {
         let node = self.node;
         // Decide the action from a read-only view of the leaf.
-        let (found, at, full) = {
+        let (found, at, n) = {
             let buf = self.page(leaf_no).map_err(fetch_to_append)?;
+            let n = node.entry_count(buf);
             match node.leaf_search(buf, key) {
-                Ok(i) => (Some(i), 0usize, false),
-                Err(at) => (None, at, node.entry_count(buf) >= node.max_leaf_keys()),
+                Ok(i) => (Some(i), 0usize, n),
+                Err(at) => (None, at, n),
             }
         };
+        let full = n >= node.max_leaf_keys();
         if let Some(i) = found {
             // Duplicate key: overwrite the value in place; tree shape and count unchanged.
             {
@@ -706,11 +720,62 @@ impl BtreeIndex {
             self.header.values += 1;
             return Ok(());
         }
-        self.split_leaf(leaf_no, path, at, key, val)?;
+        // A full leaf splits. An insert past the end of the rightmost leaf is an append (ascending
+        // keys), whose split keeps the left pages full.
+        let append = at == n && self.is_rightmost(&path)?;
+        // Every page the split can need is allocated before anything changes, so a failed
+        // allocation (e.g. a full disk) leaves the tree as it was rather than half split.
+        let mut reserve = self.reserve_split_pages(&path)?;
+        self.split_leaf(leaf_no, path, at, key, val, append, &mut reserve)?;
+        debug_assert!(reserve.is_empty(), "the split used every reserved page");
         self.header.values += 1;
         Ok(())
     }
 
+    /// True if `path` is the tree's rightmost path (every step takes the last child).
+    fn is_rightmost(&self, path: &[(u32, usize)]) -> Result<bool, AppendError> {
+        for &(p, ci) in path {
+            if ci != self.node.entry_count(self.page(p).map_err(fetch_to_append)?) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Allocate every page splitting a full leaf on `path` can need: the new right leaf, a new
+    /// right page for each full internal page above it (the split climbs while parents are full),
+    /// and a new root if the root splits. On a failure the pages taken so far go back to the free
+    /// list and nothing else has changed.
+    fn reserve_split_pages(&mut self, path: &[(u32, usize)]) -> Result<Vec<u32>, AppendError> {
+        let node = self.node;
+        let mut needed = 1;
+        let mut root_splits = true;
+        for &(p, _) in path.iter().rev() {
+            if node.entry_count(self.page(p).map_err(fetch_to_append)?) < node.max_internal_keys() {
+                root_splits = false;
+                break;
+            }
+            needed += 1;
+        }
+        if root_splits {
+            needed += 1;
+        }
+        let mut pages = Vec::with_capacity(needed);
+        for _ in 0..needed {
+            match self.allocate_page() {
+                Ok(p) => pages.push(p),
+                Err(e) => {
+                    self.free.extend(pages);
+                    return Err(e.into());
+                }
+            }
+        }
+        Ok(pages)
+    }
+
+    /// Split the full leaf `leaf_no` (inserting `(key, val)` at `at`) using pages from `reserve`
+    /// (see [`Self::reserve_split_pages`]), then insert the separator up the `path`.
+    #[allow(clippy::too_many_arguments)]
     fn split_leaf(
         &mut self,
         leaf_no: u32,
@@ -718,17 +783,18 @@ impl BtreeIndex {
         at: usize,
         key: &[u8],
         val: u64,
+        append: bool,
+        reserve: &mut Vec<u32>,
     ) -> Result<(), AppendError> {
         let node = self.node;
-        // Allocate the right sibling first (may grow the file), then split.
-        let right_no = self.allocate_page()?;
+        let right_no = reserve.pop().expect("a reserved page for the right leaf");
 
         // Split the left leaf in place; build the right leaf in a scratch buffer. Leaves are not
         // linked (copy-on-write could not keep sibling links current), so both links stay null.
         let mut rbuf = vec![0_u8; PAGE_SIZE];
         let sep = {
             let left = self.page_mut(leaf_no).map_err(fetch_to_append)?;
-            let sep = node.leaf_split(left, &mut rbuf, at, key, val);
+            let sep = node.leaf_split(left, &mut rbuf, at, key, val, append);
             node.set_leaf_prev(left, NULL_PAGE);
             node.set_leaf_next(left, NULL_PAGE);
             zero_crc(left);
@@ -742,16 +808,19 @@ impl BtreeIndex {
             r.copy_from_slice(&rbuf);
         }
         self.synced = false;
-        self.insert_into_parent(path, sep, right_no)
+        self.insert_into_parent(path, sep, right_no, append, reserve)
     }
 
     /// Insert `(sep, right_no)` into the parent, splitting internal nodes and growing a new root
-    /// as needed.
+    /// as needed, with pages from `reserve`. `append` is set on the rightmost path (see
+    /// [`Node::internal_split`]).
     fn insert_into_parent(
         &mut self,
         mut path: Vec<(u32, usize)>,
         sep: Vec<u8>,
         right_no: u32,
+        append: bool,
+        reserve: &mut Vec<u32>,
     ) -> Result<(), AppendError> {
         let node = self.node;
         let mut sep = sep;
@@ -772,11 +841,11 @@ impl BtreeIndex {
             }
             // Internal node full: split it in place (right half to scratch) and propagate the
             // median.
-            let new_right_no = self.allocate_page()?;
+            let new_right_no = reserve.pop().expect("a reserved page for the right internal page");
             let mut qbuf = vec![0_u8; PAGE_SIZE];
             let median = {
                 let p = self.page_mut(pno).map_err(fetch_to_append)?;
-                let median = node.internal_split(p, &mut qbuf, ci, &sep, right_no);
+                let median = node.internal_split(p, &mut qbuf, ci, &sep, right_no, append);
                 zero_crc(p);
                 median
             };
@@ -789,7 +858,7 @@ impl BtreeIndex {
             right_no = new_right_no;
         }
         // Path exhausted with a pending split: grow a new root one level up.
-        let new_root_no = self.allocate_page()?;
+        let new_root_no = reserve.pop().expect("a reserved page for the new root");
         let old_root = self.header.root_page;
         {
             let r = self.page_mut(new_root_no).map_err(fetch_to_append)?;
@@ -813,61 +882,122 @@ impl BtreeIndex {
             Ok(_) => {}
         }
         let node = self.node;
-        let (leaf_no, _) = self.writable_path(key)?;
-        let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
-        let Ok(i) = node.leaf_search(buf, key) else {
-            return Err(AppendError::CorruptIndex("key vanished from its leaf".to_string()));
+        let (leaf_no, path) = self.writable_path(key)?;
+        let emptied = {
+            let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
+            let Ok(i) = node.leaf_search(buf, key) else {
+                return Err(AppendError::CorruptIndex("key vanished from its leaf".to_string()));
+            };
+            node.leaf_delete(buf, i);
+            zero_crc(buf);
+            node.entry_count(buf) == 0
         };
-        node.leaf_delete(buf, i);
-        zero_crc(buf);
         self.header.values -= 1;
         self.synced = false;
+        if emptied && !path.is_empty() {
+            self.unlink_emptied(leaf_no, path)?;
+        }
         Ok(true)
     }
 
+    /// Unlink the emptied page `emptied` from the tree: drop it from its parent on the writable
+    /// `path`, and the parent too while it was the only child, up the path (an emptied root becomes
+    /// an empty leaf); then collapse a root left with a single child. Pages on the path are fresh
+    /// private copies, so an unlinked one is free at once. Under-full pages are not merged; only
+    /// empty ones go, so the tree never keeps (or scans) pages that hold nothing.
+    fn unlink_emptied(
+        &mut self,
+        mut emptied: u32,
+        mut path: Vec<(u32, usize)>,
+    ) -> Result<(), AppendError> {
+        let node = self.node;
+        while let Some((parent, ci)) = path.pop() {
+            self.retire_page(emptied);
+            if node.entry_count(self.page(parent).map_err(fetch_to_append)?) > 0 {
+                let buf = self.page_mut(parent).map_err(fetch_to_append)?;
+                node.internal_remove_child(buf, ci);
+                zero_crc(buf);
+                return self.collapse_root();
+            }
+            // `emptied` was the parent's only child: the parent empties too.
+            emptied = parent;
+        }
+        // Every page on the path emptied, the root included: it becomes an empty leaf.
+        let root = self.header.root_page;
+        let buf = self.page_mut(root).map_err(fetch_to_append)?;
+        node.init_leaf(buf, NULL_PAGE, NULL_PAGE);
+        zero_crc(buf);
+        self.header.height = 1;
+        Ok(())
+    }
+
+    /// While the root is an internal page with a single child (no keys), make that child the root.
+    fn collapse_root(&mut self) -> Result<(), AppendError> {
+        let node = self.node;
+        while self.header.height > 1 {
+            let root = self.header.root_page;
+            let child = {
+                let buf = self.page(root).map_err(fetch_to_append)?;
+                if node.entry_count(buf) > 0 {
+                    break;
+                }
+                node.internal_child(buf, 0)
+            };
+            self.retire_page(root);
+            self.header.root_page = child;
+            self.header.height -= 1;
+        }
+        Ok(())
+    }
+
+    /// Take page `p` out of the working tree: free at once if no snapshot can see it (this handle
+    /// created it since the last publish), otherwise retired until no snapshot can reach it.
+    fn retire_page(&mut self, p: u32) {
+        if self.private.contains(p) {
+            self.free.push(p);
+        } else {
+            self.superseded.push(p);
+        }
+    }
+
+    /// The key-size check of the public point ops: `key` must be `ksize()` bytes.
+    fn key_size_ok(&self, key: &[u8]) -> Result<(), (usize, usize)> {
+        let expected = self.node.ksize();
+        if key.len() == expected {
+            Ok(())
+        } else {
+            Err((expected, key.len()))
+        }
+    }
+
     /// Remove `key` from the index. Returns `true` if the key was present and removed, `false` if
-    /// not found. No node merging is performed — underflowing leaves are left sparse.
+    /// not found. An emptied leaf is unlinked (see [`Self::unlink_emptied`]); under-full ones are
+    /// not merged. A key of the wrong size is an error.
     pub fn remove(&mut self, key: &[u8]) -> Result<bool, AppendError> {
         if self.read_only {
             return Err(AppendError::ReadOnly);
         }
-        debug_assert_eq!(
-            key.len(),
-            self.node.ksize(),
-            "key wrong size, expected {}, got {}",
-            self.node.ksize(),
-            key.len()
-        );
+        self.key_size_ok(key).map_err(|(expected, got)| AppendError::KeySize { expected, got })?;
         self.remove_kv(key)
     }
 
     // ---- point API (byte-slice keys; the index's key length is `ksize()`) ----
 
-    /// Save the file position `record_pos` for `key` (inserting or overwriting).
+    /// Save the file position `record_pos` for `key` (inserting or overwriting). A key of the
+    /// wrong size is an error.
     pub fn save(&mut self, key: &[u8], record_pos: u64) -> Result<(), AppendError> {
         if self.read_only {
             return Err(AppendError::ReadOnly);
         }
-        debug_assert_eq!(
-            key.len(),
-            self.node.ksize(),
-            "key wrong size, expected {}, got {}",
-            self.node.ksize(),
-            key.len()
-        );
+        self.key_size_ok(key).map_err(|(expected, got)| AppendError::KeySize { expected, got })?;
         self.synced = false;
         self.insert_kv(key, record_pos)
     }
 
-    /// Load the file position for `key`, or [`FetchError::NotFound`].
+    /// Load the file position for `key`, or [`FetchError::NotFound`]. A key of the wrong size is
+    /// an error.
     pub fn load(&self, key: &[u8]) -> Result<u64, FetchError> {
-        debug_assert_eq!(
-            key.len(),
-            self.node.ksize(),
-            "key wrong size, expected {}, got {}",
-            self.node.ksize(),
-            key.len()
-        );
+        self.key_size_ok(key).map_err(|(expected, got)| FetchError::KeySize { expected, got })?;
         self.get_value(key)
     }
 
@@ -1025,14 +1155,9 @@ impl BtreeIndex {
         self.header.values = 0;
         self.synced = false;
         for p in old.drain() {
-            let p = p as u32; // inserted as a u32 page number
-            if self.private.contains(p) {
-                // Never published, so no snapshot can reach it. It stays private (stamped at the
-                // next publish) until reused.
-                self.free.push(p);
-            } else {
-                self.superseded.push(p);
-            }
+            // A page never published goes straight to `free` (it stays private, stamped at the
+            // next publish, until reused); a published one waits until no snapshot can reach it.
+            self.retire_page(p as u32); // inserted as a u32 page number
         }
         Ok(())
     }
@@ -1584,6 +1709,19 @@ mod tests {
     /// the model on lookups and on forward, reverse and range scans.
     #[test]
     fn test_archive_btx_cow_matches_model() {
+        cow_matches_model(2, 3_000);
+    }
+
+    /// The model test with mostly removals over few keys, so leaves keep emptying (and are
+    /// unlinked, the root collapsing and regrowing) between snapshots.
+    #[test]
+    fn test_archive_btx_cow_matches_model_heavy_removals() {
+        cow_matches_model(5, 600);
+    }
+
+    /// Random ops over `key_space` keys, `removes_in_8` of every 8 a remove (see
+    /// [`test_archive_btx_cow_matches_model`]).
+    fn cow_matches_model(removes_in_8: u64, key_space: u64) {
         use std::{collections::BTreeMap, ops::Bound};
 
         let tmp = TempDir::with_prefix("test_archive_btx_model").expect("temp dir");
@@ -1604,8 +1742,8 @@ mod tests {
         };
         for round in 0..30 {
             for _ in 0..400 {
-                let k = key_of(rand() % 3_000);
-                if rand() % 4 == 0 {
+                let k = key_of(rand() % key_space);
+                if rand() % 8 < removes_in_8 {
                     let had = model.remove(&k).is_some();
                     assert_eq!(idx.remove(&k).expect("remove"), had);
                 } else {
@@ -1625,7 +1763,7 @@ mod tests {
             rev.reverse();
             assert_eq!(scan_src(&snap, true, Bound::Unbounded, Bound::Unbounded), rev);
             assert_eq!(snap.len(), model.len());
-            let (a, b) = (key_of(rand() % 3_000), key_of(rand() % 3_000));
+            let (a, b) = (key_of(rand() % key_space), key_of(rand() % key_space));
             let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
             let fwd: Vec<_> = model.range(lo..hi).map(|(k, v)| (k.to_vec(), *v)).collect();
             assert_eq!(
@@ -2128,5 +2266,185 @@ mod tests {
             BtreeIndex::open_btx_file(&dir, &data_header, 32, true),
             Err(LoadHeaderError::InvalidIndexGeometry)
         ));
+    }
+
+    // ---- split failures, emptied leaves, append splits, key sizes ----
+
+    /// A `ksize`-byte key whose leading big-endian `u64` orders it numerically.
+    fn wide_key(i: u64, ksize: usize) -> Vec<u8> {
+        let mut k = vec![0_u8; ksize];
+        k[..8].copy_from_slice(&i.to_be_bytes());
+        k
+    }
+
+    fn open_ksize(tmp: &TempDir, ksize: u16) -> BtreeIndex {
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        BtreeIndex::open_btx_file(tmp.path().join("idx"), &data_header, ksize, false).expect("open")
+    }
+
+    /// Every `(key, position)` of the working tree, in order.
+    fn entries(idx: &BtreeIndex) -> Vec<(Vec<u8>, u64)> {
+        idx.iter().expect("iter").map(|item| item.expect("scan step")).collect()
+    }
+
+    /// Average leaf fill: stored keys over leaf capacity.
+    fn leaf_fill(idx: &BtreeIndex) -> f64 {
+        let (mut leaves, mut keys) = (0_usize, 0_usize);
+        for p in
+            idx.tree_pages(idx.header.root_page, idx.header.height, false).expect("walk").drain()
+        {
+            let buf = idx.page(p as u32).expect("page");
+            if idx.node.is_leaf(buf) {
+                leaves += 1;
+                keys += idx.node.entry_count(buf);
+            }
+        }
+        keys as f64 / (leaves * idx.node.max_leaf_keys()) as f64
+    }
+
+    /// An insert whose split cascade fails to allocate a page part-way changes nothing: the tree
+    /// keeps exactly its previous entries (no orphaned half), at every failure point.
+    #[test]
+    fn test_archive_btx_split_failure_leaves_tree_intact() {
+        use std::collections::BTreeMap;
+
+        // The widest key: two keys per page, so cascades several levels deep come quickly.
+        const KSIZE: usize = 2032;
+        let tmp = TempDir::with_prefix("btx_split_failure").expect("temp dir");
+        let mut idx = open_ksize(&tmp, KSIZE as u16);
+        let mut model: BTreeMap<Vec<u8>, u64> = BTreeMap::new();
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for n in 0..300_u64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let key = wide_key(if n % 3 == 0 { n } else { x % 100_000 }, KSIZE);
+            // Entries as (key number, position), for readable failures.
+            let numbered = |entries: Vec<(Vec<u8>, u64)>| -> Vec<(u64, u64)> {
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (u64::from_be_bytes(k[..8].try_into().expect("8 bytes")), v))
+                    .collect()
+            };
+            for fail_at in 0.. {
+                idx.fail_allocs_after = Some(fail_at);
+                let result = idx.save(&key, n);
+                idx.fail_allocs_after = None;
+                if result.is_ok() {
+                    break;
+                }
+                let expect: Vec<_> = model.iter().map(|(k, v)| (k.clone(), *v)).collect();
+                assert_eq!(
+                    numbered(entries(&idx)),
+                    numbered(expect),
+                    "failure at allocation {fail_at} of insert {n}"
+                );
+                assert_eq!(idx.len(), model.len());
+            }
+            model.insert(key, n);
+            if n % 50 == 49 {
+                drop(idx.publish());
+            }
+        }
+        assert!(idx.height() >= 5, "the test reaches deep cascades");
+        let expect: Vec<_> = model.into_iter().collect();
+        assert_eq!(entries(&idx), expect);
+    }
+
+    /// Ascending keys with the oldest removed (a sliding window): emptied leaves are unlinked and
+    /// their pages reused, so the tree stays the size of the window, not of every key ever written.
+    #[test]
+    fn test_archive_btx_fifo_removal_keeps_tree_bounded() {
+        const WINDOW: u64 = 1_000;
+        let tmp = TempDir::with_prefix("btx_fifo").expect("temp dir");
+        let mut idx = open_ksize(&tmp, 8);
+        for i in 0..200_000_u64 {
+            idx.save(&i.to_be_bytes(), i).expect("save");
+            if i >= WINDOW {
+                assert!(idx.remove(&(i - WINDOW).to_be_bytes()).expect("remove"));
+            }
+            if i % 100 == 0 {
+                drop(idx.publish());
+            }
+        }
+        assert!(idx.page_count() < 100, "{} pages for a {WINDOW}-key window", idx.page_count());
+        let expect: Vec<_> =
+            (200_000 - WINDOW..200_000).map(|i| (i.to_be_bytes().to_vec(), i)).collect();
+        assert_eq!(entries(&idx), expect);
+
+        // A clean reopen walks the shrunken tree and serves the same entries.
+        idx.sync().expect("sync");
+        drop(idx);
+        let idx = open_ksize(&tmp, 8);
+        assert_eq!(entries(&idx), expect);
+    }
+
+    /// Removing every key empties leaves, collapses the root and leaves a working empty tree; the
+    /// tree then refills correctly, with snapshots of each state intact throughout.
+    #[test]
+    fn test_archive_btx_remove_all_collapses_and_refills() {
+        let tmp = TempDir::with_prefix("btx_remove_all").expect("temp dir");
+        let mut idx = open_ksize(&tmp, 8);
+        for round in 0..3_u64 {
+            for i in 0..5_000_u64 {
+                idx.save(&(i * 7 % 5_000).to_be_bytes(), i + round).expect("save");
+            }
+            let full = idx.publish();
+            assert!(idx.height() >= 2);
+            for i in 0..5_000_u64 {
+                assert!(idx.remove(&(i * 3 % 5_000).to_be_bytes()).expect("remove"));
+            }
+            assert!(idx.is_empty());
+            assert_eq!(idx.height(), 1, "an emptied tree collapses to one leaf");
+            assert!(entries(&idx).is_empty());
+            // The snapshot published before the removals still reads every key.
+            assert_eq!(full.len(), 5_000);
+            assert!(full.load(&4_999_u64.to_be_bytes()).is_ok());
+        }
+    }
+
+    /// A key of the wrong size is an error from every point op (in release builds too), not a
+    /// panic or a silent miss.
+    #[test]
+    fn test_archive_btx_wrong_key_size_is_an_error() {
+        let tmp = TempDir::with_prefix("btx_key_size").expect("temp dir");
+        let mut idx = open_ksize(&tmp, 32);
+        let short = [7_u8; 31];
+        assert!(matches!(idx.save(&short, 1), Err(AppendError::KeySize { expected: 32, got: 31 })));
+        assert!(matches!(idx.load(&short), Err(FetchError::KeySize { expected: 32, got: 31 })));
+        assert!(matches!(
+            idx.remove(&[7_u8; 33]),
+            Err(AppendError::KeySize { expected: 32, got: 33 })
+        ));
+        assert!(!idx.contains(&short));
+        assert!(idx.is_empty(), "nothing was written");
+    }
+
+    /// Ascending inserts (and a sorted rebuild) fill pages nearly full; random inserts keep the
+    /// usual split.
+    #[test]
+    fn test_archive_btx_append_split_fills_pages() {
+        let tmp = TempDir::with_prefix("btx_append").expect("temp dir");
+        let mut ascending = open_ksize(&tmp, 8);
+        for i in 0..100_000_u64 {
+            ascending.save(&i.to_be_bytes(), i).expect("save");
+        }
+        assert!(leaf_fill(&ascending) > 0.95, "ascending fill {}", leaf_fill(&ascending));
+
+        let entries: Vec<_> = (0..100_000_u64).map(|i| (i.to_be_bytes(), i)).collect();
+        ascending.rebuild_from(entries).expect("rebuild");
+        assert!(leaf_fill(&ascending) > 0.95, "sorted rebuild fill {}", leaf_fill(&ascending));
+
+        let tmp = TempDir::with_prefix("btx_random").expect("temp dir");
+        let mut random = open_ksize(&tmp, 8);
+        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
+        for _ in 0..100_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            random.save(&x.to_be_bytes(), x).expect("save");
+        }
+        let fill = leaf_fill(&random);
+        assert!((0.55..0.9).contains(&fill), "random fill {fill}");
     }
 }

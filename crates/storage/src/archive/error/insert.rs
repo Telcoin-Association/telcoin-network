@@ -24,6 +24,13 @@ pub enum AppendError {
     },
     /// Attempted to insert a duplicate key to an index.
     DuplicateKey,
+    /// The key is not the index's fixed key size. A caller error: nothing was written.
+    KeySize {
+        /// The index's key size in bytes.
+        expected: usize,
+        /// The size of the key given.
+        got: usize,
+    },
     /// CRC problem, some index types might need this.
     CrcError,
     /// A structural on-disk index value was out of range while rewriting the index (bad bucket
@@ -44,6 +51,9 @@ impl fmt::Display for AppendError {
                 write!(f, "record size {size} exceeds the maximum {max}")
             }
             Self::DuplicateKey => write!(f, "duplicate key"),
+            Self::KeySize { expected, got } => {
+                write!(f, "key is {got} bytes, the index's keys are {expected}")
+            }
             Self::CrcError => write!(f, "crc error"),
             Self::CorruptIndex(e) => write!(f, "corrupt index: {e}"),
         }

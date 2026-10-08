@@ -291,7 +291,7 @@ impl BtreeIndex {
 
     /// Ascending iterator over all keys sharing the given byte `prefix` (a prefix longer than
     /// `ksize()` is truncated to `ksize()`).
-    pub fn prefix(&mut self, prefix: &[u8]) -> Result<BtreeIter<'_>, FetchError> {
+    pub fn prefix(&self, prefix: &[u8]) -> Result<BtreeIter<'_>, FetchError> {
         let ksize = self.ksize();
         let plen = prefix.len().min(ksize);
         // Lower bound: the prefix padded with zero bytes (smallest key with this prefix).

@@ -525,7 +525,8 @@ where
                 | AppendError::ReadOnly
                 | AppendError::CrcError
                 | AppendError::CorruptIndex(_)
-                | AppendError::DuplicateKey => {}
+                | AppendError::DuplicateKey
+                | AppendError::KeySize { .. } => {}
             }
         }
         result

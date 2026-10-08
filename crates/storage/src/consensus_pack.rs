@@ -3912,6 +3912,7 @@ pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
         | FetchError::IO(_)
         | FetchError::CrcFailed
         | FetchError::CorruptIndex(_)
+        | FetchError::KeySize { .. }
         | FetchError::RequestedSizeTooLarge(_, _)
         | FetchError::RequestedDecompressSizeTooLarge(_) => false,
     }

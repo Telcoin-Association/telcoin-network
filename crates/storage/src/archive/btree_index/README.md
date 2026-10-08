@@ -60,8 +60,11 @@ Users: `tndb::table` (each tndb table's index), the `pack-btree` column of
   marker) and it is stamped once, at publish/sync, instead of on every write.
 - **Derived, rebuildable.** It is synced only at an explicit `sync()` or a clean close. After a crash
   its owner rebuilds it from the data log (`rebuild_from`) and calls `mark_consistent()`.
-- **No sibling links, no merges.** Scans move between leaves through their parents; removal leaves
-  sparse leaves behind rather than merging.
+- **No sibling links; empty pages unlinked, no merges.** Scans move between leaves through their
+  parents. A removal that empties a leaf unlinks it (and any parent it empties, collapsing the root);
+  under-full leaves are not merged.
+- **Splits cannot fail half-way.** A split reserves every page it can need before changing anything,
+  and ascending inserts use an append split that keeps pages full.
 
 ---
 
@@ -149,9 +152,10 @@ All writes take `&mut self` (one writer). Each write first makes the root-to-lea
 |---|---|
 | **lookup** (`load`, `contains`) | Descend from the root: in each internal page binary-search the separators (`internal_child_index`), follow the child; binary-search the leaf. Bounded by `MAX_DEPTH` (48) descents. |
 | **insert** (`save`) | `writable_path(key)`, then: duplicate key → overwrite the value in place (count unchanged); room in the leaf → shift and insert; full leaf → split. |
-| **leaf split** | Allocate a right page; the left keeps `ceil((n+1)/2)` entries, the right the rest; the separator is the right leaf's first key. The separator and right child go up into the parent (`insert_into_parent`). |
-| **internal split** | When the parent is full: split it around the median (left keeps keys `[0, mid)`, right `[mid+1, …)`), lift the median, repeat upward. A split of the root grows a new root (`height += 1`). |
-| **remove** | Look the key up first, so a miss copies nothing; otherwise make the path writable and delete from the leaf. **No merging or rebalancing**: under-full leaves stay sparse (the tree stays balanced in height). |
+| **split reservation** | Before a split changes anything, `reserve_split_pages` allocates every page it can need: the right leaf, one per full internal page above it, and a new root if the root splits. If an allocation fails (e.g. a full disk), the pages go back to the free list and the tree is unchanged; with the reservation made, the split cannot fail part-way. |
+| **leaf split** | The left keeps `ceil((n+1)/2)` entries, the right the rest; the separator is the right leaf's first key. The separator and right child go up into the parent (`insert_into_parent`). **Append split:** when the key goes past the end of the tree's rightmost leaf (ascending inserts, sorted rebuilds), the left keeps all its entries and the new key starts the right leaf, so pages fill instead of being left half empty. |
+| **internal split** | When the parent is full: split it around the median (left keeps keys `[0, mid)`, right `[mid+1, …)`), lift the median, repeat upward; on the rightmost path (append) the split is just before the last key. A split of the root grows a new root (`height += 1`). |
+| **remove** | Look the key up first, so a miss copies nothing; otherwise make the path writable and delete from the leaf. If that **empties the leaf**, it is unlinked: removed from its parent with the separator beside it (`Node::internal_remove_child`), cascading while a parent loses its only child (an emptied root becomes an empty leaf), then the root collapses while it has a single child (`height -= 1`). Unlinked pages are private copies, so they are free at once. Under-full leaves are **not merged**; the tree stays balanced in height. Without the unlinking, ascending keys with old ones removed (a sliding window) would leave a growing trail of empty leaves that every scan from the start walks. |
 | **clear** | Copy-on-write: a fresh empty root leaf becomes the working root; the old tree's pages are retired (reused once no snapshot can reach them; immediately if never published). |
 | **rebuild_from** | `reset_empty` (truncate the file to a fresh empty tree, synced; refused while any snapshot is alive), then insert every `(key, position)`. Feeding keys in sorted order gives a sequential build. |
 
@@ -353,7 +357,7 @@ Public (`pub`) unless marked crate-internal.
 | item | description |
 |---|---|
 | `BtreeIndex::open_btx_file(dir, &DataHeader, ksize, read_only)` | open or create `dir/index.btx` |
-| `save(&mut, key, pos)` / `load(&, key)` / `contains(&, key)` / `remove(&mut, key) -> bool` | point ops on `&[u8]` keys of length `ksize()` (debug-asserted) |
+| `save(&mut, key, pos)` / `load(&, key)` / `contains(&, key)` / `remove(&mut, key) -> bool` | point ops on `&[u8]` keys of length `ksize()` (another length is a `KeySize` error) |
 | `save_digest` / `load_digest` / `remove_digest` | `B256` adapters (32-byte index) |
 | `impl Index<[u8; 32], u64>` | the generic point-index trait (`save`/`load`/`sync`/`contains`) for 32-byte keys |
 | `iter` / `rev_iter` / `range` / `rev_range` / `prefix` | sorted iteration over the writer's tree (`BtreeIter`) |
@@ -377,8 +381,8 @@ Public (`pub`) unless marked crate-internal.
 | type | from | notable variants |
 |---|---|---|
 | `LoadHeaderError` | `open_btx_file` | `IO`, `CrcFailed`, `InvalidType`, `InvalidIndexVersion`, `InvalidIndexUID`, `InvalidIndexAppNum`, `InvalidIndexGeometry` (geometry mismatch, implausible header, or a short file), `ReadOnlyEmpty` |
-| `FetchError` | reads | `NotFound` (a miss, not an error condition), `CorruptIndex(msg)` (out-of-tree page, zero-CRC page not written by this handle, depth exceeded, bad walk), `IO`, `CrcFailed` |
-| `AppendError` | writes | `ReadOnly`, `CorruptIndex`, `CrcError`, `WriteDataError(io)` (a failed growth also poisons the file, so it is never sealed) |
+| `FetchError` | reads | `NotFound` (a miss, not an error condition), `KeySize { expected, got }` (a key that is not `ksize` bytes), `CorruptIndex(msg)` (out-of-tree page, zero-CRC page not written by this handle, depth exceeded, bad walk), `IO`, `CrcFailed` |
+| `AppendError` | writes | `ReadOnly`, `KeySize { expected, got }`, `CorruptIndex`, `CrcError`, `WriteDataError(io)` (a failed growth also poisons the file, so it is never sealed; a failed split changes nothing) |
 | `CommitError` | `sync` | `ReadOnly`, `IndexFileSync(io)` |
 
 ---
@@ -386,8 +390,9 @@ Public (`pub`) unless marked crate-internal.
 ## Limits and non-goals
 
 - **Fixed-size keys only** (1 to 2032 bytes), **`u64` values only**.
-- **No node merging** on removal: heavy delete workloads leave sparse leaves. Since pages are reused
-  and owners rebuild, there is no compaction pass.
+- **No node merging** on removal: emptied leaves are unlinked, but under-full ones stay sparse (a
+  random-delete workload can leave pages part full). Pages are reused and owners rebuild, so there
+  is no compaction pass.
 - **No sibling links:** leaf-to-leaf movement goes through parents (O(height) per leaf boundary,
   amortized O(1) per entry).
 - **Page size is a compile-time constant** (4096) and is checked against the header.
@@ -414,6 +419,13 @@ Tests live in `index.rs` (`test_archive_btx_*`) and `iter.rs`:
   released out of order; `clear` retires the old tree; reopen recovers free pages; reset is refused
   with a live snapshot;
 - `rebuild_from`, `remove`, the CRC regime and rebuild;
+- an allocation failure at every point of deep split cascades leaves the tree unchanged;
+- a sliding window of ascending keys keeps the tree the size of the window (emptied leaves
+  unlinked, pages reused), across a clean reopen; removing every key collapses the tree to one leaf,
+  with earlier snapshots intact, and it refills;
+- ascending inserts and sorted rebuilds fill leaves above 95%, while random inserts keep the usual
+  split; the model test also runs with mostly removals over few keys;
+- a wrong-size key is a `KeySize` error from every point op;
 - iteration: sorted forward and reverse order, ranges, prefixes, and an empty tree.
 
 ```text
