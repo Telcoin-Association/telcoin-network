@@ -9,11 +9,11 @@ Every validator joins the network under a specific **stake version**. Each versi
 | `stakeAmount`       | Exact TEL a validator must stake to join   |
 | `minWithdrawAmount` | Minimum claimable reward threshold         |
 | `epochIssuance`     | Total TEL distributed as rewards per epoch |
-| `epochDuration`     | Length of each epoch                       |
+| `epochDuration`     | Length of each epoch in seconds            |
 
 Governance can create new versions by calling `upgradeStakeVersion()`. The new version takes effect next epoch. Validators who already staked retain the version they joined under by default -- their `stakeVersion` is set at stake time and does not change automatically.
 
-A validator (or its delegator) can move to a newer version in-place by calling `upgradeValidatorStakeVersion()`. Upgrades are one-way -- only to a strictly newer version -- and are available while the validator is `Staked`, `PendingActivation`, or `Active`. If the new version requires more stake, the caller must send the exact deficit; if it requires less, the surplus is refunded to the reward recipient.
+A validator (or its delegator) can move to a newer version in-place by calling `requestStakeVersionChange(validatorAddress, targetVersion)`. Upgrades are one-way -- only to a strictly newer version -- and are available while the validator is `Staked`, `PendingActivation`, or `Active`. A `Staked` validator moves at once. For a validator in service (`PendingActivation` or `Active`) the request is queued and settles at an epoch boundary: an increase at the end of the epoch in which it was requested, a decrease one epoch later. If the new version requires more stake, the caller must send the exact deficit with the request, and the registry holds it until the change settles. If it requires less, the surplus goes to the reward recipient: a `Staked` validator's surplus is paid at once, and a queued change credits it for withdrawal with `claimRefund()`. `cancelStakeVersionChange(validatorAddress)` withdraws a queued request and returns any deficit paid.
 
 ### How Rewards Are Calculated
 
@@ -156,7 +156,7 @@ With a uniform version, the stake amount is irrelevant to relative distribution.
 
 ### Key Takeaways
 
-* A validator's stake version is set at the time of staking and only changes if the validator (or its delegator) opts into an in-place upgrade to a newer version via `upgradeValidatorStakeVersion()`.
+* A validator's stake version is set at the time of staking and only changes if the validator (or its delegator) opts into an in-place upgrade to a newer version via `requestStakeVersionChange()`.
 * In a **uniform committee** (all same version), rewards depend only on consensus header production.
 * In a **mixed committee**, validators on higher-stake versions earn proportionally more per header.
 * If the stake **increases**, new validators have higher weight and earn more per header than legacy validators.
