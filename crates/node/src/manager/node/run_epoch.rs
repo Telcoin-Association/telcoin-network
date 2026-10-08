@@ -12,8 +12,8 @@
 //! persist across epochs.
 //!
 //! The epoch-start setup and epoch-teardown sequences are split into the child `start` and `close`
-//! modules. This module also holds the helpers both of them call back into — `process_output`,
-//! `parse_listener_address_for_swarm`, `wait_for_network_peers` — plus the [`RunEpochMode`] /
+//! modules. This module also holds the helpers both of them call back into, `process_output` and
+//! `parse_listener_address_for_swarm`, plus the [`RunEpochMode`] /
 //! [`ReplayResult`] types that thread control flow through the loop.
 
 use crate::{

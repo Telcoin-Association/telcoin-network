@@ -696,9 +696,18 @@ Enable a TCP health check for load balancers and monitoring:
 telcoin-network node --healthcheck 8080
 ```
 
-The endpoint binds to `0.0.0.0` on the specified port. Any TCP connection receives an `HTTP/1.1 200 OK` response with body `OK`, then the connection closes.
+The endpoint binds to `0.0.0.0` on the specified port and serves three HTTP routes before closing each connection:
 
-Warning: This endpoint has no connection limits or rate limiting. Place it behind a firewall and do not expose it to the public internet.
+| Request path | Response | Meaning |
+| --- | --- | --- |
+| `/health/network` | Versioned JSON, `503` while not-ready and `200` when reachable | The primary and every configured worker swarm must each have an established peer. Reports aggregate reachability, configured worker ids, per-swarm probe status and established-peer counts. |
+| `/health/workers` | Versioned JSON, always `200` | Worker 0's RPC transaction acceptance. Gateways read `accepting_transactions` to decide whether to forward transactions. |
+| Other paths, including `/` | `200 OK` with body `OK` | Process liveness. |
+
+Network reachability is sampled every five seconds with bounded probes and served from a cache; it can recover after peers become reachable without restarting the node.
+It does not certify consensus or synchronization readiness, and is separate from transaction acceptance.
+
+Warning: This endpoint accepts connections from any source, exposes established-peer counts, and has no connection limits or rate limiting. Place it behind a firewall and do not expose it to the public internet.
 
 ### Log verbosity
 
