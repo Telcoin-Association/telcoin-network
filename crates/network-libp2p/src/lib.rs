@@ -25,6 +25,7 @@ mod metrics;
 mod peers;
 mod quic_incoming;
 mod record_exchange;
+mod retention;
 mod service_class;
 pub mod stream;
 mod sync;
