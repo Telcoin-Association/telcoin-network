@@ -29,7 +29,7 @@ use tokio::{
     },
     time::error::Elapsed,
 };
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 /// Depth of the bounded `sync_output` queue.
 ///
@@ -43,7 +43,19 @@ use tracing::{error, warn};
 /// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
 /// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
 /// 2.5 s of subscriber work at 7-13 ms per saved output.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+pub const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+/// Depth of the bounded `consensus_output` queue.
+///
+/// `consensus_output` is a bounded mpsc: once this many outputs are queued, the subscriber's
+/// `send().await` waits for the epoch manager to receive one, and the epoch manager in turn waits
+/// on the bounded engine queue (`to_engine`). A broadcast here would drop the oldest outputs once
+/// the subscriber ran a ring ahead of the engine, and the epoch manager would exit on the resulting
+/// gap.
+///
+/// Items are full [`ConsensusOutput`]s, so the depth caps the memory held between the subscriber
+/// and the epoch manager: about 125 MB at the hardware-requirements benchmark's 1.0-1.25 MB
+/// average output, 550 MB at its 5.5 MB maximum.
+const CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 /// Capacity for the `exex_certificates` broadcast.
 ///
 /// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
@@ -52,8 +64,8 @@ const EXEX_CERTIFICATES_CHANNEL_CAPACITY: usize = 1_000;
 /// Capacity for the `exex_consensus_output` broadcast.
 ///
 /// Items are full [`ConsensusOutput`]s. ExEx handles `Lagged` natively (surfaced as
-/// `TnExExNotification::Lagged` reconciliation), so match the engine's `consensus_output`
-/// capacity instead of buffering hundreds of MB for a slow ExEx.
+/// `TnExExNotification::Lagged` reconciliation), so match the depth of the engine-bound
+/// `consensus_output` queue instead of buffering hundreds of MB for a slow ExEx.
 const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
@@ -206,11 +218,22 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         Ok(self.channel.send(value).await?)
     }
 
+    /// Queue `value` without waiting, or drop it while no receiver is subscribed.
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
+        self.try_send_outcome(value).map(|_outcome| ())
+    }
+
+    /// Queue `value` like [`TnSender::try_send`], and report
+    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed, so the network
+    /// layer counts the drop as shed instead of as forwarded.
+    fn try_send_outcome(
+        &self,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(tn_types::TrySendOutcome::Unsubscribed);
         }
-        Ok(self.channel.try_send(value)?)
+        Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
     }
 }
 
@@ -317,9 +340,12 @@ pub struct ConsensusBusAppInner {
     /// non-active nodes. A bounded queue (`SYNC_OUTPUT_CHANNEL_CAPACITY`), so a subscriber that
     /// falls behind blocks the producer instead of losing outputs.
     sync_output: QueChannel<ConsensusOutput>,
-    /// Broadcast the latest output from consensus after committing to the subdag.
-    /// Engine consumes and executes to extend canonical chain.
-    consensus_output: broadcast::Sender<ConsensusOutput>,
+    /// Saved consensus outputs on their way to execution.
+    ///
+    /// The subscriber sends each output once it is saved; the epoch manager receives it and
+    /// forwards it to the engine. Bounded by `CONSENSUS_OUTPUT_CHANNEL_CAPACITY`, so a slow epoch
+    /// manager blocks the subscriber instead of losing outputs.
+    consensus_output: QueChannel<ConsensusOutput>,
 
     /// Broadcast channel for verified certificates (ExEx).
     ///
@@ -433,7 +459,7 @@ impl ConsensusBusApp {
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
         let sync_output = QueChannel::with_capacity(SYNC_OUTPUT_CHANNEL_CAPACITY);
-        let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
+        let consensus_output = QueChannel::with_capacity(CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (exex_certificates, _) = broadcast::channel(EXEX_CERTIFICATES_CHANNEL_CAPACITY);
         let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
@@ -613,8 +639,9 @@ impl ConsensusBusApp {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
-    /// Broadcast channel with consensus output (includes the consensus chain block).
-    /// This also provides the ConsesusHeader, use this for block execution.
+    /// Bounded queue carrying saved consensus outputs (each includes its consensus chain block) to
+    /// the epoch manager, which forwards them to the engine for execution. `send().await` waits
+    /// while the epoch manager is a full queue behind; with no subscriber a send is a no-op.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
         &self.inner.consensus_output
     }
@@ -707,8 +734,15 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscription (Receiver) for consensus output.
+    ///
+    /// Outputs a previous subscriber left queued are discarded, so the new subscriber only sees
+    /// what its own producer sends. Only one subscription can be live at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the previous subscription has not been dropped yet.
     pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
-        self.inner.consensus_output.subscribe()
+        self.inner.consensus_output.subscribe_fresh()
     }
 
     /// Provide a subscription(Receiver) to verified sync consensus outputs.
@@ -922,19 +956,35 @@ impl ConsensusBusApp {
         } else {
             consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
         };
-        if let Some(previous_epoch_record) = maybe_previous {
-            if let Some(epoch_record) =
-                consensus_chain.epochs().record_by_epoch(current_epoch).await
-            {
-                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
-                // If the pack file is missing or incomplete request it.
-                // Note since we have an epoch record this is a past epoch
-                // not the current epoch.
-                if !contains_final_header {
-                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
-                }
-            }
+        let Some(previous_epoch_record) = maybe_previous else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: previous epoch record is missing"
+            );
+            return;
+        };
+        let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_epoch).await
+        else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch record is missing"
+            );
+            return;
+        };
+        // If the pack file is missing or incomplete request it.
+        // Note since we have an epoch record this is a past epoch
+        // not the current epoch.
+        if consensus_chain.is_epoch_complete(&epoch_record).await {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch pack is already complete"
+            );
+            return;
         }
+        self.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
     }
 
     /// Retrieve the next request to down load an epoch pack file.
@@ -1254,14 +1304,18 @@ mod exex_receiver_count_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConsensusBusApp, QueChannel, SYNC_OUTPUT_CHANNEL_CAPACITY};
+    use super::{
+        ConsensusBusApp, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
+        SYNC_OUTPUT_CHANNEL_CAPACITY,
+    };
     use std::{collections::VecDeque, task::Poll, time::Duration};
     use tn_types::{
         CommittedSubDag, ConsensusHeaderDigest, ConsensusOutput, TnReceiver as _, TnSender as _,
         TryRecvError, TrySendError,
     };
 
-    /// The smallest output that can sit in `sync_output`; only its number matters here.
+    /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
+    /// matters here.
     fn output(number: u64) -> ConsensusOutput {
         ConsensusOutput::new(
             CommittedSubDag::default(),
@@ -1343,6 +1397,75 @@ mod tests {
         drop(rx);
         let mut rx = bus.subscribe_sync_output();
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// `consensus_output` is a bounded queue: once full it reports `Full`, a further send waits
+    /// for the epoch manager to receive, and every output then arrives in order. A broadcast here
+    /// would overwrite the oldest unread outputs instead.
+    #[tokio::test]
+    async fn consensus_output_is_bounded_backpressured_queue() {
+        const CAPACITY: u64 = CONSENSUS_OUTPUT_CHANNEL_CAPACITY as u64;
+        let bus = ConsensusBusApp::new();
+        let mut rx = bus.subscribe_consensus_output();
+        for number in 1..=CAPACITY {
+            assert!(
+                bus.consensus_output().try_send(output(number)).is_ok(),
+                "output {number} fits"
+            );
+        }
+        assert!(matches!(
+            bus.consensus_output().try_send(output(CAPACITY + 1)),
+            Err(TrySendError::Full(_))
+        ));
+
+        // the next send waits for room instead of dropping or overwriting anything
+        let next = bus.consensus_output().send(output(CAPACITY + 1));
+        tokio::pin!(next);
+        assert!(futures::poll!(next.as_mut()).is_pending(), "a send into a full queue waits");
+
+        // one recv frees a slot and the waiting send completes
+        assert_eq!(rx.recv().await.map(|received| received.number()), Some(1));
+        assert!(matches!(futures::poll!(next.as_mut()), Poll::Ready(Ok(()))));
+        for expected in 2..=CAPACITY + 1 {
+            assert_eq!(rx.try_recv().map(|received| received.number()), Ok(expected));
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// With no subscriber a `consensus_output` send is a no-op: more sends than the queue holds
+    /// all complete without waiting, and a later subscription starts empty.
+    #[tokio::test]
+    async fn consensus_output_send_without_subscriber_is_noop() {
+        let bus = ConsensusBusApp::new();
+        for number in 1..=CONSENSUS_OUTPUT_CHANNEL_CAPACITY as u64 + 1 {
+            let sent = tokio::time::timeout(
+                Duration::from_secs(1),
+                bus.consensus_output().send(output(number)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("send {number} without a subscriber waited"));
+            assert!(sent.is_ok(), "send {number} without a subscriber succeeds");
+        }
+
+        let mut rx = bus.subscribe_consensus_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A new `consensus_output` subscription starts empty: outputs a previous epoch manager left
+    /// unread are discarded rather than handed to the next epoch, and what is sent afterwards
+    /// arrives.
+    #[test]
+    fn consensus_output_resubscribe_discards_leftovers() {
+        let bus = ConsensusBusApp::new();
+        let rx = bus.subscribe_consensus_output();
+        assert!(bus.consensus_output().try_send(output(1)).is_ok());
+        assert!(bus.consensus_output().try_send(output(2)).is_ok());
+        drop(rx);
+
+        let mut rx = bus.subscribe_consensus_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(bus.consensus_output().try_send(output(3)).is_ok());
+        assert_eq!(rx.try_recv().map(|received| received.number()), Ok(3));
     }
 
     /// `subscribe_fresh` drops what a previous subscriber left unread and then delivers what is
