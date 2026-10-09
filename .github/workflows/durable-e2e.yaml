@@ -98,9 +98,9 @@ jobs:
           import hashlib
           from pathlib import Path
           root = Path("tools/ci119-verification")
-          pins = {"1476-ci119-full-verify.py": "e33a6225a46130adfaf96f8af4b8f30c7a6cc1168821f2a2556a46c6cd70d022",
+          pins = {"1476-ci119-full-verify.py": "bb6fbe61e3bb0c096b442871efe3424c518136d70494e84d6cb9285bf2ee902e",
                   "1476-ci119-publication.py": "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664",
-                  "1476-ci119-helper-inputs.json": "9b433e33e3885123481d8a2bf0459a724cf6e404ea0074a4ecb1088f69e05567"}
+                  "1476-ci119-helper-inputs.json": "5d219ef618d162d8716be3351b64ba9c5d1232211674c50d64040fe4d5365f62"}
           for name, expected in pins.items():
               path = root / name
               if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -114,7 +114,7 @@ jobs:
         run: >-
           python3 -B -I tools/ci119-verification/1476-ci119-full-verify.py
           --manifest tools/ci119-verification/1476-ci119-helper-inputs.json
-          --manifest-sha256 9b433e33e3885123481d8a2bf0459a724cf6e404ea0074a4ecb1088f69e05567
+          --manifest-sha256 5d219ef618d162d8716be3351b64ba9c5d1232211674c50d64040fe4d5365f62
           --source-checkout "$GITHUB_WORKSPACE/qualification-source"
       - name: Retain exact public bundle and bounded independent proof
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

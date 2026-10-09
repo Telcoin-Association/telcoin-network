@@ -136,7 +136,7 @@ def main():
         "--artifacts-metadata", paths["quic_artifacts"], "--artifact-metadata", paths["quic_artifact"],
         "--source-pins", paths["quic_source_pins"], "--verifier", paths["quic_verifier"],
         "--prior-preparation", paths["quic_prior_preparation"], "--output", quic_metadata)
-    run("quic_acquirer", "--evidence-dir", quic_dir, "--metadata", quic_metadata)
+    run("quic_acquirer", "--evidence-dir", quic_dir, "--metadata", paths["quic_artifact"])
     quic_proof = work / "quic-proof.json"
     run("quic_verifier", "--repo", args.source_checkout, "--evidence-dir", quic_dir,
         "--prior-result", paths["quic_prior_result"], "--prior-verifier", paths["quic_prior_verifier"], "--output", quic_proof)
