@@ -2,13 +2,13 @@
   "capacity_run_id": 37940162416,
   "changed_destination_set_relative_to_parent": [
     ".github/workflows/durable-e2e.yaml",
-    "tools/ci119-verification/1476-ci119-full-verify.py",
     "tools/ci119-verification/1476-ci119-helper-inputs.json",
-    "tools/ci119-verification/1476-ci119-publication.py"
+    "tools/ci119-verification/1476-ci119-publish-evidence.proposed.py",
+    "tools/ci119-verification/1476-ci119-stream-qualified-evidence-v3.proposed.py"
   ],
   "execution_boundary": "Actual binary SHA map and all current archive proofs are generated only on the authenticated runner. No local pending map is a proof.",
   "helper_destination": "tools/ci119-verification/1476-ci119-helper-inputs.json",
-  "helper_parent": "ac54c8bc102d13fb5ce81538e09db52b16c53246",
+  "helper_parent": "096ec2fe8433d904d963febc72b22b243e4be192",
   "pending_roles": [],
   "publication_branch": "evidence/hub-capacity-1476-37940162416",
   "publication_default": false,
@@ -96,8 +96,8 @@
     "full_verifier": {
       "helper_destination": "tools/ci119-verification/1476-ci119-stream-qualified-evidence-v3.proposed.py",
       "name": "1476-ci119-stream-qualified-evidence-v3.proposed.py",
-      "sha256": "5bcde47856090f11c8ecc2bd2683728b321448647bdfc009bb2c0c74a30cc18e",
-      "source_path": "/private/tmp/1476-ci119-stream-qualified-evidence-v3.proposed.source-ready.py"
+      "sha256": "6564b20e292941dc5dd890b761166dcee364b2707408e790d7fec6314a8873d1",
+      "source_path": "/private/tmp/1476-ci119-stream-qualified-evidence-v3.profile-path-v2.source-ready.py"
     },
     "mutation_acquirer": {
       "helper_destination": "tools/ci119-verification/mutation-acquire.py",
@@ -148,8 +148,8 @@
     "publisher": {
       "helper_destination": "tools/ci119-verification/1476-ci119-publish-evidence.proposed.py",
       "name": "1476-ci119-publish-evidence.proposed.py",
-      "sha256": "89154bc2c6a2af0220144838e1d6df54cb28dda9898b0d0bebd17ffb25134e21",
-      "source_path": "/private/tmp/1476-ci119-publish-evidence.proposed.source-ready.py"
+      "sha256": "a9cad66e1b86a2d0bd0e465e23a150f5790214b0daafaf643ed55bb4f57c8348",
+      "source_path": "/private/tmp/1476-ci119-publish-evidence.profile-path-v2.source-ready.py"
     },
     "publisher_tests": {
       "helper_destination": "tools/ci119-verification/1476-ci119-publisher-test.py",

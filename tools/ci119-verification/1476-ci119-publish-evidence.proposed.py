@@ -135,7 +135,13 @@ def main():
     artifact_names = {phase: phase_artifacts(root, phase, document) for phase, document in evidence.items()}
     source_hashes, scorer_source = verify_source(root, plan, args.source_checkout.resolve(),
                                                 args.qualification_revision)
-    scorer_path = root / "source/qualify.py"
+    scorer_path = owned_file(args.source_checkout.resolve() / "tools/hub-capacity", "qualify.py")
+    cached_profile = owned_file(scorer_path.parent, "profile-v1.json")
+    if any(parent.is_symlink() for parent in cached_profile.parents) or cached_profile.stat().st_size > 1024**2:
+        raise ValueError("trusted checkout profile cache is symlinked or exceeds one MiB")
+    with cached_profile.open("rb") as incoming:
+        if incoming.read(1024**2 + 1) != owned_file(root, "source/profile-v1.json").read_bytes():
+            raise ValueError("trusted checkout profile cache differs from Git-authenticated retained source")
     scorer = types.ModuleType("retained_scorer")
     scorer.__file__ = str(scorer_path)
     exec(compile(scorer_source, str(scorer_path), "exec"), scorer.__dict__)
