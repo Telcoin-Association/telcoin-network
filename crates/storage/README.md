@@ -102,10 +102,10 @@ type is `Send + Sync + Clone`.
 **Open doors:**
 | door | mode | on damage |
 |------|------|-----------|
-| `open_append` | writable, creates | header-only ⇒ write+fsync meta; then recover |
-| `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes) |
+| `open_append` | writable, creates | header-only ⇒ write+fsync meta; an existing meta must match the chain-derived one on the fields `verify_epoch_meta` authenticates (epochs, start number, genesis states, committee BLS keys), else refuses without writing a meta; then recover. The rest of the on-disk committee is not compared, and the opened pack keeps the chain-derived meta |
+| `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes); loads the on-disk meta, so after a restart an imported epoch's committee fields outside the BLS keys are the peer's copy again, even if `open_append` reopened it with the chain-derived one |
 | `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; **refuses** (→ `db repair`) if the data log itself is torn |
-| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2, from a v1/v2 source; a v0 source is refused as `InvalidVersion`, no penalty). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic |
+| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2, from a v1/v2 source; a v0 source is refused as `InvalidVersion`, no penalty). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic. A later `open_append` of the epoch compares only that authenticated subset, so the peer's other fields never block the reopen |
 
 ### 5. Recovery model — four invariants
 

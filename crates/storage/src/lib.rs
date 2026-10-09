@@ -30,7 +30,7 @@ mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
-/// `LayeredDatabase`: a write-through in-memory layer plus a shared write-txn guard over a backend.
+/// `LayeredDatabase`: a write-behind memory layer whose writer thread commits to a backend.
 pub mod layered_db;
 /// The reth MDBX key/value backend (the default `Database` backend).
 #[cfg(feature = "reth-libmdbx")]
@@ -124,7 +124,8 @@ pub mod tables {
         CertificateDigestByOrigin;crate::CERTIFICATE_DIGEST_BY_ORIGIN_CF;TableHint::Epoch;<(AuthorityIdentifier, Round), HeaderDigest>,  // Cleared every epoch
         ProposedCertificates;crate::PROPOSED_CERTIFICATES_CF;TableHint::Epoch;<HeaderDigest, Certificate>,  // Cleared every epoch
         Payload;crate::PAYLOAD_CF;TableHint::Epoch;<(BlockHash, WorkerId), PayloadToken>,  // Cleared every epoch
-        // This is a cache to store this nodes batches before consensus, remove once in a ConsensusHeader.
+        // Cache of current-epoch batches until consensus commits them. A batch is evicted once the output
+        // committing it is saved to the consensus pack (`process_output`); the rest are cleared at epoch close.
         NodeBatchesCache;crate::NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
         // Cache batches we produce until they are accepted (they will move to NodeBatchesCache once accepted).
         OurNodeBatchesCache;crate::OUR_NODE_BATCHES_CACHE_CF;TableHint::Cache;<BlockHash, Batch>,
