@@ -1136,10 +1136,9 @@ impl AllPeers {
     ///
     /// No trust flag is stored on peers: a member's validator exemption is derived live from the
     /// three committee slots (issue #715), so overwriting the slots is itself the demotion - a
-    /// member absent from all three slots re-enters ordinary load scoring immediately, while
-    /// operator-allowlisted peers keep their exemption regardless. Members of the new committees
-    /// whose network identity is known have load-only bans forgiven and scores primed to max;
-    /// recorded protocol failures and their bans survive membership changes and rediscovery;
+    /// member absent from all three slots re-enters protocol scoring immediately, while
+    /// operator-allowlisted peers retain their load exemption. Members of the new committees
+    /// whose network identity is known have all reputation bans forgiven and scores primed to max;
     /// a member appearing in more than one committee is processed once.
     pub(super) fn update_committees(
         &mut self,
@@ -1170,8 +1169,8 @@ impl AllPeers {
     /// update follows shortly after via `update_committees`.
     ///
     /// Because validator exemption is derived from the slots, members not already in a slot are
-    /// NOT load-exempt during this window (intentional: exemption only ever follows
-    /// authoritative slot state). Load-only bans are forgiven; protocol bans remain. The exemption
+    /// NOT score-exempt during this window (intentional: exemption only ever follows
+    /// authoritative slot state). Existing reputation bans are forgiven. The exemption
     /// begins when `update_committees` writes the slots.
     pub(super) fn mark_committee_for_dial(
         &mut self,
@@ -1204,7 +1203,7 @@ impl AllPeers {
     ///
     /// Called from the discovery path ([`super::manager::PeerManager::add_known_peer`]) after a
     /// peer is re-keyed onto its `Confirmed` identity. If the member belongs to any tracked
-    /// committee slot its load-only ban is forgiven and score primed, closing the window for
+    /// committee slot its reputation ban is forgiven and score primed, closing the window for
     /// members that were tracked by [`Self::update_committees`] before their [PeerId] was known
     /// (the validator exemption itself derives from the slots, so it already applies). A no-op
     /// for peers that are not in any tracked committee.
@@ -1224,10 +1223,10 @@ impl AllPeers {
     /// Operates per [BlsPublicKey] against the existing `Confirmed` peer records: a member with no
     /// record yet (its libp2p [PeerId] has not been discovered) is skipped here and handled later
     /// via [`Self::apply_membership_if_committee`]. For members with a record, the banned status
-    /// is forgiven only for load history, with matching score and IP-ban bookkeeping. Recorded
-    /// protocol penalties survive. No trust flag is stored: the member's load exemption follows
-    /// the committee slots, so protocol failures remain scoreable (members of the pre-dial
-    /// path may not be in a slot yet; their exemption begins once `update_committees` lands).
+    /// is forgiven for both load and protocol history, with matching score and IP-ban bookkeeping.
+    /// No trust flag is stored: the member's scoring exemption follows the committee slots.
+    /// Members of the pre-dial path may not be in a slot yet; their exemption begins once
+    /// `update_committees` lands.
     /// Returns the unban actions for the manager to apply; the committee slots are owned by the
     /// callers.
     fn apply_committee_membership(
@@ -1241,7 +1240,6 @@ impl AllPeers {
             let peer_id = self
                 .peers
                 .get(&identity)
-                .filter(|peer| peer.permits_load_forgiveness())
                 .and_then(|peer| peer.peer_id())?;
 
             // the NewConnectionStatus doesn't affect this call

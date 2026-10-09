@@ -20,9 +20,10 @@ class MutationTests(unittest.TestCase):
 
     def test_legacy_case_ids_and_public_admission_registry_are_preserved(self):
         legacy_ids = [case[0] for case in MUTATIONS.CASES[:58]]
-        self.assertEqual(len(MUTATIONS.CASES), 75)
+        self.assertEqual(len(MUTATIONS.CASES), 77)
         self.assertEqual(len(MUTATIONS.PUBLIC_ADMISSION_CASES), 12)
         self.assertEqual(len(MUTATIONS.INGRESS_CASES), 5)
+        self.assertEqual(len(MUTATIONS.INTEGRATION_CASES), 2)
         self.assertEqual(
             hashlib.sha256(json.dumps(legacy_ids, separators=(",", ":")).encode()).hexdigest(),
             "4d72d20bbd56e32d2821fbb03cd4bd85e7a12cab3d72707bc323ecd84298b327",
@@ -32,7 +33,12 @@ class MutationTests(unittest.TestCase):
             "1f5cc43664eea3e08b939411bcbe6ea432da2534d8e59f94c4a7c526469c8704",
         )
         self.assertEqual(MUTATIONS.CASES[58:70], MUTATIONS.PUBLIC_ADMISSION_CASES)
-        self.assertEqual(MUTATIONS.CASES[70:], MUTATIONS.INGRESS_CASES)
+        self.assertEqual(MUTATIONS.CASES[70:75], MUTATIONS.INGRESS_CASES)
+        self.assertEqual(
+            hashlib.sha256(json.dumps(MUTATIONS.CASES[:75], separators=(",", ":")).encode()).hexdigest(),
+            "407e42d59f38b7e8a1ecd824565551e6737297b2863aba41975391825c8026b8",
+        )
+        self.assertEqual(MUTATIONS.CASES[75:], MUTATIONS.INTEGRATION_CASES)
 
     def test_all_registered_rewrites_have_one_current_source_anchor(self):
         for name, relative, before, after, regression in MUTATIONS.CASES:
@@ -72,6 +78,28 @@ class MutationTests(unittest.TestCase):
         self.assertEqual(mutated.count("self.0.close();"), 1)
         self.assertIn("std::mem::ManuallyDrop::new(ExpiryOwner(self.clone()))", mutated)
         self.assertIn("let _owner = owner;", mutated)
+
+    def test_integration_controls_leave_the_selected_regression_unchanged(self):
+        owners = {
+            "dao_committee_overlap_scoring": "tn-network-libp2p",
+            "own_batch_cache_retention": "tn-node",
+        }
+        for name, relative, before, after, regression in MUTATIONS.INTEGRATION_CASES:
+            with self.subTest(mutation=name):
+                source = (MUTATIONS.ROOT / relative).read_text()
+                production, tests = source.split("#[cfg(test)]", 1)
+                self.assertEqual(production.count(before), 1)
+                self.assertRegex(
+                    tests,
+                    rf"#\[(?:test|tokio::test)\]\s+(?:async\s+)?fn\s+{re.escape(regression)}\s*\(",
+                )
+                mutated = source.replace(before, after, 1)
+                self.assertEqual(mutated.split("#[cfg(test)]", 1)[1], tests)
+                owner, compilation, selected = MUTATIONS.mutation_commands(relative, regression)
+                self.assertEqual(owner, owners[name])
+                self.assertIn("--no-run", compilation)
+                self.assertEqual(selected[selected.index("-E") + 1], f"test({regression})")
+                self.assertEqual(selected[selected.index("--no-tests") + 1], "fail")
 
     def fixture(self, root):
         source = root / "crates/owner/src/lib.rs"

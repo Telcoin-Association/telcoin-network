@@ -285,6 +285,18 @@ INGRESS_CASES = [
 
 CASES += INGRESS_CASES
 
+INTEGRATION_CASES = [
+    ("dao_committee_overlap_scoring", "crates/network-libp2p/src/peers/policy.rs",
+     "Self { admission: Admission::Authorized, retention: Retention::Protected, ..self }",
+     "Self { admission: Admission::Authorized, retention: Retention::Protected, protocol_scoring: ProtocolScoring::Apply, ..self }",
+     "dao_retention_composes_with_committee_scoring"),
+    ("own_batch_cache_retention", "crates/node/src/manager/node/run_epoch.rs",
+     "txn.remove::<NodeBatchesCache>(digest)?;",
+     "txn.remove::<NodeBatchesCache>(digest)?;\n            txn.remove::<tn_storage::tables::OurNodeBatchesCache>(digest)?;",
+     "evict_committed_batches_keeps_them_in_pack"),
+]
+CASES += INTEGRATION_CASES
+
 def execute(argv, directory, label):
     """Retain finite compiler/test logs, without accepting a compiler failure as a killed mutant."""
     result = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800)

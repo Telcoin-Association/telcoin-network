@@ -2887,12 +2887,12 @@ async fn test_request_vote_persistent_tier_two_lead_is_retryable() -> eyre::Resu
 }
 
 /// A header further ahead of the local clock than the drift tolerance plus the vote timeout is
-/// rejected for good: `InvalidTimestamp`, a severe penalty, and a verdict cached for its digest.
+/// rejected for good: `InvalidTimestamp`, no score penalty, and a verdict cached for its digest.
 ///
 /// The repeat request is answered from the cache with the already-converted response; a fresh
 /// evaluation would return the error itself instead.
 #[tokio::test]
-async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
+async fn test_vote_tier_three_lead_is_cached_without_penalty() -> eyre::Result<()> {
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
@@ -2917,10 +2917,9 @@ async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
         PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
             if *created == created_at
     );
-    assert_matches!(
-        Option::<Penalty>::from(&err),
-        Some(Penalty::Severe),
-        "a header beyond the vote window must cost the author a severe penalty"
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "clock skew must reject the header without scoring its author"
     );
 
     let repeat = handler.vote(peer, header, vec![]).await?;

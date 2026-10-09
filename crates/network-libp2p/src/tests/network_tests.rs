@@ -2250,7 +2250,7 @@ async fn test_multi_peer_mesh_formation() -> eyre::Result<()> {
     Ok(())
 }
 
-/// Committee promotion forgives load-induced bans while protocol bans remain attributable.
+/// Committee promotion forgives reputation bans so validators can reconnect for consensus.
 #[tokio::test]
 async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     // Start with two peers
