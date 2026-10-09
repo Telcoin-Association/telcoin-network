@@ -1504,6 +1504,13 @@ where
         // share this process-lifetime accounting instance, including across epochs.
         let source_budget =
             network_config.source_admission().map(SourceAdmissionBudget::new).transpose()?;
+        // Committee membership is known per epoch, so warn whenever the budget is set.
+        if source_budget.is_some() {
+            warn!(
+                target: "epoch-manager",
+                "source admission is enabled: committee peers share its ceilings and are refused while it is full; do not enable it on a validator until protected capacity exists (docs/src/network/source-admission.md)"
+            );
+        }
 
         // Resolve operator mappings before any network task starts. Each worker is validated
         // against its own transport key, and retired endpoints are absent from the next record.
