@@ -1093,7 +1093,7 @@ mod tests {
         consensus::{TxEip1559, TxEip2930, TxEip4844, TxEip4844WithSidecar, TxEip7702, TxLegacy},
         eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant},
     };
-    use serde_json::Value;
+    use serde_json::{value::RawValue, Value};
     use std::cell::Cell;
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
 
@@ -1950,6 +1950,205 @@ mod tests {
         let mixed = format!("[{submission},{read},{}]", vec![read.as_str(); 98].join(","));
         let scan = scan(mixed.as_bytes(), None);
         assert_eq!((scan.len, scan.calls), (100, Calls::MixedBatch));
+    }
+
+    /// What jsonrpsee 0.26, the worker's JSON-RPC server, makes of a body:
+    /// refused whole, or the calls it reads, each with the method it would
+    /// run (`None` for a call it refuses and runs nothing for).
+    #[derive(Debug, PartialEq)]
+    enum WorkerReads {
+        /// Not a request at all: the server answers a parse error.
+        Refused,
+        /// A single call.
+        Single(Option<String>),
+        /// A batch, element by element.
+        Batch(Vec<Option<String>>),
+    }
+
+    /// Read `body` as jsonrpsee 0.26 does: `read_body` in
+    /// `jsonrpsee-core/src/http_helpers.rs` picks single or batch by the
+    /// first byte that is not ASCII whitespace in the first 128 and drops the
+    /// bytes before it; `handle_rpc_call` in `jsonrpsee-server/src/server.rs`
+    /// then reads a single call, or each element of a `Vec<&RawValue>`, as a
+    /// `Request`, else as a `Notification`, else refuses it.
+    fn worker_reads(body: &[u8]) -> WorkerReads {
+        let method_of = |call: &[u8]| {
+            serde_json::from_slice::<jsonrpsee_types::Request<'_>>(call)
+                .map(|request| request.method.into_owned())
+                .or_else(|_| {
+                    serde_json::from_slice::<jsonrpsee_types::Notification<'_, Option<&RawValue>>>(
+                        call,
+                    )
+                    .map(|notification| notification.method.into_owned())
+                })
+                .ok()
+        };
+        let Some(start) = body.iter().take(128).position(|byte| !byte.is_ascii_whitespace()) else {
+            return WorkerReads::Refused;
+        };
+        let body = &body[start..];
+        match body.first() {
+            Some(b'{') => WorkerReads::Single(method_of(body)),
+            Some(b'[') => serde_json::from_slice::<Vec<&RawValue>>(body)
+                .map(|elements| {
+                    WorkerReads::Batch(
+                        elements
+                            .iter()
+                            .map(|element| method_of(element.get().as_bytes()))
+                            .collect(),
+                    )
+                })
+                .unwrap_or(WorkerReads::Refused),
+            _ => WorkerReads::Refused,
+        }
+    }
+
+    /// post-rev-5: the shield rests on the scan reading a body as the worker
+    /// does. For every body the scan routes to the worker, each call jsonrpsee
+    /// would run must be a submission; a call the two read differently (a
+    /// duplicated member, which the scan resolves to its last occurrence) must
+    /// be one jsonrpsee refuses outright, because its derived request type
+    /// rejects duplicated fields. And wherever jsonrpsee reads calls, the
+    /// scan must count the same number or report a batch it cannot read to
+    /// its end, which the gateway refuses whole; otherwise a batch could
+    /// dodge the length cap and the per-call charge.
+    #[test]
+    fn worker_bound_bodies_parse_as_submissions_only_under_jsonrpsee() {
+        let submission = call("eth_sendRawTransaction");
+        let sync = call("eth_sendRawTransactionSync");
+        let read = call("eth_getBalance");
+        let notification = r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[]}"#;
+        let reordered =
+            r#"{"id":"a","params":[],"method":"eth_sendRawTransaction","jsonrpc":"2.0"}"#;
+        let escaped_name = r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","id":1}"#;
+        let escaped_key = r#"{"jsonrpc":"2.0","m\u0065thod":"eth_sendRawTransactionSync","id":1}"#;
+        // read differently: the scan keeps the last `method`, jsonrpsee
+        // refuses the duplicate
+        let duplicated =
+            r#"{"jsonrpc":"2.0","method":"eth_call","method":"eth_sendRawTransaction","id":1}"#;
+        let duplicated_escaped = r#"{"jsonrpc":"2.0","method":"eth_call","m\u0065thod":"eth_sendRawTransaction","id":1}"#;
+        let duplicated_last_read =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","method":"eth_call","id":1}"#;
+        // the worker skips an invalid utf-8 byte inside a member it does not
+        // read and runs the call
+        let mut non_utf8 = br#"{"jsonrpc":"2.0","x":""#.to_vec();
+        non_utf8.push(0xff);
+        non_utf8.extend_from_slice(br#"","method":"eth_sendRawTransaction","params":[],"id":1}"#);
+        // jsonrpsee reads an array as a request too, so this element runs as a
+        // submission; the scan counts it as another call and does not screen it
+        let positional =
+            format!(r#"[["2.0",1,"eth_sendRawTransaction",["{}"]]]"#, eip7702_raw_hex());
+
+        let worker_bound: Vec<String> = vec![
+            submission.clone(),
+            sync.clone(),
+            notification.to_string(),
+            reordered.to_string(),
+            escaped_name.to_string(),
+            escaped_key.to_string(),
+            duplicated.to_string(),
+            duplicated_escaped.to_string(),
+            format!("[{submission},{sync},{notification},{reordered}]"),
+            format!("[{escaped_name},{escaped_key},{duplicated}]"),
+            format!("\u{c}{submission}"),
+            format!(" \t\r\n\u{c}[{submission},{sync}]"),
+        ];
+        let kept_away: Vec<String> = vec![
+            read.clone(),
+            duplicated_last_read.to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0074ransaction","id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","Method":"eth_sendRawTransaction","id":1}"#.to_string(),
+            format!("[{submission},{read}]"),
+            format!("[{read},{escaped_name}]"),
+            format!("[{submission},1]"),
+            format!("[{submission},{duplicated_last_read}]"),
+            format!("\u{c}{read}"),
+            format!("\u{c}[{submission},{read}]"),
+            "[]".to_string(),
+            format!("{submission} trailing"),
+            positional.clone(),
+        ];
+        let worker_bound: Vec<Vec<u8>> =
+            worker_bound.into_iter().map(String::into_bytes).chain([non_utf8]).collect();
+        let kept_away: Vec<Vec<u8>> = kept_away.into_iter().map(String::into_bytes).collect();
+
+        for body in worker_bound.iter().chain(&kept_away) {
+            let scan = scan(body, None);
+            let reads = worker_reads(body);
+            let body = String::from_utf8_lossy(body);
+            let calls = match &reads {
+                WorkerReads::Refused => Vec::new(),
+                WorkerReads::Single(call) => vec![call.clone()],
+                WorkerReads::Batch(calls) => calls.clone(),
+            };
+            if reads != WorkerReads::Refused && !scan.unreadable_batch {
+                assert_eq!(
+                    scan.len,
+                    calls.len(),
+                    "the scan counts what the worker reads: {body:?}"
+                );
+            }
+            if scan.calls == Calls::Submissions {
+                for method in calls.iter().flatten() {
+                    assert!(
+                        SUBMISSION_METHODS.contains(&method.as_str()),
+                        "the worker would run {method} from a worker-bound body: {body:?}"
+                    );
+                }
+            }
+        }
+        for body in &worker_bound {
+            let text = String::from_utf8_lossy(body);
+            assert_eq!(classify(body), Calls::Submissions, "{text:?}");
+        }
+        for body in &kept_away {
+            let text = String::from_utf8_lossy(body);
+            assert_eq!(classify(body).route(), Route::Query, "{text:?}");
+        }
+        // the duplicate-key cases only stay safe because jsonrpsee refuses them
+        for body in [duplicated, duplicated_escaped] {
+            assert_eq!(worker_reads(body.as_bytes()), WorkerReads::Single(None), "{body}");
+        }
+        assert_eq!(
+            worker_reads(positional.as_bytes()),
+            WorkerReads::Batch(vec![Some(SEND_RAW_TRANSACTION.to_string())])
+        );
+
+        // an element serde's typed readers refuse ends the scan, while
+        // jsonrpsee skips it and runs the rest of the batch: wherever it sits,
+        // the scan reports the batch unreadable and the gateway refuses it
+        let triggers = [
+            "1e400".to_string(),
+            "-1e400".to_string(),
+            "1".repeat(321),
+            r#""\udc00""#.to_string(),
+            r#""\ud800""#.to_string(),
+            r#"{"\udc00":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":1e400,"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[1e400],"id":1}"#.to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["\udc00"],"id":1}"#
+                .to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[[1e400]],"id":1}"#.to_string(),
+        ];
+        for trigger in &triggers {
+            for body in [
+                format!("[{trigger},{read},{read}]"),
+                format!("[{submission},{trigger}]"),
+                format!(" [{trigger},{submission}]"),
+            ] {
+                assert!(matches!(worker_reads(body.as_bytes()), WorkerReads::Batch(_)), "{body}");
+                assert!(scan(body.as_bytes(), None).unreadable_batch, "{body}");
+            }
+        }
+        // a value the scan reads or skips without complaint is counted
+        let ignored_id = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":"\udc00"}"#;
+        for body in [format!("[1e-400,{read}]"), format!("[{ignored_id},{read}]")] {
+            let WorkerReads::Batch(calls) = worker_reads(body.as_bytes()) else {
+                panic!("jsonrpsee reads a batch: {body}");
+            };
+            let scan = scan(body.as_bytes(), None);
+            assert_eq!((scan.len, scan.unreadable_batch), (calls.len(), false), "{body}");
+        }
     }
 
     #[test]

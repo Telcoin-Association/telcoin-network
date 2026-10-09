@@ -12564,6 +12564,7 @@ dependencies = [
  "humantime",
  "hyper",
  "hyper-util",
+ "jsonrpsee-types",
  "metrics",
  "reqwest 0.12.28",
  "serde",
