@@ -1087,15 +1087,15 @@ fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash
     if digests.is_empty() {
         return;
     }
-    let evicted = db.write_txn().and_then(|mut txn| {
-        for digest in digests {
-            txn.remove::<NodeBatchesCache>(digest)?;
-        }
-        txn.commit()
-    });
-    if let Err(e) = evicted {
-        warn!(target: "epoch-manager", count = digests.len(), "failed to evict committed batches from the network batch cache: {e:?}");
-    }
+    let _ = db
+        .write_txn()
+        .and_then(|mut txn| {
+            digests.iter().try_for_each(|digest| txn.remove::<NodeBatchesCache>(digest))?;
+            txn.commit()
+        })
+        .inspect_err(|error| {
+            warn!(target: "epoch-manager", count = digests.len(), "failed to evict committed batches from the batch cache: {error:?}");
+        });
 }
 
 #[cfg(test)]

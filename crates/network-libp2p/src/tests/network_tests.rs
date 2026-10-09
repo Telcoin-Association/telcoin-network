@@ -2293,7 +2293,7 @@ async fn test_new_epoch_unbans_committee_members() -> eyre::Result<()> {
     let connected_peers = peer1.connected_peer_ids().await?;
     assert!(connected_peers.contains(&peer2_id), "Peer2 should be connected initially");
 
-    // Only load-induced bans are forgiven when a peer acquires committee privileges.
+    // Exercise load-induced ban recovery when a peer acquires committee privileges.
     futures::future::join_all((0..20).map(|_| {
         peer1.report_penalty(
             config_2.key_config().primary_public_key(),

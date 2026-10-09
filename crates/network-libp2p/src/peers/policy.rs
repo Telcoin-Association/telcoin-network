@@ -218,6 +218,8 @@ mod tests {
         [
             vec![TrustBasis::Validator],
             vec![TrustBasis::Operator, TrustBasis::Validator],
+            vec![TrustBasis::DaoObserver, TrustBasis::Validator],
+            vec![TrustBasis::Validator, TrustBasis::DaoObserver],
             vec![TrustBasis::Validator, TrustBasis::Operator, TrustBasis::Bootstrap],
         ]
         .into_iter()

@@ -291,8 +291,8 @@ INTEGRATION_CASES = [
      "Self { admission: Admission::Authorized, retention: Retention::Protected, protocol_scoring: ProtocolScoring::Apply, ..self }",
      "dao_retention_composes_with_committee_scoring"),
     ("own_batch_cache_retention", "crates/node/src/manager/node/run_epoch.rs",
-     "txn.remove::<NodeBatchesCache>(digest)?;",
-     "txn.remove::<NodeBatchesCache>(digest)?;\n            txn.remove::<tn_storage::tables::OurNodeBatchesCache>(digest)?;",
+     "digests.iter().try_for_each(|digest| txn.remove::<NodeBatchesCache>(digest))?;",
+     "digests.iter().try_for_each(|digest| {\n            txn.remove::<NodeBatchesCache>(digest)?;\n            txn.remove::<tn_storage::tables::OurNodeBatchesCache>(digest)\n        })?;",
      "evict_committed_batches_keeps_them_in_pack"),
 ]
 CASES += INTEGRATION_CASES
