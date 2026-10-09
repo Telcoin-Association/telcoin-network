@@ -145,7 +145,7 @@ async fn cached_record_converges(network_type: NetworkType) -> eyre::Result<()> 
     let query_id = *network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == authority)
+        .find(|(_, query)| query.query.request == authority)
         .map(|(id, _)| id)
         .ok_or_else(|| eyre!("cached member must be refreshed"))?;
 
@@ -289,12 +289,19 @@ async fn committee_record_retention_does_not_enable_third_party_replication() ->
     let third_party = record.key.clone();
     let authority = BlsPublicKey::from_literal_bytes(third_party.as_ref())
         .map_err(|error| eyre!("record BLS key: {error:?}"))?;
-    network.swarm.behaviour_mut().peer_manager.update_committees(
-        HashSet::new(),
-        HashSet::from([authority]),
-        HashSet::new(),
-    );
-    network.retain_committee_record(record);
+    // The command also makes the store retain the committee row that the seed below fills.
+    network.process_command(NetworkCommand::UpdateCommittees {
+        previous: HashSet::new(),
+        current: HashSet::from([authority]),
+        next: HashSet::new(),
+    })?;
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .put(record)
+        .map_err(|error| eyre!("seed committee record: {error:?}"))?;
     let interval = network.config.kad_publication_interval;
     let mut own_refresh =
         tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
