@@ -1619,14 +1619,15 @@ fn sum_metric_samples(body: &str, name: &str) -> eyre::Result<Option<f64>> {
 
 /// Read every consensus header a stopped node committed, in consensus-number order.
 ///
-/// Opens the node's consensus chain under `datadir` directly, so the node must not be running
-/// and must not be restarted on this datadir afterwards without care: opening heals the open
-/// epoch's pack in place and clears leftover staging directories, which would race a live node.
-/// The walk ends at the last header the open epoch's pack holds (read from the pack itself rather
-/// than the "latest" slot hint, which can run one ahead of a pack cut short by a hard kill) and
-/// starts at number 1, since the genesis header (number 0) is never stored. Any number in between
-/// that the chain cannot serve is an error, so a gap fails the read instead of shortening the
-/// walk.
+/// Opens the node's consensus chain under `datadir` directly, so the node must not be running and
+/// must not be restarted on this datadir afterwards without care: opening heals the open epoch's
+/// pack and the epoch-record logs in place, removes leftover `staging-*`, `import-*` and
+/// `*.migrating` directories, and restores or removes an interrupted install's `epoch-N.replaced`,
+/// all of which would race a live node. The walk ends at the last header the open epoch's pack
+/// holds (read from the pack itself rather than the "latest" slot hint, which a power loss can
+/// leave ahead of the pack) and starts at number 1, since the genesis header (number 0) is never
+/// stored. Any number in between that the chain cannot serve is an error, so a gap fails the read
+/// instead of shortening the walk.
 pub(crate) async fn read_consensus_headers(
     datadir: &Path,
 ) -> eyre::Result<Vec<tn_types::ConsensusHeader>> {

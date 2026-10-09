@@ -6,10 +6,14 @@ mod behavior;
 mod cache;
 mod manager;
 mod peer;
+mod penalty;
+mod policy;
 mod score;
 mod status;
 mod types;
 pub(crate) use manager::{PeerCapacityReached, PeerManager, PutRecordRate};
+pub use penalty::LoadPenalty;
+pub(crate) use penalty::Severity;
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 
