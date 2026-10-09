@@ -88,8 +88,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_connect_timeout: Duration,
 
-    /// Overall per-request deadline when forwarding to an upstream: a worker, or
-    /// the `--redirect-queries` endpoint.
+    /// Overall per-request deadline when forwarding to an upstream: a worker,
+    /// or the `--redirect-queries` endpoint when `--query-request-timeout` is
+    /// `0`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
@@ -97,6 +98,19 @@ pub(crate) struct Cli {
         value_parser = humantime::parse_duration
     )]
     pub(crate) upstream_request_timeout: Duration,
+
+    /// Overall per-request deadline when forwarding to the `--redirect-queries`
+    /// endpoint (default 10s; `0` disables it, and the query route then uses
+    /// `--upstream-request-timeout`). A stalled query upstream frees each read's
+    /// slot this soon, while submissions keep the longer worker deadline. With
+    /// `--redirect-queries` set it must not exceed `--upstream-request-timeout`.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT",
+        default_value = "10s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) query_request_timeout: Duration,
 
     /// How long a new connection may take to send its complete request headers
     /// before it is disconnected (slow-loris guard).
@@ -112,6 +126,38 @@ pub(crate) struct Cli {
     /// in the OS accept backlog until a slot frees up.
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
+
+    /// Maximum in-flight requests made only of transaction submissions
+    /// (default 256; `0` means unlimited). A submission over the cap is
+    /// answered at once with a `503` overload error instead of waiting. The
+    /// class is the same with or without `--redirect-queries`.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS", default_value_t = 256)]
+    pub(crate) max_inflight_submissions: usize,
+
+    /// Maximum in-flight requests of every other kind, mixed batches included
+    /// (default 256, or the ceiling below without `--redirect-queries`; `0`
+    /// means unlimited). A request over the cap is answered at once with a
+    /// `503` overload error instead of waiting, so a stalled query upstream
+    /// cannot take the connection slots submissions need; keep it below
+    /// `--max-connections` (the gateway warns at startup otherwise).
+    /// Without `--redirect-queries` every read is forwarded to the worker, so
+    /// the cap is lowered at startup to at most `--max-upstream-inflight` less
+    /// a fifth of it (at least one slot is held back, but the cap stays at
+    /// least 1); `0` counts as above that ceiling, and lowering a value set
+    /// here logs a warning. The slots held back stay free for submissions.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_QUERIES")]
+    pub(crate) max_inflight_queries: Option<usize>,
+
+    /// Maximum concurrent requests this gateway forwards to the worker
+    /// (default 100; `0` means unlimited). A request for the worker over the
+    /// cap is answered at once with a `503` overload error instead of waiting.
+    /// Every gateway in front of a worker shares its `--rpc.max-connections`
+    /// (500 by default), so keep the number of gateways times this cap below
+    /// it. Without `--redirect-queries`, reads may hold at most this cap less a
+    /// fifth of it (at least one slot), so the rest stays free for submissions
+    /// (see `--max-inflight-queries`).
+    #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
+    pub(crate) max_upstream_inflight: usize,
 
     /// Transport-stall deadline for inbound connections (`TCP_USER_TIMEOUT`):
     /// a connection whose peer leaves written response data unacknowledged, or
@@ -205,6 +251,15 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST", default_value_t = 0)]
     pub(crate) rate_limit_global_burst: u32,
 
+    /// Sustained gateway-wide rate reserved for requests made only of
+    /// transaction submissions, in requests per second, with a burst of twice
+    /// the rate (default `0` disables it). When set, submissions are metered by
+    /// this budget and every other request by the global rate limit, so a read
+    /// flood that empties the global bucket no longer refuses submissions; the
+    /// per-IP limit still applies to both.
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS", default_value_t = 0)]
+    pub(crate) rate_limit_submissions: u32,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -244,10 +299,20 @@ pub(crate) struct Settings {
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
     pub(crate) upstream_request_timeout: Duration,
+    /// Per-request deadline on the query route, or `None` when it follows the
+    /// upstream per-request deadline.
+    pub(crate) query_request_timeout: Option<Duration>,
     /// Inbound header read deadline (slow-loris guard).
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// In-flight cap for submission requests (`0` = unlimited).
+    pub(crate) max_inflight_submissions: usize,
+    /// In-flight cap for every other request (`0` = unlimited), as lowered by
+    /// [`effective_query_cap`].
+    pub(crate) max_inflight_queries: usize,
+    /// Cap on concurrent requests forwarded to the worker (`0` = unlimited).
+    pub(crate) max_upstream_inflight: usize,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
     /// or `None` when disabled.
     pub(crate) tcp_user_timeout: Option<Duration>,
@@ -263,6 +328,8 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_prefix: PrefixPolicy,
     /// Gateway-wide rate limit, or `None` when disabled.
     pub(crate) rate_limit_global: Option<RateLimit>,
+    /// Gateway-wide rate budget for submissions, or `None` when disabled.
+    pub(crate) rate_limit_submissions: Option<RateLimit>,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -286,6 +353,20 @@ impl Cli {
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
             .transpose()?;
+        let query_request_timeout = resolve_optional_duration(self.query_request_timeout);
+        // the query deadline exists to shorten the query route; one longer than
+        // the worker's would not, and could outlast the whole-request deadline
+        // built from `--upstream-request-timeout`. without a redirect the flag
+        // is unused, so it is not checked.
+        if let Some(query_timeout) = query_request_timeout.filter(|_| query_upstream.is_some()) {
+            eyre::ensure!(
+                query_timeout <= self.upstream_request_timeout,
+                "--query-request-timeout ({}) exceeds --upstream-request-timeout ({}); lower it, \
+                 or set it to 0 so the query route uses --upstream-request-timeout",
+                humantime::format_duration(query_timeout),
+                humantime::format_duration(self.upstream_request_timeout),
+            );
+        }
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
@@ -308,6 +389,34 @@ impl Cli {
             );
             Ok(())
         })?;
+        let requested_queries = self.max_inflight_queries.unwrap_or(DEFAULT_MAX_INFLIGHT_QUERIES);
+        let max_inflight_queries = effective_query_cap(
+            requested_queries,
+            self.max_upstream_inflight,
+            query_upstream.is_some(),
+        );
+        // lowering the default is the documented behaviour; lowering a value
+        // the operator chose is worth a warning
+        if self.max_inflight_queries.is_some() && max_inflight_queries != requested_queries {
+            warn!(
+                target: "gateway",
+                max_inflight_queries = requested_queries,
+                max_upstream_inflight = self.max_upstream_inflight,
+                effective = max_inflight_queries,
+                "without --redirect-queries reads share --max-upstream-inflight with submissions; \
+                 lowering --max-inflight-queries so a fifth of the worker slots stays free for \
+                 submissions"
+            );
+        }
+        if query_cap_reaches_connections(max_inflight_queries, self.max_connections) {
+            warn!(
+                target: "gateway",
+                max_inflight_queries,
+                max_connections = self.max_connections.get(),
+                "--max-inflight-queries is unlimited or not below --max-connections; a saturated \
+                 query route can then hold every connection and starve submissions"
+            );
+        }
         let rate_limit_prefix = resolve_prefix_policy(
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
@@ -320,8 +429,12 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
+            query_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            max_inflight_submissions: self.max_inflight_submissions,
+            max_inflight_queries,
+            max_upstream_inflight: self.max_upstream_inflight,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
@@ -334,6 +447,8 @@ impl Cli {
                 self.rate_limit_global,
                 self.rate_limit_global_burst,
             ),
+            // no burst flag: the burst derives like a `0` burst on the others
+            rate_limit_submissions: resolve_rate_limit(self.rate_limit_submissions, 0),
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -368,6 +483,40 @@ impl Cli {
 /// flag's disabled sentinel, mirroring the `0`-disables rate-limit flags).
 fn resolve_optional_duration(value: Duration) -> Option<Duration> {
     (!value.is_zero()).then_some(value)
+}
+
+/// `--max-inflight-queries` when it is not set (before [`effective_query_cap`]).
+const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 256;
+
+/// The query cap the gateway enforces for `--max-inflight-queries`.
+///
+/// Without a redirect every read is a forward to the worker, so the query cap
+/// is also the reads' share of `--max-upstream-inflight`. Left at or above the
+/// worker cap, reads alone could hold every worker slot and every submission
+/// would be refused with `503`. The cap is therefore lowered to the worker cap
+/// less a fifth of it (at least one slot), never below 1 since `0` means
+/// unlimited; an unlimited query cap counts as above that ceiling. With a
+/// redirect, or an unlimited worker cap, the value is kept as given.
+fn effective_query_cap(
+    max_inflight_queries: usize,
+    max_upstream_inflight: usize,
+    redirect: bool,
+) -> usize {
+    if redirect || max_upstream_inflight == 0 {
+        return max_inflight_queries;
+    }
+    let reserve = (max_upstream_inflight / 5).max(1);
+    let ceiling = max_upstream_inflight.saturating_sub(reserve).max(1);
+    match max_inflight_queries {
+        0 => ceiling,
+        cap => cap.min(ceiling),
+    }
+}
+
+/// Whether a query cap of `cap` (`0` = unlimited) lets a saturated query route
+/// take every inbound connection, leaving none for submissions.
+fn query_cap_reaches_connections(cap: usize, max_connections: NonZeroUsize) -> bool {
+    cap == 0 || cap >= max_connections.get()
 }
 
 /// Turn a `(rate, burst)` flag pair into a [`RateLimit`], or `None` when the
@@ -687,6 +836,15 @@ mod tests {
     }
 
     #[test]
+    fn submission_budget_is_off_by_default_and_derives_its_burst() -> eyre::Result<()> {
+        assert!(cli_with_flags(&[]).into_settings()?.rate_limit_submissions.is_none());
+        let settings = cli_with_flags(&["--rate-limit-submissions=50"]).into_settings()?;
+        let submissions = settings.rate_limit_submissions.expect("submission budget on");
+        assert_eq!((submissions.rate().get(), submissions.burst().get()), (50, 100));
+        Ok(())
+    }
+
+    #[test]
     fn explicit_burst_is_honored() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--rate-limit-per-ip=40", "--rate-limit-per-ip-burst=50"])
             .into_settings()?;
@@ -727,6 +885,62 @@ mod tests {
     }
 
     #[test]
+    fn inflight_caps_default_on_and_zero_means_unlimited() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        // without a redirect the query cap keeps a fifth of the worker cap back
+        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (256, 80));
+        assert_eq!(settings.max_upstream_inflight, 100);
+
+        let settings = cli_with_flags(&[
+            "--max-inflight-submissions=0",
+            "--max-inflight-queries=4",
+            "--max-upstream-inflight=0",
+        ])
+        .into_settings()?;
+        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (0, 4));
+        assert_eq!(settings.max_upstream_inflight, 0);
+        assert_eq!(
+            crate::server::inflight_slots(settings.max_inflight_submissions).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn without_a_redirect_reads_leave_a_fifth_of_the_worker_slots() -> eyre::Result<()> {
+        let query_cap = |flags: &[&str]| -> eyre::Result<usize> {
+            Ok(cli_with_flags(flags).into_settings()?.max_inflight_queries)
+        };
+        // the default worker cap of 100 keeps 20 slots back from reads
+        assert_eq!(query_cap(&[])?, 80);
+        // a cap at or below the ceiling is kept; unlimited is lowered
+        assert_eq!(query_cap(&["--max-inflight-queries=50"])?, 50);
+        assert_eq!(query_cap(&["--max-inflight-queries=80"])?, 80);
+        assert_eq!(query_cap(&["--max-inflight-queries=0"])?, 80);
+        assert_eq!(query_cap(&["--max-inflight-queries=256"])?, 80);
+        assert_eq!(query_cap(&["--max-upstream-inflight=5"])?, 4);
+        // at least one slot is held back, and the cap never drops to 0
+        assert_eq!(query_cap(&["--max-upstream-inflight=2"])?, 1);
+        assert_eq!(query_cap(&["--max-upstream-inflight=1"])?, 1);
+        // an unlimited worker cap leaves nothing to share
+        assert_eq!(query_cap(&["--max-upstream-inflight=0"])?, 256);
+        assert_eq!(query_cap(&["--max-upstream-inflight=0", "--max-inflight-queries=0"])?, 0);
+        // with a redirect reads never take a worker slot
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        assert_eq!(query_cap(&[redirect])?, 256);
+        assert_eq!(query_cap(&[redirect, "--max-inflight-queries=0"])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn query_cap_warning_covers_unlimited_and_the_connection_cap() {
+        let connections = NonZeroUsize::new(500).expect("nonzero");
+        for (cap, warns) in [(0, true), (80, false), (499, false), (500, true), (600, true)] {
+            assert_eq!(query_cap_reaches_connections(cap, connections), warns, "{cap}");
+        }
+    }
+
+    #[test]
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
@@ -751,6 +965,43 @@ mod tests {
             let settings = cli_with_flags(&[flag.as_str()]).into_settings()?;
             assert_eq!(settings.query_upstream, Some(Url::parse(url)?), "{url}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn query_timeout_above_upstream_timeout_is_rejected_at_startup() -> eyre::Result<()> {
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        let result = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=6s",
+        ])
+        .into_settings();
+        assert!(result.is_err(), "a query deadline above the worker's must fail startup");
+        // the 10s default is above a 5s worker deadline too
+        let result = cli_with_flags(&[redirect, "--upstream-request-timeout=5s"]).into_settings();
+        assert!(result.is_err(), "the default query deadline must still be checked");
+
+        // the boundary, the default, and the disabled sentinel are accepted
+        let settings = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=5s",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(5)));
+        let settings = cli_with_flags(&[redirect]).into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(10)));
+        let settings = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=0",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.query_request_timeout, None);
+
+        // without a redirect the flag is unused and not checked
+        cli_with_flags(&["--upstream-request-timeout=5s"]).into_settings()?;
         Ok(())
     }
 

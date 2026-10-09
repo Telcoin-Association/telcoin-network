@@ -101,8 +101,12 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
+| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL; must not exceed `--upstream-request-timeout` (`0` = use `--upstream-request-timeout`). |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
+| `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
+| `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
@@ -112,6 +116,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its bucket. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
+| `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
@@ -169,6 +174,15 @@ Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
 
+A third, optional bucket reserves rate for submissions.
+With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions.
+The per-IP limit still covers both classes and still refuses at the edge.
+The edge cannot tell the classes apart before the body is read, so a request the global bucket refuses is classified first: a query then gets the `429`, and a submission is charged to the submission bucket instead.
+A submission still spends a global token while one is left.
+With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways (see [Sizing for N gateways](#sizing-for-n-gateways)).
+Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
+Without the flag the edge check is unchanged.
+
 #### Prefix keying
 
 The per-client bucket is keyed on the client's **network prefix**, not its bare
@@ -217,6 +231,26 @@ the worst possible moment).
 Per-IP state is bounded: idle buckets are swept periodically and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
 limit.
+
+### Per-route capacity
+
+Every request is classified, with or without `--redirect-queries`.
+A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync` calls is a submission; everything else, including a batch that mixes the two kinds, is a query.
+
+- Each class has its own in-flight cap: `--max-inflight-submissions` and `--max-inflight-queries`, 256 each by default (`0` means unlimited; without `--redirect-queries` the query cap is lowered, see below).
+  A request whose class has no free slot is answered at once with `503` / `-32009` ("gateway overloaded; retry later"), never queued, so a stalled query upstream fills only the query slots and submissions keep theirs.
+  The inbound connection cap (`--max-connections`) still bounds both classes together, so keep `--max-inflight-queries` well below it: the difference is what a saturated query route leaves for submissions, and the gateway warns at startup when the query cap is unlimited or not below `--max-connections`.
+- Every forward to a worker, of either class, also takes a slot on `--max-upstream-inflight` (100 by default, `0` means unlimited), with the same `503` when none is free.
+  Without `--redirect-queries` that is every request, so reads and submissions share the cap.
+  The gateway then lowers `--max-inflight-queries` at startup to at most `--max-upstream-inflight` less a fifth of it (80 with the defaults, and an unlimited query cap is lowered too), and logs a warning when it lowers a value you set.
+  Unless the worker cap is 1, reads then never hold every worker slot: the fifth held back stays free for submissions.
+  The worker cap bounds how much of the worker's shared RPC connection limit one gateway can hold; size it with [Sizing for N gateways](#sizing-for-n-gateways).
+- With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never answers frees each query slot after 10 s rather than 30 s.
+  Requests to the worker keep `--upstream-request-timeout`.
+
+A class slot is held from classification until the response body has been sent to the client, or until the request fails, so a query upstream that sends its head and then stalls still holds only query slots.
+A worker slot is released when the worker's response head arrives: by then the worker has built the whole response and freed its own connection permit.
+`tn_worker_gateway_route_inflight{route}` and `tn_worker_gateway_upstream_inflight` show the slots in use, and every `503` from a cap counts as `tn_worker_gateway_rejections_total{reason="overloaded"}`.
 
 ### Request size
 
@@ -276,6 +310,7 @@ Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
 `/ready` still means "this gateway can take submissions".
 The query URL gets no readiness probe and no fallback: when it fails, the client gets `502` or `504` and the call is never retried on the worker, which would put the read load on the validator just when the public RPC is struggling.
+A query URL that accepts reads and never answers holds each one for `--query-request-timeout`, and reads beyond `--max-inflight-queries` get `503` / `-32009` at once; submissions have their own slots and keep reaching the worker (see [Per-route capacity](#per-route-capacity)).
 
 | Worker | Query URL | `/ready` | Submissions | Other calls |
 | --- | --- | --- | --- | --- |
@@ -314,6 +349,7 @@ echoed when it can be recovered.
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
+| In-flight cap reached (overloaded) | `503` | `-32009` |
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
@@ -348,6 +384,8 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
+| `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
+| `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also
@@ -371,9 +409,13 @@ Every limit is per process, so the worker sees the sum over all gateways.
 
 - **Rate.** The worker receives up to N × `--rate-limit-global` calls per second, where N is the largest number of gateways that can run at once: the HPA's `maxReplicas` if you install it (10 in the reference manifest).
   Size `--rate-limit-global` as the worker's budget divided by that N.
-- **Worker connections.** N × `--max-connections` can exceed the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
-  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s.
-  Raise the worker's limit above N × `--max-connections`, or accept that a flood of Sync calls through one gateway can make the worker refuse submissions from the others.
+  With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives only submissions, up to N × `--rate-limit-submissions` requests per second; size that flag the same way.
+  With `--rate-limit-submissions` set and no redirect, the worker receives both budgets, so keep N × (`--rate-limit-global` + `--rate-limit-submissions`) within the worker's budget.
+- **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
+  Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`.
+  The reference manifest does not on its own: its HPA allows 10 replicas, and 10 × 100 (the default cap) is 1000, above the worker's 500.
+  Lower the cap to 49 or less (10 × 49 = 490), lower `maxReplicas`, or raise the worker's `--rpc.max-connections` above N × the cap.
+  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s; a gateway whose cap is full answers `503` / `-32009` itself instead of letting the worker refuse submissions from every gateway.
 - **Memory.** Peak request memory per gateway is about `--max-connections` × `--max-request-bytes` plus overhead (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 
 ### Split routing
