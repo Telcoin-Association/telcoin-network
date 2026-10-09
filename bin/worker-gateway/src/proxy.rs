@@ -1089,7 +1089,10 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use alloy::consensus::TxEip7702;
+    use alloy::{
+        consensus::{TxEip1559, TxEip2930, TxEip4844, TxEip4844WithSidecar, TxEip7702, TxLegacy},
+        eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant},
+    };
     use serde_json::Value;
     use std::cell::Cell;
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
@@ -1128,6 +1131,23 @@ mod tests {
         let signed = TxEip7702::default().into_signed(signature);
         let encoded = PooledTransaction::Eip7702(signed).encoded_2718();
         format!("0x{}", tn_types::hex::encode(encoded))
+    }
+
+    /// One transaction of every EIP-2718 type the pooled wire format carries,
+    /// in type order, each built from a default body and a dummy signature
+    /// (the decode checks structure, not the signature). The blob transaction
+    /// carries an empty sidecar, which is enough to decode.
+    fn one_transaction_per_type() -> [PooledTransaction; 5] {
+        let signature = EthSignature::new(U256::from(1), U256::from(1), false);
+        let sidecar = BlobTransactionSidecarVariant::Eip4844(BlobTransactionSidecar::default());
+        let blob = TxEip4844WithSidecar::from_tx_and_sidecar(TxEip4844::default(), sidecar);
+        [
+            PooledTransaction::Legacy(TxLegacy::default().into_signed(signature)),
+            PooledTransaction::Eip2930(TxEip2930::default().into_signed(signature)),
+            PooledTransaction::Eip1559(TxEip1559::default().into_signed(signature)),
+            PooledTransaction::Eip4844(blob.into_signed(signature)),
+            PooledTransaction::Eip7702(TxEip7702::default().into_signed(signature)),
+        ]
     }
 
     fn send_raw(params: &str) -> Vec<u8> {
@@ -1393,6 +1413,38 @@ mod tests {
         assert!(matches!(err, GatewayError::UnsupportedTransactionType(4)));
         assert_eq!(id, RequestId::from_id(serde_json::json!(42)));
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+    }
+
+    /// WG-41: the screen must refuse exactly the transaction types the
+    /// worker's pool refuses. The pool's set is fixed by its validator in
+    /// `crates/tn-reth/src/txn_pool.rs` (`.no_eip4844().no_eip7702()`: it
+    /// admits legacy, EIP-2930 and EIP-1559 only), a crate the gateway does
+    /// not link, so that set is written out here; the screen's comes from
+    /// `tn_types::batch_allowlisted_tx_type`. A change on either side fails
+    /// this test instead of letting the two sets drift apart by convention.
+    #[test]
+    fn screen_verdicts_match_the_pool_allowlist() {
+        // the pool's admission set, by EIP-2718 type byte
+        const POOL_ADMITS: [u8; 3] = [0, 1, 2];
+        let transactions = one_transaction_per_type();
+        let types = transactions.each_ref().map(Typed2718::ty);
+        assert_eq!(types, [0, 1, 2, 3, 4], "one transaction of every pooled type");
+
+        for tx in transactions {
+            let ty = tx.ty();
+            let admitted = POOL_ADMITS.contains(&ty);
+            assert_eq!(tn_types::batch_allowlisted_tx_type(&tx), admitted, "type {ty}");
+            let hex = format!("0x{}", tn_types::hex::encode(tx.encoded_2718()));
+            let verdict = screen_err(&send_raw(&format!("[\"{hex}\"]")));
+            if admitted {
+                assert!(verdict.is_none(), "type {ty} must be forwarded: {verdict:?}");
+            } else {
+                assert!(
+                    matches!(verdict, Some(GatewayError::UnsupportedTransactionType(refused)) if refused == ty),
+                    "type {ty} must be refused as unsupported: {verdict:?}"
+                );
+            }
+        }
     }
 
     #[test]
