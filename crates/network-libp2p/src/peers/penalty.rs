@@ -18,7 +18,8 @@ pub enum LoadPenalty {
 /// Penalties applied to an attributable peer.
 ///
 /// The severity-only variants describe protocol or application validation failures. Callers
-/// must use [`Self::Load`] for temporary overload so trust never suppresses protocol failures.
+/// must use [`Self::Load`] for temporary overload so operator trust only suppresses load failures.
+/// Committee membership separately exempts all penalties to preserve consensus liveness.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Penalty {
     /// A minor protocol or application validation failure, scored at -1.
@@ -72,7 +73,7 @@ pub(super) enum PenaltyHistory {
     /// Only load penalties have been observed, or no penalties have been observed.
     #[default]
     LoadOnly,
-    /// A protocol violation has been observed; trust changes must preserve its score and ban.
+    /// A protocol violation has been observed; operator trust must preserve its score and ban.
     Protocol,
 }
 
@@ -86,14 +87,14 @@ impl PenaltyHistory {
         }
     }
 
-    /// Remember protocol failures across load signals and committee updates.
+    /// Remember protocol failures across load signals until committee promotion resets history.
     pub(super) fn record(&mut self, penalty: Penalty) {
         if !penalty.is_load() {
             *self = Self::Protocol;
         }
     }
 
-    /// Whether trust changes may reset this peer's score and forgive its ban.
+    /// Whether operator trust may reset this peer's score and forgive its ban.
     pub(super) fn permits_forgiveness(self) -> bool {
         self == Self::LoadOnly
     }

@@ -1203,9 +1203,9 @@ impl PrimaryNetworkHandle {
                     Err(e) => {
                         // Charge the peer only for a fault attributable SOLELY to its streamed
                         // bytes (never our local storage/IO).
-                        // Committee/allowlisted peers stay score-exempt
-                        // (`Peer::apply_penalty` only warns for them). Additive: still classified
-                        // `Failed` so the probe moves to the next peer.
+                        // Committee peers stay score-exempt for liveness. Operator trust alone
+                        // does not exempt these protocol penalties. Still classified `Failed`
+                        // so the probe moves to the next peer, regardless of scoring policy.
                         if Self::import_fault_is_peer_caused(&e) {
                             if let Some(penalty) = Self::consensus_chain_error_to_penalty(&e) {
                                 self.report_penalty(peer, penalty).await;
