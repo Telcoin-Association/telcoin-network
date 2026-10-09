@@ -1036,8 +1036,11 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{config::UpstreamWorker, readiness::GatewayReadiness};
     use alloy::consensus::TxEip7702;
+    use axum::http::StatusCode;
     use serde_json::Value;
+    use std::sync::{Arc, Mutex};
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
 
     /// The canonical EIP-155 example transaction (a signed legacy transfer): a
@@ -1424,27 +1427,98 @@ mod tests {
         assert_eq!(ErrorChain(&Link("alone", None)).to_string(), "alone");
     }
 
-    /// A real transport failure: the raw error's `Display` carries the url, the
-    /// fields the proxy logs do not, and the cause reaches below reqwest's own
-    /// message.
-    #[tokio::test]
-    async fn forwarding_failure_log_fields_hide_the_url() {
-        // nothing listens on port 1, as in the server's unreachable-upstream test
-        let url = Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
-        let err =
-            Client::new().post(url.clone()).send().await.expect_err("nothing listens on port 1");
-        assert!(matches!(classify_error(&err), GatewayError::UpstreamUnreachable));
-        assert!(err.to_string().contains("apikey123"), "raw display should carry the url: {err}");
+    /// A `tracing` writer that keeps everything written to it.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
-        let cause = ErrorChain(&err.without_url()).to_string();
-        for secret in ["secret", "apikey123", "xyz"] {
-            assert!(!cause.contains(secret), "cause leaks {secret:?}: {cause}");
+    impl CapturedLogs {
+        /// Everything logged so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("logs lock")).into_owned()
         }
-        assert!(
-            cause.starts_with("error sending request: "),
-            "cause should have a source: {cause}"
-        );
-        assert_eq!(UpstreamOrigin(&url).to_string(), "http://127.0.0.1:1");
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The warning `proxy()` itself writes when a forward fails, captured on
+    /// both routes: it names the upstream by origin and carries the cause from
+    /// below reqwest's own message, while the url's credential (userinfo,
+    /// path and query), which the raw error's `Display` would print, appears
+    /// nowhere in the gateway's logs.
+    ///
+    /// The throttles are process-wide statics, so this test relies on
+    /// nextest's one-process-per-test model, which `make test`, the gate and
+    /// CI use: under a single-process `cargo test`, another test failing a
+    /// forward on either route within 10 s suppresses the line this test reads.
+    #[tokio::test]
+    async fn forwarding_failure_log_hides_the_url() {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=trace")
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        // nothing listens on port 1, as in the server's unreachable-upstream test
+        let worker_url =
+            Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
+        let query_url =
+            Url::parse("http://quser:qsecret@127.0.0.1:1/qkey456?token=qtok").expect("url");
+        let secrets = ["secret", "apikey123", "xyz", "qsecret", "qkey456", "qtok"];
+        let raw = Client::new().post(worker_url.clone()).send().await.expect_err("port 1");
+        assert!(matches!(classify_error(&raw), GatewayError::UpstreamUnreachable));
+        assert!(raw.to_string().contains("apikey123"), "raw display should carry the url: {raw}");
+
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: worker_url,
+            readiness_url: Url::parse("http://127.0.0.1:1/health/workers").expect("url"),
+        };
+        let state = AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[worker])),
+            http: proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client"),
+            query_upstream: Some(query_url),
+        };
+        state.readiness.set_ready(0, true);
+        let peer: SocketAddr = "127.0.0.1:40000".parse().expect("peer");
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_call","params":[],"id":2}"#,
+        ] {
+            let response = proxy(
+                State(state.clone()),
+                ConnectInfo(peer),
+                Method::POST,
+                HeaderMap::new(),
+                Ok(Bytes::from_static(body.as_bytes())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
+        }
+
+        let text = logs.text();
+        let failures: Vec<_> =
+            text.lines().filter(|line| line.contains("forwarding to upstream failed")).collect();
+        assert_eq!(failures.len(), 2, "one warning per route: {text}");
+        for (line, route) in failures.iter().zip(["worker", "query"]) {
+            assert!(line.contains(&format!("route=\"{route}\"")), "{line}");
+            assert!(line.contains("upstream=http://127.0.0.1:1 "), "{line}");
+            assert!(line.contains("cause=error sending request: "), "cause has a source: {line}");
+        }
+        for secret in secrets {
+            assert!(!text.contains(secret), "the logs leak {secret:?}: {text}");
+        }
     }
 
     #[test]
