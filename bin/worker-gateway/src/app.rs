@@ -12,7 +12,7 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState, ServerLimits},
+    server::{inflight_slots, serve, AppState, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -31,6 +31,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_request_timeout,
         header_read_timeout,
         max_connections,
+        max_inflight_submissions,
+        max_inflight_queries,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
@@ -65,6 +67,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
+        max_inflight_submissions,
+        max_inflight_queries,
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
@@ -119,7 +123,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
+    let state = AppState {
+        readiness: Arc::clone(&readiness),
+        http: proxy_client,
+        query_upstream,
+        submission_slots: inflight_slots(max_inflight_submissions),
+        query_slots: inflight_slots(max_inflight_queries),
+    };
 
     spawner.spawn_critical_task(
         "readiness-poller",

@@ -113,6 +113,20 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
 
+    /// Maximum in-flight requests made only of transaction submissions
+    /// (default 256; `0` means unlimited). A submission over the cap is
+    /// answered at once with a `503` overload error instead of waiting. The
+    /// class is the same with or without `--redirect-queries`.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS", default_value_t = 256)]
+    pub(crate) max_inflight_submissions: usize,
+
+    /// Maximum in-flight requests of every other kind, mixed batches included
+    /// (default 256; `0` means unlimited). A request over the cap is answered
+    /// at once with a `503` overload error instead of waiting, so a stalled
+    /// query upstream cannot take the connection slots submissions need.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_QUERIES", default_value_t = 256)]
+    pub(crate) max_inflight_queries: usize,
+
     /// Transport-stall deadline for inbound connections (`TCP_USER_TIMEOUT`):
     /// a connection whose peer leaves written response data unacknowledged, or
     /// its receive window closed, for this long is forcibly closed by the
@@ -248,6 +262,10 @@ pub(crate) struct Settings {
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// In-flight cap for submission requests (`0` = unlimited).
+    pub(crate) max_inflight_submissions: usize,
+    /// In-flight cap for every other request (`0` = unlimited).
+    pub(crate) max_inflight_queries: usize,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
     /// or `None` when disabled.
     pub(crate) tcp_user_timeout: Option<Duration>,
@@ -322,6 +340,8 @@ impl Cli {
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            max_inflight_submissions: self.max_inflight_submissions,
+            max_inflight_queries: self.max_inflight_queries,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
@@ -724,6 +744,22 @@ mod tests {
         assert!(v4.is_err(), "a /33 IPv4 prefix must fail startup, not be clamped");
         let v6 = cli_with_flags(&["--rate-limit-per-ip-v6-prefix=129"]).into_settings();
         assert!(v6.is_err(), "a /129 IPv6 prefix must fail startup, not be clamped");
+    }
+
+    #[test]
+    fn inflight_caps_default_on_and_zero_means_unlimited() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (256, 256));
+
+        let settings =
+            cli_with_flags(&["--max-inflight-submissions=0", "--max-inflight-queries=4"])
+                .into_settings()?;
+        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (0, 4));
+        assert_eq!(
+            crate::server::inflight_slots(settings.max_inflight_submissions).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        Ok(())
     }
 
     #[test]

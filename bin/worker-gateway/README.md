@@ -103,6 +103,8 @@ Every flag has an environment-variable fallback.
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
+| `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
@@ -314,6 +316,7 @@ echoed when it can be recovered.
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
+| In-flight cap reached (overloaded) | `503` | `-32009` |
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
@@ -348,6 +351,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
+| `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also

@@ -45,6 +45,9 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
+    /// Every in-flight slot the request could use is taken (its route's cap,
+    /// or the cap on concurrent requests to the worker).
+    pub(super) const OVERLOADED: i32 = -32009;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -76,6 +79,10 @@ pub(crate) enum GatewayError {
     UnsupportedTransactionType,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
+    /// Every in-flight slot the request could use is taken. The gateway
+    /// answers at once instead of queueing, so one saturated route cannot
+    /// hold the connection slots the other route needs.
+    Overloaded,
 }
 
 impl GatewayError {
@@ -91,6 +98,7 @@ impl GatewayError {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
+            Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
         }
     }
 
@@ -107,6 +115,7 @@ impl GatewayError {
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::UnreadableBody => code::INVALID_REQUEST,
+            Self::Overloaded => code::OVERLOADED,
         }
     }
 
@@ -127,6 +136,7 @@ impl GatewayError {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
             Self::UnreadableBody => "request body could not be read",
+            Self::Overloaded => "gateway overloaded; retry later",
         }
     }
 
@@ -146,6 +156,7 @@ impl GatewayError {
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
             Self::UnreadableBody => "unreadable_body",
+            Self::Overloaded => "overloaded",
         }
     }
 }
@@ -475,6 +486,7 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::Overloaded.code(), -32009);
     }
 
     #[test]
@@ -495,5 +507,22 @@ mod tests {
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
+        assert_eq!(GatewayError::Overloaded.reason(), "overloaded");
+    }
+
+    #[tokio::test]
+    async fn overloaded_code_and_reason_are_stable() {
+        // clients back off on the 503 and dashboards key on the reason, so the
+        // whole overload envelope is pinned, not just its code
+        assert_eq!(GatewayError::Overloaded.code(), -32009);
+        assert_eq!(GatewayError::Overloaded.reason(), "overloaded");
+
+        let response = error_response(&GatewayError::Overloaded, br#"{"id":"slot-1"}"#);
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], json!(-32009));
+        assert_eq!(body["error"]["message"], json!("gateway overloaded; retry later"));
+        assert_eq!(body["id"], json!("slot-1"));
     }
 }

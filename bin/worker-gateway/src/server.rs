@@ -69,6 +69,21 @@ pub(crate) struct AppState {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers. It is not readiness-gated.
     pub(crate) query_upstream: Option<Url>,
+    /// In-flight cap for requests made only of submissions
+    /// (`--max-inflight-submissions`); see [`inflight_slots`].
+    pub(crate) submission_slots: Arc<Semaphore>,
+    /// In-flight cap for every other request (`--max-inflight-queries`); see
+    /// [`inflight_slots`].
+    pub(crate) query_slots: Arc<Semaphore>,
+}
+
+/// The semaphore behind an in-flight cap of `cap` requests, where `0` means
+/// unlimited (the semaphore's maximum, which no gateway can reach). Requests
+/// take a permit without waiting (see [`crate::proxy`]), so the cap is a
+/// fail-fast limit, never a queue.
+pub(crate) fn inflight_slots(cap: usize) -> Arc<Semaphore> {
+    let permits = if cap == 0 { Semaphore::MAX_PERMITS } else { cap.min(Semaphore::MAX_PERMITS) };
+    Arc::new(Semaphore::new(permits))
 }
 
 /// Inbound connection limits enforced by the accept loop and router (derived
@@ -378,6 +393,8 @@ mod tests {
             readiness: Arc::new(GatewayReadiness::new(upstreams)),
             http: client,
             query_upstream: None,
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
         }
     }
 
@@ -967,6 +984,8 @@ mod tests {
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
         }
     }
 
@@ -1251,5 +1270,199 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A redirecting gateway whose query route is capped and saturated: every
+    /// query slot is held by a read that the query upstream accepted and will
+    /// never answer. The worker is ready and answers `worker`.
+    struct SaturatedQueries {
+        gateway: SocketAddr,
+        worker_seen: Seen,
+        /// Reads the never-answering query upstream has received.
+        query_hits: Arc<AtomicUsize>,
+        /// Keeps the gateway and both mocks alive.
+        _servers: [Notifier; 3],
+    }
+
+    /// Start a [`SaturatedQueries`] with a query cap of `cap` and wait until
+    /// `cap` stalled reads hold every slot.
+    async fn saturated_query_route(cap: usize) -> SaturatedQueries {
+        let (worker, worker_seen, worker_server) = named_mock("worker").await;
+        let query_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&query_hits);
+        let stalled = Router::new().route(
+            "/",
+            post(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    future::pending::<()>().await;
+                    "never"
+                }
+            }),
+        );
+        let (query, query_server) = spawn(stalled).await;
+
+        let mut state = redirect_state(worker, Some(query));
+        state.query_slots = inflight_slots(cap);
+        state.readiness.set_ready(0, true);
+        let query_slots = Arc::clone(&state.query_slots);
+        let (gateway, gateway_server) = spawn(test_router(state)).await;
+
+        for (_, id) in (0..cap).zip(100_u64..) {
+            tokio::spawn(post_rpc(gateway, None, call("eth_getLogs", id)));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while query_slots.available_permits() > 0 || query_hits.load(Ordering::SeqCst) < cap {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled reads should take every query slot and reach the query upstream");
+
+        SaturatedQueries {
+            gateway,
+            worker_seen,
+            query_hits,
+            _servers: [worker_server, query_server, gateway_server],
+        }
+    }
+
+    #[tokio::test]
+    async fn submissions_succeed_while_query_route_is_saturated() {
+        let saturated = saturated_query_route(4).await;
+
+        // the submission has its own slots, so the four stalled reads cannot
+        // hold it back
+        let (status, text) = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_rpc(saturated.gateway, None, call("eth_sendRawTransaction", 1)),
+        )
+        .await
+        .expect("a submission must not wait behind a saturated query route");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(saturated.worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn submissions_succeed_while_stalled_reads_exceed_the_connection_cap() {
+        let (worker, worker_seen, _worker_server) = named_mock("worker").await;
+        let (query, _query_server) =
+            spawn(Router::new().route("/", post(future::pending::<&'static str>))).await;
+        let mut state = redirect_state(worker, Some(query));
+        state.query_slots = inflight_slots(4);
+        state.readiness.set_ready(0, true);
+        // six connections: stalled reads could hold all of them, so only the
+        // query cap keeps two free for the submission
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(6).expect("nonzero"),
+            ..test_limits()
+        };
+        let (gateway, _gateway_server) = spawn_with_limits(test_router(state), limits).await;
+
+        // twelve reads: four take the query slots and stall, and the other
+        // eight must be refused rather than wait for a slot (or a connection)
+        let (done, mut refused) = tokio::sync::mpsc::unbounded_channel();
+        for id in 100_u64..112 {
+            let done = done.clone();
+            tokio::spawn(async move {
+                let outcome = post_rpc(gateway, None, call("eth_getLogs", id)).await;
+                let _ = done.send(outcome);
+            });
+        }
+        for _ in 0..8 {
+            let (status, text) = tokio::time::timeout(Duration::from_secs(5), refused.recv())
+                .await
+                .expect("over-cap reads must be refused, not queued")
+                .expect("outcome");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+            assert_eq!(error_code_and_id(&text).0, -32009);
+        }
+
+        let (status, text) = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_rpc(gateway, None, call("eth_sendRawTransaction", 1)),
+        )
+        .await
+        .expect("a submission must not wait behind stalled reads");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn query_slot_is_held_until_the_response_body_ends() {
+        use futures::StreamExt as _;
+
+        let (worker, _worker_seen, _worker_server) = named_mock("worker").await;
+        // a query upstream that sends its head and a first chunk, then stalls
+        let (query, _query_server) = spawn(Router::new().route(
+            "/",
+            post(|| async {
+                let first = futures::stream::iter([Ok::<_, std::convert::Infallible>("partial")]);
+                axum::body::Body::from_stream(first.chain(futures::stream::pending()))
+            }),
+        ))
+        .await;
+        // the proxy client's 3s deadline is what ends the stalled body
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(3)).expect("client");
+        let mut state = redirect_state_with_client(worker, Some(query), client);
+        state.query_slots = inflight_slots(1);
+        let query_slots = Arc::clone(&state.query_slots);
+        let (gateway, _gateway_server) = spawn(test_router(state)).await;
+
+        let mut response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let first = response.chunk().await.expect("first chunk");
+        assert_eq!(first.as_deref(), Some(&b"partial"[..]));
+
+        // the handler has returned, but the body is still streaming, so the
+        // read keeps its slot and a second read is refused
+        assert_eq!(query_slots.available_permits(), 0);
+        let (status, text) = post_rpc(gateway, None, call("eth_getLogs", 2)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text), (-32009, serde_json::json!(2)));
+
+        // the deadline cuts the stalled body off, which frees the slot
+        let rest = tokio::time::timeout(Duration::from_secs(10), response.chunk())
+            .await
+            .expect("the upstream deadline should end the body");
+        assert!(rest.is_err(), "a body cut off by the deadline must not end cleanly");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while query_slots.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the slot should be freed once the body ends");
+    }
+
+    #[tokio::test]
+    async fn over_cap_queries_get_503_overloaded_without_waiting() {
+        let saturated = saturated_query_route(4).await;
+
+        // a read over the cap is answered at once; waiting for a slot would
+        // take until the upstream request timeout (5s) frees one
+        let client = Client::new();
+        let started = tokio::time::Instant::now();
+        let response = client
+            .post(format!("http://{}/", saturated.gateway))
+            .body(call("eth_getLogs", 5))
+            .send()
+            .await
+            .expect("send");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let text = response.text().await.expect("text");
+        assert_eq!(error_code_and_id(&text), (-32009, serde_json::json!(5)));
+        assert!(elapsed < Duration::from_secs(1), "the over-cap read waited {elapsed:?}");
+
+        // the refused read never reached either upstream
+        assert_eq!(saturated.query_hits.load(Ordering::SeqCst), 4);
+        assert_eq!(saturated.worker_seen.hits(), 0);
     }
 }
