@@ -278,6 +278,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Seed fixed launch bindings without granting committee membership.
+    SeedCommitteePeers {
+        /// This swarm's operator-owned BLS/network/address bindings.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Reply after validation and insertion, before startup dials.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Dial a peer to establish a connection.
     Dial {
         /// The peer's id.
@@ -588,6 +595,16 @@ where
         rx.await?
     }
 
+    /// Seed fixed operator-owned launch bindings before dialing committee peers.
+    pub async fn seed_committee_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SeedCommitteePeers { peers, reply }).await?;
+        rx.await?
+    }
+
     /// Dial a peer by Bls public key.
     ///
     /// Return swarm error to caller.
@@ -825,9 +842,9 @@ pub struct KadQuery {
     /// Whether the local store can contribute to this lookup.
     scope: KadQueryScope,
     /// The local candidate, discarded when this lookup becomes a refresh.
-    local: Option<NodeRecord>,
+    local: Option<(NodeRecord, crate::freshness::RecordTimestamp)>,
     /// The newest remote candidate, retained independently when a refresh joins the lookup.
-    remote: Option<NodeRecord>,
+    remote: Option<(NodeRecord, crate::freshness::RecordTimestamp)>,
 }
 
 /// Sources allowed to satisfy an outbound authority lookup.
@@ -851,27 +868,46 @@ impl KadQuery {
         self.local = None;
     }
 
-    /// Retain the newest verified candidate from each permitted source.
-    pub(crate) fn record_result(&mut self, record: NodeRecord, peer: Option<PeerId>) {
+    /// Retain the freshest verified candidate from each permitted source.
+    ///
+    /// Candidates follow local admission ordering, so a far-future signed timestamp cannot
+    /// win permanently.
+    pub(crate) fn record_result(
+        &mut self,
+        record: NodeRecord,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+        peer: Option<PeerId>,
+    ) {
         if peer.is_some() || matches!(self.scope, KadQueryScope::LocalAndRemote) {
             let candidate = if peer.is_some() { &mut self.remote } else { &mut self.local };
-            if candidate
-                .as_ref()
-                .is_none_or(|tracked| tracked.info.timestamp < record.info.timestamp)
+            if candidate.as_ref().is_none_or(|(_, cached)| timestamp.supersedes(*cached, observed))
             {
-                *candidate = Some(record);
+                *candidate = Some((record, timestamp));
             }
         }
     }
 
-    /// Consume the lookup and return its newest eligible record with the requested identity.
-    pub(crate) fn into_result(self) -> Option<(BlsPublicKey, NodeRecord)> {
+    /// Admit a local result at `observed` and retain it under the shared ordering policy.
+    #[cfg(test)]
+    pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(record.info.timestamp, observed);
+        self.record_result(record, timestamp, observed, None);
+    }
+
+    /// Consume the lookup and return the requested identity, its freshest eligible record and
+    /// the record's original admission metadata.
+    pub(crate) fn into_result(
+        self,
+        observed: tn_types::TimestampSec,
+    ) -> Option<(BlsPublicKey, NodeRecord, crate::freshness::RecordTimestamp)> {
+        let local = self.local;
         self.remote
-            .filter(|remote| {
-                self.local.as_ref().is_none_or(|local| local.info.timestamp < remote.info.timestamp)
+            .filter(|(_, remote)| {
+                local.as_ref().is_none_or(|(_, local)| remote.supersedes(*local, observed))
             })
-            .or(self.local)
-            .map(|record| (self.request, record))
+            .or(local)
+            .map(|(record, timestamp)| (self.request, record, timestamp))
     }
 }
 

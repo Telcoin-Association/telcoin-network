@@ -1,6 +1,11 @@
 //! Module with kademlia specific extensions, like a persistant store.
 
-use crate::{consensus::MAX_ADVERTISED_MULTIADDRS, types::NetworkType};
+use crate::{
+    consensus::MAX_ADVERTISED_MULTIADDRS,
+    freshness::RecordTimestamp,
+    retention::{RecordRetention, RetentionBudget},
+    types::NetworkType,
+};
 use libp2p::{
     kad::{
         store::{Error, MemoryStoreConfig, RecordStore},
@@ -13,13 +18,14 @@ use serde_with::{serde_as, DeserializeAs, SerializeAs};
 use std::{
     borrow::Cow,
     fmt, iter,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime},
 };
 use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{encode, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
+use tn_types::{encode, now, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
 use tracing::{error, warn};
 
 /// A record stored in the DHT.
@@ -60,6 +66,37 @@ impl KadRecord {
         matches!(self.expires, Some(exp) if exp <= now)
     }
 }
+
+/// Local persistence envelope, never transmitted as part of a signed node record.
+#[derive(Serialize, Deserialize)]
+struct StoredKadRecord {
+    /// Original record, including unchanged authenticated bytes and normal DHT expiry.
+    record: KadRecord,
+    /// Fixed local admission metadata for signed node records.
+    timestamp: Option<RecordTimestamp>,
+}
+
+impl StoredKadRecord {
+    /// Decode current envelopes or recover legacy rows without renewing a future ceiling.
+    fn decode(raw: &[u8]) -> Option<Self> {
+        try_decode::<Self>(raw)
+            .ok()
+            .or_else(|| {
+                try_decode::<KadRecord>(raw).ok().map(|record| Self { record, timestamp: None })
+            })
+            .map(|mut stored| {
+                stored.timestamp = stored.timestamp.or_else(|| {
+                    crate::types::NodeRecord::try_decode_compat(&stored.record.value)
+                        .map(|node| RecordTimestamp::legacy(node.info.timestamp, now()))
+                });
+                stored
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/record_freshness.rs"]
+mod record_freshness_tests;
 
 impl KadProviderRecord {
     /// Returns true if the provider record carries an expiry that has already passed.
@@ -233,7 +270,7 @@ pub(crate) fn node_record_key(primary_public_key: &BlsPublicKey) -> RecordKey {
 
 /// Provide a persistant store for kademlia data.
 /// Wraps around the consensus DB.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct KadStore<DB> {
     /// Shared database containing all swarm namespaces.
     db: DB,
@@ -261,6 +298,14 @@ pub struct KadStore<DB> {
     last_provider_evict: Option<Instant>,
     /// Index used for database retrieval with multiple KAD tables.
     kad_type: NetworkType,
+    /// Production ownership policy. Standalone stores exercise the underlying database;
+    /// every consensus swarm enables its policy before serving records.
+    retention: Option<RecordRetention<RecordKey, PeerId>>,
+    /// Rows restored from a previous run that no owner retained when retention was enabled.
+    /// They stay counted in `num_records` until the first committee prune, so `put` adds them
+    /// to the owners' capacity until then. `put` admits only retained keys, so this allowance
+    /// cannot grow the retained set.
+    startup_unretained: usize,
 }
 
 impl<DB: Database> KadStore<DB> {
@@ -288,6 +333,8 @@ impl<DB: Database> KadStore<DB> {
             num_providers: 0,
             last_provider_evict: None,
             kad_type,
+            retention: None,
+            startup_unretained: 0,
         };
         store.num_records = store.owned_records().count();
         store.num_providers = store.owned_provider_rows().count();
@@ -298,6 +345,156 @@ impl<DB: Database> KadStore<DB> {
         );
         store.update_records_gauge();
         store
+    }
+
+    /// Enable ownership with separate process allowances for required keys and connected sources.
+    /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024), bounding the union to
+    /// 2,048 rows across all primary and worker swarms. Excess configuration fails explicitly.
+    ///
+    /// Persisted rows are not pruned here. At startup only our own key is retained, because the
+    /// committees are not known yet. The first committee update prunes the rows it does not
+    /// retain. Until then, `get` and `records` do not serve unretained rows, and `put` does not
+    /// count them against the owners' capacity.
+    pub(crate) fn enable_retention(&mut self) -> libp2p::kad::store::Result<()> {
+        /// Shared across database types and all primary and worker swarms.
+        static BUDGET: OnceLock<Arc<RetentionBudget>> = OnceLock::new();
+        let budget = BUDGET.get_or_init(|| {
+            Arc::new(RetentionBudget::new(MemoryStoreConfig::default().max_records))
+        });
+        self.retention = Some(
+            RecordRetention::new(self.node_key.clone(), Arc::clone(budget))
+                .map_err(|_| Error::MaxRecords)?,
+        );
+        self.startup_unretained =
+            self.owned_records().filter(|(_, record)| !self.retains(&record.key)).count();
+        Ok(())
+    }
+
+    /// Reserve pins before granting operator-provisioned peer-manager privileges.
+    pub(crate) fn pin_records(
+        &mut self,
+        keys: impl IntoIterator<Item = BlsPublicKey>,
+    ) -> libp2p::kad::store::Result<()> {
+        self.retention
+            .as_mut()
+            .map(|retention| retention.pin(keys.into_iter().map(|key| node_record_key(&key))))
+            .transpose()
+            .map_err(|_| Error::MaxRecords)?;
+        Ok(())
+    }
+
+    /// Replace the previous/current/next committee union, preserving pins and connections.
+    pub(crate) fn retain_committees(
+        &mut self,
+        keys: impl IntoIterator<Item = BlsPublicKey>,
+    ) -> libp2p::kad::store::Result<()> {
+        self.retention
+            .as_mut()
+            .map(|retention| {
+                retention.committees(keys.into_iter().map(|key| node_record_key(&key)))
+            })
+            .transpose()
+            .map_err(|_| Error::MaxRecords)?;
+        self.prune_unretained()
+    }
+
+    /// Retain a verified source's current binding without gating its identity confirmation.
+    pub(crate) fn retain_connected(
+        &mut self,
+        source: PeerId,
+        key: RecordKey,
+    ) -> libp2p::kad::store::Result<()> {
+        let previous = self
+            .retention
+            .as_mut()
+            .map(|retention| retention.connected(source, key))
+            .transpose()
+            .map_err(|_| Error::MaxRecords)?
+            .flatten();
+        previous.map(|key| self.prune_record(&key)).transpose()?;
+        Ok(())
+    }
+
+    /// Release only connection ownership when the source's last transport connection closes.
+    pub(crate) fn release_connected(&mut self, source: &PeerId) -> libp2p::kad::store::Result<()> {
+        let previous = self.retention.as_mut().and_then(|retention| retention.disconnected(source));
+        previous.map(|key| self.prune_record(&key)).transpose()?;
+        Ok(())
+    }
+
+    /// Whether a production owner permits this row; standalone stores keep their general API.
+    fn retains(&self, key: &RecordKey) -> bool {
+        self.retention.as_ref().is_none_or(|retention| retention.retains(key))
+    }
+
+    /// Required remote keys missing a live row, including cached peers restored before policy
+    /// setup.
+    pub(crate) fn missing_required_records(&self) -> Vec<BlsPublicKey> {
+        self.retention
+            .iter()
+            .flat_map(RecordRetention::required_keys)
+            .filter(|key| *key != &self.node_key && self.get(key).is_none())
+            .filter_map(|key| BlsPublicKey::from_literal_bytes(key.as_ref()).ok())
+            .collect()
+    }
+
+    /// Count actual database rows so lifecycle tests detect retained orphan rows too.
+    #[cfg(test)]
+    pub(crate) fn persisted_record_count(&self) -> usize {
+        self.owned_records().count()
+    }
+
+    /// Use an isolated finite allowance to exercise capacity failures without consuming the
+    /// other tests' process reservations.
+    #[cfg(test)]
+    pub(crate) fn set_retention_budget_for_test(
+        &mut self,
+        limit: usize,
+    ) -> libp2p::kad::store::Result<()> {
+        self.retention = Some(
+            RecordRetention::new(self.node_key.clone(), Arc::new(RetentionBudget::new(limit)))
+                .map_err(|_| Error::MaxRecords)?,
+        );
+        self.prune_unretained()
+    }
+
+    /// Remove a row that lost its last owner, reporting failed deletion without freeing its
+    /// database row count.
+    fn prune_record(&mut self, key: &RecordKey) -> libp2p::kad::store::Result<()> {
+        if self.retains(key) {
+            Ok(())
+        } else {
+            let hash = self.key_to_hash(key);
+            self.remove(key);
+            let remains = match self.kad_type {
+                NetworkType::Primary => self.db.get::<KadRecords>(&hash),
+                NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
+            }
+            .map_err(|error| {
+                error!(target: "network-kad", ?error, ?key, kad_type = ?self.kad_type, "failed to verify Kademlia record deletion");
+                Error::MaxRecords
+            })?;
+            if remains.is_some() {
+                error!(target: "network-kad", ?key, kad_type = ?self.kad_type, "failed to delete unretained Kademlia record; row stays counted");
+                Err(Error::MaxRecords)
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Prune rotated-out keys and persisted startup rows that the committee update does not
+    /// retain. Failed deletions stay counted and are explicit.
+    fn prune_unretained(&mut self) -> libp2p::kad::store::Result<()> {
+        let obsolete: Vec<_> = self
+            .owned_records()
+            .filter(|(_, record)| !self.retains(&record.key))
+            .map(|(_, record)| record.key)
+            .collect();
+        let pruned = obsolete.into_iter().try_for_each(|key| self.prune_record(&key));
+        // Restored rows are deleted or reported now, so they no longer extend capacity.
+        self.startup_unretained = 0;
+        pruned
     }
 
     /// Mirror `num_records` into the prometheus gauge.
@@ -338,7 +535,87 @@ impl<DB: Database> KadStore<DB> {
 
     /// Decode a discovery row only when its persisted key matches this store's namespace.
     fn decode_record(&self, hash: &BlockHash, raw: &[u8]) -> Option<KadRecord> {
-        try_decode::<KadRecord>(raw).ok().filter(|record| self.owns(&record.key, hash))
+        StoredKadRecord::decode(raw)
+            .map(|stored| stored.record)
+            .filter(|record| self.owns(&record.key, hash))
+    }
+
+    /// Read the original local admission ceiling, including after a process restart.
+    pub(crate) fn record_timestamp(&self, key: &RecordKey) -> Option<RecordTimestamp> {
+        let hash = self.key_to_hash(key);
+        match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&hash),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
+        }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, "failed to read record freshness metadata");
+        })
+        .ok()
+        .flatten()
+        .and_then(|raw| StoredKadRecord::decode(&raw))
+        .filter(|stored| stored.record.key == *key)
+        .and_then(|stored| stored.timestamp)
+    }
+
+    /// Persist a record with its fixed admission metadata, preserving identical republishes.
+    pub(crate) fn put_with_timestamp(
+        &mut self,
+        r: Record,
+        timestamp: Option<RecordTimestamp>,
+    ) -> libp2p::kad::store::Result<()> {
+        self.retains(&r.key).then_some(()).ok_or(Error::MaxRecords)?;
+        if r.value.len() >= self.config.max_value_bytes {
+            return Err(Error::ValueTooLarge);
+        }
+
+        let key = self.key_to_hash(&r.key);
+        let kr: KadRecord = r.into();
+        let stored = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
+            Error::ValueTooLarge
+        })?;
+        // Startup excludes unreadable records, so repairing one is an insertion for capacity
+        // accounting. Replacing a readable owned row keeps the existing count.
+        let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
+        // Our own key holds the slot that `RecordRetention::new` reserves, so it never competes
+        // for capacity. Restored rows that no owner retains yet extend the owners' capacity
+        // until the first committee prune deletes them.
+        let own = kr.key == self.node_key;
+        let max_records = self.retention.as_ref().map_or(self.config.max_records, |retention| {
+            retention.max_records().saturating_add(self.startup_unretained)
+        });
+        if new_record && !own && self.num_records >= max_records {
+            // Try to free a slot by evicting any records whose TTL has passed.
+            self.evict_expired_records();
+            if self.num_records >= max_records {
+                return Err(Error::MaxRecords);
+            }
+        }
+        // Byte-identical republishes may refresh DHT expiry, but never the admission ceiling.
+        let timestamp = stored
+            .as_deref()
+            .and_then(StoredKadRecord::decode)
+            .filter(|stored| stored.record.value == kr.value)
+            .and_then(|stored| stored.timestamp)
+            .or(timestamp);
+        let encoded = encode(&StoredKadRecord { record: kr, timestamp });
+        match self.kad_type {
+            NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encoded),
+            NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encoded),
+        }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
+            Error::ValueTooLarge
+        })?;
+        if new_record {
+            self.num_records += 1;
+            self.update_records_gauge();
+        }
+        Ok(())
     }
 
     /// Enumerate this swarm's rows, including expired records needed for accounting.
@@ -496,6 +773,7 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     >;
 
     fn get(&self, k: &RecordKey) -> Option<Cow<'_, Record>> {
+        self.retains(k).then_some(())?;
         let key = self.key_to_hash(k);
         let record = match self.kad_type {
             NetworkType::Primary => self.db.get::<KadRecords>(&key),
@@ -506,50 +784,18 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         })
         .ok()?;
         let raw = record?;
-        try_decode::<KadRecord>(&raw)
-            .ok()
+        StoredKadRecord::decode(&raw)
+            .map(|stored| stored.record)
             .filter(|record| record.key == *k && !record.is_expired(SystemTime::now()))
             .map(|record| Cow::Owned(record.into()))
     }
 
     fn put(&mut self, r: Record) -> libp2p::kad::store::Result<()> {
-        if r.value.len() >= self.config.max_value_bytes {
-            return Err(Error::ValueTooLarge);
-        }
-
-        let key = self.key_to_hash(&r.key);
-        let kr: KadRecord = r.into();
-        let stored = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
-        }
-        .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
-            Error::ValueTooLarge
-        })?;
-        // Startup excludes unreadable records, so repairing one is an insertion for capacity
-        // accounting. Replacing a readable owned row keeps the existing count.
-        let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
-        if new_record && self.num_records >= self.config.max_records {
-            // Try to free a slot by evicting any records whose TTL has passed.
-            self.evict_expired_records();
-            if self.num_records >= self.config.max_records {
-                return Err(Error::MaxRecords);
-            }
-        }
-        match self.kad_type {
-            NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encode(&kr)),
-            NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encode(&kr)),
-        }
-        .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
-            Error::ValueTooLarge
-        })?;
-        if new_record {
-            self.num_records += 1;
-            self.update_records_gauge();
-        }
-        Ok(())
+        let timestamp = (r.value.len() < self.config.max_value_bytes)
+            .then(|| crate::types::NodeRecord::try_decode_compat(&r.value))
+            .flatten()
+            .map(|node| RecordTimestamp::admit(node.info.timestamp, now()));
+        self.put_with_timestamp(r, timestamp)
     }
 
     fn remove(&mut self, k: &RecordKey) {
@@ -558,6 +804,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Primary => self.db.get::<KadRecords>(&key),
             NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
         }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to read Kademlia record before removal");
+        })
         .ok()
         .flatten()
         .and_then(|raw| self.decode_record(&key, &raw))
@@ -566,6 +815,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
             NetworkType::Primary => self.db.remove::<KadRecords>(&key),
             NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
         }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to remove Kademlia record");
+        })
         .is_ok()
             && row_counted
         {
@@ -578,7 +830,9 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
-        RecordIter { iter: Box::new(self.owned_records()) }
+        RecordIter {
+            iter: Box::new(self.owned_records().filter(|(_, record)| self.retains(&record.key))),
+        }
     }
 
     fn add_provider(&mut self, record: ProviderRecord) -> libp2p::kad::store::Result<()> {
@@ -1978,5 +2232,62 @@ mod test {
         assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
         assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
         assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
+    }
+
+    /// Restored rows that no owner retains yet do not block a first-seen connected peer before
+    /// the first committee prune, and the prune removes them along with their extra allowance.
+    #[test]
+    fn test_kad_restored_unretained_rows_do_not_block_first_seen_peer() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        // Rows left by a previous run. A standalone store retains every key.
+        let mut previous_run =
+            KadStore::new(db.clone(), PeerId::random(), &key_config, NetworkType::Primary);
+        (0..4).try_for_each(|_| previous_run.put(test_record(false)))?;
+
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        store.enable_retention()?;
+        assert_eq!(store.num_records, 4);
+        assert_eq!(store.startup_unretained, 4);
+
+        let peer = test_record(false);
+        store.retain_connected(PeerId::random(), peer.key.clone())?;
+        store.put(peer.clone())?;
+        assert!(
+            store.get(&peer.key).is_some(),
+            "first-seen peer record must land before the prune"
+        );
+
+        store.retain_committees(std::iter::empty::<BlsPublicKey>())?;
+        assert_eq!(store.startup_unretained, 0);
+        assert_eq!(store.persisted_record_count(), 1, "only the connected peer row survives");
+        assert_eq!(store.num_records, 1);
+        Ok(())
+    }
+
+    /// Our own row is admitted even when counted rows fill the owners' capacity.
+    #[test]
+    fn test_kad_own_record_exempt_from_capacity() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let mut store = KadStore::new(db, PeerId::random(), &key_config, NetworkType::Primary);
+        (0..2).try_for_each(|_| store.put(test_record(false)))?;
+        // Counted rows with no startup allowance, as after a failed prune.
+        store.retention =
+            Some(RecordRetention::new(store.node_key.clone(), Arc::new(RetentionBudget::new(4)))?);
+        assert_eq!(store.num_records, 2);
+
+        let own = Record {
+            key: store.node_key.clone(),
+            value: vec![4, 5, 6],
+            publisher: None,
+            expires: None,
+        };
+        store.put(own.clone())?;
+        assert!(store.get(&own.key).is_some(), "own record must land at capacity");
+        assert_eq!(store.num_records, 3);
+        Ok(())
     }
 }
