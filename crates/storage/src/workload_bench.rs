@@ -27,9 +27,11 @@
 //!   late in an 8-hour epoch (about one round a second) reloads tens of thousands of certificates
 //!   and over a million payload rows into memory. At its end the epoch tables are cleared
 //!   (`clear_consensus_db_for_next_epoch`).
-//! - **The batch cache**: one single insert (its own commit) per batch of 1 KB to 1 MB; concurrent
-//!   readers (`multi_get`, from the executor and peer streams) served from disk; and, for every
-//!   committed digest, a remove from the own-batch table, nearly always of an absent key.
+//! - **The batch cache**: one single insert (its own commit) per batch of 1 KB to 1 MB, our own
+//!   batches also kept in the own-batch table until committed; concurrent readers (`multi_get`,
+//!   from the executor and peer streams) served from disk; and, once each consensus output is
+//!   saved, one write transaction evicting its committed batches from both tables
+//!   (`evict_committed_batches` in `run_epoch.rs`).
 //!
 //! ## Workloads (each an `#[ignore]`d test)
 //!
@@ -41,8 +43,9 @@
 //!   epoch-end clear. Reports time per round, the durable latency of votes and of our own header
 //!   and certificate (write to `persist` ack, including the wait behind queued writes), and the
 //!   disk the epoch leaves behind.
-//! - `workload_batch_cache`: single batch inserts (16 KB and 256 KB) against [`CACHE_READERS`]
-//!   concurrent `multi_get` readers, on the cache-mode layer.
+//! - `workload_batch_cache`: single batch inserts (16 KB and 256 KB), with a per-output eviction
+//!   transaction, against [`CACHE_READERS`] concurrent `multi_get` readers of the live batches, on
+//!   the cache-mode layer.
 //! - `workload_startup_reload`: a restart late in an epoch: reopen time, raw and with the
 //!   full-memory layer loading every row.
 //! - `workload_compaction`: a long-lived table under churn (a sliding window of single inserts and
@@ -170,6 +173,12 @@ const PAYLOAD_TOKEN: u8 = 1;
 const CACHE_READERS: usize = 4;
 /// Digests per cache `multi_get` (about an output's batches for one worker).
 const CACHE_READ_CHUNK: usize = 32;
+/// Batches one consensus output commits (N = 10 validators, [`BATCHES_PER_HEADER`] each).
+const OUTPUT_BATCHES: u64 = 50;
+/// Outputs between a batch's insert and its eviction (it is certified and committed meanwhile).
+const EVICT_LAG: u64 = 4;
+/// One batch in this many is our own, kept in the own-batch table too until it is committed.
+const OUR_SHARE: u64 = 10;
 /// The committee of the startup-reload workload.
 const RELOAD_COMMITTEE: usize = 10;
 /// Rounds before the restart: an 8-hour epoch at about one round a second.
@@ -199,7 +208,6 @@ const DOMAIN_CERT: u64 = 1;
 const DOMAIN_ORIGIN: u64 = 2;
 const DOMAIN_PAYLOAD: u64 = 3;
 const DOMAIN_BATCH: u64 = 4;
-const DOMAIN_ABSENT: u64 = 5;
 
 /// SplitMix64: a cheap, well-mixed stream.
 fn mix(mut x: u64) -> u64 {
@@ -760,25 +768,29 @@ impl Workload for BatchCache {
         let batch = filler(self.size, 9);
         let keys: Vec<B256> = (0..self.count).map(|i| digest(DOMAIN_BATCH, i, 0)).collect();
         let written = AtomicU64::new(0);
+        // The lowest batch not yet evicted. Readers choose from two outputs above it, so a batch
+        // they pick stays live for at least two more evictions.
+        let floor = AtomicU64::new(0);
         let done = AtomicBool::new(false);
 
         let (write_time, gets) = std::thread::scope(|s| {
             let readers: Vec<_> = (0..CACHE_READERS as u64)
                 .map(|reader| {
-                    let (db, keys, written, done) = (&db, &keys, &written, &done);
+                    let (db, keys, written, floor, done) = (&db, &keys, &written, &floor, &done);
                     s.spawn(move || {
                         let mut x = mix(reader);
                         let mut gets = 0_u64;
                         while !done.load(Ordering::Acquire) {
+                            let low = floor.load(Ordering::Acquire) + 2 * OUTPUT_BATCHES;
                             let available = written.load(Ordering::Acquire);
-                            if available < CACHE_READ_CHUNK as u64 {
+                            if available < low + CACHE_READ_CHUNK as u64 {
                                 std::thread::yield_now();
                                 continue;
                             }
                             let chunk: Vec<B256> = (0..CACHE_READ_CHUNK)
                                 .map(|_| {
                                     x = mix(x);
-                                    keys[(x % available) as usize]
+                                    keys[(low + x % (available - low)) as usize]
                                 })
                                 .collect();
                             let got = db.multi_get::<Batches>(chunk.iter()).expect("multi_get");
@@ -792,10 +804,26 @@ impl Workload for BatchCache {
 
             let start = Instant::now();
             for (i, key) in keys.iter().enumerate() {
+                let i = i as u64;
+                if i.is_multiple_of(OUR_SHARE) {
+                    db.insert::<OurBatches>(key, &batch).expect("insert our batch");
+                }
                 db.insert::<Batches>(key, &batch).expect("insert batch");
-                // The remove production issues for every committed digest, of a key not there.
-                db.remove::<OurBatches>(&digest(DOMAIN_ABSENT, i as u64, 0)).expect("remove");
-                written.store(i as u64 + 1, Ordering::Release);
+                written.store(i + 1, Ordering::Release);
+                // Each saved output evicts the batches it committed, from both tables, in one
+                // transaction (present in the own-batch table only for our own).
+                if (i + 1).is_multiple_of(OUTPUT_BATCHES)
+                    && i + 1 >= (EVICT_LAG + 1) * OUTPUT_BATCHES
+                {
+                    let from = i + 1 - (EVICT_LAG + 1) * OUTPUT_BATCHES;
+                    floor.store(from + OUTPUT_BATCHES, Ordering::Release);
+                    let mut txn = db.write_txn().expect("evict txn");
+                    for k in &keys[from as usize..(from + OUTPUT_BATCHES) as usize] {
+                        txn.remove::<Batches>(k).expect("evict batch");
+                        txn.remove::<OurBatches>(k).expect("evict our batch");
+                    }
+                    txn.commit().expect("evict commit");
+                }
             }
             rt.block_on(db.persist::<Batches>()).expect("persist batches");
             let write_time = start.elapsed();
@@ -803,6 +831,9 @@ impl Workload for BatchCache {
             let gets: u64 = readers.into_iter().map(|r| r.join().expect("reader")).sum();
             (write_time, gets)
         });
+        let evicted = floor.load(Ordering::Acquire) as usize;
+        let live = keys.iter().filter(|k| db.get::<Batches>(k).expect("get").is_some()).count();
+        assert_eq!(live, keys.len() - evicted, "exactly the batches not evicted remain");
 
         // Epoch end: the batch cache is cleared.
         let clear_start = Instant::now();
@@ -841,7 +872,7 @@ fn workload_batch_cache() {
                  {CACHE_READ_CHUNK}-key multi_get",
                 size / 1024
             ),
-            "write = inserts (+ an absent-key remove each) through the final persist ack; \
+            "write = inserts (+ an eviction txn per output) through the final persist ack; \
              readers run until then",
             &cols,
         );
