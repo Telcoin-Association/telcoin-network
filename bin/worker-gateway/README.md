@@ -106,7 +106,7 @@ Every flag has an environment-variable fallback.
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
-| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited); a longer batch gets `413` / `-32003`. |
+| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest enabled rate-limit burst; a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
@@ -170,6 +170,8 @@ Two token-bucket limiters shed load before a request is buffered or forwarded:
 Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
+
+A batch costs one token per call, the first before its body is read and the rest once its calls are counted; see [Batches](#batches).
 
 #### Prefix keying
 
@@ -243,6 +245,29 @@ Size it from both ends:
   With the defaults that is about 814 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
   If you raise either flag, raise the limit with it, or lower one of the two flags until the product fits, for example `--max-connections 128` for about 128 MiB.
 
+### Batches
+
+A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls it carries.
+
+- **Length cap.** `--max-batch-len` (default 50, `0` means unlimited) caps the calls in one batch.
+  The effective cap is the smaller of `--max-batch-len` and the smallest enabled rate-limit burst, and startup logs a warning when a burst lowers it.
+  A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before it is screened or forwarded, whichever upstream it would go to.
+  The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
+- **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
+  The first token is taken before the body is read; the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
+  The K - 1 come from the per-IP bucket first, so a client over its own limit spends none of the global budget on them, and each bucket is charged all or nothing.
+  A batch needs K tokens at once and a bucket never holds more than its burst, which is why the length cap stops at the smallest burst: a longer batch gets the final `413` rather than a `429` that no retry could satisfy.
+  The defaults (200 per IP, 6000 global, against 50) leave the cap at 50.
+- **Every submission is screened.** In a batch made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync` calls, each element is screened like a single call (see [Transaction screening](#transaction-screening)).
+  The first refused element answers for the whole batch with `-32007` or `-32008` and that element's `id`, and nothing is forwarded.
+  A submission with named params is not screened; the worker validates it.
+- **Mixed batches are unchanged.** A batch that mixes submissions with other calls is not screened and is forwarded whole: to the `--redirect-queries` URL when it is set (see [Query redirect](#query-redirect)), to the worker otherwise.
+
+Every element counts towards the cap and the tokens whatever its shape: an element that is not a call object is still one element, and counts as another call when the batch is classified.
+The gateway reads a body as the worker's JSON-RPC server does, leading whitespace included, so no prefix can hide a batch from the count.
+A batch the gateway cannot read to its end is refused whole with `400` / `-32600` and a `null` id, before it is charged or forwarded, so a batch's length is never unknown.
+That covers bytes after the batch and a truncated batch, which the worker refuses whole anyway, and an element holding a value the gateway's JSON reader refuses although it is valid JSON, such as a number out of range (`1e400`) or an unpaired surrogate escape (`"\udc00"`), which the worker would skip while running the rest of the batch.
+
 ### Transaction screening
 
 Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions).
@@ -262,14 +287,15 @@ Mixed batches and every other method are forwarded unchanged and validated upstr
 On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and nothing else.
 With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and every other call goes to the URL, typically a public RPC.
 Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
-Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or bytes after the JSON value.
+Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or a single call with bytes after it.
+A batch the gateway cannot read to its end is refused rather than routed (see [Batches](#batches)).
 
 The URL may be `http` or `https`; worker URLs stay `http` only.
 An `https` URL needs the system CA certificates, which the image installs.
 The URL must not point at the gateway itself or at a worker's RPC host and port, and plain `http` to a host that is not a loopback or private address logs a warning at startup.
 
 A batch goes to the worker only when every element is a submission.
-A batch that mixes submissions with other calls goes, whole, to the query URL; otherwise a client could put one submission in front of any number of reads and push them all onto the validator.
+A batch that mixes submissions with other calls, an element that is not a call object included, goes, whole, to the query URL; otherwise a client could put one submission in front of any number of reads and push them all onto the validator.
 The public RPC accepts submissions too, so the client loses nothing, but a submission inside a mixed batch reaches the network through the public RPC rather than this validator.
 `tn_worker_gateway_mixed_batches_total` counts these batches; splitting a batch and merging the two responses is not implemented.
 
@@ -313,12 +339,13 @@ echoed when it can be recovered.
 | Upstream unreachable | `502` | `-32001` |
 | Upstream request timed out | `504` | `-32002` |
 | Request body too large | `413` | `-32003` |
+| Batch longer than `--max-batch-len` | `413` | `-32003` |
 | Proxy loop detected | `508` | `-32004` |
 | Request deadline exceeded | `408` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
-| Request body unreadable (client aborted) | `400` | `-32600` |
+| Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` |
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
@@ -352,7 +379,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
-| `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
+| `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls (an element that is not a call object counts as another call). |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also
