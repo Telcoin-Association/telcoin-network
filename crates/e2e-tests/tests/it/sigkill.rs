@@ -103,7 +103,7 @@ impl Endpoint {
     }
 }
 
-/// Nonce-ordered traffic submitted on each bounded observation poll.
+/// Nonce-ordered traffic offered on each bounded observation poll.
 struct Traffic {
     /// Next nonce, advanced only when the peer accepts a transaction.
     nonce: Mutex<u128>,
@@ -130,6 +130,28 @@ impl Traffic {
         *nonce += 1;
         Ok(hash)
     }
+
+    /// Offer load on an observation poll, treating a full pool as backpressure.
+    ///
+    /// Polls repeat every few milliseconds, so the sender can fill its pool slots while the
+    /// committee crosses an epoch boundary. A rejected transaction keeps its nonce, so the next
+    /// poll offers it again and a full pool cannot end the wait before its own condition.
+    fn offer(&self, rpc: &RpcUrl) -> eyre::Result<()> {
+        self.submit(rpc).map(drop).or_else(|error| pool_full(&error).then_some(()).ok_or(error))
+    }
+}
+
+/// JSON-RPC code for a transaction the pool rejected, which includes a pool overflow.
+const TRANSACTION_REJECTED: i32 = -32003;
+
+/// Whether the pool rejected a transaction because the sender or the pool is at capacity.
+fn pool_full(error: &eyre::Report) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<jsonrpsee::core::client::Error>().is_some_and(|error| {
+            matches!(error, jsonrpsee::core::client::Error::Call(object)
+                if object.code() == TRANSACTION_REJECTED && object.message() == "txpool is full")
+        })
+    })
 }
 
 /// Walk metadata only, recording full timestamps and sizes without opening live databases.
@@ -264,7 +286,7 @@ async fn run_network(
         recipient: address_from_word(test),
     };
     wait_until(timing.epoch.saturating_mul(3), "measured SIGKILL phase under load", || async {
-        traffic.submit(&peer.rpc)?;
+        traffic.offer(&peer.rpc)?;
         let at = current_epoch(&victim_provider).await?;
         eyre::ensure!(at.epoch_id <= kill_epoch, "missed the configured kill epoch");
         epoch_seconds_remaining(&victim.rpc.0, &at)
@@ -295,7 +317,7 @@ async fn run_network(
         }))?,
     )?;
     wait_until(timing.epoch.saturating_mul(2), "committee closes the killed epoch", || async {
-        traffic.submit(&peer.rpc)?;
+        traffic.offer(&peer.rpc)?;
         current_epoch(&peer_provider).await.map(|s| s.epoch_id > kill_epoch)
     })
     .await?;
@@ -314,7 +336,7 @@ async fn run_network(
         timing.downtime.saturating_add(timing.epoch),
         "minimum downtime across boundary",
         || async {
-            traffic.submit(&peer.rpc)?;
+            traffic.offer(&peer.rpc)?;
             Ok(down_since.elapsed() >= timing.downtime)
         },
     )
@@ -335,7 +357,7 @@ async fn run_network(
         timing.recovery,
         "restarted validator catches up and becomes active",
         || async {
-            traffic.submit(&peer.rpc)?;
+            traffic.offer(&peer.rpc)?;
             let due = {
                 let mut sampled =
                     sampled.lock().map_err(|_| eyre::eyre!("sample clock lock poisoned"))?;
