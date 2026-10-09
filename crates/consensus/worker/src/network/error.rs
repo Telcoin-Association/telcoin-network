@@ -83,7 +83,7 @@ impl WorkerNetworkError {
             WorkerNetworkError::BatchValidation(batch_validation_error) => {
                 match batch_validation_error {
                     // mild
-                    BatchValidationError::CanonicalChain { .. } => Some(Penalty::LoadMild),
+                    BatchValidationError::CanonicalChain { .. } => Some(Penalty::Mild),
                     // medium
                     BatchValidationError::InvalidEpoch { .. }
                     | BatchValidationError::InvalidTx4844(_)
@@ -112,14 +112,12 @@ impl WorkerNetworkError {
                     std::io::ErrorKind::ConnectionReset
                     | std::io::ErrorKind::ConnectionAborted
                     | std::io::ErrorKind::TimedOut
-                    | std::io::ErrorKind::BrokenPipe
-                    | std::io::ErrorKind::WouldBlock
-                    | std::io::ErrorKind::Interrupted => Some(Penalty::LoadMild),
+                    | std::io::ErrorKind::Interrupted => Some(Penalty::Mild),
                     _ => Some(Penalty::Medium),
                 }
             }
             // may occur at epoch boundaries
-            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::LoadMedium),
+            WorkerNetworkError::NonCommitteeBatch => Some(Penalty::Medium),
             // protocol violations - fatal penalty
             WorkerNetworkError::InvalidTopic
             | WorkerNetworkError::Bcs(_)

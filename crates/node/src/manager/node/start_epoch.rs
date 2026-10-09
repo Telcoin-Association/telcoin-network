@@ -884,14 +884,15 @@ where
 
     /// Spawn a long-running task that dials a peer by [`BlsPublicKey`], retrying with backoff.
     ///
-    /// Dialing self and hubs maintained by their swarm is skipped. Startup callers use the node-lifetime spawner, so their retries
-    /// survive epoch turnover; per-epoch callers use the epoch spawner and are cancelled at its
-    /// boundary. Backoff doubles up to 120s. Only a successful dial or an already-connected peer
-    /// ends retries immediately; an in-flight dial may still fail and must keep being retried.
-    /// Dial outcome waits and established-peer probes each have a one-second bound, including
-    /// channel admission. A timed-out outcome wait does not cancel the swarm's transport dial.
-    /// The task only gives up once it has retried enough and another peer is established.
-    /// It will not abandon dialing while isolated, and task-manager shutdown cancels retries.
+    /// Dialing self and hubs maintained by their swarm is skipped. Startup callers use the
+    /// node-lifetime spawner, so their retries survive epoch turnover; per-epoch callers use
+    /// the epoch spawner and are cancelled at its boundary. Backoff doubles up to 120s. Only a
+    /// successful dial or an already-connected peer ends retries immediately; an in-flight dial
+    /// may still fail and must keep being retried. Dial outcome waits and established-peer
+    /// probes each have a one-second bound, including channel admission. A timed-out outcome
+    /// wait does not cancel the swarm's transport dial. The task only gives up once it has
+    /// retried enough and another peer is established. It will not abandon dialing while
+    /// isolated, and task-manager shutdown cancels retries.
     pub(super) fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
@@ -1233,37 +1234,8 @@ mod tests {
     use super::{
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
+    use crate::manager::node::tests::reth_config_and_db;
     use std::num::NonZeroUsize;
-
-    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
-    /// there: the on-disk state an `EpochManager` is built from.
-    fn reth_config_and_db<P>(
-        config: &tn_config::Config,
-        committee: &tn_types::Committee,
-        datadir: &P,
-    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
-    where
-        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
-    {
-        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
-
-        tn_reth::init_reth_defaults();
-        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            datadir,
-            true,
-            std::sync::Arc::new(config.chain_spec()),
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
-        Ok((node_config, reth_db))
-    }
 
     /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
     /// two-to-one-to-two transitions, closing and reopening removed workers' RPC listeners.

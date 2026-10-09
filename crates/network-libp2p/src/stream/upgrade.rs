@@ -126,7 +126,7 @@ impl StreamFailure {
             // transport-level: the peer went away or could not be reached
             Self::DialFailure => None,
             // stalled open
-            Self::Timeout => Some(Penalty::LoadMild),
+            Self::Timeout => Some(Penalty::Load(crate::LoadPenalty::Timeout)),
             // the peer speaks none of our stream protocols: honest version/role
             // skew, not a fault — not penalized, like `DialFailure` (mirrors the
             // request-response `UnsupportedProtocols` arm in `consensus.rs`).
@@ -142,7 +142,7 @@ impl StreamFailure {
                 _ => Some(Penalty::Medium),
             },
             // application-level abuse of the inbound stream path
-            Self::InboundRateLimited => Some(Penalty::LoadMedium),
+            Self::InboundRateLimited => Some(Penalty::Load(crate::LoadPenalty::StreamRateLimit)),
         }
     }
 }
@@ -170,9 +170,15 @@ mod tests {
     #[test]
     fn penalty_mapping_mirrors_reqres() {
         assert!(StreamFailure::DialFailure.penalty().is_none());
-        assert!(matches!(StreamFailure::Timeout.penalty(), Some(Penalty::LoadMild)));
+        assert!(matches!(
+            StreamFailure::Timeout.penalty(),
+            Some(Penalty::Load(crate::LoadPenalty::Timeout))
+        ));
         assert!(StreamFailure::UnsupportedProtocol.penalty().is_none());
-        assert!(matches!(StreamFailure::InboundRateLimited.penalty(), Some(Penalty::LoadMedium)));
+        assert!(matches!(
+            StreamFailure::InboundRateLimited.penalty(),
+            Some(Penalty::Load(crate::LoadPenalty::StreamRateLimit))
+        ));
         // transport flaps on WAN are not the peer's fault
         assert!(StreamFailure::Io(ErrorKind::ConnectionReset).penalty().is_none());
         assert!(StreamFailure::Io(ErrorKind::BrokenPipe).penalty().is_none());

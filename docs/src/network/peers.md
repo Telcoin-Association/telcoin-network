@@ -30,13 +30,13 @@ A peer's reputation is derived from its current score every time it is read, nev
 
 ## Penalties and thresholds
 
-Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`, and `Fatal` report attributable protocol or validation failures. `LoadMild`, `LoadMedium`, and `LoadSevere` report transient load with the same score changes for ordinary peers.
+Penalties have four severities and an explicit cause. `Mild`, `Medium`, `Severe`, and `Fatal` report attributable protocol or validation failures. `Penalty::Load(LoadPenalty)` reports transient load, with a typed cause that determines the score change for ordinary peers.
 
 | Severity | Score change | Examples |
 |----------|--------------|----------|
-| Mild | -1.0 | Invalid requests; `LoadMild` for timeouts and slow gossip consumers. |
-| Medium | -5.0 | Malformed responses; `LoadMedium` for inbound stream and provider rate limits. |
-| Severe | -10.0 | Invalid validation data; `LoadSevere` for Kademlia put-record flooding. |
+| Mild | -1.0 | Invalid requests; `LoadPenalty::Timeout` and `LoadPenalty::SlowPeer`. |
+| Medium | -5.0 | Malformed responses; `LoadPenalty::StreamRateLimit` and `LoadPenalty::KademliaRateLimit`. |
+| Severe | -10.0 | Invalid validation data; `LoadPenalty::KademliaFlood`. |
 | Fatal | Set to -100.0 | Invalid signatures, invalid encoding, and authenticated protocol violations. |
 
 Members of the previous, current, and next committees are exempt from all penalties for now. Operator-provisioned hubs outside those committees ignore load penalties, and protocol penalties apply to them as to every other peer. A peer that is both a hub and a committee member gets the committee exemption. Rate-limited work is still dropped for privileged peers, so an exemption never creates an unlimited service allowance.

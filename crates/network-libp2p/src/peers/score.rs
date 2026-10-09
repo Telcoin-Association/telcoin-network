@@ -5,7 +5,7 @@
 //!
 //! Heavily inspired by Sigma Prime Lighthouse's scoring system.
 
-use super::types::Penalty;
+use super::penalty::{Penalty, Severity};
 use serde::Serialize;
 use std::{fmt::Display, sync::Arc, time::Instant};
 use tn_config::ScoreConfig;
@@ -69,11 +69,11 @@ impl Score {
     pub(super) fn apply_penalty(&mut self, penalty: Penalty) {
         // NOTE: these use `Self::add`
         // which cannot overflow using default config min and max scores
-        let new_score = match penalty {
-            Penalty::Mild | Penalty::LoadMild => self.add(-1.0),
-            Penalty::Medium | Penalty::LoadMedium => self.add(-5.0),
-            Penalty::Severe | Penalty::LoadSevere => self.add(-10.0),
-            Penalty::Fatal => self.config.min_score, // The worst possible score
+        let new_score = match penalty.severity() {
+            Severity::Mild => self.add(-1.0),
+            Severity::Medium => self.add(-5.0),
+            Severity::Severe => self.add(-10.0),
+            Severity::Fatal => self.config.min_score, // The worst possible score
         };
 
         // set application score

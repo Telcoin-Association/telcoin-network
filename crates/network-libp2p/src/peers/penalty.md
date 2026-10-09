@@ -6,7 +6,7 @@ Treat each entry as an assertion to verify against the code.
 
 ## 1. Penalty Severity Levels
 
-`Penalty` is defined in `crates/network-libp2p/src/peers/types.rs:109-126`.
+`Penalty` and `LoadPenalty` are defined in `crates/network-libp2p/src/peers/penalty.rs`.
 Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 
 | Variant           | Score Delta                          | Effect                                                             | Source                                        |
@@ -16,6 +16,8 @@ Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 | `Penalty::Severe` | `-10.0`                              | Clamped to `[min_score, max_score]`                                | `crates/network-libp2p/src/peers/score.rs:92` |
 | `Penalty::Fatal`  | sets score to `min_score` (`-100.0`) | Immediate ban — score jumps below `min_score_before_ban` (`-50.0`) | `crates/network-libp2p/src/peers/score.rs:93` |
 
+| `Penalty::Load(cause)` | Mild, Medium, or Severe weight | Subject to load-scoring policy | `Penalty::severity()` in `penalty.rs` |
+
 ## 2. Score Model Invariants
 
 - Score range: `[min_score, max_score]` = `[-100.0, 100.0]`. `crates/config/src/network.rs:483-484`.
@@ -24,67 +26,68 @@ Score deltas are applied in `crates/network-libp2p/src/peers/score.rs:84-100`.
 - Disconnect threshold (`min_score_before_disconnect`): `-20.0`. `crates/config/src/network.rs:494`.
 - Score halflife: `300.0` seconds; decay factor is `e^(-ln(2)/halflife * dt)`. `crates/config/src/network.rs:488`, `crates/network-libp2p/src/peers/score.rs:130-132`.
 - `banned_before_decay_secs`: `30 * 60` (30 min). When a peer crosses the ban threshold, `last_updated` is pushed forward by this duration so the score does not decay during the lockout. `crates/config/src/network.rs:493`, `crates/network-libp2p/src/peers/score.rs:149-154`.
-- Committee validators skip penalty application entirely: `Penalty::outcome_for` returns `Exempt` for a `TrustBasis::Validator` peer, and `Peer::apply_penalty` only logs a `warn!` for a suppressed Severe, LoadSevere or Fatal penalty. Validator status is derived from the three tracked committee slots (previous/current/next) in `AllPeers::trust_basis_for`, not stored on the peer. Operator-allowlisted peers outside the committee (`TrustBasis::Operator`) skip load penalties (`Penalty::Load*`) only. Protocol and cryptographic penalties change their score, and their score decays on every heartbeat like an ordinary peer. `crates/network-libp2p/src/peers/types.rs`, `crates/network-libp2p/src/peers/peer.rs`, `crates/network-libp2p/src/peers/all_peers.rs`.
+- Operator trust suppresses only `Penalty::Load`. Previous, current, and next committee members remain exempt from all score penalties for liveness. `AllPeers::peer_policy` composes these privileges from live trust bases; see `README.md` for the matrix.
 - Penalty application has no debouncing: every `process_penalty` call evaluates reputation immediately and may produce a ban on the same call. `crates/network-libp2p/src/peers/all_peers.rs:264-306`.
 - Bans surface to the rest of the swarm as `PeerEvent::Banned`, pushed by `process_ban`. `crates/network-libp2p/src/peers/manager.rs:609-622`.
-- `Penalty::Fatal` always crosses the ban threshold on the first call because `min_score` (`-100`) is less than `min_score_before_ban` (`-50`). `crates/network-libp2p/src/peers/score.rs:93`, `crates/config/src/network.rs:484,495`.
+- When scoring applies, `Penalty::Fatal` crosses the ban threshold on its first application. Committee membership suppresses that score change, while message validation still rejects the offending content.
 - Only the `Banned`/`Disconnected`/`Trusted` reputation transitions trigger a `PeerAction`. If the new reputation equals the prior reputation, `process_penalty` returns `PeerAction::NoAction`. `crates/network-libp2p/src/peers/all_peers.rs:272-274`.
 
 ## 3. Penalty Application Sites — Network Layer
 
-All sites live in `crates/network-libp2p/src/consensus.rs`. `NetworkCommand::ReportPenalty` (L1012-1019) is the external entry from the app layer; everything below is internal.
+All sites below are in `crates/network-libp2p/src/consensus.rs`. Symbol and event names
+identify the call sites without relying on line numbers. `NetworkCommand::ReportPenalty` is
+the external application entry point. Class controls exemptions; severity controls score weight.
 
-### 3.1 Gossip events (`process_gossip_event`, L1104)
+### 3.1 Gossip events (`process_gossip_event`)
 
-| Location                                     | Trigger (immediate guard)                                                     | Severity |
-| -------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:1191` | `verify_gossip` rejected `TooLarge` (oversized payload) **and** the relaying peer's BLS has resolved (`RejectPenalty::FatalRelayer`) — the size bound is a compile-time protocol constant (`MAX_GOSSIP_MESSAGE_SIZE`) identical on every honest node, so under `Strict` validation a peer that forwards an oversized payload is itself misbehaving | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1205` | `verify_gossip` rejected `UnauthorizedAuthor` (author is not an authorized publisher for the topic) **and** the author's BLS has resolved (`RejectPenalty::FatalAuthor`) — the fault is the author's content, so the penalty lands on `GossipMessage::source`, never on the forwarding relayer (issues #801/#819) | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1208` | `TooLarge` from an unresolved relayer, or `UnauthorizedAuthor` with an absent / unresolved author (`RejectPenalty::Skip`) — the accountable peer's identity has not resolved, so the reject is unattributable and the forwarder is never charged for an author fault (issues #801/#819) | `None`   |
-| `crates/network-libp2p/src/consensus.rs:1229` | `GossipEvent::GossipsubNotSupported { peer_id }`                              | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1233` | `GossipEvent::SlowPeer { peer_id, failed_messages }`                          | `Mild`   |
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| `verify_gossip`: `TooLarge` with a resolved relayer (`FatalRelayer`) | Protocol, charged to relayer | Fatal |
+| `verify_gossip`: `UnauthorizedAuthor` with a resolved author (`FatalAuthor`) | Protocol, charged to author | Fatal |
+| Unresolved accountable identity (`RejectPenalty::Skip`) | None | None |
+| `GossipsubNotSupported` | Protocol | Fatal |
+| `SlowPeer` | `Load(SlowPeer)` | Mild |
 
-### 3.2 Req/Res events (`process_reqres_event`, L1241)
+### 3.2 Request/response events (`process_reqres_event`)
 
-| Location                                     | Trigger                                                                                            | Severity |
-| -------------------------------------------- | -------------------------------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:1346` | `OutboundFailure::DialFailure` / `OutboundFailure::ConnectionClosed`                               | `None`   |
-| `crates/network-libp2p/src/consensus.rs:1351` | `OutboundFailure::Io(e)` with transport-flap `e.kind()` (Reset/Aborted/Timed/EOF/Pipe/Interrupted) | `None`   |
-| `crates/network-libp2p/src/consensus.rs:1368` | `OutboundFailure::Io(e)` other kinds (codec violation, e.g. `io::Error::other`)                    | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:1375` | `OutboundFailure::Timeout`                                                                         | `Mild`   |
-| `crates/network-libp2p/src/consensus.rs:1384` | `OutboundFailure::UnsupportedProtocols` (honest version/role skew — warn only) | `None` |
-| `crates/network-libp2p/src/consensus.rs:1399` | `InboundFailure::Io(e)` with transport-flap `e.kind()`                                             | `None`   |
-| `crates/network-libp2p/src/consensus.rs:1416` | `InboundFailure::Io(e)` other kinds (codec violation)                                              | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:1425` | `InboundFailure::UnsupportedProtocols` (honest version/role skew — warn only) | `None` |
-| `crates/network-libp2p/src/consensus.rs:1428` | `InboundFailure::Timeout` / `InboundFailure::ConnectionClosed`                                     | `None`   |
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| Outbound `DialFailure` / `ConnectionClosed` | None | None |
+| Inbound or outbound `Io` with a transport-flap error kind | None | None |
+| Inbound or outbound `Io` with other kinds (codec violation) | Protocol | Medium |
+| Outbound `Timeout` | `Load(Timeout)` | Mild |
+| Inbound or outbound `UnsupportedProtocols` (version or role skew) | None | None |
+| Inbound `Timeout` / `ConnectionClosed` / `ResponseOmission` | None | None |
 
-`InboundFailure::ResponseOmission` is explicitly a no-op (local error). See restraint invariants below.
+### 3.3 Kademlia `GetRecord` result (`process_kad_event`)
 
-### 3.3 Kademlia outbound `GetRecord` query (`process_kad_event`, L1831)
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| `FoundRecord` fails `peer_record_valid` (signature or key mismatch) | Protocol | Fatal |
 
-| Location                                      | Trigger                                                                                                         | Severity |
-| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:1889` | `kad::QueryResult::GetRecord(Ok(FoundRecord))` but `peer_record_valid` returned `None` (bad sig / key mismatch) | `Fatal`  |
+### 3.4 Kademlia put-record handler (`process_kad_put_request`)
 
-### 3.4 Kad put-record handler (`process_kad_put_request`, L2000)
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| Rejected record with no publisher | Protocol | Fatal |
+| Put-record flood threshold exceeded, before BLS verification or storage | `Load(KademliaFlood)` | Severe |
+| Valid but stale record | None | None |
+| Invalid signature or network key | Protocol | Fatal |
 
-| Location                                      | Trigger                                                                               | Severity |
-| --------------------------------------------- | ------------------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:2030` | record was rejected AND `record.publisher.is_none()` (publisher-less record)          | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:2047` | `put_record_rate_limited(source)` — inbound puts exceed the per-source budget; dropped before the BLS verify and kad store write (GHSA-f6rq-62rr-4h9g) | `Medium` |
-| `crates/network-libp2p/src/consensus.rs:2068` | `peer_record_valid(&record).is_some()` but `!is_newer_record(&record)` (stale record — trace log only; kad routinely replays put-records to refresh TTLs) | `None`   |
-| `crates/network-libp2p/src/consensus.rs:2079` | `peer_record_valid(&record).is_none()` (invalid signature / wrong network key)        | `Fatal`  |
+A record rejected because its source or publisher is already banned incurs no extra penalty
+when a publisher is present. Over-budget work is dropped even for score-exempt peers.
 
-A rejected record from a banned source/publisher with a publisher present does
-NOT incur an extra penalty here — only the missing-publisher case is fatal. The
-ban itself was applied elsewhere.
+### 3.5 Kademlia result post-processing (`process_kad_query_result`)
 
-### 3.5 Kad query-result post-processing (`process_kad_query_result`, L2170)
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| Returned record key differs from the requested key | Protocol | Fatal |
 
-| Location                                      | Trigger                                                                       | Severity |
-| --------------------------------------------- | ----------------------------------------------------------------------------- | -------- |
-| `crates/network-libp2p/src/consensus.rs:2194` | record valid but `query.request != key` (returned key does not match request) | `Fatal`  |
-| `crates/network-libp2p/src/consensus.rs:1488` | `peer_record_valid(&record).is_none()` on the late-step path                  | `Fatal`  |
+### 3.6 Kademlia provider handler (`process_kad_add_provider`)
+
+| Trigger | Class | Severity |
+| --- | --- | --- |
+| `add_provider_rate_limited` exceeds the independent provider budget | `Load(KademliaRateLimit)` | Medium |
 
 ## 4. Penalty Application Sites — Worker Layer
 
@@ -160,9 +163,11 @@ streamed bytes — a structural/framing/over-a-resource-bound `PackError`, or
 `ConsensusChainError::{EmptyImport, InvalidImport}` — as decided by `import_fault_is_peer_caused`. It
 deliberately does NOT penalise a local/ambiguous error raised while importing (a full disk, a failed
 mmap/index write, `CorruptPack` — which local recovery also produces — or a local chain-state
-mismatch), so an honest peer is never banned for this node's own storage failure. Committee/allowlisted
-peers remain score-exempt (`Peer::apply_penalty` only warns for them), so this bans a non-committee
-Sybil/observer that ships an OOM/wedge pack but never a validator.
+mismatch), so this node's own storage failure is not charged to the peer. Committee peers
+remain score-exempt, so this import path cannot reputation-ban a validator. Operator-trusted
+peers outside the committee remain subject to protocol penalties. A pack damaged at rest on
+the serving peer may earn Medium per failed probe; the failed candidate moves to the back of
+the probe order for that epoch regardless of its scoring exemption.
 
 Two peer-facing primary paths deliberately apply no penalty and so have no row above:
 the certificate fetch (`fetch_certificates`, `crates/consensus/primary/src/network/mod.rs:457`),
@@ -210,46 +215,48 @@ malformed certificate it did not write.
 
 ### 5.3 `penalty_from_header_error`
 
-Source: `crates/consensus/primary/src/error/network.rs:210-260`.
+Source: `crates/consensus/primary/src/error/network.rs:210-273`.
 
 | `HeaderError` variant              | Severity | Source                                                  |
 | ---------------------------------- | -------- | ------------------------------------------------------- |
-| `SyncBatches(_)`                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:213` |
-| `TooNew { .. }`                    | `Mild`   | `crates/consensus/primary/src/error/network.rs:213` |
-| `InvalidParents`                   | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `WrongNumberOfParents(_, _)`       | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `TooOld { .. }`                    | `Medium` | `crates/consensus/primary/src/error/network.rs:215-217` |
-| `InvalidTimestamp { .. }`          | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `InvalidSeedSignature`             | `Severe` | `crates/consensus/primary/src/error/network.rs:227-229` |
-| `AlreadyVotedForLaterRound { .. }` | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `InvalidTimestampMillis(_)`        | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:231-244` |
-| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
-| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:245-258` |
-| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
-| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:252-258` |
+| `SyncBatches(_)`                   | `Mild`   | `crates/consensus/primary/src/error/network.rs:216-218` |
+| `TooNew { .. }` | None | `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` |
+| `InvalidParents`                   | `Medium` | `crates/consensus/primary/src/error/network.rs:220-222` |
+| `WrongNumberOfParents(_, _)`       | `Medium` | `crates/consensus/primary/src/error/network.rs:220-222` |
+| `TooOld { .. }` | None | `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` |
+| `InvalidTimestamp { .. }` | None | `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` |
+| `InvalidParentRound`               | `Severe` | `crates/consensus/primary/src/error/network.rs:232-234` |
+| `InvalidSeedSignature` | None | `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` |
+| `AlreadyVoted(_, _)`               | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `DuplicateParents`                 | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `TooManyParents(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `TooManyBatches(_, _)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnknownNetworkKey(_)`             | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `PeerNotAuthor`                    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidGenesisParent(_)`          | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidRound(_)`                  | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `ParentMissingSignature`           | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidParentTimestamp { .. }`    | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `InvalidTimestampMillis(_)`        | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnkownWorkerId`                   | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `UnknownAuthority(_)`              | `Fatal`  | `crates/consensus/primary/src/error/network.rs:236-248` |
+| `PendingCertificateOneshot`        | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `Storage(_)`                       | None     | `crates/consensus/primary/src/error/network.rs:249-262` |
+| `UnknownExecutionResult(_)`        | None     | `crates/consensus/primary/src/error/network.rs:249-262` |
+| `TNSend(_)`                        | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `InvalidEpoch { .. }`              | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `NotCommitteeMember`               | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `ClosedWatchChannel`               | None     | `crates/consensus/primary/src/error/network.rs:256-262` |
+| `AlreadyVotedForLaterRound { .. }` | None     | `crates/consensus/primary/src/error/network.rs:263-271` |
 
-`InvalidSeedSignature` is `Severe` rather than `Fatal` on purpose.
-The seed message is anchored to the verifier's local `prior_epoch_record`, so a node whose record diverged
-signs an anchor no peer accepts and rejects every honest peer's header.
-`Fatal` would make that ban mutual, total and non-self-healing — neither side could ever repair its record
-from the other once both have banned. `Severe` still suppresses a genuinely bad signer while leaving a
-divergent node a path back. `crates/consensus/primary/src/error/network.rs:220-226`.
+`TooNew` and `TooOld` compare the header against local round state, so restart or catch-up
+skew rejects a header without penalizing its author. `InvalidTimestamp` likewise rejects and
+caches a header beyond the clock window without scoring either peer for relative clock skew.
+
+`InvalidSeedSignature` carries no score penalty. Verification depends on the local
+`prior_epoch_record`; a mismatch alone does not establish which side has the wrong anchor.
+The header still receives no vote. This preserves connectivity for recovery and diagnosis;
+it does not claim a divergent record will automatically repair itself.
 
 `InvalidTimestampMillis(_)` is `Fatal` because no honest node can produce it.
 An honest `created_at_millis` is derived from a millisecond timestamp and is always below 1000,
@@ -328,8 +335,8 @@ What happens when a peer's score crosses `min_score_before_ban` (`-50.0`):
 ## 8. Open Questions / Notes
 
 - `NetworkCommand::ReportPenalty` (`crates/network-libp2p/src/consensus.rs:1012-1019`) is the external entry point from the application layer. Worker and primary call sites all route through this command via `report_penalty` on the network handle (`crates/network-libp2p/src/types.rs:755`).
-- `Penalty::Severe` never appears as a literal in `crates/network-libp2p/src/consensus.rs`. It only reaches `process_penalty` via app-layer error mappings: `BatchValidationError::RecoverTransaction` (`crates/consensus/worker/src/network/error.rs:92`), `HeaderError::{InvalidTimestamp, InvalidParentRound, InvalidSeedSignature}` (`crates/consensus/primary/src/error/network.rs:229`), `PackError::{InvalidConsensusChain, ExtraBatches, MissingBatches, TooManyBatches, CorruptPack, UnexpectedConsensusDigest, EmptySubDag, BatchTooLarge, OutputTooLarge, InvalidConsensusNumber, InvalidEpoch}` (`crates/consensus/primary/src/network/mod.rs:1176`), and `ConsensusChainError::{EmptyImport, InvalidImport}` (`crates/consensus/primary/src/network/mod.rs:1200`).
+- Severe weight reaches `process_penalty` through both protocol error mappings and `Penalty::Load(LoadPenalty::KademliaFlood)`. The latter is load-classified even though its score delta is -10; see `Penalty::severity()`.
 - `PeerAction::DisconnectWithPX` adds the peer to `temporarily_banned` and emits `DisconnectPeerX`. This is a soft ban that bypasses the score model and does not produce a `PeerEvent::Banned`. `crates/network-libp2p/src/peers/manager.rs:468-474`.
-- The exemption short-circuit in `Peer::apply_penalty` is the only mechanism preventing scored bans of exempt peers. `Penalty::outcome_for` takes the peer's `TrustBasis`: validators in any of the three tracked committee slots (previous/current/next) are exempt from every penalty, and operator-allowlisted hubs outside those slots are exempt from load penalties only. The basis is computed live by `AllPeers::exemption` rather than stored on the peer. `crates/network-libp2p/src/peers/peer.rs:297-312`, `crates/network-libp2p/src/peers/all_peers.rs:856-876`. There is no allowlist applied at the network-layer call sites.
+- `PeerPolicy::applies` exempts committee members from all scoring and operator-trusted peers outside the committee from load scoring only. Operator trust reload and identity merges preserve protocol history; committee promotion forgives reputation bans. Validation and resource limits remain before the scoring decision.
 - `PrimaryNetworkError::PeerNotInCommittee` carries two contradictory rationales in the source. The variant's own doc comment reads "Temparily disabled, will be back soon" (`crates/consensus/primary/src/error/network.rs:44-47`), implying a suppressed penalty pending re-enablement, while the handler documents it as the deliberately benign alternative to a misattributed `Fatal` (`crates/consensus/primary/src/network/handler.rs:510-517`). Section 6 follows the handler comment as the more recent and more specific of the two. Which one is authoritative is unresolved.
 - Penalty application is not debounced. A peer that produces many `Mild` errors in quick succession (e.g. during a sync flap) can still cross the ban threshold (`-50.0`) in fewer than ~50 events if its score has already drifted negative.

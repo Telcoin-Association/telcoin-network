@@ -904,20 +904,15 @@ impl PeerManagerMetrics {
         self.handles.external_addr_confirmed.set(1.0);
     }
 
-    /// Record an application-layer penalty by severity, class and outcome.
-    ///
-    /// `class` separates load penalties from protocol penalties. `outcome` separates penalties
-    /// that changed a score from penalties that the peer's trust basis suppressed.
+    /// Record an application-layer penalty by severity, class and scoring outcome.
     pub(crate) fn record_penalty(&self, penalty: &Penalty, outcome: PenaltyOutcome) {
-        let (severity, class) = match penalty {
-            Penalty::LoadMild => ("mild", "load"),
-            Penalty::LoadMedium => ("medium", "load"),
-            Penalty::LoadSevere => ("severe", "load"),
-            Penalty::Mild => ("mild", "protocol"),
-            Penalty::Medium => ("medium", "protocol"),
-            Penalty::Severe => ("severe", "protocol"),
-            Penalty::Fatal => ("fatal", "protocol"),
+        let severity = match penalty.severity() {
+            crate::peers::Severity::Mild => "mild",
+            crate::peers::Severity::Medium => "medium",
+            crate::peers::Severity::Severe => "severe",
+            crate::peers::Severity::Fatal => "fatal",
         };
+        let class = if penalty.is_load() { "load" } else { "protocol" };
         let outcome = match outcome {
             PenaltyOutcome::Applied => "applied",
             PenaltyOutcome::Exempt => "exempt",

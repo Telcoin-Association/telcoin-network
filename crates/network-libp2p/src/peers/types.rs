@@ -10,6 +10,8 @@ use std::{
 use tn_types::{BlsPublicKey, NetworkPublicKey};
 use tokio::sync::oneshot;
 
+pub use super::penalty::Penalty;
+
 /// Domain identity for a tracked peer.
 ///
 /// Telcoin associates a [BlsPublicKey] with a peer once its network settings are known
@@ -31,23 +33,6 @@ pub(super) enum PeerIdentity {
     Confirmed(BlsPublicKey),
     /// A peer known only by its libp2p [PeerId] (no bls key learned yet).
     Unidentified(PeerId),
-}
-
-/// Why a peer is exempt from load-induced penalties for the current epoch.
-///
-/// A peer subject to normal scoring has no basis (`None`). The two provenances are kept
-/// distinct on purpose (issue #715): operator allowlisting is sticky - set at construction
-/// and never altered by epoch rotation - whereas validator status is derived live from the
-/// tracked committee slots, so a validator rotating out of committee can never strip operator
-/// trust.
-/// Retention and admission are evaluated separately. Neither provenance excuses a protocol or
-/// cryptographic violation, and all peers remain subject to finite resource budgets.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum TrustBasis {
-    /// Explicitly allowlisted by the node operator.
-    Operator,
-    /// Sits in a tracked committee slot: the previous, current, or next epoch's committee.
-    Validator,
 }
 
 /// Events for the `PeerManager`.
@@ -99,67 +84,12 @@ impl PeerAction {
     }
 }
 
-/// Penalties applied to peers based on the significance of their actions.
-///
-/// Each variant has an associated score change.
-///
-/// NOTE: the number of variations is intentionally low.
-/// Too many variations or specific penalties would result in more complexity.
-#[derive(Debug, Clone, Copy)]
-pub enum Penalty {
-    /// Mild transient overload, such as a slow gossip consumer.
-    LoadMild,
-    /// Medium transient overload, such as exceeding an inbound Kademlia rate budget.
-    LoadMedium,
-    /// Severe transient overload, without evidence of a protocol violation.
-    LoadSevere,
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a high tolerance for this type of error and will be banned ~50 occurances.
-    Mild,
-    /// The penalty assessed for actions that result in an error and are likely not malicious.
-    ///
-    /// Peers have a medium tolerance for this type of error and will be banned ~10 occurances.
-    Medium,
-    /// The penalty assessed for actions that are likely not malicious, but will not be tolerated.
-    ///
-    /// The peer will be banned after ~5 occurances (based on -100).
-    Severe,
-    /// The penalty assessed for unforgiveable actions.
-    ///
-    /// This type of action results in disconnecting from a peer and banning them.
-    Fatal,
-}
-
-impl Penalty {
-    /// Whether this penalty establishes only transient load rather than a protocol violation.
-    pub(super) fn is_load(self) -> bool {
-        match self {
-            Self::LoadMild | Self::LoadMedium | Self::LoadSevere => true,
-            Self::Mild | Self::Medium | Self::Severe | Self::Fatal => false,
-        }
-    }
-
-    /// Whether `exemption` suppresses this penalty.
-    ///
-    /// Committee validators are exempt from every penalty for now. Operator-allowlisted peers
-    /// outside the committee are exempt from load penalties only. The committee wins when a peer
-    /// is both, because the [TrustBasis] lookup resolves validator status first.
-    pub(super) fn outcome_for(self, exemption: Option<TrustBasis>) -> PenaltyOutcome {
-        match exemption {
-            Some(TrustBasis::Validator) => PenaltyOutcome::Exempt,
-            Some(TrustBasis::Operator) if self.is_load() => PenaltyOutcome::Exempt,
-            Some(TrustBasis::Operator) | None => PenaltyOutcome::Applied,
-        }
-    }
-}
-
 /// Whether a reported penalty changed the peer's score.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PenaltyOutcome {
-    /// The penalty changed the peer's score.
+    /// The peer policy applies the penalty to the score.
     Applied,
-    /// The peer's [TrustBasis] suppressed the penalty.
+    /// The peer policy suppresses the penalty.
     Exempt,
 }
 
