@@ -1,54 +1,93 @@
-# git-cliff config — generates CHANGELOG.md from conventional commits.
+# git-cliff configuration for CHANGELOG.md.
 #
-# Run:    make release-changelog
-# Or:     git cliff -o CHANGELOG.md
+# `make release-prep TAG=<tag>` runs the pinned git-cliff image with
+# `--unreleased --tag <tag> --strip all` and splices the new section in right
+# after the `<!-- ANCHOR: releases -->` line. The Release notes page in the book
+# includes CHANGELOG.md from that anchor, so the header must end with it.
+# Only final tags get a section: rc tags are ignored and their commits roll
+# into the section of the tag they lead up to.
 
 [changelog]
 header = """
 # Changelog
 
-All notable changes to telcoin-network are recorded here. Entries are
-generated automatically from conventional commits between tags.
+Generated from commit messages by git-cliff when a release is cut (`make release-prep`); sections are never edited by hand.
+
+<!-- ANCHOR: releases -->
 """
 body = """
 {% if version %}\
-    ## {{ version | trim_start_matches(pat="v") }} — {{ timestamp | date(format="%Y-%m-%d") }}
-{% else %}\
-    ## Unreleased
+## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}\
+### {{ group | striptags | trim }}
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
+{{ commit.message | split(pat="\n") | first | trim | upper_first }}\
+{% if commit.breaking %} (**breaking**){% endif %}
+{% if group is ending_with("Batched merges") %}\
+{% for line in commit.raw_message | split(pat="\n") %}\
+{% if line is starting_with("* ") and line is containing("(#") %}\
+{{ "  - " }}{{ line | trim_start_matches(pat="* ") | trim }}
 {% endif %}\
-{% for group, commits in commits | group_by(attribute="group") %}
-    ### {{ group | upper_first }}
-    {% for commit in commits %}
-        - {{ commit.message | upper_first | trim }}\
-            {% if commit.breaking %} **(breaking)**{% endif %}\
-            {% if commit.id %} ({{ commit.id | truncate(length=7, end="") }}){% endif %}\
-    {% endfor %}
-{% endfor %}
+{% endfor %}\
+{% elif group is ending_with("Merged from private forks") %}\
+{% if commit.raw_message is containing("\n* ") %}\
+{% for line in commit.raw_message | split(pat="\n") %}\
+{% if line is starting_with("* ") %}\
+{{ "  - " }}{{ line | trim_start_matches(pat="* ") | trim }}
+{% endif %}\
+{% endfor %}\
+{% else %}\
+{% set_global described = false %}\
+{% for line in commit.raw_message | split(pat="\n") | slice(start=1) %}\
+{% if not described %}{% if line | trim %}{% if line is not starting_with("#") %}\
+{{ "  - " }}{{ line | trim }}
+{% set_global described = true %}\
+{% endif %}{% endif %}{% endif %}\
+{% endfor %}\
+{% if not described %}\
+{{ "  - " }}No commit description; see [{{ commit.id | truncate(length=9, end="") }}](https://github.com/Telcoin-Association/telcoin-network/commit/{{ commit.id }})
+{% endif %}\
+{% endif %}\
+{% endif %}\
+{% endfor %}\
+{% endfor %}\
+{% if previous and previous.version %}
+{% endif %}\
+{% endif %}\
 """
 trim = true
-footer = ""
+postprocessors = [
+    { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/Telcoin-Association/telcoin-network/pull/${1}))" },
+    { pattern = '\{\{#', replace = '\{{#' },
+]
 
 [git]
 conventional_commits = true
 filter_unconventional = false
 split_commits = false
-commit_parsers = [
-    { message = "^feat",     group = "Features" },
-    { message = "^fix",      group = "Bug Fixes" },
-    { message = "^perf",     group = "Performance" },
-    { message = "^refactor", group = "Refactor" },
-    { message = "^docs",     group = "Documentation" },
-    { message = "^test",     group = "Tests" },
-    { message = "^chore",    group = "Chores" },
-    { message = "^build",    group = "Build" },
-    { message = "^ci",       group = "CI" },
-    { message = "^revert",   group = "Reverts" },
-    # Anything else still appears, grouped under "Other" so we don't silently
-    # drop changes that pre-date a conventional-commit habit.
-    { message = ".*",        group = "Other" },
-]
+protect_breaking_commits = true
 filter_commits = false
-tag_pattern = "v[0-9].*"
-ignore_tags = ""
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+(-adiri)?(-rc[0-9]+)?$"
+ignore_tags = "-rc[0-9]+$"
 topo_order = false
 sort_commits = "newest"
+# First match wins, so the private-fork merges are claimed before every other
+# `Merge` subject is skipped. The `<!-- NN -->` prefixes fix the order of the
+# groups and are stripped from the headings.
+commit_parsers = [
+    { message = "^Merge commit from fork", group = "<!-- 09 -->Merged from private forks" },
+    { message = "(?i)^merge\\b", skip = true },
+    { message = "^release", skip = true },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^Staging/", group = "<!-- 08 -->Batched merges" },
+    { message = "^feat", group = "<!-- 00 -->Features" },
+    { message = "^fix", group = "<!-- 01 -->Bug fixes" },
+    { message = "^perf", group = "<!-- 02 -->Performance" },
+    { message = "^refactor", group = "<!-- 03 -->Refactoring" },
+    { message = "^docs", group = "<!-- 04 -->Documentation" },
+    { message = "^test", group = "<!-- 05 -->Tests" },
+    { message = "^(build|ci|chore)", group = "<!-- 06 -->Build, CI and chores" },
+    { message = "^[Rr]evert", group = "<!-- 07 -->Reverts" },
+    { message = ".*", group = "<!-- 10 -->Other" },
+]
