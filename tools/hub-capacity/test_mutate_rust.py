@@ -20,13 +20,19 @@ class MutationTests(unittest.TestCase):
 
     def test_legacy_case_ids_and_public_admission_registry_are_preserved(self):
         legacy_ids = [case[0] for case in MUTATIONS.CASES[:58]]
-        self.assertEqual(len(MUTATIONS.CASES), 70)
+        self.assertEqual(len(MUTATIONS.CASES), 75)
         self.assertEqual(len(MUTATIONS.PUBLIC_ADMISSION_CASES), 12)
+        self.assertEqual(len(MUTATIONS.INGRESS_CASES), 5)
         self.assertEqual(
             hashlib.sha256(json.dumps(legacy_ids, separators=(",", ":")).encode()).hexdigest(),
             "4d72d20bbd56e32d2821fbb03cd4bd85e7a12cab3d72707bc323ecd84298b327",
         )
-        self.assertEqual(MUTATIONS.CASES[58:], MUTATIONS.PUBLIC_ADMISSION_CASES)
+        self.assertEqual(
+            hashlib.sha256(json.dumps(MUTATIONS.CASES[:70], separators=(",", ":")).encode()).hexdigest(),
+            "1f5cc43664eea3e08b939411bcbe6ea432da2534d8e59f94c4a7c526469c8704",
+        )
+        self.assertEqual(MUTATIONS.CASES[58:70], MUTATIONS.PUBLIC_ADMISSION_CASES)
+        self.assertEqual(MUTATIONS.CASES[70:], MUTATIONS.INGRESS_CASES)
 
     def test_all_registered_rewrites_have_one_current_source_anchor(self):
         for name, relative, before, after, regression in MUTATIONS.CASES:
@@ -41,6 +47,13 @@ class MutationTests(unittest.TestCase):
                 self.assertRegex(
                     manager_tests + identity_tests,
                     rf"#\[(?:tokio::)?test\]\s+(?:async\s+)?fn\s+{re.escape(regression)}\s*\(",
+                )
+        ingress_tests = (MUTATIONS.ROOT / "crates/consensus/worker/src/network/ingress.rs").read_text()
+        for name, relative, before, after, regression in MUTATIONS.INGRESS_CASES:
+            with self.subTest(regression=regression):
+                self.assertRegex(
+                    ingress_tests,
+                    rf"#\[(?:tokio::)?test(?:\([^\]]*\))?\]\s+(?:async\s+)?fn\s+{re.escape(regression)}\s*\(",
                 )
 
     def test_public_classification_mutant_keeps_library_identity_reference(self):

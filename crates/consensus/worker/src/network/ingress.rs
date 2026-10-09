@@ -85,13 +85,16 @@ impl<S> StreamLane<S> {
     }
 
     /// Queue one already-admitted stream, or hand back ownership after node shutdown.
-    pub(super) fn push(&self, stream: AdmittedSyncStream<S>) -> Result<(), AdmittedSyncStream<S>> {
+    pub(super) fn push(
+        &self,
+        stream: AdmittedSyncStream<S>,
+    ) -> Result<(), Box<AdmittedSyncStream<S>>> {
         let result = match &mut *self.pending.lock() {
             PendingStreams::Open(pending) => {
                 pending.push_back(stream);
                 Ok(())
             }
-            PendingStreams::Closed => Err(stream),
+            PendingStreams::Closed => Err(Box::new(stream)),
         };
         self.receiver.wake();
         self.changed.notify_one();
@@ -104,18 +107,18 @@ impl<S> StreamLane<S> {
         pool: &WorkerSyncAdmission,
         peer: BlsPublicKey,
         stream: S,
-    ) -> Result<(), StreamForwardError<S>> {
+    ) -> Result<(), Box<StreamForwardError<S>>> {
         let decision = try_admit_sync(&pool.stream_semaphore, &pool.peers, peer)
-            .map_or(StreamAdmission::Denied, StreamAdmission::Admitted);
+            .map_or(StreamAdmission::Denied, |permit| StreamAdmission::Admitted(Box::new(permit)));
         match decision {
             StreamAdmission::Admitted(permit) => {
-                self.push(AdmittedSyncStream::new(peer, stream, permit)).map_err(|admitted| {
-                    let (peer, stream, permit, _, _) = admitted.into_parts();
+                self.push(AdmittedSyncStream::new(peer, stream, *permit)).map_err(|admitted| {
+                    let (peer, stream, permit, _, _) = (*admitted).into_parts();
                     drop(permit);
-                    StreamForwardError::Closed { peer, stream }
+                    Box::new(StreamForwardError::Closed { peer, stream })
                 })
             }
-            StreamAdmission::Denied => Err(StreamForwardError::Denied { peer, stream }),
+            StreamAdmission::Denied => Err(Box::new(StreamForwardError::Denied { peer, stream })),
         }
     }
 
@@ -207,7 +210,17 @@ enum IngressBinding {
     /// The swarm must not forward before startup has installed its shared pool.
     Unbound,
     /// The same admission pool used by every epoch's worker handler.
-    Bound { admission: WorkerSyncAdmission, handle: WorkerNetworkHandle, metrics: WorkerMetrics },
+    Bound(Box<BoundIngress>),
+}
+
+/// Shared startup resources owned by the bound worker ingress lane.
+struct BoundIngress {
+    /// The same admission pool used by every epoch's worker handler.
+    admission: WorkerSyncAdmission,
+    /// Handle retaining the existing shed task and source epoch behavior.
+    handle: WorkerNetworkHandle,
+    /// Metrics for this worker's retained stream lane.
+    metrics: WorkerMetrics,
 }
 
 /// Two worker event lanes: epoch-scoped messages and admission-owned sync streams.
@@ -250,11 +263,11 @@ impl<Events> WorkerEventChannel<Events> {
     pub fn bind(&self, handle: &WorkerNetworkHandle, serve: &NetworkServeConfig, id: WorkerId) {
         let mut binding = self.binding.lock();
         assert!(matches!(&*binding, IngressBinding::Unbound), "worker ingress already bound");
-        *binding = IngressBinding::Bound {
+        *binding = IngressBinding::Bound(Box::new(BoundIngress {
             admission: handle.sync_admission(serve).clone(),
             handle: handle.clone(),
             metrics: WorkerMetrics::new_for_worker(id),
-        };
+        }));
         let expiry = self.streams.clone().run_expiry();
         handle.get_sync_task_spawner().spawn_task("worker stream ingress expiry", async move {
             expiry.await;
@@ -279,31 +292,36 @@ impl<Events> WorkerEventChannel<Events> {
         &self,
         peer: BlsPublicKey,
         stream: Stream,
-    ) -> Result<TrySendOutcome, TrySendError<NetworkEvent<Req, Res>>> {
+    ) -> Result<TrySendOutcome, Box<TrySendError<NetworkEvent<Req, Res>>>> {
         match &*self.binding.lock() {
             IngressBinding::Unbound => {
-                Err(TrySendError::Closed(NetworkEvent::InboundStream { peer, stream }))
+                Err(Box::new(TrySendError::Closed(NetworkEvent::InboundStream { peer, stream })))
             }
-            IngressBinding::Bound { admission, handle, metrics } => self
-                .streams
-                .admit(admission, peer, stream)
-                .map(|()| TrySendOutcome::Queued)
-                .or_else(|error| match error {
-                    StreamForwardError::Closed { peer, stream } => {
-                        Err(TrySendError::Closed(NetworkEvent::InboundStream { peer, stream }))
-                    }
-                    StreamForwardError::Denied { peer, stream } => {
-                        shed_sync_stream(
-                            &admission.shed_semaphore,
-                            metrics,
-                            handle.get_sync_task_spawner(),
-                            handle.epoch(),
-                            peer,
-                            stream,
-                        );
-                        Ok(TrySendOutcome::Queued)
-                    }
-                }),
+            IngressBinding::Bound(binding) => {
+                let BoundIngress { admission, handle, metrics } = binding.as_ref();
+                self.streams
+                    .admit(admission, peer, stream)
+                    .map(|()| TrySendOutcome::Queued)
+                    .or_else(|error| match *error {
+                        StreamForwardError::Closed { peer, stream } => {
+                            Err(Box::new(TrySendError::Closed(NetworkEvent::InboundStream {
+                                peer,
+                                stream,
+                            })))
+                        }
+                        StreamForwardError::Denied { peer, stream } => {
+                            shed_sync_stream(
+                                &admission.shed_semaphore,
+                                metrics,
+                                handle.get_sync_task_spawner(),
+                                handle.epoch(),
+                                peer,
+                                stream,
+                            );
+                            Ok(TrySendOutcome::Queued)
+                        }
+                    })
+            }
         }
     }
 }
@@ -311,7 +329,7 @@ impl<Events> WorkerEventChannel<Events> {
 /// Stream admission expressed without a second permit pool.
 enum StreamAdmission {
     /// Ownership reserved from the existing global and per-peer allowance.
-    Admitted(SyncStreamPermit),
+    Admitted(Box<SyncStreamPermit>),
     /// Existing capacity is exhausted.
     Denied,
 }
@@ -343,7 +361,7 @@ impl<Events: TnSender<NetworkEvent<Req, Res>> + Sync> TnSender<NetworkEvent<Req,
     ) -> Result<(), SendError<NetworkEvent<Req, Res>>> {
         match event {
             NetworkEvent::InboundStream { peer, stream } => {
-                self.forward_stream(peer, stream).map(|_| ()).map_err(|error| match error {
+                self.forward_stream(peer, stream).map(|_| ()).map_err(|error| match *error {
                     TrySendError::Full(event)
                     | TrySendError::Closed(event)
                     | TrySendError::Broadcast(event) => SendError(event),
@@ -367,7 +385,9 @@ impl<Events: TnSender<NetworkEvent<Req, Res>> + Sync> TnSender<NetworkEvent<Req,
         event: NetworkEvent<Req, Res>,
     ) -> Result<TrySendOutcome, TrySendError<NetworkEvent<Req, Res>>> {
         match event {
-            NetworkEvent::InboundStream { peer, stream } => self.forward_stream(peer, stream),
+            NetworkEvent::InboundStream { peer, stream } => {
+                self.forward_stream(peer, stream).map_err(|error| *error)
+            }
             event @ (NetworkEvent::Request { .. }
             | NetworkEvent::Gossip(_)
             | NetworkEvent::Error(_, _)) => self.events.try_send_outcome(event),

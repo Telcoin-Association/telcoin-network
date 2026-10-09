@@ -245,6 +245,46 @@ PUBLIC_ADMISSION_CASES = [
 ]
 CASES += PUBLIC_ADMISSION_CASES
 
+INGRESS_CASES = [
+    (
+        "worker_ingress_lane_fairness",
+        "crates/consensus/worker/src/network/ingress.rs",
+        "self.turn = second;",
+        "self.turn = first;",
+        "ready_lanes_alternate_without_starving_epoch_events",
+    ),
+    (
+        "worker_ingress_epoch_gap_retention",
+        "crates/consensus/worker/src/network/ingress.rs",
+        "pending.push_back(stream);",
+        "pending.push_back(stream);\n                drop(pending.pop_back());",
+        "epoch_receiver_gap_preserves_stream_permit_and_source_epoch",
+    ),
+    (
+        "worker_ingress_shared_peer_admission",
+        "crates/consensus/worker/src/network/ingress.rs",
+        "let decision = try_admit_sync(&pool.stream_semaphore, &pool.peers, peer)",
+        "let decision = try_admit_sync(&pool.stream_semaphore, &Default::default(), peer)",
+        "pending_and_active_streams_share_admission_bounds",
+    ),
+    (
+        "worker_ingress_epoch_gap_expiry",
+        "crates/consensus/worker/src/network/ingress.rs",
+        ".map(|stream| stream.deadline)",
+        ".map(|stream| stream.deadline + SYNC_REQUEST_READ_TIMEOUT)",
+        "receiver_gap_expiry_releases_permits_without_a_consumer",
+    ),
+    (
+        "worker_ingress_unpolled_expiry_owner",
+        "crates/consensus/worker/src/network/ingress.rs",
+        "self.0.close();",
+        "self.0.receiver.wake();",
+        "unpolled_expiry_owner_releases_pending_and_rejects_late_streams",
+    ),
+]
+
+CASES += INGRESS_CASES
+
 def execute(argv, directory, label):
     """Retain finite compiler/test logs, without accepting a compiler failure as a killed mutant."""
     result = subprocess.run(argv, cwd=ROOT, capture_output=True, timeout=1800)

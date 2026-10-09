@@ -24,19 +24,19 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ShardTests(unittest.TestCase):
-    def test_two_shards_are_the_exact_disjoint_70_case_partition(self):
+    def test_two_shards_are_the_exact_disjoint_75_case_partition(self):
         first = MUTATIONS.select_cases(0, 2)
         second = MUTATIONS.select_cases(1, 2)
-        self.assertEqual((len(first), len(second)), (35, 35))
+        self.assertEqual((len(first), len(second)), (38, 37))
         self.assertEqual(first, MUTATIONS.CASES[::2])
         self.assertEqual(second, MUTATIONS.CASES[1::2])
-        self.assertEqual(len(set(case[0] for case in first + second)), 70)
+        self.assertEqual(len(set(case[0] for case in first + second)), 75)
         self.assertEqual(MUTATIONS.select_cases(), MUTATIONS.CASES)
         with patch.object(MUTATIONS, "CASES", MUTATIONS.CASES[:5]):
             self.assertEqual([len(MUTATIONS.select_cases(i, 2)) for i in range(2)], [3, 2])
 
     def test_invalid_partition_or_duplicate_registry_is_rejected(self):
-        for index, count in ((0, 0), (-1, 2), (2, 2), (0, 71), (0, -1)):
+        for index, count in ((0, 0), (-1, 2), (2, 2), (0, 76), (0, -1)):
             with self.subTest(index=index, count=count), self.assertRaisesRegex(ValueError, "shard"):
                 MUTATIONS.select_cases(index, count)
         with patch.object(MUTATIONS, "CASES", [MUTATIONS.CASES[0]] * 2):
@@ -107,10 +107,10 @@ class AggregateTests(unittest.TestCase):
                         "--shard-count", "2", "--source", expected["source"], "--run-id", "123", "--run-attempt", "2"]
                 with patch.object(sys, "argv", argv), patch.object(MUTATIONS.subprocess, "run", side_effect=cargo), redirect_stdout(io.StringIO()):
                     MUTATIONS.main()
-                self.assertEqual(len(shard_calls), 105)
+                self.assertEqual(len(shard_calls), (114, 111)[index])
                 calls.extend(shard_calls)
-        self.assertEqual(len(calls), 210)
-        self.assertEqual(len(set(name for name, stage in calls)), 70)
+        self.assertEqual(len(calls), 225)
+        self.assertEqual(len(set(name for name, stage in calls)), 75)
         return root, directories, expected
 
     def rewrite(self, path, change):
@@ -128,14 +128,14 @@ class AggregateTests(unittest.TestCase):
                     AGGREGATE.aggregate(directories, output, expected, "success")
             self.assertFalse(output.exists(), "unverified proofs must not be published")
 
-    def test_real_producer_loop_reconciles_all_70_cases_and_210_logs(self):
+    def test_real_producer_loop_reconciles_all_75_cases_and_225_logs(self):
         with tempfile.TemporaryDirectory() as temporary:
             root, directories, expected = self.fixture(temporary)
             output = Path(temporary) / "aggregate"
             with patch.object(MUTATIONS, "ROOT", root):
                 summary = AGGREGATE.aggregate(list(reversed(directories)), output, expected, "success")
-            self.assertEqual((summary["case_count"], summary["log_count"], summary["complete"]), (70, 210, True))
-            self.assertEqual(len(list(output.glob("*.log"))), 210)
+            self.assertEqual((summary["case_count"], summary["log_count"], summary["complete"]), (75, 225, True))
+            self.assertEqual(len(list(output.glob("*.log"))), 225)
             rows = json.loads((output / "report.json").read_text())
             self.assertEqual([row["mutation"] for row in rows], [case[0] for case in MUTATIONS.CASES])
             self.assertTrue(all(row["source_sha256"] == row["restored_sha256"] for row in rows))
