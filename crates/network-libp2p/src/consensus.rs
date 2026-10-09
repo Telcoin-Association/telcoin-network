@@ -3458,6 +3458,7 @@ impl PendingKadQuery {
     }
 
     /// Consume the winning record together with its original admission ceiling.
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> Option<(NodeRecord, crate::freshness::RecordTimestamp)> {
         self.query.result.zip(self.timestamp)
     }
