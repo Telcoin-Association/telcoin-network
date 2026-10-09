@@ -69,52 +69,28 @@ If you have something to share and want to inquire about the status of our bug b
 
 ## Verifying releases
 
-Every published release carries two independent attestations:
+Every release is a git tag signed with a maintainer's OpenPGP key. Its assets are a Linux x86_64 tarball, an `IMAGE_DIGEST` file that names the container image by digest, a `SHA256SUMS` file covering both, and `SHA256SUMS.asc`, a detached signature over `SHA256SUMS`. The tag and `SHA256SUMS.asc` are signed with the same key, and each signing key lives on a YubiKey. The public keys are kept in `.github/maintainer-gpg-keys/` and the release tooling always reads them from `main`, never from the tag being released. CI refuses to draft a release for a tag that is not signed by one of those keys, and the signatures, checksums and image digest are checked again before a release is published.
 
-1. CI build provenance via `actions/attest-build-provenance` — bound by OIDC
-   to `.github/workflows/release.yaml` and the tagged commit. Verified with
-   `gh attestation verify`.
-2. Two maintainer countersignatures produced locally with `cosign` and a
-   YubiKey (PIV slot 9c, ECCP256, touch-required). Two-of-two: one
-   compromised key cannot ship a release. Each maintainer signing event
-   is also recorded in the Sigstore Rekor public transparency log, so a
-   silent re-sign after the fact is detectable.
+To check a release yourself, follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html). Compare the fingerprints it prints with the table below and with the maintainer's keys on GitHub at `https://github.com/<handle>.gpg`. Neither source comes from the release tag, so a tampered tag cannot change what you compare against.
 
-Operators verify a downloaded tarball or pulled image with the commands in
-[`docs/INSTALL.md`](docs/INSTALL.md), or in one shot with
-`make release-verify TAG=<tag>` from a clone at the tag.
+### Maintainer release keys
 
-### Maintainer signing certificates
+The fingerprint is the primary key's. Signatures are made with a signing subkey on the YubiKey, and every check matches them to the primary key.
 
-Public certs live at `.github/release-keys/<handle>.pem` in this repo. Their
-SHA-256 fingerprints — record them out-of-band so a tampered repo cannot
-silently swap the cert it ships:
+| Handle | Primary key fingerprint | YubiKey serial | Added | Status |
+|--------|-------------------------|----------------|-------|--------|
+| @grantkee | pending provisioning | pending | pending | pending provisioning |
 
-| Handle | Fingerprint (SHA-256) | First release signed |
-|--------|-----------------------|----------------------|
-| @grantkee   | _to be recorded on first release_ | _pending_ |
-| @sstanfield | _to be recorded on first release_ | _pending_ |
+Signatures required: 1 (MIN_SIGNATURES in etc/release.sh).
 
-When a key is rotated the new fingerprint is appended here with the date the
-previous key is retired. Past releases remain verifiable using the cert that
-signed them at the time — committed certs are version-controlled and never
-overwritten in place.
+Until a key is provisioned, its file in `.github/maintainer-gpg-keys/` is a placeholder and every release check fails on it.
 
-### Maintainer tag-signing GPG keys
+### Changing this table
 
-The release workflow refuses to draft a release unless the pushed tag is
-GPG-signed by a maintainer key whose public key lives in
-`.github/maintainer-gpg-keys/<handle>.asc` at that commit. Fingerprints
-are recorded here so a tampered repo cannot silently swap the key it ships:
-
-| Handle | GPG fingerprint (40 hex) | First release signed |
-|--------|--------------------------|----------------------|
-| @grantkee   | _to be recorded on first release_ | _pending_ |
-| @sstanfield | _to be recorded on first release_ | _pending_ |
-
-Rotation follows the same rules as the signing certs: never overwrite an
-existing `.asc` in place; add a new file with a suffix and update this
-table with the date the previous key is retired.
+- To add a maintainer, open one pull request that adds `.github/maintainer-gpg-keys/<handle>.asc` and a row here, and have it reviewed by someone other than the key's owner. [YubiKey signing setup](https://docs.telcoin.network/maintainers/yubikey-setup.html) covers creating and exporting the key.
+- When a YubiKey is replaced, update the `.asc` file in place with the new signing subkey and change the YubiKey serial and Added date in the row. The primary fingerprint stays the same.
+- When a key is revoked, keep its row, set Status to `revoked YYYY-MM-DD`, and delete its `.asc` file. Release checks read the allowlist from `main`, so the key stops being accepted as soon as that change merges.
+- To require more signatures, raise `MIN_SIGNATURES` in `etc/release.sh` and update the Signatures required line in the same pull request. The threshold cannot exceed the number of keys in the table.
 
 ## Credits & Acknowledgments
 
