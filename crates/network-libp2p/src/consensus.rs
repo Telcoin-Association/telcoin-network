@@ -10,7 +10,7 @@ use crate::{
         ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
         SwarmMetrics,
     },
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
@@ -1205,6 +1205,7 @@ where
                         },
                         reply,
                     );
+                    self.refresh_explicit_peers();
                     self.query_missing_required_records();
                 } else {
                     let _ = reply.send(admission);
@@ -1455,6 +1456,7 @@ where
                 // Authoritative membership and identity confirmation must not depend on a
                 // capacity rejection or a failed database deletion during retention cleanup.
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                self.refresh_explicit_peers();
                 self.query_missing_required_records();
                 retention?;
             }
@@ -1517,6 +1519,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconcile gossip mesh privileges for connected peers after committee rotation.
+    ///
+    /// Operator trust survives rotation; committee protection ends when the final slot expires.
+    fn refresh_explicit_peers(&mut self) {
+        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    fn refresh_explicit_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let protected = self.swarm.is_connected(peer)
+            && manager.peer_is_important(peer)
+            && !manager.peer_banned(peer);
+        if protected {
+            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+        } else {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already
@@ -1669,7 +1692,10 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(peer_id, Penalty::Load(LoadPenalty::SlowPeer));
             }
         }
 
@@ -1812,7 +1838,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -2387,6 +2413,7 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table
@@ -2744,7 +2771,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
                 Ok(PutOutcome::Processed)
             }
             PutRecordRate::Shed => {
@@ -2858,7 +2888,8 @@ where
     /// costs a row decode, merge, re-encode, insert, and a physical MDBX commit,
     /// and repeating `AddProvider` for an already-stored key skips the store's
     /// capacity gate, so an unbounded stream would run that work at line rate;
-    /// over-budget messages are dropped with a [`Penalty::Medium`]. Second, the
+    /// over-budget messages are dropped with `Penalty::Load(LoadPenalty::KademliaRateLimit)`
+    /// at Medium weight. Second, the
     /// expected capacity rejection is logged at `debug!` and never propagated:
     /// once the provider table saturates, `MaxProvidedKeys` is remotely
     /// triggerable, so propagating it would amplify a flood in the run-loop's
@@ -2877,7 +2908,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
@@ -3013,11 +3044,13 @@ where
             })
             .into_iter()
             .for_each(|(key, node_record, timestamp)| {
+                let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
                     key,
                     node_record.info,
                     timestamp,
                 );
+                self.refresh_explicit_peer(&peer);
             });
     }
 }

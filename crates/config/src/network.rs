@@ -606,7 +606,8 @@ pub struct SyncConfig {
     /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
     ///   it answers with a retryable response and charges no penalty. The proposer retries the
     ///   request, and by then the lead may be back within tolerance.
-    /// - Further ahead, it rejects the header and penalizes the proposer.
+    /// - Further ahead, it rejects the header without a score penalty. Clock skew may be local to
+    ///   either peer, so rejecting the header must not prevent recovery through that peer.
     ///
     /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
     /// second.

@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
@@ -328,6 +329,7 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
+/// Trusted peers bypass load penalties but remain eligible for protocol bans.
 #[tokio::test]
 async fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
@@ -361,11 +363,14 @@ async fn test_add_trusted_peer() {
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // assert penalty doesn't affect trusted peer
-    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    // Load penalties do not affect a trusted peer's score or ban status.
+    peer_manager.process_penalty(peer_id, Penalty::Load(LoadPenalty::Timeout));
     assert!(!peer_manager.peer_banned(&peer_id));
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
+
+    // Protocol violations can still ban a trusted peer.
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    assert!(peer_manager.peer_banned(&peer_id));
 }
 
 #[tokio::test]
