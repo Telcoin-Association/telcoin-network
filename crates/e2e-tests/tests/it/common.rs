@@ -934,6 +934,7 @@ pub(crate) fn config_committee(
 }
 
 /// Start the network using the node cli command.
+/// Keep the WebSocket base at or above the HTTP base so worker RPC port bands cannot cross.
 pub(crate) fn start_nodes(
     temp_path: &Path,
     validators: &[(&str, Address)],
