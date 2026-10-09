@@ -10,6 +10,9 @@
 //! upstream response body is streamed through, never buffered whole. When no
 //! upstream is ready, or the upstream cannot be reached / times out, the
 //! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
+//! So does a client whose upstream answers an error status without a JSON body
+//! (a worker's `429` text/plain, say): it keeps the upstream's status, with a
+//! JSON-RPC error in place of the body.
 //!
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`classify`]),
@@ -37,7 +40,9 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    error::{error_response, error_response_with_id, GatewayError, RequestId},
+    error::{
+        error_response, error_response_with_id, upstream_error_response, GatewayError, RequestId,
+    },
     server::AppState,
     telemetry,
 };
@@ -165,10 +170,25 @@ pub(crate) async fn proxy(
     match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
         .await
     {
-        Ok(response) => {
+        // an error status without a json body (a worker's `429` text/plain,
+        // say) carries no json-rpc answer: replace it with the gateway's
+        // envelope, keeping the status and echoing the request's id
+        Ok(upstream) if is_non_json_error(&upstream) => {
+            let status = upstream.status();
+            telemetry::record_routed(route.label(), "upstream_error");
+            warn!(
+                target: "gateway::proxy",
+                route = route.label(),
+                upstream = %UpstreamOrigin(&upstream_url),
+                status = status.as_u16(),
+                "upstream answered an error status without a JSON-RPC body"
+            );
+            upstream_error_response(status, body.as_ref())
+        }
+        Ok(upstream) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
-            response
+            relay(upstream)
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -221,8 +241,8 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
-/// Forward one request to `upstream_url` and adapt the upstream response back
-/// into an axum response, preserving the status, body, and content type.
+/// Forward one request to `upstream_url` and return the upstream's response
+/// with its body still unread (see [`relay`]).
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
 /// [`REDIRECT_HEADER`] toward the query upstream, never both.
@@ -237,7 +257,7 @@ async fn forward(
     body: Bytes,
     upstream_url: Url,
     peer: SocketAddr,
-) -> Result<Response, reqwest::Error> {
+) -> Result<reqwest::Response, reqwest::Error> {
     // JSON-RPC is content-type `application/json`; preserve the client's header
     // when present, default to it otherwise.
     let content_type = headers
@@ -249,7 +269,7 @@ async fn forward(
         Route::Query => REDIRECT_HEADER,
     };
 
-    let upstream = client
+    client
         .request(method, upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
@@ -257,8 +277,40 @@ async fn forward(
         .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
         .body(body)
         .send()
-        .await?;
+        .await
+}
 
+/// Whether an upstream response is an error status without a JSON body, which
+/// the gateway replaces with its own JSON-RPC error rather than relaying.
+///
+/// Every non-2xx status counts, `3xx` included (redirects are never followed;
+/// see [`proxy_client`]). A JSON body, `application/json` or any `+json`
+/// subtype with any parameters, is relayed unchanged whatever the status: it
+/// is the upstream's own JSON-RPC error.
+fn is_non_json_error(upstream: &reqwest::Response) -> bool {
+    !upstream.status().is_success()
+        && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
+}
+
+/// Whether a `Content-Type` names JSON: `application/json` or any `+json`
+/// subtype, compared case-insensitively with parameters ignored. A missing or
+/// unreadable header is not JSON.
+fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|essence| essence.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            (kind.eq_ignore_ascii_case("application") && subtype.eq_ignore_ascii_case("json"))
+                || subtype
+                    .rsplit_once('+')
+                    .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+        })
+}
+
+/// Adapt an upstream response back into an axum response, preserving the
+/// status, body, and content type.
+fn relay(upstream: reqwest::Response) -> Response {
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
 
@@ -277,7 +329,7 @@ async fn forward(
     if let Some(content_type) = upstream_content_type {
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
-    Ok(response)
+    response
 }
 
 /// Build the client that forwards requests on both routes.
@@ -1229,6 +1281,28 @@ mod tests {
             "cause should have a source: {cause}"
         );
         assert_eq!(UpstreamOrigin(&url).to_string(), "http://127.0.0.1:1");
+    }
+
+    #[test]
+    fn json_content_types_are_recognized() {
+        let json =
+            |value: &'static str| is_json_content_type(Some(&HeaderValue::from_static(value)));
+        for value in [
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=utf-8",
+            " application/json ;charset=utf-8",
+            "application/problem+json",
+            "application/vnd.api+JSON; ext=1",
+        ] {
+            assert!(json(value), "{value}");
+        }
+        for value in
+            ["text/plain", "text/plain; charset=utf-8", "text/html", "application/jsonp", ""]
+        {
+            assert!(!json(value), "{value}");
+        }
+        assert!(!is_json_content_type(None));
     }
 
     /// A JSON-RPC call to `method` with empty params.

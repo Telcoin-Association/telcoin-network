@@ -7,16 +7,21 @@
 //! is installed and every macro below is a cheap no-op against the global noop
 //! recorder.
 //!
-//! Two counters partition every proxied request:
+//! Three recorders partition every proxied request:
 //!
 //! - [`record_forwarded`] bumps `tn_worker_gateway_requests_total{outcome="forwarded"}` for a
-//!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint);
+//!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint) whose answer is
+//!   relayed;
 //! - [`record_rejection`] bumps `tn_worker_gateway_requests_total{outcome="rejected"}` plus
 //!   `tn_worker_gateway_rejections_total{reason=...}` for a request the gateway answered with a
+//!   JSON-RPC error;
+//! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
+//!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
+//!   upstream answered an error status without a JSON body, which the gateway replaced with a
 //!   JSON-RPC error.
 //!
 //! Their sum is the total proxied-request count, and `rejections_total` breaks
-//! the rejected side down by reason. The gateway's own `/health` and `/ready`
+//! the non-forwarded side down by reason. The gateway's own `/health` and `/ready`
 //! probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
 //!
@@ -35,10 +40,12 @@ use metrics::{counter, gauge, histogram};
 /// gateway's own CPU idle.
 const INFLIGHT_REQUESTS: &str = "tn_worker_gateway_inflight_requests";
 
-/// Proxied requests by terminal `outcome` (`forwarded` or `rejected`).
+/// Proxied requests by terminal `outcome` (`forwarded`, `rejected` or
+/// `upstream_error`).
 const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 
-/// Rejected proxied requests by `reason` (the `GatewayError` reason label).
+/// Rejected and upstream-error proxied requests by `reason` (the
+/// `GatewayError` reason label).
 const REJECTIONS_TOTAL: &str = "tn_worker_gateway_rejections_total";
 
 /// End-to-end proxied-request duration, in seconds. The `_seconds` suffix picks
@@ -50,7 +57,7 @@ const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_secon
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
 
 /// Forward attempts by `route` (`worker` or `query`) and `result`
-/// (`forwarded`, `unreachable` or `timeout`).
+/// (`forwarded`, `upstream_error`, `unreachable` or `timeout`).
 const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 
 /// Batches sent whole to the query upstream because they mixed submissions
@@ -96,8 +103,17 @@ pub(crate) fn record_rejection(reason: &'static str) {
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
+/// Record a request whose upstream answered an error status without a JSON
+/// body, which the gateway replaced with a JSON-RPC error. It is kept apart
+/// from [`record_rejection`]'s `rejected` outcome because the gateway did
+/// forward it: the upstream refused it.
+pub(crate) fn record_upstream_error(reason: &'static str) {
+    counter!(REQUESTS_TOTAL, "outcome" => "upstream_error").increment(1);
+    counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
+
 /// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `unreachable` or `timeout`).
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }
@@ -111,4 +127,83 @@ pub(crate) fn record_mixed_batch() {
 /// Publish a worker's current readiness as a `0`/`1` gauge.
 pub(crate) fn set_upstream_ready(worker_id: u16, ready: bool) {
     gauge!(UPSTREAM_READY, "worker_id" => worker_id.to_string()).set(if ready { 1.0 } else { 0.0 });
+}
+
+/// Test support: capture the metrics the code under test records.
+#[cfg(test)]
+pub(crate) mod test_utils {
+    use std::collections::BTreeMap;
+
+    use metrics::LocalRecorderGuard;
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder, Snapshotter};
+
+    /// One series: its name and its sorted `(label, value)` pairs.
+    type SeriesKey = (String, Vec<(String, String)>);
+
+    /// Records every metric emitted on the current thread into a
+    /// [`DebuggingRecorder`] for as long as it lives.
+    ///
+    /// The recorder is installed thread-locally, not globally, so tests stay
+    /// independent. A `#[tokio::test]` runs on a current-thread runtime, so the
+    /// gateway, mock upstreams and client spawned by a test all run on the test's
+    /// thread and record here.
+    ///
+    /// A snapshot drains the recorder (counters and gauges reset to zero), so
+    /// every read accumulates the new snapshot into running totals first. That
+    /// makes a counter's total its whole count and an increment/decrement
+    /// gauge's total its current value; a `set` gauge is only meaningful when it
+    /// is read once after the code under test sets it.
+    pub(crate) struct CapturedMetrics {
+        /// Drains the recorder.
+        snapshotter: Snapshotter,
+        /// Keeps the recorder installed on this thread.
+        _guard: LocalRecorderGuard<'static>,
+        /// Every series seen so far, with its accumulated value.
+        totals: BTreeMap<SeriesKey, f64>,
+    }
+
+    impl CapturedMetrics {
+        /// Install a fresh recorder on the current thread.
+        pub(crate) fn install() -> Self {
+            // leaked so the thread-local guard can borrow it for the test's
+            // lifetime; each test runs in its own process under nextest
+            let recorder: &'static DebuggingRecorder =
+                Box::leak(Box::new(DebuggingRecorder::new()));
+            let snapshotter = recorder.snapshotter();
+            let guard = metrics::set_default_local_recorder(recorder);
+            Self { snapshotter, _guard: guard, totals: BTreeMap::new() }
+        }
+
+        /// Fold a fresh snapshot into the running totals.
+        fn accumulate(&mut self) {
+            for (key, _, _, value) in self.snapshotter.snapshot().into_vec() {
+                let mut labels: Vec<_> = key
+                    .key()
+                    .labels()
+                    .map(|label| (label.key().to_string(), label.value().to_string()))
+                    .collect();
+                labels.sort();
+                let delta = match value {
+                    // counts in a test stay far below 2^53, so the cast is exact
+                    DebugValue::Counter(count) => count as f64,
+                    DebugValue::Gauge(value) => value.into_inner(),
+                    DebugValue::Histogram(values) => values.len() as f64,
+                };
+                *self.totals.entry((key.key().name().to_string(), labels)).or_default() += delta;
+            }
+        }
+
+        /// The accumulated value of the series `name{labels}`, matching the
+        /// label set exactly, or `0` if it was never recorded. A histogram reads
+        /// as its number of samples.
+        pub(crate) fn value(&mut self, name: &str, labels: &[(&str, &str)]) -> f64 {
+            self.accumulate();
+            let mut labels: Vec<_> = labels
+                .iter()
+                .map(|(label, value)| ((*label).to_string(), (*value).to_string()))
+                .collect();
+            labels.sort();
+            self.totals.get(&(name.to_string(), labels)).copied().unwrap_or_default()
+        }
+    }
 }

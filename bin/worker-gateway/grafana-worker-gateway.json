@@ -52,7 +52,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Proxied requests per second split by terminal outcome (forwarded vs rejected)."
+      "description": "Proxied requests per second split by terminal outcome (forwarded, rejected, or upstream_error: an upstream error status without a JSON body)."
     },
     {
       "id": 3,
@@ -140,7 +140,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Rejected requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body)."
+      "description": "Rejected and upstream-error requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body, upstream_error)."
     },
     {
       "id": 6,
@@ -162,7 +162,7 @@
             "type": "prometheus",
             "uid": "prometheus"
           },
-          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
+          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=~\"rejected|upstream_error\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
           "refId": "A",
           "legendFormat": "reject ratio"
         }
@@ -183,7 +183,7 @@
           ]
         }
       },
-      "description": "Fraction of proxied requests rejected. Denominator is clamped to >= 1 req/s so the ratio reads 0 (not NaN) when there is no traffic."
+      "description": "Fraction of proxied requests rejected by the gateway or answered with an upstream error status without a JSON body. Denominator is clamped to >= 1 req/s so the ratio reads 0 (not NaN) when there is no traffic."
     },
     {
       "id": 7,
