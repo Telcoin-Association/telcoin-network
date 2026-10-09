@@ -1,4 +1,4 @@
-name: CI119 independent hub capacity verification
+name: CI122 independent hub capacity verification
 
 "on":
   workflow_dispatch:
@@ -22,7 +22,7 @@ jobs:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           github.repository == 'Telcoin-Association/telcoin-network' &&
-          github.ref == 'refs/heads/work/1476-ci118-verification' }}
+          github.ref == 'refs/heads/work/1476-ci122-verification' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     outputs:
@@ -53,9 +53,9 @@ jobs:
           if (not re.fullmatch("[0-9a-f]{40}", expected_sha)
               or env["ACTUAL_WORKFLOW_COMMIT"] != expected_sha
               or env["ACTUAL_REPOSITORY"] != "Telcoin-Association/telcoin-network"
-              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci118-verification"
+              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci122-verification"
               or env["ACTUAL_EVENT"] != "workflow_dispatch"
-              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci118-verification"):
+              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci122-verification"):
               failures.append("unexpected_helper_repository_ref_workflow_or_commit")
           if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
               failures.append("unsupported_runner_architecture")
@@ -87,7 +87,7 @@ jobs:
           fetch-depth: 1
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ca02e454b4f2fa5f5e1a47db8e346fb1bec00666
+          ref: 3914e53957fcc3ff7befe8b1a3f9a3284bfaba4b
           path: qualification-source
           persist-credentials: false
           fetch-depth: 0
@@ -97,10 +97,10 @@ jobs:
           python3 -B -I - <<'PY'
           import hashlib
           from pathlib import Path
-          root = Path("tools/ci119-verification")
-          pins = {"1476-ci119-full-verify.py": "b59169267c3867b6ede7de42e0c1f582c520616f439185afc607e3bde1f005b5",
-                  "1476-ci119-publication.py": "2c479ee65b85feb3216d5913ed0e41b1defe4293a1fa6b6712c1d56286757b6f",
-                  "1476-ci119-helper-inputs.json": "538851e391533857ed0d3a140f62c112ba6131fa77e5756ec35b5b6e759d4328"}
+          root = Path("tools/ci122-verification")
+          pins = {"1476-ci122-full-verify.py": "bc70473b6fe61a886e8da9c1b16b7235978a8886757fc84ab1a7910e6562a624",
+                  "1476-ci122-publication.py": "1848455659b40972b3c71e56b64b0b9c37e772d00281c86d91cd5f65b2690970",
+                  "1476-ci122-helper-inputs.json": "c2836faa6a1400228a0865e0e1ea9c4dbc5d2b50af60f84a7f8be5b7f24ba163"}
           for name, expected in pins.items():
               path = root / name
               if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -112,17 +112,17 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: >-
-          python3 -B -I tools/ci119-verification/1476-ci119-full-verify.py
-          --manifest tools/ci119-verification/1476-ci119-helper-inputs.json
-          --manifest-sha256 538851e391533857ed0d3a140f62c112ba6131fa77e5756ec35b5b6e759d4328
+          python3 -B -I tools/ci122-verification/1476-ci122-full-verify.py
+          --manifest tools/ci122-verification/1476-ci122-helper-inputs.json
+          --manifest-sha256 c2836faa6a1400228a0865e0e1ea9c4dbc5d2b50af60f84a7f8be5b7f24ba163
           --source-checkout "$GITHUB_WORKSPACE/qualification-source"
       - name: Retain exact public bundle and bounded independent proof
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ci119-qualified-${{ github.run_id }}-${{ github.run_attempt }}
+          name: ci122-qualified-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/ci119/public-bundle
-            ${{ runner.temp }}/ci119/proof.json
+            ${{ runner.temp }}/ci122/public-bundle
+            ${{ runner.temp }}/ci122/proof.json
           if-no-files-found: error
           retention-days: 7
           compression-level: 0
@@ -134,7 +134,7 @@ jobs:
           needs.verify.outputs.qualified == 'true' &&
           github.event_name == 'workflow_dispatch' &&
           github.repository == 'Telcoin-Association/telcoin-network' &&
-          github.ref == 'refs/heads/work/1476-ci118-verification' }}
+          github.ref == 'refs/heads/work/1476-ci122-verification' }}
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 30
     permissions:
@@ -166,9 +166,9 @@ jobs:
           if (not re.fullmatch("[0-9a-f]{40}", expected_sha)
               or env["ACTUAL_WORKFLOW_COMMIT"] != expected_sha
               or env["ACTUAL_REPOSITORY"] != "Telcoin-Association/telcoin-network"
-              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci118-verification"
+              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci122-verification"
               or env["ACTUAL_EVENT"] != "workflow_dispatch"
-              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci118-verification"):
+              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci122-verification"):
               failures.append("unexpected_helper_repository_ref_workflow_or_commit")
           if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
               failures.append("unsupported_runner_architecture")
@@ -201,8 +201,8 @@ jobs:
       - name: Download this attempt's independently qualified public bundle
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: ci119-qualified-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ci119-publication-input
+          name: ci122-qualified-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci122-publication-input
       - name: Authenticate publication guard and publish orphan evidence branch
         shell: bash
         env:
@@ -211,10 +211,10 @@ jobs:
           python3 -B -I - <<'PY'
           import hashlib
           from pathlib import Path
-          path = Path("tools/ci119-verification/1476-ci119-publication.py")
-          if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != "2c479ee65b85feb3216d5913ed0e41b1defe4293a1fa6b6712c1d56286757b6f":
+          path = Path("tools/ci122-verification/1476-ci122-publication.py")
+          if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != "1848455659b40972b3c71e56b64b0b9c37e772d00281c86d91cd5f65b2690970":
               raise SystemExit("reviewed publication guard hash mismatch")
           PY
-          python3 -B -I tools/ci119-verification/1476-ci119-publication.py \
-            --bundle "$RUNNER_TEMP/ci119-publication-input/public-bundle" \
-            --proof "$RUNNER_TEMP/ci119-publication-input/proof.json"
+          python3 -B -I tools/ci122-verification/1476-ci122-publication.py \
+            --bundle "$RUNNER_TEMP/ci122-publication-input/public-bundle" \
+            --proof "$RUNNER_TEMP/ci122-publication-input/proof.json"

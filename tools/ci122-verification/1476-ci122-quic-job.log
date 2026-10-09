@@ -1,0 +1,699 @@
+﻿2026-10-09T20:59:06.5869983Z Current runner version: '2.337.0'
+2026-10-09T20:59:06.5896751Z ##[group]Runner Image Provisioner
+2026-10-09T20:59:06.5897695Z Hosted Compute Agent
+2026-10-09T20:59:06.5898337Z Version: 20261002.596
+2026-10-09T20:59:06.5898969Z Commit: c3d12f3313a95f25162a1503be624f3b0617f8c0
+2026-10-09T20:59:06.5900018Z Build Date: 2026-10-02T22:28:27Z
+2026-10-09T20:59:06.5900728Z Worker ID: {5c00a3ff-2c0e-4fa2-ab29-1df1e107ffb5}
+2026-10-09T20:59:06.5901513Z Region: northcentralus
+2026-10-09T20:59:06.5902166Z Cloud: Azure
+2026-10-09T20:59:06.5902738Z ##[endgroup]
+2026-10-09T20:59:06.5904437Z ##[group]Operating System
+2026-10-09T20:59:06.5905089Z Ubuntu
+2026-10-09T20:59:06.5905773Z 24.04.5
+2026-10-09T20:59:06.5906353Z LTS
+2026-10-09T20:59:06.5906875Z ##[endgroup]
+2026-10-09T20:59:06.5907487Z ##[group]Runner Image
+2026-10-09T20:59:06.5908102Z Image: ubuntu-24.04
+2026-10-09T20:59:06.5908663Z Version: 20261004.327.1
+2026-10-09T20:59:06.5910500Z Included Software: https://github.com/actions/runner-images/blob/ubuntu24/20261004.327/images/ubuntu/Ubuntu2404-Readme.md
+2026-10-09T20:59:06.5912197Z Image Release: https://github.com/actions/runner-images/releases/tag/ubuntu24%2F20261004.327
+2026-10-09T20:59:06.5913192Z ##[endgroup]
+2026-10-09T20:59:06.5914416Z ##[group]GITHUB_TOKEN Permissions
+2026-10-09T20:59:06.5916532Z Contents: read
+2026-10-09T20:59:06.5917659Z Metadata: read
+2026-10-09T20:59:06.5918244Z ##[endgroup]
+2026-10-09T20:59:06.5920792Z Secret source: Actions
+2026-10-09T20:59:06.5921916Z Cache mode: write
+2026-10-09T20:59:06.5922833Z Prepare workflow directory
+2026-10-09T20:59:06.6482054Z Prepare all required actions
+2026-10-09T20:59:06.6531240Z Getting action download info
+2026-10-09T20:59:06.9149248Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-10-09T20:59:07.0105522Z Download action repository 'actions/upload-artifact@v4' (SHA:ea165f8d65b6e75b540449e92b4886f43607fa02)
+2026-10-09T20:59:07.2201911Z Complete job name: profile
+2026-10-09T20:59:07.3048401Z ##[group]Run actions/checkout@v4
+2026-10-09T20:59:07.3050508Z with:
+2026-10-09T20:59:07.3051378Z   repository: Telcoin-Association/telcoin-network
+2026-10-09T20:59:07.3058529Z   token: ***
+2026-10-09T20:59:07.3060246Z   ssh-strict: true
+2026-10-09T20:59:07.3060988Z   ssh-user: git
+2026-10-09T20:59:07.3061725Z   persist-credentials: true
+2026-10-09T20:59:07.3062527Z   clean: true
+2026-10-09T20:59:07.3063252Z   sparse-checkout-cone-mode: true
+2026-10-09T20:59:07.3064121Z   fetch-depth: 1
+2026-10-09T20:59:07.3064835Z   fetch-tags: false
+2026-10-09T20:59:07.3065581Z   show-progress: true
+2026-10-09T20:59:07.3066333Z   lfs: false
+2026-10-09T20:59:07.3067023Z   submodules: false
+2026-10-09T20:59:07.3067776Z   set-safe-directory: true
+2026-10-09T20:59:07.3068629Z   allow-unsafe-pr-checkout: false
+2026-10-09T20:59:07.3070466Z env:
+2026-10-09T20:59:07.3071162Z   CARGO_BUILD_JOBS: 2
+2026-10-09T20:59:07.3072595Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T20:59:07.3074120Z ##[endgroup]
+2026-10-09T20:59:07.4126735Z Syncing repository: Telcoin-Association/telcoin-network
+2026-10-09T20:59:07.4128659Z ##[group]Getting Git version info
+2026-10-09T20:59:07.4129787Z Working directory is '/home/runner/work/telcoin-network/telcoin-network'
+2026-10-09T20:59:07.4130961Z [command]/usr/bin/git version
+2026-10-09T20:59:07.4206714Z git version 2.55.0
+2026-10-09T20:59:07.4227865Z ##[endgroup]
+2026-10-09T20:59:07.4242326Z Temporarily overriding HOME='/home/runner/work/_temp/04a06968-a1b3-460e-9ccd-67e3506349ca' before making global git config changes
+2026-10-09T20:59:07.4244530Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-09T20:59:07.4247689Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/telcoin-network/telcoin-network
+2026-10-09T20:59:07.4299037Z Deleting the contents of '/home/runner/work/telcoin-network/telcoin-network'
+2026-10-09T20:59:07.4303403Z ##[group]Initializing the repository
+2026-10-09T20:59:07.4308991Z [command]/usr/bin/git init /home/runner/work/telcoin-network/telcoin-network
+2026-10-09T20:59:07.4421365Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-10-09T20:59:07.4423599Z hint: will change to "main" in Git 3.0. To configure the initial branch name
+2026-10-09T20:59:07.4425962Z hint: to use in all of your new repositories, which will suppress this warning,
+2026-10-09T20:59:07.4427554Z hint: call:
+2026-10-09T20:59:07.4428500Z hint:
+2026-10-09T20:59:07.4429239Z hint: 	git config --global init.defaultBranch <name>
+2026-10-09T20:59:07.4431035Z hint:
+2026-10-09T20:59:07.4431981Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-10-09T20:59:07.4433019Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-10-09T20:59:07.4433858Z hint:
+2026-10-09T20:59:07.4434329Z hint: 	git branch -m <name>
+2026-10-09T20:59:07.4434924Z hint:
+2026-10-09T20:59:07.4435594Z hint: Disable this message with "git config set advice.defaultBranchName false"
+2026-10-09T20:59:07.4437259Z Initialized empty Git repository in /home/runner/work/telcoin-network/telcoin-network/.git/
+2026-10-09T20:59:07.4440211Z [command]/usr/bin/git remote add origin https://github.com/Telcoin-Association/telcoin-network
+2026-10-09T20:59:07.4489618Z ##[endgroup]
+2026-10-09T20:59:07.4490473Z ##[group]Disabling automatic garbage collection
+2026-10-09T20:59:07.4495080Z [command]/usr/bin/git config --local gc.auto 0
+2026-10-09T20:59:07.4538814Z ##[endgroup]
+2026-10-09T20:59:07.4540504Z ##[group]Setting up auth
+2026-10-09T20:59:07.4546462Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-09T20:59:07.4578080Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-09T20:59:07.4942139Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-09T20:59:07.4974647Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-09T20:59:07.5194084Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-09T20:59:07.5225835Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-09T20:59:07.5444182Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-10-09T20:59:07.5479822Z ##[endgroup]
+2026-10-09T20:59:07.5480868Z ##[group]Fetching the repository
+2026-10-09T20:59:07.5489196Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +3914e53957fcc3ff7befe8b1a3f9a3284bfaba4b:refs/remotes/origin/feat/1476-public-hub-capacity
+2026-10-09T20:59:08.4391367Z From https://github.com/Telcoin-Association/telcoin-network
+2026-10-09T20:59:08.4393769Z  * [new ref]         3914e53957fcc3ff7befe8b1a3f9a3284bfaba4b -> origin/feat/1476-public-hub-capacity
+2026-10-09T20:59:08.4398289Z ##[endgroup]
+2026-10-09T20:59:08.4400256Z ##[group]Determining the checkout info
+2026-10-09T20:59:08.4402316Z ##[endgroup]
+2026-10-09T20:59:08.4407306Z [command]/usr/bin/git sparse-checkout disable
+2026-10-09T20:59:08.4462776Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-10-09T20:59:08.4495209Z ##[group]Checking out the ref
+2026-10-09T20:59:08.4501267Z [command]/usr/bin/git checkout --progress --force -B feat/1476-public-hub-capacity refs/remotes/origin/feat/1476-public-hub-capacity
+2026-10-09T20:59:08.5525497Z Switched to a new branch 'feat/1476-public-hub-capacity'
+2026-10-09T20:59:08.5536423Z branch 'feat/1476-public-hub-capacity' set up to track 'origin/feat/1476-public-hub-capacity'.
+2026-10-09T20:59:08.5542490Z ##[endgroup]
+2026-10-09T20:59:08.5584799Z [command]/usr/bin/git log -1 --format=%H
+2026-10-09T20:59:08.5610156Z 3914e53957fcc3ff7befe8b1a3f9a3284bfaba4b
+2026-10-09T20:59:08.5870000Z ##[group]Run rustup toolchain install 1.94 --profile minimal --component clippy
+2026-10-09T20:59:08.5872723Z [36;1mrustup toolchain install 1.94 --profile minimal --component clippy[0m
+2026-10-09T20:59:08.6147349Z shell: /usr/bin/bash -e {0}
+2026-10-09T20:59:08.6149180Z env:
+2026-10-09T20:59:08.6150817Z   CARGO_BUILD_JOBS: 2
+2026-10-09T20:59:08.6153867Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T20:59:08.6156446Z ##[endgroup]
+2026-10-09T20:59:08.6741940Z info: syncing channel updates for 1.94-x86_64-unknown-linux-gnu
+2026-10-09T20:59:08.7822875Z info: latest update on 2026-03-26 for version 1.94.1 (e408947bf 2026-03-25)
+2026-10-09T20:59:08.7825966Z info: downloading 4 components
+2026-10-09T20:59:16.4538195Z 
+2026-10-09T20:59:16.4617195Z   1.94-x86_64-unknown-linux-gnu installed - rustc 1.94.1 (e408947bf 2026-03-25)
+2026-10-09T20:59:16.4617884Z 
+2026-10-09T20:59:16.4724252Z ##[group]Run python3 -P testing/quic-handshake/prepare.py
+2026-10-09T20:59:16.4724861Z [36;1mpython3 -P testing/quic-handshake/prepare.py[0m
+2026-10-09T20:59:16.4791379Z shell: /usr/bin/bash -e {0}
+2026-10-09T20:59:16.4791794Z env:
+2026-10-09T20:59:16.4792123Z   CARGO_BUILD_JOBS: 2
+2026-10-09T20:59:16.4792824Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T20:59:16.4793591Z ##[endgroup]
+2026-10-09T20:59:16.6544454Z {"instrumentation": 1, "source_sha256": {"lib.rs": "218c83e5c7f9f93e9ceecfddec999ded50039315588129397925645402842977", "certificate.rs": "cc2235283eaffd86d75b302f568d08045e32b218a8fb9f7da418cc636bec5c0d", "verifier.rs": "18f4313e6de34a84153ef9b064dee3df6e5f116663bf2bc32d73d499a63ae860"}, "output": "/home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/generated/libp2p-tls"}
+2026-10-09T20:59:16.6772995Z ##[group]Run cargo +1.94 clippy --locked --manifest-path testing/quic-handshake/Cargo.toml --all-targets --no-deps -- -D warnings
+2026-10-09T20:59:16.6774161Z [36;1mcargo +1.94 clippy --locked --manifest-path testing/quic-handshake/Cargo.toml --all-targets --no-deps -- -D warnings[0m
+2026-10-09T20:59:16.6840762Z shell: /usr/bin/bash -e {0}
+2026-10-09T20:59:16.6841126Z env:
+2026-10-09T20:59:16.6841433Z   CARGO_BUILD_JOBS: 2
+2026-10-09T20:59:16.6842019Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T20:59:16.6842660Z ##[endgroup]
+2026-10-09T20:59:16.7506330Z     Updating crates.io index
+2026-10-09T20:59:17.0342859Z  Downloading crates ...
+2026-10-09T20:59:17.0662069Z   Downloaded block-buffer v0.12.1
+2026-10-09T20:59:17.0683981Z   Downloaded data-encoding-macro-internal v0.1.17
+2026-10-09T20:59:17.0695192Z   Downloaded cfg-if v1.0.4
+2026-10-09T20:59:17.0715111Z   Downloaded byteorder v1.5.0
+2026-10-09T20:59:17.0738872Z   Downloaded rustc_version v0.4.1
+2026-10-09T20:59:17.0758565Z   Downloaded ed25519 v3.0.0
+2026-10-09T20:59:17.0782620Z   Downloaded quote v1.0.45
+2026-10-09T20:59:17.0818764Z   Downloaded rand_core v0.10.1
+2026-10-09T20:59:17.0844351Z   Downloaded rcgen v0.13.2
+2026-10-09T20:59:17.0879559Z   Downloaded zerofrom v0.1.6
+2026-10-09T20:59:17.0895198Z   Downloaded unsigned-varint v0.8.0
+2026-10-09T20:59:17.0927434Z   Downloaded proc-macro2 v1.0.106
+2026-10-09T20:59:17.0971176Z   Downloaded futures-timer v3.0.3
+2026-10-09T20:59:17.0996115Z   Downloaded rand v0.10.2
+2026-10-09T20:59:17.1043158Z   Downloaded untrusted v0.9.0
+2026-10-09T20:59:17.1073300Z   Downloaded data-encoding v2.10.0
+2026-10-09T20:59:17.1089280Z   Downloaded untrusted v0.7.1
+2026-10-09T20:59:17.1105910Z   Downloaded rusticata-macros v4.1.0
+2026-10-09T20:59:17.1128150Z   Downloaded zerofrom-derive v0.1.6
+2026-10-09T20:59:17.1143110Z   Downloaded futures-task v0.3.32
+2026-10-09T20:59:17.1161307Z   Downloaded stable_deref_trait v1.2.1
+2026-10-09T20:59:17.1175275Z   Downloaded subtle v2.6.1
+2026-10-09T20:59:17.1198818Z   Downloaded tinyvec_macros v0.1.1
+2026-10-09T20:59:17.1216848Z   Downloaded web-time v1.1.0
+2026-10-09T20:59:17.1244619Z   Downloaded pkg-config v0.3.32
+2026-10-09T20:59:17.1266257Z   Downloaded yoke v0.8.1
+2026-10-09T20:59:17.1295055Z   Downloaded zerovec-derive v0.11.2
+2026-10-09T20:59:17.1319036Z   Downloaded thiserror v2.0.18
+2026-10-09T20:59:17.1394332Z   Downloaded yoke-derive v0.8.1
+2026-10-09T20:59:17.1411227Z   Downloaded time-macros v0.2.27
+2026-10-09T20:59:17.1446727Z   Downloaded zeroize v1.8.2
+2026-10-09T20:59:17.1461674Z   Downloaded zmij v1.0.21
+2026-10-09T20:59:17.1486149Z   Downloaded tracing-attributes v0.1.31
+2026-10-09T20:59:17.1517773Z   Downloaded yasna v0.6.0
+2026-10-09T20:59:17.1545011Z   Downloaded unicode-ident v1.0.24
+2026-10-09T20:59:17.1578126Z   Downloaded serde_core v1.0.228
+2026-10-09T20:59:17.1609433Z   Downloaded zerotrie v0.2.3
+2026-10-09T20:59:17.1650011Z   Downloaded typenum v1.19.0
+2026-10-09T20:59:17.1682292Z   Downloaded curve25519-dalek v5.0.0
+2026-10-09T20:59:17.1777488Z   Downloaded x509-parser v0.18.1
+2026-10-09T20:59:17.1838127Z   Downloaded zerovec v0.11.5
+2026-10-09T20:59:17.1894197Z   Downloaded serde v1.0.228
+2026-10-09T20:59:17.1930344Z   Downloaded serde_json v1.0.149
+2026-10-09T20:59:17.2005929Z   Downloaded rustls-webpki v0.103.15
+2026-10-09T20:59:17.2039994Z   Downloaded aws-lc-rs v1.18.1
+2026-10-09T20:59:17.2152135Z   Downloaded tracing-core v0.1.36
+2026-10-09T20:59:17.2181311Z   Downloaded time v0.3.47
+2026-10-09T20:59:17.2335973Z   Downloaded syn v2.0.117
+2026-10-09T20:59:17.2469564Z   Downloaded tinyvec v1.11.0
+2026-10-09T20:59:17.2503009Z   Downloaded smallvec v1.15.1
+2026-10-09T20:59:17.2528713Z   Downloaded serde_derive v1.0.228
+2026-10-09T20:59:17.2563618Z   Downloaded idna v1.1.0
+2026-10-09T20:59:17.2607465Z   Downloaded icu_properties_data v2.0.1
+2026-10-09T20:59:17.2732612Z   Downloaded hkdf v0.13.0
+2026-10-09T20:59:17.2765551Z   Downloaded futures-util v0.3.32
+2026-10-09T20:59:17.2926138Z   Downloaded thiserror-impl v2.0.18
+2026-10-09T20:59:17.2944049Z   Downloaded rustls v0.23.45
+2026-10-09T20:59:17.3081447Z   Downloaded rustls-pki-types v1.14.0
+2026-10-09T20:59:17.3112316Z   Downloaded url v2.5.8
+2026-10-09T20:59:17.3143351Z   Downloaded sha2 v0.11.0
+2026-10-09T20:59:17.3191055Z   Downloaded tracing v0.1.44
+2026-10-09T20:59:17.3356409Z   Downloaded ed25519-dalek v3.0.0
+2026-10-09T20:59:17.3391641Z   Downloaded yasna v0.5.2
+2026-10-09T20:59:17.3413716Z   Downloaded writeable v0.6.2
+2026-10-09T20:59:17.3433870Z   Downloaded tinystr v0.8.2
+2026-10-09T20:59:17.3455747Z   Downloaded semver v1.0.27
+2026-10-09T20:59:17.3485349Z   Downloaded nom v7.1.3
+2026-10-09T20:59:17.3541064Z   Downloaded libc v0.2.183
+2026-10-09T20:59:17.3940290Z   Downloaded minimal-lexical v0.2.1
+2026-10-09T20:59:17.3996390Z   Downloaded itertools v0.14.0
+2026-10-09T20:59:17.4072446Z   Downloaded static_assertions v1.1.0
+2026-10-09T20:59:17.4086768Z   Downloaded num-bigint v0.4.6
+2026-10-09T20:59:17.4133801Z   Downloaded memchr v2.8.0
+2026-10-09T20:59:17.4189309Z   Downloaded icu_normalizer v2.0.1
+2026-10-09T20:59:17.4225499Z   Downloaded icu_collections v2.0.0
+2026-10-09T20:59:17.4310122Z   Downloaded synstructure v0.13.2
+2026-10-09T20:59:17.4330334Z   Downloaded shlex v1.3.0
+2026-10-09T20:59:17.4331050Z   Downloaded pin-project v1.1.11
+2026-10-09T20:59:17.4477105Z   Downloaded icu_normalizer_data v2.0.0
+2026-10-09T20:59:17.4491532Z   Downloaded icu_locale_core v2.1.1
+2026-10-09T20:59:17.4561605Z   Downloaded futures v0.3.32
+2026-10-09T20:59:17.4613326Z   Downloaded base64 v0.22.1
+2026-10-09T20:59:17.4654600Z   Downloaded num-traits v0.2.19
+2026-10-09T20:59:17.4683461Z   Downloaded litemap v0.8.1
+2026-10-09T20:59:17.4706669Z   Downloaded icu_properties v2.0.2
+2026-10-09T20:59:17.4729648Z   Downloaded utf8_iter v1.0.4
+2026-10-09T20:59:17.4741388Z   Downloaded slab v0.4.12
+2026-10-09T20:59:17.4756710Z   Downloaded libp2p-core v0.44.0
+2026-10-09T20:59:17.4792808Z   Downloaded getrandom v0.4.2
+2026-10-09T20:59:17.4832424Z   Downloaded getrandom v0.2.17
+2026-10-09T20:59:17.4863467Z   Downloaded digest v0.11.3
+2026-10-09T20:59:17.4888885Z   Downloaded parking_lot_core v0.9.12
+2026-10-09T20:59:17.4911553Z   Downloaded parking_lot v0.12.5
+2026-10-09T20:59:17.4938661Z   Downloaded once_cell v1.21.4
+2026-10-09T20:59:17.4969811Z   Downloaded multistream-select v0.14.0
+2026-10-09T20:59:17.4983447Z   Downloaded hybrid-array v0.4.10
+2026-10-09T20:59:17.5006339Z   Downloaded hmac v0.13.0
+2026-10-09T20:59:17.5028389Z   Downloaded pem v3.0.6
+2026-10-09T20:59:17.5044072Z   Downloaded oid-registry v0.8.1
+2026-10-09T20:59:17.5057832Z   Downloaded multihash v0.19.3
+2026-10-09T20:59:17.5078019Z   Downloaded multiaddr v0.19.0
+2026-10-09T20:59:17.5097748Z   Downloaded lock_api v0.4.14
+2026-10-09T20:59:17.5111549Z   Downloaded libp2p-identity v0.3.0
+2026-10-09T20:59:17.5135396Z   Downloaded ring v0.17.14
+2026-10-09T20:59:17.5581062Z   Downloaded icu_provider v2.1.1
+2026-10-09T20:59:17.5608177Z   Downloaded futures-executor v0.3.32
+2026-10-09T20:59:17.5623360Z   Downloaded futures-channel v0.3.32
+2026-10-09T20:59:17.5642846Z   Downloaded either v1.18.0
+2026-10-09T20:59:17.5659440Z   Downloaded autocfg v1.5.0
+2026-10-09T20:59:17.5678678Z   Downloaded displaydoc v0.2.5
+2026-10-09T20:59:17.5709217Z   Downloaded der-parser v10.0.0
+2026-10-09T20:59:17.5744906Z   Downloaded ctutils v0.4.2
+2026-10-09T20:59:17.5765201Z   Downloaded cmake v0.1.58
+2026-10-09T20:59:17.5779260Z   Downloaded pin-project-lite v0.2.17
+2026-10-09T20:59:17.5838418Z   Downloaded pin-project-internal v1.1.11
+2026-10-09T20:59:17.5854583Z   Downloaded num-integer v0.1.46
+2026-10-09T20:59:17.5871330Z   Downloaded jobserver v0.1.34
+2026-10-09T20:59:17.5892192Z   Downloaded itoa v1.0.18
+2026-10-09T20:59:17.5906673Z   Downloaded futures-rustls v0.26.0
+2026-10-09T20:59:17.5923943Z   Downloaded futures-core v0.3.32
+2026-10-09T20:59:17.5937293Z   Downloaded dunce v1.0.5
+2026-10-09T20:59:17.5946860Z   Downloaded deranged v0.5.8
+2026-10-09T20:59:17.5960744Z   Downloaded signature v3.0.0
+2026-10-09T20:59:17.5975029Z   Downloaded rw-stream-sink v0.5.0
+2026-10-09T20:59:17.5983347Z   Downloaded multibase v0.9.2
+2026-10-09T20:59:17.6001903Z   Downloaded base256emoji v1.0.2
+2026-10-09T20:59:17.6009017Z   Downloaded base-x v0.2.11
+2026-10-09T20:59:17.6024713Z   Downloaded time-core v0.1.8
+2026-10-09T20:59:17.6035624Z   Downloaded percent-encoding v2.3.2
+2026-10-09T20:59:17.6044836Z   Downloaded match-lookup v0.1.2
+2026-10-09T20:59:17.6051120Z   Downloaded num-conv v0.2.1
+2026-10-09T20:59:17.6059545Z   Downloaded futures-io v0.3.32
+2026-10-09T20:59:17.6069423Z   Downloaded scopeguard v1.2.0
+2026-10-09T20:59:17.6081885Z   Downloaded idna_adapter v1.2.1
+2026-10-09T20:59:17.6092206Z   Downloaded core2 v0.4.0
+2026-10-09T20:59:17.6111623Z   Downloaded const-oid v0.10.2
+2026-10-09T20:59:17.6135804Z   Downloaded potential_utf v0.1.4
+2026-10-09T20:59:17.6146108Z   Downloaded futures-sink v0.3.32
+2026-10-09T20:59:17.6155480Z   Downloaded form_urlencoded v1.2.2
+2026-10-09T20:59:17.6163673Z   Downloaded cpufeatures v0.3.1
+2026-10-09T20:59:17.6178305Z   Downloaded fs_extra v1.3.0
+2026-10-09T20:59:17.6195017Z   Downloaded const-str v0.4.3
+2026-10-09T20:59:17.6219911Z   Downloaded crypto-common v0.2.2
+2026-10-09T20:59:17.6231546Z   Downloaded prost-derive v0.14.3
+2026-10-09T20:59:17.6244883Z   Downloaded futures-macro v0.3.32
+2026-10-09T20:59:17.6255883Z   Downloaded find-msvc-tools v0.1.9
+2026-10-09T20:59:17.6272794Z   Downloaded data-encoding-macro v0.1.19
+2026-10-09T20:59:17.6280436Z   Downloaded asn1-rs v0.7.1
+2026-10-09T20:59:17.6350191Z   Downloaded prost v0.14.3
+2026-10-09T20:59:17.6367639Z   Downloaded lazy_static v1.5.0
+2026-10-09T20:59:17.6386372Z   Downloaded fnv v1.0.7
+2026-10-09T20:59:17.6395354Z   Downloaded curve25519-dalek-derive v0.1.1
+2026-10-09T20:59:17.6405755Z   Downloaded cc v1.2.58
+2026-10-09T20:59:17.6435479Z   Downloaded powerfmt v0.2.0
+2026-10-09T20:59:17.6446817Z   Downloaded bytes v1.12.1
+2026-10-09T20:59:17.6483917Z   Downloaded chacha20 v0.10.2
+2026-10-09T20:59:17.6511603Z   Downloaded cmov v0.5.4
+2026-10-09T20:59:17.6537084Z   Downloaded arrayref v0.3.9
+2026-10-09T20:59:17.6551608Z   Downloaded bs58 v0.5.1
+2026-10-09T20:59:17.6575855Z   Downloaded asn1-rs-derive v0.6.0
+2026-10-09T20:59:17.6586765Z   Downloaded asn1-rs-impl v0.2.0
+2026-10-09T20:59:17.6594487Z   Downloaded anyhow v1.0.102
+2026-10-09T20:59:17.6832532Z   Downloaded aws-lc-sys v0.45.0
+2026-10-09T20:59:18.3510066Z    Compiling proc-macro2 v1.0.106
+2026-10-09T20:59:18.3510825Z    Compiling quote v1.0.45
+2026-10-09T20:59:18.6283958Z    Compiling unicode-ident v1.0.24
+2026-10-09T20:59:18.6972092Z    Compiling libc v0.2.183
+2026-10-09T20:59:19.7794083Z    Compiling syn v2.0.117
+2026-10-09T20:59:20.5188469Z     Checking memchr v2.8.0
+2026-10-09T20:59:21.3688750Z    Compiling jobserver v0.1.34
+2026-10-09T20:59:22.0573820Z    Compiling find-msvc-tools v0.1.9
+2026-10-09T20:59:22.5281045Z    Compiling synstructure v0.13.2
+2026-10-09T20:59:26.2217943Z     Checking stable_deref_trait v1.2.1
+2026-10-09T20:59:26.2392464Z    Compiling shlex v1.3.0
+2026-10-09T20:59:26.4168630Z    Compiling cc v1.2.58
+2026-10-09T20:59:31.2647718Z     Checking cfg-if v1.0.4
+2026-10-09T20:59:31.2804728Z    Compiling typenum v1.19.0
+2026-10-09T20:59:32.1298152Z     Checking hybrid-array v0.4.10
+2026-10-09T20:59:32.4367317Z     Checking zeroize v1.8.2
+2026-10-09T20:59:33.0116780Z     Checking cmov v0.5.4
+2026-10-09T20:59:33.1009923Z     Checking ctutils v0.4.2
+2026-10-09T20:59:33.2025118Z     Checking block-buffer v0.12.1
+2026-10-09T20:59:33.2558376Z     Checking crypto-common v0.2.2
+2026-10-09T20:59:33.6566760Z    Compiling cmake v0.1.58
+2026-10-09T20:59:34.5567013Z     Checking const-oid v0.10.2
+2026-10-09T20:59:34.6198349Z    Compiling pkg-config v0.3.32
+2026-10-09T20:59:35.8862647Z    Compiling fs_extra v1.3.0
+2026-10-09T20:59:36.0897499Z     Checking smallvec v1.15.1
+2026-10-09T20:59:36.1701157Z     Checking litemap v0.8.1
+2026-10-09T20:59:36.2679986Z     Checking pin-project-lite v0.2.17
+2026-10-09T20:59:36.2908245Z    Compiling autocfg v1.5.0
+2026-10-09T20:59:37.2859789Z    Compiling thiserror v2.0.18
+2026-10-09T20:59:37.7092905Z     Checking writeable v0.6.2
+2026-10-09T20:59:37.7910516Z    Compiling dunce v1.0.5
+2026-10-09T20:59:37.8158289Z    Compiling aws-lc-sys v0.45.0
+2026-10-09T20:59:41.8260292Z    Compiling num-traits v0.2.19
+2026-10-09T20:59:41.8970290Z     Checking digest v0.11.3
+2026-10-09T20:59:41.9737319Z    Compiling num-conv v0.2.1
+2026-10-09T20:59:42.0372532Z    Compiling time-core v0.1.8
+2026-10-09T20:59:42.0984367Z    Compiling icu_normalizer_data v2.0.0
+2026-10-09T20:59:42.1647825Z     Checking cpufeatures v0.3.1
+2026-10-09T20:59:42.1832633Z     Checking itoa v1.0.18
+2026-10-09T20:59:42.2447816Z     Checking once_cell v1.21.4
+2026-10-09T20:59:42.3197393Z     Checking powerfmt v0.2.0
+2026-10-09T20:59:42.3822024Z    Compiling semver v1.0.27
+2026-10-09T20:59:42.7716292Z    Compiling displaydoc v0.2.5
+2026-10-09T20:59:42.8387519Z    Compiling zerofrom-derive v0.1.6
+2026-10-09T20:59:44.7840724Z    Compiling yoke-derive v0.8.1
+2026-10-09T20:59:49.7556083Z     Checking zerofrom v0.1.6
+2026-10-09T20:59:49.7974786Z    Compiling zerovec-derive v0.11.2
+2026-10-09T20:59:50.3070385Z     Checking yoke v0.8.1
+2026-10-09T20:59:50.3910731Z     Checking zerotrie v0.2.3
+2026-10-09T20:59:50.5956457Z    Compiling thiserror-impl v2.0.18
+2026-10-09T20:59:52.9588888Z     Checking zerovec v0.11.5
+2026-10-09T20:59:53.4830140Z     Checking tinystr v0.8.2
+2026-10-09T20:59:53.5650545Z     Checking icu_locale_core v2.1.1
+2026-10-09T20:59:54.0543959Z     Checking potential_utf v0.1.4
+2026-10-09T20:59:54.0946291Z    Compiling icu_properties_data v2.0.1
+2026-10-09T20:59:54.1649024Z     Checking icu_collections v2.0.0
+2026-10-09T20:59:54.3273467Z     Checking icu_provider v2.1.1
+2026-10-09T20:59:54.4998579Z    Compiling rustc_version v0.4.1
+2026-10-09T20:59:55.0343922Z     Checking deranged v0.5.8
+2026-10-09T20:59:55.6708452Z    Compiling time-macros v0.2.27
+2026-10-09T20:59:58.2190016Z     Checking futures-sink v0.3.32
+2026-10-09T20:59:58.2463543Z     Checking futures-io v0.3.32
+2026-10-09T20:59:58.2840590Z     Checking subtle v2.6.1
+2026-10-09T20:59:58.3338709Z     Checking futures-core v0.3.32
+2026-10-09T20:59:58.3723539Z    Compiling anyhow v1.0.102
+2026-10-09T20:59:58.7980256Z     Checking time v0.3.47
+2026-10-09T20:59:59.6209996Z     Checking futures-channel v0.3.32
+2026-10-09T21:00:00.0803352Z    Compiling curve25519-dalek v5.0.0
+2026-10-09T21:00:00.3185095Z    Compiling futures-macro v0.3.32
+2026-10-09T21:00:03.3874907Z     Checking rand_core v0.10.1
+2026-10-09T21:00:03.4367773Z     Checking minimal-lexical v0.2.1
+2026-10-09T21:00:03.5371183Z    Compiling either v1.18.0
+2026-10-09T21:00:03.6495387Z     Checking futures-task v0.3.32
+2026-10-09T21:00:03.7030665Z    Compiling serde_core v1.0.228
+2026-10-09T21:00:04.0525347Z    Compiling aws-lc-rs v1.18.1
+2026-10-09T21:00:04.3313965Z    Compiling getrandom v0.4.2
+2026-10-09T21:00:04.4903952Z     Checking slab v0.4.12
+2026-10-09T21:00:04.5538575Z     Checking futures-util v0.3.32
+2026-10-09T21:00:06.0633008Z    Compiling itertools v0.14.0
+2026-10-09T21:00:07.1617015Z     Checking nom v7.1.3
+2026-10-09T21:00:07.9874792Z     Checking icu_properties v2.0.2
+2026-10-09T21:00:08.6190208Z     Checking icu_normalizer v2.0.1
+2026-10-09T21:00:09.3040906Z    Compiling tracing-attributes v0.1.31
+2026-10-09T21:00:14.9254603Z    Compiling curve25519-dalek-derive v0.1.1
+2026-10-09T21:00:16.7121984Z     Checking tracing-core v0.1.36
+2026-10-09T21:00:16.8985655Z     Checking data-encoding v2.10.0
+2026-10-09T21:00:17.0542500Z     Checking signature v3.0.0
+2026-10-09T21:00:17.0835430Z     Checking unsigned-varint v0.8.0
+2026-10-09T21:00:17.1376634Z     Checking untrusted v0.9.0
+2026-10-09T21:00:17.1678480Z     Checking bytes v1.12.1
+2026-10-09T21:00:19.4860361Z    Compiling data-encoding-macro-internal v0.1.17
+2026-10-09T21:00:20.0510545Z     Checking ed25519 v3.0.0
+2026-10-09T21:00:20.0888656Z     Checking tracing v0.1.44
+2026-10-09T21:00:20.5905322Z    Compiling prost-derive v0.14.3
+2026-10-09T21:00:25.3995987Z     Checking idna_adapter v1.2.1
+2026-10-09T21:00:25.4363632Z     Checking rusticata-macros v4.1.0
+2026-10-09T21:00:26.7099615Z     Checking futures-executor v0.3.32
+2026-10-09T21:00:26.7794906Z     Checking chacha20 v0.10.2
+2026-10-09T21:00:26.8788056Z    Compiling asn1-rs-impl v0.2.0
+2026-10-09T21:00:27.3061704Z    Compiling match-lookup v0.1.2
+2026-10-09T21:00:28.4454339Z    Compiling asn1-rs-derive v0.6.0
+2026-10-09T21:00:31.1680332Z    Compiling pin-project-internal v1.1.11
+2026-10-09T21:00:36.5551702Z     Checking sha2 v0.11.0
+2026-10-09T21:00:36.9155769Z     Checking hmac v0.13.0
+2026-10-09T21:00:36.9721200Z     Checking rustls-pki-types v1.14.0
+2026-10-09T21:00:37.1398371Z     Checking core2 v0.4.0
+2026-10-09T21:00:37.2090181Z    Compiling serde v1.0.228
+2026-10-09T21:00:37.5460699Z     Checking const-str v0.4.3
+2026-10-09T21:00:37.7096459Z     Checking percent-encoding v2.3.2
+2026-10-09T21:00:37.7614260Z     Checking untrusted v0.7.1
+2026-10-09T21:00:37.7938144Z    Compiling parking_lot_core v0.9.12
+2026-10-09T21:00:37.9508300Z     Checking utf8_iter v1.0.4
+2026-10-09T21:00:37.9896066Z     Checking idna v1.1.0
+2026-10-09T21:00:38.1178871Z     Checking form_urlencoded v1.2.2
+2026-10-09T21:00:38.1615520Z     Checking base256emoji v1.0.2
+2026-10-09T21:00:38.2429767Z     Checking multihash v0.19.3
+2026-10-09T21:00:38.2887751Z     Checking hkdf v0.13.0
+2026-10-09T21:00:38.3228261Z     Checking ed25519-dalek v3.0.0
+2026-10-09T21:00:38.3866358Z     Checking pin-project v1.1.11
+2026-10-09T21:00:38.4069101Z     Checking asn1-rs v0.7.1
+2026-10-09T21:00:39.0237122Z     Checking rand v0.10.2
+2026-10-09T21:00:39.3115644Z     Checking futures v0.3.32
+2026-10-09T21:00:39.3307049Z     Checking prost v0.14.3
+2026-10-09T21:00:39.5030777Z     Checking data-encoding-macro v0.1.19
+2026-10-09T21:00:39.5201512Z     Checking num-integer v0.1.46
+2026-10-09T21:00:39.6389845Z    Compiling ring v0.17.14
+2026-10-09T21:00:40.3940183Z     Checking scopeguard v1.2.0
+2026-10-09T21:00:40.4155273Z    Compiling rustls v0.23.45
+2026-10-09T21:00:40.4718311Z    Compiling oid-registry v0.8.1
+2026-10-09T21:00:41.0191490Z     Checking base-x v0.2.11
+2026-10-09T21:00:41.0614079Z     Checking static_assertions v1.1.0
+2026-10-09T21:00:41.0790609Z     Checking bs58 v0.5.1
+2026-10-09T21:00:41.1492884Z     Checking libp2p-identity v0.3.0
+2026-10-09T21:00:41.2649899Z     Checking multibase v0.9.2
+2026-10-09T21:00:41.3488591Z     Checking lock_api v0.4.14
+2026-10-09T21:00:46.9020462Z     Checking num-bigint v0.4.6
+2026-10-09T21:00:47.7493262Z     Checking url v2.5.8
+2026-10-09T21:00:48.0669927Z     Checking getrandom v0.2.17
+2026-10-09T21:00:48.1175906Z     Checking arrayref v0.3.9
+2026-10-09T21:00:48.1337393Z     Checking base64 v0.22.1
+2026-10-09T21:00:48.2636227Z    Compiling zmij v1.0.21
+2026-10-09T21:00:48.5076859Z     Checking byteorder v1.5.0
+2026-10-09T21:00:48.6059999Z     Checking multiaddr v0.19.0
+2026-10-09T21:00:48.7919756Z     Checking pem v3.0.6
+2026-10-09T21:00:49.5679080Z     Checking parking_lot v0.12.5
+2026-10-09T21:00:49.6517510Z     Checking der-parser v10.0.0
+2026-10-09T21:00:50.0008998Z     Checking rw-stream-sink v0.5.0
+2026-10-09T21:00:50.0322644Z     Checking multistream-select v0.14.0
+2026-10-09T21:00:50.1964581Z     Checking yasna v0.5.2
+2026-10-09T21:00:50.4400617Z     Checking lazy_static v1.5.0
+2026-10-09T21:00:50.4615723Z    Compiling serde_json v1.0.149
+2026-10-09T21:00:50.5295531Z     Checking fnv v1.0.7
+2026-10-09T21:00:50.6412602Z     Checking web-time v1.1.0
+2026-10-09T21:00:50.6599801Z     Checking futures-timer v3.0.3
+2026-10-09T21:00:50.7327914Z     Checking libp2p-core v0.44.0
+2026-10-09T21:00:51.1150566Z     Checking x509-parser v0.18.1
+2026-10-09T21:00:51.6488009Z     Checking rcgen v0.13.2
+2026-10-09T21:00:52.0081237Z     Checking yasna v0.6.0
+2026-10-09T21:00:57.6756743Z     Checking rustls-webpki v0.103.15
+2026-10-09T21:00:59.5547327Z     Checking futures-rustls v0.26.0
+2026-10-09T21:00:59.6454533Z     Checking libp2p-tls v0.7.0 (/home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/generated/libp2p-tls)
+2026-10-09T21:00:59.8078732Z     Checking tn-quic-handshake-profile v0.1.0 (/home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake)
+2026-10-09T21:00:59.9699992Z     Finished `dev` profile [unoptimized + debuginfo] target(s) in 1m 43s
+2026-10-09T21:01:00.0161043Z ##[group]Run cargo +1.94 build --release --locked --manifest-path testing/quic-handshake/Cargo.toml
+2026-10-09T21:01:00.0161823Z [36;1mcargo +1.94 build --release --locked --manifest-path testing/quic-handshake/Cargo.toml[0m
+2026-10-09T21:01:00.0227475Z shell: /usr/bin/bash -e {0}
+2026-10-09T21:01:00.0227795Z env:
+2026-10-09T21:01:00.0228020Z   CARGO_BUILD_JOBS: 2
+2026-10-09T21:01:00.0228556Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T21:01:00.0229180Z ##[endgroup]
+2026-10-09T21:01:00.1781591Z    Compiling proc-macro2 v1.0.106
+2026-10-09T21:01:00.1782608Z    Compiling quote v1.0.45
+2026-10-09T21:01:00.2616717Z    Compiling unicode-ident v1.0.24
+2026-10-09T21:01:00.3111574Z    Compiling libc v0.2.183
+2026-10-09T21:01:00.4738252Z    Compiling memchr v2.8.0
+2026-10-09T21:01:00.8691782Z    Compiling syn v2.0.117
+2026-10-09T21:01:01.9188252Z    Compiling jobserver v0.1.34
+2026-10-09T21:01:02.0927363Z    Compiling shlex v1.3.0
+2026-10-09T21:01:02.1665466Z    Compiling find-msvc-tools v0.1.9
+2026-10-09T21:01:02.2698365Z    Compiling stable_deref_trait v1.2.1
+2026-10-09T21:01:02.2888623Z    Compiling cc v1.2.58
+2026-10-09T21:01:03.2530394Z    Compiling synstructure v0.13.2
+2026-10-09T21:01:03.5789654Z    Compiling typenum v1.19.0
+2026-10-09T21:01:03.6961269Z    Compiling cfg-if v1.0.4
+2026-10-09T21:01:04.2226045Z    Compiling hybrid-array v0.4.10
+2026-10-09T21:01:04.2727913Z    Compiling zerofrom-derive v0.1.6
+2026-10-09T21:01:04.5623391Z    Compiling displaydoc v0.2.5
+2026-10-09T21:01:04.9225794Z    Compiling yoke-derive v0.8.1
+2026-10-09T21:01:04.9682720Z    Compiling zerofrom v0.1.6
+2026-10-09T21:01:05.0185710Z    Compiling zerovec-derive v0.11.2
+2026-10-09T21:01:05.4949939Z    Compiling yoke v0.8.1
+2026-10-09T21:01:05.6203126Z    Compiling zeroize v1.8.2
+2026-10-09T21:01:05.6756527Z    Compiling zerovec v0.11.5
+2026-10-09T21:01:06.2749784Z    Compiling cmov v0.5.4
+2026-10-09T21:01:06.3912057Z    Compiling ctutils v0.4.2
+2026-10-09T21:01:06.3934479Z    Compiling tinystr v0.8.2
+2026-10-09T21:01:06.4992680Z    Compiling crypto-common v0.2.2
+2026-10-09T21:01:06.5229938Z    Compiling block-buffer v0.12.1
+2026-10-09T21:01:06.6016900Z    Compiling cmake v0.1.58
+2026-10-09T21:01:06.7954422Z    Compiling pin-project-lite v0.2.17
+2026-10-09T21:01:06.8201924Z    Compiling smallvec v1.15.1
+2026-10-09T21:01:06.9410669Z    Compiling dunce v1.0.5
+2026-10-09T21:01:06.9649998Z    Compiling thiserror v2.0.18
+2026-10-09T21:01:07.0823414Z    Compiling writeable v0.6.2
+2026-10-09T21:01:07.3966236Z    Compiling autocfg v1.5.0
+2026-10-09T21:01:07.4567081Z    Compiling pkg-config v0.3.32
+2026-10-09T21:01:07.5986297Z    Compiling const-oid v0.10.2
+2026-10-09T21:01:07.7435120Z    Compiling litemap v0.8.1
+2026-10-09T21:01:07.7556931Z    Compiling fs_extra v1.3.0
+2026-10-09T21:01:07.8764989Z    Compiling icu_locale_core v2.1.1
+2026-10-09T21:01:07.8981195Z    Compiling aws-lc-sys v0.45.0
+2026-10-09T21:01:08.5967109Z    Compiling digest v0.11.3
+2026-10-09T21:01:08.6881974Z    Compiling num-traits v0.2.19
+2026-10-09T21:01:08.7660594Z    Compiling potential_utf v0.1.4
+2026-10-09T21:01:08.8312240Z    Compiling zerotrie v0.2.3
+2026-10-09T21:01:10.1867340Z    Compiling thiserror-impl v2.0.18
+2026-10-09T21:01:10.9180699Z    Compiling semver v1.0.27
+2026-10-09T21:01:11.0719793Z    Compiling icu_normalizer_data v2.0.0
+2026-10-09T21:01:11.1204813Z    Compiling cpufeatures v0.3.1
+2026-10-09T21:01:11.1396817Z    Compiling time-core v0.1.8
+2026-10-09T21:01:11.1964717Z    Compiling powerfmt v0.2.0
+2026-10-09T21:01:11.3190598Z    Compiling itoa v1.0.18
+2026-10-09T21:01:11.4375257Z    Compiling num-conv v0.2.1
+2026-10-09T21:01:11.4950635Z    Compiling once_cell v1.21.4
+2026-10-09T21:01:11.6095340Z    Compiling icu_properties_data v2.0.1
+2026-10-09T21:01:11.6628476Z    Compiling time-macros v0.2.27
+2026-10-09T21:01:11.7375659Z    Compiling deranged v0.5.8
+2026-10-09T21:01:12.3238987Z    Compiling rustc_version v0.4.1
+2026-10-09T21:01:12.4891076Z    Compiling icu_provider v2.1.1
+2026-10-09T21:01:12.5681015Z    Compiling icu_collections v2.0.0
+2026-10-09T21:01:13.2520779Z    Compiling futures-core v0.3.32
+2026-10-09T21:01:13.3628206Z    Compiling futures-io v0.3.32
+2026-10-09T21:01:13.4387764Z    Compiling subtle v2.6.1
+2026-10-09T21:01:13.5592303Z    Compiling futures-sink v0.3.32
+2026-10-09T21:01:13.5927714Z    Compiling anyhow v1.0.102
+2026-10-09T21:01:13.7234147Z    Compiling futures-channel v0.3.32
+2026-10-09T21:01:13.8463839Z    Compiling time v0.3.47
+2026-10-09T21:01:16.6475172Z    Compiling curve25519-dalek v5.0.0
+2026-10-09T21:01:16.7989795Z    Compiling futures-macro v0.3.32
+2026-10-09T21:01:17.1754699Z    Compiling serde_core v1.0.228
+2026-10-09T21:01:17.2730311Z    Compiling rand_core v0.10.1
+2026-10-09T21:01:17.3342986Z    Compiling getrandom v0.4.2
+2026-10-09T21:01:17.3971433Z    Compiling slab v0.4.12
+2026-10-09T21:01:17.4805303Z    Compiling futures-task v0.3.32
+2026-10-09T21:01:17.5437147Z    Compiling either v1.18.0
+2026-10-09T21:01:17.6502954Z    Compiling minimal-lexical v0.2.1
+2026-10-09T21:01:17.8148181Z    Compiling aws-lc-rs v1.18.1
+2026-10-09T21:01:17.8999042Z    Compiling nom v7.1.3
+2026-10-09T21:01:19.1810648Z    Compiling itertools v0.14.0
+2026-10-09T21:01:20.1190572Z    Compiling futures-util v0.3.32
+2026-10-09T21:01:22.1733819Z    Compiling icu_properties v2.0.2
+2026-10-09T21:01:23.2850603Z    Compiling icu_normalizer v2.0.1
+2026-10-09T21:01:24.3700181Z    Compiling tracing-core v0.1.36
+2026-10-09T21:01:25.0520255Z    Compiling curve25519-dalek-derive v0.1.1
+2026-10-09T21:01:25.3261309Z    Compiling tracing-attributes v0.1.31
+2026-10-09T21:01:26.0627231Z    Compiling untrusted v0.9.0
+2026-10-09T21:01:26.1030422Z    Compiling bytes v1.12.1
+2026-10-09T21:01:26.7169651Z    Compiling signature v3.0.0
+2026-10-09T21:01:26.7525214Z    Compiling unsigned-varint v0.8.0
+2026-10-09T21:01:26.8354148Z    Compiling data-encoding v2.10.0
+2026-10-09T21:01:29.2398920Z    Compiling data-encoding-macro-internal v0.1.17
+2026-10-09T21:01:29.4020141Z    Compiling ed25519 v3.0.0
+2026-10-09T21:01:29.4886973Z    Compiling tracing v0.1.44
+2026-10-09T21:01:31.7808554Z    Compiling prost-derive v0.14.3
+2026-10-09T21:01:32.6704750Z    Compiling idna_adapter v1.2.1
+2026-10-09T21:01:34.4039512Z    Compiling futures-executor v0.3.32
+2026-10-09T21:01:35.5466889Z    Compiling rusticata-macros v4.1.0
+2026-10-09T21:01:35.6617327Z    Compiling chacha20 v0.10.2
+2026-10-09T21:01:35.8177497Z    Compiling sha2 v0.11.0
+2026-10-09T21:01:37.1801352Z    Compiling hmac v0.13.0
+2026-10-09T21:01:37.2533862Z    Compiling rustls-pki-types v1.14.0
+2026-10-09T21:01:37.8203428Z    Compiling pin-project-internal v1.1.11
+2026-10-09T21:01:38.4188822Z    Compiling match-lookup v0.1.2
+2026-10-09T21:01:38.5523101Z    Compiling asn1-rs-impl v0.2.0
+2026-10-09T21:01:38.6799084Z    Compiling asn1-rs-derive v0.6.0
+2026-10-09T21:01:39.0468434Z    Compiling core2 v0.4.0
+2026-10-09T21:01:39.1556918Z    Compiling untrusted v0.7.1
+2026-10-09T21:01:39.1941087Z    Compiling parking_lot_core v0.9.12
+2026-10-09T21:01:39.2594665Z    Compiling const-str v0.4.3
+2026-10-09T21:01:39.6224172Z    Compiling percent-encoding v2.3.2
+2026-10-09T21:01:39.7535286Z    Compiling serde v1.0.228
+2026-10-09T21:01:39.8469280Z    Compiling utf8_iter v1.0.4
+2026-10-09T21:01:39.9092489Z    Compiling idna v1.1.0
+2026-10-09T21:01:41.5917371Z    Compiling form_urlencoded v1.2.2
+2026-10-09T21:01:41.7200502Z    Compiling base256emoji v1.0.2
+2026-10-09T21:01:41.8192480Z    Compiling multihash v0.19.3
+2026-10-09T21:01:41.8848159Z    Compiling asn1-rs v0.7.1
+2026-10-09T21:01:44.2949993Z    Compiling pin-project v1.1.11
+2026-10-09T21:01:44.3163837Z    Compiling hkdf v0.13.0
+2026-10-09T21:01:44.3599284Z    Compiling ed25519-dalek v3.0.0
+2026-10-09T21:01:44.6030455Z    Compiling rand v0.10.2
+2026-10-09T21:01:45.1360027Z    Compiling futures v0.3.32
+2026-10-09T21:01:45.1599720Z    Compiling prost v0.14.3
+2026-10-09T21:01:45.5047282Z    Compiling data-encoding-macro v0.1.19
+2026-10-09T21:01:45.5239284Z    Compiling num-integer v0.1.46
+2026-10-09T21:01:45.8368614Z    Compiling ring v0.17.14
+2026-10-09T21:01:46.0521973Z    Compiling scopeguard v1.2.0
+2026-10-09T21:01:46.0779185Z    Compiling rustls v0.23.45
+2026-10-09T21:01:46.1223736Z    Compiling base-x v0.2.11
+2026-10-09T21:01:46.1847259Z    Compiling oid-registry v0.8.1
+2026-10-09T21:01:46.3129232Z    Compiling bs58 v0.5.1
+2026-10-09T21:01:46.4310644Z    Compiling static_assertions v1.1.0
+2026-10-09T21:01:46.4506714Z    Compiling libp2p-identity v0.3.0
+2026-10-09T21:01:47.3888373Z    Compiling multibase v0.9.2
+2026-10-09T21:01:47.4945013Z    Compiling lock_api v0.4.14
+2026-10-09T21:01:55.5786227Z    Compiling num-bigint v0.4.6
+2026-10-09T21:01:58.5161765Z    Compiling url v2.5.8
+2026-10-09T21:02:00.7386807Z    Compiling getrandom v0.2.17
+2026-10-09T21:02:00.8347263Z    Compiling base64 v0.22.1
+2026-10-09T21:02:01.1280751Z    Compiling byteorder v1.5.0
+2026-10-09T21:02:01.2581646Z    Compiling zmij v1.0.21
+2026-10-09T21:02:01.3349104Z    Compiling arrayref v0.3.9
+2026-10-09T21:02:01.3527954Z    Compiling multiaddr v0.19.0
+2026-10-09T21:02:03.0231939Z    Compiling pem v3.0.6
+2026-10-09T21:02:06.7124922Z    Compiling parking_lot v0.12.5
+2026-10-09T21:02:07.3539609Z    Compiling der-parser v10.0.0
+2026-10-09T21:02:08.8186592Z    Compiling rw-stream-sink v0.5.0
+2026-10-09T21:02:08.8581442Z    Compiling multistream-select v0.14.0
+2026-10-09T21:02:09.2463488Z    Compiling yasna v0.5.2
+2026-10-09T21:02:10.4139709Z    Compiling web-time v1.1.0
+2026-10-09T21:02:10.4367394Z    Compiling serde_json v1.0.149
+2026-10-09T21:02:10.4886093Z    Compiling lazy_static v1.5.0
+2026-10-09T21:02:10.5129692Z    Compiling fnv v1.0.7
+2026-10-09T21:02:10.5395341Z    Compiling futures-timer v3.0.3
+2026-10-09T21:02:11.0445114Z    Compiling libp2p-core v0.44.0
+2026-10-09T21:02:12.5287796Z    Compiling x509-parser v0.18.1
+2026-10-09T21:02:17.6955401Z    Compiling rcgen v0.13.2
+2026-10-09T21:02:22.5634146Z    Compiling yasna v0.6.0
+2026-10-09T21:02:30.7930068Z    Compiling rustls-webpki v0.103.15
+2026-10-09T21:02:34.5590944Z    Compiling futures-rustls v0.26.0
+2026-10-09T21:02:34.6860890Z    Compiling libp2p-tls v0.7.0 (/home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/generated/libp2p-tls)
+2026-10-09T21:02:41.5456467Z    Compiling tn-quic-handshake-profile v0.1.0 (/home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake)
+2026-10-09T21:02:42.5716693Z     Finished `release` profile [optimized] target(s) in 1m 42s
+2026-10-09T21:02:42.5868272Z ##[group]Run python3 -P testing/quic-handshake/run.py --samples 50 --output testing/quic-handshake/results/ci
+2026-10-09T21:02:42.5869137Z [36;1mpython3 -P testing/quic-handshake/run.py --samples 50 --output testing/quic-handshake/results/ci[0m
+2026-10-09T21:02:42.5932311Z shell: /usr/bin/bash -e {0}
+2026-10-09T21:02:42.5932581Z env:
+2026-10-09T21:02:42.5932784Z   CARGO_BUILD_JOBS: 2
+2026-10-09T21:02:42.5933263Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T21:02:42.5933824Z ##[endgroup]
+2026-10-09T21:02:42.8870033Z default: 50 verified samples
+2026-10-09T21:02:42.9775403Z reverse-server: 50 verified samples
+2026-10-09T21:02:43.0863969Z reverse-client: 50 verified samples
+2026-10-09T21:02:43.1729451Z x25519: 50 verified samples
+2026-10-09T21:02:43.2662758Z p256: 50 verified samples
+2026-10-09T21:02:43.3716172Z p384: 50 verified samples
+2026-10-09T21:02:43.4600713Z hybrid: 50 verified samples
+2026-10-09T21:02:43.5178924Z reconnect: 50 verified samples
+2026-10-09T21:02:43.5582869Z incompatible: 50 verified samples
+2026-10-09T21:02:43.6140700Z wrong-peer: 50 verified samples
+2026-10-09T21:02:43.6565812Z kx-x25519: 50 verified samples
+2026-10-09T21:02:43.7015910Z kx-p256: 50 verified samples
+2026-10-09T21:02:43.7625538Z kx-p384: 50 verified samples
+2026-10-09T21:02:43.8075204Z kx-hybrid: 50 verified samples
+2026-10-09T21:02:43.8083937Z /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/results/ci/report.json
+2026-10-09T21:02:43.8240077Z ##[group]Run actions/upload-artifact@v4
+2026-10-09T21:02:43.8240404Z with:
+2026-10-09T21:02:43.8240613Z   name: quic-handshake-profile
+2026-10-09T21:02:43.8240887Z   path: testing/quic-handshake/results/ci
+2026-10-09T21:02:43.8241170Z   if-no-files-found: warn
+2026-10-09T21:02:43.8241405Z   compression-level: 6
+2026-10-09T21:02:43.8241618Z   overwrite: false
+2026-10-09T21:02:43.8241836Z   include-hidden-files: false
+2026-10-09T21:02:43.8242064Z env:
+2026-10-09T21:02:43.8242242Z   CARGO_BUILD_JOBS: 2
+2026-10-09T21:02:43.8242670Z   CARGO_TARGET_DIR: /home/runner/work/telcoin-network/telcoin-network/testing/quic-handshake/target
+2026-10-09T21:02:43.8243129Z ##[endgroup]
+2026-10-09T21:02:43.9899898Z (node:12100) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-10-09T21:02:43.9901221Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-10-09T21:02:43.9979263Z With the provided path, there will be 15 files uploaded
+2026-10-09T21:02:43.9984564Z Artifact name is valid!
+2026-10-09T21:02:43.9985176Z Root directory input is valid!
+2026-10-09T21:02:44.2557059Z Beginning upload of artifact content to blob storage
+2026-10-09T21:02:44.2961510Z (node:12100) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-10-09T21:02:44.4405242Z Uploaded bytes 23790
+2026-10-09T21:02:44.4782793Z Finished uploading artifact content to blob storage!
+2026-10-09T21:02:44.4784010Z SHA256 digest of uploaded artifact zip is 70a4f96919c6aaff2508c5100092c61442e2a077aa55f65d7a027dbc30218e88
+2026-10-09T21:02:44.4785058Z Finalizing artifact upload
+2026-10-09T21:02:44.6892347Z Artifact quic-handshake-profile.zip successfully finalized. Artifact ID 11645521069
+2026-10-09T21:02:44.6893417Z Artifact quic-handshake-profile has been successfully uploaded! Final size is 23790 bytes. Artifact ID is 11645521069
+2026-10-09T21:02:44.6900641Z Artifact download URL: https://github.com/Telcoin-Association/telcoin-network/actions/runs/37990580614/artifacts/11645521069
+2026-10-09T21:02:44.7117253Z Post job cleanup.
+2026-10-09T21:02:44.7952525Z [command]/usr/bin/git version
+2026-10-09T21:02:44.7991480Z git version 2.55.0
+2026-10-09T21:02:44.8031520Z Temporarily overriding HOME='/home/runner/work/_temp/7771801f-2b74-4412-bccb-bc2f689fb114' before making global git config changes
+2026-10-09T21:02:44.8033072Z Adding repository directory to the temporary git global config as a safe directory
+2026-10-09T21:02:44.8037711Z [command]/usr/bin/git config --global --add safe.directory /home/runner/work/telcoin-network/telcoin-network
+2026-10-09T21:02:44.8075236Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-10-09T21:02:44.8108813Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-10-09T21:02:44.8338665Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-10-09T21:02:44.8365171Z http.https://github.com/.extraheader
+2026-10-09T21:02:44.8376063Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-10-09T21:02:44.8410584Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-10-09T21:02:44.8634236Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-10-09T21:02:44.8667169Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-10-09T21:02:44.9028282Z Cleaning up orphan processes
+2026-10-09T21:02:44.9390426Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/upload-artifact@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
