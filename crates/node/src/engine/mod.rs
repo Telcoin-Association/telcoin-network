@@ -314,15 +314,19 @@ impl ExecutionNode {
 
     /// Stop RPC listeners for initialized workers outside the current committee.
     ///
-    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    /// Hand pending and parked transactions to worker 0, including late in-flight admissions.
+    /// Retain empty pools for reactivation. Normal destination validation and capacity apply.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
-        self.internal
-            .write()
-            .await
-            .workers
-            .iter_mut()
-            .skip(active_workers)
-            .for_each(WorkerComponents::deactivate);
+        use futures::StreamExt as _;
+        let mut guard = self.internal.write().await;
+        let destination =
+            guard.workers.first().filter(|_| active_workers > 0).map(WorkerComponents::pool);
+        futures::future::OptionFuture::from(destination.map(|destination| async move {
+            futures::stream::iter(guard.workers.iter_mut().skip(active_workers))
+                .for_each(|worker| worker.deactivate(&destination))
+                .await;
+        }))
+        .await;
     }
 
     /// Refresh an initialized worker's fee and reopen its RPC listeners if stopped.
