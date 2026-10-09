@@ -3000,8 +3000,8 @@ async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> ey
 /// names execution block 1, which this node has not reached (the fixture stops at block 0). The
 /// execution wait would suspend on that block until the vote timeout fired and end the request as
 /// a `Timeout`, which carries no penalty (see `test_vote_inner_timeout`). The drift tier is decided
-/// first instead: the answer is `InvalidTimestamp` with its severe penalty. The paused clock moves
-/// only while every task waits, so a call that never waits takes no virtual time.
+/// first instead: the answer is `InvalidTimestamp` without scoring its author. The paused clock
+/// moves only while every task waits, so a call that never waits takes no virtual time.
 #[tokio::test(start_paused = true)]
 async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::Result<()> {
     pin_subsecond_fork(true);
@@ -3042,8 +3042,8 @@ async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::
     assert_eq!(waited, Duration::ZERO, "the voter must not wait for the header's execution block");
     assert_matches!(
         Option::<Penalty>::from(&err),
-        Some(Penalty::Severe),
-        "a header beyond the vote window must cost the author a severe penalty"
+        None,
+        "clock skew must reject the header without scoring its author"
     );
 
     Ok(())
