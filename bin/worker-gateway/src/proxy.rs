@@ -116,8 +116,10 @@ pub(crate) async fn proxy(
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
-    // and time it; the guard releases both on every return path below.
-    let _in_flight = telemetry::RequestInFlight::enter();
+    // and time it. The guard releases both on every return path below, except
+    // a relayed response: its body takes the guard and releases it once it has
+    // finished streaming to the client (or is dropped).
+    let in_flight = telemetry::RequestInFlight::enter();
 
     let body = match body {
         Ok(body) => body,
@@ -196,7 +198,7 @@ pub(crate) async fn proxy(
         Ok(upstream) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
-            relay(upstream, route, upstream_url)
+            relay(upstream, route, upstream_url, in_flight)
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -320,8 +322,14 @@ fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
 /// status, body, and content type.
 ///
 /// The body streams through an [`UpstreamBody`], so a failure after the head
-/// has gone out is still logged and counted against `route`.
-fn relay(upstream: reqwest::Response, route: Route, upstream_url: Url) -> Response {
+/// has gone out is still logged and counted against `route`, and `in_flight`
+/// keeps the request in the in-flight gauge until the body has streamed.
+fn relay(
+    upstream: reqwest::Response,
+    route: Route,
+    upstream_url: Url,
+    in_flight: telemetry::RequestInFlight,
+) -> Response {
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
 
@@ -335,7 +343,8 @@ fn relay(upstream: reqwest::Response, route: Route, upstream_url: Url) -> Respon
     // the body and the poll-driven timeout never fires. That side is bounded
     // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
     // connection-lifetime cap (see [`crate::server::accept_loop`]).
-    let body = UpstreamBody { inner: upstream.bytes_stream(), route, upstream_url };
+    let body =
+        UpstreamBody { inner: upstream.bytes_stream(), route, upstream_url, _in_flight: in_flight };
     let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     if let Some(content_type) = upstream_content_type {
@@ -360,6 +369,10 @@ struct UpstreamBody<S> {
     route: Route,
     /// The upstream the body comes from, only ever logged by origin.
     upstream_url: Url,
+    /// Holds the request in the in-flight gauge and its duration timer until
+    /// the body has finished streaming, or is dropped because the client went
+    /// away or the connection closed.
+    _in_flight: telemetry::RequestInFlight,
 }
 
 impl<S> Stream for UpstreamBody<S>

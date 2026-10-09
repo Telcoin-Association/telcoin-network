@@ -34,8 +34,12 @@
 use std::time::Instant;
 
 use metrics::{counter, gauge, histogram};
+use url::Url;
 
-/// Concurrent in-flight proxied requests. This is the intended
+use crate::proxy::UpstreamOrigin;
+
+/// Concurrent in-flight proxied requests, a relayed response counting until
+/// its body has finished streaming. This is the intended
 /// horizontal-autoscaling signal: unlike CPU it tracks queueing and latency
 /// pressure directly, so it still climbs while a slow upstream leaves the
 /// gateway's own CPU idle.
@@ -49,12 +53,14 @@ const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 /// `GatewayError` reason label).
 const REJECTIONS_TOTAL: &str = "tn_worker_gateway_rejections_total";
 
-/// End-to-end proxied-request duration, in seconds. The `_seconds` suffix picks
-/// up the recorder's latency histogram buckets.
+/// End-to-end proxied-request duration, in seconds, until the response body has
+/// finished streaming. The `_seconds` suffix picks up the recorder's latency
+/// histogram buckets.
 const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_seconds";
 
 /// Per-worker upstream readiness as last seen by the poller (`1` ready, `0`
-/// not-ready), labelled by `worker_id`.
+/// not-ready), labelled by `worker_id` and `upstream` (the RPC URL's origin),
+/// so two nodes whose workers share an id keep separate series.
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
 
 /// Forward attempts by `route` (`worker` or `query`) and `result`
@@ -69,10 +75,12 @@ const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
 /// RAII guard covering one proxied request.
 ///
 /// Entering bumps the in-flight gauge and starts the duration timer; dropping
-/// releases the gauge and records the elapsed duration. Because the guard is
-/// held by value for the whole handler, every exit path is covered by one
-/// decrement, including a mid-flight cancel when the request-timeout layer
-/// aborts the handler future (the guard is dropped as the future unwinds).
+/// releases the gauge and records the elapsed duration. The handler holds the
+/// guard by value and, for a relayed response, hands it to the response body,
+/// so the gauge and the duration cover the body streaming to the client too.
+/// Every exit path is covered by one decrement, including a mid-flight cancel
+/// when the request-timeout layer aborts the handler future (the guard is
+/// dropped as the future unwinds) and a body dropped before its end.
 pub(crate) struct RequestInFlight {
     /// When the request entered the proxy handler.
     start: Instant,
@@ -127,9 +135,15 @@ pub(crate) fn record_mixed_batch() {
     counter!(MIXED_BATCHES_TOTAL).increment(1);
 }
 
-/// Publish a worker's current readiness as a `0`/`1` gauge.
-pub(crate) fn set_upstream_ready(worker_id: u16, ready: bool) {
-    gauge!(UPSTREAM_READY, "worker_id" => worker_id.to_string()).set(if ready { 1.0 } else { 0.0 });
+/// Publish a worker's current readiness as a `0`/`1` gauge, keyed by its
+/// worker id and the origin of its `rpc_url`.
+pub(crate) fn set_upstream_ready(worker_id: u16, rpc_url: &Url, ready: bool) {
+    gauge!(
+        UPSTREAM_READY,
+        "worker_id" => worker_id.to_string(),
+        "upstream" => UpstreamOrigin(rpc_url).to_string()
+    )
+    .set(if ready { 1.0 } else { 0.0 });
 }
 
 /// Test support: capture the metrics the code under test records.
@@ -207,6 +221,17 @@ pub(crate) mod test_utils {
                 .collect();
             labels.sort();
             self.totals.get(&(name.to_string(), labels)).copied().unwrap_or_default()
+        }
+
+        /// Every recorded series of `name`, as sorted label sets with their
+        /// accumulated values.
+        pub(crate) fn series(&mut self, name: &str) -> Vec<(Vec<(String, String)>, f64)> {
+            self.accumulate();
+            self.totals
+                .iter()
+                .filter(|((series, _), _)| series == name)
+                .map(|((_, labels), value)| (labels.clone(), *value))
+                .collect()
         }
     }
 }

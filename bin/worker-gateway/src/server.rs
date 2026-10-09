@@ -1481,4 +1481,72 @@ mod tests {
         assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "body_failed")]), 1.0);
         assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "forwarded")]), 1.0);
     }
+
+    /// A relayed response stays in the in-flight gauge until its body has
+    /// finished streaming, not just until the handler returns its head.
+    #[tokio::test]
+    async fn inflight_gauge_drops_after_the_body_streams() {
+        let mut metrics = CapturedMetrics::install();
+        // a mock that sends the head and a first chunk, then holds the rest of
+        // the body until released
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&release);
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let held = Arc::clone(&held);
+                async move {
+                    let head = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                            br#"{"jsonrpc":"2.0","#,
+                        ))
+                    });
+                    let tail = futures::stream::once(async move {
+                        held.notified().await;
+                        Ok(axum::body::Bytes::from_static(br#""result":"0x1","id":1}"#))
+                    });
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        axum::body::Body::from_stream(futures::StreamExt::chain(head, tail)),
+                    )
+                }
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let mut response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.chunk().await.expect("chunk").expect("first chunk").to_vec();
+
+        // the handler has long returned the head, but the body still streams
+        let inflight = "tn_worker_gateway_inflight_requests";
+        let duration = "tn_worker_gateway_request_duration_seconds";
+        assert_eq!(metrics.value(inflight, &[]), 1.0);
+        assert_eq!(metrics.value(duration, &[]), 0.0, "no duration before the body ends");
+
+        release.notify_one();
+        while let Some(chunk) = response.chunk().await.expect("chunk") {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, br#"{"jsonrpc":"2.0","result":"0x1","id":1}"#);
+        // the gateway drops the body after its last frame; allow for the
+        // client reading the end first
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(inflight, &[]) > 0.5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the in-flight gauge drops once the body has streamed");
+        assert_eq!(metrics.value(inflight, &[]), 0.0);
+        assert_eq!(metrics.value(duration, &[]), 1.0, "one duration sample, at the body's end");
+    }
 }

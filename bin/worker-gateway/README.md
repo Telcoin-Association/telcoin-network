@@ -359,11 +359,11 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight; the intended autoscaling signal. |
+| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight, a relayed response counting until its body has finished streaming; the intended autoscaling signal. |
 | `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream answered an error status without a JSON body. |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
-| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
-| `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
+| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency, up to the end of the response body. |
+| `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker readiness as last polled (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 

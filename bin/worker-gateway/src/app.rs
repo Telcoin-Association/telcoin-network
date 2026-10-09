@@ -110,9 +110,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         .await?;
         // Seed each worker's readiness gauge so the series exists (at 0) before
         // the first poll cycle publishes a real value.
-        upstreams
-            .iter()
-            .for_each(|upstream| crate::telemetry::set_upstream_ready(upstream.worker_id, false));
+        upstreams.iter().for_each(|upstream| {
+            crate::telemetry::set_upstream_ready(upstream.worker_id, &upstream.rpc_url, false)
+        });
         info!(target: "gateway", %bound, "metrics endpoint listening");
         Some(metrics_task_manager)
     } else {

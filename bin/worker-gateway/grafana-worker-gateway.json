@@ -87,7 +87,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Concurrent proxied requests in flight. This is the gauge the HorizontalPodAutoscaler targets."
+      "description": "Concurrent proxied requests in flight, a relayed response counting until its body has finished streaming. This is the gauge the HorizontalPodAutoscaler targets."
     },
     {
       "id": 4,
@@ -248,7 +248,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram."
+      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram, measured to the end of the response body."
     },
     {
       "id": 9,
@@ -284,7 +284,7 @@
           },
           "expr": "tn_worker_gateway_upstream_ready",
           "refId": "A",
-          "legendFormat": "worker {{worker_id}}"
+          "legendFormat": "worker {{worker_id}} @ {{upstream}}"
         }
       ],
       "fieldConfig": {
@@ -296,7 +296,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Per-worker upstream readiness (1 ready / 0 not ready). No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
+      "description": "Per-worker upstream readiness (1 ready / 0 not ready), one series per worker id and upstream RPC origin. No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
     },
     {
       "id": 11,
