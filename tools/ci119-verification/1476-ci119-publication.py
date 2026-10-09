@@ -97,8 +97,12 @@ def command(args, cwd, env, payload=None, timeout=600, limit=1024**2):
                         outputs[key.data].extend(chunk)
                         if len(outputs[key.data]) > limit:
                             raise ValueError("remote publication command output limit exceeded")
-        if process.wait(timeout=5) != 0:
-            raise RuntimeError("remote publication command failed: " + args[0])
+        status = process.wait(timeout=5)
+        if status != 0:
+            error = RuntimeError("remote publication command failed: " + args[0])
+            error.returncode = status
+            error.stderr = bytes(outputs["stderr"])
+            raise error
         return bytes(outputs["stdout"]).decode("utf-8")
     finally:
         if process.poll() is None:

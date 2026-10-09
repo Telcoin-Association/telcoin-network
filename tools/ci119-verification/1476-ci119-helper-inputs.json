@@ -3,11 +3,12 @@
   "changed_destination_set_relative_to_parent": [
     ".github/workflows/durable-e2e.yaml",
     "tools/ci119-verification/1476-ci119-full-verify.py",
-    "tools/ci119-verification/1476-ci119-helper-inputs.json"
+    "tools/ci119-verification/1476-ci119-helper-inputs.json",
+    "tools/ci119-verification/1476-ci119-publication.py"
   ],
   "execution_boundary": "Actual binary SHA map and all current archive proofs are generated only on the authenticated runner. No local pending map is a proof.",
   "helper_destination": "tools/ci119-verification/1476-ci119-helper-inputs.json",
-  "helper_parent": "baa8ab219e6b46302968adc13357e9f239b8738f",
+  "helper_parent": "ac54c8bc102d13fb5ce81538e09db52b16c53246",
   "pending_roles": [],
   "publication_branch": "evidence/hub-capacity-1476-37940162416",
   "publication_default": false,
@@ -135,8 +136,8 @@
     "publication": {
       "helper_destination": "tools/ci119-verification/1476-ci119-publication.py",
       "name": "1476-ci119-publication.py",
-      "sha256": "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664",
-      "source_path": "/private/tmp/1476-ci119-publication.source-ready.py"
+      "sha256": "2c479ee65b85feb3216d5913ed0e41b1defe4293a1fa6b6712c1d56286757b6f",
+      "source_path": "/private/tmp/1476-ci119-publication.diagnostics.source-ready.py"
     },
     "publication_tests": {
       "helper_destination": "tools/ci119-verification/1476-ci119-publication-test.py",
@@ -278,8 +279,8 @@
     "verification_entrypoint": {
       "helper_destination": "tools/ci119-verification/1476-ci119-full-verify.py",
       "name": "1476-ci119-full-verify.py",
-      "sha256": "bb6fbe61e3bb0c096b442871efe3424c518136d70494e84d6cb9285bf2ee902e",
-      "source_path": "/private/tmp/1476-ci119-full-verify.v3.source-ready.py"
+      "sha256": "b59169267c3867b6ede7de42e0c1f582c520616f439185afc607e3bde1f005b5",
+      "source_path": "/private/tmp/1476-ci119-full-verify.v5.source-ready.py"
     },
     "verification_tests": {
       "helper_destination": "tools/ci119-verification/1476-ci119-full-verify-test.py",

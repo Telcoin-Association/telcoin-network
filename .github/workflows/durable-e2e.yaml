@@ -98,9 +98,9 @@ jobs:
           import hashlib
           from pathlib import Path
           root = Path("tools/ci119-verification")
-          pins = {"1476-ci119-full-verify.py": "bb6fbe61e3bb0c096b442871efe3424c518136d70494e84d6cb9285bf2ee902e",
-                  "1476-ci119-publication.py": "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664",
-                  "1476-ci119-helper-inputs.json": "5d219ef618d162d8716be3351b64ba9c5d1232211674c50d64040fe4d5365f62"}
+          pins = {"1476-ci119-full-verify.py": "b59169267c3867b6ede7de42e0c1f582c520616f439185afc607e3bde1f005b5",
+                  "1476-ci119-publication.py": "2c479ee65b85feb3216d5913ed0e41b1defe4293a1fa6b6712c1d56286757b6f",
+                  "1476-ci119-helper-inputs.json": "f18445e0391ac217227dbbc0518d2729be615392122c4a9ddac877ce086d57c0"}
           for name, expected in pins.items():
               path = root / name
               if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -114,7 +114,7 @@ jobs:
         run: >-
           python3 -B -I tools/ci119-verification/1476-ci119-full-verify.py
           --manifest tools/ci119-verification/1476-ci119-helper-inputs.json
-          --manifest-sha256 5d219ef618d162d8716be3351b64ba9c5d1232211674c50d64040fe4d5365f62
+          --manifest-sha256 f18445e0391ac217227dbbc0518d2729be615392122c4a9ddac877ce086d57c0
           --source-checkout "$GITHUB_WORKSPACE/qualification-source"
       - name: Retain exact public bundle and bounded independent proof
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -212,7 +212,7 @@ jobs:
           import hashlib
           from pathlib import Path
           path = Path("tools/ci119-verification/1476-ci119-publication.py")
-          if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664":
+          if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != "2c479ee65b85feb3216d5913ed0e41b1defe4293a1fa6b6712c1d56286757b6f":
               raise SystemExit("reviewed publication guard hash mismatch")
           PY
           python3 -B -I tools/ci119-verification/1476-ci119-publication.py \

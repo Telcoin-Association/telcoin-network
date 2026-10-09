@@ -98,6 +98,38 @@ def write_json(path, value):
             raise OSError("short verification receipt write")
 
 
+def safe_child_diagnostic(role, error, env):
+    raw = getattr(error, "stderr", None)
+    if not isinstance(raw, bytes) or len(raw) > 1024**2:
+        return None
+    text = raw.decode("utf-8", "replace")
+    secrets = sorted({value for name, value in env.items() if isinstance(value, str) and value
+                      and re.search("TOKEN|SECRET|PASSWORD|CREDENTIAL|PRIVATE_KEY|AUTH", name, re.I)},
+                     key=len, reverse=True)
+    def redact(value):
+        for secret in secrets:
+            value = value.replace(secret, "[REDACTED]")
+        return value
+    text = redact(text)
+    text = re.sub(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:\x07|\x1b\\))", "", text)
+    text = re.sub(r"\x1b\][\s\S]*\Z", "", text)
+    text = redact("".join(character for character in text if character in "\n\t" or character.isprintable()))
+    def render(value, truncated):
+        return json.dumps({"child_failed": True, "reader": role, "exit_code": getattr(error, "returncode", None),
+                           "stderr": value, "stderr_truncated": truncated}, ensure_ascii=False, sort_keys=True)
+    complete = render(text, False)
+    if len(complete.encode("utf-8")) + 1 <= 8192:
+        return complete
+    low, high = 0, len(text)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(render(text[len(text) - middle:], True).encode("utf-8")) + 1 <= 8192:
+            low = middle
+        else:
+            high = middle - 1
+    return render(text[len(text) - low:], True)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path, required=True)
@@ -118,7 +150,14 @@ def main():
     work.mkdir()
     env = os.environ.copy()
     def run(role, *arguments):
-        return publication.command([sys.executable, "-B", "-I", str(paths[role]), *map(str, arguments)], root, env, timeout=2400)
+        try:
+            return publication.command([sys.executable, "-B", "-I", str(paths[role]), *map(str, arguments)], root, env, timeout=2400)
+        except RuntimeError as error:
+            if role == "full_verifier":
+                diagnostic = safe_child_diagnostic(role, error, env)
+                if diagnostic is not None:
+                    print(diagnostic, file=sys.stderr, flush=True)
+            raise
     quic_dir = work / "quic"
     quic_dir.mkdir()
     quic_api = work / "quic-api-inputs"
