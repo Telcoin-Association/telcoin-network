@@ -43,6 +43,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
+    identity::{identify, TrustedProxies},
     proxy::proxy,
     ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
@@ -118,14 +119,18 @@ struct ReadyBody {
 /// checked when the body is polled, which a slow-reading client can prevent;
 /// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
 ///
-/// When `rate_limiters` is present it is installed as the outermost layer, so
-/// an over-limit request is shed with a JSON-RPC `429` before its body is
-/// buffered or forwarded.
+/// When `rate_limiters` is present it is installed outside every other layer
+/// but one, so an over-limit request is shed with a JSON-RPC `429` before its
+/// body is buffered or forwarded. The one layer outside it is the identity
+/// middleware ([`identify`]), which resolves the client address the rate
+/// limiter keys on and the proxy forwards, believing `X-Forwarded-For` only
+/// from a peer in `trusted_proxies`.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
     max_request_bytes: usize,
     rate_limiters: Option<Arc<RateLimiters>>,
+    trusted_proxies: Arc<TrustedProxies>,
 ) -> Router {
     let router = Router::new()
         .route(HEALTH_PATH, get(liveness))
@@ -134,12 +139,15 @@ pub(crate) fn router(
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
         .layer(map_response(envelope_request_timeout));
-    // Add the rate-limit layer last so it runs first, ahead of the body read.
+    // Add the rate-limit layer after the body and deadline layers so it runs
+    // ahead of the body read.
     let router = match rate_limiters {
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
         None => router,
     };
-    router.with_state(state)
+    // Add the identity layer after the rate limiter so it runs before it: the
+    // limiter reads the client address this layer stores.
+    router.layer(from_fn_with_state(trusted_proxies, identify)).with_state(state)
 }
 
 /// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
@@ -178,6 +186,7 @@ pub(crate) async fn serve(
     state: AppState,
     limits: ServerLimits,
     rate_limiters: Option<Arc<RateLimiters>>,
+    trusted_proxies: Arc<TrustedProxies>,
     graceful_timeout: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
@@ -185,7 +194,13 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "worker gateway listening");
 
-    let app = router(state, limits.request_deadline, limits.max_request_bytes, rate_limiters);
+    let app = router(
+        state,
+        limits.request_deadline,
+        limits.max_request_bytes,
+        rate_limiters,
+        trusted_proxies,
+    );
     accept_loop(listener, app, limits, graceful_timeout, shutdown).await
 }
 
@@ -257,8 +272,8 @@ async fn accept_loop(
             debug!(target: "gateway::server", %err, "failed to set TCP_USER_TIMEOUT");
         }
 
-        // Hand handlers the real client address (`ConnectInfo`, consumed by the
-        // proxy's `X-Forwarded-For`).
+        // Hand the identity middleware the peer address (`ConnectInfo`), from
+        // which it resolves the client the rate limiter and the proxy use.
         let service =
             TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer_addr))));
         let connection =
@@ -408,7 +423,7 @@ mod tests {
     }
 
     fn test_router(state: AppState) -> Router {
-        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None)
+        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None, Arc::default())
     }
 
     fn nz(n: u32) -> NonZeroU32 {
@@ -617,7 +632,8 @@ mod tests {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         // A tiny configured body limit so a small request trips the size guard
         // through the real router path (`--max-request-bytes` is configurable).
-        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None)).await;
+        let (addr, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), 8, None, Arc::default())).await;
 
         let response = Client::new()
             .post(format!("http://{addr}/"))
@@ -648,8 +664,14 @@ mod tests {
             PrefixPolicy::default(),
         )
         .expect("limiters");
-        let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+        let (addr, _shutdown) = spawn(router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            Some(limiters),
+            Arc::default(),
+        ))
+        .await;
 
         let client = Client::new();
         let first = client
@@ -684,8 +706,14 @@ mod tests {
             PrefixPolicy::default(),
         )
         .expect("limiters");
-        let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+        let (addr, _shutdown) = spawn(router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            Some(limiters),
+            Arc::default(),
+        ))
+        .await;
 
         let client = Client::new();
         for _ in 0..5 {
@@ -720,7 +748,7 @@ mod tests {
         // Short whole-request deadline; generous header timeout so only the
         // body trickle trips.
         let (addr, _shutdown) = spawn_with_limits(
-            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None),
+            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None, Arc::default()),
             test_limits(),
         )
         .await;
@@ -1251,5 +1279,109 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A per-IP limit of one request with no burst headroom (no refill lands
+    /// inside a test), and no global limit.
+    fn one_request_per_ip() -> Option<Arc<RateLimiters>> {
+        RateLimiters::new(Some(RateLimit::new(nz(1), nz(1))), None, 16, PrefixPolicy::default())
+    }
+
+    /// The gateway router with `limiters`, trusting the proxies in `list`.
+    fn identity_router(state: AppState, limiters: Option<Arc<RateLimiters>>, list: &str) -> Router {
+        let trusted = Arc::new(list.parse::<TrustedProxies>().expect("trusted proxies"));
+        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, limiters, trusted)
+    }
+
+    /// POST a JSON-RPC call to the gateway carrying `headers`.
+    async fn post_with(gateway: SocketAddr, headers: &[(&str, &str)]) -> (StatusCode, String) {
+        let request = headers.iter().fold(
+            Client::new().post(format!("http://{gateway}/")).body(call("eth_chainId", 1)),
+            |request, (name, value)| request.header(*name, *value),
+        );
+        let response = request.send().await.expect("send");
+        (response.status(), response.text().await.expect("text"))
+    }
+
+    /// A mock upstream that answers every POST with the `X-Forwarded-For` and
+    /// `X-Forwarded-Proto` it received, joined by `|`.
+    async fn forwarding_echo() -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(|headers: HeaderMap| async move {
+                let get = |name: &str| {
+                    headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
+                };
+                format!("{}|{}", get("x-forwarded-for"), get("x-forwarded-proto"))
+            }),
+        );
+        spawn(mock).await
+    }
+
+    #[tokio::test]
+    async fn spoofed_x_forwarded_for_from_an_untrusted_peer_is_ignored() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // some proxies are trusted, but not the loopback peer the test connects from
+        let app = identity_router(state, one_request_per_ip(), "10.0.0.0/8, 2001:db8::/32");
+        let (gateway, _shutdown) = spawn(app).await;
+
+        let (status, _) = post_with(gateway, &[("x-forwarded-for", "198.51.100.1")]).await;
+        assert_eq!(status, StatusCode::OK);
+        // claiming another client from the same peer spends the same bucket
+        let (status, text) = post_with(gateway, &[("x-forwarded-for", "198.51.100.2")]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&text).0, -32006);
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn trusted_peer_requests_are_keyed_by_the_forwarded_client() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let app = identity_router(state, one_request_per_ip(), "127.0.0.1/32");
+        let (gateway, _shutdown) = spawn(app).await;
+
+        // two clients behind one trusted peer get a bucket each
+        for client in ["198.51.100.1", "198.51.100.2"] {
+            let (status, text) = post_with(gateway, &[("x-forwarded-for", client)]).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{client}");
+        }
+        // the bucket is the forwarded client's: its second request is limited,
+        // whatever the client wrote to the left of the trusted peer's entry
+        let chain = "203.0.113.9, 198.51.100.1";
+        let (status, _) = post_with(gateway, &[("x-forwarded-for", chain)]).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(worker_seen.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn untrusted_chain_is_replaced_toward_the_upstream() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(identity_router(state, None, "10.0.0.0/8")).await;
+
+        let spoofed = [("x-forwarded-for", "6.6.6.6, 7.7.7.7"), ("x-forwarded-proto", "https")];
+        let (status, text) = post_with(gateway, &spoofed).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "127.0.0.1|http"));
+    }
+
+    #[tokio::test]
+    async fn trusted_chain_is_extended_toward_the_upstream() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(identity_router(state, None, "127.0.0.1/32")).await;
+
+        // the resolved client, then the trusted peer that vouched for it
+        let forwarded = [("x-forwarded-for", "6.6.6.6, 7.7.7.7"), ("x-forwarded-proto", "https")];
+        let (status, text) = post_with(gateway, &forwarded).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "7.7.7.7, 127.0.0.1|https"));
+        // nothing forwarded: the peer alone
+        let (status, text) = post_with(gateway, &[]).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "127.0.0.1|http"));
     }
 }

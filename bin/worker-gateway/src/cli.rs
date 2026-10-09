@@ -13,6 +13,7 @@ use url::Url;
 
 use crate::{
     config::{GatewayConfig, UpstreamWorker},
+    identity::TrustedProxies,
     proxy::UpstreamOrigin,
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
@@ -160,9 +161,10 @@ pub(crate) struct Cli {
     pub(crate) max_request_bytes: usize,
 
     /// Sustained per-client-IP request rate, in requests per second (`0`
-    /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
-    /// run the gateway directly edge-facing, not behind an untrusted proxy that
-    /// hides it (see the README).
+    /// disables per-IP rate limiting). The client IP is the immediate TCP peer,
+    /// or, when that peer is in `--trusted-proxies`, the client it forwarded the
+    /// request for; behind a proxy that is not listed, every client shares the
+    /// proxy's bucket (see the README).
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP", default_value_t = 100)]
     pub(crate) rate_limit_per_ip: u32,
 
@@ -204,6 +206,20 @@ pub(crate) struct Cli {
     /// the sustained rate). Ignored when the global rate limit is disabled.
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST", default_value_t = 0)]
     pub(crate) rate_limit_global_burst: u32,
+
+    /// Comma-separated IPv4/IPv6 CIDR ranges of the proxies in front of the
+    /// gateway (a bare address is a single host). A request whose TCP peer is
+    /// inside one is attributed to the right-most `X-Forwarded-For` address that
+    /// is not itself in a listed range, and that proxy's `X-Forwarded-Proto` is
+    /// passed on; every other request is attributed to its peer, whatever
+    /// headers it carries. Unset (the default) trusts no proxy. List only the
+    /// proxies' own addresses: a range that also covers clients lets them choose
+    /// their own rate-limit key. Each listed proxy must append the address it
+    /// received the connection from to `X-Forwarded-For` (or replace the header
+    /// with it) and set `X-Forwarded-Proto` itself; one that passes a client's
+    /// headers through lets that client choose its own rate-limit key.
+    #[arg(long, env = "WORKER_GATEWAY_TRUSTED_PROXIES")]
+    pub(crate) trusted_proxies: Option<String>,
 
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
@@ -263,6 +279,9 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_prefix: PrefixPolicy,
     /// Gateway-wide rate limit, or `None` when disabled.
     pub(crate) rate_limit_global: Option<RateLimit>,
+    /// Proxies whose `X-Forwarded-For` identifies the client; empty when no
+    /// proxy is trusted.
+    pub(crate) trusted_proxies: TrustedProxies,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -312,6 +331,12 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        let trusted_proxies = self
+            .trusted_proxies
+            .as_deref()
+            .unwrap_or_default()
+            .parse::<TrustedProxies>()
+            .map_err(|err| eyre::eyre!("invalid --trusted-proxies: {err}"))?;
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -334,6 +359,7 @@ impl Cli {
                 self.rate_limit_global,
                 self.rate_limit_global_burst,
             ),
+            trusted_proxies,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -724,6 +750,40 @@ mod tests {
         assert!(v4.is_err(), "a /33 IPv4 prefix must fail startup, not be clamped");
         let v6 = cli_with_flags(&["--rate-limit-per-ip-v6-prefix=129"]).into_settings();
         assert!(v6.is_err(), "a /129 IPv6 prefix must fail startup, not be clamped");
+    }
+
+    #[test]
+    fn trusted_proxies_default_to_none_and_parse_a_list() -> eyre::Result<()> {
+        assert_eq!(cli_with_flags(&[]).into_settings()?.trusted_proxies, TrustedProxies::default());
+        let settings = cli_with_flags(&["--trusted-proxies=10.0.0.0/8, 192.0.2.7,2001:db8::/32"])
+            .into_settings()?;
+        assert_eq!(settings.trusted_proxies.len(), 3);
+        assert!(settings.trusted_proxies.contains("10.1.2.3".parse()?));
+        assert!(settings.trusted_proxies.contains("2001:db8::1".parse()?));
+        assert!(!settings.trusted_proxies.contains("192.0.2.8".parse()?));
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_cidr_is_rejected_at_startup() {
+        for list in [
+            "10.0.0.0/33",
+            "2001:db8::/129",
+            "10.0.0.0/",
+            "/8",
+            "not-an-ip",
+            "10.0.0.0/8,,192.0.2.0/24",
+            "10.0.0.0/8,",
+            // host bits below the prefix: a typo would otherwise widen trust
+            "10.0.0.1/8",
+        ] {
+            let flag = format!("--trusted-proxies={list}");
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("`{list}` must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("--trusted-proxies"), "{list}: {message}");
+        }
     }
 
     #[test]

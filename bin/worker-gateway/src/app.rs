@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     cli::Settings,
@@ -37,6 +37,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_per_ip,
         rate_limit_prefix,
         rate_limit_global,
+        trusted_proxies,
         graceful_shutdown_timeout,
         metrics_addr,
     } = settings;
@@ -61,9 +62,19 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         DEFAULT_MAX_PER_IP_ENTRIES,
         rate_limit_prefix,
     );
+    let trusted_proxies = Arc::new(trusted_proxies);
+    if trusted_proxies.has_catch_all() {
+        warn!(
+            target: "gateway",
+            "--trusted-proxies contains a /0 range: every client that can reach the gateway is \
+             a trusted proxy and may choose its own rate-limit key; list only the fronts' own \
+             addresses"
+        );
+    }
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
+        trusted_proxies = trusted_proxies.len(),
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
@@ -162,6 +173,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             state,
             limits,
             rate_limiters,
+            trusted_proxies,
             graceful_shutdown_timeout,
             shutdown.subscribe(),
         ),
