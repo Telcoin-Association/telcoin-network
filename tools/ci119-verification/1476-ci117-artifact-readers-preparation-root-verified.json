@@ -1,0 +1,554 @@
+{
+  "QUIC": {
+    "acquire": {
+      "complete_bytes_and_AST_equal_after_exact_binding_reversal": true,
+      "exact_diff": {
+        "bytes": 1253,
+        "path": "/private/tmp/1476-ci117-quic-acquire-v1.exact.diff",
+        "sha256": "c99cbf1e89543ce7c60128c6647ad3a9164f35e6d9190c792514a8188c689cab"
+      },
+      "predecessor": {
+        "bytes": 5477,
+        "path": "/private/tmp/1476-ci116-quic-acquire-v1.proposed.py",
+        "sha256": "b25b26b7c6056bc857b6dddbf22ebebe1c28945606b89b4294b1b7cc9b3135cf"
+      },
+      "proposal": {
+        "bytes": 5477,
+        "path": "/private/tmp/1476-ci117-quic-acquire-v1.proposed.py",
+        "sha256": "d8c56d142817ef79e42c6a00dd8a6823a6d0b5117c5ab4818f215cbfffff0de8"
+      }
+    },
+    "verify": {
+      "complete_bytes_and_AST_equal_after_exact_binding_reversal": true,
+      "exact_diff": {
+        "bytes": 9243,
+        "path": "/private/tmp/1476-ci117-quic-verify-v1.exact.diff",
+        "sha256": "d3a1499876c86b1ea37103735f4edc11a184b7808d0c875a43b6db1ed4a548b0"
+      },
+      "predecessor": {
+        "bytes": 32893,
+        "path": "/private/tmp/1476-ci116-quic-verify-v1.proposed.py",
+        "sha256": "34914e155393cc029f3aac002d8e9f2b486c75d1688256687e91b6e997e00df6"
+      },
+      "proposal": {
+        "bytes": 32937,
+        "path": "/private/tmp/1476-ci117-quic-verify-v1.proposed.py",
+        "sha256": "e093cb248db90d4f4aa18f1a80662947248e8628e3a44c5676d1a3a38d01c032"
+      }
+    }
+  },
+  "QUIC_ready_inputs": {
+    "archive_access_by_agent": false,
+    "assembly_capture": "/Users/oobi/Documents/gpt8/.kanon-exec/run-9L6FOD",
+    "metadata_entries": 12,
+    "official_GET_requests": 5,
+    "official_tree_bound_blobs": 52,
+    "root_archive_acquisition_reported_complete": true
+  },
+  "artifact": {
+    "digest": "sha256:357160de883b33cecff3679a519c31bcc2bec1c32b2c0885502bc255d2a09cca",
+    "id": 11602781547,
+    "job_id": 113722745593,
+    "name": "quic-handshake-profile",
+    "size_in_bytes": 23433
+  },
+  "binary": {
+    "accepted_CI116_runtime_reader": {
+      "bytes": 13423,
+      "path": "/private/tmp/1476-ci116-binary-verify-stream-v1.proposed.py",
+      "sha256": "b783da23fe6fd94ab8e68b82a50f48f355ac2b931e164242ca3fe9aa136e1bf4"
+    },
+    "accepted_runtime_anchor": {
+      "bytes": 13423,
+      "path": "/private/tmp/1476-ci110-binary-verify-stream-v1.proposed.py",
+      "sha256": "d44b2864445a1e6ba1b1952bb3bdc7c6467c0fe87b596aa54772d1c8de9b15b4"
+    },
+    "actual_producing_workflow_path": ".github/workflows/durable-e2e.yaml",
+    "adapted_probe_source_sha256": "31d3991251552206d3a60b82f00376126b0608437d0141380ec9b3cb72fd1367",
+    "archive_operations": false,
+    "archive_sha256": "b0c3681f9db559f607e297e60c0510e50124035e33d53a623ddf983679b17916",
+    "archive_size": 68540242,
+    "artifact_id": 11603426543,
+    "authenticated_hash_map": {
+      "bytes": 272,
+      "path": "/private/tmp/1476-ci117-binary-authenticated-sha256.json",
+      "sha256": "8bb9afdeab6740c424ef236e43590254d30d462f63ade44220bc5f3814fa5744"
+    },
+    "binary_execution": false,
+    "capacity_caller_snapshot": {
+      "bytes": 14626,
+      "path": "/private/tmp/1476-ci117-capacity-run-reader-snapshot.json",
+      "sha256": "eb9a01a2c622dea5125ed9bb03a12ff0901bef28fc21b68fc7d1cb4dade5f166"
+    },
+    "capacity_job_observation": "watcher reports Test capacity integration and cancellation in progress",
+    "capacity_qualified": false,
+    "complete_bytes_and_AST_equal_after_declared_binding_reversal": true,
+    "exact_diff": {
+      "bytes": 2581,
+      "path": "/private/tmp/1476-ci117-binary-verify-stream-v1.exact.diff",
+      "sha256": "f76bbd4b0e456f2058000b7ff68110e87c83bf3812023113339b9bf726783b2f"
+    },
+    "guard_deletions_rejected": 38,
+    "guard_semantic_changes": [],
+    "guard_true_replacements_rejected": 38,
+    "head_sha": "68fdb4b955a1ddcf8587c4df371489711d84e7aa",
+    "isolated_probe_result": {
+      "bytes": 1299,
+      "path": "/private/tmp/1476-ci117-binary-source-probe-result.json",
+      "sha256": "91b5f08c56e6580d180d24c592b75353ffcc11f369859b90630e2dc45d75bea6"
+    },
+    "isolated_probe_script": {
+      "bytes": 6452,
+      "path": "/private/tmp/1476-ci110-binary-source-probe.py",
+      "sha256": "44825bf75dea2dc86dc1f5116f1d84c0eb65df37ebe804e4353ead196483e1b8"
+    },
+    "nonmain_function_AST_equal_to_runtime_anchor": true,
+    "official_metadata": {
+      "bytes": 788,
+      "path": "/private/tmp/1476-ci117-capacity-artifact-11603426543-final.json",
+      "sha256": "4cdb785689c472ab966f65523dd177d0d930cd8e9719cf6810fdf1102f0eab95"
+    },
+    "predecessor": {
+      "bytes": 13423,
+      "path": "/private/tmp/1476-ci116-binary-verify-stream-v1.proposed.py",
+      "sha256": "b783da23fe6fd94ab8e68b82a50f48f355ac2b931e164242ca3fe9aa136e1bf4"
+    },
+    "predecessor_main_executed": false,
+    "probe_executed_in_memory_only": true,
+    "proposal": {
+      "bytes": 13429,
+      "path": "/private/tmp/1476-ci117-binary-verify-stream-v1.proposed.py",
+      "sha256": "74d2b57207a38662c0c162c7cdacf89db98fb1183736a24744eb437683cafb53"
+    },
+    "provenance_literal_updates": [
+      "proof_origin",
+      "packet_id"
+    ],
+    "reader_main_executed": false,
+    "reader_main_executed_by_root": true,
+    "reader_main_executed_by_this_agent": false,
+    "replacements": [
+      {
+        "after": "1476-ci117-",
+        "before": "1476-ci116-"
+      },
+      {
+        "after": "HEAD = \"68fdb4b955a1ddcf8587c4df371489711d84e7aa\"",
+        "before": "HEAD = \"750df5a0d6563693c16b0560a213d59259008921\""
+      },
+      {
+        "after": "RUN = 37900813837",
+        "before": "RUN = 37893912563"
+      },
+      {
+        "after": "ARTIFACT = 11603426543",
+        "before": "ARTIFACT = 11599857985"
+      },
+      {
+        "after": "ARCHIVE_BYTES = 68540242",
+        "before": "ARCHIVE_BYTES = 68529487"
+      },
+      {
+        "after": "ARCHIVE_SHA256 = \"b0c3681f9db559f607e297e60c0510e50124035e33d53a623ddf983679b17916\"",
+        "before": "ARCHIVE_SHA256 = \"bf4c222836eea7e4f476c6d64eae44a0d1fb5f5f407cbfb44afcdafb9a782e1d\""
+      },
+      {
+        "after": "METADATA_SHA256 = \"4cdb785689c472ab966f65523dd177d0d930cd8e9719cf6810fdf1102f0eab95\"",
+        "before": "METADATA_SHA256 = \"49f3ac8c6d385fae78e0b0546717fe47fac1f3d1a1fff62a11b6a93cea55c5f3\""
+      },
+      {
+        "after": "METADATA = Path(\"/private/tmp/1476-ci117-capacity-artifact-11603426543-final.json\")",
+        "before": "METADATA = Path(\"/private/tmp/1476-ci117-capacity-artifact-11599857985.json\")"
+      },
+      {
+        "after": "QUIC_RESULT_SHA256 = \"759c251d4f6480bc67278ee177de1195e07927faf0a7299cd0170d2a4ba9553a\"",
+        "before": "QUIC_RESULT_SHA256 = \"ade503cc9a37fe9f687a045a2a8c10d8b7dc441a8cf94454509322b236629b0b\""
+      },
+      {
+        "after": "TESTED_CHECKOUT = \"68fdb4b955a1ddcf8587c4df371489711d84e7aa\"",
+        "before": "TESTED_CHECKOUT = \"750df5a0d6563693c16b0560a213d59259008921\""
+      },
+      {
+        "after": "TESTED_TREE = \"3f40d2cb287d026a00c0d243d0691f42e54ff175\"",
+        "before": "TESTED_TREE = \"15e0d8a7d63dc1301f5cc61452dc137704d06505\""
+      },
+      {
+        "after": "\"proof_origin\": \"ci117-binary-verifier-derived-accepted-ci116\"",
+        "before": "\"proof_origin\": \"ci116-binary-verifier-derived-reviewed-ci115\""
+      },
+      {
+        "after": "\"packet_id\": \"bc8498992ca40618142d10da\"",
+        "before": "\"packet_id\": \"8c06881b7de3b563dcb241b9\""
+      }
+    ],
+    "retained_require_calls": 38,
+    "root_CI116_binary_proof": {
+      "bytes": 3890,
+      "path": "/private/tmp/1476-ci116-binary-verification-result.json",
+      "sha256": "a41bad75bc2a3ab66d2387087ff9b2da40e03daaafff2e76b25fa76013d9a97b"
+    },
+    "root_QUIC_result": {
+      "bytes": 26412,
+      "path": "/private/tmp/1476-ci117-quic-verification-result.json",
+      "sha256": "759c251d4f6480bc67278ee177de1195e07927faf0a7299cd0170d2a4ba9553a"
+    },
+    "root_capture": "run-kporXz",
+    "root_execution_command": [
+      "python3",
+      "/private/tmp/1476-ci117-binary-verify-stream-v1.proposed.py"
+    ],
+    "root_runtime_result": {
+      "bytes": 3896,
+      "path": "/private/tmp/1476-ci117-binary-verification-result.json",
+      "sha256": "3d0c21d7664a62961d118043bc4b80bd45b0823ecdd37f73101f8ae7c576a12c"
+    },
+    "run_id": 37900813837,
+    "source_check_capture": "run-ELoAHC",
+    "source_checks": {
+      "bytes": 5533,
+      "path": "/private/tmp/1476-ci117-binary-preparation-checks.json",
+      "sha256": "30782455f2d5d1f6591d5492fa9fc104abb095560cc4805e750f414f0e3dd71f"
+    },
+    "source_preparation_reader_main_executed": false,
+    "status": "root_actual_binary_verification_passed",
+    "synthetic_negatives_rejected": 26,
+    "synthetic_positives": 6,
+    "tree_sha": "3f40d2cb287d026a00c0d243d0691f42e54ff175",
+    "unchanged_manual_workflow_source_proof_path": ".github/workflows/hub-capacity-manual.yaml"
+  },
+  "capacity_qualified": false,
+  "capacity_run": 37900813837,
+  "captures": [
+    {
+      "manifest": {
+        "bytes": 2969,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-wD33A9/manifest.json",
+        "sha256": "a725a42c79e9becf0e139fb6f268dc9979cfb1a178c9ee83a5fbdc1d858b1935"
+      },
+      "phase": "source-pins"
+    },
+    {
+      "manifest": {
+        "bytes": 9043,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-wZ0loE/manifest.json",
+        "sha256": "4190fe1cb95e9babaceba0199d7acf37fb1afff32a8df0fe474d113d39be95e0"
+      },
+      "phase": "failed_preparer_pin_probe"
+    },
+    {
+      "manifest": {
+        "bytes": 9371,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-a9vnJr/manifest.json",
+        "sha256": "83127f678b20fe8a9da855aeab78864615c4574f72b20b0fc3b125ea601018bc"
+      },
+      "phase": "failed_historical_normalization_probe"
+    },
+    {
+      "manifest": {
+        "bytes": 10926,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-xdo3PD/manifest.json",
+        "sha256": "7daee355991a85a1ffcdb1c21a4820046b7706fe0cba30fe3a8c06ab2cf63ee0"
+      },
+      "phase": "QUIC_source_checks"
+    },
+    {
+      "manifest": {
+        "bytes": 3344,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-9L6FOD/manifest.json",
+        "sha256": "3633219208f348d2be3c8222c43d7f449cfcf2ad9f61e5f272eb2e497bd01e2d"
+      },
+      "phase": "official_metadata_assembly"
+    },
+    {
+      "manifest": {
+        "bytes": 3957,
+        "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-ELoAHC/manifest.json",
+        "sha256": "f03699a3998c2aa380485af0b6a00d085458f7ffa34c2c9c30b738fbb17366fe"
+      },
+      "phase": "binary_source_checks"
+    }
+  ],
+  "checks_capture": "run-xdo3PD",
+  "current_binary_runtime_result": "pass: root stream verification; no binary execution or extraction",
+  "current_capacity_result": "code-check job passed; both mutation shards active at parent observation; no candidate qualification PASS",
+  "current_staging_ref": "staging/mavenrain-2026-10-09",
+  "dispatch_finish": {
+    "capture": "/Users/oobi/Documents/gpt8/.kanon-exec/run-M2wb7Q",
+    "manifest": {
+      "bytes": 1060,
+      "path": "/Users/oobi/Documents/gpt8/.kanon-exec/run-M2wb7Q/manifest.json",
+      "sha256": "ee669d63ebe0a98f559a9cc29e8a1b8752005548eee711f1156e05aff8086a91"
+    },
+    "outcome": "pass",
+    "packet_id": "bc8498992ca40618142d10da",
+    "scope": "Source-only preparation complete; current binary runtime and live capacity outcomes remain separate.",
+    "thread_id": "/root/ci111_artifact_readers"
+  },
+  "final_source_preparation_status": "complete",
+  "guard_semantic_changes": [
+    "Strict direct source count and digest operands rebound from1 to4 observed paths.",
+    "Strict cumulative source count and digest operands rebound from44 to45 observed paths.",
+    "Exact staging ref name rebound from2026-10-08 to2026-10-09 with the same pinned b6805 base SHA."
+  ],
+  "head_sha": "68fdb4b955a1ddcf8587c4df371489711d84e7aa",
+  "input_assembly": {
+    "bytes": 7209,
+    "path": "/private/tmp/1476-ci117-quic-input-assembly.json",
+    "sha256": "f7573834e99ee34d3c6c05f8d149b819c696ccb5f9e3ed192b92afde39a0ea19"
+  },
+  "integration": {
+    "commit": "49877c35f6ab8ff61ea3d41c802f9487e62a3670",
+    "first_parent": "6bdf846ef83283251312da7a1a2f27c472db2b07",
+    "parents": [
+      "6bdf846ef83283251312da7a1a2f27c472db2b07",
+      "b6805f8a53d9b2f5fa0f48a789a3cbe513d7a5ad"
+    ],
+    "tree": "1092ca53d5938977df2abba2ab7248fb59f194cd",
+    "unchanged": true
+  },
+  "mutation_runtime_status": {
+    "expected_registry_cases": 75,
+    "parent_reported_status": "both active",
+    "runtime_proof": false,
+    "shard_count": 2,
+    "verified_current_cases": null,
+    "verified_current_logs": null
+  },
+  "mutation_v6": {
+    "path": "/private/tmp/1476-ci117-code-verify-mutations-v6.proposed.py",
+    "root_complete137_line_diff_review": "no findings",
+    "runtime_proof": false,
+    "sha256": "3db56893b738820c3480e007a4dcea434b4c89a9e1c61d8af0bc9bce54a54464"
+  },
+  "observed_operations": {
+    "Rust_Cargo_Docker": false,
+    "archive_download": false,
+    "archive_read": false,
+    "extraction": false,
+    "git_mutations": false,
+    "reader_main": false,
+    "repo_edits": false
+  },
+  "official_inputs": {
+    "artifacts": {
+      "bytes": 774,
+      "path": "/private/tmp/1476-ci117-handshake-artifacts-final.json",
+      "sha256": "89edc9b4466bc802cd564a74a63dfdbe4b4eab0554bac96e14f000829aaf86f3"
+    },
+    "jobs": {
+      "bytes": 2667,
+      "path": "/private/tmp/1476-ci117-handshake-jobs-final.json",
+      "sha256": "838763689fc164780d09c5fc9af76c17dab1f64e350bff6bbd71cd1e3fcdb3e1"
+    },
+    "metadata": {
+      "bytes": 742,
+      "path": "/private/tmp/1476-ci117-handshake-artifact-11602781547-final.json",
+      "sha256": "55945b0c93ff20e76ed9466a8f3bc61c11a6f89d3f676bd2230e411e6e2953ae"
+    },
+    "run": {
+      "bytes": 14435,
+      "path": "/private/tmp/1476-ci117-handshake-run-final.json",
+      "sha256": "9eabe7c58cc1808c62b26235aafcaf46acf545282b80a64daa8565a044ec1230"
+    },
+    "source": {
+      "bytes": 7594,
+      "path": "/private/tmp/1476-ci117-reader-source-pins.json",
+      "sha256": "d05b5da67e4edd26cfeb19ae1e122f1c1940c4d28cc881606108eb9864787795"
+    }
+  },
+  "packet_id": "bc8498992ca40618142d10da",
+  "parent_reported_code_job": {
+    "clippy_D_warnings": "PASS",
+    "job_id": 113722697388,
+    "provenance": "Parent reported current official code-job observation; this proof-sealing follow-up did not fetch or run tests.",
+    "python_seconds": 47.348,
+    "python_tests": 169,
+    "rust_seconds": 95.398,
+    "rust_tests_passed": 2725,
+    "rust_tests_skipped": 44,
+    "status": "PASS"
+  },
+  "preparation_complete_source_only": true,
+  "preparation_rework": [
+    {
+      "capture": "/Users/oobi/Documents/gpt8/.kanon-exec/run-a9vnJr",
+      "observed_exit_code": 1,
+      "probe": "direct CI116 normalization under CI117 HEAD",
+      "reason": "normalizer accepts only its pinned CI105 baseline or current HEAD, not third historical CI116 HEAD",
+      "recovery": "preserved embedded normalizer; prove CI116 guards by exact byte and AST binding reversal plus85-call equality. Reused retained candidate scripts only after exact byte equality"
+    },
+    {
+      "capture": "/Users/oobi/Documents/gpt8/.kanon-exec/run-wZ0loE",
+      "observed_exit_code": 1,
+      "probe": "prior preparer SHA assertion",
+      "reason": "transposed terminal hash digits in expected pin; assertion stopped before output writes",
+      "recovery": "recovered original outline pin and byte hash608864cc...f5282907, retained strict equality"
+    },
+    {
+      "observed_exit_code": 1,
+      "probe": "AST constant projection",
+      "reason": "literal_eval rejected Path call; no repository code executed",
+      "recovery": "literal-only extraction with AST unparse for nonliteral expressions"
+    },
+    {
+      "observed_exit_code": 2,
+      "probe": "prior file discovery with two glob patterns",
+      "reason": "patterns selected union and produced truncated overly broad list",
+      "recovery": "single exact CI116 pattern and maxdepth1; irrelevant truncated tail not reread"
+    }
+  ],
+  "prior_runtime_proofs": {
+    "QUIC": {
+      "bytes": 25804,
+      "path": "/private/tmp/1476-ci116-quic-verification-result.json",
+      "sha256": "ade503cc9a37fe9f687a045a2a8c10d8b7dc441a8cf94454509322b236629b0b"
+    },
+    "binary": {
+      "bytes": 3890,
+      "path": "/private/tmp/1476-ci116-binary-verification-result.json",
+      "sha256": "a41bad75bc2a3ab66d2387087ff9b2da40e03daaafff2e76b25fa76013d9a97b"
+    },
+    "preparation": {
+      "bytes": 18676,
+      "path": "/private/tmp/1476-ci116-artifact-readers-preparation.json",
+      "sha256": "89e98cce0047ca5893c85f58e67d4630377d9abcd5303760b9081b41e491de2e"
+    }
+  },
+  "proof_sealing_check_language": "Python checks validate Python reader result JSON bindings; no Rust behavioral tests added.",
+  "required_handshake_run": 37900832557,
+  "root_QUIC_runtime_proof": {
+    "bytes": 26412,
+    "capacity_qualified": false,
+    "capture": "run-TsOQYj",
+    "expanded_bytes": 184920,
+    "head_sha": "68fdb4b955a1ddcf8587c4df371489711d84e7aa",
+    "managed_job": "job-BePFHK",
+    "members": 15,
+    "path": "/private/tmp/1476-ci117-quic-verification-result.json",
+    "samples": 700,
+    "scenarios": 14,
+    "sha256": "759c251d4f6480bc67278ee177de1195e07927faf0a7299cd0170d2a4ba9553a",
+    "verifier_sha256": "e093cb248db90d4f4aa18f1a80662947248e8628e3a44c5676d1a3a38d01c032"
+  },
+  "root_binary_runtime_proof": {
+    "actual_producing_workflow_path": ".github/workflows/durable-e2e.yaml",
+    "agent_archive_access": false,
+    "agent_reader_main": false,
+    "archive_sha256": "b0c3681f9db559f607e297e60c0510e50124035e33d53a623ddf983679b17916",
+    "archive_size_bytes": 68540242,
+    "artifact_id": 11603426543,
+    "authenticated_hash_map": {
+      "bytes": 272,
+      "path": "/private/tmp/1476-ci117-binary-authenticated-sha256.json",
+      "sha256": "8bb9afdeab6740c424ef236e43590254d30d462f63ade44220bc5f3814fa5744"
+    },
+    "binary_count": 3,
+    "binding_report": {
+      "bytes": 1589,
+      "path": "/private/tmp/1476-ci117-root-binary-proof-binding.json",
+      "sha256": "921c12e133fa243dc131d2bfc0c42f6d5b755f1d86350b83c6747e7724047380"
+    },
+    "expanded_bytes": 232621121,
+    "head_sha": "68fdb4b955a1ddcf8587c4df371489711d84e7aa",
+    "map_exactly_equals_root_archive_report": true,
+    "members": 5,
+    "node_binary_sha256": "a3dbc92b06506b6b1d18704bb8fe407ce1f6b1ef7f7b80a6b7d5eedfbd910008",
+    "qualification_scored": false,
+    "result": {
+      "bytes": 3896,
+      "path": "/private/tmp/1476-ci117-binary-verification-result.json",
+      "sha256": "3d0c21d7664a62961d118043bc4b80bd45b0823ecdd37f73101f8ae7c576a12c"
+    },
+    "root_capture": "run-kporXz",
+    "root_disk_preflight_free_KiB": 46712764,
+    "root_full50_line_source_review": "no findings, parent reported",
+    "root_managed_job": "/private/tmp/1476-ci117-binary-verification/job-58JVNB",
+    "run_id": 37900813837,
+    "scope": "JSON byte hashes and identity/map equality checked here. Root performed the actual archive authentication and stream verification.",
+    "source_workflow_path": ".github/workflows/hub-capacity-manual.yaml",
+    "status": "root_binary_verification_pass_bound_by_agent_metadata_checks",
+    "tree_sha": "3f40d2cb287d026a00c0d243d0691f42e54ff175"
+  },
+  "root_execution": {
+    "acquisition_capture": "run-ajHefR",
+    "acquisition_receipt": {
+      "bytes": 929,
+      "path": "/private/tmp/1476-ci117-quic-evidence-v1/acquisition-attempt1.json",
+      "sha256": "95b019cf88b7bc88b2543a53929ef1da8c0a2c5fd724d960d0764b76f0b6626c"
+    },
+    "binary_commands": [],
+    "binary_status": "root_binary_verification_passed",
+    "binary_verification_capture": "run-kporXz",
+    "commands": [
+      [
+        "python3",
+        "/private/tmp/1476-ci117-quic-acquire-v1.proposed.py"
+      ],
+      [
+        "python3",
+        "/private/tmp/1476-ci117-quic-verify-v1.proposed.py"
+      ]
+    ],
+    "prerequisite": "Root reviews frozen exact diffs and completed metadata assembly, then rechecks unchanged30GiB floor.",
+    "remaining_commands": [],
+    "status": "root_QUIC_acquisition_and_verification_passed",
+    "verification_capture": "run-TsOQYj",
+    "verified_scenarios": true
+  },
+  "root_source_review": {
+    "acquisition_complete27_diff_lines": "no findings, parent report",
+    "binary_complete50_diff_lines": "no findings, parent reported",
+    "v6_complete137_diff_lines": "no findings, parent report",
+    "verifier_complete115_diff_lines": "no findings, parent report"
+  },
+  "source_list": {
+    "direct_count": 4,
+    "direct_paths": [
+      "crates/consensus/worker/src/network/ingress.rs",
+      "tools/hub-capacity/mutate-rust.py",
+      "tools/hub-capacity/test_mutate_rust.py",
+      "tools/hub-capacity/test_mutation_shards.py"
+    ],
+    "direct_sha256": "4202bc46a0bcdbd02070a8837a0f5eac30d7033a5ee0dcfc35f4b9d611f541ea",
+    "full_count": 45,
+    "full_sha256": "967c0e182195c7dc34c0a349dea3c95f855eb42a89fe0dd7cfb2d49fc9b19140"
+  },
+  "source_only_checks": {
+    "bytes": 9980,
+    "path": "/private/tmp/1476-ci117-quic-preparation-checks.json",
+    "sha256": "bd52c43666e0db738c7b67914c7761266070f384e7dee95928938ea5ade6778d"
+  },
+  "source_pins": {
+    "bytes": 7594,
+    "path": "/private/tmp/1476-ci117-reader-source-pins.json",
+    "sha256": "d05b5da67e4edd26cfeb19ae1e122f1c1940c4d28cc881606108eb9864787795"
+  },
+  "stable_QUIC_ready_snapshot": {
+    "path": "/private/tmp/1476-ci117-artifact-readers-preparation-quic-ready.json",
+    "sha256": "f2cd3cbb44351f7d26360d5c53d1a58cb7574eb13e647a2eb5986aa10babc9ba"
+  },
+  "stable_QUIC_verified_snapshot": {
+    "bytes": 10630,
+    "path": "/private/tmp/1476-ci117-artifact-readers-preparation-quic-verified.json",
+    "sha256": "d11cf3587bc39b710ef8f9e2277d64fb8c5cd1f05776b989289008e7e0e83746"
+  },
+  "stable_final_source_snapshot": {
+    "bytes": 19202,
+    "path": "/private/tmp/1476-ci117-artifact-readers-preparation-final-source.json",
+    "sha256": "7fb8be28a2988000813771e77938ca774302aa3296af313fe0e96a9f7528cbea"
+  },
+  "stable_preassembly_snapshot": {
+    "bytes": 7823,
+    "path": "/private/tmp/1476-ci117-artifact-readers-preparation-preassembly.json",
+    "sha256": "eaa3a8e25a394f5e8ba69c1e7576c8ff25d798ea3847aaf75f3095f5c2aa1e91"
+  },
+  "stable_source_ready_snapshot": {
+    "bytes": 16585,
+    "path": "/private/tmp/1476-ci117-artifact-readers-preparation-source-ready.json",
+    "sha256": "1107c42b9ae5d7b1145d9debaa37cbe022d626b9a7a24a277d55ab4d165822e6"
+  },
+  "staging_sha": "b6805f8a53d9b2f5fa0f48a789a3cbe513d7a5ad",
+  "status": "root_QUIC_and_binary_verified_capacity_mutations_active",
+  "tree_sha": "3f40d2cb287d026a00c0d243d0691f42e54ff175",
+  "version": 1
+}

@@ -1,4 +1,4 @@
-name: CI118 CPU interval diagnostics
+name: CI119 independent hub capacity verification
 
 "on":
   workflow_dispatch:
@@ -7,19 +7,26 @@ name: CI118 CPU interval diagnostics
         description: Exact reviewed helper commit SHA
         required: true
         type: string
+      publish:
+        description: Publish the independently qualified seven-file evidence branch
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   actions: read
   contents: read
 
 jobs:
-  diagnostic:
+  verify:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           github.repository == 'Telcoin-Association/telcoin-network' &&
           github.ref == 'refs/heads/work/1476-ci118-verification' }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 25
+    timeout-minutes: 60
+    outputs:
+      qualified: ${{ steps.verify.outputs.qualified }}
     env:
       EXPECTED_HELPER_SHA: ${{ inputs.helper_sha }}
       ACTUAL_REPOSITORY: ${{ github.repository }}
@@ -64,59 +71,150 @@ jobs:
                       failures.append(label + "_below_32_gib")
               except (KeyError, OSError):
                   failures.append(label + "_disk_probe_unavailable")
-          print(json.dumps({"diagnostic_only": True, "capacity_qualified": False,
+          print(json.dumps({"capacity_qualified": False,
                             "independently_rescored": False,
                             "helper_sha": expected_sha if re.fullmatch("[0-9a-f]{40}", expected_sha) else None,
                             "run_id": env["ACTUAL_RUN_ID"], "run_attempt": env["ACTUAL_RUN_ATTEMPT"],
                             "workflow_ref": env["ACTUAL_WORKFLOW_REF"], "filesystems": filesystems,
                             "preflight_passed": not failures, "failures": failures}, sort_keys=True))
           if failures:
-              raise SystemExit("diagnostic preflight failed: " + ",".join(failures))
+              raise SystemExit("verification preflight failed: " + ",".join(failures))
           PY
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ inputs.helper_sha }}
           persist-credentials: false
           fetch-depth: 1
-      - name: Verify reviewed public helper bytes and stage metadata
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ca02e454b4f2fa5f5e1a47db8e346fb1bec00666
+          path: qualification-source
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Authenticate reviewed entrypoint bytes
         shell: bash
         run: |
           python3 -B -I - <<'PY'
           import hashlib
-          import json
-          import os
           from pathlib import Path
-
-          root = Path(os.environ["GITHUB_WORKSPACE"]) / "tools/ci118-diagnostic"
-          pins = {
-              "1476-ci118-remote-diagnostic-acquire.py": "3f0a1c989ee521461626b3e844da6cfe4bc67efbf8661a48b6f8d2989bdf38e0",
-              "1476-ci118-remote-diagnostic-reader.py": "9407dcb7890ef678872486eda61ab6a16e0e2a65f8ae60e0ecfe58e34f9113ff",
-              "1476-ci118-cpu-reader.py": "a751aee10b5a490235f6c1369a89ed295c3b908c85770bea1cb6c07c690ad458",
-              "1476-ci118-cpu-test.py": "298d7adbc61558933d8f719b7e01d16a89c48f0aa932657c722c6f84b1212bc9",
-              "1476-ci118-remote-diagnostic-test.py": "7859166951654d6a1ad8725ab8d8def0579b43f9a4772a2c4fcc940a7cd41291",
-              "1476-ci118-remote-diagnostic-artifact-metadata.json": "ad1ae221ede54300de425b5a99e5fde495c25e6cc5ea0db3ea6c83cb838000ba",
-          }
+          root = Path("tools/ci119-verification")
+          pins = {"1476-ci119-full-verify.py": "e33a6225a46130adfaf96f8af4b8f30c7a6cc1168821f2a2556a46c6cd70d022",
+                  "1476-ci119-publication.py": "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664",
+                  "1476-ci119-helper-inputs.json": "9b433e33e3885123481d8a2bf0459a724cf6e404ea0074a4ecb1088f69e05567"}
           for name, expected in pins.items():
-              data = (root / name).read_bytes()
-              if hashlib.sha256(data).hexdigest() != expected:
-                  raise SystemExit("reviewed helper hash mismatch: " + name)
-          metadata = (root / "1476-ci118-remote-diagnostic-artifact-metadata.json").read_bytes()
-          destination = Path(os.environ["RUNNER_TEMP"]) / "1476-ci118-capacity-artifact-metadata.json"
-          with destination.open("xb") as output:
-              if output.write(metadata) != len(metadata):
-                  raise SystemExit("short metadata write")
-          print(json.dumps({"diagnostic_only": True, "capacity_qualified": False,
-                            "independently_rescored": False, "input_sha256": pins,
-                            "qualification_source_head": "4556f835e3d4a6f803afc941f4cfcd9cfd7faad1",
-                            "accepted_acquirer_source_sha256": "ade9e6a11d79e23873d20238fe104ce6bf4a7b5ebc61b01b518d3c3d8ef30d0c",
-                            "scorer_source_sha256": "41f8bd3a1611ae92446f9562a8430805611a5b7121961bccc014f2338f4cfb64",
-                            "collector_source_sha256": "773d5e3c9f47c704357ff1669077d02c477c7a13654e1d9a987ad9efa389a699"}, sort_keys=True))
+              path = root / name
+              if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+                  raise SystemExit("reviewed entrypoint hash mismatch: " + name)
           PY
-      - name: Acquire the exact official CI118 capacity artifact
+      - name: Independently authenticate and rescore fresh qualification
+        id: verify
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-remote-diagnostic-acquire.py
-      - name: Read CPU intervals and raw timing without extraction or qualification
+        run: >-
+          python3 -B -I tools/ci119-verification/1476-ci119-full-verify.py
+          --manifest tools/ci119-verification/1476-ci119-helper-inputs.json
+          --manifest-sha256 9b433e33e3885123481d8a2bf0459a724cf6e404ea0074a4ecb1088f69e05567
+          --source-checkout "$GITHUB_WORKSPACE/qualification-source"
+      - name: Retain exact public bundle and bounded independent proof
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ci119-qualified-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ci119/public-bundle
+            ${{ runner.temp }}/ci119/proof.json
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  publish:
+    needs: verify
+    if: >-
+      ${{ inputs.publish && needs.verify.result == 'success' &&
+          needs.verify.outputs.qualified == 'true' &&
+          github.event_name == 'workflow_dispatch' &&
+          github.repository == 'Telcoin-Association/telcoin-network' &&
+          github.ref == 'refs/heads/work/1476-ci118-verification' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    permissions:
+      actions: read
+      contents: write
+    env:
+      EXPECTED_HELPER_SHA: ${{ inputs.helper_sha }}
+      ACTUAL_REPOSITORY: ${{ github.repository }}
+      ACTUAL_REF: ${{ github.ref }}
+      ACTUAL_EVENT: ${{ github.event_name }}
+      ACTUAL_RUN_ID: ${{ github.run_id }}
+      ACTUAL_RUN_ATTEMPT: ${{ github.run_attempt }}
+      ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
+      ACTUAL_WORKFLOW_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Check exact helper identity and fresh runner disk space
         shell: bash
-        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-cpu-reader.py
+        run: |
+          python3 -B -I - <<'PY'
+          import json
+          import os
+          import platform
+          import re
+          import shutil
+
+          env = os.environ
+          failures = []
+          expected_sha = env["EXPECTED_HELPER_SHA"]
+          if (not re.fullmatch("[0-9a-f]{40}", expected_sha)
+              or env["ACTUAL_WORKFLOW_COMMIT"] != expected_sha
+              or env["ACTUAL_REPOSITORY"] != "Telcoin-Association/telcoin-network"
+              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci118-verification"
+              or env["ACTUAL_EVENT"] != "workflow_dispatch"
+              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci118-verification"):
+              failures.append("unexpected_helper_repository_ref_workflow_or_commit")
+          if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
+              failures.append("unsupported_runner_architecture")
+          filesystems = {}
+          for label, key in (("runner_temp", "RUNNER_TEMP"), ("workspace", "GITHUB_WORKSPACE")):
+              try:
+                  if not os.path.isabs(env[key]) or not os.path.isdir(env[key]):
+                      raise OSError("runner directory unavailable")
+                  usage = shutil.disk_usage(env[key])
+                  filesystems[label] = {"path": env[key], "free_bytes": usage.free,
+                                        "total_bytes": usage.total, "at_least_32_gib_free": usage.free >= 32 * 1024**3}
+                  if usage.free < 32 * 1024**3:
+                      failures.append(label + "_below_32_gib")
+              except (KeyError, OSError):
+                  failures.append(label + "_disk_probe_unavailable")
+          print(json.dumps({"capacity_qualified": False,
+                            "independently_rescored": False,
+                            "helper_sha": expected_sha if re.fullmatch("[0-9a-f]{40}", expected_sha) else None,
+                            "run_id": env["ACTUAL_RUN_ID"], "run_attempt": env["ACTUAL_RUN_ATTEMPT"],
+                            "workflow_ref": env["ACTUAL_WORKFLOW_REF"], "filesystems": filesystems,
+                            "preflight_passed": not failures, "failures": failures}, sort_keys=True))
+          if failures:
+              raise SystemExit("verification preflight failed: " + ",".join(failures))
+          PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.helper_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Download this attempt's independently qualified public bundle
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ci119-qualified-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ci119-publication-input
+      - name: Authenticate publication guard and publish orphan evidence branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -B -I - <<'PY'
+          import hashlib
+          from pathlib import Path
+          path = Path("tools/ci119-verification/1476-ci119-publication.py")
+          if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664":
+              raise SystemExit("reviewed publication guard hash mismatch")
+          PY
+          python3 -B -I tools/ci119-verification/1476-ci119-publication.py \
+            --bundle "$RUNNER_TEMP/ci119-publication-input/public-bundle" \
+            --proof "$RUNNER_TEMP/ci119-publication-input/proof.json"

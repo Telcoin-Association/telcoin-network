@@ -1,0 +1,254 @@
+{
+  "actual_executor_thread": "/root/ci96_prefix_review_recovery",
+  "all_report_summaries_match_raw": true,
+  "all_zip_members_crc_paths_types_valid": true,
+  "artifact_id": 11547354300,
+  "capacity_qualified": false,
+  "capture_attempts": {
+    "actual_argv": [
+      "python3",
+      "-B",
+      "-I",
+      "/private/tmp/1476-ci105-quic-acquire-v1.proposed.py"
+    ],
+    "archive_acquisition_count": 1,
+    "artifact_id": 11547354300,
+    "command_capture": {
+      "command_exit_code": 0,
+      "manifest": {
+        "bytes": 737,
+        "path": "/Users/oobi/Documents/gpt8/telcoin-network-1476/.kanon-exec/run-THDRoe/manifest.json",
+        "sha256": "9728c6694b4d7249b0b4716e419fc0f9221f6b1d75dc1b44c9d5cdcace8d2e0a"
+      },
+      "path": "/Users/oobi/Documents/gpt8/telcoin-network-1476/.kanon-exec/run-THDRoe",
+      "stdout": {
+        "bytes": 223,
+        "path": "/Users/oobi/Documents/gpt8/telcoin-network-1476/.kanon-exec/run-THDRoe/command-0001.stdout",
+        "sha256": "335e113b50cf785a3f43d9c9b6d7adfd34d6960d7c7b3c73409fee4bfbc20e4f"
+      }
+    },
+    "outer_argv": [
+      "kanon-wait",
+      "run",
+      "--",
+      "kanon-exec",
+      "run",
+      "--budget",
+      "4000",
+      "--",
+      "python3",
+      "-B",
+      "-I",
+      "/private/tmp/1476-ci105-quic-acquire-v1.proposed.py"
+    ],
+    "packet_id": "052c781ae19c89a28df3ad61",
+    "prior_metadata_log_attempt": {
+      "exit_code": 1,
+      "path": "/Users/oobi/Documents/gpt8/telcoin-network-1476/.kanon-exec/run-ZZd2t3",
+      "reason": "gh api refused terminal escape sequences; no log stdout and no archive transfer"
+    },
+    "receipt": {
+      "bytes": 929,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/acquisition-attempt1.json",
+      "sha256": "3a8adc9e9f9f1cc2e31481e63fb06c2f7b533c11002a639832134a2d369def79"
+    },
+    "retained_zip": {
+      "bytes": 23533,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/artifact.zip",
+      "sha256": "1d8ec0912a37e1301c61c5401b08bb431303b6d0e8d67bc2b4e6a3ccf10e213e"
+    },
+    "retries_of_archive_acquisition": 0,
+    "schema": 1,
+    "successful_metadata_log_capture": {
+      "bytes": 48237,
+      "exit_code": 0,
+      "path": "/Users/oobi/Documents/gpt8/telcoin-network-1476/.kanon-exec/run-3ORfxG"
+    }
+  },
+  "current_check_calls": 82,
+  "evidence": {
+    "artifact-metadata.json": {
+      "bytes": 742,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/artifact-metadata.json",
+      "sha256": "af0e4103b7e28e7b3100979ba58f8cd9609d7531eb274ad4c1d9e95a25687ca4"
+    },
+    "artifact.zip": {
+      "bytes": 23533,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/artifact.zip",
+      "sha256": "1d8ec0912a37e1301c61c5401b08bb431303b6d0e8d67bc2b4e6a3ccf10e213e"
+    },
+    "artifacts-list.json": {
+      "bytes": 774,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/artifacts-list.json",
+      "sha256": "27f85333630b9ea934710c12907febe7cab11700c13a5b5eb53d3b735d51c2ee"
+    },
+    "capture-attempts.json": {
+      "bytes": 1914,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/capture-attempts.json",
+      "sha256": "0ba8e7f96596a7e2441bdad2934f209f351fb2be047c7383a82b5acbd368fd18"
+    },
+    "job.json": {
+      "bytes": 2640,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/job.json",
+      "sha256": "7d12e5a356a446a9e22a05566b6fd015c888589ed2393c2263a84d026875e62c"
+    },
+    "job.log": {
+      "bytes": 48237,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/job.log",
+      "sha256": "f9db8ed2e732daa350e448f408535434c37a0305dec44b2360dd68712c14b1ab"
+    },
+    "jobs.json": {
+      "bytes": 2667,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/jobs.json",
+      "sha256": "1caa54c3610f8d5a4387f31d13bae07eb0b6afd0b1b4a04f598f8c458a1395d9"
+    },
+    "merge-recursive-tree.json": {
+      "bytes": 293819,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/merge-recursive-tree.json",
+      "sha256": "b6338ee9e6c4b71589b963ef81de8f5565ed53df713004c185ed866af94cef77"
+    },
+    "merge-rest-commit.json": {
+      "bytes": 948568,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/merge-rest-commit.json",
+      "sha256": "88eef0e5ef2e87a0d312bb257aa17364d24618668cf953a4ad51b9324b7cd372"
+    },
+    "pr.json": {
+      "bytes": 34243,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/pr.json",
+      "sha256": "af7733dcde989942c50d541a012bdf60106be75f454113249668d007a346b686"
+    },
+    "run.json": {
+      "bytes": 14473,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/run.json",
+      "sha256": "e0cd41ea0842cc02da6c101df0e35d5a1a40109564e41603ea8926bfc5437467"
+    },
+    "source-commit-official.json": {
+      "bytes": 16684,
+      "path": "/private/tmp/1476-ci105-quic-evidence-v1/source-commit-official.json",
+      "sha256": "013a02fd965fbda2dcda91b98a8c1cf13edfa907aaa9b535c472415ee00f6132"
+    }
+  },
+  "expanded_limit_bytes": 16777216,
+  "expected_source_files": [
+    "tools/hub-capacity/collect.py",
+    "tools/hub-capacity/test_collect.py",
+    "tools/hub-capacity/test_committee_fence.py"
+  ],
+  "final_result": "PASS",
+  "head_sha": "7a92ffd5fd87e5eb94be29a682cb24717a081c41",
+  "job_id": 113287974339,
+  "logical_packet_task": "ci105_quic_binary_verification",
+  "main_workflow_sha256": "b8e3d0ce383c723702aed7becfe00e5bf99efa8ebb87db17e9f30dcb071bb2e5",
+  "merge_checkout": "89f6e26672124b93fe9e31a297e74c488b99a71b",
+  "merge_parents": [
+    "51418a1d97b7db780123ebe05183b7333fe2d4b2",
+    "7a92ffd5fd87e5eb94be29a682cb24717a081c41"
+  ],
+  "merge_tree_sha": "af058a8c4a8ea36891457037df3bfc0094830a56",
+  "metadata_parameter_normalizations": [
+    "source commit change scope filenames",
+    "single-parent correction after merge, first-parent ancestry, and local full-tree equality"
+  ],
+  "node_lock_matches_tested_merge": true,
+  "outcome": "authenticated",
+  "packet_id": "052c781ae19c89a28df3ad61",
+  "pr_number": 1502,
+  "prior_check_calls_preserved": 82,
+  "prior_result": {
+    "path": "/private/tmp/1476-ci104-quic-verification-result.json",
+    "sha256": "3f066ab5116dbf24847d8903d9fa6a8bcd0cbfb254e79c5034142751e6a182ef"
+  },
+  "prior_verified_head": "3ecca49161bbe97bf2e9c8c6fcaf41a839f01c99",
+  "prior_verifier": {
+    "path": "/private/tmp/1476-ci104-quic-verify-v1.proposed.py",
+    "sha256": "42d74983387f8b53889d3179eddaac0c5eb93839756a77b3b0138d00a070a3c3"
+  },
+  "raw_sha256": {
+    "default": "a382b3d01d3ff1d701c06a8f2cdb432ca9201dac56f4ea0b7298c582fb6a33cf",
+    "hybrid": "d4f485cf96caf0c5654c10b1927020d45d14de97cc7a50c38834fe695a4781c0",
+    "incompatible": "94fa738de644be87f7fc5ad32161b5b447f0fa628bfbfd66f3dc82ebdba2f266",
+    "kx-hybrid": "2edd5384b7021e486bf0c6a843045a7d4311290d0836d8dad392eae80cb6aa2f",
+    "kx-p256": "db09dfd39dd3768365419de40a77a04e13ba5becd98c87a0d5a9e687595f9320",
+    "kx-p384": "0d472e46143a9b15e59b9fe97b94edcf0542c121e8d74462f95e97cf0292336e",
+    "kx-x25519": "2b5b26fccf10f58935d8a6067665b83d1f4acd914ade73225e83936eb17b5921",
+    "p256": "1bc49b30b5d9270b58b319e94767f0d0911ea98c7a411cd81362c495969f3a14",
+    "p384": "13334c39ab1b01f2736e338a3d4e950870644ef9110ece54832f11f7e3c3897c",
+    "reconnect": "21e60a421f4e1004941df8faa1b218f8ce99cad64987fdbb907019ab20b9ea35",
+    "reverse-client": "f27de5db983d5a01904e5873d612d1e5461adbe90aa1b57358c6ef7c8d2e2753",
+    "reverse-server": "9016bd4390b1aa2fa6f8fb6553b4a6ff0e4c09a0391605817e394051371e3b45",
+    "wrong-peer": "a9001d9ed56c7b982c471565923b2d2af8542100838ab64eec076cf1f0602caf",
+    "x25519": "38299de99e17dd5cb9b96dabc08ce832bfaec977a688c8845f8c998e1a7235cf"
+  },
+  "report_sha256": "7a9afeb9cae768d3c1bc13ffdb0a2637ed20ad19bd58b2e66f3ed1acff9a9c64",
+  "run_attempt": 1,
+  "run_id": 37770301605,
+  "samples": 700,
+  "scenarios": 14,
+  "source_files": {
+    ".github/workflows/pr.yaml": {
+      "git_blob_sha1": "ecb05661ceb9925b56b78d323e2b54c6e612bacc",
+      "sha256": "b8e3d0ce383c723702aed7becfe00e5bf99efa8ebb87db17e9f30dcb071bb2e5"
+    },
+    ".github/workflows/quic-handshake-profile.yaml": {
+      "git_blob_sha1": "08b43a19b12cc8b8824a0b9a49f4fd307e623030",
+      "sha256": "f40fd454f2a11b91ec80d9b05a7d9e0be76073aeea0dd90ae6476ea3572d0509"
+    },
+    "Cargo.lock": {
+      "git_blob_sha1": "6f45e43efed1a49ca84e324d4a593b998da3e7a4",
+      "sha256": "1490b0be12ff62108004ab3e51daa79529bcc1a6185f89bbe4fc958b0a849126"
+    },
+    "testing/quic-handshake/Cargo.lock": {
+      "git_blob_sha1": "6b6feb34270f61ada625ac1fb5a914c08a9cc8ef",
+      "sha256": "2888eb653a85c9842b5702c784b0fb4c984e129b666dcfa8f026d23fb388689f"
+    },
+    "testing/quic-handshake/Cargo.toml": {
+      "git_blob_sha1": "ac760055f232ff027fe4d9ac8584783be0f2ace0",
+      "sha256": "55f892fdaf012b254551d4257a62e6dd146f3f72bc2bb524c0b4a3598ed6c37e"
+    },
+    "testing/quic-handshake/prepare.py": {
+      "git_blob_sha1": "6ed77ca0bf91337507d8b252f3d417daac9fd5df",
+      "sha256": "866fe333979eca7029672a0de38720c1e00a01dc96c9037ec56dd4f0c420850f"
+    },
+    "testing/quic-handshake/profile.rs": {
+      "git_blob_sha1": "99c470fd11fb237a397c2ca0f101509bd44ec242",
+      "sha256": "4d1f3d177597af713999d412784ac2164514376eecb983f80a06495c0a3f4f11"
+    },
+    "testing/quic-handshake/run.py": {
+      "git_blob_sha1": "bb9223a82066430d58418ccd8ad699e5dce3415a",
+      "sha256": "cb6ebd40d7392428d48dcd041e260eb801ff926ced2c298ae4e58e44a3c92838"
+    },
+    "testing/quic-handshake/src/main.rs": {
+      "git_blob_sha1": "376a270e6076720b7d71ece34422c3f4267a707b",
+      "sha256": "1f8845dba6405a40451130600fd50d588016c1c8fdcfa8dc315782b5902c7bb1"
+    },
+    "tools/hub-capacity/collect.py": {
+      "git_blob_sha1": "ca1537176917b733c603bf82836ca7f17e711991",
+      "sha256": "f98e74fb3c456bdbb234f85070745bbdee49b0f9b952745c14e1b175b66c7ab4"
+    },
+    "tools/hub-capacity/docker-run.py": {
+      "git_blob_sha1": "4e5bf3dd3d79ff1d1dadbce84294e76b5256ad5d",
+      "sha256": "067009afe7352733c4f2856a534a383a24689f9c01d2b6d6354d7c02d701dd35"
+    },
+    "tools/hub-capacity/test_collect.py": {
+      "git_blob_sha1": "a9fb8d36b0fa6dba342590810929e9ad85d3f7e9",
+      "sha256": "452cc823f1f795d862645abe1cc2cb1a94ca28e580a90470529c128f6f32fda0"
+    },
+    "tools/hub-capacity/test_committee_fence.py": {
+      "git_blob_sha1": "ea354a00a4895c4a56725e5aaeaa7d430cd74c03",
+      "sha256": "fd0b86650ebae11db43f8436cc8a03336d004e2725477180a6b8f3c821de0575"
+    }
+  },
+  "source_files_tested_merge_match_head": true,
+  "source_parent_and_tree_authenticated": true,
+  "source_parents": [
+    "422ee20086e1ef15174af0a3d454615e81494c16"
+  ],
+  "verified": true,
+  "verifier_sha256": "9f9a87b1afe4652b054dabd6e695f14b27bfc255c52a76e18455edfb9834ed4b",
+  "workflow_samples_per_scenario": 50,
+  "zip_bytes": 23533,
+  "zip_expanded_bytes": 185907,
+  "zip_limit_bytes": 1048576,
+  "zip_members": 15,
+  "zip_sha256": "1d8ec0912a37e1301c61c5401b08bb431303b6d0e8d67bc2b4e6a3ccf10e213e"
+}

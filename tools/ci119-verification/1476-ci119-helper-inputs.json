@@ -1,0 +1,330 @@
+{
+  "capacity_run_id": 37940162416,
+  "changed_destination_set_relative_to_parent": [
+    ".github/workflows/durable-e2e.yaml",
+    "tools/ci119-verification/1476-ci105-quic-verification-result.json",
+    "tools/ci119-verification/1476-ci105-quic-verify-v1.proposed.py",
+    "tools/ci119-verification/1476-ci110-verify-qualified-bindings-v2.proposed.py",
+    "tools/ci119-verification/1476-ci117-artifact-readers-preparation-root-verified.json",
+    "tools/ci119-verification/1476-ci119-binary-artifact-official.json",
+    "tools/ci119-verification/1476-ci119-capacity-acquire.proposed.py",
+    "tools/ci119-verification/1476-ci119-capacity-artifacts-terminal-official.json",
+    "tools/ci119-verification/1476-ci119-capacity-evidence-artifact-official.json",
+    "tools/ci119-verification/1476-ci119-capacity-jobs-terminal-official.json",
+    "tools/ci119-verification/1476-ci119-capacity-livejob-success-official.json",
+    "tools/ci119-verification/1476-ci119-capacity-livejob-success.log",
+    "tools/ci119-verification/1476-ci119-capacity-run-terminal-official.json",
+    "tools/ci119-verification/1476-ci119-full-verify-test.py",
+    "tools/ci119-verification/1476-ci119-full-verify.py",
+    "tools/ci119-verification/1476-ci119-helper-inputs.json",
+    "tools/ci119-verification/1476-ci119-mutation-artifact-official.json",
+    "tools/ci119-verification/1476-ci119-official-codejob-fixture.json",
+    "tools/ci119-verification/1476-ci119-pr-official.json",
+    "tools/ci119-verification/1476-ci119-publication-test.py",
+    "tools/ci119-verification/1476-ci119-publication.py",
+    "tools/ci119-verification/1476-ci119-publish-evidence.proposed.py",
+    "tools/ci119-verification/1476-ci119-publisher-test.py",
+    "tools/ci119-verification/1476-ci119-quic-artifact-metadata-official.json",
+    "tools/ci119-verification/1476-ci119-quic-artifacts-official.json",
+    "tools/ci119-verification/1476-ci119-quic-job.log",
+    "tools/ci119-verification/1476-ci119-quic-jobs-official.json",
+    "tools/ci119-verification/1476-ci119-quic-run-official.json",
+    "tools/ci119-verification/1476-ci119-source-commit-official.json",
+    "tools/ci119-verification/1476-ci119-source-tree-official.json",
+    "tools/ci119-verification/1476-ci119-staging-ref-official.json",
+    "tools/ci119-verification/1476-ci119-stream-qualified-evidence-v3.proposed.py",
+    "tools/ci119-verification/binary-verify.py",
+    "tools/ci119-verification/ci119_runner_identity.py",
+    "tools/ci119-verification/mutation-acquire.py",
+    "tools/ci119-verification/mutation-extract.py",
+    "tools/ci119-verification/mutation-verify.py",
+    "tools/ci119-verification/quic-acquire.py",
+    "tools/ci119-verification/quic-assemble.py",
+    "tools/ci119-verification/quic-verify.py",
+    "tools/ci119-verification/source-pins.json"
+  ],
+  "execution_boundary": "Actual binary SHA map and all current archive proofs are generated only on the authenticated runner. No local pending map is a proof.",
+  "helper_destination": "tools/ci119-verification/1476-ci119-helper-inputs.json",
+  "helper_parent": "7cf96c59a5233218d95421642a70a15fdaf19fa8",
+  "pending_roles": [],
+  "publication_branch": "evidence/hub-capacity-1476-37940162416",
+  "publication_default": false,
+  "qualification_head": "ca02e454b4f2fa5f5e1a47db8e346fb1bec00666",
+  "qualification_tree": "33c406e60bcd5b6eb8327155758939c26ebe495c",
+  "quic_api_inputs": {
+    "job.log": "quic_api_job_log",
+    "merge-recursive-tree-v2.json": "quic_api_tree",
+    "pr.json": "quic_api_pr",
+    "source-commit-official.json": "quic_api_source_commit",
+    "staging-ref.json": "quic_api_staging"
+  },
+  "quic_run_id": 37940184188,
+  "reader_source_review_and_binding_pending": false,
+  "ready": true,
+  "roles": {
+    "binary_metadata": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-binary-artifact-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-binary-artifact-official.json",
+      "sha256": "7ead5beedad712d968217eb8310165f243ecbbaddbe07a109de3ea99ebd4dc64",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-binary-artifact-official.json"
+    },
+    "binary_verifier": {
+      "helper_destination": "tools/ci119-verification/binary-verify.py",
+      "independent_review_pending": false,
+      "name": "binary-verify.py",
+      "sha256": "86986bd5555f41ff220d9283935abab7bc0f075f161939a27fb6d16559fa6787",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/binary-verify.py"
+    },
+    "bindings": {
+      "helper_destination": "tools/ci119-verification/1476-ci110-verify-qualified-bindings-v2.proposed.py",
+      "name": "1476-ci110-verify-qualified-bindings-v2.proposed.py",
+      "sha256": "75d9a1285b78384b5db0e7aac1f344a527b6c7206f61949f82b8144c55b77a20",
+      "source_path": "/private/tmp/1476-ci119-bindings.source-ready.py"
+    },
+    "capacity_acquirer": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-acquire.proposed.py",
+      "name": "1476-ci119-capacity-acquire.proposed.py",
+      "sha256": "a9646db300fa2633aaf8b83882332748be1be61ad2e44b300bbac1bc6f40f2ef",
+      "source_path": "/private/tmp/1476-ci119-capacity-acquire.bound.v2.source-ready.py"
+    },
+    "capacity_artifacts": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-artifacts-terminal-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-artifacts-terminal-official.json",
+      "sha256": "f7d6381a354a4b9c7debb0de680bb4e0868440e63fe83ecf62604411a93f17de",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-artifacts-terminal-official.json"
+    },
+    "capacity_jobs": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-jobs-terminal-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-jobs-terminal-official.json",
+      "sha256": "c1015c9d5d576733adab91b49eae3219f63d6f70db6ffb21128b0266d752f4be",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-jobs-terminal-official.json"
+    },
+    "capacity_live_job": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-livejob-success-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-livejob-success-official.json",
+      "sha256": "2ebd404fa84593962f60074fa533b1b6c71a728971e7c0d61f1a4e7cef3e9f0e",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-livejob-success-official.json"
+    },
+    "capacity_live_log": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-livejob-success.log",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-livejob-success.log",
+      "sha256": "cb59cd930c2819f63957b74503f0b06386b59df0a2c1336dc10fdb1a3e4b2b4e",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-livejob-success.log"
+    },
+    "capacity_metadata": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-evidence-artifact-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-evidence-artifact-official.json",
+      "sha256": "b23488cbe9d696842586d90500381b80975d757b5a0a8a9885bebd7d44ca6c65",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-evidence-artifact-official.json"
+    },
+    "capacity_run": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-capacity-run-terminal-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-capacity-run-terminal-official.json",
+      "sha256": "2a5718d993869096d965734c2713ccb8b4dc594023d3c8ca13709550ff6f48d3",
+      "source_path": "/private/tmp/1476-ci119-terminal-delivery-v1/1476-ci119-capacity-run-terminal-official.json"
+    },
+    "full_verifier": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-stream-qualified-evidence-v3.proposed.py",
+      "name": "1476-ci119-stream-qualified-evidence-v3.proposed.py",
+      "sha256": "5bcde47856090f11c8ecc2bd2683728b321448647bdfc009bb2c0c74a30cc18e",
+      "source_path": "/private/tmp/1476-ci119-stream-qualified-evidence-v3.proposed.source-ready.py"
+    },
+    "mutation_acquirer": {
+      "helper_destination": "tools/ci119-verification/mutation-acquire.py",
+      "independent_review_pending": false,
+      "name": "mutation-acquire.py",
+      "sha256": "57c982a777b9997813e33cf6828db531e0b5f9cf3948060f0cba1566f9eff837",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/mutation-acquire.py"
+    },
+    "mutation_extractor": {
+      "helper_destination": "tools/ci119-verification/mutation-extract.py",
+      "independent_review_pending": false,
+      "name": "mutation-extract.py",
+      "sha256": "9a105baab1be58f20577da4e460d2cd49501f92a6090cde733269e4a6fd45ff9",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/mutation-extract.py"
+    },
+    "mutation_metadata": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-mutation-artifact-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-mutation-artifact-official.json",
+      "sha256": "777f5a019c3c8238803ce99b613a2d4642433e5c37850b623cad69b329dc72f3",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-mutation-artifact-official.json"
+    },
+    "mutation_verifier": {
+      "helper_destination": "tools/ci119-verification/mutation-verify.py",
+      "independent_review_pending": false,
+      "name": "mutation-verify.py",
+      "sha256": "4f78f470860dde9eccb3c10055dfe32b107ac388271fb79389308dc89d3a5a2e",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/mutation-verify.py"
+    },
+    "official_codejob_fixture": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-official-codejob-fixture.json",
+      "name": "1476-ci119-official-codejob-fixture.json",
+      "sha256": "1fc9a42d387caafcd5a3e76313d77ab375bde52e57aa73d187eced16c5f2ba0a",
+      "source_path": "/private/tmp/1476-ci119-official-codejob-fixture.json"
+    },
+    "publication": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-publication.py",
+      "name": "1476-ci119-publication.py",
+      "sha256": "1bb72e6512c5261e54c32b3a58247a1adacbe15bede17a46b1df0e075e1c4664",
+      "source_path": "/private/tmp/1476-ci119-publication.source-ready.py"
+    },
+    "publication_tests": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-publication-test.py",
+      "name": "1476-ci119-publication-test.py",
+      "sha256": "0f223ec2b595a849bc56ed784c0c1cb466779361f68128b5e600761d8a3462f1",
+      "source_path": "/private/tmp/1476-ci119-publication-test.source-ready.py"
+    },
+    "publisher": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-publish-evidence.proposed.py",
+      "name": "1476-ci119-publish-evidence.proposed.py",
+      "sha256": "89154bc2c6a2af0220144838e1d6df54cb28dda9898b0d0bebd17ffb25134e21",
+      "source_path": "/private/tmp/1476-ci119-publish-evidence.proposed.source-ready.py"
+    },
+    "publisher_tests": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-publisher-test.py",
+      "name": "1476-ci119-publisher-test.py",
+      "sha256": "5897564c2c2ec42fc18f7ac266f3dd3c3ed50c84f9dc2c3018d9e02e64d1d8c7",
+      "source_path": "/private/tmp/1476-ci119-publisher-test.source-ready.py"
+    },
+    "quic_acquirer": {
+      "helper_destination": "tools/ci119-verification/quic-acquire.py",
+      "independent_review_pending": false,
+      "name": "quic-acquire.py",
+      "sha256": "34f575369baef61954fa2665186ce63ef6f8c02ab1679d8cdf049fc8ecbe954d",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/quic-acquire.py"
+    },
+    "quic_api_job_log": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-quic-job.log",
+      "independent_review_pending": false,
+      "name": "1476-ci119-quic-job.log",
+      "sha256": "26bbef38952d889c9f98553f05246f7bcd2d218a6a0c9a3b3a1a9f369d1e2b9d",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-quic-job.log"
+    },
+    "quic_api_pr": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-pr-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-pr-official.json",
+      "sha256": "d56aec69e133e7dc64b4fdae236fae168b21b6884dcdb693c35c96011e1131bf",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-pr-official.json"
+    },
+    "quic_api_source_commit": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-source-commit-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-source-commit-official.json",
+      "sha256": "ba5c4fcc879f9253c7ed181b94806e84744c63d77a7d383859fd0e557d8c4da3",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-source-commit-official.json"
+    },
+    "quic_api_staging": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-staging-ref-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-staging-ref-official.json",
+      "sha256": "1610455c38477d929c619cf84a2f770590047f1fcd8df85fbf40f2f4b0be8ee6",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-staging-ref-official.json"
+    },
+    "quic_api_tree": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-source-tree-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-source-tree-official.json",
+      "sha256": "00f09a6cd035928afd85991f82836562e575295891672e39de570e4f7bbe759d",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-source-tree-official.json"
+    },
+    "quic_artifact": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-quic-artifact-metadata-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-quic-artifact-metadata-official.json",
+      "sha256": "2c4f5b41cac00497384bb55991efe30db1fc597c59b3bee8b16c780e75eeaca7",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-quic-artifact-metadata-official.json"
+    },
+    "quic_artifacts": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-quic-artifacts-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-quic-artifacts-official.json",
+      "sha256": "a38fb21014377ed2c3e3a52c3d1ee2405bcee5087c579b12e0814eee730bf7f6",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-quic-artifacts-official.json"
+    },
+    "quic_jobs": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-quic-jobs-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-quic-jobs-official.json",
+      "sha256": "2aae93041b7b20ba420a4068e1629dd2fbbe6b8503ecd1cf369d50864f38e01d",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-quic-jobs-official.json"
+    },
+    "quic_metadata_assembler": {
+      "helper_destination": "tools/ci119-verification/quic-assemble.py",
+      "independent_review_pending": false,
+      "name": "quic-assemble.py",
+      "sha256": "06a0ffd858eed876a177ea9ea96f22ce334a4efdcbcadf9f9fe2f49c284af9e0",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/quic-assemble.py"
+    },
+    "quic_prior_preparation": {
+      "helper_destination": "tools/ci119-verification/1476-ci117-artifact-readers-preparation-root-verified.json",
+      "independent_review_pending": false,
+      "name": "1476-ci117-artifact-readers-preparation-root-verified.json",
+      "sha256": "8efabd5306f33894a7ee2445baa1d6b7ca9e73b661058007b003e3a19c65e542",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci117-artifact-readers-preparation-root-verified.json"
+    },
+    "quic_prior_result": {
+      "helper_destination": "tools/ci119-verification/1476-ci105-quic-verification-result.json",
+      "independent_review_pending": false,
+      "name": "1476-ci105-quic-verification-result.json",
+      "sha256": "f67333ccabab62fdd1b23f7cffac282f9bafcfc5427d1dadd0bcaa869bade364",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci105-quic-verification-result.json"
+    },
+    "quic_prior_verifier": {
+      "helper_destination": "tools/ci119-verification/1476-ci105-quic-verify-v1.proposed.py",
+      "independent_review_pending": false,
+      "name": "1476-ci105-quic-verify-v1.proposed.py",
+      "sha256": "9f9a87b1afe4652b054dabd6e695f14b27bfc255c52a76e18455edfb9834ed4b",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci105-quic-verify-v1.proposed.py"
+    },
+    "quic_run": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-quic-run-official.json",
+      "independent_review_pending": false,
+      "name": "1476-ci119-quic-run-official.json",
+      "sha256": "94266198c0d65f965e00c07df6544f92a587c8b311bbb80f418a982b0e636938",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/1476-ci119-quic-run-official.json"
+    },
+    "quic_source_pins": {
+      "helper_destination": "tools/ci119-verification/source-pins.json",
+      "independent_review_pending": false,
+      "name": "source-pins.json",
+      "sha256": "c40ef0ce4c3f49339a93f86ed18f0bf9f4ee51366bab7fb3bbc6850a74362829",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/source-pins.json"
+    },
+    "quic_verifier": {
+      "helper_destination": "tools/ci119-verification/quic-verify.py",
+      "independent_review_pending": false,
+      "name": "quic-verify.py",
+      "sha256": "1568dbf6774fa0024146c85759ecd5aba8cb2bf3366921a5b1acdfc2b42cc2af",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/quic-verify.py"
+    },
+    "runner_identity": {
+      "helper_destination": "tools/ci119-verification/ci119_runner_identity.py",
+      "independent_review_pending": false,
+      "name": "ci119_runner_identity.py",
+      "sha256": "649197fc31e9ecf5dadb5de5675c19c8ed28e0e0b6f947fb7ac5b3d985f97413",
+      "source_path": "/private/tmp/1476-ci119-reader-delivery-v3/ci119_runner_identity.py"
+    },
+    "verification_entrypoint": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-full-verify.py",
+      "name": "1476-ci119-full-verify.py",
+      "sha256": "e33a6225a46130adfaf96f8af4b8f30c7a6cc1168821f2a2556a46c6cd70d022",
+      "source_path": "/private/tmp/1476-ci119-full-verify.v2.source-ready.py"
+    },
+    "verification_tests": {
+      "helper_destination": "tools/ci119-verification/1476-ci119-full-verify-test.py",
+      "name": "1476-ci119-full-verify-test.py",
+      "sha256": "c6c3ea0e148804df915d4db39e0527cce10c7ab356c9588fa9a584dc0c537449",
+      "source_path": "/private/tmp/1476-ci119-full-verify-test.v2.source-ready.py"
+    }
+  },
+  "version": 1
+}
