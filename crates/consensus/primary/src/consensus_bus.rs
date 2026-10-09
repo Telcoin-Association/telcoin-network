@@ -8,6 +8,7 @@ use crate::{
 };
 use parking_lot::Mutex;
 use std::{
+    collections::HashSet,
     error::Error,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -29,15 +30,33 @@ use tokio::{
     },
     time::error::Elapsed,
 };
-use tracing::error;
+use tracing::{error, info, warn};
 
-/// Capacity for the `sync_output` broadcast.
+/// Depth of the bounded `sync_output` queue.
 ///
-/// Items are full [`ConsensusOutput`]s (subdag + batches), so a deep buffer costs hundreds of
-/// MB when a follower lags. The state-sync producer waits for execution to catch up before each
-/// send and fails fast on a digest-chain mismatch, so a deep buffer buys nothing: 1_000 bounds
-/// worst-case memory while still absorbing bursts.
-const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 1_000;
+/// `sync_output` is a bounded mpsc: once this many outputs are queued, the state-sync producer's
+/// `send().await` blocks until the subscriber takes one. The producer's `wait_for_execution` only
+/// throttles non-empty outputs (an empty output produces no block to wait for), so while it
+/// replays empty outputs from a local pack this queue is its only throttle. A broadcast here would
+/// drop the oldest outputs once the producer ran a buffer ahead, and the subscriber cannot recover
+/// an output it never received.
+///
+/// Items are full [`ConsensusOutput`]s (subdag + batches), so the depth bounds the memory a
+/// lagging subscriber pins and the outputs refetched after an abnormal teardown. 256 is about
+/// 2.5 s of subscriber work at 7-13 ms per saved output.
+pub const SYNC_OUTPUT_CHANNEL_CAPACITY: usize = 256;
+/// Depth of the bounded `consensus_output` queue.
+///
+/// `consensus_output` is a bounded mpsc: once this many outputs are queued, the subscriber's
+/// `send().await` waits for the epoch manager to receive one, and the epoch manager in turn waits
+/// on the bounded engine queue (`to_engine`). A broadcast here would drop the oldest outputs once
+/// the subscriber ran a ring ahead of the engine, and the epoch manager would exit on the resulting
+/// gap.
+///
+/// Items are full [`ConsensusOutput`]s, so the depth caps the memory held between the subscriber
+/// and the epoch manager: about 125 MB at the hardware-requirements benchmark's 1.0-1.25 MB
+/// average output, 550 MB at its 5.5 MB maximum.
+const CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
 /// Capacity for the `exex_certificates` broadcast.
 ///
 /// Certificates are small but arrive every round forever; a lagging ExEx reconciles via its
@@ -46,9 +65,15 @@ const EXEX_CERTIFICATES_CHANNEL_CAPACITY: usize = 1_000;
 /// Capacity for the `exex_consensus_output` broadcast.
 ///
 /// Items are full [`ConsensusOutput`]s. ExEx handles `Lagged` natively (surfaced as
-/// `TnExExNotification::Lagged` reconciliation), so match the engine's `consensus_output`
-/// capacity instead of buffering hundreds of MB for a slow ExEx.
+/// `TnExExNotification::Lagged` reconciliation), so match the depth of the engine-bound
+/// `consensus_output` queue instead of buffering hundreds of MB for a slow ExEx.
 const EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY: usize = 100;
+/// Capacity of the epoch pack request queue.
+///
+/// Producers wait while the queue is full, which paces them to the fetch workers. The fetch workers
+/// that drain the queue must never wait on it: a worker that waits for room in its own queue stops
+/// the consumption that would make room (see [`ConsensusBusApp::try_requeue_epoch_pack_file`]).
+pub const EPOCH_REQUEST_QUEUE_CAPACITY: usize = 1024;
 
 /// Wrapper around a receiver and a subs count to make sure only one of these exists at a time.
 /// Note this does NOT implement Clone on purpose, do not implement it else managing subscriptions
@@ -92,18 +117,33 @@ pub struct QueChannel<T> {
 impl<T> QueChannel<T> {
     /// Create a new QueChannel.
     pub fn new() -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        let receiver = Arc::new(Mutex::new(Some(rx)));
-        let subscribed = Arc::new(AtomicBool::new(false));
-        Self { channel: tx, receiver, subscribed, always_subscribed: false }
+        Self::build(CHANNEL_CAPACITY, false)
     }
 
     /// Create a new QueChannel that will que messages even when no subscribers.
     pub fn new_always_subscribed() -> Self {
-        let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
+        Self::build(CHANNEL_CAPACITY, true)
+    }
+
+    /// Create a new QueChannel that queues at most `capacity` messages.
+    ///
+    /// Once `capacity` messages are queued, `send().await` waits for the subscriber to receive
+    /// one and `try_send` returns [`tn_types::TrySendError::Full`], so a slow subscriber
+    /// backpressures the producer instead of losing messages.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `capacity` is 0, like [`tokio::sync::mpsc::channel`].
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self::build(capacity, false)
+    }
+
+    /// Build the channel. With `always_subscribed` it queues messages even with no subscriber.
+    fn build(capacity: usize, always_subscribed: bool) -> Self {
+        let (tx, rx) = mpsc::channel(capacity);
         let receiver = Arc::new(Mutex::new(Some(rx)));
-        let subscribed = Arc::new(AtomicBool::new(true));
-        Self { channel: tx, receiver, subscribed, always_subscribed: true }
+        let subscribed = Arc::new(AtomicBool::new(always_subscribed));
+        Self { channel: tx, receiver, subscribed, always_subscribed }
     }
 
     /// Subscribe to receive messages on this channel.
@@ -117,6 +157,38 @@ impl<T> QueChannel<T> {
         let receiver = self.receiver.lock().take();
         if receiver.is_none() {
             panic!("Another subscription is already in use!")
+        }
+        self.subscribed.store(true, Ordering::Release);
+        QueChanReceiver {
+            receiver,
+            container: self.receiver.clone(),
+            subscribed: self.subscribed.clone(),
+            always_subscribed: self.always_subscribed,
+        }
+    }
+
+    /// Subscribe like [`Self::subscribe`], first discarding anything a previous subscriber left
+    /// queued.
+    ///
+    /// For channels whose messages only mean something to the subscriber that was live when they
+    /// were sent. The drain happens here rather than when the old receiver drops: a receiver can
+    /// drop while its producer is still blocked in `send().await`, and that send would land after
+    /// a drain-on-drop. By the time the next subscriber subscribes, the old producer has been
+    /// aborted with its epoch's tasks and the new producer is not spawned yet (callers subscribe
+    /// before spawning it), so nothing races this drain.
+    ///
+    /// # Panics
+    ///
+    /// Panics if another subscription is in use, like [`Self::subscribe`].
+    pub fn subscribe_fresh(&self) -> impl TnReceiver<T> + 'static
+    where
+        T: Send + 'static,
+    {
+        let mut receiver = self.receiver.lock().take();
+        let Some(rx) = receiver.as_mut() else { panic!("Another subscription is already in use!") };
+        let discarded = std::iter::from_fn(|| rx.try_recv().ok()).count();
+        if discarded > 0 {
+            warn!(target: "primary", discarded, "discarded messages a previous subscriber left queued");
         }
         self.subscribed.store(true, Ordering::Release);
         QueChanReceiver {
@@ -153,11 +225,22 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         Ok(self.channel.send(value).await?)
     }
 
+    /// Queue `value` without waiting, or drop it while no receiver is subscribed.
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
+        self.try_send_outcome(value).map(|_outcome| ())
+    }
+
+    /// Queue `value` like [`TnSender::try_send`], and report
+    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed, so the network
+    /// layer counts the drop as shed instead of as forwarded.
+    fn try_send_outcome(
+        &self,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(tn_types::TrySendOutcome::Unsubscribed);
         }
-        Ok(self.channel.try_send(value)?)
+        Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
     }
 }
 
@@ -261,11 +344,15 @@ pub struct ConsensusBusAppInner {
 
     /// Verified consensus OUTPUTs (header + batches) delivered to a following/catching-up
     /// subscriber for execution. Filled by the state-sync forward drain; used only by
-    /// non-active nodes.
-    sync_output: broadcast::Sender<ConsensusOutput>,
-    /// Broadcast the latest output from consensus after committing to the subdag.
-    /// Engine consumes and executes to extend canonical chain.
-    consensus_output: broadcast::Sender<ConsensusOutput>,
+    /// non-active nodes. A bounded queue (`SYNC_OUTPUT_CHANNEL_CAPACITY`), so a subscriber that
+    /// falls behind blocks the producer instead of losing outputs.
+    sync_output: QueChannel<ConsensusOutput>,
+    /// Saved consensus outputs on their way to execution.
+    ///
+    /// The subscriber sends each output once it is saved; the epoch manager receives it and
+    /// forwards it to the engine. Bounded by `CONSENSUS_OUTPUT_CHANNEL_CAPACITY`, so a slow epoch
+    /// manager blocks the subscriber instead of losing outputs.
+    consensus_output: QueChannel<ConsensusOutput>,
 
     /// Broadcast channel for verified certificates (ExEx).
     ///
@@ -290,10 +377,13 @@ pub struct ConsensusBusAppInner {
     /// The que channel for primary network events.
     primary_network_events: QueChannel<NetworkEvent<crate::network::Req, crate::network::Res>>,
     /// Sender for epoch records that need to have a pack file downloaded.
-    epoch_request_queue_tx: tokio::sync::mpsc::Sender<(EpochRecord, EpochRecord)>,
+    epoch_request_queue_tx: tokio::sync::mpsc::Sender<EpochPackRequest>,
     /// Reciever for epoch records to download pack files for.
-    epoch_request_queue_rx:
-        Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<(EpochRecord, EpochRecord)>>>,
+    epoch_request_queue_rx: Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<EpochPackRequest>>>,
+    /// The epochs with a pack request queued or being fetched.
+    ///
+    /// Not reset between epochs: a request outlives the epoch that queued it.
+    epoch_pack_claims: EpochPackClaims,
     /// Channel to request consensus headers to cache.
     /// Fields are epoch, consensus number, consensus digest and consensus output bytes.
     consensus_request_queue: QueChannel<(Epoch, u64, ConsensusHeaderDigest)>,
@@ -306,6 +396,99 @@ pub struct ConsensusBusAppInner {
     /// Canonical execution-DB fallback for `wait_for_execution` (installed once the execution
     /// engine is built); empty until then and in engine-less tests/tools.
     canonical_reader: CanonicalReaderSlot,
+}
+
+/// The epochs that have a pack request queued or being fetched.
+///
+/// Every queued [`EpochPackRequest`] carries the claim on its epoch, and dropping the request
+/// releases it, so an epoch is queued at most once until its fetch ends, however it ends. The set
+/// is only ever locked for one insert or remove, never across an await.
+#[derive(Clone, Debug, Default)]
+struct EpochPackClaims(Arc<Mutex<HashSet<Epoch>>>);
+
+impl EpochPackClaims {
+    /// Claim `epoch`, or return `None` if a request for it is already queued or being fetched.
+    fn claim(&self, epoch: Epoch) -> Option<EpochPackClaim> {
+        let claimed = self.0.lock().insert(epoch);
+        claimed.then(|| EpochPackClaim { epoch, claims: self.clone() })
+    }
+}
+
+/// An [`EpochPackRequest`]'s claim on its epoch; dropping it releases the epoch.
+///
+/// Releasing on drop frees the epoch on every path that ends a request: a finished fetch, a skip,
+/// shutdown, a panic, a cancelled send and dropping the queue.
+struct EpochPackClaim {
+    /// The claimed epoch.
+    epoch: Epoch,
+    /// The set to release the epoch from.
+    claims: EpochPackClaims,
+}
+
+impl Drop for EpochPackClaim {
+    fn drop(&mut self) {
+        self.claims.0.lock().remove(&self.epoch);
+    }
+}
+
+/// Prints only the claimed epoch, not the shared set behind it.
+impl std::fmt::Debug for EpochPackClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EpochPackClaim").field("epoch", &self.epoch).finish_non_exhaustive()
+    }
+}
+
+/// A request to download the pack file for one epoch.
+///
+/// The request holds the claim on its epoch, and dropping the request releases the epoch, so no
+/// second request for the epoch is queued until this one is done with. The fields are private so a
+/// caller cannot take the request apart and drop the claim partway through a fetch.
+#[derive(Debug)]
+pub struct EpochPackRequest {
+    /// The record of the epoch before the requested one, which verifies the requested epoch.
+    ///
+    /// It has no setter because a stored epoch record is final.
+    previous_epoch_record: EpochRecord,
+    /// The record of the requested epoch.
+    epoch_record: EpochRecord,
+    /// This request's claim on its epoch.
+    claim: EpochPackClaim,
+    /// Counts records [`Self::set_epoch_record`] drops for a different epoch.
+    metrics: PrimaryMetrics,
+}
+
+impl EpochPackRequest {
+    /// The requested epoch.
+    pub fn epoch(&self) -> Epoch {
+        self.claim.epoch
+    }
+
+    /// The record of the epoch before the requested one.
+    pub fn previous_epoch_record(&self) -> &EpochRecord {
+        &self.previous_epoch_record
+    }
+
+    /// The record of the requested epoch.
+    pub fn epoch_record(&self) -> &EpochRecord {
+        &self.epoch_record
+    }
+
+    /// Replace the record of the requested epoch, for example with a newer one that arrived after
+    /// the request was queued.
+    ///
+    /// Returns whether the record was applied. A record for a different epoch is dropped, counted
+    /// and logged, since only a caller bug can offer one.
+    pub fn set_epoch_record(&mut self, record: EpochRecord) -> bool {
+        let requested = self.claim.epoch;
+        if record.epoch != requested {
+            self.metrics.epoch_pack_record_epoch_mismatch_total.increment(1);
+            warn!(target: "primary", requested, offered = record.epoch,
+                "dropped an epoch record offered to the pack request of a different epoch");
+            return false;
+        }
+        self.epoch_record = record;
+        true
+    }
 }
 
 /// Late-bound handle to the canonical execution database, used by
@@ -378,15 +561,16 @@ impl ConsensusBusApp {
         let (tx_recent_blocks, _) = watch::channel(RecentBlocks::new(recent_blocks as usize));
         let (tx_sync_status, _) = watch::channel(NodeMode::default());
 
-        let (sync_output, _rx_sync_output) = broadcast::channel(SYNC_OUTPUT_CHANNEL_CAPACITY);
-        let (consensus_output, _rx_consensus_output) = broadcast::channel(100);
+        let sync_output = QueChannel::with_capacity(SYNC_OUTPUT_CHANNEL_CAPACITY);
+        let consensus_output = QueChannel::with_capacity(CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (exex_certificates, _) = broadcast::channel(EXEX_CERTIFICATES_CHANNEL_CAPACITY);
         let (exex_consensus_output, _) = broadcast::channel(EXEX_CONSENSUS_OUTPUT_CHANNEL_CAPACITY);
 
         let (tx_epoch_record, _) = watch::channel(None);
 
-        let (epoch_request_queue_tx, epochs_rx) = tokio::sync::mpsc::channel(1024);
+        let (epoch_request_queue_tx, epochs_rx) =
+            tokio::sync::mpsc::channel(EPOCH_REQUEST_QUEUE_CAPACITY);
         let epoch_request_queue_rx = Arc::new(tokio::sync::Mutex::new(epochs_rx));
         Self {
             inner: Arc::new(ConsensusBusAppInner {
@@ -408,6 +592,7 @@ impl ConsensusBusApp {
                 primary_network_events: QueChannel::new_always_subscribed(),
                 epoch_request_queue_tx,
                 epoch_request_queue_rx,
+                epoch_pack_claims: EpochPackClaims::default(),
                 consensus_request_queue: QueChannel::new(),
                 // new_with_labels (not Default): binds to the recorder active at bus
                 // construction instead of caching the first-bound recorder process-wide
@@ -559,14 +744,17 @@ impl ConsensusBusApp {
         *self.inner.tx_last_published_consensus_num_hash.borrow()
     }
 
-    /// Broadcast channel with consensus output (includes the consensus chain block).
-    /// This also provides the ConsesusHeader, use this for block execution.
+    /// Bounded queue carrying saved consensus outputs (each includes its consensus chain block) to
+    /// the epoch manager, which forwards them to the engine for execution. `send().await` waits
+    /// while the epoch manager is a full queue behind; with no subscriber a send is a no-op.
     pub fn consensus_output(&self) -> &impl TnSender<ConsensusOutput> {
         &self.inner.consensus_output
     }
 
-    /// Broadcast channel delivering verified consensus OUTPUTs (header + batches) to a
+    /// Bounded queue delivering verified consensus OUTPUTs (header + batches) to a
     /// following/catching-up subscriber for execution. Used when not participating in consensus.
+    /// `send().await` waits while the subscriber is a full queue behind; with no subscriber a
+    /// send is a no-op.
     pub fn sync_output(&self) -> &impl TnSender<ConsensusOutput> {
         &self.inner.sync_output
     }
@@ -651,13 +839,27 @@ impl ConsensusBusApp {
     }
 
     /// Provide a subscription (Receiver) for consensus output.
+    ///
+    /// Outputs a previous subscriber left queued are discarded, so the new subscriber only sees
+    /// what its own producer sends. Only one subscription can be live at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the previous subscription has not been dropped yet.
     pub fn subscribe_consensus_output(&self) -> impl TnReceiver<ConsensusOutput> {
-        self.inner.consensus_output.subscribe()
+        self.inner.consensus_output.subscribe_fresh()
     }
 
     /// Provide a subscription(Receiver) to verified sync consensus outputs.
+    ///
+    /// Outputs a previous subscriber left queued are discarded, so the new subscriber only sees
+    /// what its own producer sends. Only one subscription can be live at a time.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the previous subscription has not been dropped yet.
     pub fn subscribe_sync_output(&self) -> impl TnReceiver<ConsensusOutput> {
-        self.inner.sync_output.subscribe()
+        self.inner.sync_output.subscribe_fresh()
     }
 
     /// Broadcast sender for verified certificates (ExEx).
@@ -831,12 +1033,50 @@ impl ConsensusBusApp {
     }
 
     /// Send a request to download the epoch pack file for the provided EpochRecord.
+    ///
+    /// Returns at once if a request for the same epoch is already queued or being fetched; that
+    /// request keeps the record it was queued with, and the fetcher refreshes a stale record from
+    /// the epoch records after a failed attempt. Otherwise waits for room in the queue.
     pub async fn request_epoch_pack_file(
         &self,
         previous_epoch_record: EpochRecord,
         epoch_record: EpochRecord,
     ) {
-        let _ = self.inner.epoch_request_queue_tx.send((previous_epoch_record, epoch_record)).await;
+        let Some(claim) = self.inner.epoch_pack_claims.claim(epoch_record.epoch) else {
+            return;
+        };
+        let request = EpochPackRequest {
+            previous_epoch_record,
+            epoch_record,
+            claim,
+            metrics: self.inner.metrics.clone(),
+        };
+        let _ = self.inner.epoch_request_queue_tx.send(request).await;
+    }
+
+    /// Put an epoch pack request back on the queue without waiting for room.
+    ///
+    /// Returns the request when the queue is full so the caller can hold it and offer it again
+    /// later. Only the queue's consumers call this: a consumer that waits for room in its own
+    /// queue stops the consumption that would make room, and once every consumer waits that way
+    /// every producer waits forever (#1563). Producers call [`Self::request_epoch_pack_file`],
+    /// which waits.
+    ///
+    /// A producer already queued as a waiter takes a freed slot before this call can, so a
+    /// held request goes back only once the producers stop waiting.
+    ///
+    /// The request keeps its claim, so no producer can queue a second request for the epoch while
+    /// this one is held or queued.
+    pub fn try_requeue_epoch_pack_file(
+        &self,
+        request: EpochPackRequest,
+    ) -> Option<EpochPackRequest> {
+        match self.inner.epoch_request_queue_tx.try_send(request) {
+            Ok(()) => None,
+            Err(mpsc::error::TrySendError::Full(request)) => Some(request),
+            // cannot happen while the bus exists: the inner struct owns the receiver
+            Err(mpsc::error::TrySendError::Closed(_)) => None,
+        }
     }
 
     /// Send a request to download the epoch pack file for the provided Epoch.
@@ -859,25 +1099,42 @@ impl ConsensusBusApp {
         } else {
             consensus_chain.epochs().record_by_epoch(current_epoch.saturating_sub(1)).await
         };
-        if let Some(previous_epoch_record) = maybe_previous {
-            if let Some(epoch_record) =
-                consensus_chain.epochs().record_by_epoch(current_epoch).await
-            {
-                let contains_final_header = consensus_chain.is_epoch_complete(&epoch_record).await;
-                // If the pack file is missing or incomplete request it.
-                // Note since we have an epoch record this is a past epoch
-                // not the current epoch.
-                if !contains_final_header {
-                    self.request_epoch_pack_file(previous_epoch_record, epoch_record.clone()).await;
-                }
-            }
+        let Some(previous_epoch_record) = maybe_previous else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: previous epoch record is missing"
+            );
+            return;
+        };
+        let Some(epoch_record) = consensus_chain.epochs().record_by_epoch(current_epoch).await
+        else {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch record is missing"
+            );
+            return;
+        };
+        // If the pack file is missing or incomplete request it.
+        // Note since we have an epoch record this is a past epoch
+        // not the current epoch.
+        if consensus_chain.is_epoch_complete(&epoch_record).await {
+            info!(
+                target: "primary",
+                current_epoch,
+                "skipping epoch pack request: epoch pack is already complete"
+            );
+            return;
         }
+        self.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
     }
 
     /// Retrieve the next request to down load an epoch pack file.
     /// Will not resolve until a request is ready and will only ever
     /// provide each request once.  Returns None when the underlying channel closes.
-    pub async fn get_next_epoch_pack_file_request(&self) -> Option<(EpochRecord, EpochRecord)> {
+    /// The epoch stays claimed until the returned request is dropped.
+    pub async fn get_next_epoch_pack_file_request(&self) -> Option<EpochPackRequest> {
         self.inner.epoch_request_queue_rx.lock().await.recv().await
     }
 
@@ -1186,5 +1443,417 @@ mod exex_receiver_count_tests {
         drop(output);
         assert_eq!(bus.exex_certificates().receiver_count(), 0);
         assert_eq!(bus.exex_consensus_output().receiver_count(), 0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ConsensusBusApp, EpochPackRequest, QueChannel, CONSENSUS_OUTPUT_CHANNEL_CAPACITY,
+        EPOCH_REQUEST_QUEUE_CAPACITY, SYNC_OUTPUT_CHANNEL_CAPACITY,
+    };
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use std::{collections::VecDeque, task::Poll, time::Duration};
+    use tn_types::{
+        CommittedSubDag, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch,
+        EpochRecord, TnReceiver as _, TnSender as _, TryRecvError, TrySendError,
+    };
+
+    /// The smallest output that can sit in `sync_output` or `consensus_output`; only its number
+    /// matters here.
+    fn output(number: u64) -> ConsensusOutput {
+        ConsensusOutput::new(
+            CommittedSubDag::default(),
+            ConsensusHeaderDigest::default(),
+            number,
+            false,
+            VecDeque::new(),
+            vec![],
+        )
+    }
+
+    /// An epoch record that carries only its epoch.
+    fn epoch_record(epoch: Epoch) -> EpochRecord {
+        EpochRecord { epoch, ..EpochRecord::default() }
+    }
+
+    /// Fill the empty epoch request queue with `EPOCH_REQUEST_QUEUE_CAPACITY` epochs from
+    /// `first` on, and return the first epoch that no longer fits.
+    async fn fill_epoch_request_queue(bus: &ConsensusBusApp, first: Epoch) -> Epoch {
+        let capacity =
+            Epoch::try_from(EPOCH_REQUEST_QUEUE_CAPACITY).expect("the capacity fits an epoch");
+        for epoch in first..first + capacity {
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(epoch)).await;
+        }
+        first + capacity
+    }
+
+    /// Take the next epoch pack request, failing the test if none is queued.
+    async fn next_request(bus: &ConsensusBusApp) -> EpochPackRequest {
+        tokio::time::timeout(Duration::from_secs(1), bus.get_next_epoch_pack_file_request())
+            .await
+            .expect("a request is queued")
+            .expect("the request queue is open")
+    }
+
+    /// Take the next epoch pack request and return its epoch.
+    async fn next_epoch(bus: &ConsensusBusApp) -> Epoch {
+        next_request(bus).await.epoch()
+    }
+
+    /// Whether the epoch request queue is empty, checked without waiting.
+    async fn epoch_request_queue_is_empty(bus: &ConsensusBusApp) -> bool {
+        // unconstrained: once the task's coop budget is spent, the receiver lock reports pending
+        // without looking at the queue
+        let next = tokio::task::unconstrained(bus.get_next_epoch_pack_file_request());
+        tokio::pin!(next);
+        futures::poll!(next.as_mut()).is_pending()
+    }
+
+    /// A re-queue into the full epoch request queue hands the request back instead of waiting,
+    /// and once a request is taken the re-queue fits and drains after everything queued before it.
+    #[tokio::test]
+    async fn try_requeue_epoch_pack_file_returns_the_request_when_full() {
+        let bus = ConsensusBusApp::new();
+        // a fetch worker holds epoch 0 while producers fill the queue behind it
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(0)).await;
+        let request = next_request(&bus).await;
+        let end = fill_epoch_request_queue(&bus, 1).await;
+
+        let request =
+            bus.try_requeue_epoch_pack_file(request).expect("a full queue hands the request back");
+        assert_eq!(request.epoch(), 0, "the same request comes back");
+
+        assert_eq!(next_epoch(&bus).await, 1);
+        assert!(
+            bus.try_requeue_epoch_pack_file(request).is_none(),
+            "the freed slot takes the re-queued request"
+        );
+        for expected in 2..end {
+            assert_eq!(next_epoch(&bus).await, expected);
+        }
+        assert_eq!(next_epoch(&bus).await, 0, "the re-queued request drains last");
+        assert!(epoch_request_queue_is_empty(&bus).await);
+    }
+
+    /// A producer waiting on the full epoch request queue takes the slot a consumer frees before a
+    /// re-queue can, so a held request goes back only once the producers stop waiting.
+    #[tokio::test]
+    async fn waiting_producer_takes_a_freed_slot_before_a_requeue() {
+        let bus = ConsensusBusApp::new();
+        let next = fill_epoch_request_queue(&bus, 0).await;
+        // unconstrained: the fill spends the task's coop budget, and a send polled without budget
+        // reports pending before it joins the queue of senders waiting for a slot
+        let waiting = tokio::task::unconstrained(
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        );
+        tokio::pin!(waiting);
+        assert!(futures::poll!(waiting.as_mut()).is_pending(), "a producer waits on a full queue");
+
+        let request = next_request(&bus).await;
+        assert_eq!(request.epoch(), 0);
+        assert!(
+            bus.try_requeue_epoch_pack_file(request).is_some(),
+            "the waiting producer holds the freed slot"
+        );
+        assert!(
+            futures::poll!(waiting.as_mut()).is_ready(),
+            "the waiting producer's send completes"
+        );
+    }
+
+    /// An epoch is queued once: a second request is refused while the first is queued or held by a
+    /// fetch, and the epoch can be queued again once that request is dropped.
+    #[tokio::test]
+    async fn epoch_pack_request_is_queued_once_until_released() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let request = next_request(&bus).await;
+        assert_eq!(request.epoch(), 7);
+        assert!(epoch_request_queue_is_empty(&bus).await, "a queued epoch is not queued twice");
+
+        // a fetch worker holds the dequeued request
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert!(epoch_request_queue_is_empty(&bus).await, "an epoch being fetched is not queued");
+
+        drop(request);
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7, "a released epoch is queued again");
+    }
+
+    /// A re-queued request carries its claim back into the queue, so a producer's request for the
+    /// same epoch is refused and the epoch drains once.
+    #[tokio::test]
+    async fn requeued_epoch_pack_request_keeps_its_claim() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let request = next_request(&bus).await;
+        assert!(bus.try_requeue_epoch_pack_file(request).is_none(), "the queue has room");
+
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7);
+        assert!(epoch_request_queue_is_empty(&bus).await, "the re-queued epoch drains once");
+    }
+
+    /// A producer that stops waiting on the full queue releases its epoch, so a later request for
+    /// it is queued.
+    #[tokio::test]
+    async fn cancelled_epoch_pack_send_releases_its_claim() {
+        let bus = ConsensusBusApp::new();
+        let next = fill_epoch_request_queue(&bus, 0).await;
+        // boxed so dropping it drops the send; unconstrained because the fill spends the task's
+        // coop budget, and a send polled without budget reports pending before it joins the queue
+        // of senders waiting for a slot
+        let mut waiting = Box::pin(tokio::task::unconstrained(
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        ));
+        assert!(futures::poll!(waiting.as_mut()).is_pending(), "a producer waits on a full queue");
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        )
+        .await
+        .expect("a request for the epoch the waiting send claimed returns at once");
+        drop(waiting);
+
+        assert_eq!(next_epoch(&bus).await, 0);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(next)),
+        )
+        .await
+        .expect("the freed slot takes the request");
+        for expected in 1..next {
+            assert_eq!(next_epoch(&bus).await, expected);
+        }
+        assert_eq!(next_epoch(&bus).await, next, "the cancelled send's epoch is queued again");
+        assert!(epoch_request_queue_is_empty(&bus).await);
+    }
+
+    /// A fetch that panics while it holds a request still releases the epoch.
+    #[tokio::test]
+    async fn panicking_fetch_releases_its_claim() {
+        let bus = ConsensusBusApp::new();
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let fetch = tokio::spawn({
+            let bus = bus.clone();
+            async move {
+                let request = bus.get_next_epoch_pack_file_request().await;
+                if request.is_some() {
+                    panic!("the fetch panics while it holds the request");
+                }
+            }
+        });
+        let error = fetch.await.expect_err("the fetch panicked");
+        assert!(error.is_panic(), "the fetch ended by panicking");
+
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        assert_eq!(next_epoch(&bus).await, 7, "the panicked fetch released its epoch");
+    }
+
+    /// A record for another epoch is dropped and counted, while a record for the requested epoch
+    /// replaces the queued one.
+    #[tokio::test]
+    async fn set_epoch_record_drops_and_counts_a_record_for_another_epoch() {
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        // the bus registers its metrics with the recorder that is active while it is built
+        let bus = metrics::with_local_recorder(&recorder, ConsensusBusApp::new);
+        bus.request_epoch_pack_file(EpochRecord::default(), epoch_record(7)).await;
+        let mut request = next_request(&bus).await;
+        let queued = request.epoch_record().clone();
+        let newer = |epoch| EpochRecord {
+            final_consensus: ConsensusNumHash { number: 42, ..Default::default() },
+            ..epoch_record(epoch)
+        };
+
+        assert!(!request.set_epoch_record(newer(8)), "a record for another epoch is dropped");
+        assert_eq!(request.epoch_record(), &queued, "the dropped record leaves the queued one");
+        let mismatches =
+            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+                (key.key().name() == "tn_primary.epoch_pack_record_epoch_mismatch_total")
+                    .then_some(value)
+            });
+        assert!(
+            matches!(mismatches, Some(DebugValue::Counter(1))),
+            "the dropped record is counted once, got {mismatches:?}"
+        );
+
+        assert!(request.set_epoch_record(newer(7)), "a record for the requested epoch is applied");
+        assert_eq!(request.epoch_record(), &newer(7));
+    }
+
+    /// A bounded que channel queues exactly its capacity, then makes the producer wait.
+    #[tokio::test]
+    async fn que_channel_with_capacity_applies_backpressure() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let mut rx = channel.subscribe();
+        for item in 0..4 {
+            assert!(channel.send(item).await.is_ok(), "a send within capacity completes");
+        }
+        assert!(matches!(channel.try_send(4), Err(TrySendError::Full(4))));
+
+        // a fifth send waits for room instead of dropping or overwriting anything
+        let fifth = channel.send(4);
+        tokio::pin!(fifth);
+        assert!(futures::poll!(fifth.as_mut()).is_pending(), "a send into a full queue waits");
+
+        // one recv frees a slot and the waiting send completes
+        assert_eq!(rx.recv().await, Some(0));
+        assert!(matches!(futures::poll!(fifth.as_mut()), Poll::Ready(Ok(()))));
+        for expected in 1..=4 {
+            assert_eq!(rx.try_recv(), Ok(expected));
+        }
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// A burst of three times the capacity against a slow consumer arrives complete and in
+    /// order.
+    #[tokio::test]
+    async fn que_channel_burst_loses_nothing() {
+        const CAPACITY: usize = 8;
+        const ITEMS: u64 = CAPACITY as u64 * 3;
+        let channel = QueChannel::<u64>::with_capacity(CAPACITY);
+        let mut rx = channel.subscribe();
+        let producer = tokio::spawn({
+            let channel = channel.clone();
+            async move {
+                for item in 0..ITEMS {
+                    assert!(channel.send(item).await.is_ok(), "send failed");
+                }
+            }
+        });
+
+        for expected in 0..ITEMS {
+            let item = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("the next item arrives")
+                .expect("the channel stays open");
+            assert_eq!(item, expected);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        producer.await.expect("the producer finishes");
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+    }
+
+    /// `sync_output` is a bounded queue: once full it reports `Full`, which a broadcast never
+    /// does. A new subscription starts empty even though the previous one left the queue full.
+    #[test]
+    fn sync_output_is_bounded_backpressured_queue() {
+        let bus = ConsensusBusApp::new();
+        let rx = bus.subscribe_sync_output();
+        for number in 1..=SYNC_OUTPUT_CHANNEL_CAPACITY as u64 {
+            assert!(bus.sync_output().try_send(output(number)).is_ok(), "output {number} fits");
+        }
+        assert!(matches!(
+            bus.sync_output().try_send(output(SYNC_OUTPUT_CHANNEL_CAPACITY as u64 + 1)),
+            Err(TrySendError::Full(_))
+        ));
+
+        drop(rx);
+        let mut rx = bus.subscribe_sync_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// `consensus_output` is a bounded queue: once full it reports `Full`, a further send waits
+    /// for the epoch manager to receive, and every output then arrives in order. A broadcast here
+    /// would overwrite the oldest unread outputs instead.
+    #[tokio::test]
+    async fn consensus_output_is_bounded_backpressured_queue() {
+        const CAPACITY: u64 = CONSENSUS_OUTPUT_CHANNEL_CAPACITY as u64;
+        let bus = ConsensusBusApp::new();
+        let mut rx = bus.subscribe_consensus_output();
+        for number in 1..=CAPACITY {
+            assert!(
+                bus.consensus_output().try_send(output(number)).is_ok(),
+                "output {number} fits"
+            );
+        }
+        assert!(matches!(
+            bus.consensus_output().try_send(output(CAPACITY + 1)),
+            Err(TrySendError::Full(_))
+        ));
+
+        // the next send waits for room instead of dropping or overwriting anything
+        let next = bus.consensus_output().send(output(CAPACITY + 1));
+        tokio::pin!(next);
+        assert!(futures::poll!(next.as_mut()).is_pending(), "a send into a full queue waits");
+
+        // one recv frees a slot and the waiting send completes
+        assert_eq!(rx.recv().await.map(|received| received.number()), Some(1));
+        assert!(matches!(futures::poll!(next.as_mut()), Poll::Ready(Ok(()))));
+        for expected in 2..=CAPACITY + 1 {
+            assert_eq!(rx.try_recv().map(|received| received.number()), Ok(expected));
+        }
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// With no subscriber a `consensus_output` send is a no-op: more sends than the queue holds
+    /// all complete without waiting, and a later subscription starts empty.
+    #[tokio::test]
+    async fn consensus_output_send_without_subscriber_is_noop() {
+        let bus = ConsensusBusApp::new();
+        for number in 1..=CONSENSUS_OUTPUT_CHANNEL_CAPACITY as u64 + 1 {
+            let sent = tokio::time::timeout(
+                Duration::from_secs(1),
+                bus.consensus_output().send(output(number)),
+            )
+            .await
+            .unwrap_or_else(|_| panic!("send {number} without a subscriber waited"));
+            assert!(sent.is_ok(), "send {number} without a subscriber succeeds");
+        }
+
+        let mut rx = bus.subscribe_consensus_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// A new `consensus_output` subscription starts empty: outputs a previous epoch manager left
+    /// unread are discarded rather than handed to the next epoch, and what is sent afterwards
+    /// arrives.
+    #[test]
+    fn consensus_output_resubscribe_discards_leftovers() {
+        let bus = ConsensusBusApp::new();
+        let rx = bus.subscribe_consensus_output();
+        assert!(bus.consensus_output().try_send(output(1)).is_ok());
+        assert!(bus.consensus_output().try_send(output(2)).is_ok());
+        drop(rx);
+
+        let mut rx = bus.subscribe_consensus_output();
+        assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+        assert!(bus.consensus_output().try_send(output(3)).is_ok());
+        assert_eq!(rx.try_recv().map(|received| received.number()), Ok(3));
+    }
+
+    /// `subscribe_fresh` drops what a previous subscriber left unread and then delivers what is
+    /// sent to it.
+    #[test]
+    fn subscribe_fresh_discards_previous_subscriber_leftovers() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let rx = channel.subscribe();
+        assert!(channel.try_send(1).is_ok());
+        assert!(channel.try_send(2).is_ok());
+        drop(rx);
+
+        let mut rx = channel.subscribe_fresh();
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
+        assert!(channel.try_send(3).is_ok());
+        assert_eq!(rx.try_recv(), Ok(3));
+    }
+
+    /// Plain `subscribe` still hands leftovers to the next subscriber; `primary_network_events`
+    /// relies on messages surviving a resubscribe.
+    #[test]
+    fn subscribe_keeps_previous_subscriber_leftovers() {
+        let channel = QueChannel::<u64>::with_capacity(4);
+        let rx = channel.subscribe();
+        assert!(channel.try_send(1).is_ok());
+        assert!(channel.try_send(2).is_ok());
+        drop(rx);
+
+        let mut rx = channel.subscribe();
+        assert_eq!(rx.try_recv(), Ok(1));
+        assert_eq!(rx.try_recv(), Ok(2));
+        assert_eq!(rx.try_recv(), Err(TryRecvError::Empty));
     }
 }

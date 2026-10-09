@@ -21,8 +21,6 @@ pub use types::{PeerExchangeMap, Penalty};
 // visibility for tests
 #[cfg(test)]
 pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
-#[cfg(test)]
-pub(crate) use score::GLOBAL_SCORE_CONFIG;
 
 /// Shared production thresholds used by the consensus call-site regression tests.
 #[cfg(test)]

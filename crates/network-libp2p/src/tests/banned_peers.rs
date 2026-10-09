@@ -1,7 +1,7 @@
 //! Unit tests for banned peers
 
 use super::*;
-use crate::common::{ensure_score_config, random_ip_addr};
+use crate::common::random_ip_addr;
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use std::net::Ipv4Addr;
 
@@ -18,8 +18,6 @@ fn multiaddr_with_ip(ip: IpAddr) -> Multiaddr {
 
 /// Helper function to create a peer whose given IPs were observed on real connections.
 fn create_peer_with_ips(ips: Vec<IpAddr>) -> Peer {
-    ensure_score_config(None);
-
     let mut peer = Peer::default_for_test();
 
     // register each IP as an observed outgoing connection address
@@ -106,7 +104,6 @@ fn test_add_multiple_peers_same_ip() {
 
 #[test]
 fn test_add_peer_no_ip() {
-    ensure_score_config(None);
     let mut banned_peers = BannedPeers::default();
 
     // Create a peer with no IP addresses
@@ -344,7 +341,6 @@ fn test_remove_banned_peer_keeps_entry_until_zero() {
 /// banned, flip that honest IP to banned - denying the honest peer's real inbound connections.
 #[test]
 fn test_advertised_only_ip_never_feeds_ban_counter() {
-    ensure_score_config(None);
     let mut banned_peers = BannedPeers::default();
     // fixed, distinct addresses (TEST-NET blocks) so the test is deterministic - the attacker IPs
     // must never collide with the victim IP or the observed-vs-advertised assertions below become

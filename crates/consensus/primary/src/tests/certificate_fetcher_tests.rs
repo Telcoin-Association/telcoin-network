@@ -560,7 +560,7 @@ async fn test_timeout_scenario() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
     let round1_certificates: Vec<_> =
-        round1_headers.iter().map(|h| fixture.certificate(&h)).collect();
+        round1_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // Create round 2 certificates that depend on round 1 (which are missing)
     let round1_parents: BTreeSet<_> = round1_certificates.iter().map(|c| c.digest()).collect();
@@ -569,7 +569,7 @@ async fn test_timeout_scenario() {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
     let mut round2_certificates: Vec<_> =
-        round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
+        round2_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // trigger fetch by processing a round 2 certificate (which needs round 1 parents)
     let result =
@@ -755,7 +755,7 @@ async fn test_network_failure_keeps_trying() {
     for (digest, worker_id) in round2_headers.iter().flat_map(|h| h.payload().iter()) {
         payload_store.write_payload(digest, worker_id).unwrap();
     }
-    let mut round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(&h)).collect();
+    let mut round2_certs: Vec<_> = round2_headers.iter().map(|h| fixture.certificate(h)).collect();
 
     // trigger fetch
     let result = synchronizer.process_peer_certificate(round2_certs.get_mut(0).unwrap()).await;
@@ -865,7 +865,7 @@ async fn test_partial_response_handling_rejects_invalid_cert() {
     // allow time for writes to db
     sleep(Duration::from_secs(2)).await;
     // NOTE: the cert manager will reject - not fetcher
-    verify_certificates_not_in_store(&certificate_store, &vec![bad_cert]);
+    verify_certificates_not_in_store(&certificate_store, &[bad_cert]);
 }
 
 #[tokio::test(flavor = "current_thread")]

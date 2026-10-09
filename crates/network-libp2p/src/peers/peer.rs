@@ -12,9 +12,10 @@ use libp2p::{
     core::multiaddr::{Multiaddr, Protocol},
     PeerId,
 };
-use std::{collections::HashSet, net::IpAddr, time::Instant};
+use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
+use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -25,17 +26,10 @@ use tracing::{debug, error};
 /// the set keeps a single peer entry bounded in memory and keeps the peer-exchange payload built
 /// from it (`exchange_info`) bounded (GHSA-29v6-gvv5-45gx).
 ///
-/// The protocol assumes exactly one address per peer: a `NodeRecord` advertises one address
-/// (`NodeRecord::build`), a committee entry carries one (`network_address`), and every consumer
-/// acts on a single address for a peer. The set therefore holds only the address the peer most
-/// recently presented. The set is keyed on exact `Multiaddr` equality and one endpoint appears
-/// in two syntactic forms, with and without the `/p2p/<peer_id>` suffix (the advertised form is
-/// whatever the operator configured, the dialed form always carries `/p2p` because libp2p-swarm
-/// appends it to every dial, the inbound observed form never does); under this cap those forms
-/// replace each other instead of accumulating, and either form dials the same endpoint. An
-/// eviction only trims the peer-exchange payload (`exchange_info`): dialing reads `known_peers`,
-/// kad and `discovery_peers`, and banning reads `observed_ip_addresses`, never this set. A cap of
-/// one also bounds the dial fan-out one discovery entry can cause to a single address.
+/// The cap shares the signed record's two-generation, dual-family migration budget. Bare and
+/// `/p2p`-suffixed forms of the same endpoint replace each other. A newer accepted record replaces
+/// the previous advertised set, retiring old dial hints. Ban accounting continues to use actual
+/// connection observations, independently of any advertised endpoint.
 ///
 /// The discovery path reuses this value as the per-entry ceiling in `eligible_for_discovery`:
 /// a PeerExchange entry with more addresses than this set can hold cannot come from an honest
@@ -91,7 +85,7 @@ pub(crate) const MAX_OBSERVED_IPS_PER_PEER: usize = 16;
 /// It is possible we need to track a peer before we have network settings.
 /// These are only used for peer exchange and if not set then this peer will not
 /// be exchaged (which is fine since we don't have this info yet).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(super) struct Peer {
     /// The peers Bls public key.
     bls_public_key: Option<BlsPublicKey>,
@@ -99,7 +93,7 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
-    /// Protocol failures survive trust grants; only load-only scores may be forgiven.
+    /// Protocol failures survive operator trust grants; committee promotion forgives all scores.
     penalty_history: PenaltyHistory,
     /// The multiaddrs associated with this peer: addresses observed on real connections plus any
     /// self-advertised addresses folded in via [`Self::update_net`].
@@ -144,11 +138,15 @@ pub(super) struct Peer {
 
 impl Peer {
     /// Create a new operator-allowlisted peer.
-    pub(super) fn new_trusted(bls_public_key: BlsPublicKey, network_key: NetworkPublicKey) -> Peer {
+    pub(super) fn new_trusted(
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        score_config: Arc<ScoreConfig>,
+    ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::new_max(),
+            score: Score::new_max(score_config),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: true,
             multiaddrs: Default::default(),
@@ -164,11 +162,12 @@ impl Peer {
         bls_public_key: BlsPublicKey,
         network_key: NetworkPublicKey,
         addrs: Vec<Multiaddr>,
+        score_config: Arc<ScoreConfig>,
     ) -> Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::default(),
+            score: Score::new(score_config),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
@@ -179,6 +178,23 @@ impl Peer {
         }
     }
 
+    /// Create an unidentified peer using the owning network instance's scoring policy.
+    pub(super) fn new_unidentified(score_config: Arc<ScoreConfig>) -> Self {
+        Self {
+            bls_public_key: None,
+            network_key: None,
+            score: Score::new(score_config),
+            penalty_history: PenaltyHistory::default(),
+            multiaddrs: Default::default(),
+            observed_ip_addresses: Default::default(),
+            connection_status: Default::default(),
+            operator_allowlisted: false,
+            connection_direction: None,
+            routable: false,
+        }
+    }
+
+    /// Create a non-allowlisted peer at the default policy's maximum score for tests.
     #[cfg(test)]
     pub(super) fn default_for_test() -> Self {
         use rand::{rngs::StdRng, SeedableRng as _};
@@ -189,7 +205,7 @@ impl Peer {
         Self {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
-            score: Score::new_max(),
+            score: Score::new_max(Arc::new(ScoreConfig::default())),
             penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: Default::default(),
@@ -200,11 +216,11 @@ impl Peer {
         }
     }
 
-    /// Update keys and merge advertised network addresses.
+    /// Update keys and replace advertised network addresses after an accepted record.
     ///
-    /// The merged addresses are self-advertised (they arrive on a peer record, not on an observed
-    /// connection). They are used for dialing and peer exchange only and are never treated as
-    /// observed connection IPs, so they do not feed the per-IP ban counter
+    /// The replacement addresses are self-advertised (they arrive on a peer record, not on an
+    /// observed connection). They are used for dialing and peer exchange only and are never
+    /// treated as observed connection IPs, so they do not feed the per-IP ban counter
     /// ([`Self::observed_ip_addresses`] / GHSA-6qcj-p42p-779j).
     pub(super) fn update_net(
         &mut self,
@@ -214,7 +230,7 @@ impl Peer {
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
-        multiaddrs.into_iter().for_each(|multiaddr| self.note_multiaddr(multiaddr));
+        self.multiaddrs = multiaddrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect();
     }
 
     /// Record a multiaddr the peer is using, keeping the set within [`MAX_MULTIADDRS_PER_PEER`].
@@ -225,12 +241,20 @@ impl Peer {
     /// payload built by [`Self::exchange_info`]. If admitting it pushes the set over the cap, one
     /// of the other addresses is evicted to restore the bound. Re-recording an address already
     /// present is a no-op. A self-advertised republish flood therefore churns the set within the
-    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). With the cap at one (see
-    /// [`MAX_MULTIADDRS_PER_PEER`]) the set is the address the peer most recently presented, and
-    /// the bare and `/p2p`-suffixed forms of one honest endpoint replace each other. An eviction
+    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). Bare and `/p2p`-suffixed
+    /// forms of one honest endpoint replace each other. An eviction
     /// can only ever trim that payload: the ban path reads [`Self::observed_ip_addresses`], not
     /// this set.
     fn note_multiaddr(&mut self, multiaddr: Multiaddr) {
+        let endpoint: Multiaddr =
+            multiaddr.iter().filter(|protocol| !matches!(protocol, Protocol::P2p(_))).collect();
+        self.multiaddrs.retain(|known| {
+            known
+                .iter()
+                .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
+                .collect::<Multiaddr>()
+                != endpoint
+        });
         if self.multiaddrs.insert(multiaddr.clone())
             && self.multiaddrs.len() > MAX_MULTIADDRS_PER_PEER
         {
@@ -294,14 +318,16 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// Load-scoring privileges suppress only temporary overload. Protocol and cryptographic
-    /// violations remain attributable, scored, and eligible for bans for every peer.
+    /// Committee peers remain score-exempt for liveness. Operator trust alone suppresses only
+    /// temporary overload; protocol and cryptographic failures remain scoreable for those peers.
     pub(super) fn apply_penalty(&mut self, penalty: Penalty, policy: PeerPolicy) -> Reputation {
         if policy.applies(penalty) {
             self.penalty_history.record(penalty);
             self.score.apply_penalty(penalty);
-        } else {
+        } else if penalty.is_load() {
             debug!(target: "peer-manager", ?penalty, ?policy, "skipping load penalty for privileged peer");
+        } else {
+            warn!(target: "peer-manager", ?penalty, ?policy, "skipping protocol penalty for committee peer");
         }
 
         // return new reputation
@@ -500,15 +526,14 @@ impl Peer {
         self.penalty_history.permits_forgiveness()
     }
 
-    /// Reset a load-only score to the maximum when the peer acquires committee privileges.
+    /// Reset score and penalty history when the peer acquires committee privileges.
     ///
     /// Called when a peer enters the committee. Trust is not stored on the peer (validator
-    /// status is derived from the committee sets). A recorded protocol violation prevents
-    /// forgiveness, including during a later committee rotation or rediscovery.
+    /// status is derived from the committee sets). Pre-membership penalties must not prevent
+    /// reconnection to a validator needed for consensus liveness.
     pub(super) fn reset_score_to_max(&mut self) {
-        if self.permits_load_forgiveness() {
-            self.score = Score::new_max();
-        }
+        self.score.reset_to_max();
+        self.penalty_history = PenaltyHistory::default();
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.
@@ -532,15 +557,12 @@ impl Peer {
 mod tests {
     use super::*;
     use crate::common::create_multiaddr;
-    use tn_config::ScoreConfig;
 
     /// Regression (GHSA-29v6-gvv5-45gx): a flood of distinct addresses must not grow the stored set
     /// past the cap, and the most recent address must always survive so the ban path keeps
     /// recording the address a peer is currently presenting (a rotated key or a live connection).
     #[test]
     fn note_multiaddr_caps_the_set_and_keeps_the_newest() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more distinct addresses than the cap
@@ -561,6 +583,34 @@ mod tests {
         assert!(peer.multiaddrs.len() <= MAX_MULTIADDRS_PER_PEER);
     }
 
+    /// A new record retires old endpoint hints without discarding real observations for bans.
+    #[test]
+    fn newer_record_retires_advertised_endpoints() {
+        let mut peer = Peer::default_for_test();
+        let old = Multiaddr::empty()
+            .with(Protocol::Ip4([192, 0, 2, 1].into()))
+            .with(Protocol::Udp(9000))
+            .with(Protocol::QuicV1);
+        let new = Multiaddr::empty()
+            .with(Protocol::Ip4([192, 0, 2, 2].into()))
+            .with(Protocol::Udp(9000))
+            .with(Protocol::QuicV1);
+        peer.register_outgoing(old.clone());
+        let observed = peer.observed_ip_addresses.clone();
+        assert!(peer
+            .bls_public_key
+            .zip(peer.network_key.clone())
+            .map(|(bls, network)| {
+                peer.update_net(bls, network.clone(), vec![old.clone(), new.clone()]);
+                assert_eq!(peer.multiaddrs.len(), 2);
+                peer.update_net(bls, network, vec![new.clone()]);
+                assert_eq!(peer.multiaddrs, HashSet::from([new]));
+                assert!(!peer.multiaddrs.contains(&old));
+                assert_eq!(peer.observed_ip_addresses, observed);
+            })
+            .is_some());
+    }
+
     /// The cap holds the address a peer most recently presented (see
     /// [`MAX_MULTIADDRS_PER_PEER`]). One honest endpoint reaches the set in two syntactic forms,
     /// with and without the `/p2p/<peer_id>` suffix (advertised bare, dialed with `/p2p`, seen bare
@@ -569,8 +619,6 @@ mod tests {
     /// endpoint. The cap is exact: two forms of one endpoint would fill a cap of two.
     #[test]
     fn honest_address_forms_replace_each_other_within_the_cap() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
         // the suffix a dial carries is this peer's own id (libp2p-swarm appends it to every dial)
         let peer_id = peer.peer_id();
@@ -586,7 +634,7 @@ mod tests {
 
         // advertised bare (a record or committee entry)
         peer.note_multiaddr(endpoint.clone());
-        assert_eq!(peer.multiaddrs.len(), MAX_MULTIADDRS_PER_PEER);
+        assert_eq!(peer.multiaddrs.len(), 1);
         assert!(peer.multiaddrs.contains(&endpoint), "the advertised form is stored");
 
         // then dialed: the dial always carries `/p2p`, and that form replaces the bare one
@@ -608,8 +656,6 @@ mod tests {
     /// instead of panicking or wrapping. This test would panic on the 256th call before the fix.
     #[test]
     fn register_incoming_saturates_and_never_panics() {
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more inbound connections than `u8::MAX`; a plain `+= 1` panics here in a debug build
@@ -631,7 +677,6 @@ mod tests {
     /// at `u8::MAX` rather than panic (debug) or wrap (release).
     #[test]
     fn register_outgoing_saturates_and_never_panics() {
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         (0..300).for_each(|_| peer.register_outgoing(create_multiaddr(None)));
@@ -655,8 +700,6 @@ mod tests {
     #[test]
     fn observed_ips_clamp_at_the_cap() {
         use std::net::Ipv4Addr;
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // far more distinct genuine source IPs than the cap (TEST-NET-3)
@@ -698,8 +741,6 @@ mod tests {
     #[test]
     fn observed_ips_refuse_new_entries_instead_of_evicting() {
         use std::net::Ipv4Addr;
-        // constructing a `Peer` builds its `Score`, which reads the global score config
-        super::super::score::init_peer_score_config(ScoreConfig::default());
         let mut peer = Peer::default_for_test();
 
         // admit exactly cap-many IPs (TEST-NET-3)

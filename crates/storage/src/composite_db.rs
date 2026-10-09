@@ -5,7 +5,9 @@ use std::{future::Future, sync::Arc};
 
 use tn_types::{Database, DbTx, DbTxMut, Table, TableHint};
 
-use crate::layered_db::{LayeredDatabase, LayeredDbStats, LayeredDbTxMut};
+use crate::layered_db::{
+    LayeredDatabase, LayeredDbStats, LayeredDbTxMut, CACHE_ENV, EPOCH_ENV, KAD_ENV,
+};
 
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
@@ -17,8 +19,11 @@ struct Inner<DB: Database> {
 /// Per-layer [`LayeredDbStats`] for each database in a [`CompositeDatabase`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompositeDbStats {
+    /// Stats for the epoch sub-database (persisted, layered).
     pub epoch: LayeredDbStats,
+    /// Stats for the kad sub-database (persisted, layered).
     pub kad: LayeredDbStats,
+    /// Stats for the cache sub-database (layered; memory holds only unwritten values).
     pub cache: LayeredDbStats,
 }
 
@@ -29,10 +34,14 @@ pub struct CompositeDatabase<DB: Database> {
 }
 
 impl<DB: Database> CompositeDatabase<DB> {
+    /// Open a composite DB over three backends, wrapping each in a [`LayeredDatabase`].
+    ///
+    /// Each layer persists to its backend on its own writer thread. The epoch and kad layers also
+    /// keep every value in memory; the cache layer holds a value only until its write lands.
     pub fn open(epoch_db: DB, kad_db: DB, cache_db: DB) -> Self {
-        let epoch_db = LayeredDatabase::open(epoch_db, true);
-        let kad_db = LayeredDatabase::open(kad_db, true);
-        let cache_db = LayeredDatabase::open(cache_db, false);
+        let epoch_db = LayeredDatabase::open_named(epoch_db, true, EPOCH_ENV);
+        let kad_db = LayeredDatabase::open_named(kad_db, true, KAD_ENV);
+        let cache_db = LayeredDatabase::open_named(cache_db, false, CACHE_ENV);
         Self { inner: Arc::new(Inner { epoch_db, kad_db, cache_db }) }
     }
 

@@ -1,0 +1,38 @@
+name: QUIC handshake profile
+
+on:
+  pull_request:
+    paths:
+      - 'testing/quic-handshake/**'
+      - 'Cargo.lock'
+      - '.github/workflows/quic-handshake-profile.yaml'
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  profile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_TARGET_DIR: ${{ github.workspace }}/testing/quic-handshake/target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
+      - name: Prepare disposable instrumentation
+        run: python3 -P testing/quic-handshake/prepare.py
+      - name: Check profiling harness
+        run: cargo +1.94 clippy --locked --manifest-path testing/quic-handshake/Cargo.toml --all-targets --no-deps -- -D warnings
+      - name: Build profiling harness
+        run: cargo +1.94 build --release --locked --manifest-path testing/quic-handshake/Cargo.toml
+      - name: Verify experiments and collect samples
+        run: python3 -P testing/quic-handshake/run.py --samples 50 --output testing/quic-handshake/results/ci
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quic-handshake-profile
+          path: testing/quic-handshake/results/ci

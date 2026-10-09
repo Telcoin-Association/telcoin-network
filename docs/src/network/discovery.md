@@ -142,11 +142,17 @@ A `Medium` penalty bans a peer after roughly ten occurrences; [Peers](peers.md) 
 
 ## Epoch startup
 
-Epoch startup blocks until the node has at least one connected peer on the network it is joining, polling every 500 milliseconds and giving up after 240 attempts — roughly 2 minutes.
-Failing that, startup errors out rather than hanging indefinitely on a network the node cannot join.
+Process startup initializes swarm listeners, registers bootstrap peers and starts bootstrap dials before the epoch loop.
+Epoch setup refreshes committee membership and starts committee dials without waiting for peers.
+A process-lifetime monitor samples the primary and every configured worker swarm every five seconds, with a one-second bound on each established-peer probe.
+When enabled with `--healthcheck`, `GET /health/network` returns a cached versioned JSON snapshot: `503` until every configured swarm has an established peer, then `200`.
+Connectivity can recover while the node remains running; this route does not certify consensus, sync readiness or RPC transaction acceptance.
 
-Dials to individual committee members are more forgiving.
-They retry with backoff doubling to 120 seconds and give up only after ten retries **and** only once at least one other peer is connected, so a node that is completely isolated keeps trying rather than abandoning its only routes in.
+Bootstrap and committee dials retry with backoff doubling to a cap of 120 seconds.
+Each dial outcome wait is bounded to one second, including command admission; timing out does not cancel the swarm's transport dial.
+An already-dialing reply means the attempt is still pending, so retries continue until a dial succeeds or the peer is already connected.
+A retry task gives up after repeated failures only once at least one other peer is established, so a completely isolated node keeps trying its remaining routes in.
+Startup dial tasks survive epoch turnover; committee dials started by epoch setup use the epoch task manager and are cancelled at its boundary.
 
 > [!NOTE]
 > Reaching a peer is only the first step.
@@ -162,7 +168,10 @@ They retry with backoff doubling to 120 seconds and give up only after ten retri
 | Inbound rate limits, discovery heartbeat, peer pools | `crates/network-libp2p/src/peers/manager.rs` |
 | Advertised address cap | `crates/network-libp2p/src/peers/peer.rs` (`MAX_MULTIADDRS_PER_PEER`) |
 | TTL, republication interval, k-bucket size, peer targets | `crates/config/src/network.rs` |
-| Bootstrap peer sourcing, startup peer wait | `crates/node/src/manager/node/start_epoch.rs` |
+| Process-lifetime swarm setup, bootstrap registration and dials | `crates/node/src/manager/node.rs` |
+| Per-epoch committee refresh and dials | `crates/node/src/manager/node/start_epoch.rs` |
+| Bounded dial retries and isolation recovery | `crates/node/src/network_dial.rs` |
+| Cached network reachability and health routes | `crates/node/src/network_readiness.rs`, `crates/node/src/health.rs` |
 
 This page mirrors those files.
 Update this page when those files change.

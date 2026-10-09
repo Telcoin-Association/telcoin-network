@@ -74,6 +74,9 @@ pub(crate) trait NetworkTypeExt {
     /// back to the variant embedded in the consensus request enums when the peer has not
     /// upgraded yet (`UnsupportedProtocols` is penalty-exempt).
     fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
+
+    /// Current-record retrieval protocol. See [`NetworkType::record_exchange_protocol_name`].
+    fn record_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol>;
 }
 
 impl NetworkTypeExt for NetworkType {
@@ -91,6 +94,11 @@ impl NetworkTypeExt for NetworkType {
 
     fn peer_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
         owned_protocol(self.peer_exchange_protocol_name(chain_id))
+    }
+
+    /// Build the stream-protocol form of the current-record retrieval capability.
+    fn record_exchange_protocol(&self, chain_id: u64) -> NetworkResult<StreamProtocol> {
+        owned_protocol(self.record_exchange_protocol_name(chain_id))
     }
 }
 
@@ -268,6 +276,13 @@ where
         /// The Bls public key for t.
         peers: BTreeMap<BlsPublicKey, P2pNode>,
         /// Reply for connection outcome.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
+    /// Seed fixed launch bindings without granting committee membership.
+    SeedCommitteePeers {
+        /// This swarm's operator-owned BLS/network/address bindings.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Reply after validation and insertion, before startup dials.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
     /// Dial a peer to establish a connection.
@@ -577,6 +592,16 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Seed fixed operator-owned launch bindings before dialing committee peers.
+    pub async fn seed_committee_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SeedCommitteePeers { peers, reply }).await?;
         rx.await?
     }
 
