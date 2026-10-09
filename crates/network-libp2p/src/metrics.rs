@@ -658,6 +658,13 @@ pub(crate) struct SwarmMetrics {
 }
 
 impl SwarmMetrics {
+    /// Observe bounded lookup work and verified record convergence for each swarm role.
+    pub(crate) fn record_committee_refresh(&self, outcome: &'static str) {
+        metrics::counter!("tn_network.committee_record_refresh_total",
+            "network" => self.network.clone(), "outcome" => outcome)
+        .increment(1);
+    }
+
     /// Record effective transport ceilings using only the configured network label.
     pub(crate) fn with_capacity(
         self,

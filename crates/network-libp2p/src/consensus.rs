@@ -481,6 +481,8 @@ where
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
     kad_record_queries: HashMap<QueryId, PendingKadQuery>,
+    /// Last lookup start per tracked committee key, bounding retries after fast failures.
+    committee_record_attempts: HashMap<BlsPublicKey, tokio::time::Instant>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -822,6 +824,7 @@ where
             inbound_requests: Default::default(),
             inbound_pending: InboundOccupancy::default(),
             kad_record_queries: Default::default(),
+            committee_record_attempts: Default::default(),
             config,
             connected_peers: VecDeque::new(),
             pending_px_disconnects,
@@ -1472,6 +1475,8 @@ where
                 // Authoritative membership and identity confirmation must not depend on a
                 // capacity rejection or a failed database deletion during retention cleanup.
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                let members = self.swarm.behaviour().peer_manager.committee_members();
+                self.committee_record_attempts.retain(|key, _| members.contains(key));
                 self.refresh_explicit_peers();
                 self.query_missing_required_records();
                 retention?;
@@ -1492,6 +1497,11 @@ where
             NetworkCommand::GetAllValidatorRpcs { reply } => {
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
                 send_or_log_error!(reply, rpcs, "GetAllValidatorRpcs");
+            }
+            NetworkCommand::RefreshCommitteeRecord { authority } => {
+                if self.swarm.behaviour().peer_manager.committee_members().contains(&authority) {
+                    self.start_record_query(authority);
+                }
             }
             NetworkCommand::OpenStream { peer, reply } => {
                 // Look up the peer's PeerId from their BLS key
@@ -1569,8 +1579,7 @@ where
             .into_iter()
             .for_each(|key| {
                 if self.kad_record_queries.values().all(|query| query.query.request != key) {
-                    let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
-                    self.kad_record_queries.insert(id, key.into());
+                    self.launch_record_query(key);
                 }
             });
     }
@@ -2441,25 +2450,9 @@ where
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
             PeerEvent::MissingAuthorities(missing) => {
-                // Polling callers such as `current_committee_rpcs` report a member as
-                // missing on every call until its signed metadata reaches `known_peers`, so the
-                // same key arrives here repeatedly while its lookup is still in flight.
-                // Issue at most one live `get_record` per key: skip keys already tracked
-                // in `kad_record_queries` (issue #1135). The map is safe as the dedupe
-                // source because every terminal query path removes its entry (see
-                // `close_kad_query`), so a skipped key becomes queryable again as soon
-                // as its current query ends. The removal there runs before any result
-                // filtering, so even a query whose record is dropped as stale or
-                // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
-                        let key = node_record_key(&bls_key);
-                        let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
-                        self.kad_record_queries.insert(query_id, bls_key.into());
-                    } else {
-                        trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
-                    }
-                }
+                // Periodic refresh and missing-RPC polling share the same in-flight
+                // deduplication and cooldown, including unsuccessful terminal queries.
+                missing.into_iter().for_each(|key| self.start_record_query(key));
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
@@ -3045,7 +3038,40 @@ where
         record
     }
 
-    /// Cleanup kad record queries (called on last step).
+    /// Start at most one lookup per key and impose a 30-second committee retry cooldown.
+    ///
+    /// Existing verified mappings remain readable while a lookup is pending or fails. Only
+    /// tracked committee members consume cooldown entries, so rotation bounds this state.
+    fn start_record_query(&mut self, authority: BlsPublicKey) {
+        let in_flight =
+            self.kad_record_queries.values().any(|query| query.query.request == authority);
+        let cooling_down = self
+            .committee_record_attempts
+            .get(&authority)
+            .is_some_and(|started| started.elapsed() < std::time::Duration::from_secs(30));
+        if in_flight || cooling_down {
+            self.metrics.record_committee_refresh("coalesced");
+        } else {
+            self.launch_record_query(authority);
+            self.metrics.record_committee_refresh("started");
+        }
+    }
+
+    /// Issue one lookup and record its start for a tracked committee member.
+    ///
+    /// Required-record refills share this path, so their lookups also count toward the
+    /// committee retry cooldown.
+    fn launch_record_query(&mut self, authority: BlsPublicKey) {
+        if self.swarm.behaviour().peer_manager.committee_members().contains(&authority) {
+            self.committee_record_attempts.insert(authority, tokio::time::Instant::now());
+        }
+        let query_id =
+            self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&authority));
+        self.kad_record_queries.insert(query_id, authority.into());
+    }
+
+    /// Cleanup kad record queries (called on last step) without discarding the last verified
+    /// mapping on failure.
     ///
     /// Promote the winning result into the peer manager's bounded discovery cache. Verified
     /// matching results may also fill an independently owned committee or pinned store row in
@@ -3056,16 +3082,31 @@ where
             .remove(query_id)
             .and_then(|query| {
                 let key = query.query.request;
-                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
+                let result =
+                    query.into_result().map(|(record, timestamp)| (key, record, timestamp));
+                if result.is_none() {
+                    self.metrics.record_committee_refresh("unresolved");
+                }
+                result
             })
             .into_iter()
             .for_each(|(key, node_record, timestamp)| {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
+                let member =
+                    self.swarm.behaviour().peer_manager.committee_members().contains(&key);
+                let previous_rpc = self.swarm.behaviour().peer_manager.get_rpc(&key);
                 self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
                     key,
                     node_record.info,
                     timestamp,
                 );
+                let current_rpc = self.swarm.behaviour().peer_manager.get_rpc(&key);
+                if member {
+                    self.metrics.record_committee_refresh("resolved");
+                }
+                if member && previous_rpc != current_rpc {
+                    self.metrics.record_committee_refresh("rpc_updated");
+                }
                 self.refresh_explicit_peer(&peer);
             });
     }

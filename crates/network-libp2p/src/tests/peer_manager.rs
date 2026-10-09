@@ -1690,7 +1690,7 @@ async fn test_current_committee_rpcs_excludes_previous_and_next_only_members() {
     );
 }
 
-/// A signed record without RPC resolves a bootstrap stub and stops metadata discovery.
+/// A signed record without RPC resolves a bootstrap stub but remains eligible for URL recovery.
 #[tokio::test]
 async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
     let mut peer_manager = create_test_peer_manager(None);
@@ -1711,12 +1711,13 @@ async fn test_current_committee_rpcs_ignores_members_without_advertised_rpc() {
         peer_manager.current_committee_rpcs().is_empty(),
         "member without advertised rpc must be excluded"
     );
-    // ... and its record is learned, so no futile re-discovery is triggered
+    // Its learned identity remains cached while discovery can recover a later RPC advertisement.
+    assert!(!peer_manager.record_unlearned(&bls));
     let events = collect_all_events(&mut peer_manager);
     let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
     assert!(
-        missing_events.is_empty(),
-        "a learned record without rpc must not trigger discovery from the snapshot call"
+        !missing_events.is_empty(),
+        "a learned record without rpc must request a fresh advertisement"
     );
 }
 
@@ -1859,11 +1860,10 @@ async fn test_current_committee_rpcs_rediscovers_members_held_as_bootstrap_stub(
     assert!(missing_events.is_empty(), "a learned record must not be re-discovered");
 }
 
+/// A verified RPC-less record requests recovery without being removed from the cache.
 #[tokio::test]
-async fn test_current_committee_rpcs_no_rediscovery_for_learned_record_without_rpc() {
-    // Chasing is keyed on "is the record learned?", not "does it carry an rpc?": a validator
-    // that genuinely advertises nothing must not cause kad churn, including one whose stub was
-    // replaced by an rpc-less learned record.
+async fn committee_record_missing_rpc_is_refreshed() {
+    // A learned record with no submit URL needs bounded recovery rather than a restart.
     let mut peer_manager = create_test_peer_manager(None);
     let bls = *BlsKeypair::generate(&mut StdRng::from_seed([61; 32])).public();
 
@@ -1883,9 +1883,44 @@ async fn test_current_committee_rpcs_no_rediscovery_for_learned_record_without_r
     let events = collect_all_events(&mut peer_manager);
     let missing_events = extract_events(&events, |e| matches!(e, PeerEvent::MissingAuthorities(_)));
     assert!(
-        missing_events.is_empty(),
-        "a learned record without rpc must not trigger discovery from the snapshot call"
+        !missing_events.is_empty(),
+        "a learned record without rpc must trigger bounded discovery"
     );
+}
+
+/// Scheduled refresh covers every cached committee slot and does not burst between deadlines.
+#[tokio::test(start_paused = true)]
+async fn committee_record_heartbeat_refreshes_all_cached_slots() -> eyre::Result<()> {
+    let mut manager = create_test_peer_manager(None);
+    let keys = [71_u8, 73, 79]
+        .map(|seed| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public());
+    let [previous, current, next] = keys;
+    manager.update_committees(
+        HashSet::from([previous]),
+        HashSet::from([current]),
+        HashSet::from([next]),
+    );
+    let mut info = random_network_info();
+    info.rpc = Some(RpcInfo { http: "https://validator.example:8545".parse()?, ws: None });
+    keys.iter().for_each(|key| manager.add_discovered_peer(*key, info.clone()));
+    collect_all_events(&mut manager);
+    tokio::time::advance(Duration::from_secs(59)).await;
+    manager.heartbeat();
+    assert!(collect_all_events(&mut manager)
+        .iter()
+        .all(|event| !matches!(event, PeerEvent::MissingAuthorities(_))));
+    tokio::time::advance(Duration::from_secs(1)).await;
+    manager.heartbeat();
+    let expected = HashSet::from(keys);
+    assert!(collect_all_events(&mut manager).iter().any(|event| {
+        matches!(event, PeerEvent::MissingAuthorities(keys)
+            if keys.iter().copied().collect::<HashSet<_>>() == expected)
+    }));
+    manager.heartbeat();
+    assert!(collect_all_events(&mut manager)
+        .iter()
+        .all(|event| !matches!(event, PeerEvent::MissingAuthorities(_))));
+    Ok(())
 }
 
 #[tokio::test]

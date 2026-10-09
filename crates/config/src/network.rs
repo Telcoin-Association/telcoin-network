@@ -457,11 +457,11 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
     /// The k-bucket size for kademlia.
     pub k_bucket_size: NonZeroUsize,
-    /// The TTL applied to kademlia records — both the libp2p record TTL and the
+    /// The TTL applied to kademlia records, both the libp2p record TTL and the
     /// local store's `expires` timestamp. Drives eviction of records that are
     /// never refreshed. Also used for provider record TTL.
     pub kad_record_ttl: Duration,
-    /// How often this node republishes its own kademlia records.
+    /// How often the dedicated network timer re-signs and publishes this node's own record.
     ///
     /// Must be nonzero to give republication a positive cadence. Must also be <
     /// `kad_record_ttl`, otherwise records expire before they are refreshed.
@@ -493,13 +493,11 @@ pub struct LibP2pConfig {
 }
 
 impl LibP2pConfig {
-    /// Reject kad cadences that would panic the network task or break record persistence.
+    /// Validate the signed publication cadence and legacy replication configuration.
     ///
-    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
-    /// equal to the current time, triggering its unconditional assertion on the first swarm
-    /// poll. Publication and replication must also occur before records expire. Validate at
-    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
-    /// configuration error before either critical network task starts.
+    /// Own publication must occur before records expire. Preserve the legacy replication
+    /// constraints while retaining that serialized setting. Validate at startup beside
+    /// [`ScoreConfig::validate`] to report field-named errors before network tasks start.
     pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
             !self.kad_replication_interval.is_zero(),

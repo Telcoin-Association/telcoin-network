@@ -11,7 +11,7 @@ use libp2p::{
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
-use tn_types::{BlsPublicKey, NetworkPublicKey, P2pNode};
+use tn_types::{BlsPublicKey, CommitteeRecordRefresher, NetworkPublicKey, P2pNode};
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
 pub use tn_types::RpcInfo;
@@ -481,6 +481,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
+    /// Re-resolve a committee record even when a verified mapping is already cached.
+    RefreshCommitteeRecord {
+        /// Committee authority whose endpoint needs recovery.
+        authority: BlsPublicKey,
+    },
     /// Read a single record from the local kad store by BLS key.
     ///
     /// Test-only observation hook used to assert local-store eviction
@@ -829,6 +834,13 @@ where
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
         rx.await.map_err(Into::into)
+    }
+}
+
+impl<Req: TNMessage, Res: TNMessage> CommitteeRecordRefresher for NetworkHandle<Req, Res> {
+    fn refresh_record(&self, authority: BlsPublicKey) {
+        // A full command channel leaves periodic refresh responsible for recovery.
+        let _ = self.sender.try_send(NetworkCommand::RefreshCommitteeRecord { authority });
     }
 }
 

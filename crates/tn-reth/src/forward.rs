@@ -75,7 +75,10 @@ use std::{
     sync::{Arc, Mutex},
     time::Duration,
 };
-use tn_types::{BlsPublicKey, RpcInfo, TaskSpawner, TxnForwarder};
+use tn_types::{
+    BlsPublicKey, CommitteeRecordRefresher, NoopCommitteeRecordRefresher, RpcInfo, TaskSpawner,
+    TxnForwarder,
+};
 use tokio::{
     sync::{OwnedSemaphorePermit, Semaphore},
     time::{timeout, Instant},
@@ -438,11 +441,34 @@ struct EndpointCache {
     /// endpoint leaves the advertisement set, whichever comes first. Bounded the same way as
     /// `providers`: entries for endpoints no longer advertised are evicted on each forward.
     unreachable: BTreeMap<String, Instant>,
+    /// Recovery requests shared by forwarder clones and bounded by the committee's keys.
+    refresh_requests: BTreeMap<BlsPublicKey, Instant>,
+    /// Latest authoritative forwarding committee, excluding requests from rotated-out tasks.
+    committee: BTreeSet<BlsPublicKey>,
+}
+
+/// Coalesce endpoint recovery requests while the swarm resolves a replacement record.
+fn request_record_refresh<R: CommitteeRecordRefresher>(
+    cache: &mut EndpointCache,
+    refresher: &R,
+    authority: BlsPublicKey,
+) {
+    if cache.committee.contains(&authority)
+        && cache
+            .refresh_requests
+            .get(&authority)
+            .is_none_or(|requested| requested.elapsed() >= UNREACHABLE_COOLDOWN)
+    {
+        cache.refresh_requests.insert(authority, Instant::now());
+        refresher.refresh_record(authority);
+    }
 }
 
 /// Forwards observer transactions to validators over their advertised JSON-RPC endpoints.
 #[derive(Clone)]
-pub struct WorkerRpcForwarder {
+pub struct WorkerRpcForwarder<R = NoopCommitteeRecordRefresher> {
+    /// Non-blocking path to request a fresh committee record from the worker swarm.
+    record_refresher: R,
     /// Spawner used to run the (best-effort, non-blocking) forward on a background task.
     task_spawner: TaskSpawner,
     /// Which advertised hosts this node is willing to dial.
@@ -464,7 +490,7 @@ pub struct WorkerRpcForwarder {
     requeue_pool: Option<WorkerTxPool>,
 }
 
-impl std::fmt::Debug for WorkerRpcForwarder {
+impl<R> std::fmt::Debug for WorkerRpcForwarder<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("WorkerRpcForwarder")
     }
@@ -494,11 +520,29 @@ impl WorkerRpcForwarder {
     ) -> Self {
         ForwarderMetrics::init();
         Self {
+            record_refresher: NoopCommitteeRecordRefresher,
             task_spawner,
             policy,
             cache: Arc::new(Mutex::new(EndpointCache::default())),
             forwards_in_flight: Arc::new(Semaphore::new(MAX_CONCURRENT_FORWARDS)),
             requeue_pool,
+        }
+    }
+}
+
+impl<R: CommitteeRecordRefresher> WorkerRpcForwarder<R> {
+    /// Connect endpoint recovery to the worker swarm without blocking batch production.
+    pub fn with_record_refresher<S: CommitteeRecordRefresher>(
+        self,
+        record_refresher: S,
+    ) -> WorkerRpcForwarder<S> {
+        WorkerRpcForwarder {
+            record_refresher,
+            task_spawner: self.task_spawner,
+            policy: self.policy,
+            cache: self.cache,
+            forwards_in_flight: self.forwards_in_flight,
+            requeue_pool: self.requeue_pool,
         }
     }
 
@@ -533,7 +577,11 @@ impl WorkerRpcForwarder {
                 // the provider cache nor re-created, so a committee whose only advertised
                 // endpoint just proved unreachable refuses the next batch (keeping its
                 // transactions pooled) instead of admitting it (issue #1145).
-                (!cache.unreachable.contains_key(&url)).then_some(())?;
+                let reachable = !cache.unreachable.contains_key(&url);
+                if !reachable {
+                    request_record_refresh(&mut cache, &self.record_refresher, *key);
+                }
+                reachable.then_some(())?;
                 cache
                     .providers
                     .get(&url)
@@ -576,6 +624,10 @@ impl WorkerRpcForwarder {
                             })
                     })
                     .map(|provider| (*key, (url, provider)))
+                    .or_else(|| {
+                        request_record_refresh(&mut cache, &self.record_refresher, *key);
+                        None
+                    })
             })
             .collect()
     }
@@ -606,6 +658,7 @@ impl WorkerRpcForwarder {
         let fallbacks = shuffled_fallbacks(providers.keys().cloned().collect(), &mut rand::rng());
         let cache = Arc::clone(&self.cache);
         let requeue_pool = self.requeue_pool.clone();
+        let record_refresher = self.record_refresher.clone();
 
         self.task_spawner.spawn_task("forward-txns", async move {
             // Moved in rather than released when `forward_txns` returned, so capacity comes
@@ -680,6 +733,15 @@ impl WorkerRpcForwarder {
                     ),
                 )
                 .await;
+                {
+                    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let failed: Vec<_> = providers.iter()
+                        .filter(|(_, (url, _))| cache.unreachable.contains_key(url))
+                        .map(|(key, _)| *key).collect();
+                    failed.into_iter().for_each(|key| {
+                        request_record_refresh(&mut cache, &record_refresher, key);
+                    });
+                }
                 // `Err` from the timeout is the budget itself expiring, as opposed to the
                 // chain returning [`ForwardOutcome::NoEndpointReached`] as a verdict; the
                 // tally below needs the two apart, so remember which happened before
@@ -856,15 +918,24 @@ async fn requeue_one(pool: Option<&WorkerTxPool>, ready_at: Instant, tx: Vec<u8>
     usize::from(added)
 }
 
-impl TxnForwarder for WorkerRpcForwarder {
+impl<R: CommitteeRecordRefresher> TxnForwarder for WorkerRpcForwarder<R> {
     fn forward_txns(
         &self,
         transactions: Vec<Vec<u8>>,
         committee_slots: Vec<BlsPublicKey>,
         validator_rpcs: Vec<(BlsPublicKey, RpcInfo)>,
     ) -> bool {
-        let committee_size = committee_slots.len() as u64;
+        let committee_size = u64::try_from(committee_slots.len()).unwrap_or(u64::MAX);
         let queued = transactions.len();
+        if queued > 0 {
+            let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.committee = committee_slots.iter().copied().collect();
+            cache.refresh_requests.retain(|key, _| committee_slots.contains(key));
+            committee_slots
+                .iter()
+                .filter(|key| !validator_rpcs.iter().any(|(advertised, _)| advertised == *key))
+                .for_each(|key| request_record_refresh(&mut cache, &self.record_refresher, *key));
+        }
         let queued_total = u64::try_from(queued).unwrap_or(u64::MAX);
         if queued > 0 {
             // The base series the drop and abandon counters read against: every transaction
@@ -1451,6 +1522,8 @@ mod tests {
     use rand::{rngs::StdRng, SeedableRng};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tn_types::{BlsKeypair, TaskManager};
+
+    mod committee_record_refresh_tests;
 
     /// A reason at the cap passes through untouched.
     #[test]
