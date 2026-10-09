@@ -279,6 +279,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Seed fixed launch bindings without granting committee membership.
+    SeedCommitteePeers {
+        /// This swarm's operator-owned BLS/network/address bindings.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Reply after validation and insertion, before startup dials.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Dial a peer to establish a connection.
     Dial {
         /// The peer's id.
@@ -610,6 +617,16 @@ where
         rx.await?
     }
 
+    /// Seed fixed operator-owned launch bindings before dialing committee peers.
+    pub async fn seed_committee_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SeedCommitteePeers { peers, reply }).await?;
+        rx.await?
+    }
+
     /// Dial a peer by Bls public key.
     ///
     /// Return swarm error to caller.
@@ -876,28 +893,11 @@ pub struct KadQuery {
     pub request: BlsPublicKey,
     /// The best result so far.
     pub result: Option<NodeRecord>,
-    /// Original verified wire record, preserving publisher and remaining TTL for retention.
-    record: Option<libp2p::kad::Record>,
-}
-
-impl KadQuery {
-    /// Replace the winning wire record, returning any previous result.
-    pub(crate) fn replace_record(
-        &mut self,
-        record: libp2p::kad::Record,
-    ) -> Option<libp2p::kad::Record> {
-        self.record.replace(record)
-    }
-
-    /// Take the winning record when the query terminates.
-    pub(crate) fn take_record(&mut self) -> Option<libp2p::kad::Record> {
-        self.record.take()
-    }
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None, record: None }
+        Self { request, result: None }
     }
 }
 
