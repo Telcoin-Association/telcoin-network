@@ -1,99 +1,119 @@
-name: CI118 verification runner preflight
+name: CI118 reported capacity diagnostics
 
-"on": workflow_dispatch
+"on":
+  workflow_dispatch:
+    inputs:
+      helper_sha:
+        description: Exact reviewed helper commit SHA
+        required: true
+        type: string
 
 permissions:
   actions: read
   contents: read
 
 jobs:
-  preflight:
+  diagnostic:
     if: >-
       ${{ github.event_name == 'workflow_dispatch' &&
           github.repository == 'Telcoin-Association/telcoin-network' &&
           github.ref == 'refs/heads/work/1476-ci118-verification' }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 4
+    timeout-minutes: 25
+    env:
+      EXPECTED_HELPER_SHA: ${{ inputs.helper_sha }}
+      ACTUAL_REPOSITORY: ${{ github.repository }}
+      ACTUAL_REF: ${{ github.ref }}
+      ACTUAL_EVENT: ${{ github.event_name }}
+      ACTUAL_RUN_ID: ${{ github.run_id }}
+      ACTUAL_RUN_ATTEMPT: ${{ github.run_attempt }}
+      ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
+      ACTUAL_WORKFLOW_COMMIT: ${{ github.sha }}
     steps:
-      - name: Probe disk and pinned run metadata
+      - name: Check exact helper identity and fresh runner disk space
         shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          EXPECTED_REPOSITORY: Telcoin-Association/telcoin-network
-          EXPECTED_REPOSITORY_ID: "780459444"
-          EXPECTED_HEAD: "4556f835e3d4a6f803afc941f4cfcd9cfd7faad1"
-          EXPECTED_RUN: "37914665470"
-          EXPECTED_REF: refs/heads/work/1476-ci118-verification
-          ACTUAL_REPOSITORY: ${{ github.repository }}
-          ACTUAL_REF: ${{ github.ref }}
-          ACTUAL_EVENT: ${{ github.event_name }}
-          ACTUAL_RUN_ID: ${{ github.run_id }}
-          ACTUAL_RUN_ATTEMPT: ${{ github.run_attempt }}
-          ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
-          ACTUAL_WORKFLOW_COMMIT: ${{ github.sha }}
         run: |
           python3 -B -I - <<'PY'
           import json
           import os
           import platform
+          import re
           import shutil
-          import subprocess
 
           env = os.environ
-          floor = 32 * 1024**3
           failures = []
-          report = {"diagnostic_only": True, "capacity_qualified": False,
-                    "workflow_ref": env["ACTUAL_WORKFLOW_REF"],
-                    "workflow_commit": env["ACTUAL_WORKFLOW_COMMIT"],
-                    "run_id": env["ACTUAL_RUN_ID"], "run_attempt": env["ACTUAL_RUN_ATTEMPT"],
-                    "architecture": platform.machine(), "minimum_free_bytes": floor,
-                    "filesystems": {}, "metadata_verified": False, "metadata_requests": 0}
-          identity_ok = (env["ACTUAL_REPOSITORY"] == env["EXPECTED_REPOSITORY"]
-                         and env["ACTUAL_REF"] == env["EXPECTED_REF"]
-                         and env["ACTUAL_EVENT"] == "workflow_dispatch"
-                         and env["ACTUAL_WORKFLOW_REF"] == env["EXPECTED_REPOSITORY"]
-                         + "/.github/workflows/durable-e2e.yaml@" + env["EXPECTED_REF"])
-          if not identity_ok:
-              failures.append("unexpected_repository_ref_or_workflow")
+          expected_sha = env["EXPECTED_HELPER_SHA"]
+          if (not re.fullmatch("[0-9a-f]{40}", expected_sha)
+              or env["ACTUAL_WORKFLOW_COMMIT"] != expected_sha
+              or env["ACTUAL_REPOSITORY"] != "Telcoin-Association/telcoin-network"
+              or env["ACTUAL_REF"] != "refs/heads/work/1476-ci118-verification"
+              or env["ACTUAL_EVENT"] != "workflow_dispatch"
+              or env["ACTUAL_WORKFLOW_REF"] != "Telcoin-Association/telcoin-network/.github/workflows/durable-e2e.yaml@refs/heads/work/1476-ci118-verification"):
+              failures.append("unexpected_helper_repository_ref_workflow_or_commit")
           if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
               failures.append("unsupported_runner_architecture")
+          filesystems = {}
           for label, key in (("runner_temp", "RUNNER_TEMP"), ("workspace", "GITHUB_WORKSPACE")):
               try:
+                  if not os.path.isabs(env[key]) or not os.path.isdir(env[key]):
+                      raise OSError("runner directory unavailable")
                   usage = shutil.disk_usage(env[key])
-                  enough = usage.free >= floor
-                  report["filesystems"][label] = {"path": env[key], "free_bytes": usage.free,
-                                                   "total_bytes": usage.total, "at_least_32_gib_free": enough}
-                  if not enough:
+                  filesystems[label] = {"path": env[key], "free_bytes": usage.free,
+                                        "total_bytes": usage.total, "at_least_32_gib_free": usage.free >= 32 * 1024**3}
+                  if usage.free < 32 * 1024**3:
                       failures.append(label + "_below_32_gib")
               except (KeyError, OSError):
                   failures.append(label + "_disk_probe_unavailable")
-          if identity_ok and "unsupported_runner_architecture" not in failures:
-              endpoint = "repos/" + env["EXPECTED_REPOSITORY"] + "/actions/runs/" + env["EXPECTED_RUN"]
-              fields = "{id,head_sha,run_attempt,event,workflow_id,path,repository_id:.repository.id,head_repository_id:.head_repository.id,status,conclusion}"
-              try:
-                  report["metadata_requests"] = 1
-                  result = subprocess.run(["gh", "api", "--method", "GET", endpoint, "--jq", fields],
-                                          capture_output=True, timeout=20)
-                  if result.returncode or len(result.stdout) > 4096 or len(result.stderr) > 2048:
-                      failures.append("metadata_get_failed_or_output_exceeded_bound")
-                  else:
-                      meta = json.loads(result.stdout)
-                      report["metadata_verified"] = (isinstance(meta, dict)
-                          and meta.get("id") == int(env["EXPECTED_RUN"])
-                          and meta.get("head_sha") == env["EXPECTED_HEAD"]
-                          and meta.get("repository_id") == meta.get("head_repository_id") == int(env["EXPECTED_REPOSITORY_ID"])
-                          and meta.get("run_attempt") == 1 and meta.get("event") == "workflow_dispatch"
-                          and meta.get("workflow_id") == 333176895
-                          and meta.get("path") == ".github/workflows/durable-e2e.yaml")
-                      if report["metadata_verified"]:
-                          report["pinned_run"] = meta
-                      else:
-                          failures.append("metadata_source_repository_or_caller_mismatch")
-              except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
-                  failures.append("metadata_get_unavailable_timeout_or_invalid_json")
-          report["failures"] = failures
-          report["preflight_passed"] = not failures
-          print(json.dumps(report, sort_keys=True))
+          print(json.dumps({"diagnostic_only": True, "capacity_qualified": False,
+                            "independently_rescored": False,
+                            "helper_sha": expected_sha if re.fullmatch("[0-9a-f]{40}", expected_sha) else None,
+                            "run_id": env["ACTUAL_RUN_ID"], "run_attempt": env["ACTUAL_RUN_ATTEMPT"],
+                            "workflow_ref": env["ACTUAL_WORKFLOW_REF"], "filesystems": filesystems,
+                            "preflight_passed": not failures, "failures": failures}, sort_keys=True))
           if failures:
-              raise SystemExit("runner preflight failed: " + ",".join(failures))
+              raise SystemExit("diagnostic preflight failed: " + ",".join(failures))
           PY
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.helper_sha }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Verify reviewed public helper bytes and stage metadata
+        shell: bash
+        run: |
+          python3 -B -I - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["GITHUB_WORKSPACE"]) / "tools/ci118-diagnostic"
+          pins = {
+              "1476-ci118-remote-diagnostic-acquire.py": "3f0a1c989ee521461626b3e844da6cfe4bc67efbf8661a48b6f8d2989bdf38e0",
+              "1476-ci118-remote-diagnostic-reader.py": "9407dcb7890ef678872486eda61ab6a16e0e2a65f8ae60e0ecfe58e34f9113ff",
+              "1476-ci118-remote-diagnostic-test.py": "7859166951654d6a1ad8725ab8d8def0579b43f9a4772a2c4fcc940a7cd41291",
+              "1476-ci118-remote-diagnostic-artifact-metadata.json": "ad1ae221ede54300de425b5a99e5fde495c25e6cc5ea0db3ea6c83cb838000ba",
+          }
+          for name, expected in pins.items():
+              data = (root / name).read_bytes()
+              if hashlib.sha256(data).hexdigest() != expected:
+                  raise SystemExit("reviewed helper hash mismatch: " + name)
+          metadata = (root / "1476-ci118-remote-diagnostic-artifact-metadata.json").read_bytes()
+          destination = Path(os.environ["RUNNER_TEMP"]) / "1476-ci118-capacity-artifact-metadata.json"
+          with destination.open("xb") as output:
+              if output.write(metadata) != len(metadata):
+                  raise SystemExit("short metadata write")
+          print(json.dumps({"diagnostic_only": True, "capacity_qualified": False,
+                            "independently_rescored": False, "input_sha256": pins,
+                            "qualification_source_head": "4556f835e3d4a6f803afc941f4cfcd9cfd7faad1",
+                            "accepted_acquirer_source_sha256": "ade9e6a11d79e23873d20238fe104ce6bf4a7b5ebc61b01b518d3c3d8ef30d0c",
+                            "scorer_source_sha256": "41f8bd3a1611ae92446f9562a8430805611a5b7121961bccc014f2338f4cfb64"}, sort_keys=True))
+          PY
+      - name: Acquire the exact official CI118 capacity artifact
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-remote-diagnostic-acquire.py
+      - name: Read the CI-produced report without extraction or rescoring
+        shell: bash
+        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-remote-diagnostic-reader.py
