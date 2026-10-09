@@ -756,11 +756,14 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
-            kad_store.record_timestamp(&crate::kad::node_record_key(&key)).into_iter().for_each(
-                |timestamp| {
+            behavior
+                .kademlia
+                .store_mut()
+                .record_timestamp(&crate::kad::node_record_key(&key))
+                .into_iter()
+                .for_each(|timestamp| {
                     behavior.peer_manager.restore_record_timestamp(key, timestamp);
-                },
-            );
+                });
             restored += 1;
         }
         if restored > 0 {
@@ -851,6 +854,19 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+    }
+
+    /// Attach the process-wide source budget before starting the swarm.
+    ///
+    /// Pass clones of the same instance to the primary and every worker. The budget
+    /// charges only established QUIC endpoints, after the authenticated handshake.
+    #[must_use]
+    pub fn with_source_admission_budget(
+        mut self,
+        budget: Option<crate::source_admission::SourceAdmissionBudget>,
+    ) -> Self {
+        self.swarm.behaviour_mut().peer_manager.set_source_budget(budget);
+        self
     }
 
     /// Configure ordered externally reachable endpoints independently of the swarm's listeners.

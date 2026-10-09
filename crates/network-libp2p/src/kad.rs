@@ -466,15 +466,18 @@ impl<DB: Database> KadStore<DB> {
         } else {
             let hash = self.key_to_hash(key);
             self.remove(key);
+            // The layered kad tables delete the persisted row on the writer thread without a
+            // tombstone, so a `get` can still read the old row. The memory layer that `remove`
+            // updates at once decides whether the row stays.
             let remains = match self.kad_type {
-                NetworkType::Primary => self.db.get::<KadRecords>(&hash),
-                NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
+                NetworkType::Primary => self.db.contains_key::<KadRecords>(&hash),
+                NetworkType::Worker(_) => self.db.contains_key::<KadWorkerRecords>(&hash),
             }
             .map_err(|error| {
                 error!(target: "network-kad", ?error, ?key, kad_type = ?self.kad_type, "failed to verify Kademlia record deletion");
                 Error::MaxRecords
             })?;
-            if remains.is_some() {
+            if remains {
                 error!(target: "network-kad", ?key, kad_type = ?self.kad_type, "failed to delete unretained Kademlia record; row stays counted");
                 Err(Error::MaxRecords)
             } else {

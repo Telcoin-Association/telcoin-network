@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
+    SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -87,6 +87,9 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// Initial policy, shared by primary and worker swarms. Open preserves compatibility.
     network_mode: NetworkMode,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
     ///
     /// Network readiness is sampled continuously and no longer delays epoch startup.
@@ -216,6 +219,11 @@ impl NetworkConfig {
     /// Set the initial policy before constructing primary and worker swarms.
     pub fn set_network_mode(&mut self, mode: NetworkMode) {
         self.network_mode = mode;
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
     }
 
     /// Return the local launch inventory. Membership remains derived from chain state.
