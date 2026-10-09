@@ -6,26 +6,32 @@
 //! three deliberate additions on the upstream hop: `X-Forwarded-For` /
 //! `X-Forwarded-Proto` (client identity for worker-side logs and the PR3 rate
 //! limits) and the `X-TN-Gateway` hop marker (loop protection; an inbound
-//! request that already carries it is rejected instead of forwarded). The
-//! upstream response body is streamed through, never buffered whole. When no
-//! upstream is ready, or the upstream cannot be reached / times out, the
-//! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
+//! request that already carries it is rejected instead of forwarded). The two
+//! identity headers are built from the client the gateway resolved, never
+//! copied from the request: `X-Forwarded-For` names the peer, or the forwarded
+//! client and then the trusted proxy that vouched for it, and
+//! `X-Forwarded-Proto` is `http` unless a trusted proxy reported `https` (see
+//! [`crate::identity`]). The upstream response body is streamed through, never
+//! buffered whole. When no upstream is ready, or the upstream cannot be reached
+//! / times out, the client receives a well-formed JSON-RPC error instead (see
+//! [`crate::error`]).
 //!
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`classify`]),
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, fmt, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
     extract::{
         rejection::{BytesRejection, FailedToBufferBody},
-        ConnectInfo, State,
+        State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -38,6 +44,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
+    identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
     server::AppState,
     telemetry,
 };
@@ -83,12 +90,6 @@ pub(crate) const HOP_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway"
 /// example the deployment's own advertised endpoint) after one hop.
 const REDIRECT_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway-redirect");
 
-/// De-facto standard header carrying the client IP chain to the upstream.
-const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
-
-/// De-facto standard header carrying the client-facing scheme to the upstream.
-const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
-
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
@@ -97,7 +98,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// stay last in the parameter list.
 pub(crate) async fn proxy(
     State(state): State<AppState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(forwarding): Extension<Forwarding>,
     method: Method,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -162,8 +163,16 @@ pub(crate) async fn proxy(
         },
     };
 
-    match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
-        .await
+    match forward(
+        &state.http,
+        route,
+        method,
+        &headers,
+        body.clone(),
+        upstream_url.clone(),
+        forwarding,
+    )
+    .await
     {
         Ok(response) => {
             telemetry::record_forwarded();
@@ -225,7 +234,9 @@ fn reject_body(rejection: &BytesRejection) -> Response {
 /// into an axum response, preserving the status, body, and content type.
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
-/// [`REDIRECT_HEADER`] toward the query upstream, never both.
+/// [`REDIRECT_HEADER`] toward the query upstream, never both. `forwarding`
+/// supplies `X-Forwarded-For` and `X-Forwarded-Proto`; the client's own values
+/// of those headers are not copied.
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
@@ -236,7 +247,7 @@ async fn forward(
     headers: &HeaderMap,
     body: Bytes,
     upstream_url: Url,
-    peer: SocketAddr,
+    forwarding: Forwarding,
 ) -> Result<Response, reqwest::Error> {
     // JSON-RPC is content-type `application/json`; preserve the client's header
     // when present, default to it otherwise.
@@ -253,8 +264,8 @@ async fn forward(
         .request(method, upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
-        .header(X_FORWARDED_FOR, forwarded_for(headers, peer))
-        .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
+        .header(X_FORWARDED_FOR, forwarding.x_forwarded_for())
+        .header(X_FORWARDED_PROTO, forwarding.x_forwarded_proto())
         .body(body)
         .send()
         .await?;
@@ -304,18 +315,6 @@ pub(crate) fn proxy_client(
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
         .build()
-}
-
-/// The `X-Forwarded-For` value for the upstream hop: the immediate peer
-/// appended to any chain a prior proxy supplied.
-fn forwarded_for(headers: &HeaderMap, peer: SocketAddr) -> HeaderValue {
-    let peer_ip = peer.ip().to_string();
-    let chain = headers
-        .get(X_FORWARDED_FOR)
-        .and_then(|previous| previous.to_str().ok())
-        .map(|previous| format!("{previous}, {peer_ip}"))
-        .unwrap_or(peer_ip);
-    HeaderValue::from_str(&chain).unwrap_or_else(|_| HeaderValue::from_static("unknown"))
 }
 
 /// Classify a `reqwest` forwarding failure into a client-facing gateway error.

@@ -18,24 +18,24 @@
 //! allocations still earns a bucket per allocation, and only the gateway-wide
 //! bucket caps their total.
 //!
-//! The client identity is the immediate TCP peer address (`ConnectInfo`,
-//! injected per connection by the accept loop). The gateway is meant to run
-//! edge-facing; behind an untrusted L7 proxy the peer is that proxy, so the
-//! per-IP bucket would meter the proxy rather than the real client. Terminate
-//! such a proxy's client identity upstream, or run the gateway at the edge (see
-//! the crate README).
+//! The client identity is the request's [`ClientAddr`], resolved by the
+//! identity middleware that runs just before this one: the immediate TCP peer,
+//! or, when that peer is in `--trusted-proxies`, the client it forwarded the
+//! request for (see [`crate::identity`]). Behind a proxy that is not listed the
+//! peer is that proxy, so the per-IP bucket meters the proxy rather than the
+//! real client.
 
 use std::{
     collections::HashMap,
     fmt,
-    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
 
 use axum::{
-    extract::{ConnectInfo, Request, State},
+    extract::{Request, State},
     middleware::Next,
     response::Response,
 };
@@ -44,6 +44,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::{
     error::{error_response, GatewayError},
+    identity::ClientAddr,
     server::{HEALTH_PATH, READY_PATH},
 };
 
@@ -219,7 +220,7 @@ impl PrefixLen {
     }
 
     /// The prefix width, in bits.
-    fn bits(&self) -> u8 {
+    pub(crate) fn bits(&self) -> u8 {
         self.0
     }
 }
@@ -292,7 +293,7 @@ impl Default for PrefixPolicy {
 /// `checked_shl` returns `None` there and the `unwrap_or(0)` yields the all-zero
 /// mask that a `/0` means. At `/32` the shift is zero and the mask is all-ones,
 /// i.e. the identity.
-fn mask_v4(addr: Ipv4Addr, prefix: PrefixLen) -> Ipv4Addr {
+pub(crate) fn mask_v4(addr: Ipv4Addr, prefix: PrefixLen) -> Ipv4Addr {
     let host_bits = u32::from(V4_BITS.saturating_sub(prefix.bits()));
     let mask = u32::MAX.checked_shl(host_bits).unwrap_or(0);
     Ipv4Addr::from(u32::from(addr) & mask)
@@ -300,7 +301,7 @@ fn mask_v4(addr: Ipv4Addr, prefix: PrefixLen) -> Ipv4Addr {
 
 /// Clear the host bits of an IPv6 address below `prefix`. Same full-width shift
 /// guard as [`mask_v4`]: `/0` masks to `::`, `/128` is the identity.
-fn mask_v6(addr: Ipv6Addr, prefix: PrefixLen) -> Ipv6Addr {
+pub(crate) fn mask_v6(addr: Ipv6Addr, prefix: PrefixLen) -> Ipv6Addr {
     let host_bits = u32::from(V6_BITS.saturating_sub(prefix.bits()));
     let mask = u128::MAX.checked_shl(host_bits).unwrap_or(0);
     Ipv6Addr::from(u128::from(addr) & mask)
@@ -415,14 +416,14 @@ impl<C: Clock> RateLimiters<C> {
         Some(Self { clock, global, per_ip })
     }
 
-    /// Admit or reject a request from `peer`. A `None` peer skips the per-IP
-    /// bucket; the global bucket still applies.
+    /// Admit or reject a request from `client` (its [`ClientAddr`]). A `None`
+    /// client skips the per-IP bucket; the global bucket still applies.
     ///
     /// The global bucket is evaluated first and short-circuits (`&&`), so a
     /// request rejected by the global limit does not spend a per-IP token. This
     /// keeps the aggregate cap authoritative and can only reduce, never inflate,
     /// admitted load.
-    pub(crate) fn check(&self, peer: Option<IpAddr>) -> Result<(), GatewayError> {
+    pub(crate) fn check(&self, client: Option<IpAddr>) -> Result<(), GatewayError> {
         let now = self.clock.now();
         let global_ok = self.global.as_ref().is_none_or(|global| {
             lock(&global.bucket).try_admit(
@@ -432,7 +433,7 @@ impl<C: Clock> RateLimiters<C> {
             )
         });
         let allowed = global_ok
-            && self.per_ip.as_ref().zip(peer).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip));
+            && self.per_ip.as_ref().zip(client).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip));
         allowed.then_some(()).ok_or(GatewayError::RateLimited)
     }
 
@@ -476,8 +477,9 @@ pub(crate) async fn run_gc(
     Ok(())
 }
 
-/// Axum middleware: rate-limit by peer IP and globally, rejecting an over-limit
-/// request with the gateway's JSON-RPC `429` envelope before its body is read.
+/// Axum middleware: rate-limit by client IP ([`ClientAddr`]) and globally,
+/// rejecting an over-limit request with the gateway's JSON-RPC `429` envelope
+/// before its body is read.
 pub(crate) async fn rate_limit(
     State(limiters): State<Arc<RateLimiters>>,
     request: Request,
@@ -488,8 +490,8 @@ pub(crate) async fn rate_limit(
     // depools the pod) exactly when it is meant to be absorbing a flood.
     let path = request.uri().path();
     let exempt = path == HEALTH_PATH || path == READY_PATH;
-    let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip());
-    let rejection = (!exempt).then(|| limiters.check(peer).err()).flatten();
+    let client = request.extensions().get::<ClientAddr>().map(|client| client.0);
+    let rejection = (!exempt).then(|| limiters.check(client).err()).flatten();
     // The final dispatch stays a `match`: one arm awaits `next`, which a
     // combinator closure cannot do.
     match rejection {
