@@ -12,17 +12,19 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState, ServerLimits},
+    server::{serve, serve_probes, AppState, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
 ///
-/// Spawns two critical tasks (the HTTP server and the readiness poller) under a
-/// [`TaskManager`] and blocks on `join_until_exit`, which installs the
-/// SIGTERM/ctrl-c handler and drains the tasks on shutdown.
+/// Spawns the HTTP server, the probe listener (with `--probe-addr` set) and the
+/// readiness poller as critical tasks under a [`TaskManager`] and blocks on
+/// `join_until_exit`, which installs the SIGTERM/ctrl-c handler and drains the
+/// tasks on shutdown.
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     let Settings {
         listen_addr,
+        probe_addr,
         upstreams,
         query_upstream,
         readiness_poll_interval,
@@ -152,6 +154,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         spawner.spawn_critical_task(
             "rate-limit-gc",
             run_gc(Arc::clone(limiters), shutdown.subscribe()),
+        );
+    }
+
+    // With `--probe-addr` set, the probes also get a listener of their own,
+    // outside the client connection cap and the rate limits.
+    if let Some(probe_addr) = probe_addr {
+        spawner.spawn_critical_task(
+            "probe-server",
+            serve_probes(probe_addr, state.clone(), header_read_timeout, shutdown.subscribe()),
         );
     }
 

@@ -26,6 +26,16 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_LISTEN_ADDR", default_value = "0.0.0.0:8545")]
     pub(crate) listen_addr: SocketAddr,
 
+    /// Address of a second listener that serves only the probe endpoints
+    /// (`/health` and `/ready`), outside the client connection cap and the
+    /// rate limits, so a flood that holds every client connection cannot make
+    /// an orchestrator's probes time out. The probes stay on `--listen-addr`
+    /// too. Unset (the default) opens no probe listener. The probe listener
+    /// has no connection cap, so bind it where only the orchestrator reaches
+    /// it.
+    #[arg(long, env = "WORKER_GATEWAY_PROBE_ADDR")]
+    pub(crate) probe_addr: Option<SocketAddr>,
+
     /// Path to a YAML file listing the upstream workers. Mutually exclusive
     /// with the inline `--upstream-*` flags; provide one source or the other.
     #[arg(
@@ -231,6 +241,9 @@ pub(crate) struct Cli {
 pub(crate) struct Settings {
     /// Address the gateway listens on.
     pub(crate) listen_addr: SocketAddr,
+    /// Address of the probe-only listener, or `None` when the probes are
+    /// served on the listen address alone.
+    pub(crate) probe_addr: Option<SocketAddr>,
     /// Upstream workers, in preference order.
     pub(crate) upstreams: Vec<UpstreamWorker>,
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
@@ -282,6 +295,8 @@ impl Cli {
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        self.probe_addr
+            .map_or(Ok(()), |probe_addr| ensure_probe_addr(self.listen_addr, probe_addr))?;
         let query_upstream = self
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
@@ -314,6 +329,7 @@ impl Cli {
         )?;
         Ok(Settings {
             listen_addr: self.listen_addr,
+            probe_addr: self.probe_addr,
             upstreams,
             query_upstream,
             readiness_poll_interval: self.readiness_poll_interval,
@@ -501,6 +517,29 @@ fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
         "upstream URL `{}` points at the gateway's own listen address ({listen_addr}), \
          so forwarding to it would loop; change the upstream URL or --listen-addr",
         UpstreamOrigin(url)
+    );
+    Ok(())
+}
+
+/// Reject a `--probe-addr` that collides with `--listen-addr`: the same
+/// address, or the same port with one side on an unspecified address that
+/// covers the other. An unspecified IPv6 address covers both families (tokio
+/// leaves `IPV6_V6ONLY` unset, so `[::]` binds dual-stack on a default Linux
+/// host); an unspecified IPv4 address covers only IPv4. Port `0` asks for an
+/// ephemeral port, so it never collides. The two listeners cannot share a
+/// socket, and the probes are only out of the client connection cap's reach
+/// on a socket of their own.
+fn ensure_probe_addr(listen_addr: SocketAddr, probe_addr: SocketAddr) -> eyre::Result<()> {
+    let (listen_ip, probe_ip) = (listen_addr.ip(), probe_addr.ip());
+    let covers =
+        |wide: IpAddr, other: IpAddr| wide.is_unspecified() && (wide.is_ipv6() || other.is_ipv4());
+    let overlaps =
+        listen_ip == probe_ip || covers(listen_ip, probe_ip) || covers(probe_ip, listen_ip);
+    let same_port = listen_addr.port() != 0 && listen_addr.port() == probe_addr.port();
+    eyre::ensure!(
+        !(same_port && overlaps),
+        "--probe-addr ({probe_addr}) collides with --listen-addr ({listen_addr}); give the \
+         probe listener a port of its own"
     );
     Ok(())
 }
@@ -730,6 +769,50 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_addr_equal_to_listen_addr_is_rejected_at_startup() -> eyre::Result<()> {
+        // the default listen address is 0.0.0.0:8545, so both of these would
+        // bind the client listener's socket
+        for probe in ["0.0.0.0:8545", "127.0.0.1:8545"] {
+            let flag = format!("--probe-addr={probe}");
+            let result = cli_with_flags(&[flag.as_str()]).into_settings();
+            assert!(result.is_err(), "{probe} collides with the listen address");
+        }
+        let result = cli_with_flags(&["--listen-addr=10.0.0.5:8545", "--probe-addr=10.0.0.5:8545"])
+            .into_settings();
+        assert!(result.is_err(), "a probe address equal to the listen address must be rejected");
+
+        // an unspecified ipv6 address binds dual-stack, so it covers ipv4 too
+        for flags in [
+            ["--listen-addr=0.0.0.0:8545", "--probe-addr=[::]:8545"],
+            ["--listen-addr=[::]:8545", "--probe-addr=127.0.0.1:8545"],
+        ] {
+            let result = cli_with_flags(&flags).into_settings();
+            assert!(result.is_err(), "{flags:?} collide on the dual-stack socket");
+        }
+
+        // a port of its own, or another address on the listen port, is accepted
+        let settings = cli_with_flags(&["--probe-addr=0.0.0.0:8546"]).into_settings()?;
+        assert_eq!(settings.probe_addr, Some("0.0.0.0:8546".parse()?));
+        let settings =
+            cli_with_flags(&["--listen-addr=10.0.0.5:8545", "--probe-addr=10.0.0.6:8545"])
+                .into_settings()?;
+        assert_eq!(settings.probe_addr, Some("10.0.0.6:8545".parse()?));
+
+        // an unspecified ipv4 address does not cover ipv6, and port 0 gives
+        // each listener an ephemeral port of its own
+        let settings = cli_with_flags(&["--listen-addr=0.0.0.0:8545", "--probe-addr=[::1]:8545"])
+            .into_settings()?;
+        assert_eq!(settings.probe_addr, Some("[::1]:8545".parse()?));
+        let settings = cli_with_flags(&["--listen-addr=127.0.0.1:0", "--probe-addr=127.0.0.1:0"])
+            .into_settings()?;
+        assert_eq!(settings.probe_addr, Some("127.0.0.1:0".parse()?));
+
+        // unset opens no probe listener
+        assert_eq!(cli_with_flags(&[]).into_settings()?.probe_addr, None);
         Ok(())
     }
 

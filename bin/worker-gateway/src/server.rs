@@ -3,6 +3,9 @@
 //! A single server serves all three on one address: any request that is not
 //! `GET /health` or `GET /ready` falls through to the proxy, so JSON-RPC
 //! (`POST /`) is forwarded while orchestration probes hit the health routes.
+//! With `--probe-addr` set, a second listener serves the probes alone, outside
+//! the connection cap and the rate limits, so a flood that holds every client
+//! connection cannot make them time out.
 //!
 //! The accept loop is hand-rolled over hyper's HTTP/1 connection builder
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
@@ -315,6 +318,86 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Build the probe-only router served on `--probe-addr`: the health and
+/// readiness routes and nothing else (any other request is a `404`), with no
+/// rate limit, body limit or request deadline, since the handlers answer from
+/// memory.
+fn probe_router(state: AppState) -> Router {
+    Router::new()
+        .route(HEALTH_PATH, get(liveness))
+        .route(READY_PATH, get(readiness))
+        .with_state(state)
+}
+
+/// Bind `probe_addr` and serve the probe-only router until `shutdown` fires.
+pub(crate) async fn serve_probes(
+    probe_addr: SocketAddr,
+    state: AppState,
+    header_read_timeout: Duration,
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    let listener = TcpListener::bind(probe_addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!(target: "gateway::server", %local_addr, "probe listener listening");
+    probe_accept_loop(listener, probe_router(state), header_read_timeout, shutdown).await
+}
+
+/// Accept probe connections until `shutdown` fires, serving each on its own
+/// task, then stop accepting and let in-flight probes finish.
+///
+/// There is deliberately no connection cap: a cap is the thing a flood
+/// exhausts, and this listener exists so the probes still answer when the
+/// client listener's cap is full. Each connection must therefore be cheap and
+/// short-lived instead: it serves one request (keep-alive off), and its
+/// request head may be at most 8 KiB (hyper's smallest buffer; a larger head
+/// gets a `431`). A probe needs neither more. The header deadline bounds every
+/// connection that never completes a request.
+async fn probe_accept_loop(
+    listener: TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    let mut connection_builder = hyper::server::conn::http1::Builder::new();
+    connection_builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .keep_alive(false)
+        .max_buf_size(8 * 1024);
+    let graceful = GracefulShutdown::new();
+
+    loop {
+        let accepted = tokio::select! {
+            () = &shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, _)) = accepted.inspect_err(|err| {
+            warn!(target: "gateway::server", %err, "failed to accept probe connection");
+        }) else {
+            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            continue;
+        };
+        let connection = graceful.watch(
+            connection_builder
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone())),
+        );
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                debug!(target: "gateway::server", %err, "probe connection error");
+            }
+        });
+    }
+
+    // each connection serves one probe, answered from memory, so only one
+    // still sending its head (at most 8 KiB) can outlast its exchange, and
+    // the header deadline closes that one anyway
+    drop(listener);
+    if tokio::time::timeout(header_read_timeout, graceful.shutdown()).await.is_err() {
+        debug!(target: "gateway::server", "probe connections still open at shutdown");
+    }
+    Ok(())
+}
+
 /// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
 /// closes the connection when transmitted data stays unacknowledged, or
 /// buffered data stays untransmittable behind a closed receive window, longer
@@ -397,6 +480,26 @@ mod tests {
 
     async fn spawn(app: Router) -> (SocketAddr, Notifier) {
         spawn_with_limits(app, test_limits()).await
+    }
+
+    /// Serve the probe-only router for `state` through the real probe accept
+    /// loop on a second ephemeral port, as `--probe-addr` does. The returned
+    /// `Notifier` keeps the listener alive for the test's duration.
+    async fn spawn_probes(state: AppState) -> (SocketAddr, Notifier) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let noticer = shutdown.subscribe();
+        tokio::spawn(async move {
+            let _ = probe_accept_loop(
+                listener,
+                probe_router(state),
+                test_limits().header_read_timeout,
+                noticer,
+            )
+            .await;
+        });
+        (addr, shutdown)
     }
 
     fn upstream(addr: SocketAddr) -> UpstreamWorker {
@@ -1251,5 +1354,129 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn probes_answer_while_client_connections_hold_every_permit() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        state.readiness.set_ready(0, true);
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(4).expect("nonzero"),
+            ..test_limits()
+        };
+        let (gateway_addr, _shutdown) = spawn_with_limits(test_router(state.clone()), limits).await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // four client connections that send nothing hold every permit until
+        // the 5s header deadline
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(TcpStream::connect(gateway_addr).await.expect("connect"));
+        }
+        let client = Client::builder().timeout(Duration::from_secs(1)).build().expect("client");
+
+        // the client listener's cap is full, so a probe sent there waits in
+        // the accept backlog
+        let blocked = client.get(format!("http://{gateway_addr}{HEALTH_PATH}")).send().await;
+        assert!(blocked.is_err(), "the held connections should hold every permit");
+
+        for path in [HEALTH_PATH, READY_PATH] {
+            let response = client
+                .get(format!("http://{probe_addr}{path}"))
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("{path} on the probe listener: {err}"));
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn probe_connection_serves_one_request_with_a_small_head() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // a keep-alive request still gets one response and then EOF, long
+        // before the 5s header deadline would close an idle connection
+        let mut stream = TcpStream::connect(probe_addr).await.expect("connect");
+        stream
+            .write_all(format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: probe\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the probe connection should close after one response")
+            .expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+
+        // a head well over 8 KiB (one long header value) is refused, never
+        // served
+        let mut stream = TcpStream::connect(probe_addr).await.expect("connect");
+        let padding = "a".repeat(32 * 1024);
+        let head =
+            format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: probe\r\nX-Padding: {padding}\r\n\r\n");
+        // the server may refuse the head and close before all of it is written
+        let _ = stream.write_all(head.as_bytes()).await;
+        let mut response = Vec::new();
+        // a reset after the refusal is as good as a clean close; the bytes read
+        // before it stay in `response`
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the oversized head should end the connection");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 431"),
+            "expected 431 or a closed connection, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_listener_is_not_rate_limited() {
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        // one request per second per IP, no burst headroom
+        let limiters = RateLimiters::new(
+            Some(RateLimit::new(nz(1), nz(1))),
+            None,
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (gateway_addr, _shutdown) =
+            spawn(router(state.clone(), Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters)))
+                .await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // a client request spends the bucket; the next one is refused
+        let (first, _) = post_rpc(gateway_addr, None, call("eth_chainId", 1)).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, body) = post_rpc(gateway_addr, None, call("eth_chainId", 2)).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&body).0, -32006);
+
+        // the probe listener, from the same address, still answers every probe
+        let client = Client::new();
+        for _ in 0..3 {
+            for path in [HEALTH_PATH, READY_PATH] {
+                let response =
+                    client.get(format!("http://{probe_addr}{path}")).send().await.expect("send");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_listener_serves_no_rpc() {
+        let (worker, seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        let (status, _) = post_rpc(probe_addr, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(seen.hits(), 0, "the probe listener must never reach an upstream");
     }
 }
