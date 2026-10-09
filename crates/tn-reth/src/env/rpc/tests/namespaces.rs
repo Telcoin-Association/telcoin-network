@@ -62,8 +62,13 @@ fn server_from_cli(
     )?;
     let pool = env.init_txn_pool(BaseFeeContainer::default())?;
     let network = WorkerNetwork::new_for_test(env.chainspec());
-    let server =
-        env.get_rpc_server(pool, network, GasAccumulator::new(1).worker_base_fee(0), probe_tn())?;
+    let server = env.get_rpc_server(
+        pool,
+        network,
+        GasAccumulator::new(1).worker_base_fee(0),
+        || NodeMode::CvvActive,
+        probe_tn(),
+    )?;
     Ok(CliServer { server, env, chain })
 }
 

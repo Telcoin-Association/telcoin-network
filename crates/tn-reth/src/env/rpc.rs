@@ -35,7 +35,7 @@ use reth_provider::providers::BlockchainProvider;
 use reth_rpc_eth_api::RpcNodeCore;
 use reth_rpc_eth_types::EthConfig;
 use reth_transaction_pool::{blobstore::DiskFileBlobStore, EthTransactionPool};
-use tn_types::{gas_accumulator::WorkerBaseFee, WorkerId};
+use tn_types::{gas_accumulator::WorkerBaseFee, NodeMode, WorkerId};
 
 use crate::{
     error::{TnRethError, TnRethResult},
@@ -242,6 +242,10 @@ impl RethEnv {
     /// accumulator slot, so fee defaults and quotes track worker-count changes
     /// without retaining a detached `BaseFeeContainer` clone (issue #1282).
     ///
+    /// `node_mode` reads live consensus participation state before every raw
+    /// transaction submission. Inactive validators refuse admission before pool
+    /// insertion; active validators and forwarding observers retain their handlers.
+    ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
     /// (`crate::rpc_fee_cap`), the epoch-fee gas-price quotes, or the corrected
     /// fill-transaction method cannot replace the stock eth handlers.
@@ -250,6 +254,7 @@ impl RethEnv {
         transaction_pool: WorkerTxPool,
         network: WorkerNetwork,
         base_fee: WorkerBaseFee,
+        node_mode: impl Fn() -> NodeMode + Send + Sync + 'static,
         other: impl Into<Methods>,
     ) -> eyre::Result<RpcServer> {
         let transaction_pool: EthTransactionPool<
@@ -316,6 +321,7 @@ impl RethEnv {
         let fee_cap_guard = EthSubmitWithCap::new(
             eth_api.clone(),
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
+            node_mode,
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         // `tn` is selected like reth's modules; it is in the default set and always on IPC.
@@ -404,11 +410,13 @@ mod tests {
     /// only RPC construction path in the node, so a call through them exercises the
     /// same handler an operator's `eth_sendRawTransaction` request reaches. The
     /// transport selection comes from `rpc_args` (the default serves IPC only).
+    /// The mode reader is evaluated on each request rather than at construction.
     fn rpc_methods_with_cap(
         cap_wei: u128,
         rpc_args: reth::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
+        node_mode: impl Fn() -> NodeMode + Send + Sync + 'static,
     ) -> (jsonrpsee::Methods, WorkerTxPool, Arc<RethChainSpec>) {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let rpc_args = reth::args::RpcServerArgs { rpc_tx_fee_cap: cap_wei, ..rpc_args };
@@ -427,6 +435,7 @@ mod tests {
                 pool.clone(),
                 network,
                 GasAccumulator::new(1).worker_base_fee(0),
+                node_mode,
                 RpcModule::new(()),
             )
             .expect("rpc server with fee-cap guard");
@@ -457,6 +466,7 @@ mod tests {
                 pool,
                 network,
                 GasAccumulator::new(1).worker_base_fee(0),
+                || NodeMode::CvvActive,
                 namespaces::probe_tn(),
             )
             .expect("rpc server");
@@ -480,6 +490,74 @@ mod tests {
         assert!(ipc.method("tn_probe").is_some(), "IPC serves the tn namespace");
     }
 
+    /// Exercise admission through the registered handler across live mode changes.
+    async fn assert_submission_follows_live_mode(method: &str) -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let task_manager = TaskManager::default();
+        let (node_mode, mode_rx) = tokio::sync::watch::channel(NodeMode::CvvActive);
+        // A disabled fee cap must not disable the independent node-mode guard.
+        let (methods, pool, chain) = rpc_methods_with_cap(
+            0,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+            move || *mode_rx.borrow(),
+        );
+        let mut factory = TransactionFactory::new();
+        let tx = factory.create_eip1559(
+            chain.clone(),
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let raw = Bytes::from(tx.encoded_2718());
+
+        node_mode.send_replace(NodeMode::CvvInactive);
+        let error = methods
+            .call::<_, serde_json::Value>(method, rpc_params![raw.clone()])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("inactive validator accepted a transaction"))?;
+        assert!(error.to_string().contains("validator is inactive"), "unexpected refusal: {error}");
+        assert!(pool.get(tx.hash()).is_none(), "refused transaction reached the inactive pool");
+
+        node_mode.send_replace(NodeMode::CvvActive);
+        let accepted: B256 = methods.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+        assert_eq!(accepted, *tx.hash());
+        assert!(pool.get(tx.hash()).is_some(), "rejoined validator did not admit the transaction");
+
+        // Observers keep accepting and forwarding their batches.
+        node_mode.send_replace(NodeMode::Observer);
+        let observer_tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let accepted: B256 = methods
+            .call("eth_sendRawTransaction", rpc_params![Bytes::from(observer_tx.encoded_2718())])
+            .await?;
+        assert_eq!(accepted, *observer_tx.hash());
+        assert!(pool.get(observer_tx.hash()).is_some());
+        Ok(())
+    }
+
+    /// Raw submissions refuse inactive validators before pool insertion, then recover on rejoin.
+    #[tokio::test]
+    async fn test_raw_submission_follows_live_node_mode() -> eyre::Result<()> {
+        assert_submission_follows_live_mode("eth_sendRawTransaction").await
+    }
+
+    /// Synchronous submissions apply the same live admission guard before waiting for a receipt.
+    #[tokio::test]
+    async fn test_sync_submission_follows_live_node_mode() -> eyre::Result<()> {
+        assert_submission_follows_live_mode("eth_sendRawTransactionSync").await
+    }
+
     #[tokio::test]
     async fn test_send_raw_transaction_enforces_fee_cap() {
         let tmp_dir = TempDir::new().expect("temp dir");
@@ -492,6 +570,7 @@ mod tests {
             reth::args::RpcServerArgs::default(),
             &task_manager,
             &tmp_dir,
+            || NodeMode::CvvActive,
         );
         let mut tx_factory = TransactionFactory::new();
 
@@ -544,8 +623,13 @@ mod tests {
     async fn test_send_raw_transaction_zero_cap_disables_check() {
         let tmp_dir = TempDir::new().expect("temp dir");
         let task_manager = TaskManager::default();
-        let (methods, pool, chain) =
-            rpc_methods_with_cap(0, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir);
+        let (methods, pool, chain) = rpc_methods_with_cap(
+            0,
+            reth::args::RpcServerArgs::default(),
+            &task_manager,
+            &tmp_dir,
+            || NodeMode::CvvActive,
+        );
         let mut tx_factory = TransactionFactory::new();
 
         // 7,000,000 wei max fee sails through a disabled cap.
@@ -576,7 +660,9 @@ mod tests {
         let rpc_args =
             reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
         let (methods, pool, chain) =
-            rpc_methods_with_cap(200_000, rpc_args, &task_manager, &tmp_dir);
+            rpc_methods_with_cap(200_000, rpc_args, &task_manager, &tmp_dir, || {
+                NodeMode::CvvActive
+            });
         let mut tx_factory = TransactionFactory::new();
 
         let over_cap = tx_factory.create_eip1559(
@@ -633,7 +719,13 @@ mod tests {
         let pool = reth_env.init_txn_pool(accumulator.base_fee(0))?;
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let methods = reth_env
-            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))?
+            .get_rpc_server(
+                pool,
+                network,
+                accumulator.worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )?
             .methods_by(|name| {
                 matches!(
                     name,
@@ -861,6 +953,7 @@ mod tests {
             pool,
             network.clone(),
             accumulator.worker_base_fee(0),
+            || NodeMode::CvvActive,
             RpcModule::new(()),
         )?;
         let methods = server.methods_by(|name| name == "eth_syncing");
@@ -940,6 +1033,7 @@ mod tests {
                 pool,
                 network,
                 accumulator.worker_base_fee(worker_id),
+                || NodeMode::CvvActive,
                 RpcModule::new(()),
             )
             .expect("rpc server with corrected fee history");
@@ -1096,7 +1190,13 @@ mod tests {
         let pool = reth_env.init_txn_pool(base_fee.clone()).expect("txn pool");
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
         let server = reth_env
-            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))
+            .get_rpc_server(
+                pool,
+                network,
+                accumulator.worker_base_fee(0),
+                || NodeMode::CvvActive,
+                RpcModule::new(()),
+            )
             .expect("rpc server with epoch-fee gas-price quotes");
         (
             server.methods_by(|name| name == "eth_gasPrice" || name == "eth_maxPriorityFeePerGas"),
@@ -1368,6 +1468,7 @@ mod tests {
                 pool,
                 network,
                 accumulator.worker_base_fee(worker_id),
+                || NodeMode::CvvActive,
                 RpcModule::new(()),
             )
             .expect("rpc server");

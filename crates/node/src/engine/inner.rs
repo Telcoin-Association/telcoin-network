@@ -142,6 +142,8 @@ impl ExecutionNodeInner {
     /// the current epoch's fee (issue #1262). The RPC server keeps the [`WorkerBaseFee`]
     /// handle so `eth_feeHistory` resolves the worker's current fee on every quote, surviving
     /// worker-count changes (issue #1282).
+    /// Raw transaction admission reads the same live node mode as `tn_nodeMode`,
+    /// refusing inactive validators before their pools can retain submissions.
     pub(super) async fn initialize_worker_components<EP>(
         &mut self,
         worker_id: WorkerId,
@@ -172,6 +174,7 @@ impl ExecutionNodeInner {
             transaction_pool.clone(),
             network.clone(),
             worker_base_fee,
+            tn_ext.node_mode_reader(),
             tn_ext.into_rpc(),
         )?;
 

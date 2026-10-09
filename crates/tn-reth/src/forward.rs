@@ -1710,13 +1710,17 @@ mod tests {
     ///
     /// Every response closes its connection, so alloy re-dials per call and `hits` counts
     /// exactly the `eth_sendRawTransaction` attempts this validator's endpoint received.
-    fn scripted_endpoint(payload: &'static str, hits: Arc<AtomicUsize>) -> eyre::Result<String> {
+    fn scripted_endpoint(
+        payload: impl Into<String>,
+        hits: Arc<AtomicUsize>,
+    ) -> eyre::Result<String> {
+        let payload = payload.into();
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         std::thread::spawn(move || {
             listener.incoming().map_while(Result::ok).for_each(|stream| {
                 hits.fetch_add(1, Ordering::SeqCst);
-                let _ = serve_one(stream, payload);
+                let _ = serve_one(stream, &payload);
             });
         });
         Ok(format!("http://{addr}"))
@@ -2223,6 +2227,48 @@ mod tests {
         .await;
 
         assert!(matches!(outcome, ForwardOutcome::Delivered(_)));
+        Ok(())
+    }
+
+    /// Multiple inactive refusals are endpoint-local, so an active fallback still receives the tx.
+    #[tokio::test]
+    async fn inactive_validators_do_not_stop_the_fallback_chain() -> eyre::Result<()> {
+        let error = crate::rpc_fee_cap::ensure_can_submit(tn_types::NodeMode::CvvInactive)
+            .err()
+            .ok_or_else(|| eyre::eyre!("inactive admission must refuse the transaction"))?;
+        // Serialize the production refusal rather than duplicating its code or message.
+        let payload = format!(
+            r#"{{"jsonrpc":"2.0","id":__ID__,"error":{}}}"#,
+            serde_json::to_string(&error)?,
+        );
+        let first_hits = Arc::new(AtomicUsize::new(0));
+        let second_hits = Arc::new(AtomicUsize::new(0));
+        let active_hits = Arc::new(AtomicUsize::new(0));
+        let endpoints = vec![
+            scripted_endpoint(payload.clone(), Arc::clone(&first_hits))?,
+            scripted_endpoint(payload, Arc::clone(&second_hits))?,
+            scripted_endpoint(DELIVERY_BODY, Arc::clone(&active_hits))?,
+        ];
+        let (keys, providers) = scripted_chain(&endpoints)?;
+        let held = Mutex::new(None);
+        let outcome = walk_fallback_chain(
+            &[0_u8; 32],
+            keys.iter().cloned(),
+            &providers,
+            &held,
+            &Mutex::new(BTreeSet::new()),
+            &Mutex::new(EndpointCache::default()),
+        )
+        .await;
+
+        assert!(matches!(outcome, ForwardOutcome::Delivered(_)), "unexpected outcome: {outcome:?}");
+        assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(second_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(active_hits.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            *held.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+            Some(HeldVerdict::Delivered(_))
+        ));
         Ok(())
     }
 
