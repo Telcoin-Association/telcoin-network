@@ -7,3 +7,4 @@ mod layout;
 mod table;
 
 pub use database::TnDatabase;
+pub use table::CompactionConfig;

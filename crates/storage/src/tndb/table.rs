@@ -47,6 +47,13 @@
 //! until the last of them drops. The new generation is a spare a background thread prepared (its
 //! files created and synced) after the table opened or was last cleared, so a clear only renames it
 //! into place and syncs the table directory.
+//!
+//! Compaction rewrites a table's live rows into its next generation on a background thread and
+//! switches to it at a commit, after which the removed and overwritten records are gone from disk
+//! (see [`compact`]). It starts on its own once a table's log is large and mostly dead puts
+//! ([`CompactionConfig`]), or on request.
+
+mod compact;
 
 use std::{
     collections::BTreeMap,
@@ -59,8 +66,12 @@ use arc_swap::ArcSwap;
 use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 
+pub use compact::CompactionConfig;
+use compact::{replay_delta, Committed, Compacted, Compaction, Job, REQUESTED_MIN_BYTES};
+
 use super::layout::{
-    gen_dir, list_gens, lock_table, remove_spares, spare_dir, sync_dir, KeyMode, TableMeta,
+    compact_dir, gen_dir, list_gens, lock_table, remove_spares, spare_dir, sync_dir, KeyMode,
+    TableMeta,
 };
 use crate::archive::{
     btree_index::{
@@ -135,16 +146,17 @@ struct GenFiles {
     idx: Option<BtreeIndex>,
 }
 
-/// Keeps a cleared generation's files open (and so its mappings valid) while snapshots of it are
-/// alive: each [`Published`] holds its generation's `GenAlive`, and a clear moves the old files
-/// into it, so they close when the last old snapshot drops.
+/// Keeps a retired (cleared or compacted away) generation's files open, and so its mappings
+/// valid, while snapshots of it are alive: each [`Published`] holds its generation's `GenAlive`,
+/// and retiring the generation moves its files into it, so they close when the last old snapshot
+/// (or compaction thread) drops.
 #[derive(Debug, Default)]
 struct GenAlive {
     retired: Mutex<Option<GenFiles>>,
 }
 
 impl Drop for GenAlive {
-    /// Close a cleared generation's files (unmapping them) on a short-lived thread, off the path
+    /// Close a retired generation's files (unmapping them) on a short-lived thread, off the path
     /// of whichever writer or reader dropped the last snapshot; if no thread can be started, here.
     fn drop(&mut self) {
         if let Some(files) = self.retired.get_mut().take() {
@@ -152,6 +164,24 @@ impl Drop for GenAlive {
                 drop(files);
             });
         }
+    }
+}
+
+/// Delete a retired generation's directory on a short-lived thread (its files are unlinked now;
+/// their space returns once no mapping of them is left), or here if no thread can be started. A
+/// failure leaves it for the next open to remove.
+fn remove_in_background(dir: PathBuf) {
+    let remove = |dir: &Path| {
+        if let Err(e) = fs::remove_dir_all(dir) {
+            tracing::warn!(target: "tndb", "remove retired generation {}: {e}", dir.display());
+        }
+    };
+    let thread_dir = dir.clone();
+    let spawned = std::thread::Builder::new()
+        .name("tndb-reap".to_string())
+        .spawn(move || remove(&thread_dir));
+    if spawned.is_err() {
+        remove(&dir);
     }
 }
 
@@ -221,6 +251,8 @@ fn prepare_spare(dir: &Path, ksize: u16, cleared: Option<&Path>) -> eyre::Result
 /// end.
 struct Replay {
     rows: BTreeMap<Vec<u8>, u64>,
+    /// Committed puts, live or not.
+    puts: u64,
     data_end: u64,
     removed_end: u64,
 }
@@ -247,6 +279,7 @@ fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Re
 
     // The data log: puts, made live by the commit record after them.
     let mut rows = BTreeMap::new();
+    let mut puts = 0;
     let mut pending: Vec<(Vec<u8>, u64)> = Vec::new();
     let mut last_commit = None;
     let mut data_end = header;
@@ -279,6 +312,7 @@ fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Re
         match record {
             DataRecord::Put(key) => pending.push((key, start)),
             DataRecord::Commit => {
+                puts += pending.len() as u64;
                 rows.extend(pending.drain(..));
                 last_commit = Some(start);
                 data_end = iter.logical_position();
@@ -320,7 +354,7 @@ fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Re
     }
     check_log_end("removal", &files.removed, torn, removed_end)?;
 
-    Ok(Replay { rows, data_end, removed_end })
+    Ok(Replay { rows, puts, data_end, removed_end })
 }
 
 /// Fail closed on a log whose replay hit a bad frame (`torn`) when that cannot be a crash tail:
@@ -356,6 +390,23 @@ struct Writer {
     uncommitted: bool,
     /// Removal records appended since the removal log was last synced.
     removals_unsynced: bool,
+    /// When and how fast this table compacts.
+    config: CompactionConfig,
+    /// Puts in the current generation made dead (overwritten or removed) since it started, or
+    /// since this open (a clean open does not know the older ones): the automatic compaction's
+    /// measure of garbage.
+    dead: u64,
+    /// The running compaction, if any.
+    compaction: Option<Compaction>,
+    /// Compactions cancelled by a clear, still stopping: joined (and their results discarded)
+    /// before the next compaction starts or the table closes.
+    cancelled: Vec<std::thread::JoinHandle<eyre::Result<Compacted>>>,
+    /// Test-only: the next compaction's thread waits at each checkpoint for this channel.
+    #[cfg(test)]
+    compact_gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// Test-only: the next compaction switch's directory sync after its rename fails.
+    #[cfg(test)]
+    fail_next_switch_sync: bool,
     /// Set when this open rebuilt the index (for tests).
     #[cfg(test)]
     rebuilt: bool,
@@ -368,9 +419,9 @@ struct Writer {
     /// Test-only: the next commit fails before writing anything.
     #[cfg(test)]
     fail_next_flush: bool,
-    /// Set when a clear failed after it may have changed which generation the next open picks:
-    /// writing on here would commit to a generation a restart discards, so every later write and
-    /// commit fails (restart to recover).
+    /// Set when a clear or a compaction switch failed after it may have changed which generation
+    /// the next open picks: writing on here would commit to a generation a restart discards, so
+    /// every later write and commit fails (restart to recover).
     failed: Option<String>,
     /// The table's `flock` (see [`lock_table`]), released when the writer drops. Declared last so
     /// it is released after the files close. `None` only after a test's simulated crash.
@@ -423,11 +474,12 @@ impl Writer {
         Ok(())
     }
 
-    /// Refuse writes once a failed clear stopped this writer (see `failed`).
+    /// Refuse writes once a failed clear or compaction switch stopped this writer (see `failed`).
     fn check_failed(&self) -> eyre::Result<()> {
         match &self.failed {
             Some(cause) => bail!(
-                "tndb: table {} stopped after a failed clear ({cause}); restart to recover",
+                "tndb: table {} stopped after a failed generation change ({cause}); restart to \
+                 recover",
                 self.table_dir.display()
             ),
             None => Ok(()),
@@ -453,9 +505,18 @@ impl Writer {
         };
         // All or nothing: a failed index step takes its record back out of the log, or a later
         // commit would make durable a put the index (and the caller) never had.
-        if let Err(e) = self.index_mut().and_then(|idx| Ok(idx.save(key, pos)?)) {
-            self.files.data.rewind_to(pos);
-            return Err(e);
+        let saved = self.index_mut().and_then(|idx| {
+            let live = idx.len();
+            idx.save(key, pos)?;
+            Ok(idx.len() == live)
+        });
+        match saved {
+            // An overwrite leaves the row count as it was, and the old put dead.
+            Ok(overwrote) => self.dead += overwrote as u64,
+            Err(e) => {
+                self.files.data.rewind_to(pos);
+                return Err(e);
+            }
         }
         self.uncommitted = true;
         Ok(())
@@ -487,6 +548,7 @@ impl Writer {
             Ok(true) => {
                 self.removals_unsynced = true;
                 self.uncommitted = true;
+                self.dead += 1;
                 Ok(true)
             }
             Ok(false) => {
@@ -540,6 +602,8 @@ impl Writer {
     /// Start a new, empty generation and delete the current one's files (see the module docs).
     fn clear(&mut self) -> eyre::Result<()> {
         self.check_failed()?;
+        // A compaction of the generation being cleared is moot.
+        self.cancel_compaction();
         let next = self.gen + 1;
         let next_dir = gen_dir(&self.table_dir, next);
         let files = match self.take_spare() {
@@ -570,6 +634,18 @@ impl Writer {
                 Err(e) => return Err(e),
             },
         };
+        let old_dir = self.install_gen(next, files);
+        self.dead = 0;
+        // The old generation's directory is deleted, and the next spare prepared, in the
+        // background.
+        self.prepare_next_spare(Some(old_dir));
+        Ok(())
+    }
+
+    /// Make `files` (generation `next`, already in place on disk) the current generation and
+    /// retire the old one: its files are deleted, not sealed, once the last snapshot of them
+    /// drops. Returns the old generation's directory, for the caller to delete.
+    fn install_gen(&mut self, next: u64, files: GenFiles) -> PathBuf {
         let old_dir = std::mem::replace(&mut self.gen_dir, gen_dir(&self.table_dir, next));
         let mut old = std::mem::replace(&mut self.files, files);
         let old_alive = std::mem::take(&mut self.alive);
@@ -577,18 +653,13 @@ impl Writer {
         self.gen = next;
         self.uncommitted = false;
         self.removals_unsynced = false;
-        // The old files are deleted, not sealed, once the last snapshot of them drops.
         old.data.set_remove_on_drop();
         old.removed.set_remove_on_drop();
         if let Some(idx) = old.idx.as_mut() {
             idx.set_remove_on_drop();
         }
         *old_alive.retired.lock() = Some(old);
-        drop(old_alive);
-        // The old generation's directory is deleted, and the next spare prepared, in the
-        // background.
-        self.prepare_next_spare(Some(old_dir));
-        Ok(())
+        old_dir
     }
 
     /// Stop this writer (see `failed`) and return the error saying why.
@@ -640,18 +711,144 @@ impl Writer {
     /// the data log's current extent.
     fn publish(&mut self) -> Published {
         let index = self.files.idx.as_mut().map(BtreeIndex::publish);
-        self.data_view.publish_len(self.files.data.file_len());
+        let committed =
+            Committed { data: self.files.data.file_len(), removed: self.files.removed.file_len() };
+        self.data_view.publish_len(committed.data);
+        if let Some(compaction) = &self.compaction {
+            compaction.publish(committed);
+        }
         Published {
             index,
             data_view: Arc::clone(&self.data_view),
             value_offset: self.value_offset(),
-            _alive: Arc::clone(&self.alive),
+            gen: self.gen,
+            committed,
+            alive: Arc::clone(&self.alive),
+        }
+    }
+
+    /// True when the automatic compaction should start (see [`CompactionConfig`]): none is
+    /// running, the data log is large enough, and at least half the puts are dead. O(1), checked
+    /// at every commit.
+    fn wants_compaction(&self) -> bool {
+        self.compaction.is_none()
+            && self.config.auto_min_bytes.is_some_and(|min| self.files.data.file_len() >= min)
+            && self.dead > 0
+            && self.dead >= self.files.idx.as_ref().map_or(0, BtreeIndex::len) as u64
+    }
+
+    /// Start compacting the current generation from `snapshot`, the last publish (see
+    /// [`compact`]), unless one is already running. Returns whether a compaction is running: not
+    /// when the writer stopped, the snapshot is of an older generation (a clear not yet
+    /// published), or no thread could be started.
+    fn start_compaction(&mut self, snapshot: Arc<Published>) -> bool {
+        if self.compaction.is_some() {
+            return true;
+        }
+        if self.failed.is_some() || snapshot.gen != self.gen {
+            return false;
+        }
+        self.reap_cancelled(false);
+        let job = Job {
+            dir: compact_dir(&self.table_dir, self.gen + 1),
+            alive: Arc::clone(&snapshot.alive),
+            data_view: Arc::clone(&snapshot.data_view),
+            removed_view: self.files.removed.view(),
+            snapshot,
+            meta: self.meta,
+            key_fn: self.key_fn.clone(),
+            rate: self.config.bytes_per_sec,
+            #[cfg(test)]
+            gate: self.compact_gate.take(),
+        };
+        self.compaction = Compaction::start(self.gen, job);
+        self.compaction.is_some()
+    }
+
+    /// Right after a commit (nothing is uncommitted): if the compaction thread has finished,
+    /// catch its generation up on the commits since its last round and switch to it. A compaction
+    /// that failed is dropped (logged; its files are deleted) and the table carries on as it was.
+    /// Returns whether the table switched; an error means the switch failed after its rename,
+    /// which stops the writer (see `failed`).
+    fn switch_if_compacted(&mut self) -> eyre::Result<bool> {
+        if !self.compaction.as_ref().is_some_and(Compaction::is_finished) {
+            return Ok(false);
+        }
+        let compaction = self.compaction.take().expect("checked above");
+        debug_assert_eq!(compaction.gen, self.gen, "a clear cancels its generation's compaction");
+        let next = self.gen + 1;
+        let next_dir = gen_dir(&self.table_dir, next);
+        let renamed = compaction
+            .join()
+            .and_then(|compacted| self.catch_up(compacted))
+            .and_then(|builder| Ok(fs::rename(builder.dir(), &next_dir).map(|()| builder)?));
+        let builder = match renamed {
+            Ok(builder) => builder,
+            Err(e) => {
+                tracing::warn!(
+                    target: "tndb",
+                    "table {}: compaction abandoned: {e}",
+                    self.table_dir.display()
+                );
+                return Ok(false);
+            }
+        };
+        let (files, dead) = builder.finish();
+        // From here the next open picks the new generation, which holds every committed row (as
+        // the old one does); a failure stops this writer rather than let it commit to the old one.
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_switch_sync) {
+            return Err(self.stop("injected directory sync failure".into()));
+        }
+        if let Err(e) = sync_dir(&self.table_dir) {
+            return Err(self.stop(format!("sync the compacted generation: {e}")));
+        }
+        let old_dir = self.install_gen(next, files);
+        self.dead = dead;
+        remove_in_background(old_dir);
+        Ok(true)
+    }
+
+    /// The compaction's final catch-up, under the writer lock: replay what was committed since
+    /// the thread's last round (all of it: this runs right after a commit), then commit and sync
+    /// it. The new generation must have exactly the table's rows.
+    fn catch_up(&self, compacted: Compacted) -> eyre::Result<compact::Builder> {
+        let Compacted { mut builder, done } = compacted;
+        let (data, removed) = (&self.files.data, &self.files.removed);
+        let pending = (done.data..data.file_len(), done.removed..removed.file_len());
+        replay_delta(&mut builder, data, pending.0, removed, pending.1)?;
+        builder.commit_record()?;
+        builder.sync()?;
+        let live = self.files.idx.as_ref().map_or(0, BtreeIndex::len);
+        if builder.len() != live {
+            bail!("tndb: the compacted generation has {} rows, the table {live}", builder.len());
+        }
+        Ok(builder)
+    }
+
+    /// Stop the running compaction, if any (a clear makes it moot); its thread is joined later.
+    fn cancel_compaction(&mut self) {
+        if let Some(compaction) = self.compaction.take() {
+            self.cancelled.push(compaction.cancel());
+        }
+    }
+
+    /// Join the cancelled compactions whose threads have stopped (every one if `wait`),
+    /// discarding their results: a dropped builder deletes its files.
+    fn reap_cancelled(&mut self, wait: bool) {
+        for handle in std::mem::take(&mut self.cancelled) {
+            if wait || handle.is_finished() {
+                drop(compact::join(handle));
+            } else {
+                self.cancelled.push(handle);
+            }
         }
     }
 
     /// Rebuild the index from the logs (see [`recover`]).
     fn recover(&mut self) -> eyre::Result<()> {
         let replay = replay(&self.files, self.meta, self.key_fn.as_ref())?;
+        self.dead = replay.puts.saturating_sub(replay.rows.len() as u64);
         // Every check passed: now cut the logs back to their committed records.
         if replay.data_end < self.files.data.file_len() {
             self.files.data.rewind_to(replay.data_end);
@@ -702,7 +899,15 @@ impl Drop for Writer {
         }
         // Commit what is uncommitted the ordinary way (the removal log synced before the commit
         // record that makes its removals count).
-        if self.flush().is_err() {
+        let committed = self.flush().is_ok();
+        // Keep a compaction that has finished (switch to it); stop one still running. Wait for
+        // every compaction thread, so none writes in the table directory after it closes.
+        if committed {
+            let _ = self.switch_if_compacted();
+        }
+        self.cancel_compaction();
+        self.reap_cancelled(true);
+        if !committed {
             // The close could not commit: make the next open rebuild from the logs (a length the
             // log never has), which drops the uncommitted tail.
             if let Some(idx) = self.files.idx.as_mut() {
@@ -725,9 +930,13 @@ struct Published {
     data_view: Arc<MapView>,
     /// Bytes before each record's value (see [`Writer::value_offset`]).
     value_offset: usize,
-    /// Keeps this snapshot's generation open if it is cleared. Declared last so it drops after
-    /// the snapshot.
-    _alive: Arc<GenAlive>,
+    /// The generation this snapshot reads, and where its logs' committed records end (a
+    /// compaction starts from these).
+    gen: u64,
+    committed: Committed,
+    /// Keeps this snapshot's generation open if it is cleared or compacted away. Declared last so
+    /// it drops after the snapshot.
+    alive: Arc<GenAlive>,
 }
 
 impl Published {
@@ -808,8 +1017,19 @@ fn open_current_gen(dir: &Path) -> eyre::Result<(u64, Log, Log)> {
 impl TnTable {
     /// Open (creating if needed) the table rooted at `dir`: keyed, or with `key_fn` a derived-key
     /// table (the mode is fixed when the table is created; opening it in the other mode is an
-    /// error). Rebuilds the index from the logs when the table was not closed cleanly.
+    /// error). Rebuilds the index from the logs when the table was not closed cleanly. Compacts
+    /// as [`CompactionConfig::default`].
+    #[cfg(test)]
     pub(crate) fn open(dir: PathBuf, key_fn: Option<KeyFn>) -> eyre::Result<Self> {
+        Self::open_with(dir, key_fn, CompactionConfig::default())
+    }
+
+    /// [`Self::open`], compacting as `config` says.
+    pub(crate) fn open_with(
+        dir: PathBuf,
+        key_fn: Option<KeyFn>,
+        config: CompactionConfig,
+    ) -> eyre::Result<Self> {
         fs::create_dir_all(&dir)?;
         let lock = lock_table(&dir)?;
         let mode = if key_fn.is_some() { KeyMode::Derived } else { KeyMode::Keyed };
@@ -875,6 +1095,14 @@ impl TnTable {
             spare: None,
             uncommitted: false,
             removals_unsynced: false,
+            config,
+            dead: 0,
+            compaction: None,
+            cancelled: Vec::new(),
+            #[cfg(test)]
+            compact_gate: None,
+            #[cfg(test)]
+            fail_next_switch_sync: false,
             #[cfg(test)]
             rebuilt: false,
             #[cfg(test)]
@@ -920,6 +1148,44 @@ impl TnTable {
         self.inner.writer.lock()._lock = None;
     }
 
+    /// Test-only: start a compaction whose thread waits at each checkpoint (after the copy, and
+    /// after each catch-up round) for a message on the returned channel, or for its drop.
+    #[cfg(test)]
+    pub(crate) fn start_compaction_gated(&self) -> std::sync::mpsc::Sender<()> {
+        let (gate, wait) = std::sync::mpsc::channel();
+        let mut writer = self.inner.writer.lock();
+        writer.compact_gate = Some(wait);
+        assert!(writer.start_compaction(self.inner.published.load_full()), "compaction started");
+        gate
+    }
+
+    /// Wait (not holding the writer lock) until the running compaction's thread, if any, has
+    /// finished.
+    pub(crate) fn wait_compaction_thread(&self) {
+        while self.inner.writer.lock().compaction.as_ref().is_some_and(|c| !c.is_finished()) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Test-only: make the next compaction switch's directory sync (after its rename) fail.
+    #[cfg(test)]
+    pub(crate) fn fail_next_switch_sync(&self) {
+        self.inner.writer.lock().fail_next_switch_sync = true;
+    }
+
+    /// Test-only: the table's generation, log lengths, dead puts, and running compaction.
+    #[cfg(test)]
+    pub(crate) fn compaction_state(&self) -> CompactionState {
+        let writer = self.inner.writer.lock();
+        CompactionState {
+            gen: writer.gen,
+            data_len: writer.files.data.file_len(),
+            removed_len: writer.files.removed.file_len(),
+            dead: writer.dead,
+            running: writer.compaction.is_some(),
+        }
+    }
+
     /// Insert (or overwrite) `key → value`; readable from the next flush.
     pub(crate) fn insert(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
         self.inner.writer.lock().insert(key, value)
@@ -939,10 +1205,53 @@ impl TnTable {
     /// Commit (see [`Writer::flush`]), then publish every write so far: install a new snapshot for
     /// readers. Readers are never blocked by it (they take no lock); writers wait for it.
     pub(crate) fn flush(&self) -> eyre::Result<()> {
+        self.commit().map(drop)
+    }
+
+    /// [`Self::flush`], switching to a compaction that has finished between the commit and the
+    /// publish, and starting the automatic compaction when it is due. Returns whether the table
+    /// switched to a compacted generation.
+    fn commit(&self) -> eyre::Result<bool> {
         let mut writer = self.inner.writer.lock();
         writer.flush()?;
+        // A switch that fails after its rename stops the writer; the commit is still published.
+        let switched = writer.switch_if_compacted();
         // Stored under the writer lock, so snapshots are installed in publish order.
         self.inner.published.store(Arc::new(writer.publish()));
+        if writer.wants_compaction() {
+            writer.start_compaction(self.inner.published.load_full());
+        }
+        switched
+    }
+
+    /// Start compacting the table in the background if it holds dead puts and its data log is at
+    /// least [`REQUESTED_MIN_BYTES`] (see [`compact`]); the table switches to the compacted
+    /// generation at a later commit. Returns whether a compaction is running.
+    pub(crate) fn compact(&self) -> bool {
+        let mut writer = self.inner.writer.lock();
+        if writer.dead == 0 || writer.files.data.file_len() < REQUESTED_MIN_BYTES {
+            return writer.compaction.is_some();
+        }
+        writer.start_compaction(self.inner.published.load_full())
+    }
+
+    /// Compact the table now, whatever its garbage: start a compaction (or take the running one),
+    /// wait for its thread, and commit to switch to it. Blocks the caller for the whole copy (the
+    /// table stays readable and writable).
+    pub(crate) fn compact_now(&self) -> eyre::Result<()> {
+        let started = self.inner.writer.lock().start_compaction(self.inner.published.load_full());
+        if !started {
+            bail!("tndb: table {} cannot start a compaction", self.inner.label);
+        }
+        self.finish_compaction()
+    }
+
+    /// Wait for the running compaction's thread, then commit to switch to it.
+    pub(crate) fn finish_compaction(&self) -> eyre::Result<()> {
+        self.wait_compaction_thread();
+        if !self.commit()? {
+            bail!("tndb: table {}: the compaction did not complete (logged)", self.inner.label);
+        }
         Ok(())
     }
 
@@ -1021,6 +1330,17 @@ impl TnTable {
             }
         }
     }
+}
+
+/// Test-only: see [`TnTable::compaction_state`].
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CompactionState {
+    pub(crate) gen: u64,
+    pub(crate) data_len: u64,
+    pub(crate) removed_len: u64,
+    pub(crate) dead: u64,
+    pub(crate) running: bool,
 }
 
 /// Log a scan or seek ended by an error. `DBIter` (and a seek's `Option`) cannot carry it, but a
@@ -1240,7 +1560,9 @@ mod test {
             v
         };
         let tmp = TempDir::with_prefix("tntable_concurrent").expect("temp dir");
-        let table = TnTable::open(tmp.path().join("t"), None).expect("open");
+        // No automatic compaction: a switch to a new index would change the page count below.
+        let config = CompactionConfig { auto_min_bytes: None, ..Default::default() };
+        let table = TnTable::open_with(tmp.path().join("t"), None, config).expect("open");
         for i in 0..KEYS {
             table.insert(&kv(i).0, &value(i, 0)).expect("insert");
         }
@@ -1563,5 +1885,420 @@ mod test {
         assert_eq!(table.get_with(&k_new, |v| v.to_vec()).expect("get"), None, "failed put");
         assert!(table.contains(&k_old).expect("contains"), "failed remove");
         assert!(table.contains(&k_other).expect("contains"));
+    }
+
+    // ---- compaction ----
+
+    type Model = BTreeMap<Vec<u8>, Vec<u8>>;
+
+    /// Simulate a crash: release the table's lock (as a dead process's is) and leak the handle,
+    /// so nothing is committed or sealed on the way out.
+    fn crash(table: TnTable) {
+        table.release_lock_for_crash();
+        std::mem::forget(table);
+    }
+
+    fn put(table: &TnTable, model: &mut Model, i: u64, tag: &str) {
+        let (k, v) = (i.to_be_bytes().to_vec(), format!("{tag}{i}").into_bytes());
+        table.insert(&k, &v).expect("insert");
+        model.insert(k, v);
+    }
+
+    fn del(table: &TnTable, model: &mut Model, i: u64) {
+        let k = i.to_be_bytes().to_vec();
+        assert_eq!(table.remove(&k).expect("remove"), model.remove(&k).is_some(), "key {i}");
+    }
+
+    /// Every published read of `table` agrees with `model`: a forward scan, point reads and the
+    /// length.
+    fn assert_matches(table: &TnTable, model: &Model) {
+        let mut scan = table.scan(ScanKind::Forward);
+        let rows: Vec<_> =
+            std::iter::from_fn(|| scan.next_with(|k, v| (k.to_vec(), v.to_vec()))).collect();
+        let expected: Vec<_> = model.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        assert_eq!(rows, expected, "scan");
+        for (k, v) in model {
+            assert_eq!(table.get_with(k, |b| b.to_vec()).expect("get").as_ref(), Some(v), "get");
+        }
+        assert_eq!(table.len().expect("len"), model.len(), "len");
+    }
+
+    fn compact_dirs(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .expect("table dir")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("compact-"))
+            .count()
+    }
+
+    /// Wait for the background deletion of retired generations: only `gen` is left.
+    fn wait_for_only_gen(dir: &Path, gen: u64) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while list_gens(dir).expect("list") != vec![gen] {
+            assert!(std::time::Instant::now() < deadline, "retired generations are deleted");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// A compaction keeps exactly the live rows and drops the dead records: puts, overwrites and
+    /// removes committed while it copies, while it catches up, and after its last round (left to
+    /// the switch) all land, as does a write still uncommitted when the switch's commit runs. The
+    /// compacted generation is smaller, survives a crash (its logs replay to the same rows) and a
+    /// clean reopen (no rebuild).
+    #[test]
+    fn test_tntable_compaction_keeps_live_rows_and_drops_dead_ones() {
+        let tmp = TempDir::with_prefix("tntable_compact").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..2_000 {
+            put(&table, &mut model, i, "a");
+        }
+        for i in (0..2_000).step_by(2) {
+            put(&table, &mut model, i, "b");
+        }
+        for i in (0..2_000).step_by(3) {
+            del(&table, &mut model, i);
+        }
+        table.flush().expect("flush");
+        let before = table.compaction_state();
+        assert_eq!(before.dead, 1_000 + 667, "overwrites and removes are dead puts");
+
+        // The thread copies the snapshot, then waits: these commits are for its catch-up.
+        let gate = table.start_compaction_gated();
+        for i in 2_000..2_100 {
+            put(&table, &mut model, i, "c");
+        }
+        for i in (1..600).step_by(5) {
+            put(&table, &mut model, i, "d");
+        }
+        for i in (0..300).step_by(7) {
+            del(&table, &mut model, i);
+        }
+        del(&table, &mut model, 1);
+        put(&table, &mut model, 1, "e"); // removed, then put again in one commit
+        put(&table, &mut model, 5_000, "f");
+        del(&table, &mut model, 5_000); // put, then removed in one commit
+        table.flush().expect("flush");
+        gate.send(()).expect("resume"); // one catch-up round, then it waits again
+        assert_matches(&table, &model);
+
+        // Committed after its last round: left to the switch's own catch-up.
+        for i in 100..200 {
+            put(&table, &mut model, i, "g");
+        }
+        for i in (200..400).step_by(11) {
+            del(&table, &mut model, i);
+        }
+        table.flush().expect("flush");
+        // Uncommitted when the switch runs: its commit comes first.
+        put(&table, &mut model, 7_000, "h");
+        del(&table, &mut model, 2);
+        drop(gate);
+        table.finish_compaction().expect("switch");
+
+        let after = table.compaction_state();
+        assert_eq!(after.gen, before.gen + 1, "switched to the next generation");
+        assert!(!after.running);
+        assert!(after.data_len < before.data_len * 2 / 3, "{after:?} vs {before:?}");
+        assert!(after.removed_len < before.removed_len / 4, "{after:?} vs {before:?}");
+        assert_matches(&table, &model);
+        wait_for_only_gen(&dir, after.gen);
+        assert_eq!(compact_dirs(&dir), 0);
+
+        crash(table);
+        let table = TnTable::open(dir.clone(), None).expect("reopen after a crash");
+        assert!(table.rebuilt_on_open(), "an unclean compacted generation replays");
+        assert_matches(&table, &model);
+        drop(table);
+        let table = TnTable::open(dir, None).expect("clean reopen");
+        assert!(!table.rebuilt_on_open());
+        assert_matches(&table, &model);
+    }
+
+    /// A scan (or any snapshot) taken before the switch keeps reading the old generation, whose
+    /// files stay open until it drops; a new scan reads the compacted generation.
+    #[test]
+    fn test_tntable_compaction_readers_keep_the_old_generation() {
+        let tmp = TempDir::with_prefix("tntable_compact_readers").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..1_000 {
+            put(&table, &mut model, i, "a");
+        }
+        let old = model.clone();
+        table.flush().expect("flush");
+        let mut scan = table.scan(ScanKind::Forward);
+        assert_eq!(scan.next_with(|k, _| key_u64(k)), Some(0));
+
+        for i in 0..1_000 {
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        table.compact_now().expect("compact");
+        assert_eq!(table.compaction_state().gen, 1);
+        wait_for_only_gen(&dir, 1);
+
+        let rest: Vec<_> =
+            std::iter::from_fn(|| scan.next_with(|k, v| (k.to_vec(), v.to_vec()))).collect();
+        assert_eq!(rest, old.into_iter().skip(1).collect::<Vec<_>>(), "the old generation");
+        assert_matches(&table, &model);
+    }
+
+    /// A crash after the compaction's thread finished but before the switch leaves the table as
+    /// it was; the reopen deletes the unfinished compaction.
+    #[test]
+    fn test_tntable_compaction_crash_before_switch() {
+        let tmp = TempDir::with_prefix("tntable_compact_crash").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..500 {
+            put(&table, &mut model, i, "a");
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        drop(table.start_compaction_gated());
+        table.wait_compaction_thread();
+        assert_eq!(compact_dirs(&dir), 1);
+        crash(table);
+
+        let table = TnTable::open(dir.clone(), None).expect("reopen");
+        assert_eq!(compact_dirs(&dir), 0, "the unfinished compaction is deleted");
+        assert_eq!(list_gens(&dir).expect("list"), vec![0]);
+        assert_matches(&table, &model);
+    }
+
+    /// A clear cancels a running compaction: its thread stops and deletes its directory, and
+    /// the table keeps the cleared generation.
+    #[test]
+    fn test_tntable_clear_cancels_compaction() {
+        let tmp = TempDir::with_prefix("tntable_compact_clear").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..500 {
+            put(&table, &mut model, i, "a");
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        let gate = table.start_compaction_gated(); // waits after its copy
+        table.clear().expect("clear");
+        model.clear();
+        put(&table, &mut model, 7, "c");
+        table.flush().expect("flush");
+        assert!(!table.compaction_state().running, "the clear cancelled it");
+        drop(gate);
+        drop(table); // joins the cancelled thread
+
+        assert_eq!(compact_dirs(&dir), 0, "the cancelled compaction deleted its directory");
+        let table = TnTable::open(dir.clone(), None).expect("reopen");
+        assert_eq!(table.compaction_state().gen, 1);
+        assert_matches(&table, &model);
+    }
+
+    /// A derived-key table compacts too: its catch-up derives each put's key from its value.
+    #[test]
+    fn test_tntable_compaction_derived_keys() {
+        let tmp = TempDir::with_prefix("tntable_compact_derived").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let key_fn: KeyFn = Arc::new(|value: &[u8]| Ok(value[..8].to_vec()));
+        let table = TnTable::open(dir.clone(), Some(Arc::clone(&key_fn))).expect("open");
+        let mut model = Model::new();
+        let put = |table: &TnTable, model: &mut Model, i: u64, tag: &str| {
+            let k = i.to_be_bytes().to_vec();
+            let v = [k.as_slice(), tag.as_bytes()].concat();
+            table.insert(&k, &v).expect("insert");
+            model.insert(k, v);
+        };
+        for i in 0..500 {
+            put(&table, &mut model, i, "a");
+        }
+        for i in (0..500).step_by(2) {
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        let gate = table.start_compaction_gated();
+        for i in (0..500).step_by(3) {
+            put(&table, &mut model, i, "c");
+        }
+        for i in (0..500).step_by(5) {
+            del(&table, &mut model, i);
+        }
+        put(&table, &mut model, 900, "d");
+        table.flush().expect("flush");
+        drop(gate);
+        table.finish_compaction().expect("switch");
+        assert_matches(&table, &model);
+
+        crash(table);
+        let table = TnTable::open(dir, Some(key_fn)).expect("reopen");
+        assert!(table.rebuilt_on_open());
+        assert_matches(&table, &model);
+    }
+
+    /// The automatic compaction starts at a commit once the log is large enough and at least
+    /// half its puts are dead, not before.
+    #[test]
+    fn test_tntable_automatic_compaction_trigger() {
+        let tmp = TempDir::with_prefix("tntable_compact_auto").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let config = CompactionConfig { auto_min_bytes: Some(64 << 10), bytes_per_sec: 0 };
+        let table = TnTable::open_with(dir, None, config).expect("open");
+        let mut model = Model::new();
+        let tag = "x".repeat(100);
+        for i in 0..500 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        for i in 0..499 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        let state = table.compaction_state();
+        assert!(state.data_len >= 64 << 10 && state.dead == 499);
+        assert!(!state.running, "fewer dead puts than live rows");
+
+        put(&table, &mut model, 499, &tag);
+        table.flush().expect("flush");
+        assert!(table.compaction_state().running, "half the puts are dead");
+        table.finish_compaction().expect("switch");
+        let state = table.compaction_state();
+        assert_eq!((state.gen, state.dead), (1, 0));
+        assert!(state.data_len < 64 << 10);
+        assert_matches(&table, &model);
+    }
+
+    /// A requested compaction skips a table without dead puts.
+    #[test]
+    fn test_tntable_requested_compaction_needs_garbage() {
+        let tmp = TempDir::with_prefix("tntable_compact_requested").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
+        let table = TnTable::open_with(tmp.path().join("t"), None, config).expect("open");
+        let mut model = Model::new();
+        let tag = "x".repeat(1_000);
+        for i in 0..1_500 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        assert!(!table.compact(), "no dead puts");
+        put(&table, &mut model, 3, "y");
+        table.flush().expect("flush");
+        assert!(table.compact(), "a dead put");
+        table.finish_compaction().expect("switch");
+        assert_eq!(table.compaction_state().gen, 1);
+        assert_matches(&table, &model);
+    }
+
+    /// The copy is paced: copying ~3 MiB at 4 MiB/s waits for at least two batches' worth.
+    #[test]
+    fn test_tntable_compaction_is_paced() {
+        let tmp = TempDir::with_prefix("tntable_compact_paced").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 4 << 20 };
+        let table = TnTable::open_with(tmp.path().join("t"), None, config).expect("open");
+        let mut model = Model::new();
+        let tag = "x".repeat(1_000);
+        for i in 0..3_000 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        let started = std::time::Instant::now();
+        table.compact_now().expect("compact");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(450),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_matches(&table, &model);
+    }
+
+    /// A switch that fails after its rename stops the writer (the next open picks the compacted
+    /// generation, which holds every committed row); the reopen has them all.
+    #[test]
+    fn test_tntable_compaction_switch_failing_after_rename_latches() {
+        let tmp = TempDir::with_prefix("tntable_compact_latch").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..300 {
+            put(&table, &mut model, i, "a");
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        table.fail_next_switch_sync();
+        assert!(table.compact_now().is_err(), "the injected sync failure surfaces");
+        assert!(table.insert(&kv(1).0, &kv(1).1).is_err(), "writes are refused");
+        drop(table);
+
+        let table = TnTable::open(dir.clone(), None).expect("reopen");
+        assert_eq!(list_gens(&dir).expect("list"), vec![1]);
+        assert_matches(&table, &model);
+    }
+
+    /// Random puts, removes, clears, commits, compactions (started, and switched to at a later
+    /// commit), crashes and clean reopens: the table always reads its committed state.
+    #[test]
+    fn test_tntable_compaction_random_against_model() {
+        use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+
+        let tmp = TempDir::with_prefix("tntable_compact_random").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
+        let open = || TnTable::open_with(dir.clone(), None, config).expect("open");
+        let mut rng = StdRng::seed_from_u64(0xC0_4AC7);
+        let mut table = open();
+        let (mut committed, mut working) = (Model::new(), Model::new());
+        let mut switches = 0;
+        for step in 0..600 {
+            match rng.random_range(0..100) {
+                0..45 => {
+                    let i = rng.random_range(0..300);
+                    let tag = "v".repeat(rng.random_range(1..200));
+                    put(&table, &mut working, i, &tag);
+                }
+                45..65 => del(&table, &mut working, rng.random_range(0..300)),
+                65..67 => {
+                    // A clear is durable at once (it changes generation); the writes before it
+                    // that were never committed are gone with the old generation.
+                    table.clear().expect("clear");
+                    committed.clear();
+                    working.clear();
+                }
+                67..80 => {
+                    table.flush().expect("flush");
+                    committed = working.clone();
+                    assert_matches(&table, &committed);
+                }
+                80..86 => {
+                    table.inner.writer.lock().start_compaction(table.inner.published.load_full());
+                }
+                86..92 => {
+                    if table.compaction_state().running {
+                        let gen = table.compaction_state().gen;
+                        table.finish_compaction().unwrap_or_else(|e| panic!("step {step}: {e}"));
+                        assert_eq!(table.compaction_state().gen, gen + 1);
+                        switches += 1;
+                        committed = working.clone();
+                        assert_matches(&table, &committed);
+                    }
+                }
+                92..96 => {
+                    // No compaction thread may read the logs the reopen recovers.
+                    table.wait_compaction_thread();
+                    crash(table);
+                    table = open();
+                    working = committed.clone();
+                    assert_matches(&table, &committed);
+                }
+                _ => {
+                    drop(table); // commits what is uncommitted
+                    committed = working.clone();
+                    table = open();
+                    assert_matches(&table, &committed);
+                }
+            }
+        }
+        assert!(switches > 5, "{switches} switches");
     }
 }

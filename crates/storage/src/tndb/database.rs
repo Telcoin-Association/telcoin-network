@@ -37,7 +37,7 @@ use tn_types::{
     Database, DbTx, DbTxMut, Table,
 };
 
-use super::table::{KeyFn, ScanKind, TnTable};
+use super::table::{CompactionConfig, KeyFn, ScanKind, TnTable};
 use crate::archive::fxhasher::FxHasher;
 
 /// Reusable encode buffers for a table's writes, so an insert or remove encodes without allocating.
@@ -196,6 +196,8 @@ fn first_of<T: Table>(store: &StoreType, kind: ScanKind) -> Option<(T::Key, T::V
 pub struct TnDatabase {
     store: Arc<StoreType>,
     base: PathBuf,
+    /// How the tables compact.
+    compaction: CompactionConfig,
     /// Serializes table opens, so one table is never opened twice.
     open_lock: Arc<Mutex<()>>,
 }
@@ -204,13 +206,30 @@ impl TnDatabase {
     /// Open (creating the directory if needed) a tndb rooted at `path`.  Call
     /// [`Database::open_table`] (or [`Self::open_table_with_key`]) for each table before use.
     pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
+        Self::open_with_compaction(path, CompactionConfig::default())
+    }
+
+    /// [`Self::open`], with the tables compacting as `compaction` says.
+    pub fn open_with_compaction<P: AsRef<Path>>(
+        path: P,
+        compaction: CompactionConfig,
+    ) -> eyre::Result<Self> {
         let base = path.as_ref().to_path_buf();
         std::fs::create_dir_all(&base)?;
         Ok(Self {
             store: Arc::new(ArcSwap::from_pointee(Tables::default())),
             base,
+            compaction,
             open_lock: Arc::default(),
         })
+    }
+
+    /// Compact table `T` now, whatever its garbage, and wait for it: its log is rewritten without
+    /// the removed and overwritten records. Blocks the caller for the whole copy; the table stays
+    /// readable and writable meanwhile. For tooling and tests: tables compact on their own (see
+    /// [`CompactionConfig`]) and on [`Database::compact`].
+    pub fn compact_table_now<T: Table>(&self) -> eyre::Result<()> {
+        with_open_table::<T, _>(&self.store, |entry| entry.table.compact_now())
     }
 
     /// Open table `T` as a derived-key table: its log stores only values, and `key_of` recomputes
@@ -246,7 +265,7 @@ impl TnDatabase {
             return Ok(());
         }
         let entry = TableStore {
-            table: TnTable::open(self.base.join(T::NAME), key_fn)?,
+            table: TnTable::open_with(self.base.join(T::NAME), key_fn, self.compaction)?,
             bufs: Default::default(),
             derived,
         };
@@ -421,6 +440,16 @@ impl Database for TnDatabase {
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
         first_of::<T>(&self.store, ScanKind::Reverse)
+    }
+
+    /// Start compacting, in the background, every table holding dead (overwritten or removed)
+    /// records whose log is at least 1 MiB; each switches to its compacted log at a later commit.
+    /// Returns at once.
+    fn compact(&self) -> eyre::Result<()> {
+        for entry in self.store.load().values() {
+            entry.table.compact();
+        }
+        Ok(())
     }
 }
 
@@ -1240,5 +1269,47 @@ mod test {
         db.open_table::<TestTable>().expect("the table opens");
         assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("committed".to_string()));
         assert_eq!(db.get::<TestTable>(&2).expect("get"), None);
+    }
+
+    /// `Database::compact` starts a background compaction of each table holding dead records,
+    /// which a later commit switches to; `compact_table_now` compacts and waits. The rows read the
+    /// same throughout.
+    #[test]
+    fn test_tndb_requested_and_immediate_compaction() {
+        use std::time::{Duration, Instant};
+
+        use super::super::{layout::list_gens, CompactionConfig};
+
+        let tmp = TempDir::with_prefix("tndb_compact").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
+        let db = TnDatabase::open_with_compaction(tmp.path(), config).expect("open tndb");
+        db.open_table::<TestTable>().expect("open table");
+        let big = "x".repeat(1_000);
+        for i in 0..1_500u64 {
+            db.insert::<TestTable>(&i, &big).expect("insert");
+        }
+        for i in 0..100u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("overwrite");
+        }
+        let table_dir = tmp.path().join("TestTable");
+        assert_eq!(list_gens(&table_dir).expect("list"), vec![0]);
+
+        db.compact().expect("compact");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while list_gens(&table_dir).expect("list").last() != Some(&1) {
+            assert!(Instant::now() < deadline, "a commit switched to the compacted generation");
+            db.insert::<TestTable>(&9_999, &"tick".to_string()).expect("commit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        db.compact_table_now::<TestTable>().expect("compact now");
+        assert_eq!(list_gens(&table_dir).expect("list").last(), Some(&2));
+
+        for i in 0..100u64 {
+            assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")));
+        }
+        for i in 100..1_500u64 {
+            assert_eq!(db.get::<TestTable>(&i).expect("get").as_ref(), Some(&big));
+        }
+        assert_eq!(db.iter::<TestTable>().count(), 1_501);
     }
 }

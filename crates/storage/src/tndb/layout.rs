@@ -8,14 +8,17 @@
 //! <table>/gen-<N>/removed  the removal log: [key | data log length at the removal]
 //! <table>/gen-<N>/btx/     the B-tree index over the current generation (rebuildable)
 //! <table>/spare-<N+1>-<id>/ the next generation, prepared empty in the background
+//! <table>/compact-<N+1>-<id>/ a compaction's new generation, being built in the background
 //! ```
 //!
 //! A table's data lives in one generation directory. Clearing the table starts a new, empty
 //! generation and deletes the old one, so cleared data leaves the disk (once no reader still maps
 //! it). The new generation is a spare prepared ahead of time, so a clear only renames it into
 //! place; a spare is never a generation (only `gen-<N>` directories are), and a leftover one is
-//! deleted on open. `meta` is per table, outside the generations: its key mode is fixed when the
-//! table is created, and its key size once the first row is written.
+//! deleted on open. A compaction builds the next generation in a `compact-*` directory and renames
+//! it into place when done; a leftover one is deleted on open too. `meta` is per table, outside
+//! the generations: its key mode is fixed when the table is created, and its key size once the
+//! first row is written.
 
 use std::{
     fs,
@@ -158,18 +161,31 @@ pub(crate) fn gen_dir(table: &Path, n: u64) -> PathBuf {
 /// per-process counter), so no two preparations ever share files, and the files of a spare that
 /// became a generation never share a path with a later spare.
 pub(crate) fn spare_dir(table: &Path, n: u64) -> PathBuf {
-    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    table.join(format!("spare-{n}-{}-{id}", std::process::id()))
+    scratch_dir(table, "spare", n)
 }
 
-/// Delete every spare in `table` (one left by a close or a crash; a fresh one is prepared).
-/// Best-effort: a spare is never read, so one that cannot be deleted now (logged) is only garbage
+/// A fresh directory to build a compaction's generation `n` in (unique, as [`spare_dir`]).
+pub(crate) fn compact_dir(table: &Path, n: u64) -> PathBuf {
+    scratch_dir(table, "compact", n)
+}
+
+fn scratch_dir(table: &Path, kind: &str, n: u64) -> PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    table.join(format!("{kind}-{n}-{}-{id}", std::process::id()))
+}
+
+/// Delete every spare and unfinished compaction in `table` (left by a close or a crash).
+/// Best-effort: neither is ever read, so one that cannot be deleted now (logged) is only garbage
 /// for a later open to remove.
 pub(crate) fn remove_spares(table: &Path) -> eyre::Result<()> {
     for entry in fs::read_dir(table)? {
         let entry = entry?;
-        if entry.file_name().to_str().is_some_and(|name| name.starts_with("spare-")) {
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| name.starts_with("spare-") || name.starts_with("compact-"))
+        {
             if let Err(e) = fs::remove_dir_all(entry.path()) {
                 tracing::warn!(target: "tndb", "remove spare {}: {e}", entry.path().display());
             }

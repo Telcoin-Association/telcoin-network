@@ -45,6 +45,9 @@
 //!   concurrent `multi_get` readers, on the cache-mode layer.
 //! - `workload_startup_reload`: a restart late in an epoch: reopen time, raw and with the
 //!   full-memory layer loading every row.
+//! - `workload_compaction`: a long-lived table under churn (a sliding window of single inserts and
+//!   removes, plus overwrites), tndb with its compaction off and on: what compaction saves on disk
+//!   and what it costs the writer (step latency, including the switch at a commit).
 //!
 //! ## Columns
 //!
@@ -86,7 +89,12 @@ use crate::{
     db_bench::open_mdbx_prod,
     mdbx::database::{PROD_CACHE_GROWTH, PROD_CACHE_MAX, PROD_EPOCH_MAX, PROD_GROWTH},
 };
-use crate::{layered_db::LayeredDatabase, mem_db::MemDatabase, tndb::TnDatabase, ROUNDS_TO_KEEP};
+use crate::{
+    layered_db::LayeredDatabase,
+    mem_db::MemDatabase,
+    tndb::{CompactionConfig, TnDatabase},
+    ROUNDS_TO_KEEP,
+};
 
 /// Define a bench table with a production key shape.
 macro_rules! bench_table {
@@ -136,6 +144,13 @@ bench_table!(
 );
 bench_table!(Batches, B256, ByteVec, TableHint::Cache, "`NodeBatchesCache`: digest to batch.");
 bench_table!(OurBatches, B256, ByteVec, TableHint::Cache, "`OurNodeBatchesCache`: our batches.");
+bench_table!(
+    Churn,
+    u64,
+    ByteVec,
+    TableHint::Cache,
+    "A long-lived table whose rows are replaced over time (as the batch caches' and kad tables')."
+);
 
 // ---- the production model's sizes and rates ----
 
@@ -1020,6 +1035,146 @@ fn workload_startup_reload() {
         ),
         "reopen = open + open_table of the 7 epoch tables; the layered reopen also loads every \
          row into memory",
+        &cols,
+    );
+}
+
+// ---- workload 4: compaction ----
+
+/// Live rows in the churn workload's sliding window.
+const CHURN_WINDOW: u64 = 2_048;
+/// The churn workload's value size.
+const CHURN_VALUE: usize = 4 * 1024;
+/// Steps: each inserts the next row and removes the one leaving the window; every fourth also
+/// overwrites a live row.
+const CHURN_STEPS: u64 = 40_000;
+
+/// A long-lived table under churn: single (autocommit) inserts, removes and overwrites.
+struct ChurnWorkload;
+
+/// The compactions a tndb table has switched to: its generation number (the workload never
+/// clears), or `None` for another backend.
+fn tndb_compactions(dir: &Path) -> Option<usize> {
+    std::fs::read_dir(dir.join(Churn::NAME))
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.strip_prefix("gen-")?.parse().ok())
+        .max()
+}
+
+impl Workload for ChurnWorkload {
+    fn open_tables<DB: Database>(&self, db: &DB) {
+        db.open_table::<Churn>().expect("open Churn");
+    }
+
+    fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell> {
+        let value = filler(CHURN_VALUE, 11);
+        let mut steps = Vec::with_capacity(CHURN_STEPS as usize);
+        let mut x = mix(7);
+        let done = AtomicBool::new(false);
+        let (total, peak) = std::thread::scope(|s| {
+            // Disk use is sampled until the final persist (a layer writes in the background).
+            let sampler = dir.map(|dir| {
+                let done = &done;
+                s.spawn(move || {
+                    let mut peak = 0;
+                    while !done.load(Ordering::Acquire) {
+                        peak = peak.max(disk_bytes(dir));
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    peak.max(disk_bytes(dir))
+                })
+            });
+            let start = Instant::now();
+            for i in 0..CHURN_STEPS {
+                let step = Instant::now();
+                db.insert::<Churn>(&i, &value).expect("insert");
+                if i >= CHURN_WINDOW {
+                    db.remove::<Churn>(&(i - CHURN_WINDOW)).expect("remove");
+                }
+                if i % 4 == 3 {
+                    x = mix(x);
+                    let oldest = (i + 1).saturating_sub(CHURN_WINDOW);
+                    let key = oldest + x % (i + 1 - oldest);
+                    db.insert::<Churn>(&key, &value).expect("overwrite");
+                }
+                steps.push(step.elapsed());
+            }
+            rt.block_on(db.persist::<Churn>()).expect("persist");
+            let total = start.elapsed();
+            done.store(true, Ordering::Release);
+            (total, sampler.map(|sampler| sampler.join().expect("sampler")))
+        });
+        assert_eq!(db.iter::<Churn>().count() as u64, CHURN_WINDOW, "the window's rows");
+        drop(db);
+
+        let max = steps.iter().copied().max().unwrap_or_default();
+        let compactions = dir.and_then(tndb_compactions).map_or_else(
+            || Cell::new("compactions", Better::Unranked, "-".to_string()),
+            |n| Cell::count("compactions", n),
+        );
+        vec![
+            Cell::rate("K steps/s", CHURN_STEPS as f64 / total.as_secs_f64() / 1e3),
+            Cell::us("step p50 us", quantile(&mut steps, 0.5)),
+            Cell::us("step p99 us", quantile(&mut steps, 0.99)),
+            Cell::ms("step max ms", max),
+            Cell::mb("peak disk MB", peak),
+            Cell::mb("disk MB after close", dir.map(disk_bytes)),
+            compactions,
+        ]
+    }
+}
+
+/// A long-lived table under churn, tndb with its compaction off and on (default config: at 64 MiB
+/// of log and half its puts dead, copied at 64 MiB/s), raw and behind the cache-mode layer, with
+/// MDBX (which reuses freed pages) for scale.
+///
+/// On-demand perf test (kept out of the default suite). Run with:
+/// `cargo test --release -p tn-storage workload_compaction -- --ignored --nocapture
+/// --test-threads 1`.
+#[test]
+#[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
+fn workload_compaction() {
+    let rt = Runtime::new().expect("tokio runtime");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let mut w = ChurnWorkload;
+    let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
+    let on = CompactionConfig::default();
+    let tndb = |name: &str, config| {
+        let dir = tmp.path().join(name);
+        (TnDatabase::open_with_compaction(&dir, config).expect("open tndb"), dir)
+    };
+    let mut cols = Vec::new();
+    for (name, config) in [("TnDb-nocompact", off), ("TnDb", on)] {
+        let (db, dir) = tndb(name, config);
+        cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
+    }
+    for (name, config) in [("Layered-cache<TnDb-nocompact>", off), ("Layered-cache<TnDb>", on)] {
+        let (db, dir) = tndb(name, config);
+        let db = LayeredDatabase::open(db, false);
+        cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
+    }
+    #[cfg(feature = "reth-libmdbx")]
+    {
+        let dir = tmp.path().join("mdbx_prod");
+        let db = open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH);
+        cols.push(column(&rt, &mut w, "MDBX-prod".to_string(), db, Some(&dir)));
+        let dir = tmp.path().join("mdbx_prod_layered");
+        let db = LayeredDatabase::open(
+            open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH),
+            false,
+        );
+        cols.push(column(&rt, &mut w, "Layered-cache<MDBX-prod>".to_string(), db, Some(&dir)));
+    }
+    print_table(
+        &format!(
+            "compaction: {CHURN_STEPS} steps over a {CHURN_WINDOW}-row window of {} KB values \
+             (live data {} MiB)",
+            CHURN_VALUE / 1024,
+            (CHURN_WINDOW * CHURN_VALUE as u64) >> 20
+        ),
+        "step = insert + remove (+ an overwrite every 4th), each its own commit; the layered \
+         steps are not durable until the final persist; step max includes a compaction's switch",
         &cols,
     );
 }

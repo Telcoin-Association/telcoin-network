@@ -11,8 +11,9 @@ on this crate's own storage primitives instead of MDBX or redb:
   and writers never block readers.
 
 On top of that it adds crash recovery (rebuild the index by replaying the logs to the last commit),
-physical clears (a cleared table's data leaves the disk), and two key modes (store the key, or
-derive it from the value).
+physical clears (a cleared table's data leaves the disk), background compaction (overwritten and
+removed records leave the disk too), and two key modes (store the key, or derive it from the
+value).
 
 > **Status.** tndb is not yet the node's production database: `open_db` still builds
 > `CompositeDatabase<MdbxDatabase>`. tndb is complete enough to be benchmarked against MDBX through
@@ -21,10 +22,11 @@ derive it from the value).
 
 | file | contents |
 |---|---|
-| `mod.rs` | module root; re-exports `TnDatabase` |
+| `mod.rs` | module root; re-exports `TnDatabase` and `CompactionConfig` |
 | `database.rs` | the typed layer: `TnDatabase`, `TnDbTx`, `TnDbTxMut`, the `Database` impl, key modes |
 | `table.rs` | one table (`TnTable`): logs, index, snapshots, commits, recovery, generations, clear |
-| `layout.rs` | the on-disk layout: the `meta` file, generation and spare directories, `fsync` helpers |
+| `table/compact.rs` | compaction: the background rewrite into the next generation, and its catch-up |
+| `layout.rs` | the on-disk layout: the `meta` file, generation, spare and compaction directories, `fsync` helpers |
 
 ---
 
@@ -38,11 +40,12 @@ derive it from the value).
 6. [Commits and durability](#commits-and-durability)
 7. [Crash recovery](#crash-recovery)
 8. [Clearing a table: generations and spares](#clearing-a-table-generations-and-spares)
-9. [Concurrency and memory safety](#concurrency-and-memory-safety)
-10. [API reference](#api-reference)
-11. [Limitations and future work](#limitations-and-future-work)
-12. [Tests](#tests)
-13. [Benchmarks](#benchmarks)
+9. [Compaction](#compaction)
+10. [Concurrency and memory safety](#concurrency-and-memory-safety)
+11. [API reference](#api-reference)
+12. [Limitations and future work](#limitations-and-future-work)
+13. [Tests](#tests)
+14. [Benchmarks](#benchmarks)
 
 ---
 
@@ -92,7 +95,8 @@ TnTable (table.rs)                          one table; a cheap Clone handle over
   │    ├─ data log      Pack<Vec<u8>>       puts + commit records (the WAL, source of truth)
   │    ├─ removal log   Pack<Vec<u8>>       removed keys
   │    ├─ BtreeIndex                         key → data-log position (copy-on-write, derived)
-  │    └─ spare thread                       the next generation, prepared in the background
+  │    ├─ spare thread                       the next generation, prepared in the background
+  │    └─ compaction thread                  the live rows, rewritten into the next generation
   └─ ArcSwap<Published>                      what readers see: an IndexSnapshot + the log's MapView
 ```
 
@@ -121,6 +125,7 @@ TnTable (table.rs)                          one table; a cheap Clone handle over
       removed                           removal log (Pack, uncompressed) ── + clean-close seal
       btx/index.btx                     B+tree index (derived; created at the first insert)
     spare-<N+1>-<pid>-<id>/             the next generation, prepared in the background
+    compact-<N+1>-<pid>-<id>/           a compaction's new generation, being built
 ```
 
 ### `meta`
@@ -157,7 +162,7 @@ Overwrites append a new put; the index points at the newest. Reads find the valu
 
 `key ‖ data_len (u64 LE)`, where `data_len` is the data log's length when the key was removed: every
 put of that key **below** `data_len` is gone. A removal is logged only when the key was present (a
-miss costs nothing). The removal log is read only by recovery (and, later, compaction).
+miss costs nothing). The removal log is read only by recovery and by compaction's catch-up.
 
 ### Files and options
 
@@ -202,7 +207,8 @@ miss costs nothing). The removal log is read only by recovery (and, later, compa
 | `clear_table` | switch to an empty generation (durable on return), then publish |
 | `read_txn` → `TnDbTx` | reads go straight to the published snapshots (`multi_get` uses the trait default) |
 | `write_txn` → `TnDbTxMut` | see below |
-| `persist`, `sync_persist`, `compact` | trait defaults (no-ops): every commit is already durable when it returns |
+| `persist`, `sync_persist` | trait defaults (no-ops): every commit is already durable when it returns |
+| `compact` | starts a background compaction of every table with dead records (see [Compaction](#compaction)); returns at once |
 
 Every op that returns a `Result` on a table that was never opened is an **error** ("table … is not
 open"), as with MDBX: a write is never silently dropped. Each `insert` and `remove` is all or
@@ -234,7 +240,8 @@ has nothing uncommitted; otherwise:
 3. `msync` the **data log** (plus a one-time `fsync` after a growth, so the new size is durable).
 4. Stamp both logs' **commit markers** (best-effort, unsynced; a floor recovery uses, below), and
    record the covered log length in the index header (in memory).
-5. Publish a new snapshot to readers.
+5. If a compaction's thread has finished, switch to its generation (see [Compaction](#compaction)).
+6. Publish a new snapshot to readers, then start the automatic compaction if it is due.
 
 The B+tree index is **not** synced on commit; it is derived, synced at a clean close, and rebuilt
 after a crash.
@@ -328,12 +335,13 @@ generation, because only `gen-*` directories are generations.
 5. When the last snapshot of the old generation drops, its files are closed (unmapped) on a
    short-lived `tndb-reap` thread, off the path of whoever dropped it.
 
-**Open** removes any leftover `spare-*`, uses the newest `gen-*`, and deletes older ones. More than
-one generation exists only after a crash during a clear; the newest is current (a clear renames a
-complete generation into place, and a partly created one opens as empty). A newest generation that
-does not open is an **error**: it is never deleted and an older generation is never brought back
-in its place, since that would erase committed data or resurrect cleared data. A new table starts
-at `gen-0`. Deleting older generations and leftover spares is best-effort (logged).
+**Open** removes any leftover `spare-*` and `compact-*`, uses the newest `gen-*`, and deletes older
+ones. More than one generation exists only after a crash during a clear or a compaction's switch;
+the newest is current (a clear or a switch renames a complete generation into place, and a partly
+created one opens as empty). A newest generation that does not open is an **error**: it is never
+deleted and an older generation is never brought back in its place, since that would erase
+committed data or resurrect cleared data. A new table starts at `gen-0`. Deleting older generations
+and leftovers is best-effort (logged).
 
 **A failed clear** that may have changed which generation the next open picks (the rename into
 place succeeded but its directory sync failed, or a fallback creation failed part-way) **stops the
@@ -342,6 +350,72 @@ restart would discard.
 
 **Close** waits for a spare still being prepared, then discards it, so no background thread writes
 into a closed table's directory.
+
+---
+
+## Compaction
+
+Overwrites and removes leave dead records in the data log (and removal records in the removal log)
+until the table is cleared. Compaction rewrites a table's live rows into its next generation in the
+background and switches to it; the old generation, dead records and all, is then deleted.
+
+**When.**
+
+- **Automatically**, at a commit, once the data log is at least `CompactionConfig::auto_min_bytes`
+  (default 64 MiB) and at least half the generation's puts are dead (`dead ≥ live`). `dead` counts
+  overwrites and successful removes since the generation started; a crash rebuild counts them
+  exactly, a clean open starts at 0. The check is O(1).
+- **On request**: `Database::compact()` starts one for every table with dead puts and a log of at
+  least 1 MiB, and returns at once (`LayeredDatabase` calls it at startup and daily).
+- **Now**: `TnDatabase::compact_table_now::<T>()` compacts regardless and waits (tooling, tests).
+
+`TnDatabase::open_with_compaction(root, config)` sets the trigger and pace; `auto_min_bytes: None`
+turns the automatic trigger off.
+
+**How** (`table/compact.rs`):
+
+1. **Copy** (a `tndb-compact` thread, no lock). From the last published snapshot, walk the index in
+   key order and append each live row's record, byte for byte, to a new data log in
+   `compact-<N+1>-<pid>-<id>/`, indexing it in a new B+tree. Dead records are never reached. Key
+   order fills the new tree densely (append splits) and makes a scan of the new log sequential. The
+   snapshot is released once copied, so it pins no index pages during the catch-up; the old
+   generation's keepalive is held for the whole run.
+2. **Catch-up** (same thread, no lock). Commits keep landing in the old generation. At each publish
+   the writer tells the thread how far the old logs are committed, and the thread replays both
+   logs' committed tails through their lock-free views, merging puts and removals by position as
+   recovery does. Removals go to the new removal log against the new data log's length, so the new
+   generation replays on its own. Rounds repeat until one has at most 1 MiB to replay (at most 8).
+3. **Sync** the new logs (removal log first) and the directory.
+4. **Switch** (the writer, at the first commit after the thread finishes, between that commit and
+   its publish): replay the last tail (all of it committed by then), commit and sync it, check the
+   new generation holds exactly the table's rows, rename the directory to `gen-<N+1>` and `fsync`
+   the table directory. The old generation is retired as in a clear (its keepalive holds it for live
+   snapshots; its directory is deleted on a `tndb-reap` thread), and the publish moves readers to
+   the new one.
+
+**Pacing.** The copy and catch-up pause between 1 MiB batches to hold
+`CompactionConfig::bytes_per_sec` (default 64 MiB/s; 0 is unpaced), leaving the disk to commits.
+
+**Cost.** Readers are unaffected: they keep their snapshot and move to the new generation at the
+next publish. The writer is delayed only by the switch: a replay of what was committed since the
+thread's last round (normally at most about 1 MiB), an `msync`, a rename and a directory `fsync`. On
+the hot path, compaction adds a counter per write and two O(1) checks per commit.
+
+**Crash safety.** Before the rename, a compaction is a `compact-*` directory, never a generation:
+the next open deletes it, and the table is as it was. After the rename, the new generation is the
+newest and holds every committed row (as the old one does), so the next open uses it (rebuilding it
+from its own logs if unclean) and deletes the old one. A switch that fails after its rename (the
+directory sync) stops the writer, as a failed clear does.
+
+**Interplay.**
+
+- A **clear** cancels a running compaction: its thread stops at its next batch and deletes its
+  directory, and is joined before the next compaction starts or at close.
+- A **clean close** switches to a compaction that has finished, and stops one that has not.
+- A compaction that **fails** (an I/O error, a row-count mismatch at the switch) is dropped and
+  logged; the table carries on in its old generation.
+- **Disk:** while a compaction runs, the table holds both generations (the old one whole, the new
+  one's live rows).
 
 ---
 
@@ -358,13 +432,16 @@ into a closed table's directory.
 - **Mappings outlive their readers.** A `MapView` does not own its mapping, so a file must stay
   open while any reader can reach it. Snapshots and scans hold `Arc`s that guarantee this:
   - the current generation's files live in the table's `Writer`, which a `TableScan` keeps alive;
-  - a cleared generation's files live in its `GenAlive` keepalive, which its snapshots hold.
+  - a retired (cleared or compacted away) generation's files live in its `GenAlive` keepalive,
+    which its snapshots, and a compaction thread reading it, hold.
 
   Neither file is ever truncated or unmapped under a live reader: lock-free readers cannot be
   counted, so the design never needs to count them.
 - **The index never reuses a page a live snapshot can reach** (see the btree_index README).
-- **Background threads** are a spare preparer per table (joined on clear and on close) and
-  short-lived reapers (detached; they only close already-unlinked files).
+- **Background threads** are a spare preparer per table (joined on clear and on close), a
+  compactor while one runs (joined at the switch; cancelled by a clear; joined at close), and
+  short-lived reapers (detached; they only close already-unlinked files or delete a retired
+  generation's directory).
 
 ---
 
@@ -373,22 +450,30 @@ into a closed table's directory.
 | item | description |
 |---|---|
 | `TnDatabase::open(root)` | open or create a database rooted at `root` (tables are opened separately) |
+| `TnDatabase::open_with_compaction(root, config)` | the same, with a `CompactionConfig` (trigger and pace) |
+| `TnDatabase::compact_table_now::<T>()` | compact table `T` now and wait for the switch |
+| `Database::compact()` | start a background compaction of every table with dead records |
 | `Database::open_table::<T>()` | open (or create) table `T` as keyed; idempotent |
 | `TnDatabase::open_table_with_key::<T>(key_of)` | open (or create) table `T` as derived-key |
 | `Database` / `DbTx` / `DbTxMut` | the full trait surface (see [Reads, writes and transactions](#reads-writes-and-transactions)) |
 | `TnDbTx`, `TnDbTxMut` | the transaction types |
 
-Crate-internal building blocks (`table.rs`, `layout.rs`): `TnTable` (`open(dir, key_fn)`,
-`insert`, `remove`, `clear`, `flush`, `get_with`, `get_working_with`, `contains`, `is_empty`,
-`scan`, `first_with`), `TableScan`, `ScanKind`, `KeyFn`, `TableMeta`, `KeyMode`, `gen_dir`,
-`spare_dir`, `list_gens`, `remove_spares`, `sync_file`, `sync_dir`.
+Crate-internal building blocks (`table.rs`, `table/compact.rs`, `layout.rs`): `TnTable`
+(`open_with(dir, key_fn, config)`, `insert`, `remove`, `clear`, `flush`, `get_with`,
+`get_working_with`, `contains`, `is_empty`, `scan`, `first_with`, `compact`, `compact_now`,
+`finish_compaction`), `TableScan`, `ScanKind`, `KeyFn`, `Compaction`, `Builder`, `replay_delta`,
+`TableMeta`, `KeyMode`, `gen_dir`, `spare_dir`, `compact_dir`, `list_gens`, `remove_spares`,
+`sync_file`, `sync_dir`.
 
 ---
 
 ## Limitations and future work
 
-- **Compaction.** Overwritten and removed rows stay in the data log until the table is cleared. The
-  generation directories are the intended mechanism: compact into a new generation, swap it in.
+- **The dead count after a clean restart.** It starts at 0, so a table reopened full of garbage
+  compacts on its own only once new dead puts reach its live rows (a requested compaction runs as
+  soon as there is one). Persisting the count (e.g. in the index header) would close this.
+- **A switch waits for a commit.** A finished compaction of a table that is not written again
+  switches at its next commit or clean close.
 - **Cross-table atomicity.** Each table commits separately (see transactions).
 - **Recovery memory.** The replay builds the live key map in memory (a streaming or two-pass rebuild
   would bound it).
@@ -424,7 +509,8 @@ key check):
   - `LayeredDatabase` over tndb after a crash;
   - ops on a table that isn't open are errors; a damaged index makes `contains_key` an error;
   - a second open of the same table is refused until the first closes;
-  - a close that cannot commit drops its uncommitted writes and the table still opens.
+  - a close that cannot commit drops its uncommitted writes and the table still opens;
+  - `Database::compact` starts a compaction a later commit switches to; `compact_table_now`.
 - **`table.rs`:**
   - byte-level table operations and scans;
   - snapshots under concurrent commits, and page reuse;
@@ -433,7 +519,16 @@ key check):
   - a clear failing after its rename stops the writer, and a reopen sees the clear;
   - a put or remove whose index step fails leaves no log record (checked through a crash rebuild);
   - a clear activates the prepared spare (with its index ready once the key size is known);
-  - a leftover spare is removed on open.
+  - a leftover spare is removed on open;
+  - compaction keeps exactly the live rows, with commits landing during its copy, during its
+    catch-up, after its last round and uncommitted at the switch (a test gate pauses the thread);
+    both logs shrink; the result survives a crash and a clean reopen;
+  - a snapshot taken before the switch keeps reading the old generation;
+  - a crash before the switch leaves the table as it was, and the open deletes the compaction;
+  - a clear cancels a running compaction; a derived-key table compacts;
+  - the automatic trigger, a requested compaction needing dead puts, and pacing;
+  - a switch failing after its rename stops the writer, and the reopen has every row;
+  - randomized compactions, clears, commits, crashes and clean reopens against a model.
 - **`layout.rs`:** `meta` round trip and corruption, generation listing.
 
 Crash simulation leaks the database (`std::mem::forget`), so no file is sealed and no index synced,
@@ -451,6 +546,7 @@ All are `#[ignore]`d; run them with `--ignored --nocapture --test-threads 1`, in
 | `workload_consensus_rounds` | production-shaped consensus rounds (N = 10, 50): raw tndb, `Layered<TnDb>`, `Layered<MDBX-prod>`, MemDb |
 | `workload_batch_cache` | single batch inserts with concurrent `multi_get` readers, on the cache-mode layer |
 | `workload_startup_reload` | reopen 8 hours into an epoch (1.33M rows): clean reopen and crash reopen (rebuild) |
+| `workload_compaction` | a long-lived table under churn, tndb with compaction off and on (raw and layered), MDBX for scale: disk use and step latency |
 | `db_backend_comparison` | per-operation battery (`db_bench.rs`): tndb, MDBX (test and production configuration), MemDb |
 | `kv_concurrent_read_bench` | concurrent point reads, tndb vs MemDb vs MDBX |
 | `pack_vs_mdbx_bench` | raw pack-file KV (digest and B+tree index), tndb, MemDb, MDBX |
