@@ -9,7 +9,7 @@ use super::{
     policy::{PeerPolicy, TrustBasis},
     score::ReputationUpdate,
     status::ConnectionStatus,
-    types::{ConnectionDirection, PeerIdentity},
+    types::{ConnectionDirection, PeerIdentity, PenaltyOutcome},
     PeerExchangeMap, Penalty,
 };
 use crate::{
@@ -231,6 +231,20 @@ impl AllPeers {
         }
         self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
+    }
+
+    /// Retain an operator hub while preserving existing reputation and connection accounting.
+    pub(super) fn retain_operator_peer(
+        &mut self,
+        bls_public_key: BlsPublicKey,
+        network_key: NetworkPublicKey,
+        addrs: Vec<Multiaddr>,
+    ) {
+        self.upsert_peer(bls_public_key, network_key, addrs);
+        self.peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .into_iter()
+            .for_each(|peer| peer.retain_for_operator());
     }
 
     /// Create a peer.
@@ -890,6 +904,17 @@ impl AllPeers {
         )
     }
 
+    /// The [PenaltyOutcome] of `penalty` for the peer identified by `peer_id`.
+    ///
+    /// The manager records penalty metrics with this outcome, after the exemption decision.
+    pub(super) fn penalty_outcome(&self, peer_id: &PeerId, penalty: Penalty) -> PenaltyOutcome {
+        if self.peer_policy(peer_id).applies(penalty) {
+            PenaltyOutcome::Applied
+        } else {
+            PenaltyOutcome::Exempt
+        }
+    }
+
     /// Boolean indicating if the ip address is associated with a banned peer.
     pub(super) fn ip_banned(&self, ip: &IpAddr) -> bool {
         self.banned_peers.ip_banned(ip)
@@ -995,6 +1020,8 @@ impl AllPeers {
     /// peer. Once the heap is full, a candidate replaces that top only when the candidate is
     /// older, so the heap converges on the `excess` oldest peers. Callers evict exactly these
     /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
+    /// Operator entries are bounded by configuration and retained with their reputation, so
+    /// reconnect scheduling cannot recreate a pruned hub and erase its protocol ban.
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
@@ -1008,7 +1035,9 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) = filter(peer.connection_status()) {
+            if let Some(instant) =
+                filter(peer.connection_status()).filter(|_| !peer.is_operator_allowlisted())
+            {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
 

@@ -84,6 +84,15 @@ impl PeerAction {
     }
 }
 
+/// Whether a reported penalty changed the peer's score.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PenaltyOutcome {
+    /// The peer policy applies the penalty to the score.
+    Applied,
+    /// The peer policy suppresses the penalty.
+    Exempt,
+}
+
 /// Request for dialing peers.
 #[derive(Debug)]
 pub(crate) struct DialRequest {

@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tn_config::PeerConfig;
-use tn_types::{now, BlsPublicKey};
+use tn_types::{now, BlsPublicKey, P2pNode};
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
 
@@ -36,6 +36,28 @@ mod peer_manager;
 #[cfg(test)]
 #[path = "../tests/listen_failure.rs"]
 mod listen_failure_tests;
+
+/// Initial delay and polling resolution for configured hub reconnects.
+const TRUSTED_RETRY_INITIAL: Duration = Duration::from_secs(1);
+/// Maximum delay during a hub outage, independent of unrelated connected peers.
+const TRUSTED_RETRY_MAX: Duration = Duration::from_secs(60);
+/// Maximum delay between kad lookups for one configured hub whose record stays unresolved.
+const TRUSTED_LOOKUP_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// One bounded reconnect schedule per configured hub in this swarm.
+#[derive(Debug)]
+struct TrustedDial {
+    /// The operator's expected identity and address, never replaced by discovery.
+    info: NetworkInfo,
+    /// Earliest time a disconnected peer may be retried.
+    next_attempt: Instant,
+    /// Exponential delay for the next failed attempt.
+    backoff: Duration,
+    /// Earliest time the next kad lookup for an unresolved record may start.
+    lookup_next: Instant,
+    /// Exponential delay between kad lookups while the record stays unresolved.
+    lookup_backoff: Duration,
+}
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -151,6 +173,10 @@ pub(crate) struct PeerManager {
     config: PeerConfig,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
+    /// A single timer shared by all configured hub reconnects, dropped with the swarm.
+    trusted_retry: Option<tokio::time::Interval>,
+    /// Persistent reconnect state, bounded by the operator's configured hubs.
+    trusted_dials: HashMap<BlsPublicKey, TrustedDial>,
     /// All peers for the manager.
     peers: AllPeers,
     /// The validated read-model of kad discovery: resolves a committee member's
@@ -289,6 +315,8 @@ impl PeerManager {
             local_peer_id,
             config: *config,
             heartbeat,
+            trusted_retry: None,
+            trusted_dials: HashMap::new(),
             peers,
             known_peers: Default::default(),
             known_timestamps: Default::default(),
@@ -303,6 +331,114 @@ impl PeerManager {
             add_provider_windows: Default::default(),
             metrics,
         }
+    }
+
+    /// Install configured hubs once and start process-lifetime reconnect scheduling.
+    ///
+    /// Repeated installation cannot create duplicate dials or forgive an existing ban.
+    /// Seeded launch bindings remain authoritative for identities and dial addresses.
+    pub(crate) fn add_trusted_peers(
+        &mut self,
+        peers: std::collections::BTreeMap<BlsPublicKey, P2pNode>,
+    ) {
+        let lookup_initial = self.heartbeat.period();
+        let launch_peers = &self.committee_peers;
+        peers.into_iter().filter(|(bls, endpoint)| {
+            let compatible = launch_peers.iter().all(|(key, peer)| {
+                (*key != *bls || peer.network_key == endpoint.network_key)
+                    && (peer.network_key != endpoint.network_key || *key == *bls)
+            });
+            if !compatible {
+                warn!(target: "peer-manager", ?bls, "ignoring trusted hub that contradicts launch inventory");
+            }
+            compatible
+        }).for_each(|(bls, endpoint)| {
+            self.trusted_dials.entry(bls).or_insert_with(|| {
+                let info = NetworkInfo {
+                    pubkey: endpoint.network_key,
+                    multiaddrs: vec![launch_peers
+                        .get(&bls)
+                        .map(|peer| peer.network_address.clone())
+                        .unwrap_or(endpoint.network_address)],
+                    timestamp: tn_types::now(),
+                    rpc: endpoint.rpc,
+                };
+                self.peers.retain_operator_peer(bls, info.pubkey.clone(), info.multiaddrs.clone());
+                self.pinned_peers.insert(bls);
+                // Keep a restored or learned record that matches the configured binding, so a
+                // committee hub still resolves its BLS identity. The config wins a conflict.
+                let matches = self.known_peers.get(&bls).map(|known| known.pubkey == info.pubkey);
+                if matches == Some(false) {
+                    warn!(
+                        target: "peer-manager",
+                        ?bls,
+                        "known record conflicts with the trusted_nodes binding, using the configured binding"
+                    );
+                }
+                if matches != Some(true) {
+                    self.stub_records.insert(bls);
+                    self.known_peers.insert(bls, info.clone());
+                }
+                let now = Instant::now();
+                TrustedDial {
+                    info,
+                    next_attempt: now,
+                    backoff: TRUSTED_RETRY_INITIAL,
+                    lookup_next: now,
+                    lookup_backoff: lookup_initial,
+                }
+            });
+        });
+        if !self.trusted_dials.is_empty() {
+            self.trusted_retry.get_or_insert_with(|| {
+                let mut timer = tokio::time::interval(TRUSTED_RETRY_INITIAL);
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                timer
+            });
+            self.retry_trusted_peers();
+        }
+    }
+
+    /// Schedule due hub dials without depending on discovery or the population target.
+    fn retry_trusted_peers(&mut self) {
+        let now = Instant::now();
+        let peers = &self.peers;
+        let queued = &self.dial_requests;
+        let local_id = self.local_peer_id;
+        let dials: Vec<_> = self
+            .trusted_dials
+            .iter_mut()
+            .filter_map(|(bls, dial)| {
+                let id: PeerId = dial.info.pubkey.clone().into();
+                let status = peers.get_peer(&id).map(|peer| peer.connection_status());
+                if id == local_id
+                    || status
+                        .is_some_and(|status| matches!(status, ConnectionStatus::Connected { .. }))
+                {
+                    dial.backoff = TRUSTED_RETRY_INITIAL;
+                    dial.next_attempt = now + TRUSTED_RETRY_INITIAL;
+                    None
+                } else if now >= dial.next_attempt
+                    && !queued.iter().any(|request| request.peer_id == id)
+                    && status.is_none_or(|status| {
+                        matches!(
+                            status,
+                            ConnectionStatus::Disconnected { .. } | ConnectionStatus::Unknown
+                        )
+                    })
+                {
+                    dial.next_attempt = now + dial.backoff;
+                    dial.backoff = dial.backoff.saturating_mul(2).min(TRUSTED_RETRY_MAX);
+                    Some((*bls, id, dial.info.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        dials.into_iter().for_each(|(bls, id, info)| {
+            self.peers.retain_operator_peer(bls, info.pubkey, info.multiaddrs.clone());
+            self.dial_peer(id, info.multiaddrs, None);
+        });
     }
 
     /// Explicitly add a "trusted" peer and dial it.
@@ -477,9 +613,20 @@ impl PeerManager {
         }
     }
 
-    /// Returns a boolean indicating if the next instant in the heartbeat interval was reached.
+    /// Poll retry timers and refresh unresolved configured identities on each heartbeat.
+    ///
+    /// Return whether regular peer maintenance is due.
     pub(super) fn heartbeat_ready(&mut self, cx: &mut Context<'_>) -> bool {
-        self.heartbeat.poll_tick(cx).is_ready()
+        if self.trusted_retry.as_mut().is_some_and(|timer| timer.poll_tick(cx).is_ready()) {
+            self.retry_trusted_peers();
+        }
+        let ready = self.heartbeat.poll_tick(cx).is_ready();
+        if ready {
+            // Retry configured hubs whose record is still unresolved, inside each hub's lookup
+            // backoff. Bootstrap entries are looked up only through committee discovery.
+            self.trigger_trusted_lookups(None);
+        }
+        ready
     }
 
     /// Heartbeat maintenance.
@@ -600,9 +747,9 @@ impl PeerManager {
     ///
     /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
     /// from the just-completed epoch and the upcoming epoch both count. (NVV support remains future
-    /// work.)
+    /// work.) A configuration hint must first be confirmed by a verified signed node record.
     pub(crate) fn is_peer_validator(&self, peer_id: &PeerId) -> bool {
-        self.peers.is_peer_validator(peer_id)
+        self.peer_to_bls(peer_id).is_some() && self.peers.is_peer_validator(peer_id)
     }
 
     /// Returns a boolean if the peer is connected.
@@ -699,8 +846,9 @@ impl PeerManager {
             debug!(target: "peer-manager", ?peer_id, "skipping penalty for local peer id");
             return;
         }
-        self.metrics.record_penalty(&penalty);
+        let outcome = self.peers.penalty_outcome(&peer_id, penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
+        self.metrics.record_penalty(&penalty, outcome);
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
@@ -790,6 +938,17 @@ impl PeerManager {
             }
         }
 
+        self.trusted_dials
+            .values_mut()
+            .filter(|dial| PeerId::from(dial.info.pubkey.clone()) == *peer_id)
+            .for_each(|dial| {
+                dial.backoff = TRUSTED_RETRY_INITIAL;
+                dial.next_attempt = Instant::now() + TRUSTED_RETRY_INITIAL;
+            });
+        // A replacement connection can resolve a hub whose initial record push was interrupted.
+        // Only this peer's own key is queried, and only when it is a configured hub with an
+        // unresolved record and an elapsed lookup backoff.
+        self.trigger_trusted_lookups(Some(peer_id));
         true
     }
 
@@ -1030,6 +1189,44 @@ impl PeerManager {
         }
     }
 
+    /// Emit a [`PeerEvent::MissingAuthorities`] for configured hubs whose record is unresolved
+    /// and whose lookup backoff has elapsed.
+    ///
+    /// Only `trusted_dials` keys are queried, never bootstrap entries outside the committee.
+    /// `connected` limits the lookup to that peer's own key. Each lookup doubles the hub's delay,
+    /// from the heartbeat interval up to [`TRUSTED_LOOKUP_MAX`], so a key that never resolves (a
+    /// hub offline past the record TTL, or a conflicting `trusted_nodes` binding) has a bounded
+    /// lookup rate, and so does the conflict `warn!`. The delay resets once the record resolves.
+    fn trigger_trusted_lookups(&mut self, connected: Option<&PeerId>) {
+        let now = Instant::now();
+        let initial = self.heartbeat.period();
+        let unresolved: HashSet<BlsPublicKey> =
+            self.trusted_dials.keys().filter(|bls| self.record_unlearned(bls)).copied().collect();
+        let missing: Vec<BlsPublicKey> = self
+            .trusted_dials
+            .iter_mut()
+            .filter(|(_, dial)| {
+                connected.is_none_or(|peer_id| PeerId::from(dial.info.pubkey.clone()) == *peer_id)
+            })
+            .filter_map(|(bls, dial)| {
+                if !unresolved.contains(bls) {
+                    dial.lookup_backoff = initial;
+                    dial.lookup_next = now;
+                    return None;
+                }
+                if now < dial.lookup_next {
+                    return None;
+                }
+                dial.lookup_next = now + dial.lookup_backoff;
+                dial.lookup_backoff = dial.lookup_backoff.saturating_mul(2).min(TRUSTED_LOOKUP_MAX);
+                Some(*bls)
+            })
+            .collect();
+        if !missing.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(missing));
+        }
+    }
+
     /// Whether no network-learned record is cached for `bls_key` — either nothing is cached at
     /// all, or the entry is still an operator-provisioned stub.
     fn record_unlearned(&self, bls_key: &BlsPublicKey) -> bool {
@@ -1209,6 +1406,9 @@ impl PeerManager {
         });
         self.committee_peers.extend(peers.clone());
         peers.into_iter().for_each(|(key, peer)| {
+            self.trusted_dials.get_mut(&key).iter_mut().for_each(|dial| {
+                dial.info.multiaddrs = vec![peer.network_address.clone()];
+            });
             if self.record_unlearned(&key) {
                 self.add_known_peer(
                     key,
@@ -1243,17 +1443,17 @@ impl PeerManager {
         (known_key == key) != (known.pubkey == peer.network_key)
     }
 
-    /// Add a peer learned from the kad discovery DHT, but only if it is a tracked committee member.
+    /// Add a peer learned from the DHT for a tracked committee member or operator-pinned key.
     ///
     /// Unlike [`Self::add_known_peer`], this path is reachable by any remote peer: a
     /// signature-valid kad record only proves the publisher owns the network key it advertises,
     /// not that the advertised [`BlsPublicKey`] belongs to any committee. Caching every such
     /// record would let a peer grow `known_peers` without bound by publishing records for endless
-    /// fresh keys (issue #827). `known_peers` exists solely to resolve committee members' network
-    /// info, so a record whose key is in no tracked committee slot is dropped: it is either stale
-    /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
-    /// unaffected because kad lookups are only ever triggered for current/next committee members
-    /// whose info is missing (see [`Self::trigger_missing_authorities`]).
+    /// fresh keys (issue #827). Accept only tracked committee members and operator-pinned keys;
+    /// the latter set is bounded by local configuration. Kad lookups are only ever triggered for
+    /// current/next committee members and configured trusted hubs (see
+    /// [`Self::trigger_trusted_lookups`]), so an indirect lookup can confirm a hub's identity
+    /// after its first connection was interrupted before the signed record arrived.
     #[cfg(test)]
     pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, now());
@@ -1267,11 +1467,11 @@ impl PeerManager {
         info: NetworkInfo,
         timestamp: crate::freshness::RecordTimestamp,
     ) {
-        if !self.peers.is_committee_member(&bls_key) {
+        if !self.peers.is_committee_member(&bls_key) && !self.pinned_peers.contains(&bls_key) {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
-                "dropping discovered peer record for non-committee key"
+                "dropping discovered peer record for unconfigured non-committee key"
             );
         } else if self.kad_timestamp_is_stale(&bls_key, timestamp, now()) {
             trace!(
@@ -1379,6 +1579,7 @@ impl PeerManager {
             }
             () if cacheable => self.cache_known_peer_with_timestamp(bls_key, info, timestamp),
             () if source == advertised
+                && self.trusted_binding_matches(bls_key, &info)
                 && !self.committee_peers.values().any(|peer| peer.network_key == info.pubkey) =>
             {
                 trace!(
@@ -1467,6 +1668,14 @@ impl PeerManager {
         self.cache_known_peer_with_timestamp(bls_key, info, timestamp);
     }
 
+    /// Reject both directions of a learned binding that contradicts a configured hub.
+    fn trusted_binding_matches(&self, bls_key: BlsPublicKey, info: &NetworkInfo) -> bool {
+        self.trusted_dials.iter().all(|(expected_bls, dial)| {
+            (*expected_bls != bls_key || dial.info.pubkey == info.pubkey)
+                && (dial.info.pubkey != info.pubkey || *expected_bls == bls_key)
+        })
+    }
+
     /// Update identity, addresses and RPC info together with their local ordering metadata.
     fn cache_known_peer_with_timestamp(
         &mut self,
@@ -1474,7 +1683,9 @@ impl PeerManager {
         mut info: NetworkInfo,
         timestamp: crate::freshness::RecordTimestamp,
     ) {
-        if !self.launch_binding_matches(bls_key, &info) {
+        if !self.trusted_binding_matches(bls_key, &info) {
+            warn!(target: "peer-manager", ?bls_key, "ignoring record that contradicts configured hub identity");
+        } else if !self.launch_binding_matches(bls_key, &info) {
             warn!(target: "peer-manager", ?bls_key, "rejecting record that contradicts launch inventory");
         } else {
             self.committee_peers.get(&bls_key).iter().for_each(|peer| {
@@ -1577,11 +1788,11 @@ impl PeerManager {
         }
     }
 
-    /// Find the BlsPublicKey for a known PeerId.
+    /// Find the verified BlsPublicKey binding for a known PeerId.
     ///
-    /// Backed by the peer store's `Confirmed`-identity index, populated for connected/known peers.
+    /// Configuration stubs remain dial hints until a verified signed record confirms the binding.
     pub(crate) fn peer_to_bls(&self, peer_id: &PeerId) -> Option<BlsPublicKey> {
-        self.peers.bls_for_peer(peer_id)
+        self.peers.bls_for_peer(peer_id).filter(|bls| !self.stub_records.contains(bls))
     }
 
     /// Visibility helper for behavior to evaluate pending outbound connection attempts.

@@ -334,6 +334,11 @@ impl Peer {
         self.reputation()
     }
 
+    /// Retain an operator-provisioned peer without resetting its score or connection state.
+    pub(super) fn retain_for_operator(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
     /// Ensure the peer's status is banned.
     ///
     /// A ban is never suppressed by admission, retention, or load-scoring privileges.

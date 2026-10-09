@@ -139,6 +139,7 @@ impl PrimaryNetworkError {
 }
 
 impl From<&PrimaryNetworkError> for Option<Penalty> {
+    /// Map primary network failures to attributable peer penalties.
     fn from(val: &PrimaryNetworkError) -> Self {
         //
         // explicitly match every error type to ensure penalties are updated with changes

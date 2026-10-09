@@ -278,6 +278,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Install process-lifetime trusted hub connections in this swarm.
+    AddTrustedPeers {
+        /// Validated operator-provisioned identities and address hints for this swarm only.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Acknowledge installation independently of remote availability.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Seed fixed launch bindings without granting committee membership.
     SeedCommitteePeers {
         /// This swarm's operator-owned BLS/network/address bindings.
@@ -386,6 +393,14 @@ where
     ConnectedPeerIds {
         /// Reply to caller.
         reply: oneshot::Sender<Vec<PeerId>>,
+    },
+    /// Inspect a signed identity binding when waiting for authentication in transport tests.
+    #[cfg(test)]
+    VerifiedPeerBls {
+        /// Transport identity whose signed binding is required.
+        peer: PeerId,
+        /// Reply to caller, excluding unverified configuration hints.
+        reply: oneshot::Sender<Option<BlsPublicKey>>,
     },
     /// Number of established peers available to `SendRequestAny`.
     EstablishedPeerCount {
@@ -556,7 +571,7 @@ where
 
     /// Add explicit "trusted" peer.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain operator privileges and ignore load penalties. Protocol penalties apply.
     /// This does not unban ips and should only be called during initialization.
     pub async fn add_trusted_peer_and_dial(
         &self,
@@ -592,6 +607,19 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Install hubs and maintain their connections until the network shuts down.
+    ///
+    /// Acknowledges registration immediately, including when a hub is offline. The swarm owns
+    /// one retry timer and one schedule per hub; duplicate installation preserves existing bans.
+    pub async fn add_trusted_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::AddTrustedPeers { peers, reply }).await?;
         rx.await?
     }
 
@@ -922,6 +950,16 @@ where
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeerIds { reply }).await?;
         peers.await.map_err(Into::into)
+    }
+
+    /// Inspect the verified BLS binding without treating a configuration hint as proof.
+    pub(crate) async fn verified_peer_bls(
+        &self,
+        peer: PeerId,
+    ) -> NetworkResult<Option<BlsPublicKey>> {
+        let (reply, binding) = oneshot::channel();
+        self.sender.send(NetworkCommand::VerifiedPeerBls { peer, reply }).await?;
+        binding.await.map_err(Into::into)
     }
 
     /// Send a request to a peer by peer id.
