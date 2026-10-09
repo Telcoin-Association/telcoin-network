@@ -7,12 +7,16 @@ mod cache;
 mod manager;
 mod mesh;
 mod peer;
+mod penalty;
+mod policy;
 mod score;
 mod status;
 mod types;
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use mesh::ConfiguredPeerKind;
 pub(crate) use mesh::MeshPeerChange;
+pub use penalty::LoadPenalty;
+pub(crate) use penalty::Severity;
 pub(crate) use types::PeerEvent;
 pub use types::{PeerExchangeMap, Penalty};
 
