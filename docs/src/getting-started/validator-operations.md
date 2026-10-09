@@ -19,7 +19,7 @@ Permissionless observers need public entry points. Provide those through sentrie
 
 ## Firewall configuration
 
-The default consensus ports are UDP 49590 for the primary network and UDP 49595 for the worker network. RPC and metrics ports are TCP and should remain private unless a dedicated gateway protects them.
+The node has no default consensus ports: it takes them from the primary and worker addresses recorded in `node-info.yaml` at key generation. By convention, validators use UDP 49590 for the primary network and UDP 49594 for the worker network. RPC and metrics ports are TCP and should remain private unless a dedicated gateway protects them.
 
 Apply these controls outside the node process:
 
@@ -32,6 +32,29 @@ Apply these controls outside the node process:
 Treat DHT records, peer exchange messages, and advertised RPC endpoints as untrusted network data. Never use them to add firewall rules or cloud security group entries.
 
 Distribute validator and sentry addresses through an authenticated operator channel. A production address manifest should include the network, epoch or activation time, peer identity, IP addresses, ports, expiry, and signer set. Stage additions before removals, verify connectivity from every validator, and retain the previous manifest for rollback.
+
+## Advertising an RPC endpoint
+
+Validators should advertise a JSON-RPC endpoint. Observers do not gossip the transactions they accept. They forward each one over JSON-RPC to the endpoint advertised by the committee validator whose slot owns the sender's account, and fall back to another validator's endpoint when that one has none or cannot be reached (see [Observer](../architecture/network.md#observer)). A validator without an endpoint receives no forwarded transactions, and if no committee validator advertises one, observers cannot forward at all.
+
+Serve the endpoint from a gateway, as [Network topology](#network-topology) recommends: bind the node's RPC server to a private interface that only the gateway can reach, terminate TLS on the gateway, and keep the validator host off the public internet. A TLS reverse proxy on the validator host itself, in front of an RPC server on loopback (`--http.addr 127.0.0.1`, the default), also works, but it exposes the validator host to the internet. Either way, advertise the gateway's or proxy's `https://` URL, never the node's own RPC ports:
+
+```bash
+telcoin-network keytool set-rpc \
+    --datadir /var/lib/telcoin \
+    --http https://rpc.validator.example.com/
+```
+
+`keytool generate validator --rpc-http <URL>` records the same field at key generation. The node reads the endpoint at startup, so restart it after a change.
+
+Choose the URL with these rules:
+
+- use `https://`: the node also accepts `http://`, but observers then send signed transactions in cleartext;
+- use a public hostname or address: observers refuse loopback, private-use (RFC 1918), link-local, unique-local, shared-address-space and unspecified addresses, and the `localhost` and `.local` names, so an endpoint on one of them receives no forwarded transactions;
+- make sure the hostname resolves to a public address: the check reads the host as written and does not resolve DNS, so a hostname that resolves to a private address passes it, and observers then dial that address, fail to reach it, and forward nothing to this validator;
+- rate-limit the gateway or proxy, because the endpoint is published in the validator's node record and anyone can find it.
+
+Networks where one operator runs every validator, such as a single-host test network that advertises `127.0.0.1`, can let observers dial private addresses with [`allow_private_forward_targets`](https://github.com/Telcoin-Association/telcoin-network/blob/main/crates/telcoin-network-cli/README.md#allow_private_forward_targets). Production networks leave it off.
 
 ## BLS key custody
 
@@ -90,8 +113,8 @@ The alert levels are starting points; tune them after a week of baseline data.
 | Memory pressure | `/proc/pressure/memory`, `full avg60` | Above 1 | The kernel is reclaiming pages the node needs, so all its threads stall | Add RAM. On RPC nodes, lower `--rpc-cache.max-blocks`. Do not add swap. |
 | IO pressure | `/proc/pressure/io`, `full avg60` | Above 10 | Execution is waiting on disk | Move to faster storage or raise the volume's provisioned IOPS, then check for throttling. |
 | Disk throttling | The provider's volume metrics (GCP reports throttled read and write operations and bytes per disk); `iostat -x` queue size and await | Any sustained throttling | The volume has reached its provisioned IOPS or throughput | Raise the volume limits or move to local NVMe. |
-| Batch cache occupancy | Live data in `<datadir>/consensus-db/cache` from an MDBX statistic, for example `mdbx_stat -ef` from the libmdbx tools (pages used minus free pages, times the page size), against the 1 GiB maximum. Not the file size (see below) | 768 MiB of live data | The committee's batch volume in an epoch is approaching the per-epoch ceiling | Tell the Telcoin Association network team. Hardware does not raise this limit. |
-| Batch cache full | Node log: an error from target `layered_db_runner` that starts `DB Insert` or `DB TXN Insert` and names a cache table, for example `DB Insert node_batches_cache` or `DB Insert our_node_batches_cache` followed by the MDBX error | Any occurrence | The per-epoch cache reached its 1 GiB maximum. The node keeps running but holds each new batch in memory until the epoch closes, so resident memory climbs | Alert. Expect resident memory to grow until the epoch boundary, and tell the Telcoin Association network team. No metric reports this state. |
+| Batch cache occupancy | Live data in `<datadir>/consensus-db/cache` from an MDBX statistic, for example `mdbx_stat -ef` from the libmdbx tools (pages used minus free pages, times the page size), against the 1 GiB maximum. Not the file size (see below) | 768 MiB of live data | Batches are not leaving the cache: consensus is not committing them, or their eviction is failing (see the next row) | Tell the Telcoin Association network team. Hardware does not raise this limit. |
+| Batch cache full | `tn_storage_write_failures_total{env="cache"}`, which counts failed write operations by `op`: `insert` (a bare insert), `begin` (a transaction that could not start, whose writes then go out one at a time, so it loses no write), `txn_insert` (an insert inside a transaction), `commit` (a transaction commit, which loses every write in it), `remove` and `clear`. Or the node log: an error from target `layered_db_runner` that starts `DB Insert` or `DB TXN Insert` and names a cache table, for example `DB Insert node_batches_cache` or `DB Insert our_node_batches_cache` followed by the MDBX error | Any occurrence | The cache reached its 1 GiB maximum. The node keeps running but holds each batch it could not write in memory until the batch is evicted or the epoch closes, so resident memory climbs. A rising `remove` or `commit` count means deletes, including evictions, are not freeing space in the file | Alert. Expect resident memory to grow while failures continue, and tell the Telcoin Association network team. |
 | Engine backlog | `tn_engine_queued_outputs`, 0 to 8 | 4 or more for 5 minutes | Execution is falling behind consensus | At 8 the engine queue is full and outputs back up into the 64-slot channel in front of it. Check CPU and IO pressure and `tn_engine_execution_duration_seconds`. |
 | Resident memory | `reth_process_resident_memory_bytes` | Above 70% of RAM | Queued outputs, RPC caches or the transaction pool are growing | Compare with the engine backlog and the RPC request rate. A climb right after a restart is replay and should fall once the node catches up. |
 
@@ -99,13 +122,15 @@ Pressure stall information needs a kernel built with PSI support, which mainline
 If `/proc/pressure` is missing, the running kernel lacks it or has it disabled.
 
 The batch cache is an MDBX file that never shrinks.
-Batches are removed at each epoch close, but the file keeps its size, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
-In the 2026-09 benchmark the file reached its 1 GiB maximum on every c3 validator and on four of ten e2 validators (the rest stopped at 960 MiB) while each 20-minute epoch carried only about 0.5 GB of batch data, and no node logged a cache insert failure.
-Mainnet and testnet use 6-hour epochs, so the ceiling there is about 260 TPS of the benchmark mix (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
+Committed batches are evicted when their consensus output, already saved to the epoch pack, is forwarded to execution, and the rest are removed at each epoch close.
+The file keeps its size either way, so `du` shows the highest level the file has reached on that datadir, a high-water mark, not how full the cache is now.
+In the 2026-09 benchmark the file reached its 1 GiB maximum on every c3 validator and on four of ten e2 validators (the rest stopped at 960 MiB) while each 20-minute epoch carried only about 0.5 GB of batch data.
+The cache now holds batches that are not yet committed, not an epoch's committed batch data (see [Per-epoch batch-cache ceiling](hardware-requirements.md#per-epoch-batch-cache-ceiling)).
 Read live occupancy from MDBX instead.
 The release exports no metric for it.
 Summed over all validators since the epoch started, `tn_worker_batch_size_bytes` gives a rough estimate of the batch data a node has written to its cache, and on a node that stayed in sync the estimate runs low.
 The histogram records each batch once, when its worker reports it to the primary, but a node writes each of its own batches to the cache twice and also writes every peer batch it validates, including ones that failed quorum.
+It is not live occupancy, because committed batches are evicted.
 
 Resident memory includes pages of the memory-mapped databases that the process has touched, so it rises slowly as the database working set grows.
 Alert on how fast it climbs during load and after restarts, not only on the level.

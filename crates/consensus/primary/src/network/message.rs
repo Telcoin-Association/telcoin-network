@@ -7,7 +7,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     sync::Arc,
 };
-use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, TNMessage};
+use tn_network_libp2p::{types::IntoRpcError, PeerExchangeMap, ServiceClass, TNMessage};
 use tn_types::{
     error::HeaderError, roaring_container_count, AuthorityIdentifier, Certificate, ConsensusResult,
     Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote, Header, HeaderDigest, Round,
@@ -37,6 +37,14 @@ impl TNMessage for PrimaryRequest {
         match self {
             Self::PeerExchange { peers } => Some(peers.clone()),
             _ => None,
+        }
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::Vote { .. } => ServiceClass::Vote,
+            Self::EpochRecord { .. } => ServiceClass::EpochRecord,
+            Self::PeerExchange { .. } => ServiceClass::Other,
         }
     }
 }
@@ -301,5 +309,35 @@ pub struct PrimaryRPCError(pub String);
 impl From<PeerExchangeMap> for PrimaryResponse {
     fn from(value: PeerExchangeMap) -> Self {
         Self::PeerExchange { peers: value }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrimaryRequest;
+    use std::sync::Arc;
+    use tn_network_libp2p::{PeerExchangeMap, ServiceClass, TNMessage};
+    use tn_types::Header;
+
+    /// A vote request has the vote class.
+    #[test]
+    fn vote_is_vote_class() {
+        let request =
+            PrimaryRequest::Vote { header: Arc::new(Header::default()), parents: Vec::new() };
+        assert_eq!(request.service_class(), ServiceClass::Vote);
+    }
+
+    /// An epoch record request has the epoch record class.
+    #[test]
+    fn epoch_record_is_epoch_record_class() {
+        let request = PrimaryRequest::EpochRecord { epoch: None, hash: None };
+        assert_eq!(request.service_class(), ServiceClass::EpochRecord);
+    }
+
+    /// Peer exchange is answered inline and has the other class.
+    #[test]
+    fn peer_exchange_is_other_class() {
+        let request = PrimaryRequest::PeerExchange { peers: PeerExchangeMap::default() };
+        assert_eq!(request.service_class(), ServiceClass::Other);
     }
 }

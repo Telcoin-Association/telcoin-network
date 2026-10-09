@@ -320,7 +320,8 @@ impl RethEnv {
             admission,
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
-        if let Err(e) = server.merge_configured(other) {
+        // `tn` is selected like reth's modules; it is in the default set and always on IPC.
+        if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
         // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
@@ -372,6 +373,7 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
+    mod namespaces;
     mod simulation;
 
     use super::*;
@@ -434,8 +436,9 @@ mod tests {
     }
 
     /// The IPC transport must serve the validated allowlist, not reth's
-    /// `default_ipc_modules()` (every module, admin and txpool included). The default
-    /// `rpc_args` serve IPC only, so the methods below are exactly the IPC registration.
+    /// `default_ipc_modules()` (every module, admin and txpool included), and that set includes
+    /// `tn`. The default `rpc_args` serve IPC only, so the methods below are exactly the IPC
+    /// registration.
     #[tokio::test]
     async fn test_ipc_transport_serves_only_the_validated_modules() {
         let tmp_dir = TempDir::new().expect("temp dir");
@@ -456,7 +459,7 @@ mod tests {
                 pool,
                 network,
                 GasAccumulator::new(1).worker_base_fee(0),
-                RpcModule::new(()),
+                namespaces::probe_tn(),
             )
             .expect("rpc server");
 
@@ -475,6 +478,8 @@ mod tests {
             server.methods_by(|name| name.starts_with("eth_")).method_names().count() > 0,
             "IPC still serves the eth namespace"
         );
+        let ipc = server.ipc_methods(|_| true).expect("ipc is enabled by default");
+        assert!(ipc.method("tn_probe").is_some(), "IPC serves the tn namespace");
     }
 
     #[tokio::test]

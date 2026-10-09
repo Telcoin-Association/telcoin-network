@@ -401,7 +401,9 @@ impl<DB: Database> Subscriber<DB> {
                 // Receive consensus messages after all transaction data is downloaded
                 // then send to the execution layer for final block production.
                 //
-                // NOTE: this broadcasts to all subscribers, but lagging receivers will lose messages
+                // NOTE: `consensus_output` is a bounded queue, so while it is full the send in
+                // `handle_consensus_output` waits, and this select, including the shutdown arm, is
+                // not polled until that send completes or the epoch's tasks are aborted.
                 Some(output) = waiting.next() => {
                     match output {
                         Ok(output) => self.handle_consensus_output(&mut consensus_chain, output).await?,
@@ -661,9 +663,9 @@ impl<DB: Database> Subscriber<DB> {
 /// deliberately symmetric with it: a fetch `Err` is fail-stop, not skippable. `waiting` is a
 /// [`FuturesOrdered`] that yields in consensus (push) order, so every `Ok` output ahead of a
 /// failed fetch is the contiguous prefix. `try_fold` threads the consensus chain as its
-/// accumulator and short-circuits at the first error, so the drain saves and broadcasts that
+/// accumulator and short-circuits at the first error, so the drain saves and sends that
 /// contiguous prefix and then stops at the gap: nothing at or past the failed fetch is saved or
-/// broadcast. In steady state the same fetch `Err` returns an error that shuts the node down;
+/// sent. In steady state the same fetch `Err` returns an error that shuts the node down;
 /// here, already shutting down, the fold simply stops, leaving the drained prefix persisted for
 /// the Phase-2 DB drain and normal restart. Stopping here makes the shutdown path self-evidently
 /// fail-stop instead of relying on the downstream pack/load/replay guards to reject the
@@ -671,8 +673,11 @@ impl<DB: Database> Subscriber<DB> {
 ///
 /// `take_until` bounds only the wait for the next completed fetch, not an in-flight save: once
 /// `deadline` passes the drain stops pulling new outputs, but an output already dequeued is always
-/// saved and broadcast to completion. This preserves the original select-based drain's guarantee
-/// that a committed output, once dequeued, is never dropped mid-save during graceful shutdown.
+/// saved and sent to completion. This preserves the original select-based drain's guarantee that a
+/// committed output, once dequeued, is never dropped mid-save during graceful shutdown. The send
+/// waits while the `consensus_output` queue is full; nothing reads the queue during teardown, so
+/// the abort of the epoch's tasks ends that wait, and Phase 2 of the epoch manager's leftover
+/// drain forwards whatever was saved.
 async fn drain_pending_on_shutdown<Fut>(
     consensus_bus: &ConsensusBusApp,
     consensus_chain: &mut ConsensusChain,
@@ -694,8 +699,9 @@ async fn drain_pending_on_shutdown<Fut>(
                 warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
                 Err(())
             } else {
-                // Best-effort broadcast: if epoch manager already exited, this is a no-op.
-                // The DB-aware drain (Phase 2) handles the gap regardless.
+                // Best-effort forward: a no-op once the epoch manager has dropped its receiver,
+                // and a wait while the queue is full, which the abort of the epoch's tasks ends.
+                // The DB-aware drain (Phase 2) forwards anything saved but never received.
                 let _ = consensus_bus.consensus_output().send(output).await;
                 Ok(chain)
             }
@@ -1057,6 +1063,80 @@ mod tests {
         }
         producer.await.expect("the producer finishes once everything is consumed");
         assert_eq!(subscriber.inner.consensus_chain.latest_consensus_number(), OUTPUTS);
+    }
+
+    /// A subscriber that runs more than a buffer ahead of the epoch manager must not lose outputs.
+    ///
+    /// The epoch manager stops reading `consensus_output` whenever the engine's bounded queue is
+    /// full, while the subscriber keeps saving and publishing. The producer here drives the real
+    /// `handle_consensus_output` for more outputs than the old 128-slot broadcast ring and the
+    /// bounded queue hold, and nothing reads until it has either finished or stalled with more
+    /// than a queue's worth saved. Every output must then reach the reader exactly once and in
+    /// order, the continuity `check_output_continuity` enforces before the engine. A broadcast
+    /// overwrites the oldest unread outputs, so the first receive is a jump past output 1.
+    #[tokio::test]
+    async fn consensus_output_backlog_reaches_epoch_manager_without_gaps() {
+        // more than the old 128-slot broadcast ring and the bounded queue depth
+        const OUTPUTS: u64 = 300;
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let temp_dir = TempDir::new().unwrap();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+                .await
+                .unwrap();
+        let consensus_bus = ConsensusBusApp::new();
+        let subscriber = sync_subscriber(&fixture, consensus_chain.clone(), &consensus_bus);
+        let outputs = chained_outputs(&fixture, OUTPUTS);
+
+        // subscribe before the producer starts, as the epoch manager does
+        let mut rx_consensus_output = consensus_bus.subscribe_consensus_output();
+        let mut producer_chain = consensus_chain.clone();
+        let producer = tokio::spawn(async move {
+            for output in outputs {
+                subscriber
+                    .handle_consensus_output(&mut producer_chain, output)
+                    .await
+                    .expect("a contiguous output saves and sends");
+            }
+        });
+
+        // hold off reading until the producer has finished or has stalled more than a queue ahead
+        tokio::time::timeout(Duration::from_secs(20), async {
+            let mut last_saved = 0;
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let saved = consensus_chain.latest_consensus_number();
+                if producer.is_finished() || (saved > 100 && saved == last_saved) {
+                    break;
+                }
+                last_saved = saved;
+            }
+        })
+        .await
+        .expect("the producer either finishes or stalls on a full queue");
+
+        let mut last_forwarded = 0;
+        for _ in 0..OUTPUTS {
+            let output = tokio::time::timeout(Duration::from_secs(10), rx_consensus_output.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("output {} never reached the reader", last_forwarded + 1)
+                })
+                .expect("consensus_output stays open");
+            let number = output.number();
+            assert_eq!(
+                classify_sync_output(last_forwarded, number),
+                SyncContinuity::Next,
+                "consensus output gap: expected {} but received {}",
+                last_forwarded + 1,
+                number,
+            );
+            last_forwarded = number;
+        }
+        producer.await.expect("the producer finishes once everything is consumed");
+        assert!(rx_consensus_output.try_recv().is_err(), "nothing past the last output is sent");
+        assert_eq!(consensus_chain.latest_consensus_number(), OUTPUTS);
     }
 
     /// The sync-output guard's table: a number at or below the latest saved one is stale, exactly

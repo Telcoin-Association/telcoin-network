@@ -22,8 +22,8 @@ use tn_network_libp2p::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
         NetworkResult,
     },
-    write_frame, DenyReason, GossipMessage, Penalty, PrimarySyncRequest, ResponseChannel, Stream,
-    StreamError, SyncFrame, SyncFrameError,
+    write_frame, AdmissionShed, DenyReason, GossipMessage, Penalty, PrimarySyncRequest,
+    ResponseChannel, Stream, StreamError, SyncFrame, SyncFrameError,
 };
 use tn_network_types::{WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient};
 use tn_storage::{
@@ -1203,9 +1203,9 @@ impl PrimaryNetworkHandle {
                     Err(e) => {
                         // Charge the peer only for a fault attributable SOLELY to its streamed
                         // bytes (never our local storage/IO).
-                        // Committee/allowlisted peers stay score-exempt
-                        // (`Peer::apply_penalty` only warns for them). Additive: still classified
-                        // `Failed` so the probe moves to the next peer.
+                        // Committee peers stay score-exempt for liveness. Operator trust alone
+                        // does not exempt these protocol penalties. Still classified `Failed`
+                        // so the probe moves to the next peer, regardless of scoring policy.
                         if Self::import_fault_is_peer_caused(&e) {
                             if let Some(penalty) = Self::consensus_chain_error_to_penalty(&e) {
                                 self.report_penalty(peer, penalty).await;
@@ -1438,6 +1438,9 @@ pub struct PrimaryNetwork<DB, Events> {
     /// Per-peer count of in-flight `EpochRecord` request-response serves, capped at
     /// [`MAX_PENDING_REQUESTS_PER_PEER`].
     epoch_record_peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    /// Counts the `EpochRecord` requests dropped at the admission cap, in the primary network's
+    /// `inbound_requests_shed_total{class="epoch_record", reason="admission"}` series.
+    epoch_record_admission_shed: AdmissionShed,
 }
 
 impl<DB, Events> PrimaryNetwork<DB, Events>
@@ -1473,6 +1476,7 @@ where
             shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
             epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
+            epoch_record_admission_shed: AdmissionShed::epoch_record(),
         }
     }
 
@@ -1604,6 +1608,7 @@ where
             // on a background path, not a hang, and only while this primary is at capacity.
             // Replying "at capacity" instead would reintroduce a per-request task spawn, which is
             // exactly what this bound removes.
+            self.epoch_record_admission_shed.record();
             return;
         };
 

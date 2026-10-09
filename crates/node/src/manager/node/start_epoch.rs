@@ -1231,40 +1231,10 @@ mod tests {
     use super::{
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
+    use crate::manager::node::tests::reth_config_and_db;
+    #[cfg(not(feature = "adiri"))]
+    use crate::manager::node::tests::reth_config_and_db_with_rpc_port;
     use std::num::NonZeroUsize;
-
-    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
-    /// there: the on-disk state an `EpochManager` is built from. A fixed `http_port` pins the
-    /// HTTP RPC port that worker RPC ports derive from.
-    fn reth_config_and_db<P>(
-        config: &tn_config::Config,
-        committee: &tn_types::Committee,
-        datadir: &P,
-        http_port: Option<u16>,
-    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
-    where
-        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
-    {
-        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
-
-        tn_reth::init_reth_defaults();
-        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
-        let rpc = RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http_port: http_port.unwrap_or(rpc.http_port), ..rpc },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            datadir,
-            http_port.is_none(),
-            std::sync::Arc::new(config.chain_spec()),
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
-        Ok((node_config, reth_db))
-    }
 
     /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
     /// two-to-one-to-two transitions. Removed workers close transaction admission and keep their
@@ -1339,7 +1309,7 @@ mod tests {
         let (base_port_reservation, worker_port_reservation) = reserve_worker_rpc_ports()?;
         let base_port = base_port_reservation.local_addr()?.port();
         let (node_config, reth_db) =
-            reth_config_and_db(&config, &committee, &datadir, Some(base_port))?;
+            reth_config_and_db_with_rpc_port(&config, &committee, &datadir, Some(base_port))?;
         drop(base_port_reservation);
         drop(worker_port_reservation);
         let network_tasks = TaskManager::default();
@@ -1792,7 +1762,7 @@ mod tests {
         let datadir = temp.path().to_path_buf();
         let config = Config::default_for_test();
         let genesis = CommitteeFixture::builder(MemDatabase::default).build().committee();
-        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir, None)?;
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(308)));
         let manager = EpochManager::new(
@@ -1900,7 +1870,7 @@ mod tests {
         config.parameters.vote_timeout = Duration::from_secs(2);
         let genesis_fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let genesis = genesis_fixture.committee();
-        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir, None)?;
+        let (node_config, reth_db) = reth_config_and_db(&config, &genesis, &datadir)?;
         let keys =
             KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(29)));
         let manager = EpochManager::new(

@@ -1,9 +1,11 @@
 //! Information shared between peers.
 
 use super::{
+    penalty::PenaltyHistory,
+    policy::PeerPolicy,
     score::{Reputation, ReputationUpdate, Score},
     status::ConnectionStatus,
-    types::{ConnectionDirection, TrustBasis},
+    types::ConnectionDirection,
     Penalty,
 };
 use libp2p::{
@@ -13,7 +15,7 @@ use libp2p::{
 use std::{collections::HashSet, net::IpAddr, sync::Arc, time::Instant};
 use tn_config::ScoreConfig;
 use tn_types::{BlsPublicKey, NetworkPublicKey};
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 /// Maximum number of distinct multiaddrs retained for a single peer.
 ///
@@ -24,17 +26,10 @@ use tracing::{error, warn};
 /// the set keeps a single peer entry bounded in memory and keeps the peer-exchange payload built
 /// from it (`exchange_info`) bounded (GHSA-29v6-gvv5-45gx).
 ///
-/// The protocol assumes exactly one address per peer: a `NodeRecord` advertises one address
-/// (`NodeRecord::build`), a committee entry carries one (`network_address`), and every consumer
-/// acts on a single address for a peer. The set therefore holds only the address the peer most
-/// recently presented. The set is keyed on exact `Multiaddr` equality and one endpoint appears
-/// in two syntactic forms, with and without the `/p2p/<peer_id>` suffix (the advertised form is
-/// whatever the operator configured, the dialed form always carries `/p2p` because libp2p-swarm
-/// appends it to every dial, the inbound observed form never does); under this cap those forms
-/// replace each other instead of accumulating, and either form dials the same endpoint. An
-/// eviction only trims the peer-exchange payload (`exchange_info`): dialing reads `known_peers`,
-/// kad and `discovery_peers`, and banning reads `observed_ip_addresses`, never this set. A cap of
-/// one also bounds the dial fan-out one discovery entry can cause to a single address.
+/// The cap shares the signed record's two-generation, dual-family migration budget. Bare and
+/// `/p2p`-suffixed forms of the same endpoint replace each other. A newer accepted record replaces
+/// the previous advertised set, retiring old dial hints. Ban accounting continues to use actual
+/// connection observations, independently of any advertised endpoint.
 ///
 /// The discovery path reuses this value as the per-entry ceiling in `eligible_for_discovery`:
 /// a PeerExchange entry with more addresses than this set can hold cannot come from an honest
@@ -98,6 +93,8 @@ pub(super) struct Peer {
     network_key: Option<NetworkPublicKey>,
     /// The peer's score - used to derive [Reputation].
     score: Score,
+    /// Protocol failures survive operator trust grants; committee promotion forgives all scores.
+    penalty_history: PenaltyHistory,
     /// The multiaddrs associated with this peer: addresses observed on real connections plus any
     /// self-advertised addresses folded in via [`Self::update_net`].
     ///
@@ -150,6 +147,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(score_config),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: true,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -170,6 +168,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new(score_config),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: addrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect(),
             observed_ip_addresses: Default::default(),
@@ -185,6 +184,7 @@ impl Peer {
             bls_public_key: None,
             network_key: None,
             score: Score::new(score_config),
+            penalty_history: PenaltyHistory::default(),
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
             connection_status: Default::default(),
@@ -206,6 +206,7 @@ impl Peer {
             bls_public_key: Some(bls_public_key),
             network_key: Some(network_key),
             score: Score::new_max(Arc::new(ScoreConfig::default())),
+            penalty_history: PenaltyHistory::default(),
             operator_allowlisted: false,
             multiaddrs: Default::default(),
             observed_ip_addresses: Default::default(),
@@ -215,11 +216,11 @@ impl Peer {
         }
     }
 
-    /// Update keys and merge advertised network addresses.
+    /// Update keys and replace advertised network addresses after an accepted record.
     ///
-    /// The merged addresses are self-advertised (they arrive on a peer record, not on an observed
-    /// connection). They are used for dialing and peer exchange only and are never treated as
-    /// observed connection IPs, so they do not feed the per-IP ban counter
+    /// The replacement addresses are self-advertised (they arrive on a peer record, not on an
+    /// observed connection). They are used for dialing and peer exchange only and are never
+    /// treated as observed connection IPs, so they do not feed the per-IP ban counter
     /// ([`Self::observed_ip_addresses`] / GHSA-6qcj-p42p-779j).
     pub(super) fn update_net(
         &mut self,
@@ -229,7 +230,7 @@ impl Peer {
     ) {
         self.bls_public_key = Some(bls_public_key);
         self.network_key = Some(network_key);
-        multiaddrs.into_iter().for_each(|multiaddr| self.note_multiaddr(multiaddr));
+        self.multiaddrs = multiaddrs.into_iter().take(MAX_MULTIADDRS_PER_PEER).collect();
     }
 
     /// Record a multiaddr the peer is using, keeping the set within [`MAX_MULTIADDRS_PER_PEER`].
@@ -240,12 +241,20 @@ impl Peer {
     /// payload built by [`Self::exchange_info`]. If admitting it pushes the set over the cap, one
     /// of the other addresses is evicted to restore the bound. Re-recording an address already
     /// present is a no-op. A self-advertised republish flood therefore churns the set within the
-    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). With the cap at one (see
-    /// [`MAX_MULTIADDRS_PER_PEER`]) the set is the address the peer most recently presented, and
-    /// the bare and `/p2p`-suffixed forms of one honest endpoint replace each other. An eviction
+    /// cap instead of growing it without bound (GHSA-29v6-gvv5-45gx). Bare and `/p2p`-suffixed
+    /// forms of one honest endpoint replace each other. An eviction
     /// can only ever trim that payload: the ban path reads [`Self::observed_ip_addresses`], not
     /// this set.
     fn note_multiaddr(&mut self, multiaddr: Multiaddr) {
+        let endpoint: Multiaddr =
+            multiaddr.iter().filter(|protocol| !matches!(protocol, Protocol::P2p(_))).collect();
+        self.multiaddrs.retain(|known| {
+            known
+                .iter()
+                .filter(|protocol| !matches!(protocol, Protocol::P2p(_)))
+                .collect::<Multiaddr>()
+                != endpoint
+        });
         if self.multiaddrs.insert(multiaddr.clone())
             && self.multiaddrs.len() > MAX_MULTIADDRS_PER_PEER
         {
@@ -309,28 +318,16 @@ impl Peer {
 
     /// Apply a penalty to the peer's score.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any. Exempt peers
-    /// (operator allowlist or committee validators) bypass the score model entirely.
-    pub(super) fn apply_penalty(
-        &mut self,
-        penalty: Penalty,
-        exemption: Option<TrustBasis>,
-    ) -> Reputation {
-        if let Some(basis) = exemption {
-            // Exempt peers bypass the score model entirely. Severe/Fatal suppressions are
-            // operationally significant: they hint that an exempt peer (committee member or
-            // operator allowlist) is misbehaving in ways that would normally ban an untrusted
-            // peer. Surface as a warn! so ops can correlate downstream issues with the signal.
-            if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
-                warn!(
-                    target: "peer-manager",
-                    ?penalty,
-                    ?basis,
-                    "skipping severe/fatal penalty for exempt peer"
-                );
-            }
-        } else {
+    /// Committee peers remain score-exempt for liveness. Operator trust alone suppresses only
+    /// temporary overload; protocol and cryptographic failures remain scoreable for those peers.
+    pub(super) fn apply_penalty(&mut self, penalty: Penalty, policy: PeerPolicy) -> Reputation {
+        if policy.applies(penalty) {
+            self.penalty_history.record(penalty);
             self.score.apply_penalty(penalty);
+        } else if penalty.is_load() {
+            debug!(target: "peer-manager", ?penalty, ?policy, "skipping load penalty for privileged peer");
+        } else {
+            warn!(target: "peer-manager", ?penalty, ?policy, "skipping protocol penalty for committee peer");
         }
 
         // return new reputation
@@ -339,16 +336,15 @@ impl Peer {
 
     /// Ensure the peer's status is banned.
     ///
-    /// `exemption` is forwarded to [Self::apply_penalty]: an exempt peer (operator allowlist or
-    /// committee validator) bypasses the score model, so the `Fatal` here is suppressed and the
-    /// peer is not banned - the same protection exempt peers had before.
-    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId, exemption: Option<TrustBasis>) {
+    /// A ban is never suppressed by admission, retention, or load-scoring privileges.
+    pub(super) fn ensure_banned(&mut self, peer_id: &PeerId) {
         match self.reputation() {
             Reputation::Banned => {}
-            _ => {
+            Reputation::Trusted | Reputation::Disconnected => {
                 // if the score isn't low enough to ban, this function has been called incorrectly.
                 error!(target: "peer-manager", ?peer_id, "banning a peer with a good score");
-                self.apply_penalty(Penalty::Fatal, exemption);
+                // Normalize an already requested ban without inventing a protocol violation.
+                self.score.apply_penalty(Penalty::Fatal);
             }
         }
     }
@@ -382,9 +378,22 @@ impl Peer {
     /// worse (or equal) of the two, so a genuinely better-behaved displaced record never drags
     /// the promoted record down.
     pub(super) fn retain_worse_reputation(&mut self, other: &Peer) {
+        self.penalty_history = self.penalty_history.merge(other.penalty_history);
         if other.score < self.score {
             self.score = other.score.clone();
         }
+    }
+
+    /// Preserve protocol reputation and bounded observed-IP evidence across a trust reload.
+    pub(super) fn retain_protocol_reputation(&mut self, other: &Peer) {
+        self.retain_worse_reputation(other);
+        let capacity = MAX_OBSERVED_IPS_PER_PEER.saturating_sub(self.observed_ip_addresses.len());
+        let addresses: Vec<_> = other
+            .known_ip_addresses()
+            .filter(|ip| !self.observed_ip_addresses.contains(ip))
+            .take(capacity)
+            .collect();
+        self.observed_ip_addresses.extend(addresses);
     }
 
     /// Register the dialing peer as connected.
@@ -474,42 +483,29 @@ impl Peer {
         self.known_ip_addresses().filter(|ip| !already_banned_ips.contains(ip)).collect::<Vec<_>>()
     }
 
-    /// Heartbeat maintenance applies decaying penalty rates to a non-exempt peer's score.
+    /// Decay ordinary scores and protocol penalties earned by privileged peers.
     ///
-    /// `exemption` is the peer's [TrustBasis] for the current epoch, if any; exempt peers skip
-    /// score decay. The peer's reputation could change. This returns the reputation update for
-    /// the manager to react to.
-    pub(super) fn heartbeat(&mut self, exemption: Option<TrustBasis>) -> ReputationUpdate {
-        if exemption.is_none() {
-            let prev_reputation = self.reputation();
+    /// Recovery follows the ordinary ban duration and score-decay rules, independent of trust.
+    pub(super) fn heartbeat(&mut self, policy: PeerPolicy) -> ReputationUpdate {
+        if policy.exempts_load() && self.permits_load_forgiveness() {
+            ReputationUpdate::None
+        } else {
+            let previously_banned = self.reputation().banned();
             self.score.update();
-            let new_reputation = self.reputation();
-
-            match new_reputation {
-                Reputation::Trusted => {
-                    if prev_reputation.banned() {
-                        return ReputationUpdate::Unbanned;
-                    }
+            match (self.reputation(), previously_banned) {
+                (Reputation::Trusted | Reputation::Disconnected, true) => {
+                    ReputationUpdate::Unbanned
                 }
-                Reputation::Disconnected => {
-                    if prev_reputation.banned() {
-                        return ReputationUpdate::Unbanned;
-                    } else if self.connection_status.is_connected_or_dialing() {
-                        // disconnect if the peer is connected or dialing
-                        return ReputationUpdate::Disconnect;
-                    }
-                    // otherwise, peer was healthy and disconnected now
+                (Reputation::Disconnected, false)
+                    if self.connection_status.is_connected_or_dialing() =>
+                {
+                    ReputationUpdate::Disconnect
                 }
-                Reputation::Banned => {
-                    if !prev_reputation.banned() {
-                        return ReputationUpdate::Banned;
-                    }
-                }
+                (Reputation::Banned, false) => ReputationUpdate::Banned,
+                (Reputation::Trusted | Reputation::Disconnected, false)
+                | (Reputation::Banned, true) => ReputationUpdate::None,
             }
         }
-
-        // all other updates are no-op
-        ReputationUpdate::None
     }
 
     /// Whether the node operator explicitly allowlisted this peer.
@@ -525,14 +521,19 @@ impl Peer {
         self.network_key.as_ref().map(|network_key| (network_key.clone(), self.multiaddrs.clone()))
     }
 
-    /// Reset the peer's score to the maximum.
+    /// Whether a trust grant may forgive this peer's score and ban.
+    pub(super) fn permits_load_forgiveness(&self) -> bool {
+        self.penalty_history.permits_forgiveness()
+    }
+
+    /// Reset score and penalty history when the peer acquires committee privileges.
     ///
     /// Called when a peer enters the committee. Trust is not stored on the peer (validator
-    /// status is derived from the committee sets), but a committee member's score is primed to
-    /// the maximum so that, should it later rotate out and re-enter the score model, it starts
-    /// from a clean maximum rather than a stale value.
+    /// status is derived from the committee sets). Pre-membership penalties must not prevent
+    /// reconnection to a validator needed for consensus liveness.
     pub(super) fn reset_score_to_max(&mut self) {
         self.score.reset_to_max();
+        self.penalty_history = PenaltyHistory::default();
     }
 
     /// Update peer record to indicate participation in kad as a routable peer.
@@ -582,6 +583,34 @@ mod tests {
         assert!(peer.multiaddrs.len() <= MAX_MULTIADDRS_PER_PEER);
     }
 
+    /// A new record retires old endpoint hints without discarding real observations for bans.
+    #[test]
+    fn newer_record_retires_advertised_endpoints() {
+        let mut peer = Peer::default_for_test();
+        let old = Multiaddr::empty()
+            .with(Protocol::Ip4([192, 0, 2, 1].into()))
+            .with(Protocol::Udp(9000))
+            .with(Protocol::QuicV1);
+        let new = Multiaddr::empty()
+            .with(Protocol::Ip4([192, 0, 2, 2].into()))
+            .with(Protocol::Udp(9000))
+            .with(Protocol::QuicV1);
+        peer.register_outgoing(old.clone());
+        let observed = peer.observed_ip_addresses.clone();
+        assert!(peer
+            .bls_public_key
+            .zip(peer.network_key.clone())
+            .map(|(bls, network)| {
+                peer.update_net(bls, network.clone(), vec![old.clone(), new.clone()]);
+                assert_eq!(peer.multiaddrs.len(), 2);
+                peer.update_net(bls, network, vec![new.clone()]);
+                assert_eq!(peer.multiaddrs, HashSet::from([new]));
+                assert!(!peer.multiaddrs.contains(&old));
+                assert_eq!(peer.observed_ip_addresses, observed);
+            })
+            .is_some());
+    }
+
     /// The cap holds the address a peer most recently presented (see
     /// [`MAX_MULTIADDRS_PER_PEER`]). One honest endpoint reaches the set in two syntactic forms,
     /// with and without the `/p2p/<peer_id>` suffix (advertised bare, dialed with `/p2p`, seen bare
@@ -605,7 +634,7 @@ mod tests {
 
         // advertised bare (a record or committee entry)
         peer.note_multiaddr(endpoint.clone());
-        assert_eq!(peer.multiaddrs.len(), MAX_MULTIADDRS_PER_PEER);
+        assert_eq!(peer.multiaddrs.len(), 1);
         assert!(peer.multiaddrs.contains(&endpoint), "the advertised form is stored");
 
         // then dialed: the dial always carries `/p2p`, and that form replaces the bare one

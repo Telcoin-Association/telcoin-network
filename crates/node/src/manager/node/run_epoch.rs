@@ -22,7 +22,7 @@ use crate::{
 };
 use futures::{StreamExt as _, TryStreamExt as _};
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     future::{ready, Future},
     time::Duration,
 };
@@ -31,13 +31,15 @@ use tn_executor::subscriber::spawn_subscriber;
 use tn_primary::{ConsensusBus, NodeMode};
 use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{
-    certificate_pack::CertificatePack, epoch_records::EpochRecordDb, tables::OurNodeBatchesCache,
+    certificate_pack::CertificatePack,
+    epoch_records::EpochRecordDb,
+    tables::{NodeBatchesCache, OurNodeBatchesCache},
 };
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
-    BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput, Database as TNDatabase, Epoch,
-    EpochDigest, EpochRecord, SealedHeader, ShutdownNotifier, TaskJoinError, TaskManager,
-    TnReceiver,
+    BlockHash, BlsPublicKey, Committee, ConsensusHeaderDigest, ConsensusOutput,
+    Database as TNDatabase, DbTxMut as _, Epoch, EpochDigest, EpochRecord, SealedHeader,
+    ShutdownNotifier, TaskJoinError, TaskManager, TnReceiver,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -583,10 +585,10 @@ where
     ///
     /// If the leader's commit timestamp has reached `self.epoch_boundary`, the output is flagged as
     /// the epoch's close so the engine finalizes the epoch on execution. The output's batches are
-    /// evicted from [`OurNodeBatchesCache`] (they have reached execution, so we no longer need to
-    /// rebroadcast them), then the output is sent. `last_forwarded_consensus_number` is updated
-    /// only after the send succeeds, so the restart-replay and leftover-drain paths can rely on
-    /// it marking what actually reached the engine rather than what was merely dequeued.
+    /// evicted from [`NodeBatchesCache`] and [`OurNodeBatchesCache`] (see
+    /// [`evict_committed_batches`]), then the output is sent. `last_forwarded_consensus_number` is
+    /// updated only after the send succeeds, so the restart-replay and leftover-drain paths can
+    /// rely on it marking what actually reached the engine rather than what was merely dequeued.
     pub(super) async fn process_output(
         &mut self,
         to_engine: &mpsc::Sender<ConsensusOutput>,
@@ -597,13 +599,7 @@ where
             // update output so engine closes epoch
             output.set_epoch_close();
         }
-        // Now that this output has made it to execution (or almost) clear any of
-        // batches from our batches cache.
-        for digest in output.batch_digests().iter() {
-            if let Err(e) = self.consensus_db.remove::<OurNodeBatchesCache>(digest) {
-                error!(target: "epoch-manager", "Remove from our batches cache failed with error: {:?}", e);
-            }
-        }
+        evict_committed_batches(&self.consensus_db, output.batch_digests());
         // only forward the output to the engine
         to_engine.send(output).await?;
         // store number after successful send
@@ -627,10 +623,10 @@ where
         while let Some(mut output) = consensus_output.recv().await {
             // The engine executes exactly the sequence forwarded here, so enforce continuity
             // against the last number that actually reached it. A stale output (already
-            // forwarded, e.g. replayed from the DB) would double-execute; a gap (e.g. the
-            // broadcast lagged this receiver) would silently diverge execution from
-            // consensus. Every output is saved to the consensus DB before it is broadcast,
-            // so erroring here lets the restart path replay the gap from the DB.
+            // forwarded, e.g. replayed from the DB) would double-execute; a gap would silently
+            // diverge execution from consensus. The `consensus_output` queue never drops an
+            // output, so a gap means an output was saved to the consensus DB but never sent;
+            // erroring here lets the restart path replay it from the DB.
             match check_output_continuity(self.last_forwarded_consensus_number, output.number()) {
                 OutputContinuity::Stale => {
                     warn!(
@@ -1057,6 +1053,43 @@ async fn resolve_prior_epoch_record(
     Ok((rec, digest))
 }
 
+/// Remove a committed output's batches from [`NodeBatchesCache`] and [`OurNodeBatchesCache`].
+///
+/// Every caller of `process_output` hands it an output that is already saved and persisted to the
+/// current epoch's pack. The three `consensus_output` senders await `save_consensus` first, and
+/// startup replay and epoch-close phase 2 read the output back from the pack. Every reader of
+/// [`NodeBatchesCache`] that can meet a committed digest falls back to that pack, so the cache
+/// copies are redundant. Keeping them until the epoch-close clear makes the fixed-size cache map
+/// hold a whole epoch of batches, which overflows it under sustained load (issue #1443).
+///
+/// Our own batches have reached execution, so they no longer need rebroadcasting either.
+///
+/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) both tables live in
+/// the cache env, a [`LayeredDatabase`](tn_storage::layered_db::LayeredDatabase): each remove
+/// drops the key from the memory layer and queues the delete to that env's writer thread, which
+/// runs the backend write txn and its commit (an fsync under MDBX `Durable`). The caller pays a
+/// map remove and a channel send per key. Sharing one txn makes the writer commit at most once
+/// per output where bare removes would each commit on their own. A failure here is only logged,
+/// and a backend failure is reported on the writer thread instead. A batch left in
+/// [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
+/// [`OurNodeBatchesCache`] survives that clear and reaches `orphan_batches` as if it had never
+/// been committed.
+fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash>) {
+    if digests.is_empty() {
+        return;
+    }
+    let evicted = db.write_txn().and_then(|mut txn| {
+        for digest in digests {
+            txn.remove::<NodeBatchesCache>(digest)?;
+            txn.remove::<OurNodeBatchesCache>(digest)?;
+        }
+        txn.commit()
+    });
+    if let Err(e) = evicted {
+        warn!(target: "epoch-manager", count = digests.len(), "failed to evict committed batches from the batch caches: {e:?}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1083,9 +1116,114 @@ mod tests {
         RethChainSpec,
     };
     use tn_types::{
-        gas_accumulator::WorkerFeeConfig, Address, ExecHeader, GenesisAccount, SolCall as _,
-        WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::WorkerFeeConfig, Address, Batch, Certificate, CertifiedBatch,
+        CommittedSubDag, ConsensusHeader, EpochSeedChainValue, ExecHeader, GenesisAccount,
+        HeaderBuilder, ReputationScores, SolCall as _, WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
+
+    /// Issue #1443: once an output is saved to the pack, eviction removes its batches from both
+    /// batch caches while the pack keeps serving them.
+    #[tokio::test]
+    async fn evict_committed_batches_keeps_them_in_pack() {
+        use tn_storage::consensus::ConsensusChain;
+
+        let temp = TempDir::with_prefix("evict_committed").expect("temp dir");
+        for dir in ["db", "chain"] {
+            std::fs::create_dir_all(temp.path().join(dir)).expect("create test dir");
+        }
+        let db = tn_storage::open_db(temp.path().join("db"));
+        let consensus_chain = ConsensusChain::new(temp.path().join("chain"), Committee::default())
+            .expect("consensus chain");
+        let batches: Vec<Batch> = (0..3_u8)
+            .map(|i| Batch { transactions: vec![vec![i; 32]], ..Default::default() })
+            .collect();
+        for batch in &batches {
+            db.insert::<NodeBatchesCache>(&batch.digest(), batch).expect("cache batch");
+            db.insert::<OurNodeBatchesCache>(&batch.digest(), batch).expect("cache own batch");
+        }
+        let output = committed_output(&batches);
+        consensus_chain.save_consensus_output(output.clone()).await.expect("save output");
+        consensus_chain.persist_current().await.expect("persist pack");
+
+        evict_committed_batches(&db, output.batch_digests());
+        // removes have no tombstone, so wait for them to reach disk before reading
+        db.sync_persist();
+
+        for batch in &batches {
+            let digest = batch.digest();
+            assert_eq!(db.get::<NodeBatchesCache>(&digest).expect("read"), None);
+            assert_eq!(db.get::<OurNodeBatchesCache>(&digest).expect("read"), None);
+        }
+        let served = consensus_chain.get_batches(0, output.batch_digests().iter()).await;
+        assert_eq!(served, batches, "the pack must keep serving evicted batches");
+    }
+
+    /// Issue #1443: `process_output` evicts the output's batches from both batch caches and
+    /// forwards the output to the engine.
+    #[tokio::test]
+    async fn process_output_evicts_committed_batches() -> eyre::Result<()> {
+        use crate::{engine::TnBuilder, manager::node::tests::reth_config_and_db};
+        use tn_config::{Config, KeyConfig};
+        use tn_storage::mem_db::MemDatabase;
+        use tn_test_utils::CommitteeFixture;
+        use tn_types::BlsKeypair;
+
+        let temp = TempDir::with_prefix("process_output_evicts")?;
+        let datadir = temp.path().to_path_buf();
+        let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+        let config = Config::default_for_test();
+        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let keys =
+            KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::seed_from_u64(1443)));
+        std::fs::create_dir_all(datadir.join("db"))?;
+        let db = tn_storage::open_db(datadir.join("db"));
+        let builder = TnBuilder::new(node_config, config, reth_db);
+        let mut manager = EpochManager::new(builder, datadir, db.clone(), keys, "test").await?;
+
+        let batch = Batch { transactions: vec![vec![7; 32]], ..Default::default() };
+        let digest = batch.digest();
+        db.insert::<NodeBatchesCache>(&digest, &batch)?;
+        db.insert::<OurNodeBatchesCache>(&digest, &batch)?;
+        let output = committed_output(&[batch]);
+
+        let (to_engine, mut engine_rx) = mpsc::channel(1);
+        manager.process_output(&to_engine, output.clone()).await?;
+
+        let forwarded = engine_rx.try_recv()?;
+        assert_eq!(forwarded.number(), output.number(), "the engine must receive the output");
+        assert_eq!(forwarded.batch_digests(), output.batch_digests());
+        // removes have no tombstone, so wait for them to reach disk before reading
+        db.sync_persist();
+        assert_eq!(db.get::<NodeBatchesCache>(&digest)?, None);
+        assert_eq!(db.get::<OurNodeBatchesCache>(&digest)?, None);
+        Ok(())
+    }
+
+    /// A committed output at number 1 whose only certificate declares and carries `batches`.
+    fn committed_output(batches: &[Batch]) -> ConsensusOutput {
+        let mut leader = Certificate::default();
+        let mut header = HeaderBuilder::from_header(leader.header());
+        for batch in batches {
+            header = header.with_payload_batch(batch, 0);
+        }
+        leader.update_header_for_test(header.build());
+        let sub_dag = CommittedSubDag::new(
+            vec![leader.clone()],
+            leader,
+            1,
+            ReputationScores::default(),
+            None,
+            EpochSeedChainValue::genesis_placeholder(),
+        );
+        ConsensusOutput::new(
+            sub_dag,
+            ConsensusHeader::default().digest(),
+            1,
+            false,
+            batches.iter().map(|b| b.digest()).collect(),
+            vec![CertifiedBatch { address: Address::ZERO, batches: batches.to_vec() }],
+        )
+    }
 
     /// Deterministic BLS public keys for anchor-resolution tests.
     fn resolve_test_keys(n: u8) -> Vec<BlsPublicKey> {
