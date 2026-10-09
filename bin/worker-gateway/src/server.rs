@@ -1549,4 +1549,106 @@ mod tests {
         assert_eq!(metrics.value(inflight, &[]), 0.0);
         assert_eq!(metrics.value(duration, &[]), 1.0, "one duration sample, at the body's end");
     }
+
+    /// Send a request head promising a 100-byte body, and the first bytes of
+    /// that body, on a raw connection; then stall or stop sending as `then`
+    /// says, and return everything the gateway answers before it closes.
+    async fn partial_request(gateway: SocketAddr, then: Abort) -> String {
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        stream
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+                  Content-Length: 100\r\n\r\n{\"id\":",
+            )
+            .await
+            .expect("write");
+        if then == Abort::CloseWrites {
+            stream.shutdown().await.expect("shutdown");
+        }
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the gateway answers within the test's deadline")
+            .expect("read");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// What a client does after sending part of a request body.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Abort {
+        /// Stall, leaving the request deadline to fire.
+        Stall,
+        /// Stop sending: the body ends early.
+        CloseWrites,
+    }
+
+    /// Every kind of rejection, including the ones that log nothing per
+    /// request (`429`, `408` and an aborted body), is counted under its reason.
+    #[tokio::test]
+    async fn every_reject_kind_is_counted() {
+        let mut metrics = CapturedMetrics::install();
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+
+        // 429: a global limit of one request with no burst headroom
+        let limited = redirect_state(worker, None);
+        limited.readiness.set_ready(0, true);
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (limited, _limited) =
+            spawn(router(limited, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+        let (status, _) = post_rpc(limited, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_rpc(limited, None, call("eth_chainId", 2)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // 408: a body that stalls past a short request deadline
+        let slow = redirect_state(worker, None);
+        slow.readiness.set_ready(0, true);
+        let (slow, _slow) =
+            spawn(router(slow, Duration::from_millis(300), MAX_REQUEST_BYTES, None)).await;
+        let response = partial_request(slow, Abort::Stall).await;
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+
+        // the rest on a gateway whose only worker is not ready
+        let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, None))).await;
+        // an aborted body: the client stops sending part-way through
+        let response = partial_request(gateway, Abort::CloseWrites).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("-32600"), "{response}");
+        // a loop
+        let (status, _) = post_rpc(gateway, Some("x-tn-gateway"), call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
+        // a screened transaction
+        let junk =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":4}"#;
+        let (status, _) = post_rpc(gateway, None, junk.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // no upstream ready
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 5)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let reasons = [
+            "rate_limited",
+            "request_timeout",
+            "unreadable_body",
+            "loop_detected",
+            "invalid_transaction",
+            "no_upstream_ready",
+        ];
+        for reason in reasons {
+            assert_eq!(
+                metrics.value("tn_worker_gateway_rejections_total", &[("reason", reason)]),
+                1.0,
+                "{reason}"
+            );
+        }
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), reasons.len() as f64);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
+    }
 }

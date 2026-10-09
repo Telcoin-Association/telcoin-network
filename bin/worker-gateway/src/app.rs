@@ -9,10 +9,11 @@ use tracing::info;
 
 use crate::{
     cli::Settings,
-    proxy::{proxy_client, UpstreamOrigin},
+    proxy::{proxy_client, UpstreamOrigin, WARNING_THROTTLES},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
     server::{serve, AppState, ServerLimits},
+    telemetry::run_throttle_summaries,
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -154,6 +155,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             run_gc(Arc::clone(limiters), shutdown.subscribe()),
         );
     }
+
+    // Summarize a burst of throttled per-request warnings once it stops, so
+    // its count does not wait for the call site's next event.
+    spawner.spawn_critical_task(
+        "warning-summaries",
+        run_throttle_summaries(&WARNING_THROTTLES, shutdown.subscribe()),
+    );
 
     spawner.spawn_critical_task(
         "gateway-server",

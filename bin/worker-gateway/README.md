@@ -368,7 +368,17 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
-from these series, so they reflect real client load only. The scrape also
+from these series, so they reflect real client load only.
+
+Per-request warnings (a proxy or redirect loop, a screened transaction, no
+ready upstream, an oversized body, and, per route, a forwarding failure or an
+upstream error answer) are throttled per call site, so neither clients nor a
+failing upstream can turn request volume into log volume: the first is logged,
+then at most one line per 10 s, whose `suppressed` field counts the warnings
+skipped since the previous line. A burst that stops is summarized within 20 s
+by a line that names its call site (`site`) and the count it suppressed. The
+counters above still count every request, including the rejections that log
+nothing per request (`429`, `408` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.

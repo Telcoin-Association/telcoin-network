@@ -52,7 +52,7 @@ use crate::{
         error_response, error_response_with_id, upstream_error_response, GatewayError, RequestId,
     },
     server::AppState,
-    telemetry,
+    telemetry::{self, Throttle},
 };
 
 /// Default maximum request body the gateway will buffer before forwarding.
@@ -102,6 +102,44 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// De-facto standard header carrying the client-facing scheme to the upstream.
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
+/// Throttle for the hop-marker loop warning.
+static HOP_LOOP_WARNINGS: Throttle = Throttle::new("hop_loop");
+
+/// Throttle for the redirect-marker loop warning.
+static REDIRECT_LOOP_WARNINGS: Throttle = Throttle::new("redirect_loop");
+
+/// Throttle for the raw-transaction screen's rejection warning.
+static SCREEN_WARNINGS: Throttle = Throttle::new("screen");
+
+/// Throttle for the no-ready-upstream warning.
+static NO_UPSTREAM_WARNINGS: Throttle = Throttle::new("no_upstream");
+
+/// Throttle for the oversized-body warning.
+static OVERSIZED_BODY_WARNINGS: Throttle = Throttle::new("oversized_body");
+
+/// Throttles for the forwarding-failure warning, one per route, so a failing
+/// query upstream cannot hide a failing worker.
+static FORWARD_FAILURE_WARNINGS: PerRoute =
+    PerRoute::new("forward_failure_worker", "forward_failure_query");
+
+/// Throttles for the upstream-error warning, one per route.
+static UPSTREAM_ERROR_WARNINGS: PerRoute =
+    PerRoute::new("upstream_error_worker", "upstream_error_query");
+
+/// Every per-request warning throttle, summarized by
+/// [`telemetry::run_throttle_summaries`].
+pub(crate) static WARNING_THROTTLES: [&Throttle; 9] = [
+    &HOP_LOOP_WARNINGS,
+    &REDIRECT_LOOP_WARNINGS,
+    &SCREEN_WARNINGS,
+    &NO_UPSTREAM_WARNINGS,
+    &OVERSIZED_BODY_WARNINGS,
+    &FORWARD_FAILURE_WARNINGS.worker,
+    &FORWARD_FAILURE_WARNINGS.query,
+    &UPSTREAM_ERROR_WARNINGS.worker,
+    &UPSTREAM_ERROR_WARNINGS.query,
+];
+
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
@@ -130,11 +168,14 @@ pub(crate) async fn proxy(
     // gateway before: some upstream URL points back at a gateway, and
     // forwarding again would loop until fds run out.
     if headers.contains_key(HOP_HEADER) {
-        warn!(
-            target: "gateway::proxy",
-            "proxy loop detected (inbound request already carries the gateway hop marker); \
-             check that upstream URLs point at workers, not gateways"
-        );
+        if let Some(suppressed) = HOP_LOOP_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "proxy loop detected (inbound request already carries the gateway hop marker); \
+                 check that upstream URLs point at workers, not gateways"
+            );
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -144,11 +185,14 @@ pub(crate) async fn proxy(
     // gateway without a redirect forwards such a request like any other, so a
     // gateway can front the public rpc.
     if state.query_upstream.is_some() && headers.contains_key(REDIRECT_HEADER) {
-        warn!(
-            target: "gateway::proxy",
-            "redirect loop detected (inbound request already carries the query-redirect marker); \
-             check that --redirect-queries does not lead to a gateway that redirects"
-        );
+        if let Some(suppressed) = REDIRECT_LOOP_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "redirect loop detected (inbound request already carries the query-redirect \
+                 marker); check that --redirect-queries does not lead to a gateway that redirects"
+            );
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -157,7 +201,14 @@ pub(crate) async fn proxy(
     // for an upstream round-trip. The screen recovers the request id itself on
     // the paths that reject, so nothing here re-parses the body.
     if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
-        warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
+        if let Some(suppressed) = SCREEN_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                ?err,
+                suppressed,
+                "rejecting eth_sendRawTransaction before forwarding"
+            );
+        }
         return error_response_with_id(&err, id);
     }
 
@@ -171,7 +222,13 @@ pub(crate) async fn proxy(
         None => match state.readiness.first_ready_rpc_url() {
             Some(rpc_url) => (Route::Worker, rpc_url),
             None => {
-                warn!(target: "gateway::proxy", "no upstream worker ready; rejecting request");
+                if let Some(suppressed) = NO_UPSTREAM_WARNINGS.admit() {
+                    warn!(
+                        target: "gateway::proxy",
+                        suppressed,
+                        "no upstream worker ready; rejecting request"
+                    );
+                }
                 return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
             }
         },
@@ -186,13 +243,16 @@ pub(crate) async fn proxy(
         Ok(upstream) if is_non_json_error(&upstream) => {
             let status = upstream.status();
             telemetry::record_routed(route.label(), "upstream_error");
-            warn!(
-                target: "gateway::proxy",
-                route = route.label(),
-                upstream = %UpstreamOrigin(&upstream_url),
-                status = status.as_u16(),
-                "upstream answered an error status without a JSON-RPC body"
-            );
+            if let Some(suppressed) = UPSTREAM_ERROR_WARNINGS.get(route).admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    route = route.label(),
+                    upstream = %UpstreamOrigin(&upstream_url),
+                    status = status.as_u16(),
+                    suppressed,
+                    "upstream answered an error status without a JSON-RPC body"
+                );
+            }
             upstream_error_response(status, body.as_ref())
         }
         Ok(upstream) => {
@@ -212,14 +272,17 @@ pub(crate) async fn proxy(
             // path or query can carry a credential, so the log names the
             // upstream by origin and renders the cause with the url removed.
             let source = source.without_url();
-            warn!(
-                target: "gateway::proxy",
-                ?err,
-                route = route.label(),
-                upstream = %UpstreamOrigin(&upstream_url),
-                cause = %ErrorChain(&source),
-                "forwarding to upstream failed"
-            );
+            if let Some(suppressed) = FORWARD_FAILURE_WARNINGS.get(route).admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    ?err,
+                    route = route.label(),
+                    upstream = %UpstreamOrigin(&upstream_url),
+                    cause = %ErrorChain(&source),
+                    suppressed,
+                    "forwarding to upstream failed"
+                );
+            }
             error_response(&err, body.as_ref())
         }
     }
@@ -241,7 +304,14 @@ fn is_query(body: &[u8]) -> bool {
 fn reject_body(rejection: &BytesRejection) -> Response {
     match rejection {
         BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
-            warn!(target: "gateway::proxy", %rejection, "rejecting oversized request body");
+            if let Some(suppressed) = OVERSIZED_BODY_WARNINGS.admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    %rejection,
+                    suppressed,
+                    "rejecting oversized request body"
+                );
+            }
             error_response(&GatewayError::RequestTooLarge, b"")
         }
         _ => {
@@ -504,6 +574,30 @@ impl Route {
         match self {
             Self::Worker => "worker",
             Self::Query => "query",
+        }
+    }
+}
+
+/// One [`Throttle`] per [`Route`], for a log call site that serves both.
+struct PerRoute {
+    /// The worker route's throttle.
+    worker: Throttle,
+    /// The query route's throttle.
+    query: Throttle,
+}
+
+impl PerRoute {
+    /// Two fresh throttles, whose summary lines name them `worker_site` and
+    /// `query_site`.
+    const fn new(worker_site: &'static str, query_site: &'static str) -> Self {
+        Self { worker: Throttle::new(worker_site), query: Throttle::new(query_site) }
+    }
+
+    /// The throttle for `route`.
+    fn get(&self, route: Route) -> &Throttle {
+        match route {
+            Route::Worker => &self.worker,
+            Route::Query => &self.query,
         }
     }
 }

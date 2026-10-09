@@ -25,15 +25,22 @@
 //! probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
 //!
+//! [`Throttle`] rate-limits a per-request log call site, so request volume
+//! cannot drive log volume; the counters above still count every request.
+//!
 //! [`record_routed`] counts every forward attempt by route and result, which
 //! splits the load between the worker and the query upstream (a relayed body
 //! that fails mid-stream is counted again, as `body_failed`), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 
-use std::time::Instant;
+use std::{
+    sync::{Mutex, PoisonError},
+    time::{Duration, Instant},
+};
 
 use metrics::{counter, gauge, histogram};
+use tn_types::{Noticer, TaskError};
 use url::Url;
 
 use crate::proxy::UpstreamOrigin;
@@ -71,6 +78,9 @@ const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 /// Batches sent whole to the query upstream because they mixed submissions
 /// with other calls.
 const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
+
+/// How long a [`Throttle`] stays quiet after it lets a line through.
+const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
 
 /// RAII guard covering one proxied request.
 ///
@@ -144,6 +154,118 @@ pub(crate) fn set_upstream_ready(worker_id: u16, rpc_url: &Url, ready: bool) {
         "upstream" => UpstreamOrigin(rpc_url).to_string()
     )
     .set(if ready { 1.0 } else { 0.0 });
+}
+
+/// Rate limit for one per-request log call site.
+///
+/// A rejection a client can trigger at will (a loop marker, a junk
+/// transaction) or a failing upstream would otherwise write one warning per
+/// request, so request volume would drive log volume. The first event is
+/// logged; every later event within [`THROTTLE_WINDOW`] of the last logged
+/// line is only counted, and the first event after the window is logged again
+/// carrying that count. When no event follows, [`run_throttle_summaries`]
+/// writes the count on a summary line naming the call site once the window
+/// has passed. A call site therefore writes at most one line per window,
+/// either its own or a summary. The metrics still count every event.
+#[derive(Debug)]
+pub(crate) struct Throttle {
+    /// The call site, named on the summary line a flush writes.
+    site: &'static str,
+    /// When the call site last logged, and what it has suppressed since.
+    state: Mutex<ThrottleState>,
+}
+
+impl Throttle {
+    /// A throttle that lets its first event through; `const` so a call site
+    /// can keep its own in a `static`.
+    pub(crate) const fn new(site: &'static str) -> Self {
+        Self { site, state: Mutex::new(ThrottleState { last_logged: None, suppressed: 0 }) }
+    }
+
+    /// Whether to log an event now: `Some` with the number of events
+    /// suppressed since the last logged line, or `None` to suppress it.
+    pub(crate) fn admit(&self) -> Option<u64> {
+        self.admit_at(Instant::now())
+    }
+
+    /// [`Self::admit`] for an event at `now`.
+    fn admit_at(&self, now: Instant) -> Option<u64> {
+        // a poisoned lock only means a panic while holding it; the two plain
+        // fields are still consistent enough to throttle a log line
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.last_logged {
+            Some(last) if now.saturating_duration_since(last) < THROTTLE_WINDOW => {
+                state.suppressed = state.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                state.last_logged = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+        }
+    }
+
+    /// The count a summary line should report at `now` with no new event:
+    /// `Some` once events were suppressed and a whole window has passed since
+    /// the last line. The summary is itself the call site's line for the next
+    /// window.
+    fn flush_at(&self, now: Instant) -> Option<u64> {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        match state.last_logged {
+            Some(last)
+                if state.suppressed > 0
+                    && now.saturating_duration_since(last) >= THROTTLE_WINDOW =>
+            {
+                state.last_logged = Some(now);
+                Some(std::mem::take(&mut state.suppressed))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Every [`THROTTLE_WINDOW`] until `shutdown` fires, write one summary line
+/// for each throttle whose suppressed count has waited a whole window.
+///
+/// Without it, a burst that stops inside its window would go unreported until
+/// the call site's next event, however late that comes. A burst is therefore
+/// summarized at most two windows after its first line.
+pub(crate) async fn run_throttle_summaries(
+    throttles: &'static [&'static Throttle],
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    let mut ticker = tokio::time::interval(THROTTLE_WINDOW);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // consume the immediate first tick: nothing can be due at startup
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            () = &shutdown => break,
+            _ = ticker.tick() => {
+                let now = Instant::now();
+                throttles.iter().for_each(|throttle| {
+                    if let Some(suppressed) = throttle.flush_at(now) {
+                        tracing::warn!(
+                            target: "gateway::proxy",
+                            site = throttle.site,
+                            suppressed,
+                            "per-request warnings suppressed since the last line"
+                        );
+                    }
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The state behind a [`Throttle`].
+#[derive(Debug)]
+struct ThrottleState {
+    /// When the last line was logged, `None` before the first event.
+    last_logged: Option<Instant>,
+    /// Events suppressed since the last logged line.
+    suppressed: u64,
 }
 
 /// Test support: capture the metrics the code under test records.
@@ -233,5 +355,32 @@ pub(crate) mod test_utils {
                 .map(|((_, labels), value)| (labels.clone(), *value))
                 .collect()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn warnings_are_throttled() {
+        let throttle = Throttle::new("test");
+        let start = Instant::now();
+        // 1000 events within one second: only the first is logged
+        let logged: Vec<_> = (0..1000)
+            .filter_map(|ms| throttle.admit_at(start + Duration::from_millis(ms)))
+            .collect();
+        assert_eq!(logged, [0]);
+        // nothing is summarized inside the window
+        assert_eq!(throttle.flush_at(start + Duration::from_secs(9)), None);
+        // once the window has passed the burst is summarized, with no further event
+        assert_eq!(throttle.flush_at(start + THROTTLE_WINDOW), Some(999));
+        // the summary opened a new window: an event inside it is counted, and the
+        // next summary carries it
+        assert_eq!(throttle.admit_at(start + THROTTLE_WINDOW + Duration::from_secs(1)), None);
+        assert_eq!(throttle.flush_at(start + THROTTLE_WINDOW * 2), Some(1));
+        // a quiet call site has nothing to summarize and logs its next event at once
+        assert_eq!(throttle.flush_at(start + THROTTLE_WINDOW * 4), None);
+        assert_eq!(throttle.admit_at(start + THROTTLE_WINDOW * 10), Some(0));
     }
 }
