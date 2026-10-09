@@ -64,6 +64,15 @@ class MutationTests(unittest.TestCase):
         self.assertNotIn(before, mutated)
         self.assertEqual(mutated.count("self.peers.peer_has_confirmed_identity(peer_id)"), 1)
 
+    def test_unpolled_expiry_mutant_preserves_library_cleanup_reference(self):
+        case = next(case for case in MUTATIONS.CASES if case[0] == "worker_ingress_unpolled_expiry_owner")
+        _, relative, before, after, _ = case
+        source = (MUTATIONS.ROOT / relative).read_text().split("#[cfg(test)]", 1)[0]
+        mutated = source.replace(before, after, 1)
+        self.assertEqual(mutated.count("self.0.close();"), 1)
+        self.assertIn("std::mem::ManuallyDrop::new(ExpiryOwner(self.clone()))", mutated)
+        self.assertIn("let _owner = owner;", mutated)
+
     def fixture(self, root):
         source = root / "crates/owner/src/lib.rs"
         source.parent.mkdir(parents=True)

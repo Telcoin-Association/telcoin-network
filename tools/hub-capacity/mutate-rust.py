@@ -277,8 +277,8 @@ INGRESS_CASES = [
     (
         "worker_ingress_unpolled_expiry_owner",
         "crates/consensus/worker/src/network/ingress.rs",
-        "self.0.close();",
-        "self.0.receiver.wake();",
+        "let owner = ExpiryOwner(self.clone());",
+        "let owner = std::mem::ManuallyDrop::new(ExpiryOwner(self.clone()));",
         "unpolled_expiry_owner_releases_pending_and_rejects_late_streams",
     ),
 ]
