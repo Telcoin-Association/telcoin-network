@@ -6,6 +6,7 @@ use crate::{
         create_multiaddr, TestPrimaryRequest, TestPrimaryResponse, TestWorkerRequest,
         TestWorkerResponse, TEST_HEARTBEAT_INTERVAL,
     },
+    freshness::RecordTimestamp,
     types::RecordDomain,
 };
 use assert_matches::assert_matches;
@@ -2695,12 +2696,12 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
         .process_peer_manager_event(PeerEvent::MissingAuthorities(vec![unknown_a, unknown_b]))?;
     assert_eq!(network.kad_record_queries.len(), 2, "re-reported key must not issue a duplicate");
     assert_eq!(
-        network.kad_record_queries.values().filter(|q| q.request == unknown_a).count(),
+        network.kad_record_queries.values().filter(|q| q.query.request == unknown_a).count(),
         1,
         "one in-flight query for the re-reported key"
     );
     assert_eq!(
-        network.kad_record_queries.values().filter(|q| q.request == unknown_b).count(),
+        network.kad_record_queries.values().filter(|q| q.query.request == unknown_b).count(),
         1,
         "one in-flight query for the new key"
     );
@@ -2715,7 +2716,7 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
     let old_id = network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == unknown_a)
+        .find(|(_, query)| query.query.request == unknown_a)
         .map(|(id, _)| *id)
         .ok_or_else(|| eyre!("in-flight query for unknown_a is tracked"))?;
     network.close_kad_query(&old_id);
@@ -2725,7 +2726,7 @@ async fn test_missing_authorities_dedupes_inflight_kad_queries() -> eyre::Result
     let new_id = network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == unknown_a)
+        .find(|(_, query)| query.query.request == unknown_a)
         .map(|(id, _)| *id)
         .ok_or_else(|| eyre!("re-armed query for unknown_a is tracked"))?;
     assert_ne!(old_id, new_id, "re-armed query must be a fresh kad query");
@@ -3242,8 +3243,10 @@ async fn test_kad_self_advertisement_confirms_when_store_is_full() -> eyre::Resu
     assert_eq!(network.swarm.behaviour_mut().kademlia.store_mut().records().count(), max_records);
 
     let self_record = peer2.network.get_peer_record();
+    let observed = peer2.network.node_record.info.timestamp;
+    let timestamp = RecordTimestamp::admit(observed, observed);
     assert_eq!(
-        network.record_freshness(&self_record),
+        network.record_freshness(&self_record, timestamp, observed),
         RecordFreshness::Newer,
         "owner key must be absent from the full store"
     );
@@ -3290,6 +3293,8 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     let owner_bls = peer2.config.key_config().primary_public_key();
     let relay = PeerId::random();
     let stored_record = peer2.network.get_peer_record();
+    let observed = peer2.network.node_record.info.timestamp;
+    let timestamp = RecordTimestamp::admit(observed, observed);
 
     // The network has no tracked committee. Replication can deliver this authentic record
     // before the owner's connection, but the relay cannot confirm either peer's identity.
@@ -3298,7 +3303,7 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&owner), None);
     assert_eq!(network.swarm.behaviour().peer_manager.peer_to_bls(&relay), None);
     assert_eq!(
-        network.record_freshness(&stored_record),
+        network.record_freshness(&stored_record, timestamp, observed),
         RecordFreshness::Identical,
         "the relay must have populated the store"
     );
@@ -3313,7 +3318,8 @@ fn check_kad_self_advertisement_after_relay(timestamp_lag: u64) -> eyre::Result<
     peer2.network.node_record = NodeRecord { info, signature };
     let self_record = peer2.network.get_peer_record();
     assert!(network.peer_record_valid(&self_record).is_some());
-    assert_ne!(network.record_freshness(&self_record), RecordFreshness::Newer);
+    let timestamp = RecordTimestamp::admit(peer2.network.node_record.info.timestamp, observed);
+    assert_ne!(network.record_freshness(&self_record, timestamp, observed), RecordFreshness::Newer);
 
     network.process_kad_put_request(owner, self_record.clone())?;
     assert_eq!(
