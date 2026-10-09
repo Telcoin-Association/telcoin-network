@@ -34,7 +34,10 @@ tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi"
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
-reqwest = { workspace = true, features = ["stream"] }
+# the workspace `reqwest` has no TLS backend; rustls is required for an `https://`
+# --redirect-queries url and is already in the dependency graph (node-record-api enables
+# the same feature), so this adds no new crate
+reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
 tower-http = { workspace = true }
 
 # metrics

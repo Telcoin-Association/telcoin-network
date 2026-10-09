@@ -10,7 +10,7 @@
 //! Two counters partition every proxied request:
 //!
 //! - [`record_forwarded`] bumps `tn_worker_gateway_requests_total{outcome="forwarded"}` for a
-//!   request handed to an upstream worker;
+//!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint);
 //! - [`record_rejection`] bumps `tn_worker_gateway_requests_total{outcome="rejected"}` plus
 //!   `tn_worker_gateway_rejections_total{reason=...}` for a request the gateway answered with a
 //!   JSON-RPC error.
@@ -19,6 +19,11 @@
 //! the rejected side down by reason. The gateway's own `/health` and `/ready`
 //! probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
+//!
+//! [`record_routed`] counts every forward attempt by route and result, which
+//! splits the load between the worker and the query upstream, and
+//! [`record_mixed_batch`] counts the batches sent to the query upstream only
+//! because they mixed submissions with other calls.
 
 use std::time::Instant;
 
@@ -43,6 +48,14 @@ const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_secon
 /// Per-worker upstream readiness as last seen by the poller (`1` ready, `0`
 /// not-ready), labelled by `worker_id`.
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
+
+/// Forward attempts by `route` (`worker` or `query`) and `result`
+/// (`forwarded`, `unreachable` or `timeout`).
+const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
+
+/// Batches sent whole to the query upstream because they mixed submissions
+/// with other calls.
+const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
 
 /// RAII guard covering one proxied request.
 ///
@@ -71,7 +84,7 @@ impl Drop for RequestInFlight {
     }
 }
 
-/// Record a request forwarded to an upstream worker (a terminal success).
+/// Record a request forwarded to an upstream (a terminal success).
 pub(crate) fn record_forwarded() {
     counter!(REQUESTS_TOTAL, "outcome" => "forwarded").increment(1);
 }
@@ -81,6 +94,18 @@ pub(crate) fn record_forwarded() {
 pub(crate) fn record_rejection(reason: &'static str) {
     counter!(REQUESTS_TOTAL, "outcome" => "rejected").increment(1);
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record one forward attempt on `route` (`worker` or `query`) with its
+/// `result` (`forwarded`, `unreachable` or `timeout`).
+pub(crate) fn record_routed(route: &'static str, result: &'static str) {
+    counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
+}
+
+/// Record a batch sent whole to the query upstream because it mixed
+/// submissions with other calls.
+pub(crate) fn record_mixed_batch() {
+    counter!(MIXED_BATCHES_TOTAL).increment(1);
 }
 
 /// Publish a worker's current readiness as a `0`/`1` gauge.

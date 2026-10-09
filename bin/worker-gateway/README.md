@@ -1,12 +1,9 @@
 # worker-gateway
 
-A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC
-endpoint. It forwards the full JSON-RPC method surface (`eth_*` / `net_*` /
-`web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a
-polled per-worker readiness signal, and exposes its own liveness and readiness
-endpoints so an orchestrator can route around it. "Unchanged" applies to the
-request method, JSON-RPC body, and content type; the header contract is
-deliberately minimal (see Scope).
+A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
+It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
+With `--redirect-queries` it sends only transaction submissions to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
+"Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
 
 Because every instance is stateless and identical, the gateway can be scaled
 horizontally: any replica can serve any request. This is PR4 of the epic
@@ -17,19 +14,21 @@ and the PR3 edge protections.
 
 ## Scope (v1)
 
+The [production-readiness review](docs/production-readiness.md) evaluates this gateway as the public endpoint of a validator, lists its findings by severity, and gives the plan for each one.
+
 - HTTP-only. WebSocket (`eth_subscribe`) pass-through is deliberately out of
   scope: subscriptions are per-connection stateful and cannot survive a replica
   dying, which breaks the stateless-scaling invariant. Point subscription
   clients at a worker's WS endpoint behind your own ingress.
 - Static upstream configuration (no hot reload, no dynamic discovery).
-- Forwards to the single ready worker (`worker_id` `0`). The config models a
-  worker list so the method-aware routing follow-up can select among several
-  without a config change; v1 implements none of that selection.
+- Calls for the worker go to the first ready worker in configuration order; there is no load balancing across workers.
+  With `--redirect-queries`, only `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the worker and every other call goes to the query URL (see [Query redirect](#query-redirect)).
 - TLS termination and auth/API keys are out of scope; run the gateway behind
   your own ingress/mTLS.
 - Header forwarding is minimal. Upstream gets the request method, body, and
   `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
-  identity) and the `X-TN-Gateway` hop marker (loop protection). The client
+  identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
+  the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
   gets the upstream status, body, and `Content-Type`. All other headers are
   dropped in both directions; in particular CORS is not terminated here, so
   browser dApps need CORS handled at the ingress (or a later PR).
@@ -97,6 +96,7 @@ Every flag has an environment-variable fallback.
 | `--upstream-rpc-url` | `WORKER_GATEWAY_UPSTREAM_RPC_URL` | (none) | Inline upstream JSON-RPC URL. |
 | `--upstream-readiness-url` | `WORKER_GATEWAY_UPSTREAM_READINESS_URL` | (none) | Inline upstream readiness URL. |
 | `--worker-id` | `WORKER_GATEWAY_WORKER_ID` | `0` | Inline upstream worker id. |
+| `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions; see [Query redirect](#query-redirect). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
@@ -105,7 +105,7 @@ Every flag has an environment-variable fallback.
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
-| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `26214400` | Max request body size, in bytes. |
+| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
@@ -147,7 +147,9 @@ It must be at least the gateway's single-request bound
 (`--header-read-timeout` + the whole-request deadline above) so the first
 request on a connection can never be cut off.
 
-Every forwarded request carries the `X-TN-Gateway` hop marker, and an inbound
+Every request forwarded to a worker carries the `X-TN-Gateway` hop marker (calls
+sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
+[Query redirect](#query-redirect)), and an inbound
 request that already carries it is rejected (HTTP `508`), so a misconfigured
 upstream or VIP that points back at a gateway breaks the loop at the first
 revisit instead of exhausting file descriptors.
@@ -218,8 +220,26 @@ limit.
 
 ### Request size
 
-`--max-request-bytes` (default 25 MiB) caps the buffered request body; a larger
-body is rejected with a JSON-RPC "request too large" error before forwarding.
+`--max-request-bytes` (default 1 MiB) caps the buffered request body; a larger
+body is rejected with a JSON-RPC "request too large" error (`413`, `-32003`)
+before forwarding.
+
+Size it from both ends:
+
+- **Large enough for a submission.** The worker's transaction pool admits at
+  most 128 KiB of raw transaction (reth's `DEFAULT_MAX_TX_INPUT_BYTES`, which
+  the node does not override). Hex-encoded inside an `eth_sendRawTransaction`
+  call that is about 256 KiB, so the 1 MiB default fits the largest admissible
+  submission with room to spare, or a batch of three. If the node raises
+  `--txpool.max-tx-input-bytes`, raise this flag to at least twice that value
+  plus a little for the JSON envelope. There is no point going above the
+  worker's own request cap, 15 MiB (the node's `--rpc.max-request-size`
+  default of `15`, in MiB): the worker rejects anything larger anyway.
+- **Small enough for memory.** The whole body is buffered before it is forwarded, and every open connection can hold one, so peak request memory is about `--max-connections` × `--max-request-bytes` plus per-connection and runtime overhead.
+  Keep that well under the container's memory limit.
+  A held body costs more than its size, because the connection's read buffer stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB, so budget about 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB.
+  With the defaults that is about 814 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
+  If you raise either flag, raise the limit with it, or lower one of the two flags until the product fits, for example `--max-connections 128` for about 128 MiB.
 
 ### Transaction screening
 
@@ -229,14 +249,52 @@ EIP-4844 blob transaction (the network does not accept blobs) — saving a waste
 upstream round-trip. The decode uses the same pooled wire format the worker's
 RPC accepts and never recovers the signer, so it cannot reject a transaction the
 worker would accept. Batches (JSON arrays) and every other method are forwarded
-unchanged and validated by the worker.
+unchanged and validated upstream: by the worker, or, with `--redirect-queries`,
+by the query URL for everything that is not a submission.
+
+## Query redirect
+
+On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and nothing else.
+With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and every other call goes to the URL, typically a public RPC.
+Method names match exactly and case-sensitively.
+Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or bytes after the JSON value.
+
+The URL may be `http` or `https`; worker URLs stay `http` only.
+An `https` URL needs the system CA certificates, which the image installs.
+The URL must not point at the gateway itself or at a worker's RPC host and port, and plain `http` to a host that is not a loopback or private address logs a warning at startup.
+
+A batch goes to the worker only when every element is a submission.
+A batch that mixes submissions with other calls goes, whole, to the query URL; otherwise a client could put one submission in front of any number of reads and push them all onto the validator.
+The public RPC accepts submissions too, so the client loses nothing, but a submission inside a mixed batch reaches the network through the public RPC rather than this validator.
+`tn_worker_gateway_mixed_batches_total` counts these batches; splitting a batch and merging the two responses is not implemented.
+
+Routing happens after the [transaction screen](#transaction-screening), so an undecodable submission is still refused at the gateway.
+Calls sent to the query URL carry `X-TN-Gateway-Redirect: 1`, `X-Forwarded-For` and `X-Forwarded-Proto`, but not `X-TN-Gateway`, so a public RPC behind a gateway of its own does not reject them as a loop.
+A gateway with `--redirect-queries` set answers an inbound request carrying `X-TN-Gateway-Redirect` with `508` / `-32004`, which catches a query URL that leads back to a redirecting gateway; a gateway without the flag forwards such a request normally.
+The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client as is, without its `Location` header, so a query upstream cannot bounce a read onto the worker.
+Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
+
+`/ready` still means "this gateway can take submissions".
+The query URL gets no readiness probe and no fallback: when it fails, the client gets `502` or `504` and the call is never retried on the worker, which would put the read load on the validator just when the public RPC is struggling.
+
+| Worker | Query URL | `/ready` | Submissions | Other calls |
+| --- | --- | --- | --- | --- |
+| up | up | `200` | worker | query URL |
+| down | up | `503` | `503` / `-32000` | query URL |
+| up | down | `200` | worker | `502` / `-32001` or `504` / `-32002`, no fallback |
+
+Reads answered by the query URL come from a node that has not seen this validator's transaction pool, every one of them reaches that node from the gateway's address, and each carries the client's address in `X-Forwarded-For`; see [Split routing](#split-routing) before advertising the endpoint.
+`/ready` reports only whether submissions can be served, so a front that drops a gateway on `503` (the reference `readinessProbe`, a health-checked DNS record) also stops its reads while the worker is down; probe `/health` instead if reads must survive a worker outage.
+
+The reverse topology, a gateway that sends submissions to a validator's worker and every other call to an observer's RPC, can be expressed with the same two settings, but it is not a supported deployment yet.
 
 ## Gateway endpoints
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
   `503` with `{"ready": false}`.
-- everything else (i.e. `POST /`): forwarded to a ready upstream worker.
+- everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
+  with `--redirect-queries`, to the query URL unless it is a submission.
 
 ## Behaviour on failure
 
@@ -288,12 +346,62 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
+| `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
+
+## Operator guidance
+
+The [production-readiness review](docs/production-readiness.md#operator-guidance) gives the findings behind each rule below.
+
+### Validators: always redirect queries
+
+Set `--redirect-queries` on every gateway in front of a validator.
+Without it, every read reaches the worker, including the `tn_*` calls the node says a validator should not serve publicly, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+Point it at an `https` public RPC for the same chain.
+
+### Sizing for N gateways
+
+Every limit is per process, so the worker sees the sum over all gateways.
+
+- **Rate.** The worker receives up to N × `--rate-limit-global` calls per second, where N is the largest number of gateways that can run at once: the HPA's `maxReplicas` if you install it (10 in the reference manifest).
+  Size `--rate-limit-global` as the worker's budget divided by that N.
+- **Worker connections.** N × `--max-connections` can exceed the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
+  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s.
+  Raise the worker's limit above N × `--max-connections`, or accept that a flood of Sync calls through one gateway can make the worker refuse submissions from the others.
+- **Memory.** Peak request memory per gateway is about `--max-connections` × `--max-request-bytes` plus overhead (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
+
+### Split routing
+
+With `--redirect-queries`, reads are answered by a node that has not seen this validator's transaction pool.
+
+- `eth_getTransactionCount(.., "pending")`, `eth_getTransactionByHash` and receipts right after a submission can lag, so clients that send several transactions in a row should track their own nonces.
+- Fee quotes come from the public node and can lag an epoch boundary.
+- A submission inside a mixed batch goes to the public RPC with the rest of the batch and enters the network there.
+- Every redirected read reaches the public RPC from the gateway's address, so its per-IP limits apply to all of the gateway's clients together; agree limits with its operator before advertising the endpoint.
+- Each redirected call carries the client's address in `X-Forwarded-For`, so the public RPC's operator sees your clients' addresses.
+
+### DNS and the DDoS front
+
+- Publish the gateways behind health-checked DNS or a load balancer that probes each gateway's `/ready`; with plain round-robin records a dead gateway keeps receiving its share of clients until someone edits the zone.
+  `/ready` means "can take submissions", so a gateway whose worker is down drops out even though it still serves reads; every gateway shares the worker, so probe `/health` instead if reads must survive a worker outage.
+- Lock the domain at the registrar and enable DNSSEC where the provider supports it; a hijacked name serves forged state to every client.
+- Absorb packet floods in front of the gateways.
+  A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer; use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
+- If you use a front, firewall the gateways so that only the front reaches them; a gateway reachable directly bypasses it.
+
+### Firewalling
+
+- The worker's RPC port: reachable from the gateway hosts only.
+- The node's `--healthcheck` port: reachable from the gateway hosts only.
+  It is unauthenticated and serves one connection at a time, so a few idle connections from anyone else make every gateway report not ready.
+- The gateway's metrics port: inside the monitoring network only.
+- The gateway-to-worker hop is plaintext `http`; when it leaves a network you control, run it through a tunnel.
 
 ## Deployment
 
@@ -310,3 +418,5 @@ ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
 `tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
 turnkey install: see `deploy/README.md` for the placeholders to replace and the
 prometheus-adapter rule the autoscaler needs.
+
+Before putting gateways in front of a validator, read the [production-readiness review](docs/production-readiness.md), in particular its operator guidance on DNS, the DDoS front, firewalling and sizing for N gateways.

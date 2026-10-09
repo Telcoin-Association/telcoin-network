@@ -10,8 +10,13 @@
 //! upstream response body is streamed through, never buffered whole. When no
 //! upstream is ready, or the upstream cannot be reached / times out, the
 //! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
+//!
+//! With `--redirect-queries` set, only transaction submissions go to the
+//! worker; every other call goes to the query upstream (see [`classify`]),
+//! which is not readiness-gated, never falls back to the worker, and gets the
+//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr};
+use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
@@ -22,7 +27,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
 };
-use reqwest::Client;
+use reqwest::{redirect::Policy, Client};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserializer,
@@ -40,18 +45,43 @@ use crate::{
 /// Default maximum request body the gateway will buffer before forwarding.
 ///
 /// A guard against unbounded memory use; the effective limit is configurable
-/// via `--max-request-bytes` (this value is that flag's default).
-pub(crate) const MAX_REQUEST_BYTES: usize = 25 * 1024 * 1024;
+/// via `--max-request-bytes` (this value is that flag's default). 1 MiB is four
+/// times the largest admissible submission: the worker's pool admits at most
+/// 128 KiB of raw transaction (reth's `DEFAULT_MAX_TX_INPUT_BYTES`), about
+/// 256 KiB once hex-encoded. Each open connection can buffer one body this
+/// large, so peak request memory is roughly `--max-connections` times this value
+/// (see the README's "Request size" section).
+pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// The one JSON-RPC method whose payload the gateway inspects before
 /// forwarding (a raw-transaction submission).
 const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
 
-/// Marker header stamped on every forwarded request. An inbound request that
+/// The JSON-RPC methods that submit a transaction, and so the only calls a
+/// gateway with `--redirect-queries` sends to the worker. They are exactly the
+/// two methods the node's fee-cap guard replaces
+/// (`crates/tn-reth/src/env/rpc.rs`), matched exactly and case-sensitively, as
+/// jsonrpsee matches method names. Both contain [`SEND_RAW_TRANSACTION`], so
+/// its substring test is a fast path for either.
+const SUBMISSION_METHODS: [&str; 2] = ["eth_sendRawTransaction", "eth_sendRawTransactionSync"];
+
+/// The proxy client's `User-Agent`, so the operator of a query upstream can
+/// tell gateway traffic apart.
+const USER_AGENT: &str = concat!("tn-worker-gateway/", env!("CARGO_PKG_VERSION"));
+
+/// Marker header stamped on every request forwarded to a worker. An inbound request that
 /// already carries it has looped back through a gateway (an upstream URL or
 /// VIP that points at a gateway instead of a worker) and is rejected rather
 /// than forwarded, breaking the loop at the first revisit.
 pub(crate) const HOP_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway");
+
+/// Marker header stamped on every request sent to the query upstream, in place
+/// of [`HOP_HEADER`]: a public RPC that sits behind a gateway of its own would
+/// reject the hop marker as a loop. Only a gateway that itself redirects
+/// rejects an inbound request carrying this marker, which catches a
+/// `--redirect-queries` URL that leads back to a redirecting gateway (for
+/// example the deployment's own advertised endpoint) after one hop.
+const REDIRECT_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway-redirect");
 
 /// De-facto standard header carrying the client IP chain to the upstream.
 const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
@@ -59,7 +89,9 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// De-facto standard header carrying the client-facing scheme to the upstream.
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
-/// Forward a JSON-RPC request to the first ready upstream worker.
+/// Forward a JSON-RPC request to the first ready upstream worker or, when
+/// `--redirect-queries` is set and the request is not made only of
+/// submissions, to the query upstream.
 ///
 /// `body` is the final extractor (it consumes the request body), so it must
 /// stay last in the parameter list.
@@ -91,6 +123,20 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
+    // a redirecting gateway that receives the redirect marker is being sent
+    // reads that some gateway already redirected: its query upstream leads
+    // back to a redirecting gateway, and redirecting again would loop. a
+    // gateway without a redirect forwards such a request like any other, so a
+    // gateway can front the public rpc.
+    if state.query_upstream.is_some() && headers.contains_key(REDIRECT_HEADER) {
+        warn!(
+            target: "gateway::proxy",
+            "redirect loop detected (inbound request already carries the query-redirect marker); \
+             check that --redirect-queries does not lead to a gateway that redirects"
+        );
+        return error_response(&GatewayError::LoopDetected, body.as_ref());
+    }
+
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
     // worker would also reject (undecodable, or an EIP-4844 blob) before paying
     // for an upstream round-trip. The screen recovers the request id itself on
@@ -100,21 +146,63 @@ pub(crate) async fn proxy(
         return error_response_with_id(&err, id);
     }
 
-    let Some(rpc_url) = state.readiness.first_ready_rpc_url() else {
-        warn!(target: "gateway::proxy", "no upstream worker ready; rejecting request");
-        return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
+    // with a redirect configured, every call but a submission goes to the
+    // query upstream, with no readiness gate and no fallback to the worker: a
+    // fallback would put the read load on the validator exactly when the
+    // public rpc is struggling.
+    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(body.as_ref()));
+    let (route, upstream_url) = match query_upstream {
+        Some(query_upstream) => (Route::Query, query_upstream.clone()),
+        None => match state.readiness.first_ready_rpc_url() {
+            Some(rpc_url) => (Route::Worker, rpc_url),
+            None => {
+                warn!(target: "gateway::proxy", "no upstream worker ready; rejecting request");
+                return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
+            }
+        },
     };
 
-    match forward(&state.http, method, &headers, body.clone(), rpc_url, peer).await {
+    match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
+        .await
+    {
         Ok(response) => {
             telemetry::record_forwarded();
+            telemetry::record_routed(route.label(), "forwarded");
             response
         }
-        Err(err) => {
-            warn!(target: "gateway::proxy", ?err, "forwarding to upstream failed");
+        Err(source) => {
+            let err = classify_error(&source);
+            let result = if matches!(err, GatewayError::UpstreamTimeout) {
+                "timeout"
+            } else {
+                "unreachable"
+            };
+            telemetry::record_routed(route.label(), result);
+            // reqwest's `Display` appends the full request url, whose userinfo,
+            // path or query can carry a credential, so the log names the
+            // upstream by origin and renders the cause with the url removed.
+            let source = source.without_url();
+            warn!(
+                target: "gateway::proxy",
+                ?err,
+                route = route.label(),
+                upstream = %UpstreamOrigin(&upstream_url),
+                cause = %ErrorChain(&source),
+                "forwarding to upstream failed"
+            );
             error_response(&err, body.as_ref())
         }
     }
+}
+
+/// Whether a request goes to the query upstream rather than the worker,
+/// counting a mixed batch on the way (see [`classify`]).
+fn is_query(body: &[u8]) -> bool {
+    let calls = classify(body);
+    if calls == Calls::MixedBatch {
+        telemetry::record_mixed_batch();
+    }
+    calls.route() == Route::Query
 }
 
 /// Answer a body-buffering failure: a length-limit trip is a client error worth
@@ -133,33 +221,43 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
-/// Forward one request to `rpc_url` and adapt the upstream response back into an
-/// axum response, preserving the status, body, and content type.
+/// Forward one request to `upstream_url` and adapt the upstream response back
+/// into an axum response, preserving the status, body, and content type.
+///
+/// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
+/// [`REDIRECT_HEADER`] toward the query upstream, never both.
+///
+/// A transport failure is returned as the raw `reqwest` error so the caller can
+/// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
     client: &Client,
+    route: Route,
     method: Method,
     headers: &HeaderMap,
     body: Bytes,
-    rpc_url: Url,
+    upstream_url: Url,
     peer: SocketAddr,
-) -> Result<Response, GatewayError> {
+) -> Result<Response, reqwest::Error> {
     // JSON-RPC is content-type `application/json`; preserve the client's header
     // when present, default to it otherwise.
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
+    let marker = match route {
+        Route::Worker => HOP_HEADER,
+        Route::Query => REDIRECT_HEADER,
+    };
 
     let upstream = client
-        .request(method, rpc_url)
+        .request(method, upstream_url)
         .header(header::CONTENT_TYPE, content_type)
-        .header(HOP_HEADER, HeaderValue::from_static("1"))
+        .header(marker, HeaderValue::from_static("1"))
         .header(X_FORWARDED_FOR, forwarded_for(headers, peer))
         .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
         .body(body)
         .send()
-        .await
-        .map_err(classify_error)?;
+        .await?;
 
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
@@ -182,6 +280,32 @@ async fn forward(
     Ok(response)
 }
 
+/// Build the client that forwards requests on both routes.
+///
+/// Redirects are never followed. reqwest follows up to ten by default and
+/// replays a POST body on `307`/`308`, so a query upstream answering with a
+/// redirect (a misbehaving or compromised public RPC, or anything on the path
+/// to it) could otherwise bounce a read onto the private worker or any internal
+/// host the gateway can reach. A `3xx` from either upstream is passed through
+/// to the client like any other status, without its `Location` (only
+/// `Content-Type` is copied back), so the client cannot follow it either.
+///
+/// TLS is rustls with the platform's native root store, which only the query
+/// route can use (worker URLs must be `http`). An image without CA
+/// certificates still builds the client, but every `https` request then fails.
+pub(crate) fn proxy_client(
+    connect_timeout: Duration,
+    request_timeout: Duration,
+) -> reqwest::Result<Client> {
+    Client::builder()
+        .use_rustls_tls()
+        .redirect(Policy::none())
+        .user_agent(USER_AGENT)
+        .connect_timeout(connect_timeout)
+        .timeout(request_timeout)
+        .build()
+}
+
 /// The `X-Forwarded-For` value for the upstream hop: the immediate peer
 /// appended to any chain a prior proxy supplied.
 fn forwarded_for(headers: &HeaderMap, peer: SocketAddr) -> HeaderValue {
@@ -195,12 +319,247 @@ fn forwarded_for(headers: &HeaderMap, peer: SocketAddr) -> HeaderValue {
 }
 
 /// Classify a `reqwest` forwarding failure into a client-facing gateway error.
-fn classify_error(err: reqwest::Error) -> GatewayError {
+fn classify_error(err: &reqwest::Error) -> GatewayError {
     if err.is_timeout() {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
     }
+}
+
+/// Renders only a URL's origin, `scheme://host:port`, for logs.
+///
+/// An upstream URL can carry a credential in its userinfo, path or query (a
+/// hosted RPC provider's API key, for example), so log lines name an upstream
+/// by origin alone. The port is always written, falling back to the scheme's
+/// default, so two upstreams on one host stay distinguishable.
+pub(crate) struct UpstreamOrigin<'a>(pub(crate) &'a Url);
+
+impl fmt::Display for UpstreamOrigin<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let url = self.0;
+        write!(f, "{}://{}", url.scheme(), url.host_str().unwrap_or_default())?;
+        if let Some(port) = url.port_or_known_default() {
+            write!(f, ":{port}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Renders an error followed by every [`std::error::Error::source`] beneath it,
+/// joined with `": "`.
+///
+/// A `reqwest` error's own message is only its kind ("error sending request");
+/// the reason a forward failed (connection refused, DNS failure, reset) sits
+/// further down the source chain.
+struct ErrorChain<'a>(&'a dyn std::error::Error);
+
+impl fmt::Display for ErrorChain<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)?;
+        let mut source = self.0.source();
+        while let Some(err) = source {
+            write!(f, ": {err}")?;
+            source = err.source();
+        }
+        Ok(())
+    }
+}
+
+/// Which upstream a request goes to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    /// The first ready worker: every call without `--redirect-queries`, and
+    /// only submissions with it.
+    Worker,
+    /// The `--redirect-queries` endpoint: every call that is not a submission.
+    Query,
+}
+
+impl Route {
+    /// The `route` label on `tn_worker_gateway_routed_requests_total`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Worker => "worker",
+            Self::Query => "query",
+        }
+    }
+}
+
+/// What a request body holds, as far as routing is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Calls {
+    /// One submission, or a non-empty batch of nothing but submissions.
+    Submissions,
+    /// No submission, or nothing the classifier can read as one.
+    Queries,
+    /// A batch holding both submissions and other calls.
+    MixedBatch,
+}
+
+impl Calls {
+    /// Only an all-submission body goes to the worker.
+    fn route(self) -> Route {
+        match self {
+            Self::Submissions => Route::Worker,
+            Self::Queries | Self::MixedBatch => Route::Query,
+        }
+    }
+}
+
+/// Classify a request body for `--redirect-queries`.
+///
+/// Only a body made entirely of submissions ([`SUBMISSION_METHODS`]) goes to
+/// the worker. Everything else goes to the query upstream, and so does
+/// everything ambiguous, which keeps it away from the validator: a body that is
+/// not JSON, a `method` that is not a string, an empty batch, a batch element
+/// that is not an object, bytes trailing the JSON value, and a method name
+/// spelled with unicode escapes when the plain name appears nowhere in the body
+/// (the substring test misses it, so no parse runs). `eth_sendTransaction` is a
+/// query too: no node configures a signer, so the worker could only refuse it.
+///
+/// A batch that mixes submissions with other calls goes, whole, to the query
+/// upstream. Sending it to the worker would let a client put one submission in
+/// front of any number of reads and push them all onto the validator. Clients
+/// lose nothing, because the public RPC accepts submissions too; the
+/// submission just reaches the network through it instead of through this
+/// validator.
+fn classify(body: &[u8]) -> Calls {
+    // fast path: a body that never names the raw-transaction method holds no
+    // submission, and nothing is parsed
+    if !mentions_send_raw_transaction(body) {
+        return Calls::Queries;
+    }
+    let mut seen = SeenCalls::default();
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    let all_submissions = deserializer
+        .deserialize_any(SubmissionOnly { seen: &mut seen })
+        .and_then(|()| deserializer.end())
+        .is_ok();
+    if all_submissions {
+        Calls::Submissions
+    } else if seen.submission && seen.other {
+        Calls::MixedBatch
+    } else {
+        Calls::Queries
+    }
+}
+
+/// The kinds of call a [`SubmissionOnly`] scan has met so far. It lives
+/// outside the visitor so the caller can still read it after the error that
+/// ends a scan early.
+#[derive(Debug, Default)]
+struct SeenCalls {
+    /// At least one call was a submission.
+    submission: bool,
+    /// At least one call was something else.
+    other: bool,
+}
+
+impl SeenCalls {
+    /// Record one call by its method and report whether it is a submission.
+    fn record(&mut self, method: Option<&str>) -> bool {
+        let submission = method.is_some_and(|method| SUBMISSION_METHODS.contains(&method));
+        if submission {
+            self.submission = true;
+        } else {
+            self.other = true;
+        }
+        submission
+    }
+}
+
+/// Visitor that succeeds only on a single submission or a non-empty batch of
+/// nothing but submissions.
+///
+/// Built like [`ScreenFields`]: it reads each call's `method` and skips every
+/// other member in place, so the cost is a scan of the bytes rather than a
+/// `Value` tree. An error here is a verdict, not a failure: it means "not all
+/// submissions" and ends the scan. A batch scan stops as soon as the batch is
+/// known to be mixed, but runs on past leading non-submissions in search of a
+/// submission, so that a mixed batch is recognized, and counted, whichever end
+/// its submission sits at. At worst that is one scan of the body, the same
+/// bound the transaction screen already pays on a single call.
+struct SubmissionOnly<'a> {
+    /// Where the scan records what it has met.
+    seen: &'a mut SeenCalls,
+}
+
+impl<'de> Visitor<'de> for SubmissionOnly<'_> {
+    type Value = ();
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC request object or batch")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
+        let method = read_method(members)?;
+        if self.seen.record(method.as_deref()) {
+            Ok(())
+        } else {
+            Err(de::Error::custom("not a submission"))
+        }
+    }
+
+    /// A batch element that is not an object fails [`CallMethod`] and ends the
+    /// scan; the batch then goes to the query upstream, whose server answers
+    /// that element as an invalid request.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut calls: A) -> Result<Self::Value, A::Error> {
+        while let Some(CallMethod(method)) = calls.next_element()? {
+            self.seen.record(method.as_deref());
+            if self.seen.submission && self.seen.other {
+                return Err(de::Error::custom("batch mixes submissions with other calls"));
+            }
+        }
+        if self.seen.submission && !self.seen.other {
+            Ok(())
+        } else {
+            Err(de::Error::custom("batch holds no submission"))
+        }
+    }
+}
+
+/// One batch element reduced to its `method`, when that is a string.
+struct CallMethod(Option<String>);
+
+impl<'de> serde::Deserialize<'de> for CallMethod {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(CallMethodVisitor)
+    }
+}
+
+/// Visitor behind [`CallMethod`].
+struct CallMethodVisitor;
+
+impl<'de> Visitor<'de> for CallMethodVisitor {
+    type Value = CallMethod;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC request object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
+        read_method(members).map(CallMethod)
+    }
+}
+
+/// Read a call object's `method` when it is a string, skipping every other
+/// member in place.
+///
+/// A repeated `method` keeps the last occurrence, as a `Value` parse does.
+/// jsonrpsee's derived request type rejects a duplicated member outright, so
+/// such a call is an invalid request at either upstream; the choice only
+/// decides which one says so.
+fn read_method<'de, A: MapAccess<'de>>(mut members: A) -> Result<Option<String>, A::Error> {
+    let mut method = None;
+    while let Some(member) = members.next_key::<Cow<'_, str>>()? {
+        if member.as_ref() == "method" {
+            method = members.next_value::<MaybeString>()?.into_option();
+        } else {
+            members.next_value::<IgnoredAny>()?;
+        }
+    }
+    Ok(method)
 }
 
 /// Shallow pre-flight for `eth_sendRawTransaction`.
@@ -806,5 +1165,210 @@ mod tests {
     #[test]
     fn unrelated_body_skips_parsing() {
         assert!(screen_raw_transaction(br#"{"method":"net_version","id":1}"#).is_none());
+    }
+
+    #[test]
+    fn upstream_origin_drops_userinfo_path_and_query() {
+        for (url, origin) in [
+            ("http://user:secret@10.0.0.7:8545/key/abc?token=xyz#frag", "http://10.0.0.7:8545"),
+            ("https://rpc.example.com/v1/0123456789abcdef", "https://rpc.example.com:443"),
+            ("http://worker.internal/", "http://worker.internal:80"),
+            ("http://[::1]:8545/", "http://[::1]:8545"),
+        ] {
+            let url = Url::parse(url).expect("url");
+            assert_eq!(UpstreamOrigin(&url).to_string(), origin);
+        }
+    }
+
+    /// One link of a hand-built error chain.
+    #[derive(Debug)]
+    struct Link(&'static str, Option<Box<Link>>);
+
+    impl fmt::Display for Link {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Link {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|link| link as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_joins_every_source() {
+        let refused = Link("connection refused", None);
+        let connect = Link("client error (Connect)", Some(Box::new(refused)));
+        let err = Link("error sending request", Some(Box::new(connect)));
+        assert_eq!(
+            ErrorChain(&err).to_string(),
+            "error sending request: client error (Connect): connection refused"
+        );
+        assert_eq!(ErrorChain(&Link("alone", None)).to_string(), "alone");
+    }
+
+    /// A real transport failure: the raw error's `Display` carries the url, the
+    /// fields the proxy logs do not, and the cause reaches below reqwest's own
+    /// message.
+    #[tokio::test]
+    async fn forwarding_failure_log_fields_hide_the_url() {
+        // nothing listens on port 1, as in the server's unreachable-upstream test
+        let url = Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
+        let err =
+            Client::new().post(url.clone()).send().await.expect_err("nothing listens on port 1");
+        assert!(matches!(classify_error(&err), GatewayError::UpstreamUnreachable));
+        assert!(err.to_string().contains("apikey123"), "raw display should carry the url: {err}");
+
+        let cause = ErrorChain(&err.without_url()).to_string();
+        for secret in ["secret", "apikey123", "xyz"] {
+            assert!(!cause.contains(secret), "cause leaks {secret:?}: {cause}");
+        }
+        assert!(
+            cause.starts_with("error sending request: "),
+            "cause should have a source: {cause}"
+        );
+        assert_eq!(UpstreamOrigin(&url).to_string(), "http://127.0.0.1:1");
+    }
+
+    /// A JSON-RPC call to `method` with empty params.
+    fn call(method: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":[],"id":1}}"#)
+    }
+
+    #[test]
+    fn each_submission_method_alone_goes_to_the_worker() {
+        for method in SUBMISSION_METHODS {
+            assert_eq!(classify(call(method).as_bytes()), Calls::Submissions, "{method}");
+        }
+        let signed = send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"));
+        assert_eq!(classify(&signed).route(), Route::Worker);
+    }
+
+    #[test]
+    fn other_methods_go_to_the_query_upstream() {
+        for method in [
+            "eth_sendTransaction",
+            "eth_call",
+            "eth_chainId",
+            "eth_getLogs",
+            "eth_getTransactionCount",
+            "tn_info",
+            "debug_traceTransaction",
+        ] {
+            let calls = classify(call(method).as_bytes());
+            assert_eq!(calls, Calls::Queries, "{method}");
+            assert_eq!(calls.route(), Route::Query, "{method}");
+        }
+    }
+
+    #[test]
+    fn all_submission_batch_goes_to_the_worker() {
+        let submission = call("eth_sendRawTransaction");
+        let sync = call("eth_sendRawTransactionSync");
+        for body in [format!("[{submission}]"), format!("[{submission},{sync},{submission}]")] {
+            assert_eq!(classify(body.as_bytes()), Calls::Submissions, "{body}");
+        }
+    }
+
+    #[test]
+    fn mixed_batch_goes_whole_to_the_query_upstream() {
+        let submission = call("eth_sendRawTransaction");
+        let read = call("eth_getLogs");
+        for body in [
+            format!("[{submission},{read}]"),
+            format!("[{read},{submission}]"),
+            format!("[{read},{read},{submission},{read}]"),
+            format!("[{submission},{submission},{read}]"),
+        ] {
+            let calls = classify(body.as_bytes());
+            assert_eq!(calls, Calls::MixedBatch, "{body}");
+            assert_eq!(calls.route(), Route::Query, "{body}");
+        }
+    }
+
+    #[test]
+    fn unreadable_bodies_go_to_the_query_upstream() {
+        let submission = call("eth_sendRawTransaction");
+        let bodies = [
+            "[]".to_string(),
+            "eth_sendRawTransaction".to_string(),
+            "garbage eth_sendRawTransaction garbage".to_string(),
+            r#""eth_sendRawTransaction""#.to_string(),
+            r#"{"method":123,"params":["eth_sendRawTransaction"],"id":1}"#.to_string(),
+            r#"{"method":null,"eth_sendRawTransaction":1}"#.to_string(),
+            r#"{"method":"eth_sendRawTransaction","params":["#.to_string(),
+            format!("{submission} trailing"),
+            format!("[{submission}] trailing"),
+            format!("{submission}{submission}"),
+            format!("[{submission},1]"),
+            format!(r#"[{submission},"eth_sendRawTransaction"]"#),
+        ];
+        for body in bodies {
+            assert_eq!(classify(body.as_bytes()).route(), Route::Query, "{body}");
+        }
+        let mut not_utf8 = submission.into_bytes();
+        not_utf8.push(0xff);
+        assert_eq!(classify(&not_utf8).route(), Route::Query);
+    }
+
+    #[test]
+    fn method_name_inside_params_goes_to_the_query_upstream() {
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"eth_call","params":[{"data":"eth_sendRawTransaction"},"latest"],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_getBalance","params":["eth_sendRawTransactionSync"],"id":1}"#,
+            r#"{"jsonrpc":"2.0","eth_sendRawTransaction":{"method":"eth_sendRawTransaction"},"method":"eth_call","id":1}"#,
+        ] {
+            assert_eq!(classify(body.as_bytes()), Calls::Queries, "{body}");
+        }
+    }
+
+    #[test]
+    fn case_variants_and_escaped_names_go_to_the_query_upstream() {
+        for method in [
+            "eth_sendrawtransaction",
+            "ETH_SENDRAWTRANSACTION",
+            "Eth_sendRawTransaction",
+            "eth_sendRawTransactionsync",
+            "eth_sendRawTransactionX",
+            " eth_sendRawTransaction",
+            "eth_sendRawTransaction ",
+        ] {
+            assert_eq!(classify(call(method).as_bytes()), Calls::Queries, "{method:?}");
+        }
+        // an escaped name misses the substring test, so nothing is parsed
+        let escaped =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","params":[],"id":1}"#;
+        assert_eq!(classify(escaped.as_bytes()), Calls::Queries);
+        // with the plain name elsewhere the parse runs and unescapes the method
+        // as the server would, so a real submission still reaches the worker;
+        // an escaped read can never unescape into a submission
+        let escaped_with_mention = r#"{"method":"eth_sendRaw\u0054ransaction","params":["eth_sendRawTransaction"],"id":1}"#;
+        assert_eq!(classify(escaped_with_mention.as_bytes()), Calls::Submissions);
+    }
+
+    #[test]
+    fn duplicated_method_keeps_the_last() {
+        let last_submission =
+            r#"{"method":"eth_call","method":"eth_sendRawTransaction","params":[],"id":1}"#;
+        assert_eq!(classify(last_submission.as_bytes()), Calls::Submissions);
+        let last_read =
+            r#"{"method":"eth_sendRawTransaction","method":"eth_call","params":[],"id":1}"#;
+        assert_eq!(classify(last_read.as_bytes()), Calls::Queries);
+        let batch = format!("[{last_read},{}]", call("eth_sendRawTransaction"));
+        assert_eq!(classify(batch.as_bytes()), Calls::MixedBatch);
+    }
+
+    /// `use_rustls_tls` exists only when a rustls feature is enabled on
+    /// reqwest, so this stops compiling if the gateway's manifest drops it and
+    /// the crate is built on its own (`-p tn-worker-gateway`). A whole-workspace
+    /// build can hide that through feature unification, which is why the
+    /// standalone build is gated too.
+    #[test]
+    fn rustls_backend_is_compiled_in() {
+        let bare = Client::builder().use_rustls_tls().build();
+        assert!(bare.is_ok(), "{bare:?}");
+        let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1));
+        assert!(proxy.is_ok(), "{proxy:?}");
     }
 }

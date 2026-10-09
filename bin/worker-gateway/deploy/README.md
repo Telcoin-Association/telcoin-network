@@ -30,6 +30,19 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_CONFIG` (equivalently `--config`) to a path backed by a
   ConfigMap volume. The gateway requires at least one upstream and will refuse
   to start without one.
+- **Healthcheck port** (`deployment.yaml`): the readiness URL is not on the
+  worker RPC. It is the `/health/workers` route of the node's healthcheck
+  listener, which the node opens only when started with `--healthcheck <port>`
+  (`HEALTHCHECK_TCP_PORT`); there is no default port. Replace
+  `<HEALTHCHECK_TCP_PORT>` in
+  `http://<node>:<HEALTHCHECK_TCP_PORT>/health/workers` with that port and make
+  sure the node's Service exposes it to the gateway pods. Until you do, the URL
+  does not parse and the gateway exits at startup. The listener is
+  unauthenticated and serves one connection at a time, so admit only the
+  gateways to it.
+- **Query upstream** (`deployment.yaml`): `WORKER_GATEWAY_REDIRECT_QUERIES` (equivalently `--redirect-queries`) sends every call except `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to a public JSON-RPC endpoint for the same chain, so the validator's worker receives only submissions (see the README's "Query redirect" section).
+  Replace `<PUBLIC_RPC_HOST>` with that endpoint, preferably over `https`; until you do, the URL does not parse and the gateway exits at startup.
+  Remove the variable only for a gateway that should send every call to its worker, never in front of a validator.
 
 ## Ports and endpoints
 
@@ -40,11 +53,31 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
   **separate** listener from the client port.
 
-The `terminationGracePeriodSeconds: 40` in the Deployment is deliberately larger
-than the gateway's own `--graceful-shutdown-timeout`
-(`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s) so the process has room
-to drain in-flight proxied requests before the kubelet escalates to SIGKILL. If
-you raise the gateway's drain timeout, raise this too.
+The container has a `preStop` hook that sleeps 5s before the kubelet sends
+SIGTERM. The gateway stops accepting connections as soon as SIGTERM arrives, so
+the sleep gives the endpoint controller and any load balancer time to stop
+routing new requests to a terminating pod. The
+`terminationGracePeriodSeconds: 40` in the Deployment covers the preStop sleep
+plus the gateway's own `--graceful-shutdown-timeout`
+(`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s), 36s in total with the
+gateway's 1s join margin, so the process has room to drain in-flight proxied
+requests before the kubelet escalates to SIGKILL. If you raise the gateway's
+drain timeout or the preStop sleep, raise this too.
+
+## Readiness and reads
+
+The `readinessProbe` uses `/ready`, which reports whether the gateway can take submissions.
+Every replica polls the same worker, so when the worker is down every replica leaves the Service at once, and reads stop too even though the query upstream could still serve them.
+If reads must survive a worker outage, point the `readinessProbe` at `/health` instead; while the worker is down, submissions then get `503` / `-32000` from the gateway and reads keep working.
+The same choice applies to an external load balancer or DNS health check.
+
+## Memory limit
+
+The gateway buffers each request body whole before it forwards it, and every open connection can hold one body.
+A held body costs more than its size, because the connection's read buffer (up to about 400 KiB) stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB.
+Size the container's memory limit as 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB for the process baseline and response streaming.
+At the defaults that is 1.5 × 500 × 1 MiB + 64 MiB, about 814 MiB, and the Deployment's 1Gi limit leaves about 300 MiB over the measured peak.
+If you raise either flag, raise the limit with it; if the limit has to stay lower, lower one of the flags until the product fits (`--max-connections 256` needs about 448 MiB).
 
 ## Metrics scraping (ServiceMonitor)
 
