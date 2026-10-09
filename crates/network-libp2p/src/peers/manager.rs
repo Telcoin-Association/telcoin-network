@@ -1,5 +1,12 @@
 //! Manage peer connection status and reputation.
+//!
+//! The peer store owns reputation and IP bans; the reconnect cache owns temporary identity
+//! restrictions. Ordinary disconnected-table eviction owns no ban event. Oldest-entry ban-cache
+//! eviction, reconnect expiry, and authoritative committee/operator forgiveness release their
+//! respective owner. `Unbanned` reaches dependent gossip state only after both identity owners
+//! release it, checked at dequeue so a queued notification cannot revoke a subsequent ban.
 
+use self::admission::ConnectionAdmission;
 use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
@@ -16,10 +23,7 @@ use crate::{
     source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
-use libp2p::{
-    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
-    PeerId,
-};
+use libp2p::{kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr, PeerId};
 use rand::seq::IteratorRandom as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -40,6 +44,11 @@ mod peer_manager;
 #[cfg(test)]
 #[path = "../tests/listen_failure.rs"]
 mod listen_failure_tests;
+
+#[path = "admission.rs"]
+mod admission;
+#[path = "operator.rs"]
+mod operator;
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -143,6 +152,12 @@ struct AddProviderWindow {
 
 /// The type to manage peers.
 pub(crate) struct PeerManager {
+    /// Process-lifetime retry state for the finite operator inventory.
+    operator_retries: HashMap<BlsPublicKey, operator::OperatorRetry>,
+    /// Authenticated DAO identities with separate reserved connection allowances.
+    dao_peer_ids: HashSet<PeerId>,
+    /// Absolute connections allowed by the optional hub deployment profile.
+    dao_connection_budget: Option<u32>,
     /// This swarm's own peer id.
     ///
     /// Used to recognise and ignore the node's own identity on the dial,
@@ -159,6 +174,9 @@ pub(crate) struct PeerManager {
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
     peers: AllPeers,
+    /// Admission ownership by connection ID, retained until failure or actual closure.
+    /// Multiple connections to one identity consume one population slot.
+    connection_admissions: HashMap<ConnectionId, ConnectionAdmission>,
     /// The validated read-model of kad discovery: resolves a committee member's
     /// [`BlsPublicKey`] to its [`NetworkInfo`] on the hot send path. [`Self::auth_to_peer`] is
     /// a synchronous map probe on the swarm loop for every outbound BLS-addressed request;
@@ -328,11 +346,15 @@ impl PeerManager {
         );
 
         Self {
+            operator_retries: Default::default(),
+            dao_peer_ids: Default::default(),
+            dao_connection_budget: None,
             local_peer_id,
             config: *config,
             source_connections: SourceConnections::default(),
             heartbeat,
             peers,
+            connection_admissions: Default::default(),
             known_peers: Default::default(),
             known_timestamps: Default::default(),
             pinned_peers: Default::default(),
@@ -380,6 +402,8 @@ impl PeerManager {
     ) {
         let peer_id: PeerId = info.pubkey.clone().into();
         let multiaddr = info.multiaddrs.clone();
+        let forgiven = Self::identity_banned(&self.peers, &self.temporarily_banned, &peer_id)
+            .then_some(peer_id);
         self.peers.add_trusted_peer(bls_key, info.pubkey.clone());
 
         // remove from temporary banned and warn if peer was banned
@@ -392,6 +416,10 @@ impl PeerManager {
         self.stub_records.insert(bls_key);
         self.known_peers.insert(bls_key, info);
 
+        forgiven
+            .filter(|_| !self.peers.peer_banned(&peer_id))
+            .into_iter()
+            .for_each(|peer| self.push_event(PeerEvent::Unbanned(peer)));
         self.dial_peer(peer_id, multiaddr, Some(reply));
     }
 
@@ -476,9 +504,25 @@ impl PeerManager {
         self.peers.get_peer(peer_id).is_some_and(|peer| peer.connection_status().is_dialing())
     }
 
-    /// Push a [PeerEvent].
+    /// Queue a [PeerEvent], coalescing identity-unban candidates from both owners.
+    /// Candidates are checked at dequeue, after compound forgiveness has updated both owners.
     pub(super) fn push_event(&mut self, event: PeerEvent) {
-        self.events.push_back(event);
+        if !matches!(&event, PeerEvent::Unbanned(peer_id) if
+            self.events.iter().any(|queued| matches!(queued, PeerEvent::Unbanned(id) if id == peer_id)))
+        {
+            self.events.push_back(event);
+        }
+    }
+
+    /// Check the two identity-ban owners. Shared-IP restrictions remain an admission concern:
+    /// waiting for another identity's IP ban here could strand a forgiven peer on the blacklist.
+    fn identity_banned(
+        peers: &AllPeers,
+        temporarily_banned: &BannedPeerCache<PeerId>,
+        peer_id: &PeerId,
+    ) -> bool {
+        temporarily_banned.contains(peer_id)
+            || peers.get_peer(peer_id).is_some_and(|peer| peer.reputation().banned())
     }
 
     /// Register a dial attempt to return the result to caller.
@@ -516,7 +560,12 @@ impl PeerManager {
             }
             None
         } else {
-            self.events.pop_front()
+            let peers = &self.peers;
+            let temporarily_banned = &self.temporarily_banned;
+            std::iter::from_fn(|| self.events.pop_front()).find(|event| {
+                !matches!(event, PeerEvent::Unbanned(peer_id) if
+                    Self::identity_banned(peers, temporarily_banned, peer_id))
+            })
         }
     }
 
@@ -564,6 +613,7 @@ impl PeerManager {
         self.prune_rate_windows();
 
         // manage discovery peers
+        self.retry_operator_peers();
         self.discovery_heartbeat();
     }
 
@@ -585,10 +635,10 @@ impl PeerManager {
 
     /// Temporarily ban `peer_id` in the bounded reconnection-timeout cache.
     ///
-    /// If admitting the peer pushes the cache past its size cap, the oldest entry is evicted and a
-    /// [`PeerEvent::Unbanned`] is emitted for it, so dependent state (such as the gossipsub
-    /// blacklist maintained via `Banned`/`Unbanned`) stays in sync with the removal. This mirrors
-    /// the age-based eviction in [`Self::unban_temp_banned_peers`], which unbans each dropped peer.
+    /// Capacity overflow forgets the oldest reconnect restriction, allowing that identity to
+    /// reconnect only if its reputation/IP ban also permits it. This finite cache deliberately
+    /// trades reconnect-delay retention for bounded memory; ordinary peer-table turnover does
+    /// not revoke a restriction still in either ban layer. Expiry follows the same ownership rule.
     fn temporarily_ban(&mut self, peer_id: PeerId) {
         let (_is_new, evicted) = self.temporarily_banned.insert(peer_id);
         if let Some(evicted_peer) = evicted {
@@ -676,18 +726,6 @@ impl PeerManager {
             self.temporarily_banned
         );
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
-    }
-
-    /// Process new connection and return boolean indicating if the peer limit was reached.
-    pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
-        debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
-        if endpoint.is_dialer() {
-            // this node dialed peer
-            self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
-        } else {
-            // peer dialed this node
-            self.connected_or_dialing_peers().len() >= self.config.max_peers()
-        }
     }
 
     /// Return an iterator of peers that are connected or dialed.
@@ -799,6 +837,7 @@ impl PeerManager {
     ///
     /// Returns a boolean if the peer was successfully registered. This is the initial
     /// method to call for registering a new peer through dialing or incoming connections.
+    /// Commit a peer's connection status after every composed behaviour accepted admission.
     pub(super) fn register_peer_connection(
         &mut self,
         peer_id: &PeerId,
@@ -840,8 +879,9 @@ impl PeerManager {
     ///
     /// Some peers are disconnected with the intention to ban that peer.
     /// This method registers the peer as disconnected and ensures the list of banned/disconnected
-    /// peers doesn't grow infinitely large. Peers may become "unbanned" if the limit for banned
-    /// peers is reached. Inbound kad budgets survive disconnects until they expire, preventing
+    /// peers doesn't grow infinitely large. Ban-cache eviction releases only that cache's
+    /// ownership; a surviving temporary ban must retain its blacklist entry. Inbound kad budgets
+    /// survive disconnects until they expire, preventing
     /// reconnection from restoring a peer's allowance.
     pub(super) fn register_disconnected(&mut self, peer_id: &PeerId) {
         let (action, pruned_peers) = self.peers.register_disconnected(peer_id);
@@ -857,8 +897,9 @@ impl PeerManager {
         }
 
         // process pruned peers
-        self.events
-            .extend(pruned_peers.into_iter().map(|(peer_id, _)| PeerEvent::Unbanned(peer_id)));
+        pruned_peers.into_iter().for_each(|(peer_id, _)| {
+            self.push_event(PeerEvent::Unbanned(peer_id));
+        });
     }
 
     /// Prune peers to reach target peer counts.
@@ -869,8 +910,11 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
-        let mut excess_peer_count =
-            connected_peers.len().saturating_sub(self.config.target_num_peers);
+        let mut excess_peer_count = connected_peers
+            .iter()
+            .filter(|(peer, _)| !self.dao_peer_ids.contains(peer))
+            .count()
+            .saturating_sub(self.config.target_num_peers);
         if excess_peer_count == 0 {
             // no excess peers
             return;
@@ -1058,6 +1102,7 @@ impl PeerManager {
             if let Some((peer_id, _)) = self.auth_to_peer(*bls_key) {
                 if self.temporarily_banned.remove(&peer_id) {
                     warn!(target: "peer-manager", ?peer_id, "removed committee member from temporarily banned list");
+                    self.push_event(PeerEvent::Unbanned(peer_id));
                 }
             }
         }
@@ -1519,6 +1564,9 @@ impl PeerManager {
     ) {
         if !self.launch_binding_matches(bls_key, &info) {
             warn!(target: "peer-manager", ?bls_key, "rejecting record that contradicts launch inventory");
+        } else if self.configured_binding_conflicts(&bls_key, &info) {
+            // Configured transport bindings change only through a reviewed inventory rollout.
+            warn!(target: "peer-manager", ?bls_key, "rejecting record that changes configured transport identity");
         } else {
             self.committee_peers.get(&bls_key).iter().for_each(|peer| {
                 info.multiaddrs = vec![peer.network_address.clone()];
@@ -1568,6 +1616,9 @@ impl PeerManager {
         // `upsert_peer` just re-keyed it onto its `Confirmed` identity, so the trust pass can
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
+        if self.peers.is_committee_member(&bls_key) {
+            self.forgive_temporarily_banned(&HashSet::from([bls_key]));
+        }
         self.apply_unban_actions(unban_actions);
     }
 
@@ -1728,7 +1779,11 @@ impl PeerManager {
         });
 
         // calculate dial attempts needed for target connection limits
-        let connected_or_dialing = self.connected_or_dialing_peers().len();
+        let connected_or_dialing = self
+            .connected_or_dialing_peers()
+            .into_iter()
+            .filter(|peer| !self.dao_peer_ids.contains(peer))
+            .count();
         let peers_needed = self.config.target_num_peers.saturating_sub(connected_or_dialing);
 
         // used for random selections

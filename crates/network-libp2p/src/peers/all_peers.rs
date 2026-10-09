@@ -1029,7 +1029,11 @@ impl AllPeers {
         excess_peers
     }
 
-    /// Prune excess number of banned peers to prevent exhausting memory.
+    /// Evict the oldest reputation-ban entries on capacity overflow to bound memory.
+    ///
+    /// This explicitly ends this store's identity/IP ban ownership. The manager must consult its
+    /// independent reconnect cache before publishing `Unbanned`; disconnected-table eviction
+    /// neither calls this path nor owns ban forgiveness.
     fn prune_banned_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
         let excess = self.banned_peers.total().saturating_sub(self.max_banned_peers);
         let mut unbanned = Vec::with_capacity(excess);

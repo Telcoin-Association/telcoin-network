@@ -188,19 +188,20 @@ enum RecordFreshness {
 /// Maximum number of concurrent established connections a single peer may hold, across both
 /// directions (inbound and outbound).
 ///
-/// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of its
-/// own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct* `PeerId`s, so one
-/// peer holding many simultaneous connections still counts as one, and the inbound admission
-/// callback rejects only self-connections and banned peers. Without this cap a single unbanned peer
-/// could open connections up to the OS / QUIC file-descriptor and memory limits. Installing a
-/// [`connection_limits::Behaviour`] with this per-peer bound closes that gap (issue #1010).
+/// libp2p reports every established connection to the swarm but imposes no per-peer ceiling of
+/// its own. The peer-count admission gate (`PeerConfig::max_peers`) counts *distinct*
+/// `PeerId`s, so one peer holding many simultaneous connections still counts as one, and the
+/// inbound admission callback rejects only self-connections and banned peers. Without this cap
+/// a single unbanned peer could open connections up to the OS / QUIC file-descriptor and
+/// memory limits. Installing a [`connection_limits::Behaviour`] with this per-peer bound
+/// closes that gap (issue #1010).
 ///
-/// The value is generous headroom over legitimate use: a peer needs at most one inbound and one
-/// outbound connection concurrently (this node dials with `PeerCondition::Disconnected`, so it does
-/// not stack redundant outbound dials), and brief reconnection churn adds only a small transient
-/// overlap. Eight leaves room for that churn while bounding a hostile peer to a fixed, small number
-/// of connections instead of an unbounded fan-out.
-const MAX_ESTABLISHED_CONNECTIONS_PER_PEER: u32 = 8;
+/// The value is generous headroom over legitimate use: a peer needs at most one inbound and
+/// one outbound connection concurrently (this node dials with `PeerCondition::Disconnected`,
+/// so it does not stack redundant outbound dials), and brief reconnection churn adds only a
+/// small transient overlap. Eight leaves room for that churn while bounding a hostile peer to
+/// a fixed, small number of connections instead of an unbounded fan-out.
+pub(crate) use tn_config::MAX_ESTABLISHED_CONNECTIONS_PER_PEER;
 
 /// Memory-only ceiling on pending inbound connections (accepted handshakes that are not yet
 /// established) for one swarm.
@@ -597,6 +598,25 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let required_worker = match network_type {
+            NetworkType::Primary => None,
+            NetworkType::Worker(id) => Some(id),
+        };
+        network_config
+            .validate_operator_inventory(network_config.bootstrap_peers(), required_worker)
+            .map_err(|error| NetworkError::ProtocolError(error.to_string()))?;
+        let hub_connections = network_config
+            .dao_observers()
+            .map(|profile| {
+                profile.max_peers().checked_mul(MAX_ESTABLISHED_CONNECTIONS_PER_PEER).ok_or_else(
+                    || {
+                        NetworkError::ProtocolError(
+                            "DAO hub connection budget overflows u32".into(),
+                        )
+                    },
+                )
+            })
+            .transpose()?;
         let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
         let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
@@ -737,8 +757,25 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
-        behavior.connection_limits =
-            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
+        // A DAO hub also bounds pending outbound and established connections by its reserved
+        // capacity. A process allocation, when present, keeps its lower ceilings.
+        behavior.connection_limits = hub_connections.map_or_else(
+            || connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget),
+            |hub_total| {
+                let total = budget.map_or(hub_total, |budget| budget.connections().min(hub_total));
+                connection_limits::Behaviour::new(
+                    ConnectionLimits::default()
+                        .with_max_established_per_peer(Some(
+                            budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                                budget.connections_per_peer()
+                            }),
+                        ))
+                        .with_max_pending_incoming(Some(MAX_PENDING_INCOMING_CONNECTIONS))
+                        .with_max_pending_outgoing(Some(total))
+                        .with_max_established(Some(total)),
+                )
+            },
+        );
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -765,13 +802,18 @@ where
         if restored > 0 {
             info!(target: "network-kad", restored, "restored persisted kad records into the local peer cache");
         }
+        behavior.peer_manager.configure_operator_peers(network_config, network_type)?;
 
         let network_pubkey = keypair.public().into();
 
         // QUIC listener hardening: Retry for unvalidated addresses and bounded incoming queues.
         let quic_incoming = std::sync::Arc::new(libp2p::quic::IncomingStats::default());
         let quic_limits = QuicIncomingLimits::new(
-            network_config.peer_config().max_priority_peers(),
+            network_config
+                .dao_observers()
+                .map_or(network_config.peer_config().max_priority_peers(), |profile| {
+                    usize::try_from(profile.max_peers()).unwrap_or(usize::MAX)
+                }),
             MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
         );
         let quic_stats = std::sync::Arc::clone(&quic_incoming);
@@ -1436,6 +1478,13 @@ where
             }
             NetworkCommand::ReportPenalty { peer, penalty } => {
                 debug!(target: "network", "penalty reported for peer {peer}");
+                if matches!(penalty, Penalty::Severe | Penalty::Fatal) {
+                    warn!(
+                        target: "network",
+                        ?penalty,
+                        "severe or fatal penalty reported for peer {peer}"
+                    );
+                }
                 if let Some((peer, _)) = self.swarm.behaviour().peer_manager.auth_to_peer(peer) {
                     self.swarm.behaviour_mut().peer_manager.process_penalty(peer, penalty);
                 } else {
@@ -1835,6 +1884,7 @@ where
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
+                        | ErrorKind::NotConnected
                         | ErrorKind::Interrupted => {
                             // transport flap on WAN — no penalty
                         }
@@ -1890,6 +1940,7 @@ where
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
+                        | ErrorKind::NotConnected
                         | ErrorKind::Interrupted => {
                             // transport flap on WAN — no penalty
                         }

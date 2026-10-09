@@ -13,12 +13,183 @@ use assert_matches::assert_matches;
 use eyre::eyre;
 use rand::{rngs::StdRng, SeedableRng as _};
 use std::num::NonZeroUsize;
-use tn_config::{ConsensusConfig, NetworkConfig};
+use tn_config::{ConsensusConfig, DaoObserverProfile, NetworkConfig, TrustedNode};
 use tn_reth::test_utils::fixture_batch_with_transactions;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils::{wait_until, CommitteeFixture};
 use tn_types::{BlsKeypair, Certificate, Header, TaskManager, DEFAULT_WORKER_ID};
 use tokio::{sync::mpsc, time::timeout};
+
+/// A real QUIC swarm and its event receiver for DAO profile regressions.
+type DaoSocketNode = (
+    ConsensusNetwork<
+        TestPrimaryRequest,
+        TestPrimaryResponse,
+        MemDatabase,
+        mpsc::Sender<NetworkEvent<TestPrimaryRequest, TestPrimaryResponse>>,
+    >,
+    mpsc::Receiver<NetworkEvent<TestPrimaryRequest, TestPrimaryResponse>>,
+);
+
+/// Construct a swarm using a specific primary or worker transport identity.
+fn dao_socket_network(
+    config: &ConsensusConfig<MemDatabase>,
+    network_config: &NetworkConfig,
+    role: NetworkType,
+    tasks: &TaskManager,
+) -> NetworkResult<DaoSocketNode> {
+    let (events, receiver) = mpsc::channel(10);
+    let keypair = match role {
+        NetworkType::Primary => config.key_config().primary_network_keypair().clone(),
+        NetworkType::Worker(id) => config.key_config().worker_network_keypair(id),
+    };
+    ConsensusNetwork::new(
+        network_config,
+        events,
+        config.key_config().clone(),
+        keypair,
+        MemDatabase::default(),
+        tasks.get_spawner(),
+        role,
+        config.primary_address(),
+        None,
+    )
+    .map(|network| (network, receiver))
+}
+
+/// Startup retries establish and reestablish actual QUIC connections at ordinary capacity.
+#[tokio::test]
+async fn dao_observer_socket_reconnects_on_every_swarm() -> eyre::Result<()> {
+    use futures::TryStreamExt as _;
+    futures::stream::iter(
+        [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(7)]
+            .into_iter()
+            .map(Ok::<_, eyre::Report>),
+    )
+    .try_for_each(|role| async move {
+        // Each role owns its transport tasks and fresh listener addresses.
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let configs: Vec<_> =
+            fixture.authorities().take(3).map(|node| node.consensus_config()).collect();
+        let hub = configs.first().ok_or_else(|| eyre!("missing hub fixture"))?;
+        let ordinary = configs.get(1).ok_or_else(|| eyre!("missing ordinary fixture"))?;
+        let observer = configs.get(2).ok_or_else(|| eyre!("missing observer fixture"))?;
+        let tasks = TaskManager::default();
+        let tasks_ref = &tasks;
+        let keys = observer.key_config();
+        let node = TrustedNode::new(
+            tn_types::P2pNode {
+                network_key: keys.primary_network_public_key(),
+                network_address: observer.primary_address(),
+                rpc: None,
+            },
+            [0, 7]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id,
+                        tn_types::P2pNode {
+                            network_key: keys.worker_network_public_key(id),
+                            network_address: observer.primary_address(),
+                            rpc: None,
+                        },
+                    )
+                })
+                .collect(),
+        );
+        let mut hub_config = NetworkConfig::default();
+        hub_config.peer_config_mut().target_num_peers = 1;
+        hub_config.peer_config_mut().peer_excess_factor = 0.0;
+        hub_config.peer_config_mut().priority_peer_excess = 0.0;
+        hub_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+        hub_config.set_dao_observers(Some(DaoObserverProfile::new(
+            std::collections::BTreeMap::from([(keys.primary_public_key(), node)]),
+            2,
+        )));
+        let (hub_network, _hub_events) = dao_socket_network(hub, &hub_config, role, tasks_ref)?;
+        let hub_handle = hub_network.network_handle();
+        let hub_task = tokio::spawn(hub_network.run());
+        hub_handle.start_listening(hub.primary_address()).await?;
+        let (ordinary_network, _ordinary_events) =
+            dao_socket_network(ordinary, &NetworkConfig::default(), role, tasks_ref)?;
+        let ordinary_handle = ordinary_network.network_handle();
+        let ordinary_task = tokio::spawn(ordinary_network.run());
+        ordinary_handle.start_listening(ordinary.primary_address()).await?;
+        let hub_key = match role {
+            NetworkType::Primary => hub.key_config().primary_network_public_key(),
+            NetworkType::Worker(id) => hub.key_config().worker_network_public_key(id),
+        };
+        ordinary_handle
+            .add_explicit_peer(
+                hub.key_config().primary_public_key(),
+                hub_key,
+                hub.primary_address(),
+            )
+            .await?;
+        ordinary_handle.dial_by_bls(hub.key_config().primary_public_key()).await?;
+        wait_for_peer_discovery(
+            &hub_handle,
+            ordinary.key_config().primary_public_key(),
+            Duration::from_secs(15),
+        )
+        .await?;
+        let observer_peer: PeerId = match role {
+            NetworkType::Primary => keys.primary_network_public_key(),
+            NetworkType::Worker(id) => keys.worker_network_public_key(id),
+        }
+        .into();
+        let start_observer = || -> NetworkResult<_> {
+            dao_socket_network(observer, &NetworkConfig::default(), role, tasks_ref).map(
+                |(network, events)| (network.network_handle(), tokio::spawn(network.run()), events),
+            )
+        };
+        let (observer_handle, observer_task, _observer_events) = start_observer()?;
+        observer_handle.start_listening(observer.primary_address()).await?;
+        wait_until(
+            Duration::from_secs(90),
+            "reserved observer attaches at full ordinary capacity",
+            || async {
+                hub_handle.connected_peers().await.map_err(eyre::Report::from).map(|peers| {
+                    peers.contains(&keys.primary_public_key())
+                        && peers.contains(&ordinary.key_config().primary_public_key())
+                })
+            },
+        )
+        .await?;
+        observer_task.abort();
+        let _ = observer_task.await;
+        wait_until(Duration::from_secs(15), "observer outage releases its connection", || async {
+            hub_handle
+                .connected_peer_ids()
+                .await
+                .map_err(eyre::Report::from)
+                .map(|peers| !peers.contains(&observer_peer))
+        })
+        .await?;
+        hub_handle
+            .update_committees(Default::default(), Default::default(), Default::default())
+            .await?;
+        let (observer_handle, observer_task, _restarted_events) = start_observer()?;
+        observer_handle.start_listening(observer.primary_address()).await?;
+        wait_until(
+            Duration::from_secs(90),
+            "reserved observer reconnects after rotation",
+            || async {
+                hub_handle.connected_peers().await.map_err(eyre::Report::from).map(|peers| {
+                    peers.contains(&keys.primary_public_key())
+                        && peers.contains(&ordinary.key_config().primary_public_key())
+                })
+            },
+        )
+        .await?;
+        futures::future::join_all(
+            [observer_task, ordinary_task, hub_task].into_iter().inspect(|task| task.abort()),
+        )
+        .await;
+        Ok(())
+    })
+    .await
+}
 
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
@@ -1259,23 +1430,25 @@ async fn test_msg_verification_ignores_unauthorized_publisher() -> eyre::Result<
     Ok(())
 }
 
+/// An excess ordinary peer receives discovery peers and reconnects through the committee.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     tn_types::test_utils::init_test_tracing();
     // Create a custom config with very low peer limits for testing
-    let target = NonZeroUsize::new(5).unwrap();
+    let target = NonZeroUsize::new(6).ok_or_else(|| eyre!("committee size must be nonzero"))?;
     let mut network_config = NetworkConfig::default();
-    network_config.peer_config_mut().target_num_peers = 5; // entire committee + 1
+    network_config.peer_config_mut().target_num_peers = 5; // five remote committee peers
     network_config.peer_config_mut().peer_excess_factor = 0.1;
     network_config.peer_config_mut().excess_peers_reconnection_timeout = Duration::from_secs(10);
     network_config.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
     network_config.libp2p_config_mut().k_bucket_size = target;
 
     // Set up peers with the custom config
-    let (mut target_peer, mut other_peers, _) = create_test_peers::<
-        TestWorkerRequest,
-        TestWorkerResponse,
-    >(target, Some(network_config.clone()));
+    let (mut target_peer, mut other_peers, _task_manager) =
+        create_test_peers::<TestWorkerRequest, TestWorkerResponse>(
+            target,
+            Some(network_config.clone()),
+        );
 
     // spawn target network
     let target_network = target_peer.network.take().expect("target network is some");
@@ -1291,6 +1464,14 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     let target_peer_id = target_peer.network_handle.local_peer_id().await?;
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
+
+    // Discovery entries do not grant retention privileges. Install authoritative membership
+    // so the excess non-validator is the only peer eligible for pruning.
+    let committee_keys = target_peer.config.committee_pub_keys();
+    target_peer
+        .network_handle
+        .update_committees(Default::default(), committee_keys.clone(), Default::default())
+        .await?;
 
     debug!(target: "network", ?target_peer_id, ?target_peer_bls, "target peer started");
 
@@ -1335,9 +1516,11 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
         .await?;
     }
 
-    // allow heartbeat to trigger peer pruning - increased to give libp2p time to
-    // stabilize internal connection state and avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 3)).await;
+    let target_handle = &target_peer.network_handle;
+    wait_until(Duration::from_secs(5), "committee fills target peer budget", move || async move {
+        target_handle.connected_peers().await.map(|peers| peers.len() == 5).map_err(Into::into)
+    })
+    .await?;
 
     // check that target has limited peers
     let connected_peers = target_peer.network_handle.connected_peer_ids().await?;
@@ -1353,40 +1536,8 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     );
 
     // create a new non-validator peer
-    let TestTypes { peer1: nvv_peer, peer2, .. } =
+    let TestTypes { peer1: nvv_peer, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-
-    let NetworkPeer {
-        config: peer2_config,
-        network_handle: peer2,
-        network: peer2_network,
-        network_events: _,
-    } = peer2;
-
-    // connect peer2
-    tokio::spawn(async move {
-        if let Err(e) = peer2_network.run().await {
-            error!(target: "network", ?e, "peer2 network run failed");
-        }
-    });
-
-    peer2.start_listening(peer2_config.primary_address()).await?;
-
-    // add peers to each other's known peers
-    // add target as a bootstrap nodes
-    peer2.add_explicit_peer(target_peer_bls, target_peer_net.clone(), target_addr.clone()).await?;
-
-    // subscribe to topic for gossip
-    peer2
-        .subscribe_with_publishers(TEST_TOPIC.into(), vec![target_peer_bls].into_iter().collect())
-        .await?;
-
-    // connect to target
-    peer2.dial_by_bls(target_peer_bls).await?;
-
-    // give time for connection to establish and libp2p state to stabilize
-    // target should be at max capacity
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // spawn nvv that goes through px
     let NetworkPeer {
@@ -1417,9 +1568,23 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
     // connect nvv to target (which already has too many peers)
     nvv.dial_by_bls(target_peer_bls).await?;
 
-    // allow time for kademlia records to propagate and libp2p connection state to
-    // stabilize after disconnection - increased to avoid race conditions in CI
-    tokio::time::sleep(Duration::from_secs(TEST_HEARTBEAT_INTERVAL * 5)).await;
+    // Wait for the goodbye and peer exchange to lead to a committee connection before publishing.
+    let nvv_handle = &nvv;
+    let committee_keys = &committee_keys;
+    wait_until(
+        Duration::from_secs(10),
+        "excess peer reconnects through peer exchange",
+        move || async move {
+            tokio::try_join!(target_handle.connected_peers(), nvv_handle.connected_peers())
+                .map(|(target_connected, connected)| {
+                    !target_connected.contains(&nvv_peer_bls)
+                        && !connected.contains(&target_peer_bls)
+                        && connected.iter().any(|peer| committee_keys.contains(peer))
+                })
+                .map_err(Into::into)
+        },
+    )
+    .await?;
 
     // assert target is disconnected from nvv
     assert!(!target_peer
@@ -1483,6 +1648,15 @@ async fn test_peer_exchange_with_excess_peers() -> eyre::Result<()> {
 /// `PeerExchange` variant embedded in the request enum.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre::Result<()> {
+    /// A legacy peer supports gossip and exchanges peers through the main RPC.
+    #[derive(NetworkBehaviour)]
+    struct LegacyPeerBehaviour {
+        /// Main RPC, including the embedded peer-exchange request.
+        req_res: request_response::Behaviour<TNCodec<TestWorkerRequest, TestWorkerResponse>>,
+        /// Gossip support prevents a fatal ban before heartbeat pruning.
+        gossipsub: gossipsub::Behaviour,
+    }
+
     tn_types::test_utils::init_test_tracing();
     // 4 committee peers fill the target to its limit; validators are protected from
     // pruning, so the raw legacy peer is deterministically the excess one
@@ -1510,6 +1684,16 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
     let target_addr = target_peer.config.primary_address();
     let target_peer_bls = target_peer.config.key_config().primary_public_key();
     let target_peer_net = target_peer.config.primary_networkkey();
+
+    // Adding discovery peers alone does not protect them from pruning.
+    target_peer
+        .network_handle
+        .update_committees(
+            Default::default(),
+            target_peer.config.committee_pub_keys(),
+            Default::default(),
+        )
+        .await?;
 
     // fill the target with protected committee peers
     for peer in other_peers.iter_mut() {
@@ -1540,8 +1724,7 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         .await?;
     }
 
-    // raw legacy peer: the target's main req-res protocol only, no dedicated
-    // peer-exchange protocol
+    // The legacy peer supports gossip and exchanges peers through the main RPC.
     let chain_id = network_config.libp2p_config().chain_id;
     let raw_keypair = NetworkKeypair::generate_ed25519();
     let raw_peer_id: PeerId = raw_keypair.public().into();
@@ -1553,10 +1736,20 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
         vec![(NetworkType::Primary.req_res_protocol(chain_id)?, ProtocolSupport::Full)],
         request_response::Config::default(),
     );
+    let legacy_gossipsub = gossipsub::Behaviour::new(
+        gossipsub::MessageAuthenticity::Signed(raw_keypair.clone()),
+        gossipsub::ConfigBuilder::default()
+            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
+            .build()?,
+    )
+    .map_err(NetworkError::GossipBehavior)?;
     let mut raw_swarm = SwarmBuilder::with_existing_identity(raw_keypair)
         .with_tokio()
         .with_quic()
-        .with_behaviour(|_| legacy_req_res)
+        .with_behaviour(|_| LegacyPeerBehaviour {
+            req_res: legacy_req_res,
+            gossipsub: legacy_gossipsub,
+        })
         .map_err(|e| eyre!("raw swarm behaviour: {e:?}"))?
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(30)))
         .build();
@@ -1569,18 +1762,20 @@ async fn test_goodbye_falls_back_to_embedded_exchange_for_legacy_peer() -> eyre:
     tokio::spawn(async move {
         let mut goodbye_tx = Some(goodbye_tx);
         loop {
-            if let SwarmEvent::Behaviour(request_response::Event::Message {
-                message:
-                    request_response::Message::Request {
-                        request: TestWorkerRequest::PeerExchange(map),
-                        channel,
-                        ..
-                    },
-                ..
-            }) = raw_swarm.select_next_some().await
+            if let SwarmEvent::Behaviour(LegacyPeerBehaviourEvent::ReqRes(
+                request_response::Event::Message {
+                    message:
+                        request_response::Message::Request {
+                            request: TestWorkerRequest::PeerExchange(map),
+                            channel,
+                            ..
+                        },
+                    ..
+                },
+            )) = raw_swarm.select_next_some().await
             {
                 let ack = TestWorkerResponse::from(PeerExchangeMap::default());
-                let _ = raw_swarm.behaviour_mut().send_response(channel, ack);
+                let _ = raw_swarm.behaviour_mut().req_res.send_response(channel, ack);
                 if let Some(tx) = goodbye_tx.take() {
                     let _ = tx.send(map);
                 }

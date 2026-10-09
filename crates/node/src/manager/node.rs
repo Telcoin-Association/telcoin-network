@@ -999,7 +999,7 @@ where
         // network builder, the gossip handles, and the gossip-validation handlers.
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.bootstrap_servers = network_config
-            .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
+            .configure_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
         let node_info = &self.builder.tn_config.node_info;
         network_config.validate_committee_peers(&committee, &self.bootstrap_servers)?;
         network_config.validate_local_committee_peer(
@@ -1011,6 +1011,10 @@ where
             |(id, worker)| {
                 network_config.validate_local_committee_peer(public_key, Some(id), worker)
             },
+        )?;
+        network_config.validate_operator_inventory(
+            &self.bootstrap_servers,
+            node_info.p2p_info.workers.iter().zip(0..=WorkerId::MAX).map(|(_, id)| id),
         )?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         let (primary_address, worker_addresses) = self

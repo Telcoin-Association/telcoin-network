@@ -25,6 +25,10 @@ mod network;
 pub use network::*;
 mod network_budget;
 pub use network_budget::*;
+mod observers;
+pub use observers::{
+    DaoObserverProfile, ObserverConfigError, TrustedNode, MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+};
 mod source_admission;
 pub use source_admission::SourceAdmissionConfig;
 mod retry;
