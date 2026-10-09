@@ -248,12 +248,14 @@ has nothing uncommitted; otherwise:
 The B+tree index is **not** synced on commit; it is derived, synced at a clean close, and rebuilt
 after a crash.
 
-**Platform note.** tndb's commits are `msync`, and its directory and `meta` syncs are plain
-`fsync(2)` (the `layout::sync_file` / `sync_dir` helpers). On Linux that is what `File::sync_all`
-does. On macOS `sync_all` would be `F_FULLFSYNC`, a full drive-cache flush, which tndb's data
-commits don't use either. So on macOS tndb (like MDBX's `Durable` mode with `write_map`) is not a
-full power-loss barrier, and its numbers there understate the production (Linux) sync cost.
-`MmapDataFile`'s own growth `fsync` still uses `sync_all`.
+**Platform note.** tndb's commits are `msync`, and every other sync (directory entries, `meta`,
+growth sizes, the writable-reopen sentinel, the clean-close seal) is a plain `fsync(2)` (the
+`archive::data_file::fsync_file` / `fdatasync_file` helpers, which `layout::sync_file` / `sync_dir`
+use). On Linux those are exactly `File::sync_all` / `sync_data`. On macOS std's versions would be
+`F_FULLFSYNC`, a flush of the whole drive's write cache that stalls every other write on the drive
+for 10–20 ms, and tndb's commits don't issue one either. So on macOS tndb (like MDBX's `Durable`
+mode with `write_map`) is not a full power-loss barrier, and its numbers there understate the
+production (Linux) sync cost.
 
 **A clean close** commits anything uncommitted through the ordinary commit (so the removal log is
 synced before the commit record), for example a dropped transaction's writes. A close that cannot
@@ -573,6 +575,10 @@ All are `#[ignore]`d; run them with `--ignored --nocapture --test-threads 1`, in
 cargo test --release -p tn-storage workload_ -- --ignored --nocapture --test-threads 1
 ```
 
-Interpreting results on macOS: directory and growth syncs there can cost a full drive-cache flush,
-and benches that clear and then immediately time a run (`db_bench`) overlap the background spare
-preparation. Compare backends on Linux for production numbers.
+Interpreting results on macOS: commits there do not flush the drive's cache (see the platform
+note), so durable latencies understate Linux's. The first write to each page of a data log's
+preallocated growth faults that page in from disk on APFS, which keeps large single inserts (the
+256 KB batch-cache row) behind MDBX there, since MDBX grows sparsely; Linux's `fallocate` leaves
+unwritten extents that should fault without a read (not yet measured). A bench must not sleep
+before a timed region: an idle CPU slows the region that follows by up to about 2×. Compare
+backends on Linux for production numbers.

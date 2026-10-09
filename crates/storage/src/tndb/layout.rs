@@ -29,21 +29,12 @@ use std::{
 
 use eyre::{bail, WrapErr as _};
 
-use crate::archive::crc::crc32;
+use crate::archive::{crc::crc32, data_file::fsync_file};
 
-/// `fsync(2)` an open file or directory: its contents, and for a directory its entries.
-///
-/// On Linux this is what `File::sync_all` does. On macOS `sync_all` is `F_FULLFSYNC`, a flush of
-/// the whole drive cache, which tndb does not use: its commits are `msync`, which on macOS does not
-/// flush the drive's cache either, so a full flush for its directory entries alone would add no
-/// durability its data has, at a far higher cost (tens of milliseconds under write load).
+/// `fsync(2)` an open file or directory: its contents, and for a directory its entries. A plain
+/// `fsync` on every platform, never macOS's `F_FULLFSYNC` (see [`fsync_file`]).
 pub(crate) fn sync_file(file: &fs::File) -> io::Result<()> {
-    // SAFETY: `fsync` on a valid, open file descriptor borrowed for the call.
-    if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
-    }
+    fsync_file(file)
 }
 
 /// [`sync_file`] a directory, making its entries (created, renamed or removed) durable.

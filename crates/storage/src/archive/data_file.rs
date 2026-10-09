@@ -53,9 +53,16 @@
 //! [`derived`](MmapFileOptions::derived) index skips that fsync and leaves its size to the
 //! clean-close seal: its owner rebuilds it from the data log after any unclean open anyway.
 //! `MmapDataFile::sync_disk` is the full,
-//! slower `msync` + `fsync`, which additionally persists the file's size/metadata. (On macOS
-//! `fsync` is not a full power-loss barrier — that needs `F_FULLFSYNC`; the real win of the msync
-//! default is on Linux.)
+//! slower `msync` + `fsync`, which additionally persists the file's size/metadata.
+//!
+//! **macOS.** Neither `msync` nor `fsync` is a full power-loss barrier there (that needs
+//! `F_FULLFSYNC`, a flush of the whole drive's write cache). Commits are `msync`, so every other
+//! sync here is a plain `fsync` too ([`fsync_file`], [`fdatasync_file`]): std's
+//! `File::sync_all`/`sync_data` would issue `F_FULLFSYNC`, costing 10–20 ms each and stalling
+//! every other write on the drive, for a guarantee the commits never give. A crash of the process
+//! or the kernel loses nothing acked; a power loss can, as with MDBX's `Durable` mode with
+//! `write_map`. On Linux these are exactly `File::sync_all`/`sync_data` (`fsync`/`fdatasync`,
+//! which do flush the drive's cache).
 //!
 //! This module also holds the shared directory-durability helpers (`fsync_directory`,
 //! `create_dir_synced`) used across the pack file types.
@@ -90,7 +97,39 @@ use crate::archive::error::rename::RenameError;
 /// that file's contents instead of providing the directory-entry durability
 /// guarantee callers expect, so all in-crate call sites pass a directory.
 pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
-    File::open(path)?.sync_all()
+    fsync_file(&File::open(path)?)
+}
+
+/// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`
+/// (see the module docs' Durability section) and this is a plain `fsync`.
+pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches
+        // no Rust memory.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_all()
+    }
+}
+
+/// `fdatasync(2)` `file`: [`File::sync_data`] everywhere but macOS, where that is `F_FULLFSYNC`
+/// and this is a plain `fsync` (see [`fsync_file`]).
+pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        fsync_file(file)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        file.sync_data()
+    }
 }
 
 /// Create `dir` (and any missing parents) and fsync its parent so the new directory
@@ -479,7 +518,7 @@ impl MmapDataFile {
         // sync per writable reopen of a sealed file (an open, never the persist hot path).
         if !read_only && !opened_unclean && logical_end < orig_len {
             file.write_all_at(&[0_u8; SENTINEL_LEN as usize], logical_end)?;
-            file.sync_data()?;
+            fdatasync_file(&file)?;
         }
 
         // Map only the bytes that already exist. A fresh (0-length) RW file is left unallocated
@@ -973,7 +1012,7 @@ impl MmapDataFile {
     /// A [`derived`](MmapFileOptions::derived) file skips it and leaves its size to the seal.
     fn sync_size_if_grown(&self) -> io::Result<()> {
         if self.size_unsynced.load(Ordering::Relaxed) && !self.opts.derived {
-            self.file.sync_all().inspect_err(|_| self.poison())?;
+            fsync_file(&self.file).inspect_err(|_| self.poison())?;
             self.size_unsynced.store(false, Ordering::Relaxed);
             #[cfg(test)]
             self.size_syncs.fetch_add(1, Ordering::Relaxed);
@@ -1207,7 +1246,7 @@ impl MmapDataFile {
             // here would let the clean-close sentinel be stamped over a
             // possibly-non-durable tail.
             if sync && self.flushed_end.load(Ordering::Relaxed) < self.end {
-                self.file.sync_all().inspect_err(|_| self.poison())?;
+                fsync_file(&self.file).inspect_err(|_| self.poison())?;
                 self.flushed_end.store(self.end, Ordering::Relaxed);
                 // That fsync persisted the size too.
                 self.size_unsynced.store(false, Ordering::Relaxed);
@@ -1281,7 +1320,7 @@ impl MmapDataFile {
             return Ok(());
         }
         self.flush_dirty(true)?;
-        self.file.sync_all().inspect_err(|_| self.poison())?;
+        fsync_file(&self.file).inspect_err(|_| self.poison())?;
         self.size_unsynced.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -1572,7 +1611,7 @@ impl Drop for MmapDataFile {
                 }
             }
         }
-        if let Err(e) = self.file.sync_all() {
+        if let Err(e) = fsync_file(&self.file) {
             if !std::thread::panicking() {
                 tracing::error!("MmapDataFile: failed to fsync on drop: {e}");
             }
@@ -2676,6 +2715,21 @@ mod tests {
         // The physical file is at least the logical length (padding may make it larger until
         // close).
         assert!(std::fs::metadata(&path).expect("meta").len() >= 300);
+    }
+
+    /// The platform sync helpers work on a file and on a directory (this platform's branch is the
+    /// one compiled here), and a path that cannot be opened is an error, not a silent success.
+    #[test]
+    fn fsync_helpers_sync_files_and_directories() {
+        let tmp = TempDir::with_prefix("mmap_df_fsync_helpers").expect("temp dir");
+        let path = tmp.path().join("file");
+        std::fs::write(&path, b"bytes").expect("write");
+        let file = File::open(&path).expect("open file");
+        fsync_file(&file).expect("fsync a file");
+        fdatasync_file(&file).expect("fdatasync a file");
+        fsync_file(&File::open(tmp.path()).expect("open dir")).expect("fsync a directory");
+        fsync_directory(tmp.path()).expect("fsync_directory");
+        assert!(fsync_directory(&tmp.path().join("missing")).is_err(), "a missing path errors");
     }
 
     /// The append `msync` watermark must never drop earlier-synced data. Sync, append past the
