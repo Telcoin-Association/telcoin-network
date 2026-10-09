@@ -14,8 +14,7 @@ use std::{
 };
 use tn_config::NetworkServeConfig;
 use tn_types::{
-    SendError, TaskSpawner, TnReceiver, TnSender, TryRecvError, TrySendError, TrySendOutcome,
-    WorkerId,
+    SendError, TnReceiver, TnSender, TryRecvError, TrySendError, TrySendOutcome, WorkerId,
 };
 use tokio::{sync::Notify, time::Instant};
 
@@ -31,6 +30,17 @@ pub struct AdmittedSyncStream<S = Stream> {
     arrived: Instant,
     /// Opening-request deadline, including time spent waiting for an epoch.
     deadline: Instant,
+}
+
+impl<S> std::fmt::Debug for AdmittedSyncStream<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AdmittedSyncStream")
+            .field("peer", &self.peer)
+            .field("arrived", &self.arrived)
+            .field("deadline", &self.deadline)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<S> AdmittedSyncStream<S> {
@@ -373,6 +383,15 @@ pub enum WorkerIngressEvent<S = Stream> {
     Sync(AdmittedSyncStream<S>),
 }
 
+impl<S> std::fmt::Debug for WorkerIngressEvent<S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Network(_) => formatter.debug_tuple("Network").finish_non_exhaustive(),
+            Self::Sync(stream) => formatter.debug_tuple("Sync").field(stream).finish(),
+        }
+    }
+}
+
 impl From<NetworkEvent<Req, Res>> for WorkerIngressEvent {
     fn from(event: NetworkEvent<Req, Res>) -> Self {
         Self::Network(event)
@@ -380,6 +399,7 @@ impl From<NetworkEvent<Req, Res>> for WorkerIngressEvent {
 }
 
 /// Alternate ready lanes so neither a gossip burst nor sync traffic starves the other.
+#[derive(Debug)]
 enum LaneTurn {
     /// Give an epoch-scoped message the first opportunity.
     Epoch,
@@ -395,6 +415,15 @@ pub struct WorkerEventReceiver<Events, S = Stream> {
     streams: Arc<StreamLane<S>>,
     /// Lane polled first on the next receive.
     turn: LaneTurn,
+}
+
+impl<Events, S> std::fmt::Debug for WorkerEventReceiver<Events, S> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerEventReceiver")
+            .field("turn", &self.turn)
+            .finish_non_exhaustive()
+    }
 }
 
 impl<Events: TnReceiver<NetworkEvent<Req, Res>>, S> WorkerEventReceiver<Events, S> {
