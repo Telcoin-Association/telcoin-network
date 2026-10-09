@@ -6,11 +6,15 @@ use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
     kad::{node_record_key, KadStore},
-    metrics::{InboundDenial, PeerManagerMetrics, SwarmMetrics},
+    metrics::{
+        ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
+        SwarmMetrics,
+    },
     peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
         GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
@@ -40,12 +44,14 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io::ErrorKind,
     num::NonZeroUsize,
-    time::Duration,
+    time::{Duration, Instant},
 };
-use tn_config::{KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, MAX_GOSSIP_MESSAGE_SIZE};
+use tn_config::{
+    KeyConfig, LibP2pConfig, NetworkConfig, PeerConfig, SwarmNetworkBudget, MAX_GOSSIP_MESSAGE_SIZE,
+};
 use tn_types::{
     encode, now, BlsPublicKey, BlsSigner, Database, NetworkKeypair, NetworkPublicKey, TaskSpawner,
-    TnSender, WorkerId,
+    TnSender, TrySendOutcome, WorkerId,
 };
 use tokio::sync::{
     mpsc::{Receiver, Sender},
@@ -53,9 +59,32 @@ use tokio::sync::{
 };
 use tracing::{debug, error, info, instrument, trace, warn};
 
+/// An inbound request that the swarm forwarded to the application and has not yet answered.
+#[derive(Debug)]
+struct PendingInbound {
+    /// The cancel notice to the handler when the request ends.
+    notify: oneshot::Sender<()>,
+    /// The class that counts this request in the pending occupancy.
+    class: ServiceClass,
+    /// The time that the swarm forwarded the request, for the service time histogram.
+    received: Instant,
+}
+
 #[cfg(test)]
 #[path = "tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+#[path = "tests/committee_seeding.rs"]
+mod committee_seeding;
+
+#[cfg(test)]
+#[path = "tests/network_budget_tests.rs"]
+mod network_budget_tests;
+
+#[cfg(test)]
+#[path = "tests/inbound_service_tests.rs"]
+mod inbound_service_tests;
 
 #[cfg(test)]
 #[path = "tests/admission_contention.rs"]
@@ -225,11 +254,15 @@ impl InboundDenialWarning {
 
 /// Build the [`connection_limits::Behaviour`] for one swarm.
 ///
-/// It sets two bounds:
-/// - at most [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`] concurrent established connections per peer
-///   (issue #1010);
+/// It sets the following bounds:
+/// - at most the process allocation's per-peer ceiling, or [`MAX_ESTABLISHED_CONNECTIONS_PER_PEER`]
+///   without an allocation, concurrent established connections per peer (issue #1010);
+/// - at most the process allocation's established connections in total, when configured;
 /// - at most `max_pending_incoming` concurrent pending inbound connections in total (production
 ///   passes [`MAX_PENDING_INCOMING_CONNECTIONS`]).
+///
+/// Both directions and all peer classes consume the process allocation: this behaviour must never
+/// install bypass peer IDs.
 ///
 /// Pending inbound slot lifecycle (libp2p `connection_limits::Behaviour` owns every slot):
 /// - acquire: `handle_pending_inbound_connection` takes a slot, keyed by `ConnectionId`, only when
@@ -247,16 +280,24 @@ impl InboundDenialWarning {
 /// second default, which is shorter than the configured QUIC `handshake_timeout`. So an unfinished
 /// inbound handshake holds its slot for about 10 seconds at most, not for the QUIC value.
 ///
-/// The budget applies to each swarm separately. Each primary and worker network builds its own
-/// [`TNBehavior`], so the host total is this budget times the number of swarms.
+/// The pending inbound ceiling applies to each swarm separately. Each primary and worker network
+/// builds its own [`TNBehavior`], so the host total is this ceiling times the number of swarms.
 ///
-/// The other `connection_limits` dimensions (pending outgoing, established totals and per-direction
-/// caps) stay unbounded. Shared by [`TNBehavior::new`] and the regression tests so all of them
-/// exercise the identical limits.
-fn connection_limits_behaviour(max_pending_incoming: u32) -> connection_limits::Behaviour {
+/// Pending outgoing and per-direction established caps stay unbounded. Established totals are
+/// unbounded without a process allocation. Shared by [`TNBehavior::new`] and the regression tests
+/// so all of them exercise the identical limits.
+fn connection_limits_behaviour(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> connection_limits::Behaviour {
     connection_limits::Behaviour::new(
         ConnectionLimits::default()
-            .with_max_established_per_peer(Some(MAX_ESTABLISHED_CONNECTIONS_PER_PEER))
+            .with_max_established_per_peer(Some(
+                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                    budget.connections_per_peer()
+                }),
+            ))
+            .with_max_established(budget.map(|budget| budget.connections()))
             .with_max_pending_incoming(Some(max_pending_incoming)),
     )
 }
@@ -284,8 +325,9 @@ where
     /// The peer manager — first so banned-peer denials short-circuit
     /// before other behaviors register the connection.
     pub(crate) peer_manager: peers::PeerManager,
-    /// Per-peer established connection ceiling (issue #1010) and memory-only ceiling on pending
-    /// inbound connections (see [`connection_limits_behaviour`]).
+    /// Per-peer established connection ceiling (issue #1010), optional per-swarm process
+    /// allocation, and memory-only ceiling on pending inbound connections (see
+    /// [`connection_limits_behaviour`]).
     ///
     /// Placed immediately after `peer_manager` so self / banned denials still fire first (a banned
     /// peer or IP is rejected before it is counted here or takes a pending slot), and before the
@@ -333,7 +375,7 @@ where
         stream_protocol: StreamProtocol,
     ) -> Self {
         let peer_manager = PeerManager::new(local_peer_id, peer_config, metrics);
-        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS);
+        let connection_limits = connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None);
         let (req_res, peer_exchange, record_exchange) = req_res;
         let stream = StreamBehavior::new(stream_protocol);
         Self {
@@ -429,14 +471,16 @@ where
     /// caller is responsible for decoding message bytes and reporting peers who return bad
     /// data. Peers that send messages that fail to decode must receive an application score
     /// penalty.
-    inbound_requests: HashMap<InboundRequestId, oneshot::Sender<()>>,
+    inbound_requests: HashMap<InboundRequestId, PendingInbound>,
+    /// The pending inbound requests by service class. Changes only with `inbound_requests`.
+    inbound_pending: InboundOccupancy,
     /// The collection of kademlia record requests.
     ///
     /// When the application layer makes a request, the swarm stores the kad::QueryId and the
     /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
-    kad_record_queries: HashMap<QueryId, KadQuery>,
+    kad_record_queries: HashMap<QueryId, PendingKadQuery>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -462,17 +506,13 @@ where
     verified_peer_records: LruCache<kad::RecordKey, Vec<u8>>,
     /// Peers we have already pushed our [NodeRecord] to.
     ///
-    /// A peer connecting for the first time needs our record before it can resolve
-    /// our BLS key, so we push it on `PeerConnected`. A peer that reconnects (or that
-    /// flaps repeatedly, as observed with banned peers in adiri testnet) should already have
-    /// the record in their persistent kad store, so we skip the push for peers already in here.
+    /// A peer needs our record before it can resolve our BLS key, so we push it on
+    /// `PeerConnected`. The last-connection close clears this marker because the receiver
+    /// relinquishes connection-owned retention and needs another advertisement on reconnect.
     ///
-    /// A capacity-bounded LRU rather than an unbounded set: entries are never removed on
-    /// disconnect (removing them would re-enable the exact kad re-push amplification on flapping
-    /// peers that this de-dup gate exists to prevent), so an unbounded set would grow once per
-    /// distinct `PeerId` ever seen and eventually OOM a RAM-capped node. The LRU caps resident
-    /// size at [`MAX_PUBLISHED_TO_PEERS`] and promotes actively (re)connecting peers so they are
-    /// never evicted; see that constant for the full rationale.
+    /// A bounded LRU limits metadata for concurrent connections and failed publication attempts.
+    /// Entries survive intermediate connection closes and are removed on the last close. The
+    /// resident cap is [`MAX_PUBLISHED_TO_PEERS`].
     published_to_peers: LruCache<PeerId, ()>,
     /// Bounded record retrievals and cooldown history, independent of push suppression.
     record_exchange: RecordExchange,
@@ -557,6 +597,8 @@ where
         external_addr: Multiaddr,
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
+        let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
         // the network config from genesis at node startup; see
@@ -626,12 +668,11 @@ where
         kad_config.set_kbucket_inserts(kad::BucketInserts::Manual);
         let libp2p = network_config.libp2p_config();
         kad_config.set_kbucket_size(libp2p.k_bucket_size);
+        configure_record_jobs(&mut kad_config);
         kad_config
             .set_max_packet_size(MAX_KAD_PACKET_SIZE)
             .set_record_ttl(Some(libp2p.kad_record_ttl))
             .set_record_filtering(kad::StoreInserts::FilterBoth)
-            .set_publication_interval(Some(libp2p.kad_publication_interval))
-            .set_replication_interval(Some(libp2p.kad_replication_interval))
             .set_query_timeout(Duration::from_secs(60))
             .set_provider_record_ttl(Some(libp2p.kad_record_ttl));
         let mut kad_store = KadStore::new(db.clone(), peer_id, &key_config, network_type);
@@ -660,7 +701,7 @@ where
             }
         }
 
-        // Purge corrupt records before the store is cloned into the kademlia behaviour
+        // Purge corrupt records before moving the store into the kademlia behaviour
         // so its record accounting stays accurate.
         for key in corrupt {
             warn!(target: "network-kad", ?key, "removing invalid record from kad store (undecodable or wrong signing domain)");
@@ -680,7 +721,10 @@ where
             );
         }
 
-        let kademlia = kad::Behaviour::with_config(peer_id, kad_store.clone(), kad_config);
+        kad_store
+            .enable_retention()
+            .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()))?;
+        let kademlia = kad::Behaviour::with_config(peer_id, kad_store, kad_config);
 
         // create custom behavior
         let stream_protocol = crate::types::stream_protocol(network_type, chain_id)?;
@@ -693,6 +737,8 @@ where
             PeerManagerMetrics::new_for(&network_type),
             stream_protocol,
         );
+        behavior.connection_limits =
+            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -706,6 +752,14 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
+            behavior
+                .kademlia
+                .store_mut()
+                .record_timestamp(&crate::kad::node_record_key(&key))
+                .into_iter()
+                .for_each(|timestamp| {
+                    behavior.peer_manager.restore_record_timestamp(key, timestamp);
+                });
             restored += 1;
         }
         if restored > 0 {
@@ -726,7 +780,7 @@ where
         let mut swarm = SwarmBuilder::with_existing_identity(keypair)
             .with_tokio()
             .with_quic_config(|config| {
-                let mut config = network_config.quic_config().apply_to(config);
+                let mut config = quic_config.apply_to(config);
                 quic_limits.apply(
                     &mut config,
                     network_config.quic_config().retry_unvalidated_incoming,
@@ -766,6 +820,7 @@ where
             authorized_publishers: Default::default(),
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
+            inbound_pending: InboundOccupancy::default(),
             kad_record_queries: Default::default(),
             config,
             connected_peers: VecDeque::new(),
@@ -786,7 +841,7 @@ where
                 record_retry_interval,
             ),
             record_retry_interval,
-            metrics: SwarmMetrics::new_for(&network_type),
+            metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
@@ -835,8 +890,10 @@ where
     /// Re-sign our configured network information and publish it with a fresh timestamp.
     ///
     /// `provide_our_data` replaces the local store entry before publishing, so subsequent
-    /// replication snapshots and direct pushes use the new signed value. Our local copy keeps
-    /// `expires: None`; Kademlia assigns the configured TTL to outbound copies.
+    /// direct pushes and record lookups use the new signed value. Our local copy keeps
+    /// `expires: None`; Kademlia assigns the configured TTL to outbound copies. The libp2p-kad
+    /// record job is disabled (see [`configure_record_jobs`]), so this is the only periodic
+    /// republication of our record.
     fn refresh_own_record(&mut self) {
         self.node_record
             .refresh(self.record_domain, |data| self.key_config.request_signature_direct(data));
@@ -847,10 +904,10 @@ where
     /// Return None if we don't have any confirmed external addresses yet.
     fn get_peer_record(&self) -> kad::Record {
         let key = node_record_key(&self.key_config.primary_public_key());
-        // Leave `expires: None` for our OWN record so libp2p's PutRecordJob
-        // recomputes a fresh `now + kad_record_ttl` on every replication snapshot
-        // (see libp2p-kad jobs.rs:217-221). The configured `kad_record_ttl` still
-        // drives the wire-level expiry that remote peers store.
+        // Leave `expires: None` for our OWN record. The local row keeps the value given to
+        // `put_record`, so `None` never lapses on our read path. `put_record` and
+        // `put_record_to` fill a fresh `now + kad_record_ttl` into each outbound copy, so the
+        // configured `kad_record_ttl` still drives the wire-level expiry that remote peers store.
         kad::Record {
             key: key.clone(),
             value: encode(&self.node_record),
@@ -994,6 +1051,9 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_established_connections(
+                self.swarm.network_info().connection_counters().num_established(),
+            );
             let (pending, deferred) = self.record_exchange.counts();
             self.metrics.set_record_exchange_pending(pending, deferred);
             self.metrics.record_quic_incoming(&self.quic_incoming);
@@ -1007,6 +1067,18 @@ where
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
         match event {
+            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
+                // Connection-owned rows are gone at the receiver too. A reconnect needs a fresh
+                // direct advertisement even when the bounded publication cache saw this peer
+                // before.
+                self.published_to_peers.pop(&peer_id);
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .release_connected(&peer_id)
+                    .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()))?;
+            }
             SwarmEvent::Behaviour(behavior) => match behavior {
                 TNBehaviorEvent::Gossipsub(event) => self.process_gossip_event(event)?,
                 TNBehaviorEvent::ReqRes(event) => self.process_reqres_event(event)?,
@@ -1059,32 +1131,46 @@ where
                 }
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling or the per-peer established ceiling); count it, and log only the configured
-            // limit and the fixed limit description, never peer-supplied data
+            // ceiling, the per-peer established ceiling or the total established ceiling); count
+            // it by the bound that the refusal names, and log only the configured limit and the
+            // fixed limit description, never peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
-                peer_id,
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(|_| {
-                    // the pending hook runs before the remote is authenticated, so only a
-                    // refusal at establishment (the per-peer ceiling) carries a peer id
-                    let denial = peer_id.map_or(InboundDenial::PendingIncomingLimit, |_| {
-                        InboundDenial::EstablishedPerPeerLimit
-                    });
-                    self.metrics.record_inbound_denied(&denial);
-                    self.inbound_denial_warning
-                        .record(tokio::time::Instant::now())
-                        .into_iter()
-                        .for_each(|denied| {
-                            warn!(
-                                target: "network",
-                                denied,
-                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                "inbound connections keep being refused by connection limits"
-                            );
-                        });
-                });
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        // classify by the refusal text, not by the peer id: both established
+                        // ceilings refuse after authentication, so a peer id cannot tell them apart
+                        let reason = ConnectionLimitReason::from_exceeded(exceeded);
+                        self.metrics.record_connection_limit_rejection(reason);
+                        let denial = InboundDenial::from_reason(reason);
+                        self.metrics.record_inbound_denied(&denial);
+                        self.inbound_denial_warning
+                            .record(tokio::time::Instant::now())
+                            .into_iter()
+                            .for_each(|denied| {
+                                warn!(
+                                    target: "network",
+                                    denied,
+                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                    "inbound connections keep being refused by connection limits"
+                                );
+                            });
+                    },
+                );
+            }
+            SwarmEvent::OutgoingConnectionError {
+                error: libp2p::swarm::DialError::Denied { cause },
+                ..
+            } => {
+                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
+                    |exceeded| {
+                        self.metrics.record_connection_limit_rejection(
+                            ConnectionLimitReason::from_exceeded(exceeded),
+                        );
+                    },
+                );
             }
             // other events handled by peer manager and other behaviors
             _ => {}
@@ -1104,30 +1190,50 @@ where
                 send_or_log_error!(reply, addrs, "GetListeners");
             }
             NetworkCommand::AddTrustedPeerAndDial { bls_pubkey, network_pubkey, addr, reply } => {
-                // update peer manager
-                self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
-                    bls_pubkey,
-                    NetworkInfo {
-                        pubkey: network_pubkey,
-                        multiaddrs: vec![addr],
-                        timestamp: now(),
-                        rpc: None,
-                    },
-                    reply,
-                );
+                let admission = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .pin_records([bls_pubkey])
+                    .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
+                if admission.is_ok() {
+                    self.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
+                        bls_pubkey,
+                        NetworkInfo {
+                            pubkey: network_pubkey,
+                            multiaddrs: vec![addr],
+                            timestamp: now(),
+                            rpc: None,
+                        },
+                        reply,
+                    );
+                    self.query_missing_required_records();
+                } else {
+                    let _ = reply.send(admission);
+                }
             }
             NetworkCommand::AddExplicitPeer { bls_pubkey, network_pubkey, addr, reply } => {
-                // update peer manager
-                self.swarm.behaviour_mut().peer_manager.add_known_peer(
-                    bls_pubkey,
-                    NetworkInfo {
-                        pubkey: network_pubkey,
-                        multiaddrs: vec![addr],
-                        timestamp: now(),
-                        rpc: None,
-                    },
-                );
-                let _ = reply.send(Ok(()));
+                let result = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .pin_records([bls_pubkey])
+                    .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()))
+                    .map(|_| {
+                        self.swarm.behaviour_mut().peer_manager.add_known_peer(
+                            bls_pubkey,
+                            NetworkInfo {
+                                pubkey: network_pubkey,
+                                multiaddrs: vec![addr],
+                                timestamp: now(),
+                                rpc: None,
+                            },
+                        )
+                    });
+                let _ = reply.send(result);
+                self.query_missing_required_records();
             }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
@@ -1135,19 +1241,33 @@ where
                 // existing record with the config-derived stub. an rpc endpoint the operator
                 // configured for the peer is carried through so it is usable before the peer's
                 // own record is learned; `cache_known_peer` strips it if malformed
-                let peer = &mut self.swarm.behaviour_mut().peer_manager;
-                for (bls, info) in peers {
-                    peer.add_bootstrap_peer(
-                        bls,
-                        NetworkInfo {
-                            pubkey: info.network_key,
-                            multiaddrs: vec![info.network_address],
-                            timestamp: now(),
-                            rpc: info.rpc,
-                        },
-                    );
-                }
-                let _ = reply.send(Ok(()));
+                let result = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .pin_records(peers.keys().copied())
+                    .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()))
+                    .map(|_| {
+                        let peer = &mut self.swarm.behaviour_mut().peer_manager;
+                        peers.into_iter().for_each(|(bls, info)| {
+                            peer.add_bootstrap_peer(
+                                bls,
+                                NetworkInfo {
+                                    pubkey: info.network_key,
+                                    multiaddrs: vec![info.network_address],
+                                    timestamp: now(),
+                                    rpc: info.rpc,
+                                },
+                            );
+                        });
+                    });
+                let _ = reply.send(result);
+                self.query_missing_required_records();
+            }
+            NetworkCommand::SeedCommitteePeers { peers, reply } => {
+                let result = self.swarm.behaviour_mut().peer_manager.seed_committee_peers(peers);
+                let _ = reply.send(result);
             }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(
@@ -1328,7 +1448,18 @@ where
                 // positional rotation), so current/previous self-correct against on-chain state and
                 // any peer that exits the three-slot window is demoted.
                 info!(target: "network", this_node=?self.swarm.local_peer_id(), "updating previous/current/next committees");
+                let retention = self
+                    .swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .retain_committees(previous.iter().chain(&current).chain(&next).copied())
+                    .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
+                // Authoritative membership and identity confirmation must not depend on a
+                // capacity rejection or a failed database deletion during retention cleanup.
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
+                self.query_missing_required_records();
+                retention?;
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
@@ -1391,6 +1522,23 @@ where
         Ok(())
     }
 
+    /// Refill required rows after ownership updates, even if the restored peer cache already
+    /// resolves a key. Queries hold no persistent ownership and are deduplicated by requested key.
+    fn query_missing_required_records(&mut self) {
+        self.swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .missing_required_records()
+            .into_iter()
+            .for_each(|key| {
+                if self.kad_record_queries.values().all(|query| query.query.request != key) {
+                    let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
+                    self.kad_record_queries.insert(id, key.into());
+                }
+            });
+    }
+
     /// Process gossip events.
     fn process_gossip_event(&mut self, event: GossipEvent) -> NetworkResult<()> {
         match event {
@@ -1444,12 +1592,15 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
-                        // forward gossip to handler
-                        if let Err(e) = self
+                        // forward gossip to handler; a full queue or a queue with no
+                        // subscriber counts as shed
+                        let forwarded = self
                             .event_stream
-                            .try_send(accepted_gossip_event(message, relayer, author))
-                        {
+                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
+                        if forwarded.inspect_err(|e| {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
+                        }).is_err() {
                             // ignore failures at the epoch boundary
                             // During epoch change the event_stream reciever can be closed.
                             return Ok(());
@@ -1556,17 +1707,22 @@ where
                         // network that we can ignore and it should not
                         // cause any lasting damage if triggered.
                         if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
+                            let class = request.service_class();
                             let (notify, cancel) = oneshot::channel();
                             // forward request to handler without blocking other events
-                            if let Err(e) = self.event_stream.try_send(NetworkEvent::Request {
-                                peer: bls,
-                                request,
-                                channel: ResponseChannel::new(peer, channel),
-                                cancel,
-                            }) {
+                            let forwarded =
+                                self.event_stream.try_send_outcome(NetworkEvent::Request {
+                                    peer: bls,
+                                    request,
+                                    channel: ResponseChannel::new(peer, channel),
+                                    cancel,
+                                });
+                            self.metrics.record_forward(class, &forwarded);
+                            // Only queued requests become pending. An unsubscribed queue
+                            // drops the response channel, and epoch-boundary errors are ignored.
+                            if !forwarded.inspect_err(|e| {
                                 error!(target: "network", topics=?self.authorized_publishers.keys(), ?request_id, ?e, "failed to forward request!");
-                                // ignore failures at the epoch boundary
-                                // During epoch change the event_stream reciever can be closed.
+                            }).is_ok_and(|outcome| outcome == TrySendOutcome::Queued) {
                                 return Ok(());
                             }
 
@@ -1574,11 +1730,14 @@ where
                             //
                             // NOTE: the request id is internally generated, so this should not
                             // happen
-                            if let Some(channel) = self.inbound_requests.insert(request_id, notify)
-                            {
+                            self.add_inbound(class);
+                            if let Some(duplicate) = self.inbound_requests.insert(
+                                request_id,
+                                PendingInbound { notify, class, received: Instant::now() },
+                            ) {
                                 // cancel if this is a duplicate request
                                 warn!(target: "network", ?peer, "duplicate request id from peer");
-                                let _ = channel.send(());
+                                self.close_inbound(duplicate);
                             }
                         } else if let Err(e) = self.event_stream.try_send(NetworkEvent::Error(
                             format!("requesting peer unknown: {peer:?}"),
@@ -1620,14 +1779,7 @@ where
                     return Ok(());
                 }
 
-                let failure_kind = match &error {
-                    ReqResOutboundFailure::DialFailure => "dial",
-                    ReqResOutboundFailure::ConnectionClosed => "connection",
-                    ReqResOutboundFailure::Io(_) => "io",
-                    ReqResOutboundFailure::Timeout => "timeout",
-                    ReqResOutboundFailure::UnsupportedProtocols => "unsupported",
-                };
-                self.metrics.record_outbound_failure(failure_kind);
+                self.metrics.record_outbound_failure(&error);
 
                 // Differentiate transport-level failures (peer disconnect, dial fail) from
                 // protocol-level violations. Transport failures are common on WAN and should
@@ -1683,6 +1835,13 @@ where
                 });
             }
             ReqResEvent::InboundFailure { peer, request_id, error, connection_id: _ } => {
+                // Dropped, unforwarded requests have no tracked class or occupancy. Ignore
+                // their failures, including ResponseOmission after an unsubscribed queue.
+                if !self.inbound_requests.contains_key(&request_id) {
+                    return Ok(());
+                }
+                // classify before the match below takes `error` apart
+                let outcome = InboundFailureOutcome::from_failure(&error);
                 debug!(target: "network", ?peer, ?error, pending=?self.inbound_requests, "Inbound failure for req/res");
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match &error {
@@ -1722,20 +1881,39 @@ where
                     ReqResInboundFailure::ResponseOmission => { /* ignore local error */ }
                 }
 
-                // forward cancelation to handler and ignore errors
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
-                }
+                // count the failure under the class of the forwarded request, then forward
+                // cancelation to handler and release the class occupancy
+                self.inbound_requests.remove(&request_id).into_iter().for_each(|entry| {
+                    self.metrics.record_inbound_failure(entry.class, outcome);
+                    self.close_inbound(entry);
+                });
             }
 
             ReqResEvent::ResponseSent { request_id, .. } => {
-                if let Some(channel) = self.inbound_requests.remove(&request_id) {
-                    let _ = channel.send(());
+                if let Some(entry) = self.inbound_requests.remove(&request_id) {
+                    self.metrics.record_service_time(entry.class, entry.received.elapsed());
+                    self.close_inbound(entry);
                 }
             }
         }
 
         Ok(())
+    }
+
+    /// Count one forwarded inbound request of `class` as pending and export the occupancy.
+    fn add_inbound(&mut self, class: ServiceClass) {
+        self.inbound_pending = self.inbound_pending.added(class);
+        self.metrics.set_inbound_pending(class, self.inbound_pending.pending(class));
+    }
+
+    /// End a pending inbound request: notify the handler and release the class occupancy.
+    ///
+    /// Every removal of an `inbound_requests` entry calls this once, so the swarm releases each
+    /// added request exactly once.
+    fn close_inbound(&mut self, entry: PendingInbound) {
+        let _ = entry.notify.send(());
+        self.inbound_pending = self.inbound_pending.released(entry.class);
+        self.metrics.set_inbound_pending(entry.class, self.inbound_pending.pending(entry.class));
     }
 
     /// Request the connected peer's self-record, coalescing pending and deferred work.
@@ -1906,7 +2084,7 @@ where
             .peer_manager
             .peer_to_bls(&peer)
             .filter(|_| self.swarm.behaviour().peer_manager.is_peer_validator(&peer))
-            .filter(|key| self.kad_record_queries.values().all(|query| query.request != *key))
+            .filter(|key| self.kad_record_queries.values().all(|query| query.query.request != *key))
             .into_iter()
             .for_each(|key| {
                 let query = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
@@ -2193,9 +2371,8 @@ where
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
 
-                // First-time connections need a direct record push so the peer can resolve
-                // our BLS key without waiting for the next kad publication interval. Skip
-                // on reconnects to avoid amplifying the local kad store on flapping peers.
+                // Each newly connected peer needs a direct record push. Concurrent connections
+                // share the publication marker; the last close clears it for a reconnect.
                 if self.mark_published_to_peer(peer_id) {
                     self.publish_our_data_to_peer(peer_id);
                 }
@@ -2235,7 +2412,7 @@ where
                 // filtering, so even a query whose record is dropped as stale or
                 // non-committee re-arms the key.
                 for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.request != bls_key) {
+                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
@@ -2266,16 +2443,18 @@ where
                 );
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
-                if let Some(bls) = self.swarm.behaviour().peer_manager.peer_to_bls(&peer) {
-                    if let Err(e) = self
-                        .event_stream
-                        .try_send(NetworkEvent::InboundStream { peer: bls, stream })
-                    {
-                        error!(target: "network", ?e, "failed to forward inbound stream");
-                    }
-                } else {
-                    warn!(target: "network", ?peer, "received inbound stream from unknown peer");
-                }
+                self.swarm.behaviour().peer_manager.peer_to_bls(&peer).map_or_else(
+                    || warn!(target: "network", ?peer, "received inbound stream from unknown peer"),
+                    |bls| {
+                        let forwarded = self
+                            .event_stream
+                            .try_send_outcome(NetworkEvent::InboundStream { peer: bls, stream });
+                        self.metrics.record_forward(ServiceClass::Other, &forwarded);
+                        forwarded.err().into_iter().for_each(|e| {
+                            error!(target: "network", ?e, "failed to forward inbound stream");
+                        });
+                    },
+                );
             }
             StreamEvent::OutboundFailure { peer, failure }
             | StreamEvent::InboundFailure { peer, failure } => {
@@ -2342,6 +2521,46 @@ where
                     ))) => {
                         if let Some((key, node_record)) = self.peer_record_valid(&record) {
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
+                            // Only a matching requested key may supply a required store row. Query
+                            // ownership itself is temporary and cannot admit an unrelated record.
+                            // Our own key is skipped, so a queried copy cannot replace the
+                            // `expires: None` row that `provide_our_data` keeps for it.
+                            let observed = now();
+                            let timestamp =
+                                self.admission_timestamp(key, node_record.info.timestamp, observed);
+                            let freshness = self.record_freshness(&record, timestamp, observed);
+                            if self
+                                .kad_record_queries
+                                .get(&query_id)
+                                .is_some_and(|query| query.query.request == key)
+                                && key != self.key_config.primary_public_key()
+                                && matches!(
+                                    freshness,
+                                    RecordFreshness::Newer | RecordFreshness::Identical
+                                )
+                            {
+                                let record = if freshness == RecordFreshness::Identical {
+                                    self.preserve_record_expiry(record)
+                                } else {
+                                    record
+                                };
+                                // Mirror libp2p's inbound-put cap, so a queried copy never
+                                // outlives `kad_record_ttl`. A responder that answers from its own
+                                // `expires: None` row sends ttl 0, which decodes back to `None`.
+                                // The cap runs after the merge, so a stored `None` cannot win.
+                                let cap = std::time::Instant::now()
+                                    .checked_add(self.config.kad_record_ttl);
+                                let expires = cap
+                                    .map(|cap| {
+                                        record.expires.map_or(cap, |expires| expires.min(cap))
+                                    })
+                                    .or(record.expires);
+                                self.swarm.behaviour_mut().kademlia.store_mut().put_with_timestamp(kad::Record { expires, ..record }, Some(timestamp))
+                                    .unwrap_or_else(|error| {
+                                        debug!(target: "network-kad", ?key, ?error,
+                                            "queried binding could not be retained; discovery remains available");
+                                    });
+                            }
                             self.process_kad_query_result(
                                 &query_id,
                                 key,
@@ -2542,7 +2761,9 @@ where
                         self.verified_peer_records.put(record.key.clone(), record.value.clone());
                     }
 
-                    let freshness = self.record_freshness(&record);
+                    let observed = now();
+                    let timestamp = self.admission_timestamp(key, value.info.timestamp, observed);
+                    let freshness = self.record_freshness(&record, timestamp, observed);
                     let should_store = if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
@@ -2569,7 +2790,20 @@ where
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
-                        .add_self_advertised_peer(source, key, value.info);
+                        .add_self_advertised_peer_with_timestamp(
+                            source, key, value.info, timestamp, observed,
+                        );
+
+                    // Signature and publisher validation preceded confirmation. Only the
+                    // authenticated transport source's own live binding gains connection ownership.
+                    if record.publisher == Some(source) && self.swarm.is_connected(&source) {
+                        self.swarm.behaviour_mut().kademlia.store_mut()
+                            .retain_connected(source, record.key.clone())
+                            .unwrap_or_else(|error| {
+                                warn!(target: "network-kad", ?source, ?error,
+                                    "connected binding could not be retained; identity remains confirmed");
+                            });
+                    }
 
                     // Store newer records and refresh the expiry of byte-identical republishes.
                     match freshness {
@@ -2577,7 +2811,7 @@ where
                             // Capacity is remotely triggerable. Match the add-provider path instead of
                             // propagating expected rejections to the run loop's per-event error log.
                             if should_store {
-                                self.swarm.behaviour_mut().kademlia.store_mut().put(record).unwrap_or_else(
+                                self.swarm.behaviour_mut().kademlia.store_mut().put_with_timestamp(record, Some(timestamp)).unwrap_or_else(
                                 |error| match error {
                                     kad::store::Error::MaxRecords => {
                                         debug!(target: "network-kad", ?source, "dropping inbound kad record: store at capacity");
@@ -2662,28 +2896,58 @@ where
         });
     }
 
+    /// Reuse retained metadata for the same signed timestamp, or admit it exactly once.
+    fn admission_timestamp(
+        &mut self,
+        key: BlsPublicKey,
+        signed: tn_types::TimestampSec,
+        observed: tn_types::TimestampSec,
+    ) -> crate::freshness::RecordTimestamp {
+        self.swarm
+            .behaviour()
+            .peer_manager
+            .record_timestamp(&key, signed)
+            .or_else(|| {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .store_mut()
+                    .record_timestamp(&crate::kad::node_record_key(&key))
+                    .filter(|timestamp| timestamp.matches(signed))
+            })
+            .unwrap_or_else(|| crate::freshness::RecordTimestamp::admit(signed, observed))
+    }
+
     /// Check the local kad store to compare record timestamps.
     ///
-    /// Compare timestamps and signed bytes so identical republishes can refresh expiry without
-    /// replacing a newer record or admitting conflicting values with the same timestamp.
+    /// Compare local admission metadata and signed bytes. Ordinary stale records cannot replace
+    /// newer records, while cached future timestamps have a bounded repair path. Identical
+    /// republishes refresh only DHT expiry, and conflicting equal signed timestamps stay stale.
     /// It is the caller's responsibility to ensure records are verified and valid.
-    fn record_freshness(&mut self, record: &kad::Record) -> RecordFreshness {
+    fn record_freshness(
+        &mut self,
+        record: &kad::Record,
+        incoming: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) -> RecordFreshness {
         let store = self.swarm.behaviour_mut().kademlia.store_mut();
 
         store.get(&record.key).map_or(RecordFreshness::Newer, |existing| {
-            NodeRecord::try_decode_compat(&existing.value)
-                .zip(NodeRecord::try_decode_compat(&record.value))
-                .map_or(RecordFreshness::Undecodable, |(stored, incoming)| {
-                    match incoming.info.timestamp.cmp(&stored.info.timestamp) {
-                        std::cmp::Ordering::Greater => RecordFreshness::Newer,
-                        std::cmp::Ordering::Equal if existing.value == record.value => {
-                            RecordFreshness::Identical
-                        }
-                        std::cmp::Ordering::Equal | std::cmp::Ordering::Less => {
-                            RecordFreshness::Older
-                        }
+            NodeRecord::try_decode_compat(&existing.value).map_or(
+                RecordFreshness::Undecodable,
+                |stored| {
+                    let cached = store.record_timestamp(&record.key).unwrap_or_else(|| {
+                        crate::freshness::RecordTimestamp::legacy(stored.info.timestamp, observed)
+                    });
+                    if existing.value == record.value {
+                        RecordFreshness::Identical
+                    } else if incoming.supersedes(cached, observed) {
+                        RecordFreshness::Newer
+                    } else {
+                        RecordFreshness::Older
                     }
-                })
+                },
+            )
         })
     }
 
@@ -2702,17 +2966,13 @@ where
         is_last_step: bool,
     ) {
         // return if query id unknown - should not happen
+        let observed = now();
+        let timestamp = self.admission_timestamp(key, new_record.info.timestamp, observed);
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.request == key {
-            match &mut query.result {
-                None => query.result = Some(new_record),
-                Some(tracked) if tracked.info.timestamp < new_record.info.timestamp => {
-                    *tracked = new_record
-                }
-                Some(_) => {} // keep existing record
-            }
+        if query.query.request == key {
+            query.consider_with_timestamp(new_record, timestamp, observed);
         } else {
             // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
@@ -2727,27 +2987,95 @@ where
         }
     }
 
+    /// Preserve the longest accepted lifetime when a query returns an identical signed record.
+    fn preserve_record_expiry(&mut self, mut record: kad::Record) -> kad::Record {
+        record.expires = self
+            .swarm
+            .behaviour_mut()
+            .kademlia
+            .store_mut()
+            .get(&record.key)
+            .map_or(record.expires, |existing| {
+                existing.expires.zip(record.expires).map(|(old, new)| old.max(new))
+            });
+        record
+    }
+
     /// Cleanup kad record queries (called on last step).
     ///
-    /// The winning record is promoted ONLY into the peer manager's `known_peers` cache (via
-    /// `add_discovered_peer`) and deliberately NOT written to the kad store: `known_peers` is
-    /// the read model of discovery, and the node needs the resolution, not the record.
-    /// Persisting merely-queried third-party records would enlist libp2p's `PutRecordJob` to
-    /// republish them on every replication run (hourly by libp2p default), making this node an
-    /// hourly replicator of records it never needed to serve, and would erode the store's
-    /// max-records cap — the node's DHT storage-duty budget — with query traffic. Nothing is
-    /// lost: peers push their own records on first connect (an inbound kad put handled by
-    /// [`Self::process_kad_put_request`]), which is the path that legitimately feeds the store.
+    /// Promote the winning result into the peer manager's bounded discovery cache. Verified
+    /// matching results may also fill an independently owned committee or pinned store row in
+    /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
+    /// periodic replication is disabled by [`configure_record_jobs`].
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        if let Some(query) = self.kad_record_queries.remove(query_id) {
-            if let Some(node_record) = query.result {
-                self.swarm
-                    .behaviour_mut()
-                    .peer_manager
-                    .add_discovered_peer(query.request, node_record.info);
-            }
+        self.kad_record_queries
+            .remove(query_id)
+            .and_then(|query| {
+                let key = query.query.request;
+                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
+            })
+            .into_iter()
+            .for_each(|(key, node_record, timestamp)| {
+                self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
+                    key,
+                    node_record.info,
+                    timestamp,
+                );
+            });
+    }
+}
+
+/// Internal query state with local ordering metadata, preserving the public [`KadQuery`] shape.
+#[derive(Debug)]
+pub(crate) struct PendingKadQuery {
+    /// Requested authority and best authenticated record.
+    query: KadQuery,
+    /// Admission ceiling of the winning result, retained until the query closes.
+    timestamp: Option<crate::freshness::RecordTimestamp>,
+}
+
+impl From<BlsPublicKey> for PendingKadQuery {
+    fn from(key: BlsPublicKey) -> Self {
+        Self { query: key.into(), timestamp: None }
+    }
+}
+
+impl PendingKadQuery {
+    /// Retain the freshest verified result under the shared local admission policy.
+    #[cfg(test)]
+    pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(record.info.timestamp, observed);
+        self.consider_with_timestamp(record, timestamp, observed);
+    }
+
+    /// Retain a verified result without renewing a timestamp already admitted elsewhere.
+    fn consider_with_timestamp(
+        &mut self,
+        record: NodeRecord,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) {
+        if self.timestamp.is_none_or(|cached| timestamp.supersedes(cached, observed)) {
+            self.query.result = Some(record);
+            self.timestamp = Some(timestamp);
         }
     }
+
+    /// Consume the winning record together with its original admission ceiling.
+    pub(crate) fn into_result(self) -> Option<(NodeRecord, crate::freshness::RecordTimestamp)> {
+        self.query.result.zip(self.timestamp)
+    }
+}
+
+/// Disable the libp2p-kad periodic record job.
+///
+/// On libp2p-kad 0.49, publication and replication are one `PutRecordJob`. Each run sends every
+/// stored record that is not locally authored, so a replication interval of `None` alone does not
+/// stop third-party replication. `ConsensusNetwork::refresh_own_record` republishes our record
+/// on `kad_publication_interval`. Retained committee, pin, and connection bindings are served on
+/// demand.
+pub(crate) fn configure_record_jobs(config: &mut kad::Config) {
+    config.set_publication_interval(None).set_replication_interval(None);
 }
 
 /// Enum if the received gossip is initially accepted for further processing.
