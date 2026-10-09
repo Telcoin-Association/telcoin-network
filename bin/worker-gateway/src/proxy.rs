@@ -12,11 +12,11 @@
 //! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
 //!
 //! With `--redirect-queries` set, only transaction submissions go to the
-//! worker; every other call goes to the query upstream (see [`classify`]),
+//! worker; every other call goes to the query upstream (see [`scan`]),
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, fmt, marker::PhantomData, net::SocketAddr, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
@@ -30,8 +30,9 @@ use axum::{
 use reqwest::{redirect::Policy, Client};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
-    Deserializer,
+    Deserialize, Deserializer,
 };
+use serde_json::de::SliceRead;
 use tn_types::{Decodable2718, PooledTransaction};
 use tracing::{debug, warn};
 use url::Url;
@@ -57,13 +58,16 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// forwarding (a raw-transaction submission).
 const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
 
+/// The raw-transaction submission that waits for the receipt.
+const SEND_RAW_TRANSACTION_SYNC: &str = "eth_sendRawTransactionSync";
+
 /// The JSON-RPC methods that submit a transaction, and so the only calls a
 /// gateway with `--redirect-queries` sends to the worker. They are exactly the
 /// two methods the node's fee-cap guard replaces
 /// (`crates/tn-reth/src/env/rpc.rs`), matched exactly and case-sensitively, as
 /// jsonrpsee matches method names. Both contain [`SEND_RAW_TRANSACTION`], so
 /// its substring test is a fast path for either.
-const SUBMISSION_METHODS: [&str; 2] = ["eth_sendRawTransaction", "eth_sendRawTransactionSync"];
+const SUBMISSION_METHODS: [&str; 2] = [SEND_RAW_TRANSACTION, SEND_RAW_TRANSACTION_SYNC];
 
 /// The proxy client's `User-Agent`, so the operator of a query upstream can
 /// tell gateway traffic apart.
@@ -137,11 +141,15 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
+    // One pass over the body answers both questions asked of it below: whether
+    // the transaction screen refuses it, and where it routes.
+    let scan = scan(body.as_ref());
+
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
-    // worker would also reject (undecodable, or an EIP-4844 blob) before paying
-    // for an upstream round-trip. The screen recovers the request id itself on
-    // the paths that reject, so nothing here re-parses the body.
-    if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
+    // worker would also reject (undecodable, or a type the network does not
+    // accept) before paying for an upstream round-trip. The scan recovers the
+    // request id itself on the paths that reject.
+    if let Some((err, id)) = scan.rejection {
         warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
         return error_response_with_id(&err, id);
     }
@@ -150,7 +158,7 @@ pub(crate) async fn proxy(
     // query upstream, with no readiness gate and no fallback to the worker: a
     // fallback would put the read load on the validator exactly when the
     // public rpc is struggling.
-    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(body.as_ref()));
+    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(scan.calls));
     let (route, upstream_url) = match query_upstream {
         Some(query_upstream) => (Route::Query, query_upstream.clone()),
         None => match state.readiness.first_ready_rpc_url() {
@@ -196,9 +204,8 @@ pub(crate) async fn proxy(
 }
 
 /// Whether a request goes to the query upstream rather than the worker,
-/// counting a mixed batch on the way (see [`classify`]).
-fn is_query(body: &[u8]) -> bool {
-    let calls = classify(body);
+/// counting a mixed batch on the way (see [`scan`]).
+fn is_query(calls: Calls) -> bool {
     if calls == Calls::MixedBatch {
         telemetry::record_mixed_batch();
     }
@@ -393,7 +400,8 @@ enum Calls {
     Submissions,
     /// No submission, or nothing the classifier can read as one.
     Queries,
-    /// A batch holding both submissions and other calls.
+    /// A batch holding both submissions and other calls (an element that is
+    /// not an object counts as another call).
     MixedBatch,
 }
 
@@ -407,206 +415,431 @@ impl Calls {
     }
 }
 
-/// Classify a request body for `--redirect-queries`.
+/// What one pass over a request body found: where the body routes and whether
+/// the transaction screen refuses it.
+struct Scan {
+    /// How the body routes under `--redirect-queries`.
+    calls: Calls,
+    /// The screen's verdict: the error and the request id to answer it with,
+    /// or `None` to forward the body.
+    rejection: Option<(GatewayError, RequestId)>,
+}
+
+/// Read a request body once, classifying it for `--redirect-queries` and
+/// screening its raw-transaction submission in the same pass.
 ///
-/// Only a body made entirely of submissions ([`SUBMISSION_METHODS`]) goes to
-/// the worker. Everything else goes to the query upstream, and so does
-/// everything ambiguous, which keeps it away from the validator: a body that is
-/// not JSON, a `method` that is not a string, an empty batch, a batch element
-/// that is not an object, bytes trailing the JSON value, and a method name
-/// spelled with unicode escapes when the plain name appears nowhere in the body
-/// (the substring test misses it, so no parse runs). `eth_sendTransaction` is a
-/// query too: no node configures a signer, so the worker could only refuse it.
+/// Routing: only a body made entirely of submissions ([`SUBMISSION_METHODS`])
+/// goes to the worker. Everything else goes to the query upstream, and so does
+/// everything ambiguous, which keeps it away from the validator: a body that
+/// is not JSON, a `method` that is not a string, an empty batch, bytes
+/// trailing the JSON value, and a method name spelled with unicode escapes
+/// when the plain name appears nowhere in the body (the substring test misses
+/// it, so no parse runs). `eth_sendTransaction` is a query too: no node
+/// configures a signer, so the worker could only refuse it.
 ///
 /// A batch that mixes submissions with other calls goes, whole, to the query
-/// upstream. Sending it to the worker would let a client put one submission in
-/// front of any number of reads and push them all onto the validator. Clients
-/// lose nothing, because the public RPC accepts submissions too; the
+/// upstream; a batch element that is not an object counts as another call.
+/// Sending a mixed batch to the worker would let a client put one submission
+/// in front of any number of reads and push them all onto the validator.
+/// Clients lose nothing, because the public RPC accepts submissions too; the
 /// submission just reaches the network through it instead of through this
 /// validator.
-fn classify(body: &[u8]) -> Calls {
+///
+/// Screening: a single `eth_sendRawTransaction` call is refused when its raw
+/// transaction cannot be decoded or decodes to a type the network does not
+/// accept (see [`screen_transaction`]). Every other request, including
+/// batches, other methods, any structurally-off submission and any body that
+/// is not exactly one JSON value, is forwarded unchanged.
+///
+/// Cost: one deserializer reads the body, and every member the gateway does
+/// not act on is skipped in place, so the cost is a scan of the bytes rather
+/// than a `Value` tree several times the size of the request. Keys are matched
+/// where they lie and never copied; a `method` or raw transaction is copied
+/// only when it is written with escapes. The request id is not read at all:
+/// only a rejection needs it, and a rejection recovers it from the bytes with
+/// one more scan (see [`RequestId::recover`]), so a forwarded request never
+/// materializes its id, which is where all of a request's bulk can sit.
+fn scan(body: &[u8]) -> Scan {
     // fast path: a body that never names the raw-transaction method holds no
     // submission, and nothing is parsed
     if !mentions_send_raw_transaction(body) {
-        return Calls::Queries;
+        return Scan { calls: Calls::Queries, rejection: None };
     }
-    let mut seen = SeenCalls::default();
-    let mut deserializer = serde_json::Deserializer::from_slice(body);
-    let all_submissions = deserializer
-        .deserialize_any(SubmissionOnly { seen: &mut seen })
+    let mut state = ScanState::default();
+    let mut deserializer = body_deserializer(body);
+    let parsed = deserializer
+        .deserialize_any(ScanVisitor { state: &mut state })
         .and_then(|()| deserializer.end())
         .is_ok();
-    if all_submissions {
-        Calls::Submissions
-    } else if seen.submission && seen.other {
-        Calls::MixedBatch
-    } else {
-        Calls::Queries
-    }
+    let calls = match (state.submission, state.other) {
+        (true, false) if parsed => Calls::Submissions,
+        (true, true) => Calls::MixedBatch,
+        _ => Calls::Queries,
+    };
+    // a verdict on a body that is not exactly one json value is dropped: the
+    // body is forwarded and the upstream answers its parse error
+    let rejection = state.rejection.filter(|_| parsed).map(|err| (err, RequestId::recover(body)));
+    Scan { calls, rejection }
 }
 
-/// The kinds of call a [`SubmissionOnly`] scan has met so far. It lives
-/// outside the visitor so the caller can still read it after the error that
-/// ends a scan early.
+/// The deserializer a request body is read with. [`scan`] is its only caller,
+/// so a body is parsed once however many questions the handler asks of it.
+fn body_deserializer(body: &[u8]) -> serde_json::Deserializer<SliceRead<'_>> {
+    #[cfg(test)]
+    tests::count_parse();
+    serde_json::Deserializer::from_slice(body)
+}
+
+/// What a [`ScanVisitor`] pass has met so far. It lives outside the visitor
+/// so [`scan`] can still read it after an error ends the pass early.
 #[derive(Debug, Default)]
-struct SeenCalls {
+struct ScanState {
     /// At least one call was a submission.
     submission: bool,
-    /// At least one call was something else.
+    /// At least one call was something else, a batch element that is not an
+    /// object included.
     other: bool,
+    /// The screen's verdict on a single submission, when it refuses it.
+    rejection: Option<GatewayError>,
 }
 
-impl SeenCalls {
-    /// Record one call by its method and report whether it is a submission.
-    fn record(&mut self, method: Option<&str>) -> bool {
-        let submission = method.is_some_and(|method| SUBMISSION_METHODS.contains(&method));
-        if submission {
+impl ScanState {
+    /// Record one call by its method.
+    fn record(&mut self, method: RpcMethod) {
+        if method.is_submission() {
             self.submission = true;
         } else {
             self.other = true;
         }
-        submission
     }
 }
 
-/// Visitor that succeeds only on a single submission or a non-empty batch of
-/// nothing but submissions.
+/// Visitor behind [`scan`]: a single call or a batch of calls.
 ///
-/// Built like [`ScreenFields`]: it reads each call's `method` and skips every
-/// other member in place, so the cost is a scan of the bytes rather than a
-/// `Value` tree. An error here is a verdict, not a failure: it means "not all
-/// submissions" and ends the scan. A batch scan stops as soon as the batch is
-/// known to be mixed, but runs on past leading non-submissions in search of a
-/// submission, so that a mixed batch is recognized, and counted, whichever end
-/// its submission sits at. At worst that is one scan of the body, the same
-/// bound the transaction screen already pays on a single call.
-struct SubmissionOnly<'a> {
-    /// Where the scan records what it has met.
-    seen: &'a mut SeenCalls,
+/// An error here is a verdict, not a failure, when it ends a batch scan early
+/// (the batch is mixed); otherwise it means the body is not well-formed JSON.
+/// [`scan`] reads what the state recorded either way.
+struct ScanVisitor<'s> {
+    /// Where the pass records what it has met.
+    state: &'s mut ScanState,
 }
 
-impl<'de> Visitor<'de> for SubmissionOnly<'_> {
+impl<'de> Visitor<'de> for ScanVisitor<'_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str("a JSON-RPC request object or batch")
     }
 
+    /// A single call: classified, and screened when it is an
+    /// `eth_sendRawTransaction`.
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
-        let method = read_method(members)?;
-        if self.seen.record(method.as_deref()) {
-            Ok(())
-        } else {
-            Err(de::Error::custom("not a submission"))
+        let call = Call::read(members)?;
+        self.state.record(call.method);
+        if call.method == RpcMethod::SendRawTransaction {
+            self.state.rejection = call.raw_transaction.as_deref().and_then(screen_transaction);
         }
+        Ok(())
     }
 
-    /// A batch element that is not an object fails [`CallMethod`] and ends the
-    /// scan; the batch then goes to the query upstream, whose server answers
-    /// that element as an invalid request.
-    fn visit_seq<A: SeqAccess<'de>>(self, mut calls: A) -> Result<Self::Value, A::Error> {
-        while let Some(CallMethod(method)) = calls.next_element()? {
-            self.seen.record(method.as_deref());
-            if self.seen.submission && self.seen.other {
+    /// A batch: classified element by element. The scan stops as soon as the
+    /// batch is known to be mixed, but runs on past leading non-submissions in
+    /// search of a submission, so that a mixed batch is recognized, and
+    /// counted, whichever end its submission sits at.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
+        while let Some(element) = elements.next_element::<Element<'de>>()? {
+            match element {
+                Element::Call(call) => self.state.record(call.method),
+                Element::Other => self.state.other = true,
+            }
+            if self.state.submission && self.state.other {
                 return Err(de::Error::custom("batch mixes submissions with other calls"));
             }
         }
-        if self.seen.submission && !self.seen.other {
-            Ok(())
-        } else {
-            Err(de::Error::custom("batch holds no submission"))
+        Ok(())
+    }
+}
+
+/// One call object, reduced to what the gateway acts on.
+struct Call<'de> {
+    /// The call's `method`.
+    method: RpcMethod,
+    /// The first element of `params` when it is a string: the raw transaction,
+    /// if the call is a submission. Borrowed from the body unless it is
+    /// written with escapes.
+    raw_transaction: Option<Cow<'de, str>>,
+}
+
+impl<'de> Call<'de> {
+    /// Read a call object's `method` and first `params` element, skipping
+    /// every other member in place.
+    ///
+    /// A repeated member keeps its last occurrence, as a `Value` parse does.
+    /// jsonrpsee's derived request type rejects a duplicated member outright,
+    /// so such a call is an invalid request at either upstream; the choice
+    /// only decides which one says so.
+    fn read<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
+        let mut call = Self { method: RpcMethod::Other, raw_transaction: None };
+        while let Some(member) = members.next_key::<Member>()? {
+            match member {
+                Member::Method => {
+                    call.method =
+                        RpcMethod::named(members.next_value::<MaybeStr<'de>>()?.0.as_deref());
+                }
+                Member::Params => call.raw_transaction = members.next_value::<FirstParam<'de>>()?.0,
+                Member::Other => {
+                    members.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(call)
+    }
+}
+
+/// A call's `method`, reduced to what the gateway acts on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RpcMethod {
+    /// `eth_sendRawTransaction`.
+    SendRawTransaction,
+    /// `eth_sendRawTransactionSync`.
+    SendRawTransactionSync,
+    /// Any other method, or a `method` that is not a string.
+    Other,
+}
+
+impl RpcMethod {
+    /// The method a `method` member names, matched against
+    /// [`SUBMISSION_METHODS`] exactly and case-sensitively, as jsonrpsee
+    /// matches method names.
+    fn named(name: Option<&str>) -> Self {
+        match name.filter(|name| SUBMISSION_METHODS.contains(name)) {
+            Some(SEND_RAW_TRANSACTION) => Self::SendRawTransaction,
+            Some(_) => Self::SendRawTransactionSync,
+            None => Self::Other,
+        }
+    }
+
+    /// Whether the method is one of [`SUBMISSION_METHODS`].
+    fn is_submission(self) -> bool {
+        self != Self::Other
+    }
+}
+
+/// A call-object member the scan acts on, matched where the key lies: a key
+/// borrowed from the body, or one serde decoded from escapes into its scratch
+/// buffer, is compared in place and never copied.
+enum Member {
+    /// `method`.
+    Method,
+    /// `params`.
+    Params,
+    /// Any other member.
+    Other,
+}
+
+impl Lenient<'_> for Member {
+    fn other() -> Self {
+        Self::Other
+    }
+
+    fn string(name: &str) -> Self {
+        match name {
+            "method" => Self::Method,
+            "params" => Self::Params,
+            _ => Self::Other,
         }
     }
 }
 
-/// One batch element reduced to its `method`, when that is a string.
-struct CallMethod(Option<String>);
-
-impl<'de> serde::Deserialize<'de> for CallMethod {
+impl<'de> Deserialize<'de> for Member {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(CallMethodVisitor)
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
     }
 }
 
-/// Visitor behind [`CallMethod`].
-struct CallMethodVisitor;
+/// A batch element: a call object, or anything else.
+enum Element<'de> {
+    /// A call object.
+    Call(Call<'de>),
+    /// An element that is not an object; the upstream answers it as an
+    /// invalid request.
+    Other,
+}
 
-impl<'de> Visitor<'de> for CallMethodVisitor {
-    type Value = CallMethod;
+impl<'de> Lenient<'de> for Element<'de> {
+    fn other() -> Self {
+        Self::Other
+    }
+
+    fn object<A: MapAccess<'de>>(members: A) -> Result<Self, A::Error> {
+        Call::read(members).map(Self::Call)
+    }
+}
+
+impl<'de> Deserialize<'de> for Element<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+/// A `params` member reduced to its first element when that element is a
+/// string.
+///
+/// The remaining elements are drained through the ignored-value sink, so a
+/// `params` array of any length costs a scan rather than an allocation per
+/// element. Named params (an object) and any other shape have no first
+/// element and leave the call to the upstream.
+struct FirstParam<'de>(Option<Cow<'de, str>>);
+
+impl<'de> Lenient<'de> for FirstParam<'de> {
+    fn other() -> Self {
+        Self(None)
+    }
+
+    fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
+        let first = elements.next_element::<MaybeStr<'de>>()?.and_then(|first| first.0);
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Self(first))
+    }
+}
+
+impl<'de> Deserialize<'de> for FirstParam<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+/// A value kept only when it is a string, borrowed from the body unless it is
+/// written with escapes; any other shape is consumed and discarded.
+///
+/// The screen once read `method` and `params[0]` through `Value::as_str`,
+/// which yields `None` for a non-string without failing the parse. This
+/// reproduces that: a non-string in either position leaves the field unset
+/// and the request is forwarded, instead of the whole scan bailing out.
+struct MaybeStr<'de>(Option<Cow<'de, str>>);
+
+impl<'de> Lenient<'de> for MaybeStr<'de> {
+    fn other() -> Self {
+        Self(None)
+    }
+
+    fn borrowed_string(value: &'de str) -> Self {
+        Self(Some(Cow::Borrowed(value)))
+    }
+
+    fn string(value: &str) -> Self {
+        Self(Some(Cow::Owned(value.to_owned())))
+    }
+}
+
+impl<'de> Deserialize<'de> for MaybeStr<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+/// A value the scan reads leniently: every JSON shape is accepted, and a shape
+/// the reader has no use for is skipped in place and read as [`Self::other`].
+///
+/// A reader in the scan must never fail on well-formed JSON, because a failure
+/// ends the whole pass: an unexpected shape anywhere in a call would hide the
+/// call's method from the classifier, or its transaction from the screen.
+/// Only malformed JSON ends a scan early. Containers a reader does not take
+/// are drained through the ignored-value sink, so an oversized member costs a
+/// scan, not an allocation per node.
+trait Lenient<'de>: Sized {
+    /// The value for a shape the reader has no use for.
+    fn other() -> Self;
+
+    /// Read a string borrowed from the body (it holds no escapes).
+    fn borrowed_string(value: &'de str) -> Self {
+        Self::string(value)
+    }
+
+    /// Read a string serde decoded from escapes.
+    fn string(_value: &str) -> Self {
+        Self::other()
+    }
+
+    /// Read an array.
+    fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(Self::other())
+    }
+
+    /// Read an object.
+    fn object<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
+        while members.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(Self::other())
+    }
+}
+
+/// Visitor behind every [`Lenient`] reader.
+struct LenientVisitor<T>(PhantomData<T>);
+
+impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
+    type Value = T;
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON-RPC request object")
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_borrowed_str<E: de::Error>(self, value: &'de str) -> Result<Self::Value, E> {
+        Ok(T::borrowed_string(value))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(T::string(value))
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(T::other())
+    }
+
+    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Self::Value, A::Error> {
+        T::array(elements)
     }
 
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
-        read_method(members).map(CallMethod)
+        T::object(members)
     }
 }
 
-/// Read a call object's `method` when it is a string, skipping every other
-/// member in place.
-///
-/// A repeated `method` keeps the last occurrence, as a `Value` parse does.
-/// jsonrpsee's derived request type rejects a duplicated member outright, so
-/// such a call is an invalid request at either upstream; the choice only
-/// decides which one says so.
-fn read_method<'de, A: MapAccess<'de>>(mut members: A) -> Result<Option<String>, A::Error> {
-    let mut method = None;
-    while let Some(member) = members.next_key::<Cow<'_, str>>()? {
-        if member.as_ref() == "method" {
-            method = members.next_value::<MaybeString>()?.into_option();
-        } else {
-            members.next_value::<IgnoredAny>()?;
-        }
-    }
-    Ok(method)
-}
-
-/// Shallow pre-flight for `eth_sendRawTransaction`.
-///
-/// Returns `Some((error, id))` only when `body` is a single
-/// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
-/// decodes to an EIP-4844 blob transaction (which the network does not accept).
-/// Every other request — including batches, other methods, and any
-/// structurally-off submission — returns `None` and is forwarded unchanged.
-///
-/// The `id` rides along with the rejection so the response path does not have
-/// to parse the body again. Only the reject paths recover it, and they read it
-/// member-by-member from the bytes; the forward path skips the `id` in place
-/// like every other member the screen does not use, so a request that is
-/// forwarded never materializes its id at all (see [`ScreenFields`]).
+/// The screen's verdict on one raw transaction, given as hex: `None` to
+/// forward it, or the error to refuse it with.
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
 /// would have accepted (no false rejections); it only front-runs a rejection
-/// the worker would issue anyway.
-fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
-    // Fast path: skip JSON parsing entirely unless the method name is present.
-    if !mentions_send_raw_transaction(body) {
-        return None;
-    }
-    // Only the two members the screen reads are materialized; everything else
-    // is skipped in place. Parsing into a `Value` here would build a tree several
-    // times the size of the request, and the substring test above is satisfied by
-    // the method name appearing anywhere (a string value, a key, padding), so the
-    // request reaching this point is attacker-shaped and attacker-sized.
-    let fields: ScreenFields = serde_json::from_slice(body).ok()?;
-    // Single-call objects only; a batch (a JSON array) fails the map visitor and
-    // is forwarded, left to the worker to validate per element.
-    if fields.method.as_deref() != Some(SEND_RAW_TRANSACTION) {
-        return None;
-    }
-    // A submission whose params are structurally off (missing / not a string)
-    // is forwarded so the worker returns its own canonical parameter error.
-    let raw_hex = fields.raw_transaction.as_deref()?;
-
-    // From here the payload is unambiguously a raw transaction, so a decode
-    // failure is a real rejection rather than a reason to forward. Only a
-    // rejection echoes the id, and every rejection recovers it through the one
-    // call site below: one more scan of bytes the screen has already read once.
-    // The forward path, which is where an attacker-shaped request lands after
-    // costing the screen its parse, allocates nothing for the id.
-    let raw_tx_error = decode_hex(raw_hex).map_or(Some(GatewayError::InvalidTransaction), |raw| {
+/// the worker would issue anyway. From here the payload is unambiguously a
+/// raw transaction, so a decode failure is a real rejection rather than a
+/// reason to forward.
+fn screen_transaction(raw_hex: &str) -> Option<GatewayError> {
+    decode_hex(raw_hex).map_or(Some(GatewayError::InvalidTransaction), |raw| {
         let mut buf = raw.as_slice();
         match PooledTransaction::decode_2718(&mut buf) {
             Err(_) => Some(GatewayError::InvalidTransaction),
@@ -615,199 +848,13 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
             }
             Ok(_) => None,
         }
-    });
-    raw_tx_error.map(|err| (err, RequestId::recover(body)))
+    })
 }
 
 /// Whether `body` is valid UTF-8 mentioning the raw-transaction method. JSON is
 /// UTF-8 by definition, so a non-UTF-8 body is not a JSON-RPC call we inspect.
 fn mentions_send_raw_transaction(body: &[u8]) -> bool {
     std::str::from_utf8(body).is_ok_and(|text| text.contains(SEND_RAW_TRANSACTION))
-}
-
-/// The members [`screen_raw_transaction`] reads, materialized without building a
-/// `Value` tree for the whole request.
-///
-/// Same technique, and the same reason, as [`RequestId::recover`]'s `IdMember`
-/// in [`crate::error`]: every member the screen does not read deserializes into
-/// serde's ignored-value sink, which skips it in place. Cost is a scan of the
-/// bytes plus the raw-transaction string itself, rather than a `Value` tree
-/// several times the size of the request.
-///
-/// The `id` is deliberately not among the members kept. Materializing it here
-/// would keep the amplification this type exists to remove, just moved into
-/// one member: all of a request's bulk can sit in `id`, and it would be built
-/// eagerly even for a request that is then forwarded and the id dropped
-/// unused. The reject paths, the only readers of the id, recover it from the
-/// bytes instead (see [`RequestId::recover`]).
-struct ScreenFields {
-    /// Top-level `method`, when it is a string.
-    method: Option<String>,
-    /// First element of `params`, when `params` is an array whose first element
-    /// is a string. This is the only unbounded member kept, and it is kept at
-    /// its wire size: it is the hex payload the screen exists to decode.
-    raw_transaction: Option<String>,
-}
-
-impl<'de> serde::Deserialize<'de> for ScreenFields {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_map(ScreenFieldsVisitor)
-    }
-}
-
-/// Visitor behind [`ScreenFields`].
-struct ScreenFieldsVisitor;
-
-impl<'de> Visitor<'de> for ScreenFieldsVisitor {
-    type Value = ScreenFields;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON-RPC request object")
-    }
-
-    /// Accepts an object only, so a batch (a JSON array) is a type error here
-    /// and the caller forwards it, which is what the previous `Value`-based
-    /// screen did when `get("method")` came back `None` on an array.
-    fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<Self::Value, A::Error> {
-        let mut fields = ScreenFields { method: None, raw_transaction: None };
-        // A repeated member keeps the last occurrence, which is how a full parse
-        // into `Value` resolves a duplicated key.
-        while let Some(member) = members.next_key::<Cow<'_, str>>()? {
-            match member.as_ref() {
-                "method" => fields.method = members.next_value::<MaybeString>()?.into_option(),
-                "params" => {
-                    fields.raw_transaction = members.next_value::<FirstParam>()?.0;
-                }
-                _ => {
-                    members.next_value::<IgnoredAny>()?;
-                }
-            }
-        }
-        Ok(fields)
-    }
-}
-
-/// A `params` array reduced to its first element when that element is a string.
-///
-/// The remaining elements are drained through the ignored-value sink, so a
-/// `params` array of any length costs a scan rather than an allocation per
-/// element.
-struct FirstParam(Option<String>);
-
-impl<'de> serde::Deserialize<'de> for FirstParam {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(FirstParamVisitor)
-    }
-}
-
-struct FirstParamVisitor;
-
-impl<'de> Visitor<'de> for FirstParamVisitor {
-    type Value = FirstParam;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("a JSON-RPC params array")
-    }
-
-    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
-        let first = elements.next_element::<MaybeString>()?.and_then(MaybeString::into_option);
-        while elements.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(FirstParam(first))
-    }
-
-    /// `params` given as an object (or anything else) has no first element, and
-    /// the previous screen's `params.get(0)` returned `None` for those too.
-    fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<Self::Value, A::Error> {
-        while members.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(FirstParam(None))
-    }
-
-    serde::forward_to_deserialize_any! {}
-}
-
-/// A value kept only when it is a string, with any other shape consumed and
-/// discarded rather than erroring.
-///
-/// The previous screen read `method` and `params[0]` through `Value::as_str`,
-/// which yields `None` for a non-string without failing the parse. This
-/// reproduces that: a non-string in either position leaves the field unset and
-/// the request is forwarded, instead of the whole screen bailing out.
-enum MaybeString {
-    Str(String),
-    Other,
-}
-
-impl MaybeString {
-    fn into_option(self) -> Option<String> {
-        match self {
-            Self::Str(value) => Some(value),
-            Self::Other => None,
-        }
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for MaybeString {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(MaybeStringVisitor)
-    }
-}
-
-struct MaybeStringVisitor;
-
-impl<'de> Visitor<'de> for MaybeStringVisitor {
-    type Value = MaybeString;
-
-    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("any JSON value")
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(MaybeString::Str(value.to_owned()))
-    }
-
-    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-        Ok(MaybeString::Str(value))
-    }
-
-    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_some<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
-        deserializer.deserialize_any(self)
-    }
-
-    /// Nested containers are drained through the ignored-value sink so an
-    /// oversized non-string member costs a scan, not an allocation per node.
-    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
-        while elements.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(MaybeString::Other)
-    }
-
-    fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<Self::Value, A::Error> {
-        while members.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
-        Ok(MaybeString::Other)
-    }
 }
 
 /// Decode a `0x`-prefixed (or bare) hex string into bytes, or `None` if it is
@@ -822,7 +869,29 @@ mod tests {
     use super::*;
     use alloy::consensus::TxEip7702;
     use serde_json::Value;
+    use std::cell::Cell;
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
+
+    std::thread_local! {
+        /// Deserializers [`body_deserializer`] has built on this thread.
+        static PARSES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Count one deserializer built over a request body (see
+    /// [`body_deserializer`]).
+    pub(super) fn count_parse() {
+        PARSES.with(|parses| parses.set(parses.get() + 1));
+    }
+
+    /// The screen's verdict on a body, from the one pass that also routes it.
+    fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
+        scan(body).rejection
+    }
+
+    /// How a body routes, from the one pass that also screens it.
+    fn classify(body: &[u8]) -> Calls {
+        scan(body).calls
+    }
 
     /// The canonical EIP-155 example transaction (a signed legacy transfer): a
     /// well-formed, non-blob raw transaction that must be forwarded untouched.
@@ -958,9 +1027,9 @@ mod tests {
     /// The one documented divergence from the previous `Value` parse, pinned
     /// deliberately rather than fixed. serde_json caps `Value` deserialization
     /// at 128 frames of recursion, so under the old screen an `id` nested past
-    /// that limit failed the whole `ScreenFields` parse and the request was
-    /// forwarded regardless of its transaction: a forward by accident of the
-    /// recursion limit, not by a verdict. The new reader skips the id
+    /// that limit failed the whole parse and the request was forwarded
+    /// regardless of its transaction: a forward by accident of the recursion
+    /// limit, not by a verdict. The new reader skips the id
     /// iteratively, with no depth bound, so the transaction is now screened on
     /// its merits and a reject-worthy payload is rejected locally.
     /// `RequestId::recover` materializes the id as a `Value` and hits the same
@@ -1345,6 +1414,57 @@ mod tests {
         // an escaped read can never unescape into a submission
         let escaped_with_mention = r#"{"method":"eth_sendRaw\u0054ransaction","params":["eth_sendRawTransaction"],"id":1}"#;
         assert_eq!(classify(escaped_with_mention.as_bytes()), Calls::Submissions);
+    }
+
+    /// post-rev-11: a submission batched with an element that is not an
+    /// object used to end the scan at that element, so the batch was counted
+    /// as unreadable rather than mixed. It routes to the query upstream either
+    /// way; now it is counted in `tn_worker_gateway_mixed_batches_total` too.
+    #[test]
+    fn submission_batched_with_a_non_object_element_is_mixed() {
+        let submission = call("eth_sendRawTransaction");
+        for other in
+            ["1", "null", "true", r#""eth_sendRawTransaction""#, "[]", &format!("[{submission}]")]
+        {
+            for body in [format!("[{submission},{other}]"), format!("[{other},{submission}]")] {
+                let calls = classify(body.as_bytes());
+                assert_eq!(calls, Calls::MixedBatch, "{body}");
+                assert!(is_query(calls), "{body}");
+            }
+        }
+    }
+
+    /// post-dos-4: the classifier used to parse a body a second time after
+    /// the screen, allocating a `String` per key and per batch element. A
+    /// 1 MiB body built to clear the substring gate and carry as many keys and
+    /// elements as fit is now read by one deserializer, whose one pass yields
+    /// both the route and the screen's verdict. Counted at the single site
+    /// that builds a deserializer over a body ([`body_deserializer`]).
+    #[test]
+    fn body_is_parsed_once() {
+        let element = r#"{"method":"eth_sendRawTransaction","a":0,"b":0,"c":0,"d":0,"e":0}"#;
+        let elements = MAX_REQUEST_BYTES / (element.len() + 1);
+        let batch = format!("[{}]", vec![element; elements].join(","));
+        let keys: String =
+            (0..MAX_REQUEST_BYTES / 14).map(|key| format!(r#","k{key:07}":0"#)).collect();
+        let single = format!(r#"{{"method":"eth_chainId","eth_sendRawTransaction":0{keys}}}"#);
+        for (body, calls) in [(batch, Calls::Submissions), (single, Calls::Queries)] {
+            assert!(
+                body.len() > MAX_REQUEST_BYTES * 9 / 10,
+                "fixture should be large: {}",
+                body.len()
+            );
+            assert!(
+                body.len() <= MAX_REQUEST_BYTES,
+                "fixture must fit the body cap: {}",
+                body.len()
+            );
+            PARSES.with(|parses| parses.set(0));
+            let scan = scan(body.as_bytes());
+            assert_eq!(PARSES.with(Cell::get), 1, "one deserializer per body");
+            assert_eq!(scan.calls, calls);
+            assert!(scan.rejection.is_none());
+        }
     }
 
     #[test]
