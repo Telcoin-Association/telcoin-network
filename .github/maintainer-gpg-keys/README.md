@@ -1,51 +1,33 @@
-# Maintainer Tag-Signing GPG Keys
+# Maintainer release keys
 
-This directory holds the ASCII-armored OpenPGP public keys for each maintainer's tag-signing key.
-The release workflow imports every `.asc` file here and rejects any pushed tag that does not carry a `Good signature` from a key whose fingerprint matches one of the imported keys.
+This directory is the allowlist of OpenPGP keys that may sign a Telcoin Network release tag and its `SHA256SUMS.asc`.
 
-This is the encoded form of the policy "tags must be signed by a maintainer."
-Enforcement lives in `.github/workflows/release.yaml`, not in a repo setting that can be silently toggled off.
+## Format
+
+Each file is named `<handle>.asc`, where `<handle>` is the maintainer's GitHub login and matches `^[A-Za-z0-9-]+$`.
+Its content is the output of `gpg --armor --export --export-options export-minimal <PRIMARY_FPR>`: the primary key plus its current signing subkeys.
+Signatures are matched on the primary key fingerprint, and a primary fingerprint may appear in only one file.
+
+## Readers
+
+- `.github/workflows/release.yaml` and `make release-*` (through `etc/release.sh`) always read this directory from `main`, never from the tagged tree, so a release cannot vouch for its own signer.
+- Operators import these keys to verify `SHA256SUMS.asc`, then compare the fingerprints with the table in `SECURITY.md` on `main`.
+
+## Threshold
+
+A release needs signatures from at least `MIN_SIGNATURES` distinct maintainers (`MIN_SIGNATURES=1` in `etc/release.sh`).
+`RELEASE_SIG_THRESHOLD` raises the requirement for a run, up to the number of maintainers listed here.
 
 ## Files
 
 | File | Maintainer | Status |
 |------|------------|--------|
-| `grantkee.asc`   | @grantkee   | placeholder — replace with the real public key before the first release |
-| `sstanfield.asc` | @sstanfield | placeholder — replace with the real public key before the first release |
+| `grantkee.asc` | @grantkee | Placeholder until provisioned; every check fails closed on it and names the file. |
 
-## Provisioning a new key
+## Rules
 
-One-time setup per maintainer. Requires `gpg` (GnuPG >= 2.2).
+- When a signing subkey is added or replaced, or an expiry date changes, re-export the key and update the file in place.
+- When a key is revoked, delete its file and mark its row in the `SECURITY.md` table as revoked.
+- Never add a placeholder for a new maintainer; add the file only once the real key exists.
 
-```bash
-# 1. Generate a long-lived signing-capable primary key.
-gpg --full-generate-key
-
-# 2. Confirm the fingerprint.
-gpg --list-secret-keys --with-fingerprint <handle>@example.com
-
-# 3. Export the ASCII-armored public key.
-gpg --armor --export <FINGERPRINT> > .github/maintainer-gpg-keys/<handle>.asc
-
-# 4. Open a PR adding the file. Record the fingerprint in SECURITY.md.
-```
-
-The PR adding or rotating a key must be reviewed by the *other* maintainer.
-
-## Signing a tag
-
-```bash
-git config user.signingkey <FINGERPRINT>
-git tag -s v0.6.0 -m "v0.6.0"
-git push origin v0.6.0
-```
-
-The workflow runs `git tag -v "$TAG"` against the imported keys.
-A `Good signature` from a key not in this directory is rejected the same as no signature at all.
-
-## Rotation policy
-
-- **Never overwrite** an existing `.asc` in place. Past releases must remain verifiable.
-- Add a new file (`<handle>-2.asc`, `<handle>-3.asc`, ...) when a key is rotated.
-- Update `SECURITY.md` with the new fingerprint and the date the previous key is retired.
-- A revoked or lost key is called out in `SECURITY.md` with the date and reason.
+Provisioning a key on a YubiKey is covered in <https://docs.telcoin.network/maintainers/yubikey-setup.html>, and the published fingerprints are in [SECURITY.md](../../SECURITY.md#maintainer-release-keys).
