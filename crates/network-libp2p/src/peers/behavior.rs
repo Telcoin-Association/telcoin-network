@@ -74,6 +74,12 @@ impl NetworkBehaviour for PeerManager {
                 debug!(target: "peer-manager", ?peer_id, "denying outbound connection to local peer id");
                 return Err(ConnectionDenied::new("refusing to dial self"));
             }
+            (addresses.is_empty()
+                || !addresses.iter().all(|addr| self.endpoint_demoted(&peer_id, addr)))
+            .then_some(())
+            .ok_or_else(|| {
+                ConnectionDenied::new("committee endpoints await verified rediscovery")
+            })?;
             // PeerManager and Kad may initiate dials
             // intercept kad dial attempts, sanitize, and register
             if self.dial_attempt_already_registered(&peer_id) {
@@ -287,6 +293,7 @@ impl PeerManager {
     /// Another behavior can terminate the connection early, making it unsafe to
     /// assume a peer is connected until this event is received.
     fn on_connection_established(&mut self, peer_id: PeerId, endpoint: &ConnectedPoint) {
+        self.committee_dial_succeeded(peer_id, endpoint.get_remote_address());
         debug!(
             target: "peer-manager",
             ?peer_id,
@@ -365,7 +372,8 @@ impl PeerManager {
     /// an outgoing dial attempt fails because the peer connected during the dial.
     pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         self.metrics.record_dial_failure();
-        if let Some(peer_id) = peer_id {
+        peer_id.into_iter().for_each(|peer_id| {
+            self.committee_dial_failed(peer_id, error);
             if !self.is_connected(&peer_id) {
                 self.register_disconnected(&peer_id);
             }
@@ -374,6 +382,6 @@ impl PeerManager {
             // consumes the reply channel with a hardcoded cause, so the real `DialError`
             // (wrong key, refused, firewall, timeout) reaches the caller.
             self.notify_dial_result(&peer_id, Err(error.into()));
-        }
+        });
     }
 }

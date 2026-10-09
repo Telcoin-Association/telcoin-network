@@ -838,14 +838,82 @@ pub use tn_node_record::{NetworkInfo, NodeRecord, RecordDomain};
 #[derive(Debug)]
 pub struct KadQuery {
     /// The [BlsPublicKey] for the requested authority record.
-    pub request: BlsPublicKey,
-    /// The best result so far.
-    pub result: Option<NodeRecord>,
+    request: BlsPublicKey,
+    /// Whether the local store can contribute to this lookup.
+    scope: KadQueryScope,
+    /// The local candidate, discarded when this lookup becomes a refresh.
+    local: Option<(NodeRecord, crate::freshness::RecordTimestamp)>,
+    /// The newest remote candidate, retained independently when a refresh joins the lookup.
+    remote: Option<(NodeRecord, crate::freshness::RecordTimestamp)>,
+}
+
+/// Sources allowed to satisfy an outbound authority lookup.
+#[derive(Debug)]
+enum KadQueryScope {
+    /// Ordinary discovery can use either the local replica or a remote holder.
+    LocalAndRemote,
+    /// Failure recovery requires a remote holder to confirm the record.
+    RemoteOnly,
+}
+
+impl KadQuery {
+    /// Return the authority whose record is requested.
+    pub(crate) fn request(&self) -> BlsPublicKey {
+        self.request
+    }
+
+    /// Upgrade a coalesced lookup to recovery without losing its remote candidate.
+    pub(crate) fn require_remote(&mut self) {
+        self.scope = KadQueryScope::RemoteOnly;
+        self.local = None;
+    }
+
+    /// Retain the freshest verified candidate from each permitted source.
+    ///
+    /// Candidates follow local admission ordering, so a far-future signed timestamp cannot
+    /// win permanently.
+    pub(crate) fn record_result(
+        &mut self,
+        record: NodeRecord,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+        peer: Option<PeerId>,
+    ) {
+        if peer.is_some() || matches!(self.scope, KadQueryScope::LocalAndRemote) {
+            let candidate = if peer.is_some() { &mut self.remote } else { &mut self.local };
+            if candidate.as_ref().is_none_or(|(_, cached)| timestamp.supersedes(*cached, observed))
+            {
+                *candidate = Some((record, timestamp));
+            }
+        }
+    }
+
+    /// Admit a local result at `observed` and retain it under the shared ordering policy.
+    #[cfg(test)]
+    pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
+        let timestamp = crate::freshness::RecordTimestamp::admit(record.info.timestamp, observed);
+        self.record_result(record, timestamp, observed, None);
+    }
+
+    /// Consume the lookup and return the requested identity, its freshest eligible record and
+    /// the record's original admission metadata.
+    pub(crate) fn into_result(
+        self,
+        observed: tn_types::TimestampSec,
+    ) -> Option<(BlsPublicKey, NodeRecord, crate::freshness::RecordTimestamp)> {
+        let local = self.local;
+        self.remote
+            .filter(|(_, remote)| {
+                local.as_ref().is_none_or(|(_, local)| remote.supersedes(*local, observed))
+            })
+            .or(local)
+            .map(|(record, timestamp)| (self.request, record, timestamp))
+    }
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None }
+        Self { request, scope: KadQueryScope::LocalAndRemote, local: None, remote: None }
     }
 }
 

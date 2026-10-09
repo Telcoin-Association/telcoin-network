@@ -17,8 +17,11 @@ use crate::{
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
-    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
-    PeerId,
+    core::ConnectedPoint,
+    kad::PeerInfo,
+    multiaddr::Protocol,
+    swarm::{ConnectionId, DialError},
+    Multiaddr, PeerId,
 };
 use rand::seq::IteratorRandom as _;
 use std::{
@@ -40,6 +43,31 @@ mod peer_manager;
 #[cfg(test)]
 #[path = "../tests/listen_failure.rs"]
 mod listen_failure_tests;
+
+/// Three failed attempts to one advertised endpoint within a minute trigger rediscovery.
+const COMMITTEE_DIAL_FAILURE_THRESHOLD: u8 = 3;
+/// Reachability failures outside this window do not establish that an endpoint is stale.
+const COMMITTEE_DIAL_FAILURE_WINDOW: Duration = Duration::from_secs(60);
+/// At most one failure-driven record lookup per committee member per minute, including misses.
+const COMMITTEE_RECORD_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Reachability evidence for one endpoint of the cached committee binding.
+enum EndpointDialFailures {
+    /// A transient series that has not yet justified demotion.
+    Counting {
+        /// Time of the first failed attempt in this series.
+        first_attempt: Instant,
+        /// Number of failed attempts within the window.
+        attempts: u8,
+    },
+    /// Excluded from BLS-addressed dialing until a verified record or successful dial repairs it.
+    Demoted,
+}
+
+/// Match both the advertised address and libp2p's dial form with the expected peer suffix.
+fn dial_address_matches(advertised: &Multiaddr, attempted: &Multiaddr, peer: PeerId) -> bool {
+    advertised == attempted || advertised.clone().with(Protocol::P2p(peer)) == *attempted
+}
 
 /// Tumbling window over which inbound kad `PutRecord` messages are counted per source.
 const PUT_RECORD_RATE_WINDOW: Duration = Duration::from_secs(60);
@@ -213,6 +241,10 @@ pub(crate) struct PeerManager {
     /// Always a subset of `known_peers` (pruned alongside it). Today also a subset of
     /// `pinned_peers`, since every stub writer pins.
     stub_records: HashSet<BlsPublicKey>,
+    /// Failure evidence bounded by tracked committee keys and their signed address lists.
+    committee_dial_failures: HashMap<(BlsPublicKey, Multiaddr), EndpointDialFailures>,
+    /// Per-member lookup cooldowns, retained across replacements and pruned on rotation.
+    committee_record_retry: HashMap<BlsPublicKey, Instant>,
     /// Operator-owned launch bindings and addresses, fixed for this swarm's lifetime.
     ///
     /// Membership is chain-derived. Signed records can refresh RPC endpoints, but changing a
@@ -337,6 +369,8 @@ impl PeerManager {
             known_timestamps: Default::default(),
             pinned_peers: Default::default(),
             stub_records: Default::default(),
+            committee_dial_failures: Default::default(),
+            committee_record_retry: Default::default(),
             committee_peers: Default::default(),
             events: Default::default(),
             dial_requests: Default::default(),
@@ -413,6 +447,8 @@ impl PeerManager {
             }
             return;
         }
+        let multiaddrs: Vec<_> =
+            multiaddrs.into_iter().filter(|addr| !self.endpoint_demoted(&peer_id, addr)).collect();
         // return early if peer is banned, connected, or currently being dialed
         if let Some(peer) = self.peers.get_peer(&peer_id) {
             match peer.connection_status() {
@@ -520,6 +556,12 @@ impl PeerManager {
         }
     }
 
+    /// Drain peer events so integration tests can drive the normal consensus event handler.
+    #[cfg(test)]
+    pub(crate) fn take_test_events(&mut self) -> Vec<PeerEvent> {
+        std::iter::from_fn(|| self.poll_events()).collect()
+    }
+
     /// Returns a boolean indicating if the next instant in the heartbeat interval was reached.
     pub(super) fn heartbeat_ready(&mut self, cx: &mut Context<'_>) -> bool {
         self.heartbeat.poll_tick(cx).is_ready()
@@ -562,6 +604,9 @@ impl PeerManager {
 
         // Release expired rate budgets independently of connection lifetime.
         self.prune_rate_windows();
+
+        // Recovery continues even after an epoch dial task gives up or all endpoints are demoted.
+        self.refresh_stale_committee_records();
 
         // manage discovery peers
         self.discovery_heartbeat();
@@ -1044,6 +1089,8 @@ impl PeerManager {
         // keep the stub set a subset of `known_peers`; a no-op while every stub is pinned
         let known = &self.known_peers;
         self.stub_records.retain(|bls_key| known.contains_key(bls_key));
+        self.committee_dial_failures.retain(|(key, _), _| peers.is_committee_member(key));
+        self.committee_record_retry.retain(|key, _| peers.is_committee_member(key));
         self.known_timestamps.retain(|bls_key, _| known.contains_key(bls_key));
     }
 
@@ -1316,7 +1363,7 @@ impl PeerManager {
                 ?bls_key,
                 "dropping discovered peer record for non-committee key"
             );
-        } else if self.kad_timestamp_is_stale(&bls_key, timestamp, now()) {
+        } else if self.kad_timestamp_is_stale(&bls_key, &info, timestamp, now()) {
             trace!(
                 target: "peer-manager",
                 ?bls_key,
@@ -1412,7 +1459,9 @@ impl PeerManager {
         let cacheable =
             self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
         match () {
-            () if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) => {
+            () if cacheable
+                && self.kad_timestamp_is_stale(&bls_key, &info, timestamp, observed) =>
+            {
                 trace!(
                     target: "peer-manager",
                     ?bls_key,
@@ -1462,6 +1511,36 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
     }
 
+    /// Check the signed cache's freshness floor even when the durable kad copy is absent.
+    ///
+    /// Config stubs carry local provisioning timestamps and cannot establish a signed floor.
+    /// An equal signed timestamp is left to the store-side identical or conflict check.
+    pub(crate) fn cached_record_newer(
+        &self,
+        bls_key: &BlsPublicKey,
+        timestamp: crate::freshness::RecordTimestamp,
+        observed: tn_types::TimestampSec,
+    ) -> bool {
+        !self.stub_records.contains(bls_key)
+            && self.known_peers.get(bls_key).is_some_and(|existing| {
+                !timestamp.matches(existing.timestamp)
+                    && !timestamp
+                        .supersedes(self.cached_timestamp(bls_key, existing, observed), observed)
+            })
+    }
+
+    /// Return a cached record's local ordering metadata, recovering a legacy entry.
+    fn cached_timestamp(
+        &self,
+        bls_key: &BlsPublicKey,
+        existing: &NetworkInfo,
+        observed: tn_types::TimestampSec,
+    ) -> crate::freshness::RecordTimestamp {
+        self.known_timestamps.get(bls_key).copied().unwrap_or_else(|| {
+            crate::freshness::RecordTimestamp::legacy(existing.timestamp, observed)
+        })
+    }
+
     /// Check whether a kad-sourced record fails the shared local freshness policy.
     ///
     /// Mirrors the store-side freshness check so kad-sourced ordinary records never regress
@@ -1483,18 +1562,26 @@ impl PeerManager {
     /// so a relayed or replayed older record cannot regress it. Keying the exemption on
     /// `pinned_peers` instead would leave every operator-provisioned validator open to that
     /// regression for the life of the process, because pins are never cleared.
+    /// An equal timestamp can repair demoted endpoints only when every cached field matches.
+    /// Conflicting equal-timestamp records remain stale, and the recovery cooldown is retained.
     fn kad_timestamp_is_stale(
         &self,
         bls_key: &BlsPublicKey,
+        info: &NetworkInfo,
         timestamp: crate::freshness::RecordTimestamp,
         observed: tn_types::TimestampSec,
     ) -> bool {
         !self.stub_records.contains(bls_key)
             && self.known_peers.get(bls_key).is_some_and(|existing| {
-                let cached = self.known_timestamps.get(bls_key).copied().unwrap_or_else(|| {
-                    crate::freshness::RecordTimestamp::legacy(existing.timestamp, observed)
-                });
-                !timestamp.supersedes(cached, observed)
+                let identical_repair = existing.timestamp == info.timestamp
+                    && existing.pubkey == info.pubkey
+                    && existing.multiaddrs == info.multiaddrs
+                    && existing.rpc == info.rpc
+                    && self.committee_dial_failures.iter().any(|((key, _), state)| {
+                        key == bls_key && matches!(state, EndpointDialFailures::Demoted)
+                    });
+                let cached = self.cached_timestamp(bls_key, existing, observed);
+                !timestamp.supersedes(cached, observed) && !identical_repair
             })
     }
 
@@ -1558,6 +1645,27 @@ impl PeerManager {
                 })
                 .is_ok()
         });
+        let recovering = self.committee_dial_failures.iter().any(|((key, _), state)| {
+            *key == bls_key && matches!(state, EndpointDialFailures::Demoted)
+        });
+        self.known_peers
+            .get(&bls_key)
+            .filter(|previous| {
+                self.peers.is_committee_member(&bls_key)
+                    && (previous.pubkey != info.pubkey || previous.multiaddrs != info.multiaddrs)
+            })
+            .into_iter()
+            .for_each(|previous| {
+                self.events.push_back(PeerEvent::CommitteeRecordUpdated {
+                    previous: previous.pubkey.clone().into(),
+                    peer: info.pubkey.clone().into(),
+                    addresses: info.multiaddrs.clone(),
+                });
+            });
+        // Discovery callers enforce timestamp monotonicity before reaching this update. Retain
+        // the cooldown so a new signed publication cannot create a tight failure/lookup loop.
+        self.committee_dial_failures.retain(|(key, _), _| *key != bls_key);
+        let replacement = (info.pubkey.clone().into(), info.multiaddrs.clone());
         trace!(target: "peer-manager", ?bls_key, "adding known peer");
         self.peers.upsert_peer(bls_key, info.pubkey.clone(), info.multiaddrs.clone());
         self.known_peers.insert(bls_key, info);
@@ -1569,6 +1677,10 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        if recovering {
+            debug!(target: "peer-manager", ?bls_key, "committee binding updated; retrying dial");
+            self.dial_peer(replacement.0, replacement.1, None);
+        }
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.
@@ -1610,13 +1722,128 @@ impl PeerManager {
             .collect()
     }
 
-    /// Find the peer id for an authority.
+    /// Return an authority's cached transport identity and usable advertised endpoints.
+    ///
+    /// Demotion preserves the cached identity and freshness watermark. An empty address list
+    /// means recovery is pending: heartbeat lookups continue, but neither this result nor a
+    /// lookup miss authorizes a replacement transport key.
     pub(crate) fn auth_to_peer(&self, bls_key: BlsPublicKey) -> Option<(PeerId, Vec<Multiaddr>)> {
-        if let Some(NetworkInfo { pubkey, multiaddrs, .. }) = self.known_peers.get(&bls_key) {
-            Some((pubkey.clone().into(), multiaddrs.clone()))
-        } else {
-            debug!(target: "peer-manager", ?bls_key, "unknown peer for bls key");
-            None
+        self.known_peers.get(&bls_key).map(|info| {
+            let addresses = info
+                .multiaddrs
+                .iter()
+                .filter(|addr| {
+                    !matches!(
+                        self.committee_dial_failures.get(&(bls_key, (*addr).clone())),
+                        Some(EndpointDialFailures::Demoted)
+                    )
+                })
+                .cloned()
+                .collect();
+            (info.pubkey.clone().into(), addresses)
+        })
+    }
+
+    /// Count genuine endpoint failures only for the current committee transport binding.
+    ///
+    /// Policy denials, duplicate/aborted dials and errors from displaced transport keys are
+    /// not reachability evidence. No attacker is required: a validator re-key or address change
+    /// suffices. Neither a failure nor a lookup miss grants admission to another identity.
+    pub(super) fn committee_dial_failed(&mut self, peer: PeerId, error: &DialError) {
+        let now = Instant::now();
+        self.peer_to_bls(&peer)
+            .filter(|key| self.peers.is_committee_member(key) && !self.is_connected(&peer))
+            .and_then(|key| self.known_peers.get(&key).map(|info| (key, info)))
+            .map(|(key, info)| {
+                info.multiaddrs
+                    .iter()
+                    .filter(|addr| match error {
+                        DialError::Transport(errors) => errors
+                            .iter()
+                            .any(|(attempted, _)| dial_address_matches(addr, attempted, peer)),
+                        DialError::WrongPeerId { address, .. }
+                        | DialError::LocalPeerId { address } => {
+                            dial_address_matches(addr, address, peer)
+                        }
+                        DialError::NoAddresses
+                        | DialError::DialPeerConditionFalse(_)
+                        | DialError::Aborted
+                        | DialError::Denied { .. } => false,
+                    })
+                    .map(|addr| (key, addr.clone()))
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default()
+            .into_iter()
+            .for_each(|endpoint| {
+                self.committee_dial_failures
+                    .entry(endpoint)
+                    .and_modify(|state| match state {
+                        EndpointDialFailures::Counting { first_attempt, attempts } => {
+                            if now.duration_since(*first_attempt) >= COMMITTEE_DIAL_FAILURE_WINDOW {
+                                *first_attempt = now;
+                                *attempts = 1;
+                            } else {
+                                *attempts = attempts.saturating_add(1);
+                            }
+                            if *attempts >= COMMITTEE_DIAL_FAILURE_THRESHOLD {
+                                *state = EndpointDialFailures::Demoted;
+                            }
+                        }
+                        EndpointDialFailures::Demoted => {}
+                    })
+                    .or_insert(EndpointDialFailures::Counting { first_attempt: now, attempts: 1 });
+            });
+        self.refresh_stale_committee_records();
+    }
+
+    /// Clear transient failures on an authenticated connection and repair its successful endpoint.
+    pub(super) fn committee_dial_succeeded(&mut self, peer: PeerId, address: &Multiaddr) {
+        self.peer_to_bls(&peer).into_iter().for_each(|key| {
+            self.committee_dial_failures.retain(|(bls, addr), state| {
+                *bls != key
+                    || (matches!(state, EndpointDialFailures::Demoted)
+                        && !dial_address_matches(addr, address, peer))
+            });
+        });
+    }
+
+    /// Whether an address is demoted for this peer's current committee binding.
+    pub(super) fn endpoint_demoted(&self, peer: &PeerId, address: &Multiaddr) -> bool {
+        self.peer_to_bls(peer).is_some_and(|key| {
+            self.committee_dial_failures.iter().any(|((bls, addr), state)| {
+                *bls == key
+                    && matches!(state, EndpointDialFailures::Demoted)
+                    && dial_address_matches(addr, address, *peer)
+            })
+        })
+    }
+
+    /// Coalesce demoted endpoints into bounded, cooldown-limited record refreshes on heartbeat.
+    fn refresh_stale_committee_records(&mut self) {
+        let now = Instant::now();
+        self.committee_dial_failures.retain(|_, state| match state {
+            EndpointDialFailures::Counting { first_attempt, .. } => {
+                now.duration_since(*first_attempt) < COMMITTEE_DIAL_FAILURE_WINDOW
+            }
+            EndpointDialFailures::Demoted => true,
+        });
+        let stale: HashSet<_> = self
+            .committee_dial_failures
+            .iter()
+            .filter(|(_, state)| matches!(state, EndpointDialFailures::Demoted))
+            .map(|((key, _), _)| *key)
+            .collect();
+        let refresh: Vec<_> = stale
+            .into_iter()
+            .filter(|key| self.committee_record_retry.get(key).is_none_or(|due| now >= *due))
+            .collect();
+        if !refresh.is_empty() {
+            refresh.iter().for_each(|key| {
+                self.committee_record_retry.insert(*key, now + COMMITTEE_RECORD_RETRY_INTERVAL);
+            });
+            warn!(target: "peer-manager", ?refresh, "rediscovering stale committee endpoints");
+            self.events.push_back(PeerEvent::RefreshAuthorities(refresh));
         }
     }
 

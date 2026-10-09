@@ -480,7 +480,7 @@ where
     /// the bls key associated with the desired authority's [NodeRecord]. The query runs until
     /// the last step. During this time, results are tracked and compared to one another to
     /// ensure the latest valid record is used for the peer's info.
-    kad_record_queries: HashMap<QueryId, PendingKadQuery>,
+    kad_record_queries: HashMap<QueryId, KadQuery>,
     /// The configurables for the libp2p consensus network implementation.
     config: LibP2pConfig,
     /// Track peers we have a connection with.
@@ -1568,7 +1568,7 @@ where
             .missing_required_records()
             .into_iter()
             .for_each(|key| {
-                if self.kad_record_queries.values().all(|query| query.query.request != key) {
+                if self.kad_record_queries.values().all(|query| query.request() != key) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
                 }
@@ -2123,7 +2123,7 @@ where
             .peer_manager
             .peer_to_bls(&peer)
             .filter(|_| self.swarm.behaviour().peer_manager.is_peer_validator(&peer))
-            .filter(|key| self.kad_record_queries.values().all(|query| query.query.request != *key))
+            .filter(|key| self.kad_record_queries.values().all(|query| query.request() != *key))
             .into_iter()
             .for_each(|key| {
                 let query = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
@@ -2440,6 +2440,43 @@ where
                 // remove blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.remove_blacklisted_peer(&peer_id);
             }
+            PeerEvent::CommitteeRecordUpdated { previous, peer, addresses } => {
+                self.swarm.behaviour_mut().kademlia.remove_peer(&previous);
+                if previous != peer {
+                    self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&previous);
+                    let _ = self.swarm.disconnect_peer_id(previous);
+                    self.connected_peers.retain(|connected| *connected != previous);
+                }
+                // Manual kad insertion must preserve peers whose existing connection survives
+                // an address update. Disconnected peers are registered by PeerConnected.
+                let reinsert = self.swarm.is_connected(&peer)
+                    && !self.swarm.behaviour().peer_manager.peer_banned(&peer);
+                addresses.into_iter().for_each(|address| {
+                    self.swarm.add_peer_address(peer, address.clone());
+                    if reinsert {
+                        self.swarm.behaviour_mut().kademlia.add_address(&peer, address);
+                    }
+                });
+                self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer);
+            }
+            PeerEvent::RefreshAuthorities(authorities) => {
+                // Retain the durable replica and its inbound-PUT freshness floor. Only remote
+                // answers can repair an endpoint, including when joining an existing lookup.
+                authorities.into_iter().for_each(|key| {
+                    let query_id = self
+                        .kad_record_queries
+                        .iter()
+                        .find(|(_, query)| query.request() == key)
+                        .map(|(id, _)| *id)
+                        .unwrap_or_else(|| {
+                            self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key))
+                        });
+                    self.kad_record_queries
+                        .entry(query_id)
+                        .or_insert_with(|| key.into())
+                        .require_remote();
+                });
+            }
             PeerEvent::MissingAuthorities(missing) => {
                 // Polling callers such as `current_committee_rpcs` report a member as
                 // missing on every call until its signed metadata reaches `known_peers`, so the
@@ -2451,15 +2488,15 @@ where
                 // as its current query ends. The removal there runs before any result
                 // filtering, so even a query whose record is dropped as stale or
                 // non-committee re-arms the key.
-                for bls_key in missing {
-                    if self.kad_record_queries.values().all(|q| q.query.request != bls_key) {
+                missing.into_iter().for_each(|bls_key| {
+                    if self.kad_record_queries.values().all(|q| q.request() != bls_key) {
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
                     } else {
                         trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
                     }
-                }
+                });
             }
             PeerEvent::Discovery => {
                 let peer_id = PeerId::random();
@@ -2572,7 +2609,7 @@ where
                             if self
                                 .kad_record_queries
                                 .get(&query_id)
-                                .is_some_and(|query| query.query.request == key)
+                                .is_some_and(|query| query.request() == key)
                                 && key != self.key_config.primary_public_key()
                                 && matches!(
                                     freshness,
@@ -2806,7 +2843,16 @@ where
 
                     let observed = now();
                     let timestamp = self.admission_timestamp(key, value.info.timestamp, observed);
-                    let freshness = self.record_freshness(&record, timestamp, observed);
+                    let freshness = if self
+                        .swarm
+                        .behaviour()
+                        .peer_manager
+                        .cached_record_newer(&key, timestamp, observed)
+                    {
+                        RecordFreshness::Older
+                    } else {
+                        self.record_freshness(&record, timestamp, observed)
+                    };
                     let should_store = if freshness == RecordFreshness::Identical {
                         // A relayed identical copy can carry less remaining TTL. Refreshing it must
                         // not shorten the lifetime we already accepted. None means no expiry.
@@ -3015,8 +3061,8 @@ where
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.query.request == key {
-            query.consider_with_timestamp(new_record, timestamp, observed);
+        if query.request() == key {
+            query.record_result(new_record, timestamp, observed, peer);
         } else {
             // assess penalty for returning record that doesn't match key
             if let Some(peer_id) = peer {
@@ -3052,12 +3098,10 @@ where
     /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
     /// periodic replication is disabled by [`configure_record_jobs`].
     fn close_kad_query(&mut self, query_id: &QueryId) {
+        let observed = now();
         self.kad_record_queries
             .remove(query_id)
-            .and_then(|query| {
-                let key = query.query.request;
-                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
-            })
+            .and_then(|query| query.into_result(observed))
             .into_iter()
             .for_each(|(key, node_record, timestamp)| {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
@@ -3068,48 +3112,6 @@ where
                 );
                 self.refresh_explicit_peer(&peer);
             });
-    }
-}
-
-/// Internal query state with local ordering metadata, preserving the public [`KadQuery`] shape.
-#[derive(Debug)]
-pub(crate) struct PendingKadQuery {
-    /// Requested authority and best authenticated record.
-    query: KadQuery,
-    /// Admission ceiling of the winning result, retained until the query closes.
-    timestamp: Option<crate::freshness::RecordTimestamp>,
-}
-
-impl From<BlsPublicKey> for PendingKadQuery {
-    fn from(key: BlsPublicKey) -> Self {
-        Self { query: key.into(), timestamp: None }
-    }
-}
-
-impl PendingKadQuery {
-    /// Retain the freshest verified result under the shared local admission policy.
-    #[cfg(test)]
-    pub(crate) fn consider(&mut self, record: NodeRecord, observed: tn_types::TimestampSec) {
-        let timestamp = crate::freshness::RecordTimestamp::admit(record.info.timestamp, observed);
-        self.consider_with_timestamp(record, timestamp, observed);
-    }
-
-    /// Retain a verified result without renewing a timestamp already admitted elsewhere.
-    fn consider_with_timestamp(
-        &mut self,
-        record: NodeRecord,
-        timestamp: crate::freshness::RecordTimestamp,
-        observed: tn_types::TimestampSec,
-    ) {
-        if self.timestamp.is_none_or(|cached| timestamp.supersedes(cached, observed)) {
-            self.query.result = Some(record);
-            self.timestamp = Some(timestamp);
-        }
-    }
-
-    /// Consume the winning record together with its original admission ceiling.
-    pub(crate) fn into_result(self) -> Option<(NodeRecord, crate::freshness::RecordTimestamp)> {
-        self.query.result.zip(self.timestamp)
     }
 }
 

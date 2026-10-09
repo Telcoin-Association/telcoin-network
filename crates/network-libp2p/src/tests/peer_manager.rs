@@ -1085,6 +1085,193 @@ fn random_network_info() -> NetworkInfo {
     }
 }
 
+/// Seed a current committee binding with two independently usable verified endpoints.
+fn stale_committee_fixture() -> (PeerManager, BlsPublicKey, NetworkInfo, PeerId) {
+    let mut manager = create_test_peer_manager(None);
+    let key = *BlsKeypair::generate(&mut StdRng::from_seed([147; 32])).public();
+    let mut info = random_network_info();
+    info.timestamp = 1;
+    info.multiaddrs = vec![create_multiaddr(None), create_multiaddr(None)];
+    let peer = info.pubkey.clone().into();
+    manager.update_committees(HashSet::new(), HashSet::from([key]), HashSet::new());
+    manager.add_discovered_peer(key, info.clone());
+    collect_all_events(&mut manager);
+    (manager, key, info, peer)
+}
+
+/// Exercise the swarm failure hook, including libp2p's expected-peer address suffix.
+fn stale_committee_fail_endpoint(manager: &mut PeerManager, peer: PeerId, address: &Multiaddr) {
+    let error = DialError::WrongPeerId {
+        obtained: PeerId::random(),
+        address: address.clone().with(Protocol::P2p(peer)),
+    };
+    (0..COMMITTEE_DIAL_FAILURE_THRESHOLD).for_each(|_| manager.on_dial_failure(Some(peer), &error));
+}
+
+/// Three failures demote only the failed endpoint and leave the signed identity intact.
+#[tokio::test(start_paused = true)]
+async fn stale_committee_endpoint_demotion_keeps_usable_addresses() -> eyre::Result<()> {
+    let (mut manager, key, mut info, peer) = stale_committee_fixture();
+    let failed = info.multiaddrs.first().ok_or_else(|| eyre::eyre!("first endpoint"))?.clone();
+    let usable = info.multiaddrs.last().ok_or_else(|| eyre::eyre!("second endpoint"))?.clone();
+    info.timestamp = 2;
+    info.multiaddrs.extend([failed.clone(), failed.clone()]);
+    manager.add_discovered_peer(key, info.clone());
+    collect_all_events(&mut manager);
+    let error = DialError::WrongPeerId { obtained: PeerId::random(), address: failed.clone() };
+    manager.on_dial_failure(Some(peer), &error);
+    assert_eq!(
+        manager.auth_to_peer(key),
+        Some((peer, info.multiaddrs.clone())),
+        "duplicate advertised addresses count as one failed attempt"
+    );
+    assert!(manager.poll_events().is_none());
+    (0..2).for_each(|_| manager.on_dial_failure(Some(peer), &error));
+    assert_eq!(manager.auth_to_peer(key), Some((peer, vec![usable.clone()])));
+    assert_eq!(manager.peer_to_bls(&peer), Some(key));
+    assert_eq!(manager.known_peers.get(&key).map(|record| record.timestamp), Some(2));
+    assert!(manager.peers.is_committee_member(&key));
+    assert_matches!(manager.poll_events(), Some(PeerEvent::RefreshAuthorities(keys)) if keys == [key]);
+    assert!(manager.poll_events().is_none());
+    manager.dial_peer(peer, vec![failed.clone(), usable.clone()], None);
+    assert_matches!(manager.next_dial_request(), Some(request) if request.multiaddrs == [usable.clone()]);
+    Ok(())
+}
+
+/// Missing lookup results leave bounded retries active even when every endpoint is demoted.
+#[tokio::test(start_paused = true)]
+async fn stale_committee_retry_is_bounded_after_missing_results() -> eyre::Result<()> {
+    let (mut manager, key, info, peer) = stale_committee_fixture();
+    info.multiaddrs.iter().for_each(|addr| {
+        stale_committee_fail_endpoint(&mut manager, peer, addr);
+    });
+    assert_eq!(manager.auth_to_peer(key), Some((peer, Vec::new())));
+    assert_eq!(collect_all_events(&mut manager).len(), 1);
+    (0..100).for_each(|_| manager.refresh_stale_committee_records());
+    assert!(manager.poll_events().is_none());
+    tokio::time::advance(COMMITTEE_RECORD_RETRY_INTERVAL - Duration::from_secs(1)).await;
+    manager.refresh_stale_committee_records();
+    assert!(manager.poll_events().is_none());
+    tokio::time::advance(Duration::from_secs(1)).await;
+    manager.refresh_stale_committee_records();
+    assert_matches!(manager.poll_events(), Some(PeerEvent::RefreshAuthorities(keys)) if keys == [key]);
+    assert!(manager.poll_events().is_none());
+    assert_eq!(manager.committee_dial_failures.len(), info.multiaddrs.len());
+    assert_eq!(manager.committee_record_retry.len(), 1);
+    Ok(())
+}
+
+/// Transient failures reset on success or window expiry; rotated-out keys release all state.
+#[tokio::test(start_paused = true)]
+async fn stale_committee_transients_and_rotation_preserve_reachability() -> eyre::Result<()> {
+    let (mut manager, key, info, peer) = stale_committee_fixture();
+    let address = info.multiaddrs.first().ok_or_else(|| eyre::eyre!("endpoint"))?;
+    let error = DialError::WrongPeerId { obtained: PeerId::random(), address: address.clone() };
+    manager.on_dial_failure(Some(peer), &error);
+    manager.on_dial_failure(Some(peer), &error);
+    assert!(manager.poll_events().is_none());
+    assert_eq!(manager.committee_dial_failures.len(), 1, "transient attempts are tracked");
+    [
+        DialError::Aborted,
+        DialError::NoAddresses,
+        DialError::DialPeerConditionFalse(libp2p::swarm::dial_opts::PeerCondition::Disconnected),
+        DialError::Denied { cause: libp2p::swarm::ConnectionDenied::new("policy") },
+    ]
+    .iter()
+    .for_each(|error| manager.on_dial_failure(Some(peer), error));
+    assert!(
+        manager.poll_events().is_none(),
+        "policy and duplicate dials are not endpoint failures"
+    );
+    manager.committee_dial_succeeded(peer, address);
+    assert!(manager.committee_dial_failures.is_empty());
+    assert!(manager.register_peer_connection(
+        &peer,
+        ConnectionType::OutgoingConnection { multiaddr: address.clone() }
+    ));
+    stale_committee_fail_endpoint(&mut manager, peer, address);
+    assert!(manager.committee_dial_failures.is_empty(), "an established peer is still usable");
+    collect_all_events(&mut manager);
+    manager.register_disconnected(&peer);
+    manager.on_dial_failure(Some(peer), &error);
+    manager.on_dial_failure(Some(peer), &error);
+    tokio::time::advance(COMMITTEE_DIAL_FAILURE_WINDOW).await;
+    manager.on_dial_failure(Some(peer), &error);
+    assert!(manager.poll_events().is_none());
+    assert_eq!(manager.auth_to_peer(key), Some((peer, info.multiaddrs.clone())));
+    stale_committee_fail_endpoint(&mut manager, peer, address);
+    collect_all_events(&mut manager);
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(manager.committee_dial_failures.is_empty());
+    assert!(manager.committee_record_retry.is_empty());
+    manager.on_dial_failure(Some(peer), &error);
+    assert!(manager.committee_dial_failures.is_empty());
+    Ok(())
+}
+
+/// A verified identical record repairs a temporary outage without accepting timestamp conflicts.
+#[tokio::test(start_paused = true)]
+async fn stale_committee_identical_record_repairs_temporary_outage() -> eyre::Result<()> {
+    let (mut manager, key, info, peer) = stale_committee_fixture();
+    info.multiaddrs.iter().for_each(|addr| {
+        stale_committee_fail_endpoint(&mut manager, peer, addr);
+    });
+    collect_all_events(&mut manager);
+    assert_eq!(manager.auth_to_peer(key), Some((peer, Vec::new())));
+    let mut conflicting = random_network_info();
+    conflicting.timestamp = info.timestamp;
+    manager.add_discovered_peer(key, conflicting);
+    assert_eq!(
+        manager.auth_to_peer(key),
+        Some((peer, Vec::new())),
+        "equal-timestamp conflicting bindings cannot repair endpoints"
+    );
+    manager.add_discovered_peer(key, info.clone());
+    assert_eq!(manager.auth_to_peer(key), Some((peer, info.multiaddrs.clone())));
+    assert_matches!(manager.next_dial_request(), Some(request) if request.peer_id == peer);
+    assert!(manager.committee_dial_failures.is_empty());
+    info.multiaddrs.iter().for_each(|addr| {
+        stale_committee_fail_endpoint(&mut manager, peer, addr);
+    });
+    assert!(manager.poll_events().is_none(), "an identical repair retains the lookup cooldown");
+    Ok(())
+}
+
+/// Verified re-keying repairs dialing while late records and old transport errors cannot regress
+/// it.
+#[tokio::test(start_paused = true)]
+async fn stale_committee_verified_replacement_preserves_freshness() -> eyre::Result<()> {
+    let (mut manager, key, old, peer) = stale_committee_fixture();
+    old.multiaddrs.iter().for_each(|addr| stale_committee_fail_endpoint(&mut manager, peer, addr));
+    collect_all_events(&mut manager);
+    let mut replacement = random_network_info();
+    replacement.timestamp = 2;
+    let replacement_peer = replacement.pubkey.clone().into();
+    manager.add_discovered_peer(key, replacement.clone());
+    assert_eq!(manager.auth_to_peer(key), Some((replacement_peer, replacement.multiaddrs.clone())));
+    assert_eq!(manager.peer_to_bls(&peer), None);
+    assert_eq!(manager.peer_to_bls(&replacement_peer), Some(key));
+    assert!(manager.committee_dial_failures.is_empty());
+    assert_matches!(manager.next_dial_request(), Some(request) if request.peer_id == replacement_peer);
+    assert!(collect_all_events(&mut manager).iter().any(|event| matches!(event,
+        PeerEvent::CommitteeRecordUpdated { previous, peer: new, .. }
+            if *previous == peer && *new == replacement_peer)));
+    manager.add_discovered_peer(key, old.clone());
+    stale_committee_fail_endpoint(
+        &mut manager,
+        peer,
+        old.multiaddrs.first().ok_or_else(|| eyre::eyre!("old endpoint"))?,
+    );
+    assert_eq!(manager.auth_to_peer(key), Some((replacement_peer, replacement.multiaddrs.clone())));
+    assert!(manager.committee_dial_failures.is_empty());
+    // A second outage immediately after repair must not bypass the original cooldown.
+    replacement.multiaddrs.iter().for_each(|addr| {
+        stale_committee_fail_endpoint(&mut manager, replacement_peer, addr);
+    });
+    assert!(manager.poll_events().is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_discovered_peers_bounded_to_committee_membership() {
     // Regression (issue #827): a flood of signature-valid kad records for fresh, non-committee keys

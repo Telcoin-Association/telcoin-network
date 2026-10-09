@@ -1,10 +1,7 @@
 //! Regression tests for local record metadata, persistence and query ordering.
 
 use super::*;
-use crate::{
-    consensus::PendingKadQuery,
-    types::{NodeRecord, RecordDomain},
-};
+use crate::types::{KadQuery, NodeRecord, RecordDomain};
 use libp2p::{multiaddr::Protocol, Multiaddr};
 use std::net::Ipv4Addr;
 use tn_storage::mem_db::MemDatabase;
@@ -94,11 +91,11 @@ fn legacy_future_record_is_repairable() -> Result<(), &'static str> {
 #[test]
 fn query_repairs_future_record_without_reaccepting_stale_results() -> Result<(), &'static str> {
     let bls = BlsKeypair::generate(&mut rand::rng());
-    let mut query = PendingKadQuery::from(*bls.public());
+    let mut query = KadQuery::from(*bls.public());
     query.consider(signed_record(&bls, u64::MAX), 1_000);
     query.consider(signed_record(&bls, 1_001), 1_001);
     query.consider(signed_record(&bls, 999), 1_001);
-    let (winner, timestamp) = query.into_result().ok_or("query lost its winner")?;
+    let (_, winner, timestamp) = query.into_result(1_001).ok_or("query lost its winner")?;
     assert_eq!(winner.info.timestamp, 1_001);
     assert_eq!(timestamp, RecordTimestamp::admit(1_001, 1_001));
     Ok(())
