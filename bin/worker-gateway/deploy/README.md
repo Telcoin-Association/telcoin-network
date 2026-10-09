@@ -46,9 +46,13 @@ A Grafana dashboard for the metrics these expose lives at
 
 ## Ports and endpoints
 
-- `rpc` / `8545` -- client JSON-RPC plus the gateway's own `/health` (liveness,
-  always 200) and `/ready` (readiness, 200 when an upstream worker is ready,
-  else 503). All three share this one port.
+- `rpc` / `8545` -- client JSON-RPC plus the gateway's own `/health` (liveness, always 200), `/ready` (200 when an upstream worker is ready, else 503) and `/ready/any` (200 when the gateway can serve any route, else 503).
+  The probes answer here for fronts that can only check the client port; they are exempt from rate limiting but share the client connection cap.
+- `probe` / `8546` -- the same three probes on a **separate** listener, enabled by `WORKER_GATEWAY_PROBE_ADDR` (equivalently `--probe-addr <addr>`), which serves nothing else.
+  It sits outside the client connection cap and the rate limits, so a connection flood that holds every client slot cannot make the kubelet's probes time out and get a healthy pod restarted; both probes in the Deployment target it.
+  It has no connection cap of its own, so keep it reachable from the pod's node only.
+  Leaving it out of the Service, as `service.yaml` does, is not enough: any pod in the cluster can still reach it on the pod IP.
+  A NetworkPolicy that admits only `8545` and `9100`, like the example below, shuts other pods out (on a network plugin that enforces NetworkPolicy) and still lets the kubelet's probes in, because a pod always accepts connections from its own node.
 - `metrics` / `9100` -- Prometheus `/metrics`, enabled by
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
   **separate** listener from the client port.
@@ -66,10 +70,18 @@ drain timeout or the preStop sleep, raise this too.
 
 ## Readiness and reads
 
-The `readinessProbe` uses `/ready`, which reports whether the gateway can take submissions.
-Every replica polls the same worker, so when the worker is down every replica leaves the Service at once, and reads stop too even though the query upstream could still serve them.
-If reads must survive a worker outage, point the `readinessProbe` at `/health` instead; while the worker is down, submissions then get `503` / `-32000` from the gateway and reads keep working.
-The same choice applies to an external load balancer or DNS health check.
+`/ready` reports whether the gateway can take submissions: `200` when an upstream worker is ready, else `503`.
+`/ready/any` reports whether it can serve any route: `200` when `/ready` would, or when the `WORKER_GATEWAY_REDIRECT_QUERIES` endpoint answered the gateway's last probe (one `eth_chainId` call per `--readiness-poll-interval`), else `503`.
+Without a query redirect, `/ready/any` is exactly `/ready`.
+
+Every replica polls the same worker, so when the worker is down every replica's `/ready` fails at once.
+A `readinessProbe` on `/ready` would then take every replica out of the Service, and reads would stop too, although the query upstream could still serve them; removing the replicas gains submissions nothing, since every replica would answer them with the same `503` / `-32000`.
+The Deployment's `readinessProbe` therefore uses `/ready/any`: the replicas stay in the Service while reads can be served, submissions get `503` / `-32000` until the worker is back, and a replica leaves only when neither the worker nor the query upstream answers.
+
+The same choice applies to an external load balancer or DNS health check, which has to check the client port (`8545`), since the probe port is not exposed.
+Check `/ready/any` to keep a gateway published while it can serve reads; that suits a validator's gateways, which all share one worker.
+Check `/ready` only when a gateway that cannot take submissions should receive no traffic at all, for example when the front can send submissions to another validator's gateways instead.
+On the client port the probes share the client connection cap, so a connection flood can still make an external check time out.
 
 ## Memory limit
 
@@ -78,6 +90,7 @@ A held body costs more than its size, because the connection's read buffer (up t
 Size the container's memory limit as 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB for the process baseline and response streaming.
 At the defaults that is 1.5 × 500 × 1 MiB + 64 MiB, about 814 MiB, and the Deployment's 1Gi limit leaves about 300 MiB over the measured peak.
 If you raise either flag, raise the limit with it; if the limit has to stay lower, lower one of the flags until the product fits (`--max-connections 256` needs about 448 MiB).
+The probe port is not counted in the formula: each open probe connection holds up to about 24 KiB of buffers for at most `--header-read-timeout`, and nothing caps how many are open, which is why it must stay unreachable from clients.
 
 ## Metrics scraping (ServiceMonitor)
 
