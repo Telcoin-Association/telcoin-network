@@ -14,6 +14,8 @@ mod governance_safe_fork;
 mod metrics;
 mod restarts;
 mod rpc_namespaces;
+#[cfg(unix)]
+mod sigkill;
 mod staking;
 mod state_export_import;
 mod sync;

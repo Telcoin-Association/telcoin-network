@@ -604,7 +604,7 @@ Limits of the benchmark:
 - Egress includes JSON-RPC traffic to the in-zone load generators (see [Networking](#networking)).
 - β_reth misses growth inside the execution database file (see [Storage](#storage)).
 - In the e2 run, bench-validator-03 in australia-southeast1 fell behind at 08:15Z and ran as a follower for 53 minutes. Its worker could not report one batch and re-sealed it 1,457 times, and the node's process never restarted. Consensus stayed live with 9 batch producers. The failure is tracked separately.
-- In the c3 run, bench-validator-05, restarted after the 5-minute kill, had not resumed execution when the run ended 30 minutes later. Its static files did not grow and it reported no execution or batch metrics after the restart, so the c3 run had 9 executing validators from the kill at 06:20Z and gives no replay figure. This also needs its own investigation.
+- In the c3 run, bench-validator-05, restarted after the 5-minute kill, had not resumed execution when the run ended 30 minutes later. Its static files did not grow and it reported no execution or batch metrics after the restart, so the c3 run had 9 executing validators from the kill at 06:20Z and gives no replay figure. The investigation and missing capture are tracked in [issue #1510](https://github.com/Telcoin-Association/telcoin-network/issues/1510).
 - An earlier e2 run, r20260923-0215, is superseded. A load-generator bug re-sent pending transactions, so about a third of its batch content was duplicates (1.33 executed transactions per landed transaction). No sizing figure on this page comes from it.
 
 ### Networks running today
