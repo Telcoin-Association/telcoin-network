@@ -135,8 +135,8 @@ impl ExecutionNodeInner {
 
     /// Initialize the worker's transaction pool and public RPC.
     /// Peer tracking is attached separately when the worker enters an epoch.
-    /// Must call this function in accending worker_id order or will panic,
-    /// for instance call for worker id 0, then 1, etc.
+    /// Worker ids must be consecutive, starting at zero. Reject existing or skipped ids before
+    /// creating a pool or binding RPC listeners.
     ///
     /// The pool receives the shared [`BaseFeeContainer`] so canonical updates always charge
     /// the current epoch's fee (issue #1262). The RPC server keeps the [`WorkerBaseFee`]
@@ -152,6 +152,11 @@ impl ExecutionNodeInner {
     where
         EP: EngineToPrimary + Send + Sync + 'static,
     {
+        eyre::ensure!(
+            usize::from(worker_id) == self.workers.len(),
+            "cannot initialize worker {worker_id}: next uninitialized worker is {}",
+            self.workers.len()
+        );
         let transaction_pool = self.reth_env.init_txn_pool(base_fee.clone())?;
 
         let network = WorkerNetwork::new(
@@ -182,10 +187,6 @@ impl ExecutionNodeInner {
 
         // take ownership of worker components
         let components = WorkerComponents::new(rpc_handle, server, transaction_pool, network);
-        // Must call this function in accending worker_id order or will panic.
-        if worker_id as usize != self.workers.len() {
-            panic!("initialize_worker_components not called with sequencial worker ids!")
-        }
         self.workers.push(components);
         Ok(())
     }
