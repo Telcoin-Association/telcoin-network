@@ -100,7 +100,7 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
-| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
+| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
@@ -147,6 +147,7 @@ cut off at the cap, so size it well above the longest legitimate transfer.
 It must be at least the gateway's single-request bound
 (`--header-read-timeout` + the whole-request deadline above) so the first
 request on a connection can never be cut off.
+With the default timeouts that bound is 55 s (10 s + 35 s + 10 s), and an explicit `--max-connection-duration` below it fails startup.
 
 Every request forwarded to a worker carries the `X-TN-Gateway` hop marker (calls
 sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
@@ -244,20 +245,23 @@ Size it from both ends:
 
 ### Transaction screening
 
-A single `eth_sendRawTransaction` call is decoded far enough to reject, at the
-edge, the two cases the worker would also reject — an undecodable payload and an
-EIP-4844 blob transaction (the network does not accept blobs) — saving a wasted
-upstream round-trip. The decode uses the same pooled wire format the worker's
-RPC accepts and never recovers the signer, so it cannot reject a transaction the
-worker would accept. Batches (JSON arrays) and every other method are forwarded
-unchanged and validated upstream: by the worker, or, with `--redirect-queries`,
-by the query URL for everything that is not a submission.
+Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions).
+This saves a wasted upstream round-trip.
+The decode uses the same pooled wire format the worker's RPC accepts and never recovers the signer, so it cannot reject a transaction the worker would accept.
+
+- The method name is read as the worker reads it, unicode escapes included.
+- The raw transaction is the first positional param, written as a hex string or as an array of byte values, the two shapes the worker accepts.
+- In a batch, the first refused element answers for the whole batch, with that element's `id`, and nothing is forwarded.
+- A submission with named params (`"params": {...}`) is not screened; the worker reads and validates those itself.
+- Only call objects are screened: a batch element written in positional form (a JSON array) counts as another call and is not screened.
+
+Mixed batches and every other method are forwarded unchanged and validated upstream: by the worker, or, with `--redirect-queries`, by the query URL for everything that is not a submission.
 
 ## Query redirect
 
 On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and nothing else.
 With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and every other call goes to the URL, typically a public RPC.
-Method names match exactly and case-sensitively.
+Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
 Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or bytes after the JSON value.
 
 The URL may be `http` or `https`; worker URLs stay `http` only.
@@ -373,7 +377,7 @@ Every limit is per process, so the worker sees the sum over all gateways.
 - **Rate.** The worker receives up to N × `--rate-limit-global` calls per second, where N is the largest number of gateways that can run at once: the HPA's `maxReplicas` if you install it (10 in the reference manifest).
   Size `--rate-limit-global` as the worker's budget divided by that N.
 - **Worker connections.** N × `--max-connections` can exceed the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
-  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s.
+  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s (reth's `--rpc.send-raw-transaction-sync-timeout`, inside the gateway's 35 s `--upstream-request-timeout`).
   Raise the worker's limit above N × `--max-connections`, or accept that a flood of Sync calls through one gateway can make the worker refuse submissions from the others.
 - **Memory.** Peak request memory per gateway is about `--max-connections` × `--max-request-bytes` plus overhead (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 

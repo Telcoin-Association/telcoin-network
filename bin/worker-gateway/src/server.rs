@@ -1006,6 +1006,41 @@ mod tests {
         format!("[{}]", (1..=len).map(|id| call(method, id)).collect::<Vec<_>>().join(","))
     }
 
+    /// An all-submission batch is screened element by element; the first bad
+    /// element answers for the batch with its own id, and nothing reaches an
+    /// upstream. A mixed batch is not screened: it goes whole to the query
+    /// upstream, which validates it.
+    #[tokio::test]
+    async fn bad_element_inside_an_all_submission_batch_is_refused_with_its_id() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // a submission without a raw transaction is left to the worker
+        let unscreened = call("eth_sendRawTransaction", 1);
+        let bad = |method: &str, id: &str| {
+            format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":["0xdeadbeef"],"id":{id}}}"#)
+        };
+        let body = format!(
+            "[{unscreened},{},{}]",
+            bad("eth_sendRawTransactionSync", r#""tx-2""#),
+            bad("eth_sendRawTransaction", "3")
+        );
+        let (status, text) = post_rpc(gateway, None, body).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(error_code_and_id(&text), (-32007, serde_json::json!("tx-2")));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
+
+        let (status, text) = post_rpc(gateway, None, format!("[{unscreened},{unscreened}]")).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        let mixed = format!("[{},{}]", bad("eth_sendRawTransaction", "4"), call("eth_chainId", 5));
+        let (status, text) = post_rpc(gateway, None, mixed).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+    }
+
     /// A batch of K calls costs K rate-limit tokens: one at the edge, before
     /// the body is read, and K - 1 once the handler has counted the calls. A
     /// per-IP burst of K - 1 refuses it; a burst of K admits it.

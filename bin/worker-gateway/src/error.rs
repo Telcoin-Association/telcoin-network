@@ -13,7 +13,7 @@ use axum::{
     response::Response,
 };
 use serde::{
-    de::{IgnoredAny, MapAccess, Visitor},
+    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::{json, Value};
@@ -242,6 +242,47 @@ impl RequestId {
             .map(|parsed| Self(parsed.0))
             .unwrap_or(Self(Value::Null))
     }
+
+    /// Best-effort recovery of the `id` of the call at `index` in an unparsed
+    /// batch body, read the way [`Self::recover`] reads a single call's.
+    ///
+    /// The elements before it are skipped in place and the ones after it
+    /// drained, so this too costs one scan of the body and materializes only
+    /// the one `id`. Anything that is not a batch with an object at `index`
+    /// recovers `null`.
+    pub(crate) fn recover_element(request_body: &[u8], index: usize) -> Self {
+        let mut deserializer = serde_json::Deserializer::from_slice(request_body);
+        (&mut deserializer)
+            .deserialize_seq(ElementIdVisitor { index })
+            .and_then(|id| deserializer.end().map(|()| Self(id)))
+            .unwrap_or(Self(Value::Null))
+    }
+}
+
+/// Visitor behind [`RequestId::recover_element`]: the `id` of the batch
+/// element at `index`, every other element skipped in place.
+struct ElementIdVisitor {
+    /// The position of the element whose id is kept.
+    index: usize,
+}
+
+impl<'de> Visitor<'de> for ElementIdVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC batch")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
+        for _ in 0..self.index {
+            if elements.next_element::<IgnoredAny>()?.is_none() {
+                return Ok(Value::Null);
+            }
+        }
+        let id = elements.next_element::<IdMember>()?.map_or(Value::Null, |IdMember(id)| id);
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(id)
+    }
 }
 
 /// Deserialization shim that materializes a request's `id` member and nothing
@@ -336,6 +377,20 @@ mod tests {
         // Last-wins is how a full parse into `Value` resolves a duplicated
         // member; recovery must not diverge from it on a malformed body.
         assert_eq!(recovered(br#"{"id":1,"id":2}"#), json!(2));
+    }
+
+    #[test]
+    fn recovers_the_id_of_a_batch_element() {
+        let batch = br#"[{"id":1},{"method":"m","params":["0x00"],"id":"tx-2"},{"id":[3]},7]"#;
+        let element = |index| RequestId::recover_element(batch, index).0;
+        assert_eq!(element(0), json!(1));
+        assert_eq!(element(1), json!("tx-2"));
+        assert_eq!(element(2), json!([3]));
+        // not an object, past the end, and not a batch at all
+        assert_eq!(element(3), Value::Null);
+        assert_eq!(element(4), Value::Null);
+        assert_eq!(RequestId::recover_element(br#"{"id":1}"#, 0).0, Value::Null);
+        assert_eq!(RequestId::recover_element(br#"[{"id":1}] trailing"#, 0).0, Value::Null);
     }
 
     #[test]

@@ -89,11 +89,14 @@ pub(crate) struct Cli {
     pub(crate) upstream_connect_timeout: Duration,
 
     /// Overall per-request deadline when forwarding to an upstream: a worker, or
-    /// the `--redirect-queries` endpoint.
+    /// the `--redirect-queries` endpoint. The default outlasts the 30 s reth
+    /// gives `eth_sendRawTransactionSync` to wait for its receipt
+    /// (`--rpc.send-raw-transaction-sync-timeout`), so a slow Sync call gets
+    /// the worker's own answer rather than a gateway timeout.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
-        default_value = "30s",
+        default_value = "35s",
         value_parser = humantime::parse_duration
     )]
     pub(crate) upstream_request_timeout: Duration,
@@ -615,15 +618,15 @@ mod tests {
 
     #[test]
     fn connection_cap_below_request_deadline_is_rejected() {
-        // Default single-request bound is 10s (header phase) + 30s + 10s
-        // (whole-request deadline) = 50s; a cap of the bare whole-request
-        // deadline (40s) could still cut off a request whose headers took the
+        // Default single-request bound is 10s (header phase) + 35s + 10s
+        // (whole-request deadline) = 55s; a cap of the bare whole-request
+        // deadline (45s) could still cut off a request whose headers took the
         // full header window to arrive.
         let result = Cli::parse_from([
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
-            "--max-connection-duration=40s",
+            "--max-connection-duration=45s",
         ])
         .into_settings();
         assert!(result.is_err(), "a cap below the single-request bound must be a startup error");
@@ -633,10 +636,23 @@ mod tests {
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
-            "--max-connection-duration=50s",
+            "--max-connection-duration=55s",
         ])
         .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
+    }
+
+    /// WG-32: reth gives `eth_sendRawTransactionSync` 30 s to wait for its
+    /// receipt by default (`--rpc.send-raw-transaction-sync-timeout`). The
+    /// gateway's default upstream deadline must outlast it, or a slow Sync
+    /// call races the gateway's own `504`.
+    #[test]
+    fn default_upstream_timeout_exceeds_reths_sync_deadline() -> eyre::Result<()> {
+        let reth_sync_deadline = Duration::from_secs(30);
+        let timeout = cli_with_flags(&[]).into_settings()?.upstream_request_timeout;
+        assert!(timeout > reth_sync_deadline, "{timeout:?}");
+        assert!(timeout >= Duration::from_secs(35), "{timeout:?}");
+        Ok(())
     }
 
     #[test]

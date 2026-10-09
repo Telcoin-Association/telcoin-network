@@ -190,12 +190,13 @@ pub(crate) async fn proxy(
         return error_response(&err, b"");
     }
 
-    // Shallow pre-flight for raw-transaction submissions: reject a payload the
-    // worker would also reject (undecodable, or a type the network does not
-    // accept) before paying for an upstream round-trip. The scan recovers the
+    // Shallow pre-flight for raw-transaction submissions, alone or in a batch
+    // of nothing but submissions: reject a payload the worker would also
+    // reject (undecodable, or a type the network does not accept) before
+    // paying for an upstream round-trip. The scan recovers the refused call's
     // request id itself on the paths that reject.
     if let Some((err, id)) = scan.rejection {
-        warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
+        warn!(target: "gateway::proxy", ?err, "rejecting a raw-transaction submission before forwarding");
         return error_response_with_id(&err, id);
     }
 
@@ -490,12 +491,11 @@ struct Scan {
 /// runs the rest of the batch.
 ///
 /// Routing: only a body made entirely of submissions ([`SUBMISSION_METHODS`])
-/// goes to the worker. Everything else goes to the query upstream, and so does
+/// goes to the worker. A method name is read as the worker reads it, unicode
+/// escapes included. Everything else goes to the query upstream, and so does
 /// everything ambiguous, which keeps it away from the validator: a body that
-/// is not JSON, a `method` that is not a string, an empty batch, bytes
-/// trailing the JSON value, and a method name spelled with unicode escapes
-/// when the plain name appears nowhere in the body (the substring test misses
-/// it, so no parse runs). `eth_sendTransaction` is a query too: no node
+/// is not JSON, a `method` that is not a string, an empty batch, and bytes
+/// trailing the JSON value. `eth_sendTransaction` is a query too: no node
 /// configures a signer, so the worker could only refuse it.
 ///
 /// A batch that mixes submissions with other calls goes, whole, to the query
@@ -506,20 +506,25 @@ struct Scan {
 /// submission just reaches the network through it instead of through this
 /// validator.
 ///
-/// Screening: a single `eth_sendRawTransaction` call is refused when its raw
-/// transaction cannot be decoded or decodes to a type the network does not
-/// accept (see [`screen_transaction`]). Every other request, including
-/// batches, other methods, any structurally-off submission and any body that
-/// is not exactly one JSON value, is forwarded unchanged.
+/// Screening: a submission, alone or in a batch made only of submissions, is
+/// refused when the raw transaction in its first positional param cannot be
+/// decoded or decodes to a type the network does not accept (see
+/// [`screen_transaction`]). In a batch the first refused element answers for
+/// the whole batch, with its own id, and later elements are not decoded.
+/// Every other request is forwarded unchanged: other methods, a mixed batch,
+/// a submission whose params are named or structurally off (the worker
+/// answers with its own parameter error), and a single call that is not
+/// exactly one JSON value.
 ///
 /// Cost: one deserializer reads the body, and every member the gateway does
 /// not act on is skipped in place, so the cost is a scan of the bytes rather
 /// than a `Value` tree several times the size of the request. Keys are matched
-/// where they lie and never copied; a `method` or raw transaction is copied
-/// only when it is written with escapes. The request id is not read at all:
-/// only a rejection needs it, and a rejection recovers it from the bytes with
-/// one more scan (see [`RequestId::recover`]), so a forwarded request never
-/// materializes its id, which is where all of a request's bulk can sit.
+/// where they lie and never copied; a `method` or hex raw transaction is
+/// copied only when it is written with escapes. The request id is not read at
+/// all: only a rejection needs it, and a rejection recovers it from the bytes
+/// with one more scan (see [`RequestId::recover`] and
+/// [`RequestId::recover_element`]), so a forwarded request never materializes
+/// its id, which is where all of a request's bulk can sit.
 fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
     // the worker's server drops leading ascii whitespace, form feed included,
     // before it reads a body, where json allows only four whitespace bytes;
@@ -527,10 +532,9 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
     // batch from the count or a call from the screen
     let body = body.trim_ascii_start();
     let batch = is_batch(body);
-    // fast path: a body that is not a batch and never names the
-    // raw-transaction method is one call and holds no submission, and nothing
-    // is parsed
-    if !batch && !mentions_send_raw_transaction(body) {
+    // fast path: a body that is not a batch and cannot name a submission
+    // method is one call and holds no submission, and nothing is parsed
+    if !batch && !may_name_a_submission(body) {
         return Scan { len: 1, calls: Calls::Queries, rejection: None, unreadable_batch: false };
     }
     let mut state = ScanState::default();
@@ -545,9 +549,17 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
         (true, true) => Calls::MixedBatch,
         _ => Calls::Queries,
     };
-    // a verdict on a body that is not exactly one json value is dropped: the
-    // body is forwarded and the upstream answers its parse error
-    let rejection = state.rejection.filter(|_| parsed).map(|err| (err, RequestId::recover(body)));
+    // a verdict stands only on a body of nothing but submissions that is
+    // exactly one json value: otherwise the body is forwarded, and the
+    // upstream answers its parse error or its other calls
+    let rejection =
+        state.rejection.filter(|_| calls == Calls::Submissions).map(|(err, element)| {
+            let id = element.map_or_else(
+                || RequestId::recover(body),
+                |index| RequestId::recover_element(body, index),
+            );
+            (err, id)
+        });
     Scan { len: if batch { state.len } else { 1 }, calls, rejection, unreadable_batch }
 }
 
@@ -572,8 +584,9 @@ struct ScanState {
     /// At least one call was something else, a batch element that is not an
     /// object included.
     other: bool,
-    /// The screen's verdict on a single submission, when it refuses it.
-    rejection: Option<GatewayError>,
+    /// The screen's verdict on the first submission it refuses, with the
+    /// refused call's index when it is a batch element.
+    rejection: Option<(GatewayError, Option<usize>)>,
 }
 
 impl ScanState {
@@ -587,10 +600,16 @@ impl ScanState {
     }
 
     /// Record one batch element; one that is not an object counts as another
-    /// call.
+    /// call. A submission is screened while the batch can still be all
+    /// submissions, up to the first one the screen refuses.
     fn record_element(&mut self, element: Element<'_>) {
         match element {
-            Element::Call(call) => self.record(call.method),
+            Element::Call(call) => {
+                self.record(call.method);
+                if !self.other && self.rejection.is_none() {
+                    self.rejection = call.screen().map(|err| (err, Some(self.len)));
+                }
+            }
             Element::Other => self.other = true,
         }
     }
@@ -621,15 +640,12 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
         formatter.write_str("a JSON-RPC request object or batch")
     }
 
-    /// A single call: classified, and screened when it is an
-    /// `eth_sendRawTransaction`.
+    /// A single call: classified, and screened when it is a submission.
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
         let call = Call::read(members)?;
         self.state.len = 1;
         self.state.record(call.method);
-        if call.method == RpcMethod::SendRawTransaction {
-            self.state.rejection = call.raw_transaction.as_deref().and_then(screen_transaction);
-        }
+        self.state.rejection = call.screen().map(|err| (err, None));
         Ok(())
     }
 
@@ -664,10 +680,9 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
 struct Call<'de> {
     /// The call's `method`.
     method: RpcMethod,
-    /// The first element of `params` when it is a string: the raw transaction,
-    /// if the call is a submission. Borrowed from the body unless it is
-    /// written with escapes.
-    raw_transaction: Option<Cow<'de, str>>,
+    /// The first element of `params` when it has a shape the worker reads as
+    /// bytes: the raw transaction, if the call is a submission.
+    raw_transaction: Option<RawTransaction<'de>>,
 }
 
 impl<'de> Call<'de> {
@@ -694,15 +709,22 @@ impl<'de> Call<'de> {
         }
         Ok(call)
     }
+
+    /// The screen's verdict on this call: `None` unless it is a submission
+    /// whose raw transaction the worker would refuse.
+    fn screen(&self) -> Option<GatewayError> {
+        if !self.method.is_submission() {
+            return None;
+        }
+        self.raw_transaction.as_ref().and_then(screen_transaction)
+    }
 }
 
 /// A call's `method`, reduced to what the gateway acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RpcMethod {
-    /// `eth_sendRawTransaction`.
-    SendRawTransaction,
-    /// `eth_sendRawTransactionSync`.
-    SendRawTransactionSync,
+    /// One of [`SUBMISSION_METHODS`].
+    Submission,
     /// Any other method, or a `method` that is not a string.
     Other,
 }
@@ -712,16 +734,16 @@ impl RpcMethod {
     /// [`SUBMISSION_METHODS`] exactly and case-sensitively, as jsonrpsee
     /// matches method names.
     fn named(name: Option<&str>) -> Self {
-        match name.filter(|name| SUBMISSION_METHODS.contains(name)) {
-            Some(SEND_RAW_TRANSACTION) => Self::SendRawTransaction,
-            Some(_) => Self::SendRawTransactionSync,
-            None => Self::Other,
+        if name.is_some_and(|name| SUBMISSION_METHODS.contains(&name)) {
+            Self::Submission
+        } else {
+            Self::Other
         }
     }
 
     /// Whether the method is one of [`SUBMISSION_METHODS`].
     fn is_submission(self) -> bool {
-        self != Self::Other
+        self == Self::Submission
     }
 }
 
@@ -782,14 +804,14 @@ impl<'de> Deserialize<'de> for Element<'de> {
     }
 }
 
-/// A `params` member reduced to its first element when that element is a
-/// string.
+/// A `params` member reduced to its first element when that element holds a
+/// raw transaction.
 ///
 /// The remaining elements are drained through the ignored-value sink, so a
 /// `params` array of any length costs a scan rather than an allocation per
 /// element. Named params (an object) and any other shape have no first
 /// element and leave the call to the upstream.
-struct FirstParam<'de>(Option<Cow<'de, str>>);
+struct FirstParam<'de>(Option<RawTransaction<'de>>);
 
 impl<'de> Lenient<'de> for FirstParam<'de> {
     fn other() -> Self {
@@ -797,7 +819,7 @@ impl<'de> Lenient<'de> for FirstParam<'de> {
     }
 
     fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
-        let first = elements.next_element::<MaybeStr<'de>>()?.and_then(|first| first.0);
+        let first = elements.next_element::<MaybeRawTransaction<'de>>()?.and_then(|first| first.0);
         while elements.next_element::<IgnoredAny>()?.is_some() {}
         Ok(Self(first))
     }
@@ -809,13 +831,91 @@ impl<'de> Deserialize<'de> for FirstParam<'de> {
     }
 }
 
+/// A raw transaction in one of the two shapes the worker's `Bytes` parameter
+/// accepts.
+enum RawTransaction<'de> {
+    /// A hex string, `0x`-prefixed or bare, borrowed from the body unless it
+    /// is written with escapes.
+    Hex(Cow<'de, str>),
+    /// An array of integers from 0 to 255.
+    Bytes(Vec<u8>),
+}
+
+impl RawTransaction<'_> {
+    /// The transaction's bytes, or `None` when the hex is not valid hex.
+    fn bytes(&self) -> Option<Cow<'_, [u8]>> {
+        match self {
+            Self::Hex(hex) => decode_hex(hex).map(Cow::Owned),
+            Self::Bytes(bytes) => Some(Cow::Borrowed(bytes)),
+        }
+    }
+}
+
+/// A first param kept only when it is a raw transaction: a string, or an
+/// array whose every element is an integer from 0 to 255, as alloy's `Bytes`
+/// reads it. Any other shape, an array holding anything else included, is
+/// consumed and discarded, and the worker answers it with its own parameter
+/// error.
+struct MaybeRawTransaction<'de>(Option<RawTransaction<'de>>);
+
+impl<'de> Lenient<'de> for MaybeRawTransaction<'de> {
+    fn other() -> Self {
+        Self(None)
+    }
+
+    fn borrowed_string(value: &'de str) -> Self {
+        Self(Some(RawTransaction::Hex(Cow::Borrowed(value))))
+    }
+
+    fn string(value: &str) -> Self {
+        Self(Some(RawTransaction::Hex(Cow::Owned(value.to_owned()))))
+    }
+
+    fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
+        let mut bytes = Vec::new();
+        while let Some(MaybeByte(byte)) = elements.next_element()? {
+            let Some(byte) = byte else {
+                while elements.next_element::<IgnoredAny>()?.is_some() {}
+                return Ok(Self(None));
+            };
+            bytes.push(byte);
+        }
+        Ok(Self(Some(RawTransaction::Bytes(bytes))))
+    }
+}
+
+impl<'de> Deserialize<'de> for MaybeRawTransaction<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+/// A value kept only when it is an integer from 0 to 255.
+struct MaybeByte(Option<u8>);
+
+impl Lenient<'_> for MaybeByte {
+    fn other() -> Self {
+        Self(None)
+    }
+
+    fn unsigned(value: u64) -> Self {
+        Self(u8::try_from(value).ok())
+    }
+}
+
+impl<'de> Deserialize<'de> for MaybeByte {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
 /// A value kept only when it is a string, borrowed from the body unless it is
 /// written with escapes; any other shape is consumed and discarded.
 ///
-/// The screen once read `method` and `params[0]` through `Value::as_str`,
-/// which yields `None` for a non-string without failing the parse. This
-/// reproduces that: a non-string in either position leaves the field unset
-/// and the request is forwarded, instead of the whole scan bailing out.
+/// The screen once read `method` through `Value::as_str`, which yields `None`
+/// for a non-string without failing the parse. This reproduces that: a
+/// `method` that is not a string reads as another call, instead of the whole
+/// scan bailing out.
 struct MaybeStr<'de>(Option<Cow<'de, str>>);
 
 impl<'de> Lenient<'de> for MaybeStr<'de> {
@@ -863,6 +963,11 @@ trait Lenient<'de>: Sized {
         Self::other()
     }
 
+    /// Read a non-negative integer.
+    fn unsigned(_value: u64) -> Self {
+        Self::other()
+    }
+
     /// Read an array.
     fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
         while elements.next_element::<IgnoredAny>()?.is_some() {}
@@ -894,8 +999,8 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
         Ok(T::other())
     }
 
-    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(T::other())
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(T::unsigned(value))
     }
 
     fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
@@ -931,8 +1036,8 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
     }
 }
 
-/// The screen's verdict on one raw transaction, given as hex: `None` to
-/// forward it, or the error to refuse it with.
+/// The screen's verdict on one raw transaction: `None` to forward it, or the
+/// error to refuse it with.
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
@@ -940,9 +1045,9 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 /// the worker would issue anyway. From here the payload is unambiguously a
 /// raw transaction, so a decode failure is a real rejection rather than a
 /// reason to forward.
-fn screen_transaction(raw_hex: &str) -> Option<GatewayError> {
-    decode_hex(raw_hex).map_or(Some(GatewayError::InvalidTransaction), |raw| {
-        let mut buf = raw.as_slice();
+fn screen_transaction(raw: &RawTransaction<'_>) -> Option<GatewayError> {
+    raw.bytes().map_or(Some(GatewayError::InvalidTransaction), |raw| {
+        let mut buf = raw.as_ref();
         match PooledTransaction::decode_2718(&mut buf) {
             Err(_) => Some(GatewayError::InvalidTransaction),
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
@@ -958,10 +1063,20 @@ fn is_batch(body: &[u8]) -> bool {
     body.first() == Some(&b'[')
 }
 
-/// Whether `body` is valid UTF-8 mentioning the raw-transaction method. JSON is
-/// UTF-8 by definition, so a non-UTF-8 body is not a JSON-RPC call we inspect.
-fn mentions_send_raw_transaction(body: &[u8]) -> bool {
-    std::str::from_utf8(body).is_ok_and(|text| text.contains(SEND_RAW_TRANSACTION))
+/// Whether `body` can name a submission method: it mentions the
+/// raw-transaction method (both submission methods contain it), or it holds a
+/// unicode escape, which can spell any name. No other JSON escape decodes to a
+/// letter or `_`.
+///
+/// The body need not be valid UTF-8: the worker's server skips an invalid
+/// byte inside a member it does not read and runs the call, so each valid
+/// stretch of the body is searched in place. Both needles are ASCII, so a
+/// match never spans an invalid byte.
+fn may_name_a_submission(body: &[u8]) -> bool {
+    body.utf8_chunks().any(|chunk| {
+        let text = chunk.valid();
+        text.contains(SEND_RAW_TRANSACTION) || text.contains("\\u")
+    })
 }
 
 /// Decode a `0x`-prefixed (or bare) hex string into bytes, or `None` if it is
@@ -1032,6 +1147,11 @@ mod tests {
         result.map(|(err, id)| (format!("{err:?}"), id))
     }
 
+    /// The substring gate the previous screen parsed behind.
+    fn mentions_send_raw_transaction(body: &[u8]) -> bool {
+        std::str::from_utf8(body).is_ok_and(|text| text.contains(SEND_RAW_TRANSACTION))
+    }
+
     /// The extraction this fix replaced, verbatim, kept as the reference the new
     /// member-by-member reader is checked against. Only the extraction differs;
     /// the decode and verdict below it are the same code in both paths.
@@ -1059,12 +1179,16 @@ mod tests {
         }
     }
 
-    /// The new reader must agree with the old `Value` parse on every shape, so
-    /// the fix is a memory change and not a behaviour change. In particular it
-    /// must not start rejecting anything it used to forward. The single
-    /// documented exception is an `id` nested past serde_json's recursion
-    /// limit, pinned by
-    /// [`deeply_nested_id_rejects_locally_where_the_old_parse_forwarded`].
+    /// The new reader must agree with the old `Value` parse on every shape the
+    /// old screen read, so the fix is a memory change and not a behaviour
+    /// change. In particular it must not start rejecting anything it used to
+    /// forward. The documented exceptions are an `id` nested past serde_json's
+    /// recursion limit, pinned by
+    /// [`deeply_nested_id_rejects_locally_where_the_old_parse_forwarded`], and
+    /// the shapes the screen reads since WG-32, which the old one forwarded
+    /// unread although the worker refuses them too: `eth_sendRawTransactionSync`,
+    /// an escaped method name, a byte-array param and a batch, each pinned by
+    /// its own test.
     #[test]
     fn extraction_matches_the_previous_value_parse() {
         let valid = format!("[\"{EIP155_LEGACY_TX}\"]");
@@ -1076,7 +1200,6 @@ mod tests {
             // Decodes cleanly, but to a type outside the batch allowlist.
             send_raw(&format!("[\"{}\"]", eip7702_raw_hex())),
             send_raw("[]"),
-            send_raw(r#"[123]"#),
             send_raw(r#"[null]"#),
             send_raw(r#"[{"nested":"object"}]"#),
             send_raw(r#"[["nested","array"]]"#),
@@ -1319,12 +1442,131 @@ mod tests {
 
     #[test]
     fn batched_send_raw_is_forwarded() {
-        // A batch is a JSON array with no top-level "method"; it is forwarded and
-        // validated per element by the worker.
+        // A batch of nothing but valid submissions passes the screen element
+        // by element and is forwarded.
         let body = format!(
             r#"[{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":1}}]"#
         );
         assert!(screen_raw_transaction(body.as_bytes()).is_none());
+    }
+
+    /// WG-32: `eth_sendRawTransactionSync` carries a raw transaction exactly
+    /// like `eth_sendRawTransaction`, and is screened the same way, alone and
+    /// in a batch.
+    #[test]
+    fn sync_submissions_are_screened() {
+        let sync = |params: &str, id: &str| {
+            format!(
+                r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransactionSync","params":{params},"id":{id}}}"#
+            )
+        };
+        let (err, id) = screen_raw_transaction(sync(r#"["0xdeadbeef"]"#, "9").as_bytes())
+            .expect("undecodable tx must be rejected");
+        assert!(matches!(err, GatewayError::InvalidTransaction));
+        assert_eq!(id, RequestId::from_id(serde_json::json!(9)));
+
+        let disallowed = sync(&format!("[\"{}\"]", eip7702_raw_hex()), "10");
+        assert!(matches!(
+            screen_err(disallowed.as_bytes()),
+            Some(GatewayError::UnsupportedTransactionType)
+        ));
+        let valid = sync(&format!("[\"{EIP155_LEGACY_TX}\"]"), "11");
+        assert!(screen_err(valid.as_bytes()).is_none());
+
+        let batch = format!("[{valid},{}]", sync(r#"["0xdeadbeef"]"#, r#""s-2""#));
+        let (err, id) =
+            screen_raw_transaction(batch.as_bytes()).expect("bad element must be rejected");
+        assert!(matches!(err, GatewayError::InvalidTransaction));
+        assert_eq!(id, RequestId::from_id(serde_json::json!("s-2")));
+    }
+
+    /// WG-32: a method name written with unicode escapes slipped past the
+    /// substring gate unread, while the worker unescapes it into a submission.
+    /// The scan now reads names as the worker does, member keys included.
+    #[test]
+    fn escaped_method_name_is_screened() {
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","params":["0xdeadbeef"],"id":5}"#,
+            r#"{"jsonrpc":"2.0","method":"\u0065th_sendRawTransactionSync","params":["0xdeadbeef"],"id":5}"#,
+            r#"{"jsonrpc":"2.0","m\u0065thod":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":5}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","p\u0061rams":["0xdeadbeef"],"id":5}"#,
+            r#"[{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","params":["0xdeadbeef"],"id":5}]"#,
+        ] {
+            assert_eq!(classify(body.as_bytes()), Calls::Submissions, "{body}");
+            let (err, id) = screen_raw_transaction(body.as_bytes()).expect(body);
+            assert!(matches!(err, GatewayError::InvalidTransaction), "{body}");
+            assert_eq!(id, RequestId::from_id(serde_json::json!(5)), "{body}");
+        }
+        // an escaped payload is decoded as the worker decodes it
+        let escaped_payload = format!(
+            r#"{{"method":"eth_sendRawTransaction","params":["\u0030x{}"],"id":6}}"#,
+            &EIP155_LEGACY_TX[2..]
+        );
+        assert!(screen_err(escaped_payload.as_bytes()).is_none());
+    }
+
+    /// WG-32: alloy's `Bytes`, the worker's parameter type, also reads an
+    /// array of integers from 0 to 255, so the screen reads that shape too.
+    /// An array holding anything else is not bytes to the worker either, and
+    /// is left to the worker's own parameter error.
+    #[test]
+    fn byte_array_param_is_screened() {
+        let as_array = |hex: &str| {
+            let bytes = decode_hex(hex).expect("hex");
+            let bytes: Vec<String> = bytes.iter().map(u8::to_string).collect();
+            send_raw(&format!("[[{}]]", bytes.join(",")))
+        };
+        assert!(screen_err(&as_array(EIP155_LEGACY_TX)).is_none(), "valid bytes are forwarded");
+        assert!(matches!(
+            screen_err(&as_array(&eip7702_raw_hex())),
+            Some(GatewayError::UnsupportedTransactionType)
+        ));
+        for params in ["[[222,173,190,239]]", "[[]]", "[[123]]"] {
+            let err = screen_err(&send_raw(params));
+            assert!(matches!(err, Some(GatewayError::InvalidTransaction)), "{params}");
+        }
+        for params in ["[[1,256]]", "[[-1]]", "[[1.0]]", r#"[[1,"2"]]"#, "[[[1]]]", "[[null]]"] {
+            assert!(screen_err(&send_raw(params)).is_none(), "{params}");
+        }
+    }
+
+    /// WG-32: named params have no first positional element, so the screen
+    /// leaves them to the worker, which reads and validates them itself.
+    #[test]
+    fn named_params_are_left_to_the_worker() {
+        let disallowed = format!(r#"{{"bytes":"{}"}}"#, eip7702_raw_hex());
+        for params in [r#"{"bytes":"0xdeadbeef"}"#, r#"{"0":"0xdeadbeef"}"#, disallowed.as_str()] {
+            let body = send_raw(params);
+            assert!(screen_err(&body).is_none(), "{params}");
+            assert_eq!(classify(&body), Calls::Submissions, "{params}");
+        }
+    }
+
+    /// The worker's server skips an invalid UTF-8 byte inside a member it
+    /// does not read and runs the call, so such a body is read and screened
+    /// like its UTF-8 twin.
+    #[test]
+    fn non_utf8_submission_is_screened() {
+        let body = |filler: &[u8], raw: &str| {
+            let mut body = br#"{"jsonrpc":"2.0","x":""#.to_vec();
+            body.extend_from_slice(filler);
+            body.extend_from_slice(
+                format!(r#"","method":"eth_sendRawTransaction","params":["{raw}"],"id":7}}"#)
+                    .as_bytes(),
+            );
+            body
+        };
+        for raw in [eip7702_raw_hex(), EIP155_LEGACY_TX.to_string()] {
+            let non_utf8 = body(&[0xff], &raw);
+            assert!(std::str::from_utf8(&non_utf8).is_err());
+            assert_eq!(classify(&non_utf8), Calls::Submissions);
+            assert_eq!(
+                verdict(screen_raw_transaction(&non_utf8)),
+                verdict(screen_raw_transaction(&body(b"a", &raw))),
+            );
+        }
+        let refused = screen_raw_transaction(&body(&[0xff], &eip7702_raw_hex()));
+        assert_eq!(refused.map(|(_, id)| id), Some(RequestId::recover(br#"{"id":7}"#)));
     }
 
     #[test]
@@ -1515,15 +1757,16 @@ mod tests {
         ] {
             assert_eq!(classify(call(method).as_bytes()), Calls::Queries, "{method:?}");
         }
-        // an escaped name misses the substring test, so nothing is parsed
+        // an escaped name is read as the worker reads it: one that unescapes
+        // to a case variant is a query like the variant, and one that
+        // unescapes to a submission is a submission (see
+        // `escaped_method_name_is_screened`)
+        let escaped_variant =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0074ransaction","params":[],"id":1}"#;
+        assert_eq!(classify(escaped_variant.as_bytes()), Calls::Queries);
         let escaped =
             r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","params":[],"id":1}"#;
-        assert_eq!(classify(escaped.as_bytes()), Calls::Queries);
-        // with the plain name elsewhere the parse runs and unescapes the method
-        // as the server would, so a real submission still reaches the worker;
-        // an escaped read can never unescape into a submission
-        let escaped_with_mention = r#"{"method":"eth_sendRaw\u0054ransaction","params":["eth_sendRawTransaction"],"id":1}"#;
-        assert_eq!(classify(escaped_with_mention.as_bytes()), Calls::Submissions);
+        assert_eq!(classify(escaped.as_bytes()), Calls::Submissions);
     }
 
     /// post-rev-11: a submission batched with an element that is not an
@@ -1594,6 +1837,7 @@ mod tests {
             r#"{"\udc00":1}"#,
             r#"{"jsonrpc":"2.0","method":1e400,"id":1}"#,
             r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[1e400],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[[1e400]],"id":1}"#,
         ];
         for trigger in triggers {
             for body in [
