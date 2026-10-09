@@ -372,6 +372,78 @@ class CollectorTests(unittest.TestCase):
                 else:
                     self.assertEqual(completed, [])
 
+    def test_process_reads_retain_per_hub_brackets_before_sequential_scrapes(self):
+        for delays, cores, genuine_breach in (((0.1, 1.6), 0.7, False), ((1.6, 0.1), 0.9, True)):
+            with self.subTest(delays=delays), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                profile, topology, protocol = [root / name for name in ("profile.json", "topology.json", "validator.jsonl")]
+                profile.write_text("{}")
+                topology.write_text(json.dumps({"population": {"validators": [{"bls_key": f"synthetic-{index}"} for index in range(2)]}}))
+                protocol.write_bytes(b"synthetic production log\n")
+                second_protocol = root / "validator-1.jsonl"
+                second_protocol.write_bytes(b"synthetic production log\n")
+                phase = {"revision": "a" * 40, "profile": {}, "binary_sha256": {"telcoin-network": "b" * 64}}
+                plan = {"hubs": ["hub-0", "hub-1"], "baseline": phase, "adapter_command": "synthetic-workload",
+                        "envelope": {"duration_seconds": 10, "committee_peers": 2}}
+                frozen = {"plan": plan, "plan_sha256": COLLECT.QUALIFY.digest(plan)}
+                bindings = {"hubs": {hub: {"revision": phase["revision"], "profile_path": str(profile),
+                    "pid": 42 + index, "metrics_url": f"http://synthetic.invalid/{hub}",
+                    "progress": {"name": "synthetic_progress"}} for index, hub in enumerate(plan["hubs"])},
+                    "workload": ["synthetic-workload"], "topology_artifact": str(topology),
+                    "protocol_logs": [str(protocol), str(second_protocol)]}
+                clock = {"time": 0.0, "hub0_scrapes": 0}
+
+                def process_read(pid, **_options):
+                    counter = cores * (clock["time"] + 0.001)
+                    clock["time"] += 0.002
+                    return {"rss_bytes": 1, "cpu_seconds": counter}, 1, f"{pid} (synthetic) stat"
+
+                def scrape(url, _deadline):
+                    if url.endswith("hub-0"):
+                        clock["time"] += delays[min(clock["hub0_scrapes"], 1)]
+                        clock["hub0_scrapes"] += 1
+                    return b""
+
+                child = mock.Mock()
+                child.poll.side_effect = lambda: 0 if clock["time"] >= 10 else None
+                child.wait.return_value = 0
+                output = root / "evidence"
+                # Exercise real process/HTTP ordering; synthetic hardware and workload
+                # fixtures bypass qualification and do not certify population capacity.
+                with mock.patch.object(COLLECT.QUALIFY, "validate_plan"), \
+                     mock.patch.object(COLLECT.QUALIFY, "validate_evidence"), \
+                     mock.patch.object(COLLECT.QUALIFY, "verify_artifacts"), \
+                     mock.patch.object(COLLECT, "validate_process"), \
+                     mock.patch.object(COLLECT, "file_hash", return_value="b" * 64), \
+                     mock.patch.object(COLLECT, "process_sample", side_effect=process_read), \
+                     mock.patch.object(COLLECT, "observations", return_value={}), \
+                     mock.patch.object(COLLECT, "read_operations", return_value={}), \
+                     mock.patch.object(COLLECT.subprocess, "Popen", return_value=child), \
+                     mock.patch.object(COLLECT, "metrics_get", side_effect=scrape), \
+                     mock.patch.object(COLLECT.time, "monotonic", side_effect=lambda: clock["time"]), \
+                     mock.patch.object(COLLECT.time, "sleep", side_effect=lambda seconds: clock.update(time=clock["time"] + seconds)):
+                    run = COLLECT.collect(frozen, bindings, "baseline", output)
+                rows = [json.loads(line) for path in sorted(output.glob("telemetry-*.jsonl"))
+                        for line in path.read_text().splitlines()]
+                self.assertEqual(len(rows), len(run["samples"]) * 2)
+                for row in rows:
+                    sample = next(sample for sample in run["samples"] if sample["elapsed_seconds"] == row["elapsed_seconds"])
+                    hub = sample["hubs"][row["hub"]]
+                    for field in ("process_sample_started_elapsed_seconds", "process_sample_completed_elapsed_seconds", "process_sample_elapsed_seconds"):
+                        self.assertEqual(row[field], hub[field])
+                    self.assertAlmostEqual(hub["process_sample_completed_elapsed_seconds"] - hub["process_sample_started_elapsed_seconds"], 0.002)
+                    self.assertLessEqual(hub["process_sample_completed_elapsed_seconds"], row["scrape_started_elapsed_seconds"])
+                    self.assertEqual(row["clock_ticks_per_second"], COLLECT.os.sysconf("SC_CLK_TCK"))
+                first, second = run["samples"][:2]
+                first_hub, second_hub = first["hubs"]["hub-1"], second["hubs"]["hub-1"]
+                self.assertAlmostEqual(second["elapsed_seconds"] - first["elapsed_seconds"], 2)
+                self.assertGreater(first_hub["process_sample_started_elapsed_seconds"], first["elapsed_seconds"])
+                delta = second_hub["cpu_seconds"] - first_hub["cpu_seconds"]
+                old_rate = delta / (second["elapsed_seconds"] - first["elapsed_seconds"])
+                conservative_rate = delta / (second_hub["process_sample_started_elapsed_seconds"] - first_hub["process_sample_completed_elapsed_seconds"])
+                self.assertEqual(old_rate > 0.75, not genuine_breach)
+                self.assertEqual(conservative_rate > 0.75, genuine_breach)
+
     def test_full_mapping_and_worker_omission(self):
         binding = {"progress": {"name": "progress"}, "dao_connected": {"name": "dao"}}
         parsed = COLLECT.parse_metrics(telemetry())

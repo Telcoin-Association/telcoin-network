@@ -366,6 +366,15 @@ fresh run to qualify with completed-output progress.
 Process restarts, missing metrics, sparse sampling, invalid observations and
 incomplete workloads fail collection.
 
+Each hub's CPU sample retains monotonic timestamps immediately before and after
+the process read, before its HTTP metrics request. The scorer divides CPU usage
+by the interval from the previous read's completion to the current read's start.
+This conservative interval must be positive and at most five seconds, so read
+uncertainty cannot reduce the measured CPU rate. Scored timestamps and counters
+must match the retained raw process records, including clock tick rate and
+process identity. Malformed or incomplete telemetry fails verification. Captures
+without these read boundaries require a fresh paired baseline and candidate run.
+
 The output retains the frozen plan, workload manifest, runtime and topology
 declarations, public deployment hashes, raw process/Prometheus samples, all four
 validator logs and nonce-bound operation traces. The final scorer verifies raw

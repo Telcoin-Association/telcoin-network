@@ -134,6 +134,16 @@ def integer(value, name, minimum=1):
     return value
 
 
+def process_sample_times(hub):
+    """Require the descriptive timestamp to be bound to the process-read bracket."""
+    started = number(hub.get("process_sample_started_elapsed_seconds"), "process sample start")
+    completed = number(hub.get("process_sample_completed_elapsed_seconds"), "process sample completion")
+    timestamp = number(hub.get("process_sample_elapsed_seconds"), "process sample time")
+    if completed < started or timestamp != started + (completed - started) / 2:
+        fail("process sample time must be the midpoint of its retained read bracket")
+    return started, completed
+
+
 def validate_plan(plan):
     """Check the complete declaration before either workload is scored."""
     if type(plan.get("version")) is not int or plan["version"] != 1:
@@ -228,14 +238,24 @@ def validate_evidence(plan, evidence, phase):
             fail("every raw artifact requires a path and SHA-256")
     swarms = {"primary", "worker-0", "worker-1"}
     previous = None
-    for sample in evidence["samples"]:
+    previous_process = {}
+    samples = evidence["samples"]
+    for index, sample in enumerate(samples):
         timestamp = number(sample["elapsed_seconds"], "sample time")
         if previous is not None and not 0 < timestamp - previous <= 5:
             fail("samples must be monotonic, no more than five seconds apart")
         previous = timestamp
         if set(sample["hubs"]) != set(plan["hubs"]):
             fail("every sample must cover every hub process")
-        for hub in sample["hubs"].values():
+        next_loop = (number(samples[index + 1]["elapsed_seconds"], "next sample time")
+                     if index + 1 < len(samples) else plan["envelope"]["duration_seconds"] + 30)
+        for hub_id, hub in sample["hubs"].items():
+            process_started, process_completed = process_sample_times(hub)
+            if process_started < timestamp or process_completed > next_loop:
+                fail("process read bracket lies outside its collection loop or drain budget")
+            if hub_id in previous_process and not 0 < process_started - previous_process[hub_id] <= 5:
+                fail("process read brackets must have a positive CPU interval no more than five seconds")
+            previous_process[hub_id] = process_completed
             number(hub["rss_bytes"], "whole-process RSS", 1)
             number(hub["cpu_seconds"], "whole-process CPU")
             integer(hub["progress"], "application progress", 0)
@@ -265,7 +285,6 @@ def validate_evidence(plan, evidence, phase):
                 integer(count, "task occupancy", 0)
             if hub["tasks"] != totals:
                 fail("process serve occupancy must equal the measured primary and worker totals")
-    samples = evidence["samples"]
     if len(samples) < 2 or samples[0]["elapsed_seconds"] != 0:
         fail("capture must start at zero and contain multiple samples")
     if samples[-1]["elapsed_seconds"] < plan["envelope"]["duration_seconds"]:
@@ -344,7 +363,14 @@ def score(plan, evidence):
         for previous, sample in zip(evidence["samples"], evidence["samples"][1:]):
             hub = sample["hubs"][hub_id]
             delta = hub["cpu_seconds"] - previous_cpu
-            if delta < 0 or delta / (sample["elapsed_seconds"] - previous["elapsed_seconds"]) > bounds["max_cpu_cores"]:
+            # The counter was read somewhere inside each bracket. Use the shortest
+            # possible interval so read uncertainty cannot hide a CPU threshold breach.
+            previous_completed = process_sample_times(previous["hubs"][hub_id])[1]
+            current_started = process_sample_times(hub)[0]
+            interval = current_started - previous_completed
+            if not 0 < interval <= 5:
+                fail("process read brackets must have a positive CPU interval no more than five seconds")
+            if delta < 0 or delta / interval > bounds["max_cpu_cores"]:
                 failures.append(f"{hub_id}: CPU headroom exhausted or process restarted")
             previous_cpu = hub["cpu_seconds"]
             if hub["progress"] < previous_progress:
@@ -384,18 +410,32 @@ def raw_artifact_limit(path):
     return MAX_PROTOCOL_LOG_BYTES if re.fullmatch(r"protocol-[0-9]{2}\.jsonl", path) else MAX_RAW_ARTIFACT_BYTES
 
 
-def raw_records(path, expected_hash, maximum_line):
-    """Scan bounded hash-bound records and retain their exact byte provenance."""
+def raw_records(path, expected_hash, maximum_line, *, strict=False):
+    """Scan bounded hash-bound records, requiring complete JSONL in strict CPU mode."""
+    def unique_fields(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                fail(f"duplicate retained process telemetry field: {path.name}")
+            record[key] = value
+        return record
+
     hasher = hashlib.sha256()
     offset = 0
     with path.open("rb") as stream:
         while line := stream.readline(maximum_line + 1):
             if len(line) > maximum_line:
                 fail(f"raw line exceeds bounded input size: {path.name}")
+            if strict and (not line.endswith(b"\n") or not line.strip()):
+                fail(f"invalid retained process telemetry record: {path.name}")
             hasher.update(line)
             try:
-                record = json.loads(line)
+                record = (json.loads(line, object_pairs_hook=unique_fields,
+                                     parse_constant=lambda _: fail("nonfinite retained process telemetry value"))
+                          if strict else json.loads(line))
             except (ValueError, UnicodeError):
+                if strict:
+                    fail(f"invalid retained process telemetry record: {path.name}")
                 if b"committee_" in line or path.name == "operations.jsonl":
                     fail(f"invalid retained committee record: {path.name}")
             else:
@@ -553,6 +593,60 @@ def reconcile_committee(evidence, directory):
         fail("committee summary differs from hash-bound raw operations")
 
 
+def reconcile_process_samples(evidence, directory):
+    """Bind scored CPU counters and read brackets to hash-checked raw process stats."""
+    samples = evidence["samples"]
+    expected = {(sample["elapsed_seconds"], hub_id): (hub,
+                samples[index + 1]["elapsed_seconds"] if index + 1 < len(samples)
+                else evidence["envelope"]["duration_seconds"] + 30)
+                for index, sample in enumerate(samples) for hub_id, hub in sample["hubs"].items()}
+    seen, identities = set(), {}
+    clock_ticks = None
+    telemetry = [artifact for artifact in evidence["artifacts"]
+                 if re.fullmatch(r"telemetry-[0-9]{3}\.jsonl", artifact["path"])]
+    if not telemetry:
+        fail("CPU scoring requires retained raw process telemetry with read brackets")
+    for artifact in sorted(telemetry, key=lambda entry: entry["path"]):
+        for _, _, record in raw_records(directory / artifact["path"], artifact["sha256"], 8 * 1024**2, strict=True):
+            if not isinstance(record, dict):
+                fail("raw process sample must be an object")
+            elapsed = number(record.get("elapsed_seconds"), "raw sample time")
+            hub_id = record.get("hub")
+            if not isinstance(hub_id, str) or (elapsed, hub_id) not in expected or (elapsed, hub_id) in seen:
+                fail("duplicate, orphan, or extra raw process sample")
+            key = elapsed, hub_id
+            hub, next_loop = expected[key]
+            process_started, process_completed = process_sample_times(record)
+            if (process_started, process_completed) != process_sample_times(hub) or record["process_sample_elapsed_seconds"] != hub["process_sample_elapsed_seconds"]:
+                fail("scored process timing differs from its retained raw read bracket")
+            scrape_started = number(record.get("scrape_started_elapsed_seconds"), "raw scrape start")
+            scrape_completed = number(record.get("scrape_completed_elapsed_seconds"), "raw scrape completion")
+            if not elapsed <= process_started <= process_completed <= scrape_started <= scrape_completed <= next_loop:
+                fail("raw process read must precede its HTTP scrape within the collection loop")
+            ticks = integer(record.get("clock_ticks_per_second"), "raw process clock ticks")
+            if clock_ticks is not None and ticks != clock_ticks:
+                fail("raw process clock tick rate changed during collection")
+            clock_ticks = ticks
+            stat = record.get("stat")
+            pid = integer(record.get("pid"), "raw process pid")
+            if not isinstance(stat, str) or re.match(rf"{pid} \(.*\) ", stat, re.DOTALL) is None:
+                fail("raw process stat does not match its retained pid")
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) < 22 or any(re.fullmatch(r"[0-9]+", fields[index]) is None for index in (11, 12, 19)):
+                fail("raw process stat is incomplete or has invalid CPU/identity fields")
+            cpu = (integer(int(fields[11]), "raw user CPU ticks", 0) +
+                   integer(int(fields[12]), "raw system CPU ticks", 0)) / ticks
+            if cpu != hub["cpu_seconds"]:
+                fail("scored CPU counter differs from its retained raw process stat")
+            identity = pid, integer(int(fields[19]), "raw process identity", 0)
+            if hub_id in identities and identities[hub_id] != identity:
+                fail("raw process restarted during qualification")
+            identities[hub_id] = identity
+            seen.add(key)
+    if seen != expected.keys():
+        fail("missing raw process sample or read bracket")
+
+
 def verify_artifacts(evidence, directory):
     """Verify retained raw files without loading whole logs into memory."""
     if len(evidence["artifacts"]) > 64:
@@ -570,6 +664,8 @@ def verify_artifacts(evidence, directory):
                 hasher.update(chunk)
         if hasher.hexdigest() != artifact["sha256"]:
             fail(f"raw artifact digest mismatch: {artifact['path']}")
+    if "samples" in evidence:
+        reconcile_process_samples(evidence, directory)
     if "operations" in evidence:
         reconcile_committee(evidence, directory)
 

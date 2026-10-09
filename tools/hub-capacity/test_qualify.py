@@ -75,6 +75,7 @@ def evidence(plan, phase="candidate"):
         observation = copy.deepcopy(hub)
         observation["cpu_seconds"] = second
         observation["progress"] = 1 + second
+        observation.update(process_timing(second))
         samples.append({"elapsed_seconds": second, "hubs": {name: copy.deepcopy(observation) for name in plan["hubs"]}})
     return {"phase": phase, "plan_sha256": QUALIFY.digest(plan),
             "revision": plan[phase]["revision"],
@@ -86,6 +87,41 @@ def evidence(plan, phase="candidate"):
                  "elapsed_seconds": index * 60 + (0.01 if scenario == "committee_progress" else 0),
                  "hops": 2, "rejection_reason": None}
                 for index in range(10)] for scenario in QUALIFY.SCENARIOS}}
+
+
+def process_timing(started, completed=None):
+    completed = started if completed is None else completed
+    return {"process_sample_started_elapsed_seconds": started,
+            "process_sample_completed_elapsed_seconds": completed,
+            "process_sample_elapsed_seconds": started + (completed - started) / 2}
+
+
+def retain_process_telemetry(run, directory):
+    """Retain synthetic process reads for artifact validation, never qualification."""
+    path = directory / "telemetry-000.jsonl"
+    existing = {(row["elapsed_seconds"], row["hub"]): row
+                for row in (json.loads(line) for line in path.read_text().splitlines())} if path.exists() else {}
+    pids = {row["hub"]: row["pid"] for row in existing.values()}
+    rows = []
+    for sample in run["samples"]:
+        for index, (hub_id, hub) in enumerate(sample["hubs"].items()):
+            fields = ["S"] + ["0"] * 21
+            fields[11] = str(round(hub["cpu_seconds"] * 100))
+            fields[19] = "123"
+            fields[21] = "1"
+            pid = pids.get(hub_id, 42 + index)
+            rows.append({"metrics": "", "workload_completed_before_sample": False,
+                         **existing.get((sample["elapsed_seconds"], hub_id), {}),
+                         "hub": hub_id, "elapsed_seconds": sample["elapsed_seconds"],
+                         "pid": pid, "stat": f"{pid} (synthetic hub) " + " ".join(fields),
+                         "clock_ticks_per_second": 100,
+                         **{field: hub[field] for field in process_timing(0)},
+                         "scrape_started_elapsed_seconds": hub["process_sample_completed_elapsed_seconds"],
+                         "scrape_completed_elapsed_seconds": hub["process_sample_completed_elapsed_seconds"]})
+    path.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    run["artifacts"] = [artifact for artifact in run["artifacts"] if artifact["path"] != path.name]
+    run["artifacts"].append({"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    return path
 
 
 class QualificationTests(unittest.TestCase):
@@ -157,6 +193,8 @@ class QualificationTests(unittest.TestCase):
     def test_native_committee_deadline_is_exclusive_at_microsecond_precision(self):
         sample = copy.deepcopy(self.run["samples"][-1])
         sample["elapsed_seconds"] = 605
+        for hub in sample["hubs"].values():
+            hub.update(process_timing(605))
         self.run["samples"].append(sample)
         for ended in (0.000999, 0.001, 0.001001, 600.000999, 600.001, 600.001001):
             for success, cancelled in ((True, False), (False, False), (False, True)):
@@ -175,6 +213,8 @@ class QualificationTests(unittest.TestCase):
     def test_predeadline_drain_outcomes_preserve_denominators(self):
         sample = copy.deepcopy(self.run["samples"][-1])
         sample["elapsed_seconds"] = 605
+        for hub in sample["hubs"].values():
+            hub.update(process_timing(605))
         self.run["samples"].append(sample)
         operations = self.run["operations"]["committee_progress"]
         operations.extend({"id": f"native-{index}", "success": success, "cancelled": cancelled,
@@ -192,6 +232,8 @@ class QualificationTests(unittest.TestCase):
     def test_postdeadline_committee_success_cannot_omit_cancellation_state_to_pass(self):
         sample = copy.deepcopy(self.run["samples"][-1])
         sample["elapsed_seconds"] = 605
+        for hub in sample["hubs"].values():
+            hub.update(process_timing(605))
         self.run["samples"].append(sample)
         self.run["operations"]["committee_progress"].append({
             "id": "late-success", "success": True, "latency_ms": 1,
@@ -256,6 +298,9 @@ class QualificationTests(unittest.TestCase):
                 fixture.update({key: raw[key] for key in ("measurement_start_unix_us", "committee_sources", "artifacts")})
                 fixture["operations"]["committee_progress"] = raw["operations"]["committee_progress"]
                 fixture["samples"].append({"elapsed_seconds": 600.5, "hubs": copy.deepcopy(fixture["samples"][-1]["hubs"])})
+                for hub in fixture["samples"][-1]["hubs"].values():
+                    hub.update(process_timing(600.5))
+                retain_process_telemetry(fixture, phase_root)
                 paths[phase] = phase_root / "evidence.json"
                 fixture["serializer_fixture_padding"] = "x" * QUALIFY.MAX_BYTES
                 COLLECT.write_evidence(paths[phase], fixture)

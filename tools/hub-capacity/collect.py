@@ -406,6 +406,7 @@ def collect(frozen, bindings, phase, output):
     fences, previous_watermarks = {}, {}
     write_committee_fences(fence_path, started_unix_us, duration, fences)
     samples = []
+    clock_ticks = os.sysconf("SC_CLK_TCK")
     child = None
     try:
         with workload_log.open("xb") as log:
@@ -421,7 +422,14 @@ def collect(frozen, bindings, phase, output):
                 elapsed = 0.0 if not samples else time.monotonic() - started
                 hubs = {}
                 for hub, binding in bindings["hubs"].items():
-                    process, identity, stat = process_sample(binding["pid"])
+                    process_started = time.monotonic() - started
+                    process, identity, stat = process_sample(binding["pid"], ticks=clock_ticks)
+                    process_completed = time.monotonic() - started
+                    process_timing = {
+                        "process_sample_started_elapsed_seconds": process_started,
+                        "process_sample_completed_elapsed_seconds": process_completed,
+                        "process_sample_elapsed_seconds": process_started + (process_completed - process_started) / 2,
+                    }
                     if identity != identities[hub]:
                         raise ValueError(f"{hub}: process restarted during qualification")
                     scrape_started = time.monotonic()
@@ -465,12 +473,14 @@ def collect(frozen, bindings, phase, output):
                             write_committee_fences(fence_path, started_unix_us, duration, fences)
                     raw.append({"hub": hub, "elapsed_seconds": elapsed,
                                 "pid": binding["pid"], "stat": stat, "metrics": text,
+                                **process_timing, "clock_ticks_per_second": clock_ticks,
                                 "workload_completed_before_sample": completed_before_sample,
                                 "scrape_started_unix_us": scrape_started_unix_us,
                                 "scrape_started_elapsed_seconds": scrape_started - started,
                                 "scrape_completed_elapsed_seconds": scrape_completed - started,
                                 "committee_fence": fences.get(committee_sources[hub])})
-                    hubs[hub] = {**process, **observations(capacity_metrics(text, binding["progress"]["name"]), binding, phase)}
+                    hubs[hub] = {**process, **process_timing,
+                                 **observations(capacity_metrics(text, binding["progress"]["name"]), binding, phase)}
                 samples.append({"elapsed_seconds": elapsed, "hubs": hubs})
                 if time.monotonic() >= drain_deadline:
                     raise ValueError("sample processing exceeded workload drain deadline")
