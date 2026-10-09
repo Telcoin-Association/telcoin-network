@@ -16,7 +16,9 @@
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, marker::PhantomData, net::SocketAddr, time::Duration};
+use std::{
+    borrow::Cow, fmt, marker::PhantomData, net::SocketAddr, num::NonZeroUsize, time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -53,6 +55,14 @@ use crate::{
 /// large, so peak request memory is roughly `--max-connections` times this value
 /// (see the README's "Request size" section).
 pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+
+/// Default maximum number of calls in one JSON-RPC batch (`--max-batch-len`).
+///
+/// Neither the worker nor jsonrpsee bounds a batch's length, so without a cap
+/// one request can carry as many calls as fit in the body: thousands in the
+/// 1 MiB default, about 135k in the worker's own 15 MiB request cap. 50 is far
+/// above what a wallet or an exchange batches in practice.
+pub(crate) const DEFAULT_MAX_BATCH_LEN: usize = 50;
 
 /// The one JSON-RPC method whose payload the gateway inspects before
 /// forwarding (a raw-transaction submission).
@@ -141,9 +151,27 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
-    // One pass over the body answers both questions asked of it below: whether
-    // the transaction screen refuses it, and where it routes.
-    let scan = scan(body.as_ref());
+    // One pass over the body answers every question asked of it below: how
+    // many calls it carries, whether the transaction screen refuses it, and
+    // where it routes.
+    let scan = scan(body.as_ref(), state.max_batch_len);
+
+    // A batch the scan could not read to its end has an unknown length: the
+    // worker skips an element serde's typed readers refuse (an out-of-range
+    // number, an unpaired surrogate escape) and runs the rest, so forwarding
+    // it would dodge the length cap. It is refused whole and has no single id
+    // to echo.
+    if scan.unreadable_batch {
+        warn!(target: "gateway::proxy", "rejecting a batch the gateway cannot read to its end");
+        return error_response(&GatewayError::UnreadableBody, b"");
+    }
+
+    // A batch over the length cap is refused whole. A batch has no single id
+    // to echo, so the error carries `null`.
+    if state.max_batch_len.is_some_and(|max| scan.len > max.get()) {
+        warn!(target: "gateway::proxy", "rejecting a batch longer than --max-batch-len");
+        return error_response(&GatewayError::BatchTooLong, b"");
+    }
 
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
     // worker would also reject (undecodable, or a type the network does not
@@ -418,15 +446,31 @@ impl Calls {
 /// What one pass over a request body found: where the body routes and whether
 /// the transaction screen refuses it.
 struct Scan {
+    /// How many calls the body carries: 1 for anything but a batch, and for a
+    /// batch its element count, which stops one past the length cap.
+    len: usize,
     /// How the body routes under `--redirect-queries`.
     calls: Calls,
     /// The screen's verdict: the error and the request id to answer it with,
     /// or `None` to forward the body.
     rejection: Option<(GatewayError, RequestId)>,
+    /// A batch the pass could not read to its end for any reason but the
+    /// length cap, so `len` is only a lower bound on its calls.
+    unreadable_batch: bool,
 }
 
-/// Read a request body once, classifying it for `--redirect-queries` and
-/// screening its raw-transaction submission in the same pass.
+/// Read a request body once, counting its calls, classifying it for
+/// `--redirect-queries` and screening its raw-transaction submission in the
+/// same pass.
+///
+/// Length: a batch's elements are counted, every element whatever its shape,
+/// and the count stops one past `max_batch_len` (`None` counts them all), so
+/// the caller can refuse an over-length batch having paid for no more than
+/// the cap. A batch the pass cannot read to its end for any other reason is
+/// reported as unreadable, because its count is then only a lower bound: an
+/// element serde's typed readers refuse (an out-of-range number, an unpaired
+/// surrogate escape) ends the pass, while the worker skips that element and
+/// runs the rest of the batch.
 ///
 /// Routing: only a body made entirely of submissions ([`SUBMISSION_METHODS`])
 /// goes to the worker. Everything else goes to the query upstream, and so does
@@ -459,18 +503,26 @@ struct Scan {
 /// only a rejection needs it, and a rejection recovers it from the bytes with
 /// one more scan (see [`RequestId::recover`]), so a forwarded request never
 /// materializes its id, which is where all of a request's bulk can sit.
-fn scan(body: &[u8]) -> Scan {
-    // fast path: a body that never names the raw-transaction method holds no
-    // submission, and nothing is parsed
-    if !mentions_send_raw_transaction(body) {
-        return Scan { calls: Calls::Queries, rejection: None };
+fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
+    // the worker's server drops leading ascii whitespace, form feed included,
+    // before it reads a body, where json allows only four whitespace bytes;
+    // the scan reads the body the worker reads, so a prefix cannot hide a
+    // batch from the count or a call from the screen
+    let body = body.trim_ascii_start();
+    let batch = is_batch(body);
+    // fast path: a body that is not a batch and never names the
+    // raw-transaction method is one call and holds no submission, and nothing
+    // is parsed
+    if !batch && !mentions_send_raw_transaction(body) {
+        return Scan { len: 1, calls: Calls::Queries, rejection: None, unreadable_batch: false };
     }
     let mut state = ScanState::default();
     let mut deserializer = body_deserializer(body);
     let parsed = deserializer
-        .deserialize_any(ScanVisitor { state: &mut state })
+        .deserialize_any(ScanVisitor { state: &mut state, max_batch_len })
         .and_then(|()| deserializer.end())
         .is_ok();
+    let unreadable_batch = batch && !parsed && !state.capped;
     let calls = match (state.submission, state.other) {
         (true, false) if parsed => Calls::Submissions,
         (true, true) => Calls::MixedBatch,
@@ -479,7 +531,7 @@ fn scan(body: &[u8]) -> Scan {
     // a verdict on a body that is not exactly one json value is dropped: the
     // body is forwarded and the upstream answers its parse error
     let rejection = state.rejection.filter(|_| parsed).map(|err| (err, RequestId::recover(body)));
-    Scan { calls, rejection }
+    Scan { len: if batch { state.len } else { 1 }, calls, rejection, unreadable_batch }
 }
 
 /// The deserializer a request body is read with. [`scan`] is its only caller,
@@ -494,6 +546,10 @@ fn body_deserializer(body: &[u8]) -> serde_json::Deserializer<SliceRead<'_>> {
 /// so [`scan`] can still read it after an error ends the pass early.
 #[derive(Debug, Default)]
 struct ScanState {
+    /// Calls read so far: 1 for a single call, the elements read for a batch.
+    len: usize,
+    /// The length cap, not a reader, ended the pass.
+    capped: bool,
     /// At least one call was a submission.
     submission: bool,
     /// At least one call was something else, a batch element that is not an
@@ -512,16 +568,33 @@ impl ScanState {
             self.other = true;
         }
     }
+
+    /// Record one batch element; one that is not an object counts as another
+    /// call.
+    fn record_element(&mut self, element: Element<'_>) {
+        match element {
+            Element::Call(call) => self.record(call.method),
+            Element::Other => self.other = true,
+        }
+    }
+
+    /// Whether the calls read so far mix submissions with other calls.
+    fn is_mixed(&self) -> bool {
+        self.submission && self.other
+    }
 }
 
 /// Visitor behind [`scan`]: a single call or a batch of calls.
 ///
 /// An error here is a verdict, not a failure, when it ends a batch scan early
-/// (the batch is mixed); otherwise it means the body is not well-formed JSON.
-/// [`scan`] reads what the state recorded either way.
+/// (the batch is over the length cap); otherwise the body is not well-formed
+/// JSON or holds a value serde's typed readers refuse. [`scan`] reads what the
+/// state recorded either way.
 struct ScanVisitor<'s> {
     /// Where the pass records what it has met.
     state: &'s mut ScanState,
+    /// The length cap a batch count stops one past, or `None` for no cap.
+    max_batch_len: Option<NonZeroUsize>,
 }
 
 impl<'de> Visitor<'de> for ScanVisitor<'_> {
@@ -535,6 +608,7 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
     /// `eth_sendRawTransaction`.
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
         let call = Call::read(members)?;
+        self.state.len = 1;
         self.state.record(call.method);
         if call.method == RpcMethod::SendRawTransaction {
             self.state.rejection = call.raw_transaction.as_deref().and_then(screen_transaction);
@@ -542,21 +616,30 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
         Ok(())
     }
 
-    /// A batch: classified element by element. The scan stops as soon as the
-    /// batch is known to be mixed, but runs on past leading non-submissions in
-    /// search of a submission, so that a mixed batch is recognized, and
-    /// counted, whichever end its submission sits at.
+    /// A batch: counted and classified element by element. Once the batch is
+    /// known to be mixed its route is settled, and the rest of it is only
+    /// counted, each element skipped in place. The count stops one past the
+    /// length cap, which ends the scan.
     fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
-        while let Some(element) = elements.next_element::<Element<'de>>()? {
-            match element {
-                Element::Call(call) => self.state.record(call.method),
-                Element::Other => self.state.other = true,
+        let Self { state, max_batch_len } = self;
+        loop {
+            let read = if state.is_mixed() {
+                elements.next_element::<IgnoredAny>()?.is_some()
+            } else {
+                elements
+                    .next_element::<Element<'de>>()?
+                    .map(|element| state.record_element(element))
+                    .is_some()
+            };
+            if !read {
+                return Ok(());
             }
-            if self.state.submission && self.state.other {
-                return Err(de::Error::custom("batch mixes submissions with other calls"));
+            state.len += 1;
+            if max_batch_len.is_some_and(|max| state.len > max.get()) {
+                state.capped = true;
+                return Err(de::Error::custom("batch longer than the length cap"));
             }
         }
-        Ok(())
     }
 }
 
@@ -741,12 +824,14 @@ impl<'de> Deserialize<'de> for MaybeStr<'de> {
 /// A value the scan reads leniently: every JSON shape is accepted, and a shape
 /// the reader has no use for is skipped in place and read as [`Self::other`].
 ///
-/// A reader in the scan must never fail on well-formed JSON, because a failure
-/// ends the whole pass: an unexpected shape anywhere in a call would hide the
+/// A reader in the scan must accept every JSON shape, because a failure ends
+/// the whole pass: an unexpected shape anywhere in a call would hide the
 /// call's method from the classifier, or its transaction from the screen.
-/// Only malformed JSON ends a scan early. Containers a reader does not take
-/// are drained through the ignored-value sink, so an oversized member costs a
-/// scan, not an allocation per node.
+/// Only malformed JSON, or a value serde's typed readers refuse (a number out
+/// of `f64` range, a string or key with an unpaired surrogate escape), ends a
+/// scan early; [`scan`] reports a batch so ended as unreadable. Containers a
+/// reader does not take are drained through the ignored-value sink, so an
+/// oversized member costs a scan, not an allocation per node.
 trait Lenient<'de>: Sized {
     /// The value for a shape the reader has no use for.
     fn other() -> Self;
@@ -851,6 +936,11 @@ fn screen_transaction(raw_hex: &str) -> Option<GatewayError> {
     })
 }
 
+/// Whether `body`, its leading whitespace already dropped, is a JSON array.
+fn is_batch(body: &[u8]) -> bool {
+    body.first() == Some(&b'[')
+}
+
 /// Whether `body` is valid UTF-8 mentioning the raw-transaction method. JSON is
 /// UTF-8 by definition, so a non-UTF-8 body is not a JSON-RPC call we inspect.
 fn mentions_send_raw_transaction(body: &[u8]) -> bool {
@@ -885,12 +975,12 @@ mod tests {
 
     /// The screen's verdict on a body, from the one pass that also routes it.
     fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
-        scan(body).rejection
+        scan(body, None).rejection
     }
 
     /// How a body routes, from the one pass that also screens it.
     fn classify(body: &[u8]) -> Calls {
-        scan(body).calls
+        scan(body, None).calls
     }
 
     /// The canonical EIP-155 example transaction (a signed legacy transfer): a
@@ -1376,6 +1466,9 @@ mod tests {
         for body in bodies {
             assert_eq!(classify(body.as_bytes()).route(), Route::Query, "{body}");
         }
+        // the batch with bytes after it reaches neither upstream: the handler
+        // refuses a batch the scan cannot read to its end
+        assert!(scan(format!("[{submission}] trailing").as_bytes(), None).unreadable_batch);
         let mut not_utf8 = submission.into_bytes();
         not_utf8.push(0xff);
         assert_eq!(classify(&not_utf8).route(), Route::Query);
@@ -1460,11 +1553,90 @@ mod tests {
                 body.len()
             );
             PARSES.with(|parses| parses.set(0));
-            let scan = scan(body.as_bytes());
+            let scan = scan(body.as_bytes(), None);
             assert_eq!(PARSES.with(Cell::get), 1, "one deserializer per body");
             assert_eq!(scan.calls, calls);
             assert!(scan.rejection.is_none());
         }
+    }
+
+    /// A batch element serde's typed readers refuse ends the pass, while the
+    /// worker skips that element and runs every other call. Wherever such an
+    /// element sits, the batch is reported unreadable, so the handler refuses
+    /// it rather than forward a batch whose count is only a lower bound. A
+    /// value the pass reads or skips without complaint is counted as usual.
+    #[test]
+    fn batch_the_scan_cannot_read_to_its_end_is_unreadable() {
+        let max = NonZeroUsize::new(50);
+        let read = call("eth_getBalance");
+        let submission = call("eth_sendRawTransaction");
+        let reads = vec![read.as_str(); 20].join(",");
+        let triggers = [
+            "1e400",
+            r#""\udc00""#,
+            r#"{"\udc00":1}"#,
+            r#"{"jsonrpc":"2.0","method":1e400,"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[1e400],"id":1}"#,
+        ];
+        for trigger in triggers {
+            for body in [
+                format!("[{trigger},{reads}]"),
+                format!("[{reads},{trigger},{reads}]"),
+                format!("[{submission},{trigger}]"),
+            ] {
+                assert!(scan(body.as_bytes(), max).unreadable_batch, "{body}");
+            }
+        }
+        // so is a batch that is not exactly one JSON value
+        for body in [format!("[{submission}] trailing"), format!("[{submission},{read}")] {
+            assert!(scan(body.as_bytes(), max).unreadable_batch, "{body}");
+        }
+        // a value read or skipped without complaint is counted
+        let ignored_id = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":"\udc00"}"#;
+        for body in
+            [format!("[1e-400,{read}]"), format!("[1,{read}]"), format!("[{ignored_id},{read}]")]
+        {
+            let scan = scan(body.as_bytes(), max);
+            assert_eq!((scan.len, scan.unreadable_batch), (2, false), "{body}");
+        }
+        // only a batch is reported: anything else is one call, read or not
+        for body in [
+            format!("{submission} trailing"),
+            r#""eth_sendRawTransaction""#.to_string(),
+            "1e400".to_string(),
+        ] {
+            let scan = scan(body.as_bytes(), max);
+            assert_eq!((scan.len, scan.unreadable_batch), (1, false), "{body}");
+        }
+        // the length cap ending the pass makes a batch too long, not unreadable
+        let long = format!("[{}]", vec![read.as_str(); 60].join(","));
+        let scan = scan(long.as_bytes(), max);
+        assert_eq!((scan.len, scan.unreadable_batch), (51, false));
+    }
+
+    /// The scan counts every batch element, whatever its shape and route, and
+    /// stops one past the cap, so an over-length batch is refused having cost
+    /// no more than the cap to read.
+    #[test]
+    fn batch_count_stops_one_past_the_cap() {
+        let max = NonZeroUsize::new(3);
+        let submission = call("eth_sendRawTransaction");
+        let read = call("eth_chainId");
+        let batch = |element: &str, len: usize| format!("[{}]", vec![element; len].join(","));
+        assert_eq!(scan(read.as_bytes(), max).len, 1);
+        assert_eq!(scan(b"[]", max).len, 0);
+        assert_eq!(scan(b"not json", max).len, 1);
+        // the worker drops leading ascii whitespace, form feed included
+        assert_eq!(scan(format!("\u{c}{}", batch(read.as_str(), 1_000)).as_bytes(), max).len, 4);
+        for element in [read.as_str(), submission.as_str(), "1"] {
+            assert_eq!(scan(batch(element, 3).as_bytes(), max).len, 3, "{element}");
+            assert_eq!(scan(batch(element, 1_000).as_bytes(), max).len, 4, "{element}");
+            assert_eq!(scan(batch(element, 1_000).as_bytes(), None).len, 1_000, "{element}");
+        }
+        // a mixed batch is still counted to its end once its route is settled
+        let mixed = format!("[{submission},{read},{}]", vec![read.as_str(); 98].join(","));
+        let scan = scan(mixed.as_bytes(), None);
+        assert_eq!((scan.len, scan.calls), (100, Calls::MixedBatch));
     }
 
     #[test]

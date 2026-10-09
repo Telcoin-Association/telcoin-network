@@ -159,6 +159,17 @@ pub(crate) struct Cli {
     )]
     pub(crate) max_request_bytes: usize,
 
+    /// Maximum number of calls in one JSON-RPC batch (default 50; `0` means
+    /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
+    /// long" error (`413`, `-32003`) before it is screened or forwarded, on
+    /// either route.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_BATCH_LEN",
+        default_value_t = crate::proxy::DEFAULT_MAX_BATCH_LEN
+    )]
+    pub(crate) max_batch_len: usize,
+
     /// Sustained per-client-IP request rate, in requests per second (`0`
     /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
     /// run the gateway directly edge-facing, not behind an untrusted proxy that
@@ -256,6 +267,8 @@ pub(crate) struct Settings {
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
+    /// Maximum calls in one JSON-RPC batch, or `None` when unlimited.
+    pub(crate) max_batch_len: Option<NonZeroUsize>,
     /// Per-client-IP rate limit, or `None` when disabled.
     pub(crate) rate_limit_per_ip: Option<RateLimit>,
     /// Network prefix each client address is masked to before it keys a
@@ -325,6 +338,7 @@ impl Cli {
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
+            max_batch_len: NonZeroUsize::new(self.max_batch_len),
             rate_limit_per_ip: resolve_rate_limit(
                 self.rate_limit_per_ip,
                 self.rate_limit_per_ip_burst,
@@ -667,6 +681,7 @@ mod tests {
     fn edge_protection_defaults() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_048_576);
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(50));
         let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
         assert_eq!(per_ip.rate().get(), 100);
         // A zero burst flag derives twice the sustained rate.
@@ -730,6 +745,15 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn max_batch_len_is_configurable_and_zero_is_unlimited() -> eyre::Result<()> {
+        let settings = cli_with_flags(&["--max-batch-len=7"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(7));
+        let settings = cli_with_flags(&["--max-batch-len=0"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, None);
         Ok(())
     }
 

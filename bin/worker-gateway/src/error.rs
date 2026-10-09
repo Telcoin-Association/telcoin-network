@@ -32,7 +32,8 @@ mod code {
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
     /// The upstream did not answer within the request deadline.
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
-    /// The request body exceeded the gateway's size limit.
+    /// The request body exceeded the gateway's size limit, or a batch its
+    /// length limit.
     pub(super) const REQUEST_TOO_LARGE: i32 = -32003;
     /// The request already passed through a worker gateway (forwarding loop).
     pub(super) const LOOP_DETECTED: i32 = -32004;
@@ -62,6 +63,8 @@ pub(crate) enum GatewayError {
     UpstreamTimeout,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
+    /// A batch carried more calls than `--max-batch-len` allows.
+    BatchTooLong,
     /// The request already carried the gateway's hop marker (forwarding loop).
     LoopDetected,
     /// The request did not complete within the gateway's request deadline.
@@ -75,6 +78,8 @@ pub(crate) enum GatewayError {
     /// network does not accept (an EIP-4844 blob transaction).
     UnsupportedTransactionType,
     /// The request body could not be read (e.g. the client aborted mid-body).
+    /// Also answers a batch the gateway cannot read to its end, whose length,
+    /// and so its cost, is unknown.
     UnreadableBody,
 }
 
@@ -85,7 +90,7 @@ impl GatewayError {
             Self::NoUpstreamReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
@@ -100,7 +105,7 @@ impl GatewayError {
             Self::NoUpstreamReady => code::NO_UPSTREAM_READY,
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
-            Self::RequestTooLarge => code::REQUEST_TOO_LARGE,
+            Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
             Self::LoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
@@ -117,6 +122,7 @@ impl GatewayError {
             Self::UpstreamUnreachable => "upstream unreachable",
             Self::UpstreamTimeout => "upstream request timed out",
             Self::RequestTooLarge => "request body too large",
+            Self::BatchTooLong => "batch too long",
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"
             }
@@ -140,6 +146,7 @@ impl GatewayError {
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::RequestTooLarge => "request_too_large",
+            Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
             Self::RequestTimeout => "request_timeout",
             Self::RateLimited => "rate_limited",
@@ -459,6 +466,10 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
+            error_response(&GatewayError::BatchTooLong, b"{}").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
             error_response(&GatewayError::InvalidTransaction, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
@@ -472,9 +483,29 @@ mod tests {
     fn new_edge_protection_codes_are_stable() {
         // The codes are part of the client contract; pin them so a reorder or
         // renumber is caught.
+        assert_eq!(GatewayError::BatchTooLong.code(), -32003);
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+    }
+
+    /// An over-length batch shares the "too large" code and status with an
+    /// oversized body, so a client that already handles `413` / `-32003`
+    /// handles it too, while its own reason label and message tell the two
+    /// apart.
+    #[tokio::test]
+    async fn batch_too_long_code_and_reason_are_stable() {
+        let err = GatewayError::BatchTooLong;
+        assert_eq!((err.code(), err.reason()), (-32003, "batch_too_long"));
+        assert_ne!(err.reason(), GatewayError::RequestTooLarge.reason());
+
+        let response = error_response(&err, br#"[{"id":1}]"#);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], json!(-32003));
+        assert_eq!(body["error"]["message"], json!("batch too long"));
+        assert_eq!(body["id"], Value::Null);
     }
 
     #[test]
@@ -486,6 +517,7 @@ mod tests {
         assert_eq!(GatewayError::UpstreamUnreachable.reason(), "upstream_unreachable");
         assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
+        assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
         assert_eq!(GatewayError::RequestTimeout.reason(), "request_timeout");
         assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");

@@ -69,6 +69,9 @@ pub(crate) struct AppState {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers. It is not readiness-gated.
     pub(crate) query_upstream: Option<Url>,
+    /// Maximum calls in one JSON-RPC batch (`--max-batch-len`), or `None` when
+    /// unlimited.
+    pub(crate) max_batch_len: Option<NonZeroUsize>,
 }
 
 /// Inbound connection limits enforced by the accept loop and router (derived
@@ -339,7 +342,7 @@ mod tests {
     use super::*;
     use crate::{
         config::UpstreamWorker,
-        proxy::{proxy_client, MAX_REQUEST_BYTES},
+        proxy::{proxy_client, DEFAULT_MAX_BATCH_LEN, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
     };
     use axum::{
@@ -378,6 +381,7 @@ mod tests {
             readiness: Arc::new(GatewayReadiness::new(upstreams)),
             http: client,
             query_upstream: None,
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
         }
     }
 
@@ -967,6 +971,7 @@ mod tests {
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
         }
     }
 
@@ -994,6 +999,68 @@ mod tests {
     fn error_code_and_id(body: &str) -> (i64, serde_json::Value) {
         let body: serde_json::Value = serde_json::from_str(body).expect("json error body");
         (body["error"]["code"].as_i64().expect("error code"), body["id"].clone())
+    }
+
+    /// A batch of `len` calls to `method`, with ids `1..=len`.
+    fn batch(method: &str, len: u64) -> String {
+        format!("[{}]", (1..=len).map(|id| call(method, id)).collect::<Vec<_>>().join(","))
+    }
+
+    #[tokio::test]
+    async fn over_length_batch_gets_413_batch_too_long() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        state.max_batch_len = NonZeroUsize::new(3);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // at the cap, a batch routes as usual
+        for (method, expected) in
+            [("eth_getBalance", "query"), ("eth_sendRawTransaction", "worker")]
+        {
+            let (status, text) = post_rpc(gateway, None, batch(method, 3)).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, expected), "{method}");
+        }
+
+        // one past the cap, on either route, is refused whole at the gateway
+        for body in [
+            batch("eth_getBalance", 4),
+            batch("eth_sendRawTransaction", 4),
+            batch("eth_getBalance", 1_000),
+            format!("[{},1,2,3]", call("eth_sendRawTransaction", 1)),
+            // the worker drops leading ascii whitespace, form feed included
+            format!("\u{c}{}", batch("eth_getBalance", 4)),
+        ] {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE, "{body}");
+            assert_eq!(error_code_and_id(&text), (-32003, serde_json::Value::Null), "{body}");
+            let error: serde_json::Value = serde_json::from_str(&text).expect("json");
+            assert_eq!(error["error"]["message"], "batch too long");
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+    }
+
+    /// A batch the gateway cannot read to its end is refused whole, with or
+    /// without the redirect: the worker would skip the element serde's typed
+    /// readers refuse and run every other call, so the gateway cannot know
+    /// the batch's length, its cost or whether it is all submissions.
+    #[tokio::test]
+    async fn unreadable_batch_gets_400_invalid_request() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let reads = (1..=1_000).map(|id| call("eth_getBalance", id)).collect::<Vec<_>>().join(",");
+        for redirect in [Some(query), None] {
+            let state = redirect_state(worker, redirect);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+            for lead in ["1e400", r#"{"\udc00":1}"#] {
+                let (status, text) = post_rpc(gateway, None, format!("[{lead},{reads}]")).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{lead}");
+                assert_eq!(error_code_and_id(&text), (-32600, serde_json::Value::Null), "{lead}");
+            }
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
     }
 
     #[tokio::test]

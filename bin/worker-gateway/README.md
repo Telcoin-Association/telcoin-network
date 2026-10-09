@@ -106,6 +106,7 @@ Every flag has an environment-variable fallback.
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
+| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited); a longer batch gets `413` / `-32003`. |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
