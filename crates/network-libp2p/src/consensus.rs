@@ -819,11 +819,11 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
-            kad_store.record_timestamp(&crate::kad::node_record_key(&key)).into_iter().for_each(
-                |timestamp| {
-                    behavior.peer_manager.restore_record_timestamp(key, timestamp);
-                },
-            );
+            let timestamp =
+                behavior.kademlia.store_mut().record_timestamp(&crate::kad::node_record_key(&key));
+            timestamp.into_iter().for_each(|timestamp| {
+                behavior.peer_manager.restore_record_timestamp(key, timestamp);
+            });
             restored += 1;
         }
         if restored > 0 {
