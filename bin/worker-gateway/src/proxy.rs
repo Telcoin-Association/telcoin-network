@@ -93,6 +93,12 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
 ///
+/// A worker forward that fails to connect, a connect timeout included, counts
+/// toward `--upstream-failure-threshold` (see
+/// [`crate::readiness::GatewayReadiness::record_rpc_failure`]); one that gets
+/// any response resets the count. A timeout after the request was sent does
+/// not count, since the method and params decide how long the worker takes.
+///
 /// `body` is the final extractor (it consumes the request body), so it must
 /// stay last in the parameter list.
 pub(crate) async fn proxy(
@@ -166,12 +172,22 @@ pub(crate) async fn proxy(
         .await
     {
         Ok(response) => {
+            if route == Route::Worker {
+                state.readiness.record_rpc_success(&upstream_url);
+            }
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
             response
         }
         Err(source) => {
             let err = classify_error(&source);
+            // only a failed connect shows that the worker's rpc port is down.
+            // reqwest flags a connect timeout as a connect error too, so a
+            // worker that drops syns still counts. a timeout or failure after
+            // the request was sent neither counts nor resets the count: the
+            // client's method and params decide how long the worker takes
+            // (eth_sendRawTransactionSync waits up to 30 s for inclusion).
+            let connect_failed = source.is_connect();
             let result = if matches!(err, GatewayError::UpstreamTimeout) {
                 "timeout"
             } else {
@@ -190,6 +206,13 @@ pub(crate) async fn proxy(
                 cause = %ErrorChain(&source),
                 "forwarding to upstream failed"
             );
+            // passive health: a worker whose rpc port keeps failing to connect
+            // is marked not-ready, so later requests go to the next ready
+            // upstream. this request is answered with its own error and never
+            // retried.
+            if route == Route::Worker && connect_failed {
+                state.readiness.record_rpc_failure(&upstream_url);
+            }
             error_response(&err, body.as_ref())
         }
     }

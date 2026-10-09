@@ -50,11 +50,38 @@ The gateway polls each upstream node's readiness endpoint
 }
 ```
 
-A worker is considered ready only when its entry reports
-`accepting_transactions: true`. Every other outcome, an unreachable node, a
-timed-out poll, a malformed payload, or the worker missing from the list, marks
-the upstream **not-ready**, so the gateway fails closed. Unknown fields and
-newer envelope versions are tolerated (forward compatible).
+A poll succeeds only when the worker's entry reports `accepting_transactions: true`.
+Every other outcome is a failed poll: an unreachable node, a timed-out poll, an HTTP error status, a malformed payload, a body over 64 KiB, the worker missing from the list, or the worker not accepting transactions.
+Unknown fields and newer envelope versions are tolerated (forward compatible).
+
+Every upstream starts **not-ready**, so the gateway fails closed until an upstream's first run of successful polls.
+After that, readiness changes only on a run of consecutive results, so one slow poll does not drop every gateway that polls the same node:
+
+- a ready upstream turns not-ready after `--readiness-failure-threshold` failed polls in a row (default 3);
+- a not-ready upstream turns ready after `--readiness-success-threshold` successful polls in a row (default 2), at startup too, so at the defaults an upstream serves from its second poll, one interval after the gateway starts.
+
+Each cycle polls every upstream at once, each poll bounded by `--readiness-poll-timeout`, so a hanging upstream does not delay the polls of the others.
+The body is read up to 64 KiB: a larger declared `Content-Length` is refused before any of the body is read, and a body without one is cut off at the cap.
+
+### Passive health on the RPC path
+
+The poll measures the node's health listener, not the worker's RPC port, so the gateway also counts its own forwards to each worker.
+A forward that fails to connect, a connect timeout included, counts toward `--upstream-failure-threshold` (default 3), and a forward that gets any response, an HTTP error included, resets the count.
+A timeout or any other failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes (`eth_sendRawTransactionSync` waits up to 30 s for inclusion).
+A worker that accepts connections but stops answering is left to the poller.
+At the threshold the upstream is marked not-ready until the poller sees `--readiness-success-threshold` successful polls in a row again, and later requests go to the next ready upstream in configuration order.
+The request that saw the failure is answered with its own error (`502` or `504`) and is never retried on another upstream.
+Forwards to the `--redirect-queries` URL are not counted.
+`--upstream-failure-threshold 0` turns passive health off.
+
+While the health listener answers and the RPC port stays down, the upstream cycles: the poller turns it ready after its run of successful polls, and the next `--upstream-failure-threshold` worker requests fail before it is marked again.
+
+### Readiness logs
+
+Each transition is logged with the worker id and the upstream's RPC and readiness origins (scheme, host and port, never the full URL): at `info` with the run of successful polls when an upstream becomes ready, and at `warn` with a `cause` when it becomes not-ready.
+The cause is that of the last failed poll (`timeout`, `HTTP status <code>`, `connection error (<class>)`, `malformed payload`, `body too large`, `worker not accepting transactions`), or `rpc path` for a mark from the forwards.
+An upstream that has never been ready logs the cause of its first failed poll at `info`, once, so a gateway that never becomes ready says why at the default log level.
+Every other failed poll logs at `debug`.
 
 ## Configuration
 
@@ -99,6 +126,9 @@ Every flag has an environment-variable fallback.
 | `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions; see [Query redirect](#query-redirect). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
+| `--readiness-failure-threshold` | `WORKER_GATEWAY_READINESS_FAILURE_THRESHOLD` | `3` | Failed polls in a row that turn a ready upstream not-ready (at least 1); see [Readiness contract](#readiness-contract). |
+| `--readiness-success-threshold` | `WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD` | `2` | Successful polls in a row that turn a not-ready upstream ready, at startup too (at least 1). |
+| `--upstream-failure-threshold` | `WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD` | `3` | Worker forwards in a row that fail to connect, a connect timeout included, before the upstream is marked not-ready (`0` disables); a timeout or failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes, and a worker that accepts connections but stops answering is left to the poller; see [Passive health on the RPC path](#passive-health-on-the-rpc-path). |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
@@ -345,7 +375,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected`) | Proxied requests by terminal outcome. |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
-| `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
+| `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
