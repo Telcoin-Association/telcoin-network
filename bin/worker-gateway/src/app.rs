@@ -11,7 +11,7 @@ use crate::{
     cli::Settings,
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
-    readiness::{run_poller, GatewayReadiness},
+    readiness::{run_poller, GatewayReadiness, QueryProbe},
     server::{serve, serve_probes, AppState, ServerLimits},
 };
 
@@ -121,6 +121,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
+    // The poller probes the query upstream with the proxy client, so the probe
+    // travels like a redirected read.
+    let query_probe =
+        query_upstream.clone().map(|url| QueryProbe { url, client: proxy_client.clone() });
     let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
 
     spawner.spawn_critical_task(
@@ -128,6 +132,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         run_poller(
             readiness,
             readiness_client,
+            query_probe,
             readiness_poll_interval,
             readiness_poll_timeout,
             shutdown.subscribe(),

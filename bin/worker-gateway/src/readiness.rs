@@ -6,11 +6,12 @@
 //! the gateway's own `/ready` endpoint reflects whether any upstream is ready.
 //!
 //! Readiness governs the worker route only. With `--redirect-queries` set,
-//! non-submission calls go to the query upstream whatever this state says, and
-//! that upstream is never probed: there is one query URL and no fallback, so a
-//! probe would have nothing to fail over to, while N gateways polling a shared
-//! public endpoint would add load to it. Its failures show up per request (as
-//! `502`/`504`) and in the routed-request metrics instead.
+//! non-submission calls go to the query upstream whatever this state says.
+//! The poller also sends that upstream one `eth_chainId` call per cycle, but
+//! only so `/ready/any` can report whether reads can be served: there is one
+//! query URL and no fallback, so its state never gates routing, and its
+//! failures still show up per request (as `502`/`504`) and in the
+//! routed-request metrics.
 //!
 //! Every failure mode (unreachable, timed out, malformed payload, worker absent
 //! from the payload) marks the upstream not-ready, so the gateway fails closed.
@@ -24,19 +25,33 @@ use std::{
 };
 
 use futures::StreamExt as _;
-use reqwest::Client;
+use reqwest::{header::CONTENT_TYPE, Client};
 use serde::Deserialize;
 use tn_types::{Noticer, TaskError};
 use tokio::time::{interval, timeout, MissedTickBehavior};
-use tracing::debug;
+use tracing::{debug, info};
 use url::Url;
 
-use crate::config::UpstreamWorker;
+use crate::{config::UpstreamWorker, proxy::UpstreamOrigin};
 
 /// Readiness envelope version the gateway targets. Newer versions still parse,
 /// because unknown fields are ignored (see [`NodeReadiness`]); this is only used
 /// to log a heads-up when the shape may have changed.
 const READINESS_VERSION: u32 = 1;
+
+/// The call the poller sends the query upstream: any node answers it cheaply
+/// and without side effects.
+const QUERY_PROBE_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
+
+/// The marker header every query-route request carries (the proxy's
+/// `REDIRECT_HEADER`), so the probe reaches the query upstream the way a
+/// redirected read does.
+const QUERY_PROBE_MARKER: &str = "x-tn-gateway-redirect";
+
+/// Largest probe reply the poller reads. An `eth_chainId` answer is a few dozen
+/// bytes; the cap keeps a misbehaving query upstream from making the poller
+/// buffer an unbounded body every cycle.
+const MAX_QUERY_PROBE_REPLY_BYTES: usize = 64 * 1024;
 
 /// Mirror of the node's per-worker readiness entry
 /// (`crates/node/src/health.rs`).
@@ -76,6 +91,9 @@ impl UpstreamReadiness {
 #[derive(Debug)]
 pub(crate) struct GatewayReadiness {
     upstreams: Vec<UpstreamReadiness>,
+    /// Whether the query upstream (`--redirect-queries`) answered its last
+    /// probe; always `false` without a redirect, since nothing probes it.
+    query_ready: AtomicBool,
 }
 
 impl GatewayReadiness {
@@ -91,7 +109,7 @@ impl GatewayReadiness {
                 ready: AtomicBool::new(false),
             })
             .collect();
-        Self { upstreams }
+        Self { upstreams, query_ready: AtomicBool::new(false) }
     }
 
     /// The JSON-RPC base URL of the first ready upstream, in preference order.
@@ -107,6 +125,32 @@ impl GatewayReadiness {
         self.upstreams.iter().any(UpstreamReadiness::is_ready)
     }
 
+    /// Whether the query upstream (`--redirect-queries`) answered its last
+    /// probe. Always `false` without a redirect.
+    pub(crate) fn query_ready(&self) -> bool {
+        self.query_ready.load(Ordering::Relaxed)
+    }
+
+    /// Whether the gateway can serve any route: an upstream worker is ready,
+    /// or the query upstream is up. Without a redirect this is
+    /// [`Self::any_ready`].
+    pub(crate) fn any_route_ready(&self) -> bool {
+        self.any_ready() || self.query_ready()
+    }
+
+    /// Record the query upstream's probe result, logging a change at info
+    /// with the upstream's origin only.
+    fn record_query_ready(&self, ready: bool, url: &Url) {
+        if self.query_ready.swap(ready, Ordering::Relaxed) != ready {
+            let upstream = UpstreamOrigin(url);
+            if ready {
+                info!(target: "gateway::readiness", %upstream, "query upstream became ready");
+            } else {
+                info!(target: "gateway::readiness", %upstream, "query upstream became not-ready");
+            }
+        }
+    }
+
     /// Test-only: force an upstream's readiness state.
     #[cfg(test)]
     pub(crate) fn set_ready(&self, worker_id: u16, ready: bool) {
@@ -117,12 +161,24 @@ impl GatewayReadiness {
     }
 }
 
-/// Poll every upstream's readiness endpoint on `poll_interval` until `shutdown`
-/// fires. The first tick runs immediately so readiness converges promptly on
-/// startup.
+/// The query upstream (`--redirect-queries`) as the poller probes it.
+#[derive(Debug)]
+pub(crate) struct QueryProbe {
+    /// The query upstream's URL.
+    pub(crate) url: Url,
+    /// The proxy client (see [`crate::proxy::proxy_client`]), so the probe
+    /// travels like a redirected read: same connection pool, user agent and
+    /// redirect policy.
+    pub(crate) client: Client,
+}
+
+/// Poll every upstream's readiness endpoint, and probe the query upstream when
+/// `query_probe` is set, on `poll_interval` until `shutdown` fires. The first
+/// tick runs immediately so readiness converges promptly on startup.
 pub(crate) async fn run_poller(
     readiness: Arc<GatewayReadiness>,
     client: Client,
+    query_probe: Option<QueryProbe>,
     poll_interval: Duration,
     poll_timeout: Duration,
     shutdown: Noticer,
@@ -180,10 +236,78 @@ pub(crate) async fn run_poller(
                         }
                     })
                     .await;
+                // the query upstream goes last, behind the same shutdown check,
+                // so teardown still waits on at most one probe
+                if let Some(probe) = query_probe.as_ref().filter(|_| !shutdown.noticed()) {
+                    poll_query_upstream(probe, &readiness, poll_timeout).await;
+                }
             }
         }
     }
     Ok(())
+}
+
+/// Probe the query upstream once and record whether it is up; any failure
+/// counts as down.
+async fn poll_query_upstream(
+    probe: &QueryProbe,
+    readiness: &GatewayReadiness,
+    poll_timeout: Duration,
+) {
+    let upstream = UpstreamOrigin(&probe.url);
+    let ready = match timeout(poll_timeout, fetch_query_ready(&probe.client, &probe.url)).await {
+        Ok(Ok(ready)) => {
+            if !ready {
+                debug!(
+                    target: "gateway::readiness",
+                    %upstream,
+                    "query upstream did not answer the probe with a 2xx result"
+                );
+            }
+            ready
+        }
+        // a reqwest error renders the full request url, which can carry a
+        // credential, so it is logged without it
+        Ok(Err(err)) => {
+            debug!(
+                target: "gateway::readiness",
+                %upstream,
+                err = ?err.without_url(),
+                "query upstream probe failed"
+            );
+            false
+        }
+        Err(_) => {
+            debug!(target: "gateway::readiness", %upstream, "query upstream probe timed out");
+            false
+        }
+    };
+    readiness.record_query_ready(ready, &probe.url);
+}
+
+/// Send the probe call and report whether the reply is a `2xx` whose JSON body
+/// has a `result` member. A reply longer than [`MAX_QUERY_PROBE_REPLY_BYTES`]
+/// counts as down and is not read further.
+async fn fetch_query_ready(client: &Client, url: &Url) -> reqwest::Result<bool> {
+    let mut response = client
+        .post(url.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .header(QUERY_PROBE_MARKER, "1")
+        .body(QUERY_PROBE_CALL)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_QUERY_PROBE_REPLY_BYTES {
+            return Ok(false);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice::<serde_json::Value>(&body)
+        .is_ok_and(|reply| reply.get("result").is_some()))
 }
 
 /// Poll a single upstream, returning `false` (not-ready) on any failure.
@@ -313,5 +437,103 @@ mod tests {
             readiness.first_ready_rpc_url(),
             Some(Url::parse("http://127.0.0.1:8545").expect("url"))
         );
+    }
+
+    /// The sink a test subscriber formats its lines into.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Captured {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("capture lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn query_probe_transitions_are_logged_at_info() {
+        let captured = Captured::default();
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("gateway=debug"))
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a query upstream whose answer the test flips from up to down
+        let up = Arc::new(AtomicBool::new(true));
+        let answer = Arc::clone(&up);
+        let mock = axum::Router::new().fallback(move || {
+            let up = answer.load(Ordering::SeqCst);
+            async move {
+                if up {
+                    (axum::http::StatusCode::OK, r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#)
+                } else {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "")
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, mock).await });
+
+        // the url carries a credential in its userinfo, path and query; the
+        // logs may name only its origin
+        let client = crate::proxy::proxy_client(Duration::from_secs(1), Duration::from_secs(2))
+            .expect("client");
+        let probe = QueryProbe {
+            url: Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url"),
+            client: client.clone(),
+        };
+        let readiness = GatewayReadiness::new(&[]);
+        let poll_timeout = Duration::from_secs(2);
+
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        assert!(readiness.query_ready());
+        assert!(readiness.any_route_ready());
+        // a repeat of the same state is not a transition
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        up.store(false, Ordering::SeqCst);
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        assert!(!readiness.query_ready());
+        assert!(!readiness.any_route_ready());
+
+        // a transport failure is logged without the url too
+        let unreachable = QueryProbe {
+            url: Url::parse("http://user:s3cr3t@127.0.0.1:1/k3y?token=t0k3n").expect("url"),
+            client,
+        };
+        poll_query_upstream(&unreachable, &readiness, poll_timeout).await;
+        assert!(!readiness.query_ready());
+
+        let logs = captured.text();
+        let transitions: Vec<&str> =
+            logs.lines().filter(|line| line.contains("query upstream became")).collect();
+        assert_eq!(transitions.len(), 2, "one line per transition, none for a repeat: {logs}");
+        let origin = format!("upstream=http://{addr}");
+        for (line, message) in transitions
+            .iter()
+            .zip(["query upstream became ready", "query upstream became not-ready"])
+        {
+            assert!(line.trim_start().starts_with("INFO "), "not at info: {line}");
+            assert!(line.contains(message), "expected `{message}`: {line}");
+            assert!(line.contains(&origin), "expected `{origin}`: {line}");
+        }
+        assert!(logs.contains("query upstream probe failed"), "{logs}");
+        for secret in ["s3cr3t", "k3y", "t0k3n"] {
+            assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+        }
     }
 }

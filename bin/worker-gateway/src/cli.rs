@@ -27,12 +27,12 @@ pub(crate) struct Cli {
     pub(crate) listen_addr: SocketAddr,
 
     /// Address of a second listener that serves only the probe endpoints
-    /// (`/health` and `/ready`), outside the client connection cap and the
-    /// rate limits, so a flood that holds every client connection cannot make
-    /// an orchestrator's probes time out. The probes stay on `--listen-addr`
-    /// too. Unset (the default) opens no probe listener. The probe listener
-    /// has no connection cap, so bind it where only the orchestrator reaches
-    /// it.
+    /// (`/health`, `/ready` and `/ready/any`), outside the client connection
+    /// cap and the rate limits, so a flood that holds every client connection
+    /// cannot make an orchestrator's probes time out. The probes stay on
+    /// `--listen-addr` too. Unset (the default) opens no probe listener. The
+    /// probe listener has no connection cap, so bind it where only the
+    /// orchestrator reaches it.
     #[arg(long, env = "WORKER_GATEWAY_PROBE_ADDR")]
     pub(crate) probe_addr: Option<SocketAddr>,
 
@@ -69,7 +69,8 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
     pub(crate) redirect_queries: Option<Url>,
 
-    /// How often to poll each upstream's readiness endpoint.
+    /// How often to poll each upstream's readiness endpoint, and to probe the
+    /// `--redirect-queries` endpoint for `/ready/any`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_READINESS_POLL_INTERVAL",
@@ -78,8 +79,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) readiness_poll_interval: Duration,
 
-    /// Per-poll timeout for the readiness endpoint (a slow or failed poll marks
-    /// the upstream not-ready).
+    /// Per-poll timeout for the readiness endpoint and the `--redirect-queries`
+    /// probe (a slow or failed poll marks that upstream not-ready).
     #[arg(
         long,
         env = "WORKER_GATEWAY_READINESS_POLL_TIMEOUT",
