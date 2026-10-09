@@ -52,6 +52,12 @@ struct SwarmMetricHandles {
     px_disconnects_pending: Gauge,
     /// Outbound requests in flight.
     outbound_requests_pending: Gauge,
+    /// Commands waiting for the swarm event loop.
+    command_queue_occupancy: Gauge,
+    /// Inbound request-response operations awaiting completion or cancellation.
+    inbound_requests_pending: Gauge,
+    /// Record queries awaiting a result.
+    record_queries_pending: Gauge,
     /// Record retrievals awaiting a response or terminal failure.
     record_exchange_pending: Gauge,
     /// Peers queued for another record retrieval attempt.
@@ -504,7 +510,7 @@ impl PerOutboundFailure {
 /// zero events.
 #[derive(Clone)]
 struct LabeledHandles {
-    /// `inbound_requests_pending` per class.
+    /// `inbound_requests_pending_by_class` per class.
     inbound_pending: PerClass<Gauge>,
     /// `inbound_request_service_seconds` per class (answered requests only).
     service_seconds: PerClass<Histogram>,
@@ -534,7 +540,7 @@ impl LabeledHandles {
             outbound_failed: PerOutboundFailure::new(network),
             inbound_pending: PerClass::new(|class| {
                 metrics::gauge!(
-                    "tn_network.inbound_requests_pending",
+                    "tn_network.inbound_requests_pending_by_class",
                     "network" => network.to_owned(),
                     "class" => class.label(),
                 )
@@ -717,6 +723,12 @@ impl SwarmMetrics {
     }
 
     /// Update the in-flight request gauges (called once per event-loop iteration).
+    pub(crate) fn set_queues(&self, commands: usize, inbound: usize, records: usize) {
+        self.handles.command_queue_occupancy.set(commands as f64);
+        self.handles.inbound_requests_pending.set(inbound as f64);
+        self.handles.record_queries_pending.set(records as f64);
+    }
+
     pub(crate) fn set_pending(&self, px_disconnects: usize, outbound_requests: usize) {
         self.handles.px_disconnects_pending.set(px_disconnects as f64);
         self.handles.outbound_requests_pending.set(outbound_requests as f64);
@@ -817,6 +829,10 @@ impl SwarmMetrics {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct PeerManagerMetricHandles {
+    /// Connected peers with ordinary retention policy.
+    ordinary_peers_connected: Gauge,
+    /// Connected members of the operator-declared DAO observer set.
+    dao_observers_connected: Gauge,
     /// Currently connected peers.
     connected_peers: Gauge,
     /// Peers known with a resolved network record (BLS key -> address).
@@ -846,6 +862,35 @@ pub(crate) struct PeerManagerMetrics {
 }
 
 impl PeerManagerMetrics {
+    /// Count failed source reservations with a bounded reason and no peer or address labels.
+    pub(crate) fn record_source_rejection(&self, error: crate::source_admission::AdmissionError) {
+        use crate::source_admission::AdmissionError;
+
+        let reason = match error {
+            AdmissionError::InvalidLimits => "invalid_limits",
+            AdmissionError::ProcessFull => "process_full",
+            AdmissionError::PeerFull => "peer_full",
+            AdmissionError::AddressFull => "address_full",
+            AdmissionError::PrefixFull => "prefix_full",
+            AdmissionError::SourcesFull => "sources_full",
+            AdmissionError::UnsupportedAddress => "unsupported_address",
+            AdmissionError::DuplicateConnection => "duplicate_connection",
+            AdmissionError::Poisoned => "poisoned",
+        };
+        metrics::counter!(
+            "tn_network.source_rejections_total",
+            "network" => self.network.clone(),
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
+    /// Observe ordinary population and the reserved observer identities independently.
+    pub(crate) fn set_population_counts(&self, ordinary: usize, observers: usize) {
+        self.handles.ordinary_peers_connected.set(ordinary as f64);
+        self.handles.dao_observers_connected.set(observers as f64);
+    }
+
     /// Record one failed inbound attempt with a fixed reason label, never a peer or address.
     pub(crate) fn record_listen_failure(&self, reason: &'static str) {
         metrics::counter!(
@@ -977,6 +1022,7 @@ mod tests {
             let swarm = SwarmMetrics::new_for(&NetworkType::Worker(2))
                 .with_capacity(&QuicConfig::default(), None);
             swarm.set_established_connections(7);
+            swarm.set_queues(2, 3, 4);
             swarm.record_connection_limit_rejection(ConnectionLimitReason::EstablishedTotal);
         });
         let snapshot = snapshotter.snapshot().into_vec();
@@ -995,6 +1041,22 @@ mod tests {
         assert!(gauge_is("tn_network.established_connection_limit", 0.0));
         assert!(gauge_is("tn_network.inbound_streams_per_connection_limit", 10_000.0));
         assert!(gauge_is("tn_network.receive_credit_per_connection_bytes", 104_857_600.0));
+        assert!(gauge_is("tn_network.command_queue_occupancy", 2.0));
+        assert!(gauge_is("tn_network.inbound_requests_pending", 3.0));
+        assert!(gauge_is("tn_network.record_queries_pending", 4.0));
+        let pending_by_class = snapshot
+            .iter()
+            .filter(|(key, _, _, value)| {
+                key.key().name() == "tn_network.inbound_requests_pending_by_class"
+                    && key.key().labels().count() == 2
+                    && key
+                        .key()
+                        .labels()
+                        .any(|label| label.key() == "network" && label.value() == "worker-2")
+                    && matches!(value, DebugValue::Gauge(value) if value.0 == 0.0)
+            })
+            .count();
+        assert_eq!(pending_by_class, ServiceClass::ALL.len());
         assert!(snapshot.iter().any(|(key, _, _, value)| key.key().name()
             == "tn_network.connection_limit_rejections_total"
             && key

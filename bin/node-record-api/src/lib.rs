@@ -38,6 +38,8 @@ pub mod telemetry;
 // dev-dependencies exercised only by the integration test in `tests/`; named here so the lib's
 // own unit-test build does not trip `unused_crate_dependencies`
 #[cfg(test)]
+use rand as _;
+#[cfg(test)]
 use tn_config as _;
 #[cfg(test)]
 use tn_network_libp2p as _;

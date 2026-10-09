@@ -32,12 +32,15 @@ worker count requires recalculating the allocation and restarting the node. An a
 to give each swarm one connection, or each connection one stream/byte, fails startup.
 
 Inbound and outbound connections, committee members, trusted peers and ordinary peers all consume
-the same established limits. No peer bypass is installed in the connection-limit behaviour. Peer
-admission and trust rules remain separate. Swarms cannot borrow each other's allocation, which
-preserves primary connection capacity when workers fill their allocation. This does not reserve
-service within a swarm: hostile peers can occupy its slots, and bulk traffic can still delay votes
-or epoch records. The [inbound service class](#inbound-service-classes) metrics show this delay, but
-nothing limits it. Admission policy and message scheduling need joint calibration.
+the same established limits. Configured bootstrap identities reserve admission capacity within
+those limits; total and per-peer ceilings still apply. Runtime bootstrap or logical trust changes
+do not expand this startup reservation set. Swarms cannot borrow each other's allocation, which
+preserves primary connection capacity when workers fill their allocation.
+
+Bulk traffic can still delay votes or epoch records within a swarm. The
+[inbound service class](#inbound-service-classes) metrics expose this delay; admission policy and
+message scheduling need joint calibration. The [public hub capacity profile](hub-capacity.md)
+documents the additional bounded stream admission and its qualification envelope.
 
 Receive credit is advertised protocol capacity. It is not RSS or a bound on application buffers,
 tasks, CPU, locally initiated streams, pre-admission handshake state, or transient transport state
@@ -100,7 +103,8 @@ metric is not exported, not zero.
 
 | Metric | Meaning |
 | --- | --- |
-| `tn_network_inbound_requests_pending` | Inbound requests sent to the application that wait for a response |
+| `tn_network_inbound_requests_pending` | Aggregate pending inbound requests, labeled by `network` |
+| `tn_network_inbound_requests_pending_by_class` | Inbound requests waiting for an application response, labeled by `network` and `class` |
 | `tn_network_inbound_request_service_seconds` | Time from sending a request to the application to sending its response. Answered requests only |
 | `tn_network_inbound_requests_shed_total` | Inbound messages dropped before service, by the swarm or at application admission |
 | `tn_network_inbound_requests_failed_total` | Inbound requests sent to the application that got no response |

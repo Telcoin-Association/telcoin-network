@@ -40,7 +40,7 @@ members = [
 # Carried libp2p patches are wired in through `[patch.crates-io]` below and kept out of
 # the workspace so that upstream code is not held to the house lints. Each patch has a PATCH.md
 # maintenance record.
-exclude = ["patches/libp2p-quic", "patches/libp2p-connection-limits"]
+exclude = ["patches/libp2p-quic", "patches/libp2p-connection-limits", "patches/libp2p-kad"]
 
 # Explicitly set the resolver to version 2, which is the default for packages with edition >= 2021
 # https://doc.rust-lang.org/edition-guide/rust-2021/default-cargo-resolver.html
@@ -86,6 +86,7 @@ tracing-subscriber = { version = "0.3.20", default-features = false }
 metrics = "0.24"                                       # Must stay in sync with reth's `metrics` version - a mismatch silently splits the global recorder
 metrics-exporter-prometheus = { version = "0.18", default-features = false }
 metrics-process = "2.4"
+flate2 = "=1.1.9"
 metrics-util = "0.20"
 serde_json = "1.0.94"
 humantime-serde = "1.1"
@@ -294,3 +295,5 @@ libp2p-quic = { path = "patches/libp2p-quic" }
 # Release per-peer connection accounting after the last connection closes.
 # See patches/libp2p-connection-limits/PATCH.md for provenance and retirement criteria.
 libp2p-connection-limits = { path = "patches/libp2p-connection-limits" }
+# See patches/libp2p-kad/PATCH.md for authenticated filtering and expiry provenance.
+libp2p-kad = { path = "patches/libp2p-kad" }

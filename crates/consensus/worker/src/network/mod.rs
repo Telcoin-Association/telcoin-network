@@ -5,6 +5,9 @@ use futures::{AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
+pub use ingress::{
+    AdmittedSyncStream, WorkerEventChannel, WorkerEventReceiver, WorkerIngressEvent,
+};
 pub use message::{WorkerRequest, WorkerResponse};
 use parking_lot::Mutex;
 use std::{
@@ -14,20 +17,29 @@ use std::{
 };
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
-    read_frame, types::NetworkEvent, write_frame, DenyReason, GossipMessage, ResponseChannel,
-    Stream, SyncFrame, SyncFrameError, WorkerSyncRequest,
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
+    read_frame,
+    types::{NetworkEvent, NetworkType},
+    write_frame, DenyReason, GossipMessage, ResponseChannel, Stream, SyncFrame, SyncFrameError,
+    WorkerSyncRequest,
 };
 use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     BatchValidation, BlsPublicKey, Database, Epoch, SealedBatch, TaskError, TaskSpawner,
     TnReceiver, WorkerId, B256,
 };
-use tokio::sync::{oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::oneshot;
 use tracing::{debug, warn};
 
+#[cfg(test)]
+mod epoch_sync_tests;
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
+mod ingress;
 pub(crate) mod message;
 pub(crate) mod primary;
 pub(crate) mod stream_codec;
@@ -80,7 +92,7 @@ pub const MAX_CONCURRENT_GOSSIP_PREFETCHES: usize = 8;
 /// is dropped without spawning (the requester sees a reset and retries
 /// elsewhere), so the worker's total sync-task fan-out stays bounded by
 /// [`MAX_CONCURRENT_BATCH_STREAMS`] admitted tasks plus this many shed tasks.
-pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+pub const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Timeout for reading the opening request frame of an inbound sync stream.
 ///
@@ -129,10 +141,15 @@ fn try_admit_sync(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *sync_guard.entry(peer).or_insert(0) += 1;
+            SyncStreamPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -225,9 +242,11 @@ fn shed_sync_stream<S>(
 
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
-pub struct WorkerNetwork<DB, Events> {
+pub struct WorkerNetwork<DB, Events, Event = NetworkEvent<Req, Res>> {
     /// Receiver for network events.
     network_events: Events,
+    /// Input type retains support for legacy raw-event receivers.
+    input: std::marker::PhantomData<fn() -> Event>,
     /// Network handle to send commands.
     network_handle: WorkerNetworkHandle,
     /// Request handler to process requests and return responses.
@@ -259,10 +278,37 @@ pub struct WorkerNetwork<DB, Events> {
     consensus_chain: ConsensusChain,
 }
 
-impl<DB, Events> WorkerNetwork<DB, Events>
+/// Admission shared by every epoch using the same persistent worker handle.
+#[derive(Clone, Debug)]
+struct WorkerSyncAdmission {
+    stream_semaphore: Arc<Semaphore>,
+    peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    shed_semaphore: Arc<Semaphore>,
+}
+
+impl WorkerSyncAdmission {
+    fn new(serve: &tn_config::NetworkServeConfig, id: WorkerId) -> Self {
+        Self {
+            stream_semaphore: Arc::new(Semaphore::new_for(
+                serve.batch_stream(),
+                ServeClass::BatchStream,
+                &NetworkType::Worker(id),
+            )),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            shed_semaphore: Arc::new(Semaphore::new_for(
+                serve.worker_shed(),
+                ServeClass::WorkerShed,
+                &NetworkType::Worker(id),
+            )),
+        }
+    }
+}
+
+impl<DB, Events, Event> WorkerNetwork<DB, Events, Event>
 where
     DB: Database,
-    Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
+    Events: TnReceiver<Event> + 'static,
+    Event: Into<WorkerIngressEvent> + Send + 'static,
 {
     /// Create a new instance of Self.
     pub fn new(
@@ -273,15 +319,18 @@ where
         validator: Arc<dyn BatchValidation>,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler =
             RequestHandler::new(id, validator, consensus_config, network_handle.clone());
+        let sync_admission = network_handle.sync_admission(&serve).clone();
         Self {
             network_events,
+            input: std::marker::PhantomData,
             network_handle,
             request_handler,
-            batch_stream_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_BATCH_STREAMS)),
-            sync_stream_peers: Arc::new(Mutex::new(HashMap::new())),
-            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
+            batch_stream_semaphore: sync_admission.stream_semaphore,
+            sync_stream_peers: sync_admission.peers,
+            shed_task_semaphore: sync_admission.shed_semaphore,
             metrics: WorkerMetrics::new_for_worker(id),
             consensus_chain,
         }
@@ -293,7 +342,10 @@ where
             loop {
                 match self.network_events.recv().await {
                     Some(event) => {
-                        self.process_network_event(event);
+                        match event.into() {
+                            WorkerIngressEvent::Network(event) => self.process_network_event(event),
+                            WorkerIngressEvent::Sync(stream) => self.process_admitted_sync_stream(stream),
+                        }
                     }
                     None => {
                         warn!(target: "worker::network", "critical worker network events channel dropped");
@@ -431,11 +483,17 @@ where
             self.shed_inbound_sync_stream(peer, stream);
             return;
         };
+        self.process_admitted_sync_stream(AdmittedSyncStream::new(peer, stream, permit));
+    }
+
+    /// Serve an ingress-admitted stream without reacquiring or extending its admission.
+    fn process_admitted_sync_stream(&self, admitted: AdmittedSyncStream) {
+        let (peer, stream, permit, _arrived, deadline) = admitted.into_parts();
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let epoch = self.network_handle.epoch();
         let task_name = format!("sync-batches-{peer}");
-        self.network_handle.get_task_spawner().spawn_task(task_name, async move {
+        self.network_handle.get_sync_task_spawner().spawn_task(task_name, async move {
             // hold the admission permit for the lifetime of the exchange
             let _permit = permit;
             let mut stream = stream;
@@ -446,8 +504,8 @@ where
             // or sends a malformed one (io error) is dropped after releasing the
             // permit. Collapse the timeout/io results rather than nesting matches.
             let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
-            let request = tokio::time::timeout(
-                SYNC_REQUEST_READ_TIMEOUT,
+            let request = tokio::time::timeout_at(
+                deadline,
                 read_frame::<_, WorkerSyncRequest>(
                     &mut stream,
                     &mut decode_buffer,
@@ -457,7 +515,8 @@ where
             )
             .await
             .ok()
-            .and_then(Result::ok);
+            .and_then(Result::ok)
+            .filter(|_| tokio::time::Instant::now() < deadline);
             let Some(request) = request else {
                 warn!(target: "worker::network", %peer, "no readable sync request frame");
                 // bound the best-effort close so a peer that sent no readable frame
@@ -531,7 +590,7 @@ where
         shed_sync_stream(
             &self.shed_task_semaphore,
             &self.metrics,
-            self.network_handle.get_task_spawner(),
+            self.network_handle.get_sync_task_spawner(),
             self.network_handle.epoch(),
             peer,
             stream,

@@ -7,8 +7,9 @@ mod network;
 mod worker;
 pub use crate::metrics::WorkerMetrics;
 pub use network::{
-    WorkerNetwork, WorkerNetworkHandle, WorkerRequest, WorkerResponse,
-    MAX_BATCH_DIGESTS_PER_REQUEST, MAX_CONCURRENT_BATCH_STREAMS, MAX_CONCURRENT_GOSSIP_PREFETCHES,
+    AdmittedSyncStream, WorkerEventChannel, WorkerEventReceiver, WorkerIngressEvent, WorkerNetwork,
+    WorkerNetworkHandle, WorkerRequest, WorkerResponse, MAX_BATCH_DIGESTS_PER_REQUEST,
+    MAX_CONCURRENT_BATCH_STREAMS, MAX_CONCURRENT_GOSSIP_PREFETCHES, MAX_CONCURRENT_SHED_TASKS,
     MAX_PENDING_REQUESTS_PER_PEER,
 };
 pub mod quorum_waiter;
@@ -19,7 +20,7 @@ pub use crate::{
         handler::RequestHandler,
         message::{WorkerGossip, WorkerRPCError},
     },
-    worker::{new_worker, Worker, CHANNEL_CAPACITY},
+    worker::{new_worker, LocalBatchRecovery, Worker, CHANNEL_CAPACITY},
 };
 
 /// The number of shutdown receivers to create on startup. We need one per component loop.

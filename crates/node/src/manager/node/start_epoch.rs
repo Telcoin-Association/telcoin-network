@@ -963,7 +963,7 @@ where
             .worker_event_streams
             .get(usize::from(*worker_id))
             .ok_or_else(|| eyre!("no event stream for worker {worker_id}"))?
-            .subscribe();
+            .subscribe_with(|events| events.subscribe());
         debug!(target: "epoch-manager", "spawning worker network for epoch");
 
         let committee_keys: HashSet<BlsPublicKey> = consensus_config

@@ -47,7 +47,7 @@ use tn_types::{
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
 pub(crate) use tn_types::gas_accumulator::worker_id_from_header;
-use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tn_worker::{WorkerEventChannel, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -83,6 +83,12 @@ const EXEX_EVENT_CAPACITY: usize = 16;
 /// bursts (e.g. restart replay) while a persistently full channel backpressures the epoch
 /// manager's forwarder instead of consuming memory.
 const TO_ENGINE_CAPACITY: usize = 64;
+
+/// Authenticated neighbors of the committee at a single epoch-start header.
+struct NeighborCommitteeKeys {
+    previous: HashSet<BlsPublicKey>,
+    next: Vec<BlsPublicKey>,
+}
 
 /// Inputs for one worker swarm, validated before any process-lifetime network is spawned.
 struct PreparedWorkerNetwork<Events> {
@@ -277,7 +283,8 @@ pub(crate) struct EpochManager<P, DB> {
     /// Persistent event streams for the long-running worker networks, one per configured worker
     /// and indexed by [`WorkerId`](tn_types::WorkerId). Outlive any single epoch so the worker
     /// swarms do not have to be rebuilt on each transition.
-    worker_event_streams: Vec<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>,
+    worker_event_streams:
+        Vec<WorkerEventChannel<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>>,
 
     /// Final consensus header of the epoch that just closed, carried into the next epoch so it can
     /// be used as the starting point for the new epoch's chain.
@@ -724,6 +731,39 @@ where
     P: TelcoinDirs + Clone + 'static,
     DB: TNDatabase,
 {
+    /// Read the same pinned neighbor window for process startup and epoch entry.
+    async fn read_neighbor_committee_keys(
+        engine: &ExecutionNode,
+        entered: Epoch,
+        epoch_start_header: &SealedHeader,
+    ) -> eyre::Result<NeighborCommitteeKeys> {
+        let epochs: Vec<_> =
+            if entered == 0 { vec![entered + 1] } else { vec![entered - 1, entered + 1] };
+        let sets = retry_provider_faults(
+            "neighbor committees at the epoch-start pin",
+            epoch_start_header,
+            |pin| engine.validators_for_epochs_at_header(&epochs, pin),
+        )
+        .await
+        .map_err(|e| {
+            eyre!(
+                "failed neighbor-committee read at the epoch-start pin - halting rather than \
+                 entering epoch {entered} with an unverifiable neighbor committee: {e}"
+            )
+        })?;
+        if entered == 0 {
+            let [next] = sets
+                .try_into()
+                .map_err(|_| eyre!("neighbor-committee batch arity mismatch for epoch 0"))?;
+            Ok(NeighborCommitteeKeys { previous: HashSet::new(), next })
+        } else {
+            let [previous, next] = sets.try_into().map_err(|_| {
+                eyre!("neighbor-committee batch arity mismatch for epoch {entered}")
+            })?;
+            Ok(NeighborCommitteeKeys { previous: previous.into_iter().collect(), next })
+        }
+    }
+
     /// Construct the manager and its process-lifetime state.
     ///
     /// Opens the consensus chain, builds the application-scoped consensus bus, and loads bootstrap
@@ -766,7 +806,7 @@ where
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
         // one event stream per configured worker, indexed by worker id
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
-            .map(|_| QueChannel::new())
+            .map(|_| WorkerEventChannel::new(QueChannel::new()))
             .collect();
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
@@ -918,7 +958,16 @@ where
         if let Some(addr) = self.builder.metrics {
             let db = self.reth_db.clone();
             let hooks = tn_metrics::MetricsHooks::default()
-                .with_hook(move || tn_reth::report_db_metrics(&db));
+                .with_hook(move || tn_reth::report_db_metrics(&db))
+                .with_hook(|| {
+                    if let Some(snapshot) = tn_primary::network::vote_observation_watermark() {
+                        metrics::gauge!(
+                            "tn_primary_vote_observation_allocated",
+                            "generation" => snapshot.generation
+                        )
+                        .set(snapshot.allocated_request_count as f64);
+                    }
+                });
             tn_metrics::start_metrics_server(
                 addr,
                 &node_task_manager.get_spawner(),
@@ -958,6 +1007,15 @@ where
         // Epoch 0 keeps the protocol-minimum defaults because it has no preceding close.
         let (committee, _, _, epoch_start_header) =
             self.get_committee_with_epoch_start_info(&engine).await?;
+        let startup_committee_keys: HashSet<_> = committee
+            .authorities()
+            .into_iter()
+            .map(|authority| *authority.protocol_key())
+            .collect();
+        let startup_neighbors =
+            Self::read_neighbor_committee_keys(&engine, committee.epoch(), &epoch_start_header)
+                .await?;
+        let startup_next_committee_keys: HashSet<_> = startup_neighbors.next.into_iter().collect();
         if committee.epoch() > 0 {
             read_base_fees_for_entered_epoch(
                 &engine.get_reth_env().await,
@@ -1052,9 +1110,9 @@ where
             Ok(())
         });
 
-        // Register bootstrap peers before per-epoch committee updates resolve known peers.
-        // Listening and bootstrap dials belong to process startup, before replay can close an
-        // epoch without creating consensus. Membership stays per-epoch; readiness and reconnect
+        // Bind bootstrap peer identities before seeding authoritative startup membership.
+        // Membership must precede listening so validators cannot consume ordinary public slots.
+        // Per-epoch startup refreshes the complete committee window. Readiness and reconnect
         // work continue independently for the entire process.
         primary_network_handle
             .inner_handle()
@@ -1079,12 +1137,17 @@ where
         // Validate cached bindings on every swarm before opening any listener or starting dials.
         let committee_peers = network_config.committee_peers();
         let startup_bootstrap = &self.bootstrap_servers;
-        let startup_members: HashSet<_> = committee.bls_keys().iter().copied().collect();
         primary_network_handle
             .inner_handle()
-            .update_committees(HashSet::new(), startup_members.clone(), HashSet::new())
+            .update_committees(
+                startup_neighbors.previous.clone(),
+                startup_committee_keys.clone(),
+                startup_next_committee_keys.clone(),
+            )
             .await?;
-        let startup_members = &startup_members;
+        let startup_membership = &startup_committee_keys;
+        let startup_previous_membership = &startup_neighbors.previous;
+        let startup_next_membership = &startup_next_committee_keys;
         futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
             .try_for_each(|network_handle| async move {
                 let worker_id = network_handle.worker_id();
@@ -1105,7 +1168,11 @@ where
                 network_handle.inner_handle().seed_committee_peers(peers).await?;
                 network_handle
                     .inner_handle()
-                    .update_committees(HashSet::new(), startup_members.clone(), HashSet::new())
+                    .update_committees(
+                        startup_previous_membership.clone(),
+                        startup_membership.clone(),
+                        startup_next_membership.clone(),
+                    )
                     .await
                     .map_err(Into::into)
             })
@@ -1482,15 +1549,9 @@ where
             on_chain_workers,
         )?;
 
-        // Reject an invalid peer-score config before it is installed into the process-global,
-        // first-write-wins `GLOBAL_SCORE_CONFIG` by the `PeerManager` built below
-        // (`init_peer_score_config`). This is the boot-path install funnel, so validating here
-        // fails the node fast at start with a field-named error rather than letting a
-        // `min_score > max_score` or `NaN` bound poison the scoring path and later panic
-        // `Score::add`'s `f64::clamp` on the first peer penalty.
-        // `ConsensusConfig::new_with_committee` validates the same config for the
-        // construction path (tests, epoch transitions); this guard covers the node boot
-        // that actually performs the one-time install.
+        // Validate the instance's peer-score config before building its PeerManager so node
+        // startup reports invalid bounds by field name before they reach Score::add's clamp.
+        // ConsensusConfig::new_with_committee also validates tests and epoch transitions.
         network_config.peer_config().score_config.validate()?;
 
         // Validate the operator-provided kad cadences before installing them into either swarm,
@@ -1628,7 +1689,7 @@ where
                 let worker_network = ConsensusNetwork::new_for_worker(
                     worker_id,
                     network_config,
-                    event_stream,
+                    event_stream.clone(),
                     self.key_config.clone(),
                     self.consensus_db.clone(),
                     node_task_spawner.clone(),
@@ -1637,7 +1698,16 @@ where
                 )?
                 .with_source_admission_budget(source_budget.clone())
                 .with_advertised_addresses(advertised)?;
-                let worker_network_handle = worker_network.network_handle();
+                // The epoch task spawner is refreshed on each epoch; ingress expiry uses the
+                // node-lifetime spawner retained by the network handle.
+                let worker_network_handle = WorkerNetworkHandle::new(
+                    worker_network.network_handle(),
+                    node_task_spawner.clone(),
+                    worker_id,
+                    epoch,
+                    network_config.chain_id(),
+                );
+                event_stream.bind(&worker_network_handle, network_config.serve_limits(), worker_id);
                 let node_shutdown = self.node_shutdown.subscribe();
 
                 // spawn long-running worker network task
@@ -1656,14 +1726,7 @@ where
                     },
                 );
 
-                // set temporary task spawner - this is updated with each epoch
-                Ok(WorkerNetworkHandle::new(
-                    worker_network_handle,
-                    node_task_spawner.clone(),
-                    worker_id,
-                    epoch,
-                    network_config.chain_id(),
-                ))
+                Ok(worker_network_handle)
             })
             .collect::<eyre::Result<Vec<_>>>()?;
 

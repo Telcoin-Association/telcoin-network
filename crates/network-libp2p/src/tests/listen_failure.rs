@@ -7,7 +7,10 @@ use futures::{future, stream, StreamExt as _, TryStreamExt as _};
 use libp2p::{
     allow_block_list,
     connection_limits::{self, ConnectionLimits},
-    core::{transport::TransportError, ConnectedPoint},
+    core::{
+        transport::{PortUse, TransportError},
+        ConnectedPoint, Endpoint,
+    },
     swarm::{
         ConnectionDenied, ConnectionId, FromSwarm, ListenError, ListenFailure, NetworkBehaviour,
         SwarmEvent,
@@ -43,6 +46,106 @@ fn metric<'a>(
                 })
         })
         .map(|(_, value)| value)
+}
+
+/// Source admission counts real inbound and outbound refusals once, before listener accounting.
+#[tokio::test(start_paused = true)]
+async fn test_source_reservation_rejections_are_counted_once_per_attempt() -> eyre::Result<()> {
+    use crate::source_admission::AdmissionError;
+    use tn_config::SourceAdmissionConfig;
+
+    let config: SourceAdmissionConfig = serde_json::from_value(serde_json::json!({
+        "max_connections": 1,
+        "max_connections_per_peer": 1,
+        "max_connections_per_address": 1,
+        "max_connections_per_prefix": 1,
+        "max_sources": 1,
+        "ipv4_prefix_length": 24,
+        "ipv6_prefix_length": 64,
+    }))?;
+    let recorder = DebuggingRecorder::new();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    [NetworkType::Primary, NetworkType::Worker(0), NetworkType::Worker(1)]
+        .into_iter()
+        .try_for_each(|network| {
+            let budget = SourceAdmissionBudget::new(&config)?;
+            let mut manager = PeerManager::new(
+                PeerId::random(),
+                &PeerConfig::default(),
+                PeerManagerMetrics::new_for(&network),
+            );
+            manager.set_source_budget(Some(budget.clone()));
+            let address: Multiaddr = "/ip4/127.0.0.1/udp/12345/quic-v1".parse()?;
+            manager.handle_established_inbound_connection(
+                ConnectionId::new_unchecked(1),
+                PeerId::random(),
+                &address,
+                &address,
+            )?;
+            let rejected_peer = PeerId::random();
+            let rejected_id = ConnectionId::new_unchecked(2);
+            let inbound = manager
+                .handle_established_inbound_connection(
+                    rejected_id,
+                    rejected_peer,
+                    &address,
+                    &address,
+                )
+                .err()
+                .ok_or_eyre("full source budget accepted an inbound connection")?;
+            let outbound = manager
+                .handle_established_outbound_connection(
+                    ConnectionId::new_unchecked(3),
+                    PeerId::random(),
+                    &address,
+                    Endpoint::Dialer,
+                    PortUse::Reuse,
+                )
+                .err()
+                .ok_or_eyre("full source budget accepted an outbound connection")?;
+            assert_eq!(
+                inbound.downcast_ref::<AdmissionError>(),
+                Some(&AdmissionError::ProcessFull)
+            );
+            assert_eq!(
+                outbound.downcast_ref::<AdmissionError>(),
+                Some(&AdmissionError::ProcessFull)
+            );
+
+            let error = ListenError::Denied { cause: inbound };
+            manager.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+                local_addr: &address,
+                send_back_addr: &address,
+                error: &error,
+                connection_id: rejected_id,
+                peer_id: Some(rejected_peer),
+            }));
+            assert_eq!(budget.snapshot()?.connections(), 1);
+            let label = network_label(&network);
+            let snapshot = snapshot_metrics(&recorder);
+            assert_eq!(
+                metric(
+                    &snapshot,
+                    "tn_network.source_rejections_total",
+                    &[("network", &label), ("reason", "process_full")],
+                ),
+                Some(&DebugValue::Counter(2)),
+            );
+            assert_eq!(
+                metric(
+                    &snapshot,
+                    "tn_network.listen_failures_total",
+                    &[("network", &label), ("reason", "other_behaviour_denied")],
+                ),
+                Some(&DebugValue::Counter(1)),
+            );
+            assert!(snapshot
+                .iter()
+                .filter(|(key, _)| { key.name() == "tn_network.source_rejections_total" })
+                .all(|(key, _)| key.labels().count() == 2));
+            Ok::<_, eyre::Report>(())
+        })?;
+    Ok(())
 }
 
 /// Every failure kind is counted once without changing unrelated peer or outbound dial state.

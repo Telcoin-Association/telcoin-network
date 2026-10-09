@@ -16,6 +16,115 @@ use thiserror::Error;
 
 use super::WorkerId;
 
+/// Node-wide locks serialize exact-digest cache retry without blocking unrelated batches.
+#[derive(Debug, Default)]
+pub struct LocalBatchSealLocks {
+    /// Weak keys remain only while a seal attempt owns or waits for its digest lock.
+    entries: std::sync::Mutex<
+        std::collections::HashMap<BlockHash, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
+}
+
+impl LocalBatchSealLocks {
+    /// Reserve one of at most 1024 live digest locks, with cancellation-safe key cleanup.
+    pub async fn acquire(
+        self: &std::sync::Arc<Self>,
+        digest: BlockHash,
+    ) -> Option<LocalBatchSealGuard> {
+        let lock = {
+            let mut entries =
+                self.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            entries.retain(|_, lock| lock.strong_count() > 0);
+            entries.get(&digest).and_then(std::sync::Weak::upgrade).or_else(|| {
+                (entries.len() < 1024).then(|| {
+                    let lock = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    entries.insert(digest, std::sync::Arc::downgrade(&lock));
+                    lock
+                })
+            })
+        }?;
+        let mut lease =
+            LocalBatchSealGuard { owner: self.clone(), digest, lock: lock.clone(), guard: None };
+        lease.guard = Some(lock.lock_owned().await);
+        Some(lease)
+    }
+}
+
+/// Releases the exact-digest lock and promptly removes its final registry key on drop.
+#[derive(Debug)]
+pub struct LocalBatchSealGuard {
+    /// Explicit node owner shared across workers and epochs.
+    owner: std::sync::Arc<LocalBatchSealLocks>,
+    /// Digest whose cache/quorum/report/delete sequence is serialized.
+    digest: BlockHash,
+    /// Keep the lock alive while acquiring or holding it.
+    lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    /// Held across every await in the accepted-cache ownership sequence.
+    guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for LocalBatchSealGuard {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        let mut entries =
+            self.owner.entries.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if std::sync::Arc::strong_count(&self.lock) == 1 {
+            entries.remove(&self.digest);
+        }
+    }
+}
+
+#[cfg(test)]
+mod local_seal_lock_tests {
+    //! Deterministic controls for the bounded node-wide seal lock registry.
+    use super::{BlockHash, LocalBatchSealLocks};
+    use futures::{poll, FutureExt, StreamExt};
+    use std::sync::Arc;
+
+    /// Exact-digest exclusion and capacity remain bounded through waiter cancellation.
+    #[tokio::test]
+    async fn local_batch_seal_locks_bound_serialize_and_release() {
+        let owner = Arc::new(LocalBatchSealLocks::default());
+        let digest = BlockHash::from([1; 32]);
+        let first = owner.acquire(digest).await.expect("first seal lock");
+        let mut waiting = Box::pin(owner.acquire(digest));
+        assert!(poll!(waiting.as_mut()).is_pending());
+        let mut independent = Box::pin(owner.acquire(BlockHash::from([2; 32])));
+        let second = independent
+            .as_mut()
+            .now_or_never()
+            .expect("unrelated digest must acquire independently")
+            .expect("available key");
+        drop(independent);
+        drop(first);
+        assert_eq!(owner.entries.lock().expect("registry").len(), 2);
+        drop(waiting);
+        assert_eq!(owner.entries.lock().expect("registry").len(), 1);
+        drop(second);
+        assert!(owner.entries.lock().expect("registry").is_empty());
+
+        let mut guards = futures::stream::iter(0_u32..1024)
+            .then(|index| {
+                let owner = owner.clone();
+                async move {
+                    let mut bytes = [0; 32];
+                    bytes[..4].copy_from_slice(&index.to_be_bytes());
+                    owner.acquire(BlockHash::from(bytes)).await.expect("bounded key")
+                }
+            })
+            .collect::<Vec<_>>()
+            .await;
+        let extra = BlockHash::from([3; 32]);
+        assert!(owner.acquire(extra).await.is_none());
+        drop(guards.pop());
+        let replacement = owner.acquire(extra).await.expect("released slot is reusable");
+        assert_eq!(owner.entries.lock().expect("registry").len(), 1024);
+        drop(guards);
+        drop(replacement);
+        assert!(owner.entries.lock().expect("registry").is_empty());
+    }
+}
+
 /// The batch for workers to communicate for consensus.
 #[derive(Clone, Serialize, Deserialize, Debug, PartialEq, Eq)]
 pub struct SealedBatch {

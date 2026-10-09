@@ -24,6 +24,7 @@ use rand::seq::IteratorRandom as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::IpAddr,
+    num::NonZeroUsize,
     sync::Arc,
     task::Context,
     time::Duration,
@@ -153,6 +154,10 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Optional ordinary-population ceiling independent of protected peer retention.
+    public_peer_limit: Option<NonZeroUsize>,
+    /// Bounded, operator-selected observer identities, measured separately from other pins.
+    dao_observers: HashSet<BlsPublicKey>,
     /// Leases owned by this swarm using optional process-wide source accounting.
     source_connections: SourceConnections,
     /// The interval to perform maintenance.
@@ -295,6 +300,7 @@ impl PeerManager {
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let important = self.peer_is_important(&peer);
         self.source_connections.reserve(connection, peer, address).map_err(|error| {
+            self.metrics.record_source_rejection(error);
             self.metrics.record_source_admission_denied(direction, error.label());
             if matches!(error, AdmissionError::Poisoned) {
                 error!(target: "peer-manager", %error, "source admission accounting poisoned");
@@ -330,6 +336,8 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            public_peer_limit: None,
+            dao_observers: HashSet::new(),
             source_connections: SourceConnections::default(),
             heartbeat,
             peers,
@@ -538,6 +546,18 @@ impl PeerManager {
 
         // Emit peer metrics via tracing for OpenTelemetry export.
         let connected_count = self.peers.connected_peer_ids().count();
+        // Keep this conservative qualification gauge: unresolved identities are nonimportant.
+        // Admission counts confirmed ordinary identities separately, within the aggregate target.
+        let ordinary =
+            self.peers.connected_peer_ids().filter(|peer| !self.peer_is_important(peer)).count();
+        let observers = self
+            .peers
+            .connected_peer_ids()
+            .filter(|peer| {
+                self.peer_to_bls(peer).is_some_and(|key| self.dao_observers.contains(&key))
+            })
+            .count();
+        self.metrics.set_population_counts(ordinary, observers);
         let connected_or_dialing = self.connected_or_dialing_peers().len();
         let banned_count = self.temporarily_banned.len();
         tracing::info!(
@@ -648,8 +668,14 @@ impl PeerManager {
         self.peers.is_peer_validator(peer_id)
     }
 
+    /// Simulate temporary-ban expiry without completing a pending connection close.
+    #[cfg(test)]
+    pub(crate) fn simulate_temporary_ban_expiry(&mut self, peer_id: &PeerId) -> bool {
+        self.temporarily_banned.remove(peer_id)
+    }
+
     /// Returns a boolean if the peer is connected.
-    pub(super) fn is_connected(&self, peer_id: &PeerId) -> bool {
+    pub(crate) fn is_connected(&self, peer_id: &PeerId) -> bool {
         self.peers.get_peer(peer_id).is_some_and(|peer| {
             matches!(peer.connection_status(), ConnectionStatus::Connected { .. })
         })
@@ -678,22 +704,82 @@ impl PeerManager {
         self.temporarily_banned.contains(peer_id) || self.peers.peer_banned(peer_id)
     }
 
-    /// Process new connection and return boolean indicating if the peer limit was reached.
+    /// Check confirmed ordinary population and the aggregate provisional-admission bound.
+    ///
+    /// The established count includes this connection. Pending dials use transport budgets.
     pub(super) fn peer_limit_reached(&self, endpoint: &ConnectedPoint) -> bool {
         debug!(target: "peer-manager", connected_peers=?self.peers.connected_peer_ids().count(), "checking peer limits");
-        if endpoint.is_dialer() {
-            // this node dialed peer
-            self.peers.connected_peer_ids().count() >= self.config.max_outbound_dialing_peers()
-        } else {
-            // peer dialed this node
-            self.connected_or_dialing_peers().len() >= self.config.max_peers()
+        self.public_peer_limit.map_or_else(
+            || {
+                if endpoint.is_dialer() {
+                    self.peers.connected_peer_ids().count()
+                        >= self.config.max_outbound_dialing_peers()
+                } else {
+                    self.connected_or_dialing_peers().len() >= self.config.max_peers()
+                }
+            },
+            |limit| {
+                self.confirmed_ordinary_peer_count() > limit.get()
+                    || self.peers.connected_peer_ids().count() > self.config.target_num_peers
+            },
+        )
+    }
+
+    /// Unresolved identities consume aggregate headroom until a valid record classifies them.
+    pub(crate) fn peer_is_confirmed_ordinary(&self, peer_id: &PeerId) -> bool {
+        self.peers.peer_has_confirmed_identity(peer_id) && !self.peer_is_important(peer_id)
+    }
+
+    fn confirmed_ordinary_peer_count(&self) -> usize {
+        self.peers.connected_peer_ids().filter(|peer| self.peer_is_confirmed_ordinary(peer)).count()
+    }
+
+    /// Enforce public limits after connection acceptance, identity promotion, or trust changes.
+    pub(super) fn enforce_public_peer_limits(&mut self) {
+        if self.public_peer_limit.is_some() {
+            self.prune_connected_peers();
         }
+    }
+
+    pub(super) fn record_population_rejection(&self, peer_id: PeerId) {
+        if let Some(limit) = self.public_peer_limit {
+            let ordinary_count = self.confirmed_ordinary_peer_count();
+            let connected_count = self.peers.connected_peer_ids().count();
+            let decision_basis = match () {
+                () if ordinary_count > limit.get()
+                    && connected_count > self.config.target_num_peers =>
+                {
+                    "ordinary_and_aggregate"
+                }
+                () if ordinary_count > limit.get() => "ordinary",
+                () => "aggregate",
+            };
+            tracing::debug!(target: "network::identity", event = "population_rejected",
+                ?peer_id, ordinary_count, connected_count, ordinary_limit = limit.get(),
+                aggregate_target = self.config.target_num_peers, decision_basis);
+        }
+    }
+
+    /// Set an ordinary-peer admission ceiling while preserving aggregate connection limits.
+    pub(crate) fn set_public_peer_limit(&mut self, limit: Option<NonZeroUsize>) {
+        self.public_peer_limit = limit;
+    }
+
+    /// Reserve retention for prevalidated DAO identities while preserving their penalty policy.
+    pub(crate) fn set_dao_observers(&mut self, observers: HashSet<BlsPublicKey>) {
+        self.dao_observers = observers;
+        self.metrics.set_population_counts(0, 0);
     }
 
     /// Return an iterator of peers that are connected or dialed.
     pub(crate) fn connected_or_dialing_peers(&self) -> Vec<PeerId> {
         trace!(target: "peer-manager", "all peers:\n{:?}", self.peers);
         self.peers.connected_or_dialing_peers()
+    }
+
+    /// Return authenticated peers with an established connection, excluding pending dials.
+    pub(crate) fn connected_peers(&self) -> Vec<PeerId> {
+        self.peers.connected_peer_ids().collect()
     }
 
     /// Record an inbound `AddProvider` from `provider` and report whether it
@@ -733,6 +819,7 @@ impl PeerManager {
     /// The application layer reports issues from peers that are processed here.
     /// Some reports are propagated to libp2p network layer. Caller is responsible
     /// for specifying the severity of the penalty to apply.
+    #[track_caller]
     pub(crate) fn process_penalty(&mut self, peer_id: PeerId, penalty: Penalty) {
         // Never penalize our own identity. A self-connection (e.g. a learned
         // hairpin address routed back to our own peer id) must not feed the
@@ -744,6 +831,13 @@ impl PeerManager {
         }
         self.metrics.record_penalty(&penalty);
         let action = self.peers.process_penalty(&peer_id, penalty);
+
+        if matches!(&action, PeerAction::Ban(_) | PeerAction::Disconnect) {
+            let caller = std::panic::Location::caller();
+            warn!(target: "peer-manager", ?peer_id, ?penalty, ?action,
+                source_file = caller.file(), source_line = caller.line(),
+                "peer penalty caused connection loss");
+        }
 
         debug!(target: "peer-manager", ?peer_id, ?action, "processed penalty");
         self.apply_peer_action(peer_id, action);
@@ -792,7 +886,13 @@ impl PeerManager {
         );
 
         debug!(target: "peer-manager", ?action, "disconnect peer results in:");
-        self.apply_peer_action(peer_id, action);
+        match action {
+            // The explicit disconnect above already includes the selected peer-exchange policy.
+            PeerAction::Disconnect | PeerAction::DisconnectWithPX => self.temporarily_ban(peer_id),
+            PeerAction::Ban(_) | PeerAction::Unban(_) | PeerAction::NoAction => {
+                self.apply_peer_action(peer_id, action);
+            }
+        }
     }
 
     /// Register a connected peer if their reputation is sufficient.
@@ -806,6 +906,8 @@ impl PeerManager {
     ) -> bool {
         if self.peers.peer_banned(peer_id) {
             // log error if the peer is banned
+            tracing::debug!(target: "network::identity", event = "connection_registered",
+                ?peer_id, outcome = "banned");
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
         }
@@ -833,6 +935,8 @@ impl PeerManager {
             }
         }
 
+        tracing::debug!(target: "network::identity", event = "connection_registered",
+            ?peer_id, bls_key = ?self.peer_to_bls(peer_id));
         true
     }
 
@@ -869,8 +973,16 @@ impl PeerManager {
         // connected peers sorted from lowest to highest aggregate score
         // peers that do not participate in the kad routing table are prioritized for disconnect
         let connected_peers = self.peers.connected_peers_by_score_and_routability();
-        let mut excess_peer_count =
+        let mut public_excess = self.public_peer_limit.map_or(0, |limit| {
+            connected_peers
+                .iter()
+                .filter(|(peer_id, _)| self.peer_is_confirmed_ordinary(peer_id))
+                .count()
+                .saturating_sub(limit.get())
+        });
+        let mut aggregate_excess =
             connected_peers.len().saturating_sub(self.config.target_num_peers);
+        let mut excess_peer_count = aggregate_excess.max(public_excess);
         if excess_peer_count == 0 {
             // no excess peers
             return;
@@ -886,14 +998,31 @@ impl PeerManager {
 
         // disconnect peers until excess_peer_count is 0 or no more peers
         for peer_id in ready_to_prune {
-            if excess_peer_count > 0 {
+            let ordinary = self.peer_is_confirmed_ordinary(&peer_id);
+            if excess_peer_count > 0 && (aggregate_excess > 0 || ordinary) {
+                let decision_basis = match () {
+                    () if aggregate_excess > 0 && public_excess > 0 && ordinary => {
+                        "ordinary_and_aggregate"
+                    }
+                    () if aggregate_excess > 0 => "aggregate",
+                    () => "ordinary",
+                };
+                tracing::debug!(target: "network::identity", event = "population_pruned",
+                    ?peer_id, ordinary_count = self.confirmed_ordinary_peer_count(),
+                    connected_count = self.peers.connected_peer_ids().count(),
+                    aggregate_target = self.config.target_num_peers, public_excess,
+                    aggregate_excess, decision_basis);
                 self.disconnect_peer(peer_id, true);
-                excess_peer_count = excess_peer_count.saturating_sub(1);
+                aggregate_excess = aggregate_excess.saturating_sub(1);
+                public_excess = public_excess.saturating_sub(usize::from(ordinary));
+                excess_peer_count = aggregate_excess.max(public_excess);
                 continue;
             }
 
             // excess peers 0 - finish pruning
-            break;
+            if excess_peer_count == 0 {
+                break;
+            }
         }
     }
 
@@ -967,12 +1096,17 @@ impl PeerManager {
     /// Derive independent privileges from live committee membership and operator configuration.
     ///
     /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Configured DAO observers also reserve retention, while remaining subject to load penalties.
     /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
     pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
         let policy = self.peers.peer_policy(peer_id);
-        self.peer_to_bls(peer_id)
+        let policy = self
+            .peer_to_bls(peer_id)
             .filter(|key| self.pinned_peers.contains(key))
-            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap));
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.dao_observers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::DaoObserver))
     }
 
     /// Whether retention policy protects this peer from population pruning and mesh treatment.
@@ -1015,6 +1149,9 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        if self.public_peer_limit.is_some() {
+            self.prune_connected_peers();
+        }
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -1266,10 +1403,12 @@ impl PeerManager {
                 // a learned record with the launch binding: pin it and re-cache it so the launch
                 // address applies, without discarding its signed timestamp and rpc
                 self.pinned_peers.insert(key);
-                self.known_peers
-                    .remove(&key)
-                    .into_iter()
-                    .for_each(|known| self.cache_known_peer(key, known));
+                self.known_peers.remove(&key).into_iter().for_each(|known| {
+                    let timestamp = self.known_timestamps.get(&key).copied().unwrap_or_else(|| {
+                        crate::freshness::RecordTimestamp::legacy(known.timestamp, now())
+                    });
+                    self.cache_known_peer_with_timestamp(key, known, timestamp);
+                });
             }
         });
         Ok(())
@@ -1375,6 +1514,40 @@ impl PeerManager {
         }
     }
 
+    /// Expired proofs can only confirm a new anonymous public identity.
+    /// Existing peer bindings and configured or learned authority records remain unchanged.
+    pub(crate) fn can_confirm_expired_public_identity(
+        &self,
+        source: &PeerId,
+        bls_key: &BlsPublicKey,
+    ) -> bool {
+        self.peer_to_bls(source).is_none()
+            && !self.peers.has_confirmed_identity(bls_key)
+            && !self.known_peers.contains_key(bls_key)
+            && !self.peers.is_committee_member(bls_key)
+            && !self.pinned_peers.contains(bls_key)
+    }
+
+    /// Confirm a fully validated live source without learning expired address or RPC metadata.
+    pub(crate) fn confirm_expired_public_identity(
+        &mut self,
+        source: PeerId,
+        bls_key: BlsPublicKey,
+        info: NetworkInfo,
+    ) {
+        if self.can_confirm_expired_public_identity(&source, &bls_key) {
+            // This confirms identity only. Preserve retained transport endpoints without
+            // learning the expired record's advertised addresses or RPC metadata.
+            let retained_addresses = self
+                .peers
+                .get_peer(&source)
+                .map(|peer| peer.multiaddrs_snapshot().into_iter().collect::<Vec<_>>())
+                .unwrap_or_default();
+            self.peers.upsert_peer(bls_key, info.pubkey, retained_addresses);
+            self.enforce_public_peer_limits();
+        }
+    }
+
     /// Admit a peer record pushed to us over the peer's own authenticated connection (a kad PUT
     /// whose `source` is the sending peer).
     ///
@@ -1411,35 +1584,41 @@ impl PeerManager {
         let advertised: PeerId = info.pubkey.clone().into();
         let cacheable =
             self.peers.is_committee_member(&bls_key) || self.pinned_peers.contains(&bls_key);
-        match () {
-            () if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) => {
-                trace!(
-                    target: "peer-manager",
-                    ?bls_key,
-                    ?source,
-                    "dropping stale self-advertised record for committee member"
-                );
-            }
-            () if cacheable => self.cache_known_peer_with_timestamp(bls_key, info, timestamp),
-            () if source == advertised
-                && !self.committee_peers.values().any(|peer| peer.network_key == info.pubkey) =>
-            {
-                trace!(
-                    target: "peer-manager",
-                    ?bls_key,
-                    ?source,
-                    "confirming self-advertised connected peer identity"
-                );
-                self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
-            }
-            () => {
-                trace!(
-                    target: "peer-manager",
-                    ?bls_key,
-                    ?source,
-                    "dropping non-committee relayed peer record"
-                );
-            }
+        if cacheable && self.kad_timestamp_is_stale(&bls_key, timestamp, observed) {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "stale");
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "dropping stale self-advertised record for committee member"
+            );
+        } else if cacheable {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "accepted_known");
+            self.cache_known_peer_with_timestamp(bls_key, info, timestamp);
+        } else if source == advertised
+            && !self.committee_peers.values().any(|peer| peer.network_key == info.pubkey)
+        {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "accepted_self_owned");
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "confirming self-advertised connected peer identity"
+            );
+            self.peers.upsert_peer(bls_key, info.pubkey, info.multiaddrs);
+            self.enforce_public_peer_limits();
+        } else {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                ?source, ?advertised, ?bls_key, outcome = "not_self_owned");
+            trace!(
+                target: "peer-manager",
+                ?bls_key,
+                ?source,
+                "dropping non-committee relayed peer record"
+            );
         }
     }
 
@@ -1460,6 +1639,12 @@ impl PeerManager {
     #[cfg(test)]
     pub(crate) fn peer_multiaddr_count(&self, peer_id: &PeerId) -> Option<usize> {
         self.peers.get_peer(peer_id).map(|peer| peer.multiaddr_count())
+    }
+
+    /// Snapshot the exact multiaddrs currently retained for `peer_id`, if it is tracked.
+    #[cfg(test)]
+    pub(crate) fn peer_multiaddrs(&self, peer_id: &PeerId) -> Option<HashSet<Multiaddr>> {
+        self.peers.get_peer(peer_id).map(|peer| peer.multiaddrs_snapshot())
     }
 
     /// Check whether a kad-sourced record fails the shared local freshness policy.
@@ -1569,6 +1754,7 @@ impl PeerManager {
         // resolve its peer id immediately.
         let unban_actions = self.peers.apply_membership_if_committee(bls_key);
         self.apply_unban_actions(unban_actions);
+        self.enforce_public_peer_limits();
     }
 
     /// Find authorities for the epoch manager, upgrading configured dial hints to signed records.

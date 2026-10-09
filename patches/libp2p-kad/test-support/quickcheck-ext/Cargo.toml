@@ -1,0 +1,27 @@
+[package]
+name = "quickcheck-ext"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "Unlicense/MIT"
+
+[package.metadata.release]
+release = false
+
+[dependencies]
+quickcheck = "1"
+num-traits = "0.2"
+
+[lints.rust]
+unreachable_pub = "warn"
+
+[lints.clippy]
+used_underscore_binding = "warn"
+type_complexity = "allow"
+unnecessary_wraps = "warn"
+manual_let_else = "warn"
+dbg_macro = "warn"
+
+[lints.clippy.pedantic]
+level = "allow"
+priority = -1

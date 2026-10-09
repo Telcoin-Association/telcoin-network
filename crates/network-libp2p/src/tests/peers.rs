@@ -78,7 +78,10 @@ fn instance_peer_registry_configuration() {
                 Some(config.default_score)
             );
             assert!(peers.get_peer_mut(&peer_id).is_some_and(|peer| {
-                peer.apply_penalty(Penalty::Severe, PeerPolicy::default());
+                peer.apply_penalty(
+                    Penalty::Load(crate::LoadPenalty::KademliaFlood),
+                    PeerPolicy::default(),
+                );
                 peer.score().aggregate_score() == config.default_score - 10.0
             }));
             peers.upsert_peer(bls, net.clone(), Vec::new());
@@ -390,12 +393,180 @@ fn test_upsert_peer_rotation_releases_displaced_record_counters() {
 }
 
 #[test]
+fn test_add_trusted_peer_preserves_connected_authenticated_state() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net, peer_id, _, _) = rotation_keys(61);
+    all_peers.upsert_peer(bls, net.clone(), vec![]);
+    [ConnectionDirection::Outgoing, ConnectionDirection::Incoming].into_iter().for_each(
+        |direction| {
+            all_peers.update_connection_status(
+                &peer_id,
+                NewConnectionStatus::Connected { multiaddr: create_multiaddr(None), direction },
+            );
+        },
+    );
+    let observed_ips: HashSet<_> =
+        all_peers.get_peer(&peer_id).unwrap().known_ip_addresses().collect();
+    assert!(!observed_ips.is_empty());
+
+    // No establishment event occurs after either the grant or a repeated trust reload.
+    (0..2).for_each(|_| {
+        all_peers.add_trusted_peer(bls, net.clone());
+        let peer = all_peers.get_peer(&peer_id).unwrap();
+        assert!(matches!(
+            peer.connection_status(),
+            ConnectionStatus::Connected { num_in: 1, num_out: 1 }
+        ));
+        assert_eq!(peer.reputation(), Reputation::Trusted);
+        assert_eq!(peer.known_ip_addresses().collect::<HashSet<_>>(), observed_ips);
+        // This is the identity projection used by the ConnectedPeers command.
+        let connected_bls: HashSet<_> =
+            all_peers.connected_peer_ids().filter_map(|id| all_peers.bls_for_peer(&id)).collect();
+        assert_eq!(connected_bls, HashSet::from([bls]));
+        assert_eq!(all_peers.disconnected_peers, 0);
+        assert_eq!(all_peers.banned_peers.total(), 0);
+    });
+
+    all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+    all_peers.add_trusted_peer(bls, net);
+    assert!(matches!(
+        all_peers.get_peer(&peer_id).unwrap().connection_status(),
+        ConnectionStatus::Disconnected { .. }
+    ));
+    assert_eq!(all_peers.disconnected_peers, 1);
+    assert_eq!(all_peers.connected_peer_ids().count(), 0);
+}
+
+#[test]
+fn test_add_trusted_peer_does_not_authenticate_anonymous_connection() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net, peer_id, _, _) = rotation_keys(64);
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(None),
+            direction: ConnectionDirection::Incoming,
+        },
+    );
+    assert_eq!(all_peers.bls_for_peer(&peer_id), None);
+    assert_eq!(all_peers.connected_peer_ids().collect::<Vec<_>>(), vec![peer_id]);
+
+    all_peers.add_trusted_peer(bls, net);
+    assert_eq!(all_peers.bls_for_peer(&peer_id), Some(bls));
+    assert!(matches!(
+        all_peers.get_peer(&peer_id).unwrap().connection_status(),
+        ConnectionStatus::Unknown
+    ));
+    assert_eq!(all_peers.connected_peer_ids().count(), 0);
+}
+
+#[test]
+fn test_add_trusted_peer_preserves_protocol_ban_and_observed_ips() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net, peer_id, _, _) = rotation_keys(62);
+    all_peers.upsert_peer(bls, net.clone(), vec![]);
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(None),
+            direction: ConnectionDirection::Outgoing,
+        },
+    );
+    let observed_ips: HashSet<_> =
+        all_peers.get_peer(&peer_id).unwrap().known_ip_addresses().collect();
+    assert!(!observed_ips.is_empty());
+    assert!(matches!(all_peers.process_penalty(&peer_id, Penalty::Fatal), PeerAction::Disconnect));
+    let penalized = all_peers.get_peer(&peer_id).unwrap();
+    assert!(penalized.reputation().banned());
+    assert!(matches!(
+        penalized.connection_status(),
+        ConnectionStatus::Disconnecting { banned: true }
+    ));
+    assert_eq!(all_peers.banned_peers.total(), 0);
+    all_peers.add_trusted_peer(bls, net.clone());
+    assert!(matches!(
+        all_peers.get_peer(&peer_id).unwrap().connection_status(),
+        ConnectionStatus::Banned { .. }
+    ));
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+
+    (0..2).for_each(|_| {
+        all_peers.add_trusted_peer(bls, net.clone());
+        let peer = all_peers.get_peer(&peer_id).unwrap();
+        assert!(peer.reputation().banned());
+        assert!(matches!(peer.connection_status(), ConnectionStatus::Banned { .. }));
+        assert_eq!(peer.known_ip_addresses().collect::<HashSet<_>>(), observed_ips);
+        assert_eq!(all_peers.banned_peers.total(), 1);
+        assert_eq!(all_peers.disconnected_peers, 0);
+        assert_eq!(all_peers.connected_peer_ids().count(), 0);
+    });
+}
+
+#[test]
+fn test_add_trusted_peer_forgives_load_only_status_ban() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net, peer_id, _, _) = rotation_keys(63);
+    all_peers.upsert_peer(bls, net.clone(), vec![]);
+    all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+    all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
+    assert_eq!(all_peers.banned_peers.total(), 1);
+
+    all_peers.add_trusted_peer(bls, net);
+    let peer = all_peers.get_peer(&peer_id).unwrap();
+    assert_eq!(peer.reputation(), Reputation::Trusted);
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Unknown));
+    assert_eq!(all_peers.banned_peers.total(), 0);
+    assert_eq!(all_peers.disconnected_peers, 0);
+}
+
+#[test]
+fn test_add_trusted_peer_forgives_load_only_pending_ban() {
+    let mut all_peers = create_all_peers(None);
+    let (bls, net, peer_id, _, _) = rotation_keys(65);
+    all_peers.upsert_peer(bls, net.clone(), vec![]);
+    all_peers.update_connection_status(
+        &peer_id,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(None),
+            direction: ConnectionDirection::Outgoing,
+        },
+    );
+    all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+    all_peers
+        .update_connection_status(&peer_id, NewConnectionStatus::Disconnecting { banned: true });
+
+    all_peers.add_trusted_peer(bls, net);
+    let peer = all_peers.get_peer(&peer_id).unwrap();
+    assert_eq!(peer.reputation(), Reputation::Trusted);
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Disconnecting { banned: false }));
+    assert_eq!(all_peers.connected_peer_ids().count(), 0);
+    assert_eq!(all_peers.banned_peers.total(), 0);
+
+    all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
+    assert!(matches!(
+        all_peers.get_peer(&peer_id).unwrap().connection_status(),
+        ConnectionStatus::Disconnected { .. }
+    ));
+    assert_eq!(all_peers.banned_peers.total(), 0);
+    assert_eq!(all_peers.disconnected_peers, 1);
+}
+
+#[test]
 fn test_add_trusted_peer_network_key_rotation() {
     let mut all_peers = create_all_peers(None);
     let (bls, net1, peer_id_1, net2, peer_id_2) = rotation_keys(24);
 
     all_peers.add_trusted_peer(bls, net1);
     assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls));
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: create_multiaddr(None),
+            direction: ConnectionDirection::Outgoing,
+        },
+    );
 
     // rotate the network key, same bls key
     all_peers.add_trusted_peer(bls, net2);
@@ -409,6 +580,8 @@ fn test_add_trusted_peer_network_key_rotation() {
     let peer = all_peers.get_peer(&peer_id_2).expect("rotated trusted peer resolves");
     assert_eq!(peer.peer_id(), Some(peer_id_2));
     assert_eq!(peer.reputation(), Reputation::Trusted);
+    assert!(matches!(peer.connection_status(), ConnectionStatus::Unknown));
+    assert_eq!(all_peers.connected_peer_ids().count(), 0);
 }
 
 #[test]
@@ -866,8 +1039,15 @@ fn test_add_trusted_peer_rekeys_network_key_bound_to_other_bls() {
     let addr = create_multiaddr(None);
 
     // the network key is first bound to a different bls identity
-    all_peers.upsert_peer(bls_x, net1.clone(), vec![addr]);
+    all_peers.upsert_peer(bls_x, net1.clone(), vec![addr.clone()]);
     assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls_x));
+    all_peers.update_connection_status(
+        &peer_id_1,
+        NewConnectionStatus::Connected {
+            multiaddr: addr,
+            direction: ConnectionDirection::Incoming,
+        },
+    );
 
     // trusting bls_y with the same network key must displace the bls_x record, not orphan it
     // (an orphaned record's later eviction would delete the legitimate index entry)
@@ -877,6 +1057,11 @@ fn test_add_trusted_peer_rekeys_network_key_bound_to_other_bls() {
     assert!(all_peers.peers.contains_key(&PeerIdentity::Confirmed(bls_y)));
     assert_eq!(all_peers.bls_by_peer_id.len(), 1);
     assert_eq!(all_peers.bls_for_peer(&peer_id_1), Some(bls_y));
+    assert!(matches!(
+        all_peers.get_peer(&peer_id_1).unwrap().connection_status(),
+        ConnectionStatus::Unknown
+    ));
+    assert_eq!(all_peers.connected_peer_ids().count(), 0);
 }
 
 #[test]
@@ -1204,6 +1389,40 @@ fn test_committee_rotation_revokes_validator_exemption() {
         all_peers.process_penalty(&peer_id, load);
     });
     assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+}
+
+/// Operator peers retain load privileges while protocol bans survive unrelated committee updates.
+#[test]
+fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), NetworkError> {
+    let mut all_peers =
+        AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
+    let mut rng = StdRng::from_seed([46; 32]);
+    let (bls, net, peer_id) = committee_member(&mut rng);
+    all_peers.add_trusted_peer(bls, net.clone());
+    let (other_bls, ..) = committee_member(&mut rng);
+    let before =
+        all_peers.get_peer(&peer_id).ok_or(NetworkError::PeerMissing)?.score().aggregate_score();
+    (0..100).for_each(|_| {
+        all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+    });
+    assert_eq!(
+        all_peers.get_peer(&peer_id).ok_or(NetworkError::PeerMissing)?.score().aggregate_score(),
+        before
+    );
+    assert!(all_peers.peer_policy(&peer_id).protects_retention());
+    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    assert!(action.is_ban());
+    assert!(all_peers.peer_banned(&peer_id));
+    assert!(all_peers
+        .update_committees(HashSet::from([other_bls]), HashSet::new(), HashSet::new())
+        .is_empty());
+    assert!(all_peers.apply_membership_if_committee(bls).is_empty());
+    assert!(all_peers.mark_committee_for_dial(HashSet::from([other_bls])).is_empty());
+    assert!(all_peers.peer_banned(&peer_id), "trust must not forgive a protocol ban");
+    all_peers.add_trusted_peer(bls, net);
+    assert!(all_peers.peer_banned(&peer_id), "trust reload must not forgive a protocol ban");
+    assert_eq!(all_peers.banned_peers.total(), 1);
+    Ok(())
 }
 
 /// Operator trust preserves protocol bans, but promotion to any committee slot restores liveness.

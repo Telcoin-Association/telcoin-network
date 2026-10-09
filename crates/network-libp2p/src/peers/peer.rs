@@ -384,6 +384,19 @@ impl Peer {
         }
     }
 
+    /// Preserve transport state and observed-IP evidence only for the same authenticated identity.
+    pub(super) fn retain_connection_state(&mut self, other: &Peer) {
+        self.peer_id()
+            .zip(self.bls_public_key)
+            .filter(|identity| Some(*identity) == other.peer_id().zip(other.bls_public_key))
+            .into_iter()
+            .for_each(|_| {
+                self.connection_status = other.connection_status;
+                self.connection_direction = other.connection_direction.clone();
+                self.observed_ip_addresses = other.observed_ip_addresses.clone();
+            });
+    }
+
     /// Preserve protocol reputation and bounded observed-IP evidence across a trust reload.
     pub(super) fn retain_protocol_reputation(&mut self, other: &Peer) {
         self.retain_worse_reputation(other);
@@ -551,12 +564,43 @@ impl Peer {
     pub(super) fn multiaddr_count(&self) -> usize {
         self.multiaddrs.len()
     }
+
+    /// Snapshot the exact multiaddrs currently retained for this peer.
+    pub(super) fn multiaddrs_snapshot(&self) -> HashSet<Multiaddr> {
+        self.multiaddrs.clone()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::common::create_multiaddr;
+
+    #[test]
+    fn retain_connection_state_preserves_direction_only_for_authenticated_identity() {
+        let mut existing = Peer::default_for_test();
+        existing.register_outgoing(create_multiaddr(None));
+        let mut trusted = Peer::new_trusted(
+            existing.bls_public_key.unwrap(),
+            existing.network_key.clone().unwrap(),
+            Arc::new(ScoreConfig::default()),
+        );
+        trusted.retain_connection_state(&existing);
+        assert!(matches!(
+            trusted.connection_status,
+            ConnectionStatus::Connected { num_in: 0, num_out: 1 }
+        ));
+        assert!(matches!(trusted.connection_direction, Some(ConnectionDirection::Outgoing)));
+        assert_eq!(trusted.observed_ip_addresses, existing.observed_ip_addresses);
+
+        let mut anonymous = Peer::new_unidentified(Arc::new(ScoreConfig::default()));
+        anonymous.register_incoming(create_multiaddr(None));
+        let mut unresolved = Peer::new_unidentified(Arc::new(ScoreConfig::default()));
+        unresolved.retain_connection_state(&anonymous);
+        assert!(matches!(unresolved.connection_status, ConnectionStatus::Unknown));
+        assert!(unresolved.connection_direction.is_none());
+        assert!(unresolved.observed_ip_addresses.is_empty());
+    }
 
     /// Regression (GHSA-29v6-gvv5-45gx): a flood of distinct addresses must not grow the stored set
     /// past the cap, and the most recent address must always survive so the ban path keeps

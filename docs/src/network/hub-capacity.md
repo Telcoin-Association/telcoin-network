@@ -1,0 +1,384 @@
+# Public hub capacity profile
+
+`tools/hub-capacity/profile-v1.json` selects an experimental public hub profile
+for one primary and two worker swarms. JSON is valid YAML: copy it to the node's
+network configuration path, preserving the deployment's bootstrap peers and
+hostname. Restart after changing the profile. Inactive configured workers are
+included in its allocation.
+
+Capacity qualification requires a passing live run and published evidence for
+the recorded source revision and envelope. Unit tests and synthetic scoring
+fixtures do not qualify capacity or complete issue #1476.
+Validator validated-address and handshake qualification retains its Launch scope.
+
+## Coupled bounds
+
+| Resource | Per swarm | Whole hub process |
+| --- | ---: | ---: |
+| Ordinary established peers | 64 | 192 peer slots |
+| Established connections | 172 | 516 |
+| Established connections per PeerId | 2 | Source admission additionally caps each PeerId at 6 |
+| Negotiated inbound streams per connection | 8 | 4,128 |
+| Receive credit per connection | floor(1 GiB / 516) bytes | At most 1 GiB |
+| Observed address rows | Shared accounting | 516 |
+| Connections per observed address | Shared accounting | 128 |
+| Connections per IPv4 /24 or IPv6 /64 | Shared accounting | 384 |
+| Banned, disconnected, temporarily banned peers | 512 in each table | Three swarm allocations |
+| Gossip target / low / high / outbound floor | 12 / 8 / 16 / 4 per topic | Primary and every worker |
+
+When both the public peer limit and process budget are configured, each gossip
+heartbeat announces cached message IDs to all eligible subscribed peers outside
+the mesh. The process connection allocation bounds this metadata fanout to at
+most 172 connections per swarm in this profile. Nodes with both bounds also
+forward accepted gossip payloads directly to connected, confirmed ordinary peers
+within their public allocation, up to 64 per swarm in this profile. This policy
+applies to any node configured with both bounds, including a node with a smaller
+public allocation. Public peers retain ordinary admission and resource limits;
+direct delivery grants no committee or DAO retention privilege.
+
+Direct recipients are excluded from future gossip mesh selection; the configured
+mesh bounds govern the remaining eligible peers. Publisher authorization and validation
+still apply before forwarding. Direct public membership is removed on pruning,
+disconnect or ban and reconsidered after identity or trust changes, preventing
+persistent explicit-peer reconnects after removal. Any already queued dial remains
+subject to admission limits.
+Announcements can also cause requests for cached payloads, subject to gossipsub's
+control limits and the transport allocation. Deployments without both bounds
+retain the library's default sampled announcements and existing forwarding policy.
+The qualification measures the resulting traffic under the same CPU, memory,
+link, and latency limits.
+
+The ordinary limit counts confirmed BLS peer identities and excludes peers with a
+current retention privilege. Each swarm allows 64 ordinary identities plus 22
+protected identities: 8 DAO observers, 12 distinct committee peers across the
+previous/current/next committees, and 2 bootstrap/hub identities. Two connections
+per identity give a finite ceiling of 172 per swarm and 516 across all three.
+This permits inbound and outbound connections during simultaneous dialing. The
+stream and receive-credit totals remain fixed as connection headroom increases.
+
+Provisional connections whose BLS identity has not been confirmed consume the
+existing aggregate target of 86 identities. They have no retention privilege and
+do not consume authenticated ordinary slots until a validated record classifies
+them. Admission, successful identity promotion, and protected arrivals enforce
+the ordinary and aggregate limits immediately. Aggregate pruning and ordinary
+pruning track separate deficits, so removing a provisional peer cannot satisfy
+an authenticated ordinary excess. A recognized protected arrival displaces
+eligible unprotected peers when the target is full. Physical connection and
+source leases remain charged until actual closure; a displaced unprotected peer
+keeps the existing 600-second population reconnection cooldown.
+
+The existing `tn_network.ordinary_peers_connected` qualification gauge remains
+conservative: it counts all connected nonimportant identities, including
+provisional peers. Startup can therefore have aggregate 86 and gauge 86 before
+protected identities resolve, then aggregate 86 and gauge 64 after promotion.
+The frozen scorer still requires this gauge to stay at or below 64 throughout
+the actual `[T0,T1)` measurement interval. Admission headroom does not relax
+that check, move the measurement window, or change startup deadlines or retries.
+Physical, source, and unfinished-handshake controls bound occupancy; they do not
+guarantee admission fairness for protected identities that are still unresolved.
+
+
+Select at most 8 DAO identities through `dao_observers`, using identities already
+present in `bootstrap_peers`. This selection reserves retention while preserving
+normal load scoring. Additional operator-protected identities compete for the
+same protected headroom. Protocol violations can still cause bans, and every peer
+remains subject to the hard process, source, stream, and receive-credit limits.
+
+With a finite process connection budget, each swarm reserves one existing slot
+for each distinct, nonlocal bootstrap PeerId configured for that swarm. While a
+required identity is disconnected, opportunistic discovery and query connections
+cannot use its slot. A duplicate connection to another required peer cannot use
+that slot either. Reservations are installed before the swarm starts, and a
+bootstrap set larger than the swarm's connection cap is rejected. All existing
+total, per-peer, directional and pending connection limits still apply.
+Reservations cover the initial configuration, including configured DAO observers;
+adding logical trust at runtime does not add physical reservations. Networks
+without a finite process connection budget retain their existing admission rules.
+
+Network allocations do not bound RSS: engine state, record storage, caches, RPC,
+cryptography, queues, and allocator overhead also consume memory. Qualification
+therefore measures the whole process alongside every primary/worker allocation.
+Record retention protects operator and committee records under the existing
+finite record/provider quotas. TTL remains 48 hours, publication 12 hours,
+and replication 1 hour.
+
+Application lookups return the first verified signed record matching the requested
+authority and cancel the remaining DHT traversal. Authority discovery makes that
+binding usable immediately while continuing to collect newer signed records.
+Signature, record-key, chain and swarm-domain validation remain required before
+either path accepts a record.
+
+| Serve class | Whole hub process concurrency |
+| --- | ---: |
+| Primary sync/epoch streams | 5 |
+| Primary epoch-record RPC serving | 5, separate from vote handling and stream serving |
+| Primary shed response tasks | 8 |
+| Worker batch streams | 5 per worker, 10 total |
+| Worker shed response tasks | 8 per worker, 16 total |
+| Worker gossip prefetch | 8 per worker, 16 total |
+
+Existing class admission also caps pending requests from one peer at 2. Bulk
+admission uses nonblocking semaphore acquisition; prefetch also deduplicates.
+These limits do not establish committee liveness under concurrent public traffic.
+The six `serve_limits` fields select these independent budgets. Omitted fields
+preserve the existing defaults; zero limits are rejected. The shipped profile
+pins all six values explicitly. Each primary and worker exports its allocation
+and occupancy, including idle swarms. A reserved task counts before its first
+poll and releases its measurement on completion, failure, or cancellation.
+
+Admitted sync streams and bounded rejection responses retain the node's task
+owner across epoch changes. Their stream, per-peer, and rejection-task admission
+pools are shared by consecutive epoch handlers, so an old response still consumes
+the same capacity after a new epoch starts. Existing transfer timeouts and node
+shutdown still end these tasks. Worker sync streams acquire the same global and
+per-peer permits before entering a separate queue that survives the epoch event
+receiver handoff. Queued and active streams share the five-stream limit, and the
+request-read deadline starts at admission. Independent expiry releases queued
+permits even when the next epoch receiver is delayed. Worker RPC and gossip
+events retain their epoch-scoped receiver and do not enter this queue.
+
+Concurrent committee vote requests can arrive after the receiver has processed a later round or
+collected the requested round. These requests are rejected without lowering the author's peer
+reputation, and the receiver preserves its cached response and durable vote. A different header
+digest at the same author, epoch and round remains equivocation and receives a fatal penalty.
+
+### Local batch recovery
+
+Local seal recovery keeps raw signed transactions in a shared RAM owner and a
+durable node batch cache. Each independently caps retention at 64 MiB, 1,024
+transactions and 1,024 batches across all workers. Exhausting either budget
+applies backpressure before quorum acknowledgement. Quorum-accepted local bytes
+have no TTL. Observer forwarding admission is tracked separately; an observer
+acknowledgement does not establish committee quorum.
+
+After a nonce-gap skip is confirmed in canonical output, retained transactions
+return through normal `External` pool validation. Canonical transaction hashes
+or consumed sender nonces release RAM ownership. Accepted durable entries remain
+after RAM replay or a failed publication report until canonical nonces consume
+every signed transaction in the batch. Restart retries load the durable batch
+cache; ordinary RPC pool submissions receive no added crash-durability guarantee.
+A shared lock serializes retries of the exact batch digest across cache, quorum,
+reporting and cleanup, with at most 1,024 live digest keys. Runtime tests of this
+recovery path and a fresh measured comparison must pass before treating the
+profile as qualified.
+
+## Predeclared qualification
+
+The GitHub Actions envelope declares two hubs, each with one assigned CPU and
+3 GiB RAM. The workstation template uses four CPUs and 8 GiB per hub. Both use a
+25 Mbit/s link, 50 ms RTT and 0.1% loss, with 64 ordinary public peers,
+including sixteen behind one kernel NAT, eight DAO observers, four active
+validators and two workers per hub. The profile reserves twelve committee
+identities across previous, current and next committees. Four active validators
+exercise the three-swarm process budget within that reservation.
+
+Each phase lasts at least ten minutes. The PR author selected the experimental
+criteria under the requester's instruction to use engineering judgment.
+`qualify.py freeze` validates and hashes the exact profiles, revisions, binaries,
+workload and thresholds before measurement. Changing a profile or envelope
+requires a new frozen plan and complete baseline/candidate run.
+
+Every scenario requires 99% success. The p99 limits are joins 8 s, shared-NAT
+restarts 20 s, gossip beyond a direct hub 3 s, record and submit-URL resolution
+3 s, concurrent sync 30 s, committee requests 1.5 s, and DAO connectivity 1 s.
+The plan also declares minimum attempts for each scenario. Committee request
+observations retain failures and cancellations. Completed requests determine
+success and latency; cancellations must remain at or below 35%, reflecting the
+certifier's cancellation of obsolete proposals and requests after quorum.
+
+For GitHub Actions, whole-process RSS must stay at or below 2 GiB and CPU at or
+below 0.75 cores per sample interval. The workstation limits are 4 GiB and three
+cores. Both require queue occupancy at or below 100 and DAO connectivity at eight
+on the primary and each worker throughout measurement. Successful engine output
+completions must never regress or stall for more than fifteen seconds, including
+empty outputs that intentionally produce no block.
+
+## Collection and concurrent workload
+
+`docker-run.py` creates a private Linux topology, prepares a fresh local chain
+with ID 4476, freezes the plan and runs baseline and candidate phases. Both use
+the same binaries, identities, link conditions and concurrent workload. The
+baseline uses default network limits with the same bootstrap peers and DAO
+identities. The candidate uses `profile-v1.json`. Each phase starts with fresh
+databases and waits ninety seconds before measurement.
+
+The `github-actions` preset needs four CPUs and at least 14 GiB RAM. Each hub has
+a separate one-CPU, 3 GiB container. The coordinator has two other CPUs and 8 GiB.
+The default `workstation` preset needs twelve CPUs and at least 24 GiB RAM, with
+four CPUs and 8 GiB for each of the three containers. The coordinator hosts the
+other two validators and
+72 persistent peer processes. Participant namespaces receive 25 Mbit/s,
+25 ms egress delay and 0.1% loss. Sixteen namespace peers share the coordinator's
+SNAT address. The coordinator shares a private PID namespace with the hubs so
+the collector can inspect their actual processes. Cleanup removes only the
+containers and network created by the invocation.
+
+Download the `hub-capacity-linux-arm64-<revision>` artifact from the CI run for the
+recorded binary revision. The runner verifies the revision and binary digests and
+requires a clean, committed worktree. It permits an ancestor artifact when only
+the Python qualification scripts or this document have changed, and rejects changed
+code, dependency, profile, workflow, or other inputs. `source-provenance.json` and
+the frozen plan record both the binary and qualification revisions. A live run can
+start once CI retains the binaries; acceptance also requires the workspace tests,
+Clippy, and compiling mutation checks to pass.
+
+```sh
+docker build -t tn-capacity-1476-runtime:ubuntu24 tools/hub-capacity
+python3 -B -I tools/hub-capacity/docker-run.py \
+  --binaries /absolute/path/to/extracted-ci-artifact \
+  --output /absolute/path/to/new-qualification-directory
+```
+
+Use `--runner-envelope github-actions` for the smaller declared envelope.
+The `hub-capacity-qualification` job in the required main-target PR workflow runs
+this preset after workspace compilation, tests, Clippy and compiling mutations
+pass. It uses the same commit's
+source-bound binaries and retains raw evidence and diagnostics for ninety days.
+The artifact excludes generated validator key files and executable copies.
+
+For a staging-target PR, run the same qualification explicitly through the registered
+`Durable e2e` manual entry point. Set `hub_capacity=true` and select the PR branch:
+
+```sh
+gh workflow run durable-e2e.yaml --repo Telcoin-Association/telcoin-network \
+  --ref feat/1476-public-hub-capacity -f hub_capacity=true
+```
+
+This opt-in route calls `hub-capacity-manual.yaml` at the selected commit and runs
+the complete code checks, both mutation shards, their aggregation, and both live
+phases. Its checks have distinct names. Ordinary durable runs and scheduled runs
+keep their existing behavior. Verify the run's source SHA against the intended PR
+head before using its evidence; qualification does not replace the final-source
+maintainer attestation.
+
+The collector retains complete production diagnostic logs as
+`protocol-NN.jsonl`, with a 512 MiB per-file cap and a SHA-256 hash. Other raw
+artifacts keep their 64 MiB cap. The production observation follower uses the
+same protocol cap and reads incrementally with a 64 KiB line limit.
+Exceeding a cap fails collection, observation or scoring;
+the collector removes incomplete copies. These evidence limits change neither
+the network profile nor any acceptance threshold.
+
+Qualification node commands freeze `RUST_LOG=info,network::capacity=debug` in
+their retained command JSON. This keeps INFO, WARN and ERROR records plus the
+required gossip and committee DEBUG events. Engine and block-builder DEBUG
+records containing full execution output are excluded: CI47 produced records
+above the unchanged 64 KiB observation line limit. Existing logs are diagnostic
+evidence; qualification requires a fresh run with the frozen filter.
+
+The peer example uses the production libp2p network, deterministic local test
+identities and three persistent swarms. Commands perform authenticated joins,
+fresh signature-validated record queries, worker submit-URL resolution and
+nonempty ACK/DATA/END epoch transfers. Shared-NAT commands restart the actual
+peer process, preserve its keys and verify connections to both hubs on every
+swarm. DAO checks observe those same live authenticated connections.
+Each client pins the two declared gateways as trusted peers in its own swarms.
+Its twelve-connection process budget gives each swarm four physical slots, with
+one reserved for each required gateway while that gateway is disconnected.
+The measured hubs apply their public and DAO admission rules to those clients.
+Commands for peers outside the shared-NAT group enter their native bounded command
+servers concurrently, with sixteen slots per client. Commands for a shared-NAT
+peer are serialized with its restart, so a command cannot contact the stopped
+process. Restarts stop the old process before checking the replacement's connections.
+An ordinary join also holds its client's lifecycle lease: existing commands drain
+before disconnecting, and new commands wait until the native join acknowledges
+completion. Admission consumes the existing command deadline. An uncertain join
+transport failure quarantines that client and attempts to stop its process before
+releasing the lease; failed cleanup leaves the client quarantined. Other clients
+continue their concurrent workloads.
+Protocol failures remain failed operations. The frozen driver allows 32 concurrent
+gossip commands and 60 commands across all declared scenarios, within 64 active
+driver slots and 72 private control handlers. Saturation remains a failed attempt.
+If a dial reports an error during automatic gateway reconnection, the fixture
+requires an observed connection to the requested identity before accepting it.
+Penalties that disconnect or ban a peer log their severity and immediate call site
+without changing the score or its consequences.
+
+Transaction traffic uses 512 offline-signed chain-4476 transactions from the
+public Anvil test account funded in the local genesis. `cast` must be installed.
+Each transaction carries 32 KiB of deterministic calldata. The signed fixture
+is hashed into the workload manifest before freezing: 128 transactions seed
+the warmup, and 384 are submitted at a fixed cadence during measurement.
+The first sixteen seed transactions form four groups of four. Before submitting
+the next group, the producer requires the previous group's last transaction to
+appear in a receipt and its matching canonical block. Each fence has a 60-second
+deadline and polls at 250 ms; RPC timeouts cannot exceed the remaining deadline.
+The 500 ms seed cadence resumes after each fence, and all receipt probes are
+retained. Missing inclusion or a mismatched receipt fails setup.
+An inclusion timeout or failed submission retains four optional transaction,
+account and pool probes, each limited to two seconds, before propagating the
+original failure. Diagnostic errors cannot replace that failure. Each submission
+row retains its planned signed hash, including a rejected transaction.
+Every RPC acknowledgement and canonical batch-selection observation is retained.
+Offline Keccak transaction hashes are frozen with the signed inputs. A transport
+failure triggers a bounded lookup of that exact hash before resubmitting the same
+payload and nonce, with at most three submission attempts. Failed submissions and
+lookup outcomes remain in the raw log. Protocol rejections remain fatal, and an
+unacknowledged transaction prevents the qualification run from completing.
+
+Bulk commands run in bursts of eight, divided between the two hubs. Each command
+simultaneously transfers a completed primary epoch pack and four executed batches
+on worker-0 and worker-1. The coordinator selects the first four distinct nonempty
+executed batches from completed epochs, using retained canonical block responses.
+Each digest's source epoch is recorded. The primary transfer uses the completed
+epoch containing the first selected batch.
+Peers decode each returned batch and verify its digest against those observations.
+Successful worker transfers require at least 128 KiB each. Missing workers,
+empty transfers, incomplete frame sequences and mismatched digests fail the command.
+
+Gossip receipts retain message ID, author, authenticated forwarding peer and
+receipt time. The log service correlates each receipt with the actual publisher
+event. Successful routes require three distinct identities and publication
+after measurement starts. Committee observations come from every validator's
+production JSON log, with the measured hubs' actual vote-request latency,
+completion, failure and cancellation data.
+Each native vote request has a process generation and monotonically allocated ID,
+retained on both its start and terminal observation. A bounded consumer per hub
+collects these events against one fixed measurement interval and drains in-window
+requests within the existing final collection deadline. Empty polls are telemetry;
+native failures and cancellations retain their original outcomes and latencies.
+Offline scoring reconciles raw starts, terminals and scored request identities,
+then checks the allocated-ID prefix against an independent post-drain metrics
+watermark. Missing, duplicate or conflicting evidence fails qualification.
+
+`workload.py` schedules all eight scenarios concurrently with bounded command
+concurrency. The declared scenarios overlap at 60 commands; the driver allows
+64 active commands and the private control server allows 72 handlers. Overload
+refusals remain failed attempts. Its frozen manifest binds agent identities and
+argv; every reply must match its operation nonce, scenario and identity. Failed commands remain
+in the operation log and success denominator. Reconnect scheduling offsets NAT
+restarts from ordinary joins.
+
+`collect.py` checks executable SHA-256, argv, CPU affinity, cgroup CPU/RAM
+limits, declared revision, exact profile and frozen driver command. It measures
+whole-process user and system CPU, RSS, primary and both worker allocations,
+class tasks, queues, rejection counters and source-accounting rows. Its progress
+selector is `tn_engine_outputs_executed_total`, incremented only after the engine
+successfully handles a consensus output. This includes an intentional empty-output
+skip after its engine update is sent, as well as successful block execution. A
+blocked or failed execution does not increment it, and execution is serial, so later
+empty outputs cannot mask a blocked block. The same 15-second progress limit applies
+through measurement and drain. Canonical height remains in the raw telemetry, but
+can legitimately stay constant when empty non-closing outputs produce no block.
+The selector is recorded in the deployment before either phase starts. Results from
+the previous canonical-height binding remain results of that binding and require a
+fresh run to qualify with completed-output progress.
+Process restarts, missing metrics, sparse sampling, invalid observations and
+incomplete workloads fail collection.
+
+Each hub's CPU sample retains monotonic timestamps immediately before and after
+the process read, before its HTTP metrics request. The scorer divides CPU usage
+by the interval from the previous read's completion to the current read's start.
+This conservative interval must be positive and at most five seconds, so read
+uncertainty cannot reduce the measured CPU rate. Scored timestamps and counters
+must match the retained raw process records, including clock tick rate and
+process identity. Malformed or incomplete telemetry fails verification. Captures
+without these read boundaries require a fresh paired baseline and candidate run.
+
+The output retains the frozen plan, workload manifest, runtime and topology
+declarations, public deployment hashes, raw process/Prometheus samples, all four
+validator logs and nonce-bound operation traces. The final scorer verifies raw
+artifact hashes and writes baseline/candidate results to `report.json`.
+Publish the evidence directories, plan, manifest, report and public topology
+inputs. Private keys under `deployment/templates` belong only to the disposable
+local fixture. Unit tests and topology smokes alone do not qualify hub capacity.

@@ -64,6 +64,17 @@ enum PendingState {
     ObserveOnly,
 }
 
+/// Ownership visible to a locally sealed observer batch after its optimistic prune.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ForwardRetentionStatus {
+    /// Forwarding or inclusion tracking still owns the signed bytes.
+    Retained,
+    /// Normal pool readmission completed and may have preceded the prune.
+    Queued,
+    /// Tracking ended; local retained bytes still need a normal ownership handoff.
+    Absent,
+}
+
 /// One payload and its retry history. Re-admission never refreshes its overall lifetime.
 #[derive(Debug)]
 struct PendingTransaction<Validator, Output> {
@@ -103,6 +114,21 @@ pub(crate) struct PendingForwards<Hash, Validator, Output> {
 impl<Hash: Ord + Clone, Validator: Ord + Clone, Output: Eq>
     PendingForwards<Hash, Validator, Output>
 {
+    /// Inspect forwarding ownership without changing retry or expiry policy.
+    pub(crate) fn retention_status(&self, hash: &Hash) -> ForwardRetentionStatus {
+        self.entries
+            .get(hash)
+            .map(|entry| match entry.state {
+                PendingState::Queued => ForwardRetentionStatus::Queued,
+                PendingState::Sending(_)
+                | PendingState::AwaitingInclusion(_)
+                | PendingState::RetryDue
+                | PendingState::Reinserting(_)
+                | PendingState::ObserveOnly => ForwardRetentionStatus::Retained,
+            })
+            .unwrap_or(ForwardRetentionStatus::Absent)
+    }
+
     /// Construct an empty buffer with the pool's configured limits.
     pub(crate) fn new(limits: RetentionLimits) -> Self {
         Self {

@@ -22,7 +22,7 @@ NETWORK_METRICS = frozenset({
 })
 # The exporter adds the `reth` prefix to process metrics, see crates/tn-metrics/src/recorder.rs.
 PROCESS_METRICS = frozenset({"reth_process_resident_memory_bytes", "reth_process_cpu_seconds_total"})
-PENDING = "tn_network_inbound_requests_pending"
+PENDING = "tn_network_inbound_requests_pending_by_class"
 SHED = "tn_network_inbound_requests_shed_total"
 SERVICE = "tn_network_inbound_request_service_seconds"
 FAILED = "tn_network_inbound_requests_failed_total"
@@ -63,6 +63,7 @@ def bounded(text, upper):
 
 LABEL_SETS = {
     **{name: frozenset({"network"}) for name in NETWORK_METRICS},
+    "tn_network_inbound_requests_pending": frozenset({"network"}),
     "tn_network_outbound_request_failures_total": frozenset({"network", "kind"}),
     REJECTIONS: frozenset({"network", "reason"}),
     DENIALS: frozenset({"network", "reason"}),

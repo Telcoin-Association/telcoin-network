@@ -3,7 +3,14 @@
 //! This module includes implementations for when the primary receives network
 //! requests from it's own workers and other primaries.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, OnceLock,
+    },
+    time::Duration,
+};
 
 use crate::{
     proposer::OurDigestMessage, state_sync::StateSynchronizer, ConsensusBus, ConsensusBusApp,
@@ -13,14 +20,18 @@ use handler::RequestHandler;
 pub use message::{MissingCertificatesRequest, PrimaryRequest, PrimaryResponse};
 use message::{PrimaryGossip, PrimaryRPCError};
 use parking_lot::Mutex;
-use rand::{seq::SliceRandom as _, Rng};
+use rand::{seq::SliceRandom as _, Rng, TryRngCore as _};
 use tn_config::ConsensusConfig;
 use tn_network_libp2p::{
+    capacity::{
+        CapacityPermit as OwnedSemaphorePermit, CapacitySemaphore as Semaphore, ServeClass,
+        ServeRejection,
+    },
     error::NetworkError,
     read_frame,
     types::{
         IntoResponse as _, NetworkCommand, NetworkEvent, NetworkHandle, NetworkResponseMessage,
-        NetworkResult,
+        NetworkResult, NetworkType,
     },
     write_frame, AdmissionShed, DenyReason, GossipMessage, Penalty, PrimarySyncRequest,
     ResponseChannel, Stream, StreamError, SyncFrame, SyncFrameError,
@@ -32,19 +43,374 @@ use tn_storage::{
     PayloadStore,
 };
 use tn_types::{
-    encode, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest, ConsensusOutput,
-    ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord, EpochVote,
-    Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote, WorkerId,
+    encode, AuthorityIdentifier, BlsPublicKey, BlsSignature, Certificate, ConsensusHeaderDigest,
+    ConsensusOutput, ConsensusResult, Database, Epoch, EpochCertificate, EpochDigest, EpochRecord,
+    EpochVote, Header, HeaderDigest, Round, TaskError, TaskSpawner, TnReceiver, TnSender, Vote,
+    WorkerId,
 };
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, info, warn};
+#[cfg(test)]
+mod epoch_sync_tests;
 pub mod handler;
 mod message;
 mod sync_codec;
 
+/// Finite terminal categories for the retained vote request observation.
+#[derive(Clone, Copy)]
+enum VoteRequestOutcome {
+    /// The request future was dropped before producing its final result.
+    Cancelled,
+    /// The peer returned a vote.
+    Vote,
+    /// The peer identified missing parents.
+    MissingParents,
+    /// The request returned a retryable RPC error.
+    RpcRetryable,
+    /// The peer returned a permanent RPC error or an unexpected response.
+    RpcError,
+    /// Dispatch, response transport or acknowledgement failed.
+    NetworkError,
+}
+
+impl VoteRequestOutcome {
+    /// Stable bounded value used by the existing capacity observation event.
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Cancelled => "cancelled",
+            Self::Vote => "vote",
+            Self::MissingParents => "missing_parents",
+            Self::RpcRetryable => "rpc_retryable",
+            Self::RpcError => "rpc_error",
+            Self::NetworkError => "network_error",
+        }
+    }
+}
+
+/// Process-wide identity, independent of handle clones and epoch recreation.
+#[derive(Clone, Copy)]
+struct VoteRequestIdentity {
+    generation: &'static str,
+    request_id: u64,
+}
+
+#[derive(Clone, Copy)]
+enum VoteIdentityError {
+    EntropyUnavailable,
+    CounterExhausted,
+}
+
+impl VoteIdentityError {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::EntropyUnavailable => "generation entropy unavailable",
+            Self::CounterExhausted => "request identity counter exhausted",
+        }
+    }
+}
+
+static VOTE_OBSERVATION_GENERATION: OnceLock<Result<String, VoteIdentityError>> = OnceLock::new();
+static VOTE_OBSERVATION_NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Independent producer snapshot for the existing native metrics sampler.
+#[derive(Clone, Copy, Debug)]
+pub struct VoteObservationWatermark {
+    /// Random generation shared by every handle in this process.
+    pub generation: &'static str,
+    /// Highest allocated request ID, including an allocated but unlogged request.
+    pub allocated_request_count: u64,
+}
+
+/// Read the exact producer counter without allocating an ID or emitting another request.
+pub fn vote_observation_watermark() -> Option<VoteObservationWatermark> {
+    VOTE_OBSERVATION_GENERATION.get().and_then(|generation| generation.as_ref().ok()).map(
+        |generation| VoteObservationWatermark {
+            generation,
+            // RMW observes the preceding allocation without allocating an ID or flushing logs.
+            allocated_request_count: VOTE_OBSERVATION_NEXT_ID
+                .fetch_add(0, Ordering::Relaxed)
+                .saturating_sub(1),
+        },
+    )
+}
+
+fn allocate_vote_request_id(counter: &AtomicU64) -> Result<u64, VoteIdentityError> {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| next.checked_add(1))
+        .map_err(|_| VoteIdentityError::CounterExhausted)
+}
+
+impl VoteRequestIdentity {
+    fn allocate() -> Result<Self, VoteIdentityError> {
+        let generation = VOTE_OBSERVATION_GENERATION
+            .get_or_init(|| {
+                let mut bytes = [0_u8; 16];
+                rand::rngs::OsRng
+                    .try_fill_bytes(&mut bytes)
+                    .map_err(|_| VoteIdentityError::EntropyUnavailable)
+                    .map(|()| format!("{:032x}", u128::from_le_bytes(bytes)))
+            })
+            .as_ref()
+            .map_err(|error| *error)?;
+        allocate_vote_request_id(&VOTE_OBSERVATION_NEXT_ID)
+            .map(|request_id| Self { generation, request_id })
+    }
+}
+
+#[cfg(test)]
+mod vote_identity_tests {
+    use super::{allocate_vote_request_id, AtomicU64, Ordering, VoteIdentityError};
+
+    #[test]
+    fn request_identity_exhaustion_preserves_the_final_watermark() {
+        let counter = AtomicU64::new(u64::MAX - 1);
+        assert_eq!(allocate_vote_request_id(&counter).ok(), Some(u64::MAX - 1));
+        assert!(matches!(
+            allocate_vote_request_id(&counter),
+            Err(VoteIdentityError::CounterExhausted)
+        ));
+        assert_eq!(counter.load(Ordering::Relaxed), u64::MAX);
+    }
+}
+
+/// Observe a real vote request, including errors and cancellation, when capacity tracing is
+/// enabled.
+struct VoteObservation {
+    /// Monotonic request start for its complete duration, including retries.
+    started: std::time::Instant,
+    /// Wall-clock start used to select the fixed measurement population.
+    started_unix_us: u128,
+    /// Telemetry failure does not change the production RPC result.
+    identity: Option<VoteRequestIdentity>,
+    /// Signed header being voted on.
+    header: HeaderDigest,
+    /// Authenticated committee destination.
+    peer: BlsPublicKey,
+    /// Whether the request reached a final response rather than cancellation or an early error.
+    completed: bool,
+    /// Whether that final response was a vote or a missing-parent response.
+    success: bool,
+    /// Native result category, or cancellation while the request is still pending.
+    outcome: VoteRequestOutcome,
+    /// Native error display clipped to the existing peer error character bound.
+    error: Option<String>,
+    /// Inner retry requests started, including attempts interrupted before their response.
+    retry_count: u8,
+}
+
+impl Drop for VoteObservation {
+    fn drop(&mut self) {
+        debug!(target: "network::capacity", event = "committee_request",
+            generation = self.identity.map_or("", |identity| identity.generation),
+            request_id = self.identity.map_or(0, |identity| identity.request_id),
+            process_id = std::process::id(), started_unix_us = %self.started_unix_us,
+            allocated_request_count = VOTE_OBSERVATION_NEXT_ID.load(Ordering::Relaxed).saturating_sub(1),
+            header = %self.header, peer = %self.peer, completed = self.completed,
+            success = self.success, latency_us = %self.started.elapsed().as_micros(),
+            outcome = self.outcome.label(), error = self.error.as_deref().unwrap_or_default(),
+            retry_count = self.retry_count,
+            unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_micros()), "capacity observation");
+    }
+}
+
+/// Report only slow inbound vote stages, without adding a timer or retaining request history.
+const INBOUND_VOTE_SLOW_STAGE: Duration = Duration::from_secs(1);
+
+/// Existing header identity shared by inbound stage events. Retries can share this context.
+#[derive(Clone)]
+struct InboundVoteContext {
+    epoch: Epoch,
+    round: Round,
+    header: HeaderDigest,
+    author: AuthorityIdentifier,
+}
+
+impl InboundVoteContext {
+    fn new(header: &Header) -> Self {
+        Self {
+            epoch: header.epoch(),
+            round: header.round(),
+            header: header.digest(),
+            author: header.author().clone(),
+        }
+    }
+}
+
+/// Finite inbound work categories. These labels do not identify a unique RPC attempt.
+#[derive(Clone, Copy)]
+enum InboundVoteStageKind {
+    Dispatch,
+    Vote,
+    AuthorLock,
+    Execution,
+    MissingParents,
+    AcceptParents,
+    ReadParents,
+    HeaderLead,
+    Batches,
+    Persistence,
+    PeerPenalty,
+    SendResponse,
+}
+
+impl InboundVoteStageKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Dispatch => "dispatch",
+            Self::Vote => "vote",
+            Self::AuthorLock => "author_lock",
+            Self::Execution => "execution",
+            Self::MissingParents => "missing_parents",
+            Self::AcceptParents => "accept_parents",
+            Self::ReadParents => "read_parents",
+            Self::HeaderLead => "header_lead",
+            Self::Batches => "batches",
+            Self::Persistence => "persistence",
+            Self::PeerPenalty => "peer_penalty",
+            Self::SendResponse => "send_response",
+        }
+    }
+}
+
+/// Distinguish a completed wait from a future dropped by cancellation or its existing timeout.
+#[derive(Clone, Copy)]
+enum InboundVoteStageOutcome {
+    Returned,
+    Error,
+    Dropped,
+}
+
+impl InboundVoteStageOutcome {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Returned => "returned",
+            Self::Error => "error",
+            Self::Dropped => "dropped",
+        }
+    }
+}
+
+/// One constant-size observation owned by the existing request future.
+struct InboundVoteStage {
+    context: InboundVoteContext,
+    stage: InboundVoteStageKind,
+    started: std::time::Instant,
+    outcome: InboundVoteStageOutcome,
+}
+
+impl InboundVoteStage {
+    fn new(context: &InboundVoteContext, stage: InboundVoteStageKind) -> Self {
+        Self {
+            context: context.clone(),
+            stage,
+            started: std::time::Instant::now(),
+            outcome: InboundVoteStageOutcome::Dropped,
+        }
+    }
+
+    fn finish(mut self, outcome: InboundVoteStageOutcome) {
+        self.outcome = outcome;
+    }
+
+    async fn observe<F, T, E>(self, future: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+    {
+        let result = future.await;
+        self.finish(if result.is_ok() {
+            InboundVoteStageOutcome::Returned
+        } else {
+            InboundVoteStageOutcome::Error
+        });
+        result
+    }
+
+    fn is_slow(elapsed: Duration) -> bool {
+        elapsed >= INBOUND_VOTE_SLOW_STAGE
+    }
+}
+
+impl Drop for InboundVoteStage {
+    fn drop(&mut self) {
+        let elapsed = self.started.elapsed();
+        if Self::is_slow(elapsed) {
+            info!(target: "network::capacity", event = "committee_vote_stage",
+                direction = "inbound", trace_scope = "header",
+                epoch = self.context.epoch, round = self.context.round,
+                header = %self.context.header, author = %self.context.author,
+                stage = self.stage.label(), outcome = self.outcome.label(),
+                latency_us = %elapsed.as_micros(),
+                unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |time| time.as_micros()), "slow inbound vote stage");
+        }
+    }
+}
+
 #[cfg(test)]
 #[path = "../tests/network_tests.rs"]
 mod network_tests;
+
+#[cfg(test)]
+mod inbound_vote_observation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tn_storage::mem_db::MemDatabase;
+    use tn_test_utils::CommitteeFixture;
+
+    fn context() -> InboundVoteContext {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let authority = fixture.authorities().next().expect("fixture authority");
+        let header = authority.header_builder(authority.consensus_config().committee()).build();
+        InboundVoteContext::new(&header)
+    }
+
+    #[test]
+    fn slow_vote_stage_boundary_is_inclusive() {
+        assert!(!InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE - Duration::from_nanos(1)));
+        assert!(InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE));
+        assert!(InboundVoteStage::is_slow(INBOUND_VOTE_SLOW_STAGE + Duration::from_nanos(1)));
+    }
+
+    #[tokio::test]
+    async fn vote_stage_observation_preserves_success_and_error() {
+        let context = context();
+        let success = InboundVoteStage::new(&context, InboundVoteStageKind::Batches)
+            .observe(futures::future::ready(Ok::<_, &str>(17)))
+            .await;
+        assert_eq!(success, Ok(17));
+        let failure = InboundVoteStage::new(&context, InboundVoteStageKind::ReadParents)
+            .observe(futures::future::ready(Err::<u8, _>("original parent error")))
+            .await;
+        assert_eq!(failure, Err("original parent error"));
+    }
+
+    struct DropProbe(Arc<AtomicBool>);
+
+    impl Drop for DropProbe {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn dropping_vote_stage_observation_drops_the_existing_wait() {
+        let released = Arc::new(AtomicBool::new(false));
+        let probe = DropProbe(released.clone());
+        let future = async move {
+            let _probe = probe;
+            futures::future::pending::<Result<(), ()>>().await
+        };
+        let context = context();
+        let mut observed = Box::pin(
+            InboundVoteStage::new(&context, InboundVoteStageKind::Execution).observe(future),
+        );
+        assert!(observed.as_mut().now_or_never().is_none());
+        assert!(!released.load(Ordering::SeqCst));
+        drop(observed);
+        assert!(released.load(Ordering::SeqCst));
+    }
+}
 
 /// Convenience type for Primary network.
 pub(crate) type Req = PrimaryRequest;
@@ -111,7 +477,7 @@ pub const MAX_PENDING_REQUESTS_PER_PEER: usize = 2;
 /// stream is dropped without spawning (the requester sees a reset and retries
 /// elsewhere), so the primary's total sync-task fan-out stays bounded by
 /// [`MAX_CONCURRENT_EPOCH_STREAMS`] admitted tasks plus this many shed tasks.
-pub(crate) const MAX_CONCURRENT_SHED_TASKS: usize = 8;
+pub const MAX_CONCURRENT_SHED_TASKS: usize = 8;
 
 /// Longest peer-supplied error text, in characters, that a vote request keeps.
 ///
@@ -267,10 +633,15 @@ fn try_admit_sync(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut sync_guard = sync_peers.lock();
     let sync_count = sync_guard.get(&peer).copied().unwrap_or(0);
-    (sync_count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *sync_guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
-    })
+    (sync_count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *sync_guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: sync_peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Try to reserve a slot in the bounded shed-task budget.
@@ -298,10 +669,15 @@ pub(crate) fn try_admit_epoch_record(
     let permit = semaphore.clone().try_acquire_owned().ok()?;
     let mut guard = peers.lock();
     let count = guard.get(&peer).copied().unwrap_or(0);
-    (count < MAX_PENDING_REQUESTS_PER_PEER).then(|| {
-        *guard.entry(peer).or_insert(0) += 1;
-        PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
-    })
+    (count < MAX_PENDING_REQUESTS_PER_PEER)
+        .then(|| {
+            *guard.entry(peer).or_insert(0) += 1;
+            PeerSlotPermit { _permit: permit, peers: peers.clone(), peer }
+        })
+        .or_else(|| {
+            semaphore.record_rejection(ServeRejection::PeerLimit);
+            None
+        })
 }
 
 /// Primary network specific handle.
@@ -338,6 +714,34 @@ pub struct PrimaryNetworkHandle {
     /// returned `Ok` or by a hash-verified output, never by a failed or unanswered probe.
     /// [`Self::clear_sync_capability`] deliberately leaves it in place.
     last_sync_server: Arc<Mutex<Option<BlsPublicKey>>>,
+    /// One admission pool for sync transfers across every epoch served by this handle.
+    sync_admission: Arc<std::sync::OnceLock<PrimarySyncAdmission>>,
+}
+
+/// Node-lifetime admission for streams that may finish after their admitting epoch.
+#[derive(Clone, Debug)]
+struct PrimarySyncAdmission {
+    stream_semaphore: Arc<Semaphore>,
+    peers: Arc<Mutex<HashMap<BlsPublicKey, usize>>>,
+    shed_semaphore: Arc<Semaphore>,
+}
+
+impl PrimarySyncAdmission {
+    fn new(serve: &tn_config::NetworkServeConfig) -> Self {
+        Self {
+            stream_semaphore: Arc::new(Semaphore::new_for(
+                serve.epoch_stream(),
+                ServeClass::EpochStream,
+                &NetworkType::Primary,
+            )),
+            peers: Arc::new(Mutex::new(HashMap::default())),
+            shed_semaphore: Arc::new(Semaphore::new_for(
+                serve.primary_shed(),
+                ServeClass::PrimaryShed,
+                &NetworkType::Primary,
+            )),
+        }
+    }
 }
 
 // Test-only conversion that defaults the chain id to 0. Gated to tests so the only
@@ -353,11 +757,22 @@ impl From<NetworkHandle<Req, Res>> for PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 }
 
 impl PrimaryNetworkHandle {
+    /// Select the persistent swarm owner, retaining support for command-only test handles.
+    fn sync_task_spawner<'a>(&'a self, fallback: &'a TaskSpawner) -> &'a TaskSpawner {
+        self.handle.sync_task_spawner().unwrap_or(fallback)
+    }
+
+    /// Share admission across epochs without resetting permits held by older transfers.
+    fn sync_admission(&self, serve: &tn_config::NetworkServeConfig) -> &PrimarySyncAdmission {
+        self.sync_admission.get_or_init(|| PrimarySyncAdmission::new(serve))
+    }
+
     /// Create a new instance of Self.
     pub fn new(handle: NetworkHandle<Req, Res>, chain_id: u64) -> Self {
         Self {
@@ -366,6 +781,7 @@ impl PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -377,6 +793,7 @@ impl PrimaryNetworkHandle {
             sync_capability: Arc::new(Mutex::new(HashMap::new())),
             epoch_sync_failed: Arc::new(Mutex::new(HashMap::new())),
             last_sync_server: Arc::new(Mutex::new(None)),
+            sync_admission: Arc::new(std::sync::OnceLock::new()),
         }
     }
 
@@ -455,47 +872,94 @@ impl PrimaryNetworkHandle {
         header: Header,
         parents: Vec<Certificate>,
     ) -> NetworkResult<RequestVoteResult> {
-        let header = Arc::new(header);
-        let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-        let res = self.handle.send_request(request, peer).await?;
-        let mut res = res.await??.result;
-        let mut tries = 0;
-        while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
-            debug!(
-                target: "primary::network",
-                %peer,
-                error = %clip_peer_error(s),
-                "recoverable vote error, retrying"
-            );
-            tokio::time::sleep(Duration::from_millis(250)).await;
+        let mut observation = VoteObservation {
+            started: std::time::Instant::now(),
+            identity: VoteRequestIdentity::allocate().inspect_err(|error| {
+                debug!(target: "network::capacity", event = "committee_observation_error", reason = error.label(),
+                    process_id = std::process::id(), "capacity observation identity unavailable");
+            }).ok(),
+            started_unix_us: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |time| time.as_micros()),
+            header: header.digest(),
+            peer,
+            completed: false,
+            success: false,
+            outcome: VoteRequestOutcome::Cancelled,
+            error: None,
+            retry_count: 0,
+        };
+        if let Some(identity) = observation.identity {
+            debug!(target: "network::capacity", event = "committee_request_start",
+                generation = identity.generation, request_id = identity.request_id,
+                process_id = std::process::id(), started_unix_us = %observation.started_unix_us,
+                allocated_request_count = VOTE_OBSERVATION_NEXT_ID.load(Ordering::Relaxed).saturating_sub(1),
+                header = %observation.header, peer = %observation.peer, "capacity request start");
+        }
+        let result = async {
+            let header = Arc::new(header);
             let request = PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
-            let res_raw = self.handle.send_request(request, peer).await?;
-            res = res_raw.await??.result;
-            tries += 1;
-            if tries > 5 {
-                break;
+            let res = self.handle.send_request(request, peer).await?;
+            let mut res = res.await??.result;
+            let mut tries = 0;
+            while let PrimaryResponse::RecoverableError(PrimaryRPCError(s)) = res {
+                debug!(
+                    target: "primary::network",
+                    %peer,
+                    error = %clip_peer_error(s),
+                    "recoverable vote error, retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                let request =
+                    PrimaryRequest::Vote { header: header.clone(), parents: parents.clone() };
+                observation.retry_count += 1;
+                let res_raw = self.handle.send_request(request, peer).await?;
+                res = res_raw.await??.result;
+                tries += 1;
+                if tries > 5 {
+                    break;
+                }
+            }
+            match res {
+                PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
+                // still recoverable after the retries above: report it as retryable so the caller
+                // backs off and asks again rather than giving up on this peer for the header
+                PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCRetryable(clip_peer_error(s)))
+                }
+                PrimaryResponse::Error(PrimaryRPCError(s)) => {
+                    Err(NetworkError::RPCError(clip_peer_error(s)))
+                }
+                PrimaryResponse::MissingParents(parents) => {
+                    Ok(RequestVoteResult::MissingParents(parents))
+                }
+                PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is epoch record!".to_string(),
+                )),
+                PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
+                    "Got wrong response, not a vote is peer exchange!".to_string(),
+                )),
             }
         }
-        match res {
-            PrimaryResponse::Vote(vote) => Ok(RequestVoteResult::Vote(vote)),
-            // still recoverable after the retries above: report it as retryable so the caller
-            // backs off and asks again rather than giving up on this peer for the header
-            PrimaryResponse::RecoverableError(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCRetryable(clip_peer_error(s)))
-            }
-            PrimaryResponse::Error(PrimaryRPCError(s)) => {
-                Err(NetworkError::RPCError(clip_peer_error(s)))
-            }
-            PrimaryResponse::MissingParents(parents) => {
-                Ok(RequestVoteResult::MissingParents(parents))
-            }
-            PrimaryResponse::EpochRecord { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is epoch record!".to_string(),
-            )),
-            PrimaryResponse::PeerExchange { .. } => Err(NetworkError::RPCError(
-                "Got wrong response, not a vote is peer exchange!".to_string(),
-            )),
-        }
+        .await;
+        observation.completed = true;
+        observation.success = result.is_ok();
+        observation.outcome = result.as_ref().map_or_else(
+            |error| {
+                if matches!(error, NetworkError::RPCRetryable(_)) {
+                    VoteRequestOutcome::RpcRetryable
+                } else if matches!(error, NetworkError::RPCError(_)) {
+                    VoteRequestOutcome::RpcError
+                } else {
+                    VoteRequestOutcome::NetworkError
+                }
+            },
+            |response| match response {
+                RequestVoteResult::Vote(_) => VoteRequestOutcome::Vote,
+                RequestVoteResult::MissingParents(_) => VoteRequestOutcome::MissingParents,
+            },
+        );
+        observation.error = result.as_ref().err().map(|error| clip_peer_error(error.to_string()));
+        result
     }
 
     /// Fetch missing certificates from `peer` over the typed sync protocol.
@@ -1458,26 +1922,36 @@ where
         task_spawner: TaskSpawner,
         consensus_chain: ConsensusChain,
     ) -> Self {
+        let serve = consensus_config.network_config().serve_limits().clone();
         let request_handler = RequestHandler::new(
             consensus_config,
             consensus_bus,
             state_sync.clone(),
             consensus_chain.clone(),
         );
-        let epoch_stream_semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_STREAMS));
+        let sync_admission = network_handle.sync_admission(&serve).clone();
         Self {
             network_events,
             network_handle,
             request_handler,
             task_spawner,
             consensus_chain,
-            epoch_stream_semaphore,
-            sync_stream_peers: Arc::new(Mutex::new(HashMap::default())),
-            shed_task_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_SHED_TASKS)),
-            epoch_record_semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)),
+            epoch_stream_semaphore: sync_admission.stream_semaphore,
+            sync_stream_peers: sync_admission.peers,
+            shed_task_semaphore: sync_admission.shed_semaphore,
+            epoch_record_semaphore: Arc::new(Semaphore::new_for(
+                serve.epoch_record(),
+                ServeClass::EpochRecord,
+                &NetworkType::Primary,
+            )),
             epoch_record_peers: Arc::new(Mutex::new(HashMap::default())),
             epoch_record_admission_shed: AdmissionShed::epoch_record(),
         }
+    }
+
+    /// Production handles retain the swarm owner; command-only test handles use their caller.
+    fn sync_task_spawner(&self) -> &TaskSpawner {
+        self.network_handle.sync_task_spawner(&self.task_spawner)
     }
 
     pub fn handle(&self) -> &PrimaryNetworkHandle {
@@ -1554,10 +2028,19 @@ where
         let request_handler = self.request_handler.clone();
         let network_handle = self.network_handle.clone();
         let task_name = format!("VoteRequest-{}", header.digest());
+        let context = InboundVoteContext::new(&header);
+        let dispatch = InboundVoteStage::new(&context, InboundVoteStageKind::Dispatch);
 
         self.task_spawner.spawn_task(task_name, async move {
+            dispatch.finish(InboundVoteStageOutcome::Returned);
+            let evaluation = InboundVoteStage::new(&context, InboundVoteStageKind::Vote);
             tokio::select! {
                 vote = request_handler.vote(peer, header, parents) => {
+                    evaluation.finish(if vote.is_ok() {
+                        InboundVoteStageOutcome::Returned
+                    } else {
+                        InboundVoteStageOutcome::Error
+                    });
                     // report penalty if any
                     //
                     // votes are consensus-critical, so a peer that returns a penalizable
@@ -1567,12 +2050,17 @@ where
                     // silently dropping it.
                     if let Err(ref e) = vote {
                         if let Some(penalty) = e.into() {
+                            warn!(target: "primary-network", ?peer, ?penalty, error = %e,
+                                "vote request rejected with a peer penalty");
+                            let observation = InboundVoteStage::new(&context, InboundVoteStageKind::PeerPenalty);
                             network_handle.report_penalty(peer, penalty).await;
+                            observation.finish(InboundVoteStageOutcome::Returned);
                         }
                     }
 
                     let response = vote.into_response();
-                    let _ = network_handle.handle.send_response(response, channel).await;
+                    let _ = InboundVoteStage::new(&context, InboundVoteStageKind::SendResponse)
+                        .observe(network_handle.handle.send_response(response, channel)).await;
                 }
                 // cancel notification from network layer
                 _ = cancel => (),
@@ -1626,6 +2114,8 @@ where
                         // penalize peer's reputation for bad request
                         if let Err(err) = &header {
                             if let Some(penalty) = err.into() {
+                                warn!(target: "primary-network", ?peer, ?penalty, error = %err,
+                                    "epoch record request rejected with a peer penalty");
                                 network_handle.report_penalty(peer, penalty).await;
                             }
                         }
@@ -1701,7 +2191,7 @@ where
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let task_name = format!("sync-epoch-pack-{peer}");
-        self.task_spawner.spawn_task(task_name, async move {
+        self.sync_task_spawner().spawn_task(task_name, async move {
             // hold the admission permit for the lifetime of the exchange
             let _permit = permit;
             let mut stream = stream;
@@ -1825,7 +2315,7 @@ where
             },
             |shed_permit| {
                 let task_name = format!("shed-sync-epoch-pack-{peer}");
-                self.task_spawner.spawn_task(task_name, async move {
+                self.sync_task_spawner().spawn_task(task_name, async move {
                     // hold the shed budget slot for the lifetime of the task
                     let _shed_permit = shed_permit;
                     let mut stream = stream;

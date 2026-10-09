@@ -243,10 +243,6 @@ jobs:
 
   # This carried dependency is outside the workspace, so workspace test lanes do not
   # exercise its accounting regressions. Run them for maintainer PRs as well.
-  #
-  # No cache step: main warms no entry for this package (cache-deps.yaml) and the
-  # policy above lets no lane save one, so a restore would find nothing. The cold
-  # dependency build takes about 75 s, inside the lane's 15-minute budget.
   connection-limits-patch:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -258,6 +254,275 @@ jobs:
 
       - name: Test connection accounting
         run: cargo +1.94 test --locked -p libp2p-connection-limits --lib
+
+      - name: Test carried Kademlia application filtering patch
+        run: cargo +1.94 test --locked --manifest-path patches/libp2p-kad/Cargo.toml --lib
+
+  # Capacity instrumentation needs executable validation even before a live run is available.
+  # Keep this lane independent of draft/maintainer deferral, with a finite source scope.
+  hub-capacity:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    outputs:
+      qualification_required: ${{ steps.scope.outputs.changed }}
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Detect capacity source changes
+        id: scope
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "${BASE_SHA}" HEAD -- .github/workflows/pr.yaml Cargo.toml Cargo.lock tools/hub-capacity bin/node-record-api crates/config/src crates/network-libp2p/src crates/tn-metrics crates/consensus/primary/src/network crates/consensus/worker/src/network crates/node/src/manager/node.rs; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install pinned Rust toolchain
+        if: steps.scope.outputs.changed == 'true'
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
+
+      - name: Install cargo-nextest
+        if: steps.scope.outputs.changed == 'true'
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - name: Restore test dependencies
+        if: steps.scope.outputs.changed == 'true'
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+
+      - name: Test capacity evidence tools
+        if: steps.scope.outputs.changed == 'true'
+        run: python3 -B -I -m unittest discover -s tools/hub-capacity -p 'test_*.py'
+
+      - name: Compile the pinned workspace closure
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 test --locked --workspace --no-run
+
+      - name: Build Linux qualification binaries
+        if: steps.scope.outputs.changed == 'true'
+        run: |
+          cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api
+          cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer
+          cargo +1.94 test --locked -p tn-node-record-api --example hub-capacity-peer
+          git rev-parse HEAD > target/debug/hub-capacity-revision.txt
+          sha256sum target/debug/telcoin-network target/debug/node-record-api target/debug/examples/hub-capacity-peer > target/debug/hub-capacity-binaries.sha256
+
+      - name: Retain Linux qualification binaries
+        if: steps.scope.outputs.changed == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-capacity-linux-arm64-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            target/debug/telcoin-network
+            target/debug/node-record-api
+            target/debug/examples/hub-capacity-peer
+            target/debug/hub-capacity-revision.txt
+            target/debug/hub-capacity-binaries.sha256
+
+      - name: Test capacity integration and cancellation
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 nextest run --locked --workspace --exclude tn-faucet
+
+      - name: Check the pinned workspace with Clippy
+        if: steps.scope.outputs.changed == 'true'
+        run: cargo +1.94 clippy --locked --workspace --all-targets --keep-going -- -D warnings
+
+  # Each shard has its own checkout and target directory; mutations never race in one tree.
+  hub-capacity-mutation-shards:
+    needs: hub-capacity
+    if: needs.hub-capacity.outputs.qualification_required == 'true'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1]
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_INCREMENTAL: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94 --profile minimal --component clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
+        with:
+          tool: cargo-nextest
+
+      - name: Restore test dependencies
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
+
+      - name: Confirm compiling Rust mutations in this shard
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: >-
+          python3 -B -I tools/hub-capacity/mutate-rust.py
+          --output target/debug/hub-capacity-mutations
+          --shard-index ${{ matrix.shard }} --shard-count 2
+          --source "$EXPECTED_SOURCE" --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }}
+
+      - name: Retain mutation shard diagnostics
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-${{ matrix.shard }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: target/debug/hub-capacity-mutations
+
+  hub-capacity-mutations:
+    needs: [hub-capacity, hub-capacity-mutation-shards]
+    if: always()
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          submodules: true
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Require complete mutation shard outcomes
+        env:
+          CODE_RESULT: ${{ needs.hub-capacity.result }}
+          REQUIRED: ${{ needs.hub-capacity.outputs.qualification_required }}
+          SHARDS_RESULT: ${{ needs.hub-capacity-mutation-shards.result }}
+        run: |
+          set -euo pipefail
+          test "$CODE_RESULT" = success
+          case "$REQUIRED" in
+            true) test "$SHARDS_RESULT" = success ;;
+            false) test "$SHARDS_RESULT" = skipped ;;
+            *) echo "::error::missing mutation scope decision"; exit 1 ;;
+          esac
+
+      - name: Download first mutation shard
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-0
+          path: ${{ runner.temp }}/hub-capacity-mutation-shards/0
+
+      - name: Download second mutation shard
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hub-capacity-mutation-shard-${{ github.event.pull_request.head.sha || github.sha }}-run-${{ github.run_id }}-attempt-${{ github.run_attempt }}-1
+          path: ${{ runner.temp }}/hub-capacity-mutation-shards/1
+
+      - name: Reconcile every mutation case and raw command log
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        env:
+          EXPECTED_SOURCE: ${{ github.event.pull_request.head.sha || github.sha }}
+          SHARDS_RESULT: ${{ needs.hub-capacity-mutation-shards.result }}
+        run: >-
+          python3 -B -I tools/hub-capacity/aggregate-mutations.py
+          --input "${{ runner.temp }}/hub-capacity-mutation-shards/0"
+          --input "${{ runner.temp }}/hub-capacity-mutation-shards/1"
+          --output target/debug/hub-capacity-mutations
+          --source "$EXPECTED_SOURCE" --run-id ${{ github.run_id }} --run-attempt ${{ github.run_attempt }}
+          --shards-result "$SHARDS_RESULT"
+
+      - name: Retain complete mutation evidence
+        if: always() && needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-capacity-mutations-${{ github.event.pull_request.head.sha || github.sha }}
+          retention-days: 7
+          if-no-files-found: ignore
+          path: target/debug/hub-capacity-mutations
+
+  # A measured qualification is required whenever the capacity source scope changes.
+  hub-capacity-qualification:
+    needs: [hub-capacity, hub-capacity-mutations]
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Download attested qualification binaries
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: hub-capacity-linux-arm64-${{ github.event.pull_request.head.sha || github.sha }}
+          path: ${{ runner.temp }}/hub-capacity-binaries
+
+      - name: Install offline transaction signer
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        env:
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 93fc23be26c8a902ca58fe54aa6ca28c880b58af95d052674933161df7928e6d
+        run: |
+          set -euo pipefail
+          archive="foundry_${FOUNDRY_VERSION}_linux_arm64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/capacity-foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/capacity-foundry" cast anvil
+          echo "${RUNNER_TEMP}/capacity-foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/capacity-foundry/cast" --version
+          "${RUNNER_TEMP}/capacity-foundry/anvil" --version
+
+      - name: Build isolated Linux runtime
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        run: docker build -f tools/hub-capacity/Dockerfile -t tn-capacity-1476-runtime:ubuntu24 tools/hub-capacity
+
+      - name: Qualify the declared population and resource envelope
+        if: needs.hub-capacity.outputs.qualification_required == 'true'
+        env:
+          HUB_CAPACITY_BINARIES: ${{ runner.temp }}/hub-capacity-binaries
+          HUB_CAPACITY_EVIDENCE: ${{ runner.temp }}/hub-capacity-qualification
+        run: python3 -B -I tools/hub-capacity/docker-run.py --binaries "$HUB_CAPACITY_BINARIES" --output "$HUB_CAPACITY_EVIDENCE" --runner-envelope github-actions
+
+      - name: Retain qualification evidence and diagnostics
+        if: always() && needs.hub-capacity.outputs.qualification_required == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: hub-capacity-evidence-${{ github.event.pull_request.head.sha || github.sha }}-attempt-${{ github.run_attempt }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            ${{ runner.temp }}/hub-capacity-qualification/*.json
+            ${{ runner.temp }}/hub-capacity-qualification/*-docker-exec.log
+            ${{ runner.temp }}/hub-capacity-qualification/source
+            ${{ runner.temp }}/hub-capacity-qualification/*-evidence
+            ${{ runner.temp }}/hub-capacity-qualification/deployment/*/*.json
+            ${{ runner.temp }}/hub-capacity-qualification/deployment/*/*.jsonl
+            ${{ runner.temp }}/hub-capacity-qualification/deployment/*/*-process-*.log
+            ${{ runner.temp }}/hub-capacity-qualification/deployment/*/peers/*.json
+            ${{ runner.temp }}/hub-capacity-qualification/deployment/population.json
 
   # Clippy - replaces cargo check, catches more issues.
   #
@@ -434,7 +699,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     if: always()
-    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, transport-evidence, quic-profile-pins]
+    needs: [ci-scope, attest, fmt, clippy, test, adiri-test, archive-mode-gate, connection-limits-patch, hub-capacity, hub-capacity-mutations, hub-capacity-qualification, transport-evidence, quic-profile-pins]
     steps:
       - name: Check all jobs passed
         env:
@@ -461,7 +726,7 @@ jobs:
           # The job list is asserted, not discovered: a job renamed or dropped from
           # `needs` would otherwise leave this check silently, or turn up as an unnamed
           # lane whose `skipped` the pull_request branch below accepts.
-          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt quic-profile-pins test transport-evidence"
+          expected="adiri-test archive-mode-gate attest ci-scope clippy connection-limits-patch fmt hub-capacity hub-capacity-mutations hub-capacity-qualification quic-profile-pins test transport-evidence"
           actual=$(jq -r 'keys | join(" ")' <<<"${RESULTS}")
           if [[ "${actual}" != "${expected}" ]]; then
             echo "::error::needs mismatch: expected [${expected}], got [${actual}]. Update 'expected' in this step together with 'needs'."
@@ -489,14 +754,9 @@ jobs:
                 echo "::error::attest: ${result} on ${EVENT_NAME}"
                 failed=1
                 ;;
-              *:connection-limits-patch:success) echo "  ok       ${job}" ;;
-              *:connection-limits-patch:*)
-                echo "::error::connection-limits-patch: ${result}"
-                failed=1
-                ;;
-              *:transport-evidence:success) echo "  ok       ${job}" ;;
-              *:transport-evidence:*)
-                echo "::error::transport-evidence: ${result}"
+              *:connection-limits-patch:success|*:hub-capacity:success|*:hub-capacity-mutations:success|*:hub-capacity-qualification:success|*:transport-evidence:success) echo "  ok       ${job}" ;;
+              *:connection-limits-patch:*|*:hub-capacity:*|*:hub-capacity-mutations:*|*:hub-capacity-qualification:*|*:transport-evidence:*)
+                echo "::error::${job}: ${result}"
                 failed=1
                 ;;
               # Never gated by ci-scope, so the maintainer bypass below must not accept a

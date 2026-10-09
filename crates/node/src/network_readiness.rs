@@ -283,16 +283,38 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn epoch_turnover_preserves_monitor_and_node_shutdown_cancels_it() -> eyre::Result<()> {
         use tn_types::{ShutdownNotifier, TaskManager};
-        let mut node_tasks = TaskManager::new("readiness-node");
+        use tokio::sync::Notify;
+
+        let node_tasks = TaskManager::new("readiness-node");
         let mut epoch_tasks = TaskManager::new("readiness-epoch");
         let (publisher, mut readiness) = watch::channel(NetworkReadiness::pending());
+        let primary_started = Arc::new(Notify::new());
+        let worker_started = Arc::new(Notify::new());
+        let primary_probe_started = primary_started.clone();
+        let worker_probe_started = worker_started.clone();
         node_tasks.get_spawner().spawn_task("network-readiness", async move {
-            monitor(publisher, pending::<Result<usize, ()>>, || {
-                vec![(4, pending::<Result<usize, ()>>())]
-            })
+            monitor(
+                publisher,
+                move || {
+                    let started = primary_probe_started.clone();
+                    async move {
+                        started.notify_one();
+                        pending::<Result<usize, ()>>().await
+                    }
+                },
+                move || {
+                    let started = worker_probe_started.clone();
+                    vec![(4, async move {
+                        started.notify_one();
+                        pending::<Result<usize, ()>>().await
+                    })]
+                },
+            )
             .await;
             Ok(())
         });
+        primary_started.notified().await;
+        worker_started.notified().await;
         readiness.changed().await?;
         let epoch_shutdown = ShutdownNotifier::default();
         epoch_shutdown.notify();
@@ -301,15 +323,10 @@ mod tests {
         assert!(!readiness.has_changed()?);
         assert_eq!(readiness.borrow().primary, SwarmReadiness::TimedOut);
         tokio::time::advance(NETWORK_PROBE_INTERVAL).await;
-        tokio::task::yield_now().await;
-        // `join` signals only its own notifier: the monitor stops when the manager drops. Track
-        // the queued monitor now and give `join` no grace, so the join cannot outlast the
-        // timeout whichever `until_exit` select branch wins.
-        node_tasks.update_tasks();
-        node_tasks.set_join_wait(0);
-        let node_shutdown = ShutdownNotifier::default();
-        node_shutdown.notify();
-        tokio::time::timeout(Duration::from_secs(1), node_tasks.join(node_shutdown)).await??;
+        primary_started.notified().await;
+        worker_started.notified().await;
+        let _ = readiness.borrow_and_update();
+        // Manager drop cancels the stalled monitor and drops its sole readiness publisher.
         drop(node_tasks);
         assert!(tokio::time::timeout(Duration::from_secs(1), readiness.changed()).await?.is_err());
         Ok(())

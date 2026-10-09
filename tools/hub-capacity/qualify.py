@@ -1,0 +1,749 @@
+#!/usr/bin/env python3
+"""Freeze acceptance criteria and score complete public hub qualification evidence.
+
+Input measurements must come from a live workload adapter. This tool neither
+generates population measurements nor turns a unit test into capacity evidence.
+"""
+
+import argparse
+import hashlib
+import json
+import math
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parent
+MAX_BYTES = 16 * 1024 * 1024
+# Compact CI107 baseline evidence reached 18,014,619 bytes; reserve finite phase headroom.
+EVIDENCE_MAX_BYTES = 24 * 1024**2
+MAX_RAW_ARTIFACT_BYTES = 64 * 1024**2
+# A CI47 baseline validator log reached 355,304,227 bytes.
+MAX_PROTOCOL_LOG_BYTES = 512 * 1024**2
+SCENARIOS = {
+    "public_join", "shared_nat_reconnect", "gossip_two_hops", "record_lookup",
+    "submit_url_lookup", "concurrent_sync", "committee_progress", "dao_connectivity",
+}
+SERVICES = {"epoch_stream", "epoch_record", "primary_shed", "batch_stream", "worker_shed", "prefetch"}
+TASK_LIMITS = {
+    "primary": {"epoch_stream": 5, "epoch_record": 5, "primary_shed": 8},
+    "worker-0": {"batch_stream": 5, "worker_shed": 8, "prefetch": 8},
+    "worker-1": {"batch_stream": 5, "worker_shed": 8, "prefetch": 8},
+}
+
+OPERATION_FIELDS = {"id", "success", "rejection_reason", "latency_ms", "elapsed_seconds",
+                    "hops", "cancelled", "committee_request"}
+
+
+def native_integer(fields, name, minimum=0):
+    value = fields[name]
+    if type(value) is not int and (not isinstance(value, str) or re.fullmatch(r"[0-9]{1,20}", value) is None):
+        fail(f"invalid native {name}")
+    value = int(value)
+    if not minimum <= value <= 2**64 - 1:
+        fail(f"invalid native {name}")
+    return value
+
+
+def committee_identity(fields):
+    generation = fields["generation"]
+    if not isinstance(generation, str) or re.fullmatch(r"[0-9a-f]{32}", generation) is None:
+        fail("invalid native process generation")
+    request_id = native_integer(fields, "request_id", 1)
+    if request_id > native_integer(fields, "allocated_request_count", 1):
+        fail("request identity exceeds producer allocation watermark")
+    native_integer(fields, "process_id", 1)
+    native_integer(fields, "started_unix_us", 1)
+    return generation, request_id
+
+
+def committee_operation(observation, measurement, duration):
+    """Project a real terminal while preserving its exact request and raw-log provenance."""
+    fields = observation["record"]["fields"]
+    generation, request_id = committee_identity(fields)
+    started = native_integer(fields, "started_unix_us", 1)
+    ended = native_integer(fields, "unix_us", 1)
+    latency = native_integer(fields, "latency_us")
+    outcome = fields["outcome"]
+    if fields["event"] != "committee_request" or observation["record"]["target"] != "network::capacity":
+        fail("committee operation must reference a native terminal")
+    if not measurement <= started < measurement + duration * 1_000_000 or ended < started:
+        fail("committee request started outside measurement interval")
+    if type(fields["success"]) is not bool or type(fields["completed"]) is not bool:
+        fail("native committee outcome flags must be boolean")
+    if outcome not in {"vote", "missing_parents", "rpc_retryable", "rpc_error", "network_error", "cancelled"}:
+        fail("unknown native committee outcome")
+    if fields["success"] != (outcome in {"vote", "missing_parents"}) or fields["completed"] != (outcome != "cancelled"):
+        fail("inconsistent native committee outcome")
+    native_integer(fields, "retry_count")
+    integer(observation["offset"], "terminal log offset", 0)
+    if re.fullmatch(r"[0-9a-f]{64}", observation["line_sha256"]) is None:
+        fail("native terminal requires raw line digest")
+    source = observation["source"]
+    if not isinstance(source, str) or not source:
+        fail("native terminal requires a hub identity")
+    return {"scenario": "committee_progress", "id": f"committee-{source}-{generation}-{request_id}",
+            "success": fields["success"], "cancelled": not fields["completed"],
+            "rejection_reason": None if fields["success"] else fields.get("error") or outcome,
+            "latency_ms": latency / 1000, "elapsed_seconds": (ended - measurement) / 1_000_000,
+            "committee_request": {"source": source, "generation": generation, "request_id": request_id,
+                                  "process_id": native_integer(fields, "process_id", 1),
+                                  "started_unix_us": started, "terminal_offset": observation["offset"],
+                                  "terminal_line_sha256": observation["line_sha256"]},
+            "trace": {"observation": observation}}
+
+
+def read_json(path, *, maximum_bytes=MAX_BYTES):
+    """Bound input size, defaulting to metadata, and reject duplicate keys and nonfinite numbers."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError(f"duplicate key: {key}")
+            result[key] = value
+        return result
+
+    with path.open("rb") as source:
+        raw = source.read(maximum_bytes + 1)
+    if len(raw) > maximum_bytes:
+        raise ValueError(f"input exceeds {maximum_bytes // 1024**2} MiB")
+    return json.loads(raw, object_pairs_hook=unique,
+                      parse_constant=lambda value: fail(f"nonfinite number: {value}"))
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def digest(value):
+    """Hash semantic JSON, independent of formatting or object key order."""
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def number(value, name, minimum=0):
+    if type(value) not in (int, float) or abs(value) > 2**64 - 1 or not math.isfinite(value) or value < minimum:
+        fail(f"{name} must be a finite number >= {minimum}")
+    return value
+
+
+def integer(value, name, minimum=1):
+    if type(value) is not int or value < minimum or value > 2**64 - 1:
+        fail(f"{name} must be an integer >= {minimum}")
+    return value
+
+
+def process_sample_times(hub):
+    """Require the descriptive timestamp to be bound to the process-read bracket."""
+    started = number(hub.get("process_sample_started_elapsed_seconds"), "process sample start")
+    completed = number(hub.get("process_sample_completed_elapsed_seconds"), "process sample completion")
+    timestamp = number(hub.get("process_sample_elapsed_seconds"), "process sample time")
+    if completed < started or timestamp != started + (completed - started) / 2:
+        fail("process sample time must be the midpoint of its retained read bracket")
+    return started, completed
+
+
+def validate_plan(plan):
+    """Check the complete declaration before either workload is scored."""
+    if type(plan.get("version")) is not int or plan["version"] != 1:
+        fail("unsupported plan version")
+    for phase in ("baseline", "candidate"):
+        revision = plan[phase]["revision"]
+        if not isinstance(revision, str) or re.fullmatch(r"[0-9a-f]{40}", revision) is None:
+            fail(f"{phase}.revision must be a full source SHA")
+        if not plan[phase]["build_command"] or not plan[phase]["binary_sha256"]:
+            fail(f"{phase} requires build command and binary digests")
+        for value in plan[phase]["binary_sha256"].values():
+            if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+                fail("binary digest must be SHA-256")
+    shipped = read_json(ROOT / "profile-v1.json")
+    candidate_profile = plan["candidate"]["profile"]
+    selected = {key: candidate_profile.get(key) for key in shipped}
+    if digest(selected) != digest(shipped):
+        fail("candidate configuration differs from the shipped profile")
+    if set(candidate_profile) - set(shipped) - {"bootstrap_peers", "hostname", "dao_observers", "libp2p_config"}:
+        fail("v1 permits bootstrap, hostname, DAO, and chain deployment settings alongside the exact profile")
+    if "libp2p_config" in candidate_profile:
+        deployment = candidate_profile["libp2p_config"]
+        if not isinstance(deployment, dict) or set(deployment) != {"chain_id"}:
+            fail("libp2p deployment settings may contain only chain_id")
+        integer(deployment["chain_id"], "chain_id")
+    if plan["baseline"]["profile"].get("libp2p_config") != candidate_profile.get("libp2p_config"):
+        fail("baseline and candidate must declare the same chain settings")
+    observers = candidate_profile.get("dao_observers", [])
+    if not isinstance(observers, list) or len(observers) != 8 or any(not isinstance(key, str) or not key for key in observers) or len(set(observers)) != 8:
+        fail("declare eight distinct DAO observer identities before qualification")
+    if any(key not in candidate_profile.get("bootstrap_peers", {}) for key in observers):
+        fail("every DAO observer must be provisioned in the trusted bootstrap set")
+    if plan["baseline"]["profile"].get("dao_observers") != observers:
+        fail("baseline and candidate must measure the same DAO identities")
+    envelope = plan["envelope"]
+    for field in ("cpus_per_hub", "ram_bytes_per_hub", "link_mbps", "rtt_ms",
+                  "public_peers", "shared_nat_peers", "dao_observers", "committee_peers", "workers_per_hub",
+                  "duration_seconds"):
+        integer(envelope[field], field)
+    number(envelope["loss_percent"], "loss_percent")
+    if envelope["loss_percent"] > 100:
+        fail("loss_percent exceeds 100")
+    if envelope["public_peers"] != 64 or envelope["shared_nat_peers"] != 16:
+        fail("v1 qualifies 64 public peers, including 16 sharing one NAT")
+    if envelope["dao_observers"] != 8 or envelope["committee_peers"] != 4 or envelope["workers_per_hub"] != 2:
+        fail("v1 requires 8 DAO observers, 12 committee peers across rotation, and 2 workers per hub")
+    if envelope["duration_seconds"] < 600:
+        fail("each phase must last at least 600 seconds")
+    if not envelope["hardware"] or not envelope["network_setup"]:
+        fail("hardware and exact network setup must be recorded")
+    if not plan["hubs"] or len(set(plan["hubs"])) != len(plan["hubs"]):
+        fail("declare distinct hub IDs")
+    thresholds = plan["thresholds"]
+    for field in ("max_rss_bytes", "max_queue_occupancy", "max_progress_stall_seconds"):
+        number(thresholds[field], field, 1)
+    if thresholds["max_rss_bytes"] > envelope["ram_bytes_per_hub"]:
+        fail("RSS threshold exceeds available RAM")
+    if not 0 < number(thresholds["max_cpu_cores"], "max_cpu_cores") < envelope["cpus_per_hub"]:
+        fail("CPU threshold must be positive and leave aggregate headroom")
+    if set(thresholds["scenarios"]) != SCENARIOS:
+        fail("declare acceptance criteria for all eight workload scenarios")
+    for scenario, bounds in thresholds["scenarios"].items():
+        integer(bounds["minimum_attempts"], scenario)
+        number(bounds["max_p99_ms"], scenario, 1)
+        rate = number(bounds["minimum_success_rate"], scenario)
+        if not 0 < rate <= 1:
+            fail(f"invalid success rate for {scenario}")
+        if scenario == "committee_progress" and not 0 <= number(bounds["max_cancelled_fraction"], "committee cancellation bound") < 1:
+            fail("invalid committee cancellation bound")
+    if not plan["threshold_owner"] or not plan["adapter_command"]:
+        fail("record the threshold decision and exact workload adapter command")
+
+
+def validate_evidence(plan, evidence, phase):
+    """Reject missing, stale, inconsistent, or incomplete telemetry."""
+    if evidence.get("phase") != phase or evidence.get("plan_sha256") != digest(plan):
+        fail("evidence is not bound to this predeclared plan and phase")
+    if evidence.get("revision") != plan[phase]["revision"]:
+        fail("source revision mismatch")
+    if evidence.get("profile_sha256") != digest(plan[phase]["profile"]):
+        fail("deployed profile mismatch")
+    if evidence.get("binary_sha256") != plan[phase]["binary_sha256"]:
+        fail("deployed binary mismatch")
+    if evidence.get("envelope") != plan["envelope"]:
+        fail("baseline and candidate must use the declared envelope")
+    if "committee_sources" in evidence and list(evidence["committee_sources"]) != plan["hubs"]:
+        fail("committee source order must match the declared hub order")
+    if not evidence.get("artifacts"):
+        fail("raw telemetry and workload logs must be retained")
+    for artifact in evidence["artifacts"]:
+        if not artifact["path"] or re.fullmatch(r"[0-9a-f]{64}", artifact["sha256"]) is None:
+            fail("every raw artifact requires a path and SHA-256")
+    swarms = {"primary", "worker-0", "worker-1"}
+    previous = None
+    previous_process = {}
+    samples = evidence["samples"]
+    for index, sample in enumerate(samples):
+        timestamp = number(sample["elapsed_seconds"], "sample time")
+        if previous is not None and not 0 < timestamp - previous <= 5:
+            fail("samples must be monotonic, no more than five seconds apart")
+        previous = timestamp
+        if set(sample["hubs"]) != set(plan["hubs"]):
+            fail("every sample must cover every hub process")
+        next_loop = (number(samples[index + 1]["elapsed_seconds"], "next sample time")
+                     if index + 1 < len(samples) else plan["envelope"]["duration_seconds"] + 30)
+        for hub_id, hub in sample["hubs"].items():
+            process_started, process_completed = process_sample_times(hub)
+            if process_started < timestamp or process_completed > next_loop:
+                fail("process read bracket lies outside its collection loop or drain budget")
+            if hub_id in previous_process and not 0 < process_started - previous_process[hub_id] <= 5:
+                fail("process read brackets must have a positive CPU interval no more than five seconds")
+            previous_process[hub_id] = process_completed
+            number(hub["rss_bytes"], "whole-process RSS", 1)
+            number(hub["cpu_seconds"], "whole-process CPU")
+            integer(hub["progress"], "application progress", 0)
+            integer(hub["dao_connected"], "DAO connectivity", 0)
+            integer(hub["source_rows"], "source accounting occupancy", 0)
+            if set(hub["swarms"]) != swarms:
+                fail("primary and all configured workers must be measured")
+            totals = dict.fromkeys(SERVICES, 0)
+            for network, swarm in hub["swarms"].items():
+                for field in ("connections", "connection_limit", "streams_per_connection_limit",
+                              "receive_credit_per_connection_bytes", "queue_occupancy",
+                              "ordinary_peers", "dao_connected"):
+                    integer(swarm[field], field, 0)
+                if not isinstance(swarm["rejections"], dict):
+                    fail("record rejection counts by reason, including an empty map")
+                for count in swarm["rejections"].values():
+                    integer(count, "rejections", 0)
+                if set(swarm["tasks"]) != set(TASK_LIMITS[network]) or swarm["task_limits"] != TASK_LIMITS[network]:
+                    fail("every swarm must declare its independent serve-class allocations")
+                for limit in swarm["task_limits"].values():
+                    integer(limit, "per-swarm serve allocation", 1)
+                for service, count in swarm["tasks"].items():
+                    totals[service] += integer(count, "per-swarm serve occupancy", 0)
+            if set(hub["tasks"]) != SERVICES:
+                fail("all serve-class task occupancies must be measured")
+            for count in hub["tasks"].values():
+                integer(count, "task occupancy", 0)
+            if hub["tasks"] != totals:
+                fail("process serve occupancy must equal the measured primary and worker totals")
+    if len(samples) < 2 or samples[0]["elapsed_seconds"] != 0:
+        fail("capture must start at zero and contain multiple samples")
+    if samples[-1]["elapsed_seconds"] < plan["envelope"]["duration_seconds"]:
+        fail("incomplete measurement interval")
+    if set(evidence["operations"]) != SCENARIOS:
+        fail("missing workload scenarios")
+    for scenario, operations in evidence["operations"].items():
+        if not operations:
+            fail(f"empty {scenario} workload")
+        identities = set()
+        for operation in operations:
+            if operation["id"] in identities:
+                fail("duplicate operation ID")
+            identities.add(operation["id"])
+            if type(operation["success"]) is not bool:
+                fail("operation success must be boolean")
+            reason = operation["rejection_reason"]
+            if not operation["success"] and (not isinstance(reason, str) or not reason):
+                fail("rejected operations require a reason")
+            if type(operation.get("cancelled", False)) is not bool or (operation.get("cancelled", False) and (scenario != "committee_progress" or operation["success"])):
+                fail("only unsuccessful committee requests may be classified as cancelled")
+            latency = number(operation["latency_ms"], "operation latency")
+            at = number(operation["elapsed_seconds"], "operation timestamp")
+            if at > samples[-1]["elapsed_seconds"]:
+                fail("operation lies outside captured interval")
+            # Native committee observations declare cancellation state; failed queries do not.
+            if scenario == "committee_progress" and (operation["success"] or "cancelled" in operation):
+                started_us = (operation["committee_request"]["started_unix_us"] - evidence["measurement_start_unix_us"]
+                              if "committee_request" in operation else round(at * 1_000_000) - round(latency * 1000))
+                if not 0 <= started_us < plan["envelope"]["duration_seconds"] * 1_000_000:
+                    fail("committee request started outside measurement interval")
+            if scenario == "gossip_two_hops" and operation["success"]:
+                if integer(operation["hops"], "gossip hops") < 2:
+                    fail("direct hub delivery is insufficient gossip evidence")
+
+
+def score(plan, evidence):
+    """Apply absolute candidate limits while reporting measured baseline results separately."""
+    bounds = plan["thresholds"]
+    failures = []
+    summary = {}
+    profile = plan["candidate"]["profile"]
+    process_budget = profile["process_budget"]
+    swarm_limit = process_budget["max_established_connections"] // process_budget["swarm_count"]
+    total_connections = swarm_limit * process_budget["swarm_count"]
+    stream_limit = process_budget["max_inbound_streams"] // total_connections
+    credit_limit = process_budget["max_receive_credit_bytes"] // total_connections
+    for scenario, operations in evidence["operations"].items():
+        rule = bounds["scenarios"][scenario]
+        completed = [operation for operation in operations if not operation.get("cancelled", False)]
+        cancellations = len(operations) - len(completed)
+        latencies = sorted(operation["latency_ms"] for operation in completed)
+        p99 = latencies[math.ceil(len(latencies) * 0.99) - 1] if latencies else 0
+        rate = sum(operation["success"] for operation in completed) / len(completed) if completed else 0
+        summary[scenario] = {"attempts": len(completed), "cancelled": cancellations, "success_rate": rate, "p99_ms": p99}
+        if scenario == "committee_progress" and cancellations / len(operations) > rule["max_cancelled_fraction"]:
+            failures.append("committee_progress: cancellation threshold exceeded")
+        if len(completed) < rule["minimum_attempts"] or rate < rule["minimum_success_rate"] or p99 > rule["max_p99_ms"]:
+            failures.append(f"{scenario}: workload threshold exceeded")
+    task_limits = {"epoch_stream": 5, "epoch_record": 5, "primary_shed": 8,
+                   "batch_stream": 10, "worker_shed": 16, "prefetch": 16}
+    first = evidence["samples"][0]
+    last = evidence["samples"][-1]
+    for hub_id in plan["hubs"]:
+        initial = first["hubs"][hub_id]
+        final = last["hubs"][hub_id]
+        for network in TASK_LIMITS:
+            if max(sample["hubs"][hub_id]["swarms"][network]["ordinary_peers"]
+                   for sample in evidence["samples"]) < plan["envelope"]["public_peers"]:
+                failures.append(f"{hub_id}/{network}: declared public population was never measured")
+        if final["progress"] <= initial["progress"]:
+            failures.append(f"{hub_id}: application made no progress")
+        previous_cpu = initial["cpu_seconds"]
+        previous_progress = initial["progress"]
+        last_advanced_at = first["elapsed_seconds"]
+        for previous, sample in zip(evidence["samples"], evidence["samples"][1:]):
+            hub = sample["hubs"][hub_id]
+            delta = hub["cpu_seconds"] - previous_cpu
+            # The counter was read somewhere inside each bracket. Use the shortest
+            # possible interval so read uncertainty cannot hide a CPU threshold breach.
+            previous_completed = process_sample_times(previous["hubs"][hub_id])[1]
+            current_started = process_sample_times(hub)[0]
+            interval = current_started - previous_completed
+            if not 0 < interval <= 5:
+                fail("process read brackets must have a positive CPU interval no more than five seconds")
+            if delta < 0 or delta / interval > bounds["max_cpu_cores"]:
+                failures.append(f"{hub_id}: CPU headroom exhausted or process restarted")
+            previous_cpu = hub["cpu_seconds"]
+            if hub["progress"] < previous_progress:
+                failures.append(f"{hub_id}: application progress regressed")
+            if hub["progress"] > previous_progress:
+                last_advanced_at = sample["elapsed_seconds"]
+            elif sample["elapsed_seconds"] - last_advanced_at > bounds["max_progress_stall_seconds"]:
+                failures.append(f"{hub_id}: application progress stalled")
+            previous_progress = hub["progress"]
+        for sample in evidence["samples"]:
+            hub = sample["hubs"][hub_id]
+            if hub["rss_bytes"] > bounds["max_rss_bytes"] or hub["source_rows"] > profile["source_admission"]["max_sources"]:
+                failures.append(f"{hub_id}: RSS or accounting table exceeded")
+            if hub["dao_connected"] < plan["envelope"]["dao_observers"]:
+                failures.append(f"{hub_id}: DAO observer reservation lost")
+            allocations = list(hub["swarms"].values())
+            if any(swarm["ordinary_peers"] > profile["public_peer_limit"] or
+                   swarm["dao_connected"] < plan["envelope"]["dao_observers"] for swarm in allocations):
+                failures.append(f"{hub_id}: public population or per-swarm DAO reservation exceeded")
+            if any(count > swarm["task_limits"][service]
+                   for swarm in allocations for service, count in swarm["tasks"].items()):
+                failures.append(f"{hub_id}: independent swarm task budget exceeded")
+            if any(swarm["connection_limit"] != swarm_limit or swarm["connections"] > swarm_limit or
+                   swarm["streams_per_connection_limit"] != stream_limit or
+                   swarm["receive_credit_per_connection_bytes"] != credit_limit or
+                   swarm["queue_occupancy"] > bounds["max_queue_occupancy"] for swarm in allocations):
+                failures.append(f"{hub_id}: swarm allocation or queue threshold exceeded")
+            if sum(swarm["connection_limit"] for swarm in allocations) > process_budget["max_established_connections"]:
+                failures.append(f"{hub_id}: aggregate connection allocation exceeded")
+            if any(count > task_limits[service] for service, count in hub["tasks"].items()):
+                failures.append(f"{hub_id}: serve-class task budget exceeded")
+    return {"passed": not failures, "failures": sorted(set(failures)), "scenarios": summary}
+
+
+def raw_artifact_limit(path):
+    """Reserve the larger finite budget for canonical production node logs."""
+    return MAX_PROTOCOL_LOG_BYTES if re.fullmatch(r"protocol-[0-9]{2}\.jsonl", path) else MAX_RAW_ARTIFACT_BYTES
+
+
+def raw_records(path, expected_hash, maximum_line, *, strict=False):
+    """Scan bounded hash-bound records, requiring complete JSONL in strict CPU mode."""
+    def unique_fields(pairs):
+        record = {}
+        for key, value in pairs:
+            if key in record:
+                fail(f"duplicate retained process telemetry field: {path.name}")
+            record[key] = value
+        return record
+
+    hasher = hashlib.sha256()
+    offset = 0
+    with path.open("rb") as stream:
+        while line := stream.readline(maximum_line + 1):
+            if len(line) > maximum_line:
+                fail(f"raw line exceeds bounded input size: {path.name}")
+            if strict and (not line.endswith(b"\n") or not line.strip()):
+                fail(f"invalid retained process telemetry record: {path.name}")
+            hasher.update(line)
+            try:
+                record = (json.loads(line, object_pairs_hook=unique_fields,
+                                     parse_constant=lambda _: fail("nonfinite retained process telemetry value"))
+                          if strict else json.loads(line))
+            except (ValueError, UnicodeError):
+                if strict:
+                    fail(f"invalid retained process telemetry record: {path.name}")
+                if b"committee_" in line or path.name == "operations.jsonl":
+                    fail(f"invalid retained committee record: {path.name}")
+            else:
+                yield offset, hashlib.sha256(line).hexdigest(), record
+            offset += len(line)
+    if hasher.hexdigest() != expected_hash:
+        fail(f"raw artifact changed during reconciliation: {path.name}")
+
+
+def reconcile_committee(evidence, directory):
+    """Require exact raw start, terminal, and scored-row equality for each measured hub."""
+    artifacts = {entry["path"]: entry["sha256"] for entry in evidence["artifacts"]}
+    if len(artifacts) != len(evidence["artifacts"]):
+        fail("duplicate raw artifact path")
+    measurement = integer(evidence.get("measurement_start_unix_us"), "measurement origin", 1)
+    duration = evidence["envelope"]["duration_seconds"]
+    required = {"topology.json", "operations.jsonl"} | {
+        f"protocol-{index:02}.jsonl" for index in range(evidence["envelope"]["committee_peers"])}
+    if not required <= artifacts.keys():
+        fail("committee reconciliation requires retained topology, operations and every validator log")
+    topology = read_json(directory / "topology.json")
+    validators = topology["population"]["validators"]
+    if len(validators) != evidence["envelope"]["committee_peers"] or [node["hub"] for node in validators] != [True, True, False, False]:
+        fail("retained topology does not bind the two measured hub log indices")
+    sources = [node["bls_key"] for node in validators[:2]]
+    if len(set(sources)) != 2:
+        fail("retained topology must bind distinct measured hub identities")
+    if list(evidence.get("committee_sources", {}).values()) != sources:
+        fail("committee sources do not match the retained topology log mapping")
+    starts, terminals, raw_terminals = {}, {}, {}
+    allocated, generation_sources = {}, {}
+    for index, source in enumerate(sources):
+        name = f"protocol-{index:02}.jsonl"
+        for offset, line_hash, record in raw_records(directory / name, artifacts[name], 65536):
+            if not isinstance(record, dict) or record.get("target") != "network::capacity":
+                continue
+            fields = record["fields"]
+            event = fields["event"]
+            if event == "committee_observation_error":
+                fail("native committee identity allocation failed")
+            if event not in {"committee_request_start", "committee_request"}:
+                continue
+            generation, request_id = committee_identity(fields)
+            key = (source, generation, request_id)
+            owner = generation_sources.setdefault(generation, source)
+            if owner != source:
+                fail("native process generation aliases another hub")
+            allocated.setdefault((source, generation), {"ids": set(), "watermark": 0})
+            state = allocated[(source, generation)]
+            state["watermark"] = max(state["watermark"], native_integer(fields, "allocated_request_count", 1))
+            if event == "committee_request_start":
+                if key in starts:
+                    fail("duplicate native committee start")
+                starts[key] = fields
+                state["ids"].add(request_id)
+            else:
+                if key in raw_terminals:
+                    fail("duplicate native committee terminal")
+                raw_terminals[key] = (offset, line_hash, record)
+    snapshots = {}
+    producer_pids = {}
+    previous_snapshots = {}
+    watermark_pattern = re.compile(r'^tn_primary_vote_observation_allocated\{generation="([0-9a-f]{32})"\} ([0-9]+)$', re.MULTILINE)
+    for name, artifact_hash in sorted(artifacts.items()):
+        if re.fullmatch(r"telemetry-[0-9]{3}\.jsonl", name) is None:
+            continue
+        for _, _, sample in raw_records(directory / name, artifact_hash, 8 * 1024**2):
+            source = evidence["committee_sources"].get(sample["hub"])
+            if source is None:
+                fail("producer snapshot has an undeclared hub")
+            pid = integer(sample["pid"], "producer process ID", 1)
+            if producer_pids.setdefault(source, pid) != pid:
+                fail("producer process changed during measurement")
+            matches = watermark_pattern.findall(sample["metrics"])
+            if matches:
+                if len(matches) != 1:
+                    fail("native producer watermark is ambiguous")
+                generation, count = matches[0]
+                count = integer(int(count), "producer allocation watermark", 0)
+                if count > 2**53:
+                    fail("producer watermark exceeds exact native gauge integer range")
+                previous = previous_snapshots.get(source)
+                if previous is not None and (generation != previous[0] or count < previous[1]):
+                    fail("native producer generation changed or watermark regressed")
+                previous_snapshots[source] = generation, count
+            if sample.get("workload_completed_before_sample") is True and sample["elapsed_seconds"] >= duration:
+                if len(matches) != 1:
+                    fail("post-drain native producer watermark missing or ambiguous")
+                generation, count = matches[0]
+                count = integer(int(count), "producer allocation watermark", 0)
+                if count > 2**53:
+                    fail("producer watermark exceeds exact native gauge integer range")
+                snapshots[source] = (generation, count)
+    if set(snapshots) != set(sources):
+        fail("post-drain producer watermark missing for a measured hub")
+    for source, (generation, count) in snapshots.items():
+        state = allocated.get((source, generation))
+        ids = set() if state is None else {identity for identity in state["ids"] if identity <= count}
+        if len(ids) != count or (ids and (min(ids) != 1 or max(ids) != count)):
+            fail("native producer allocation gap in retained starts")
+    for key, (_, _, terminal) in raw_terminals.items():
+        start = starts.get(key)
+        if start is None:
+            fail("native committee terminal has no start")
+        fields = terminal["fields"]
+        if native_integer(fields, "process_id", 1) != producer_pids[key[0]]:
+            fail("native request generation is not bound to the sampled process")
+        if any(fields[field] != start[field] for field in ("started_unix_us", "process_id", "header", "peer")):
+            fail("native start and terminal binding mismatch")
+    selected_starts = {key for key, fields in starts.items()
+                       if measurement <= native_integer(fields, "started_unix_us", 1) < measurement + duration * 1_000_000}
+    if any(key[1] != snapshots[key[0]][0] or key[2] > snapshots[key[0]][1] for key in selected_starts):
+        fail("native in-window start exceeds the independent post-drain producer snapshot")
+    if selected_starts != (selected_starts & raw_terminals.keys()):
+        fail("native in-window committee start missing terminal after drain")
+    for key in selected_starts:
+        offset, line_hash, record = raw_terminals[key]
+        terminals[key] = committee_operation({"source": key[0], "record": record, "offset": offset,
+                                             "line_sha256": line_hash}, measurement, duration)
+    actual, complete = {}, {}
+    for _, _, operation in raw_records(directory / "operations.jsonl", artifacts["operations.jsonl"], MAX_RAW_ARTIFACT_BYTES):
+        if operation.get("scenario") != "committee_progress":
+            continue
+        if operation.get("kind") == "collector_telemetry":
+            if operation["source"] not in sources or operation["measurement_start_unix_us"] != measurement:
+                fail("collector telemetry source or measurement binding mismatch")
+            if operation["state"] not in {"empty", "batch", "complete"}:
+                fail("collector telemetry records an evidence error")
+            if operation["state"] == "complete":
+                if operation["source"] in complete or operation["pending"] != 0 or not operation["follower"]["caught_up"] or operation["follower"]["queued"] != 0:
+                    fail("duplicate or incomplete committee final drain")
+                if not duration <= operation["elapsed_seconds"] <= duration + 30:
+                    fail("committee final drain lies outside its existing budget")
+                complete[operation["source"]] = operation
+            continue
+        request = operation["committee_request"]
+        key = (request["source"], request["generation"], request["request_id"])
+        if key in actual or key not in terminals:
+            fail("duplicate, orphan, or extra scored committee request")
+        expected = terminals[key]
+        if operation.get("trace") != expected["trace"] or any(operation.get(field) != expected.get(field) for field in OPERATION_FIELDS):
+            fail("scored committee request differs from its raw native terminal")
+        actual[key] = {field: value for field, value in operation.items() if field in OPERATION_FIELDS}
+    if set(actual) != selected_starts or set(complete) != set(sources):
+        fail("missing scored committee request or final hub drain")
+    for source, observation in complete.items():
+        count = sum(key[0] == source for key in selected_starts)
+        if observation["started"] != count or observation["terminals"] != count:
+            fail("collector native population count mismatch")
+    projected = evidence["operations"]["committee_progress"]
+    if len(projected) != len(actual) or {entry["id"] for entry in projected} != {entry["id"] for entry in actual.values()}:
+        fail("committee summary and raw operation sets differ")
+    by_id = {entry["id"]: entry for entry in actual.values()}
+    if any(entry != by_id[entry["id"]] for entry in projected):
+        fail("committee summary differs from hash-bound raw operations")
+
+
+def reconcile_process_samples(evidence, directory):
+    """Bind scored CPU counters and read brackets to hash-checked raw process stats."""
+    samples = evidence["samples"]
+    expected = {(sample["elapsed_seconds"], hub_id): (hub,
+                samples[index + 1]["elapsed_seconds"] if index + 1 < len(samples)
+                else evidence["envelope"]["duration_seconds"] + 30)
+                for index, sample in enumerate(samples) for hub_id, hub in sample["hubs"].items()}
+    seen, identities = set(), {}
+    clock_ticks = None
+    telemetry = [artifact for artifact in evidence["artifacts"]
+                 if re.fullmatch(r"telemetry-[0-9]{3}\.jsonl", artifact["path"])]
+    if not telemetry:
+        fail("CPU scoring requires retained raw process telemetry with read brackets")
+    for artifact in sorted(telemetry, key=lambda entry: entry["path"]):
+        for _, _, record in raw_records(directory / artifact["path"], artifact["sha256"], 8 * 1024**2, strict=True):
+            if not isinstance(record, dict):
+                fail("raw process sample must be an object")
+            elapsed = number(record.get("elapsed_seconds"), "raw sample time")
+            hub_id = record.get("hub")
+            if not isinstance(hub_id, str) or (elapsed, hub_id) not in expected or (elapsed, hub_id) in seen:
+                fail("duplicate, orphan, or extra raw process sample")
+            key = elapsed, hub_id
+            hub, next_loop = expected[key]
+            process_started, process_completed = process_sample_times(record)
+            if (process_started, process_completed) != process_sample_times(hub) or record["process_sample_elapsed_seconds"] != hub["process_sample_elapsed_seconds"]:
+                fail("scored process timing differs from its retained raw read bracket")
+            scrape_started = number(record.get("scrape_started_elapsed_seconds"), "raw scrape start")
+            scrape_completed = number(record.get("scrape_completed_elapsed_seconds"), "raw scrape completion")
+            if not elapsed <= process_started <= process_completed <= scrape_started <= scrape_completed <= next_loop:
+                fail("raw process read must precede its HTTP scrape within the collection loop")
+            ticks = integer(record.get("clock_ticks_per_second"), "raw process clock ticks")
+            if clock_ticks is not None and ticks != clock_ticks:
+                fail("raw process clock tick rate changed during collection")
+            clock_ticks = ticks
+            stat = record.get("stat")
+            pid = integer(record.get("pid"), "raw process pid")
+            if not isinstance(stat, str) or re.match(rf"{pid} \(.*\) ", stat, re.DOTALL) is None:
+                fail("raw process stat does not match its retained pid")
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) < 22 or any(re.fullmatch(r"[0-9]+", fields[index]) is None for index in (11, 12, 19)):
+                fail("raw process stat is incomplete or has invalid CPU/identity fields")
+            cpu = (integer(int(fields[11]), "raw user CPU ticks", 0) +
+                   integer(int(fields[12]), "raw system CPU ticks", 0)) / ticks
+            if cpu != hub["cpu_seconds"]:
+                fail("scored CPU counter differs from its retained raw process stat")
+            identity = pid, integer(int(fields[19]), "raw process identity", 0)
+            if hub_id in identities and identities[hub_id] != identity:
+                fail("raw process restarted during qualification")
+            identities[hub_id] = identity
+            seen.add(key)
+    if seen != expected.keys():
+        fail("missing raw process sample or read bracket")
+
+
+def verify_artifacts(evidence, directory):
+    """Verify retained raw files without loading whole logs into memory."""
+    if len(evidence["artifacts"]) > 64:
+        fail("at most 64 raw artifacts per phase")
+    for artifact in evidence["artifacts"]:
+        path = directory / artifact["path"]
+        maximum_bytes = raw_artifact_limit(artifact["path"])
+        hasher = hashlib.sha256()
+        size = 0
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                size += len(chunk)
+                if size > maximum_bytes:
+                    fail(f"raw artifact exceeds {maximum_bytes // 1024**2} MiB: {artifact['path']}")
+                hasher.update(chunk)
+        if hasher.hexdigest() != artifact["sha256"]:
+            fail(f"raw artifact digest mismatch: {artifact['path']}")
+    if "samples" in evidence:
+        reconcile_process_samples(evidence, directory)
+    if "operations" in evidence:
+        reconcile_committee(evidence, directory)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    template = commands.add_parser("template", help="write an unfilled declaration for a real run")
+    template.add_argument("--output", required=True, type=Path)
+    freeze = commands.add_parser("freeze", help="validate and freeze criteria before workload execution")
+    freeze.add_argument("declaration", type=Path)
+    freeze.add_argument("--output", required=True, type=Path)
+    qualify = commands.add_parser("score", help="score complete baseline and candidate evidence")
+    qualify.add_argument("plan", type=Path)
+    qualify.add_argument("baseline", type=Path)
+    qualify.add_argument("candidate", type=Path)
+    qualify.add_argument("--output", required=True, type=Path)
+    args = parser.parse_args()
+    if args.command == "template":
+        phase = {"revision": "REPLACE_WITH_SOURCE_SHA", "build_command": "REPLACE_WITH_EXACT_BUILD_COMMAND",
+                 "binary_sha256": {"telcoin-network": "REPLACE_WITH_BINARY_SHA256"}, "profile": {}}
+        scenario_bounds = {
+            "public_join": (64, 8000), "shared_nat_reconnect": (64, 20000),
+            "gossip_two_hops": (4096, 3000), "record_lookup": (256, 3000),
+            "submit_url_lookup": (256, 3000), "concurrent_sync": (256, 30000),
+            "committee_progress": (512, 1500), "dao_connectivity": (512, 1000),
+        }
+        result = {
+            "version": 1, "baseline": phase,
+            "candidate": {**phase, "profile": read_json(ROOT / "profile-v1.json")},
+            "envelope": {"cpus_per_hub": 4, "ram_bytes_per_hub": 8 * 1024**3,
+                         "link_mbps": 25, "rtt_ms": 50, "loss_percent": 0.1,
+                         "public_peers": 64, "shared_nat_peers": 16, "dao_observers": 8, "committee_peers": 4,
+                         "workers_per_hub": 2, "duration_seconds": 600,
+                         "hardware": "REPLACE_WITH_HARDWARE_DESCRIPTION",
+                         "network_setup": "REPLACE_WITH_REPRODUCIBLE_NETWORK_COMMANDS"},
+            "hubs": ["hub-0", "hub-1"],
+            "threshold_owner": "PR author, using requester-authorized engineering judgment",
+            "adapter_command": "REPLACE_WITH_EXACT_WORKLOAD_ADAPTER_COMMAND",
+            "thresholds": {"max_rss_bytes": 4 * 1024**3, "max_cpu_cores": 3,
+                           "max_queue_occupancy": 100, "max_progress_stall_seconds": 15,
+                           "scenarios": {scenario: {"minimum_attempts": attempts,
+                               "minimum_success_rate": 0.99, "max_p99_ms": latency,
+                               **({"max_cancelled_fraction": 0.35} if scenario == "committee_progress" else {})}
+                               for scenario, (attempts, latency) in scenario_bounds.items()}},
+        }
+        with args.output.open("x") as output:
+            json.dump(result, output, indent=2, allow_nan=False)
+            output.write("\n")
+        return 0
+    document = read_json(args.declaration if args.command == "freeze" else args.plan)
+    plan = document if args.command == "freeze" else document["plan"]
+    validate_plan(plan)
+    if args.command == "freeze":
+        result = {"plan": plan, "plan_sha256": digest(plan)}
+    else:
+        frozen = document
+        # A frozen plan cannot silently acquire new thresholds after measurements exist.
+        if frozen["plan_sha256"] != digest(frozen["plan"]):
+            fail("frozen plan hash mismatch")
+        plan = frozen["plan"]
+        baseline = read_json(args.baseline, maximum_bytes=EVIDENCE_MAX_BYTES)
+        candidate = read_json(args.candidate, maximum_bytes=EVIDENCE_MAX_BYTES)
+        validate_evidence(plan, baseline, "baseline")
+        validate_evidence(plan, candidate, "candidate")
+        verify_artifacts(baseline, args.baseline.parent)
+        verify_artifacts(candidate, args.candidate.parent)
+        result = {"plan_sha256": digest(plan), "baseline": score(plan, baseline),
+                  "candidate": score(plan, candidate)}
+    with args.output.open("x") as output:
+        json.dump(result, output, indent=2, allow_nan=False)
+        output.write("\n")
+    return 0 if args.command == "freeze" or result["candidate"]["passed"] else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, KeyError, TypeError, OSError, AttributeError, IndexError, RecursionError) as error:
+        print(f"qualification rejected: {error}", file=sys.stderr)
+        sys.exit(2)

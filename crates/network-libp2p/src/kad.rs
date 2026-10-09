@@ -350,11 +350,8 @@ impl<DB: Database> KadStore<DB> {
     /// Enable ownership with separate process allowances for required keys and connected sources.
     /// Each allowance inherits `MemoryStoreConfig::max_records` (1,024), bounding the union to
     /// 2,048 rows across all primary and worker swarms. Excess configuration fails explicitly.
-    ///
-    /// Persisted rows are not pruned here. At startup only our own key is retained, because the
-    /// committees are not known yet. The first committee update prunes the rows it does not
-    /// retain. Until then, `get` and `records` do not serve unretained rows, and `put` does not
-    /// count them against the owners' capacity.
+    /// Startup rows wait for the first committee update before pruning because ownership is
+    /// not known yet. Unretained rows are not served and do not consume admission capacity.
     pub(crate) fn enable_retention(&mut self) -> libp2p::kad::store::Result<()> {
         /// Shared across database types and all primary and worker swarms.
         static BUDGET: OnceLock<Arc<RetentionBudget>> = OnceLock::new();
@@ -464,30 +461,41 @@ impl<DB: Database> KadStore<DB> {
         if self.retains(key) {
             Ok(())
         } else {
-            let hash = self.key_to_hash(key);
-            self.remove(key);
-            // The layered kad tables delete the persisted row on the writer thread without a
-            // tombstone, so a `get` can still read the old row. The memory layer that `remove`
-            // updates at once decides whether the row stays.
-            let remains = match self.kad_type {
-                NetworkType::Primary => self.db.contains_key::<KadRecords>(&hash),
-                NetworkType::Worker(_) => self.db.contains_key::<KadWorkerRecords>(&hash),
-            }
-            .map_err(|error| {
-                error!(target: "network-kad", ?error, ?key, kad_type = ?self.kad_type, "failed to verify Kademlia record deletion");
-                Error::MaxRecords
-            })?;
-            if remains {
-                error!(target: "network-kad", ?key, kad_type = ?self.kad_type, "failed to delete unretained Kademlia record; row stays counted");
-                Err(Error::MaxRecords)
-            } else {
-                Ok(())
-            }
+            self.delete_row(key).then_some(()).ok_or(Error::MaxRecords)
         }
     }
 
-    /// Prune rotated-out keys and persisted startup rows that the committee update does not
-    /// retain. Failed deletions stay counted and are explicit.
+    /// Delete one owned row and report whether the database accepted the delete.
+    ///
+    /// The layered database applies the persistent delete later on its writer thread and
+    /// keeps no tombstone. A `get` immediately after an accepted delete can still return the
+    /// disk row, so the delete result is the report and a read-back is not.
+    fn delete_row(&mut self, k: &RecordKey) -> bool {
+        let key = self.key_to_hash(k);
+        let row_counted = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .ok()
+        .flatten()
+        .and_then(|raw| self.decode_record(&key, &raw))
+        .is_some();
+        let deleted = match self.kad_type {
+            NetworkType::Primary => self.db.remove::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
+        }
+        .is_ok();
+        if deleted && row_counted {
+            // Only readable owned rows contribute to startup accounting. An absent or
+            // malformed row cannot uncount another row even when MDBX removal returns Ok.
+            // Saturation also tolerates a preexisting stale count without wrapping capacity.
+            self.num_records = self.num_records.saturating_sub(1);
+            self.update_records_gauge();
+        }
+        deleted
+    }
+
+    /// Prune startup rows and rotated-out keys. Failed deletions stay counted and are explicit.
     fn prune_unretained(&mut self) -> libp2p::kad::store::Result<()> {
         let obsolete: Vec<_> = self
             .owned_records()
@@ -802,39 +810,19 @@ impl<DB: Database> RecordStore for KadStore<DB> {
     }
 
     fn remove(&mut self, k: &RecordKey) {
-        let key = self.key_to_hash(k);
-        let row_counted = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
-        }
-        .inspect_err(|error| {
-            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to read Kademlia record before removal");
-        })
-        .ok()
-        .flatten()
-        .and_then(|raw| self.decode_record(&key, &raw))
-        .is_some();
-        if match self.kad_type {
-            NetworkType::Primary => self.db.remove::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.remove::<KadWorkerRecords>(&key),
-        }
-        .inspect_err(|error| {
-            error!(target: "network-kad", ?error, key = ?k, kad_type = ?self.kad_type, "failed to remove Kademlia record");
-        })
-        .is_ok()
-            && row_counted
-        {
-            // Only readable owned rows contribute to startup accounting. An absent or
-            // malformed row cannot uncount another row even when MDBX removal returns Ok.
-            // Saturation also tolerates a preexisting stale count without wrapping capacity.
-            self.num_records = self.num_records.saturating_sub(1);
-            self.update_records_gauge();
-        }
+        // This trait method has no failure channel. `prune_record` reports failed deletes.
+        self.delete_row(k);
     }
 
     fn records(&self) -> Self::RecordsIter<'_> {
         RecordIter {
-            iter: Box::new(self.owned_records().filter(|(_, record)| self.retains(&record.key))),
+            // libp2p's publication job also replicates every enumerated remote record, even
+            // with replication_interval=None. Production exposes only our own publication;
+            // retained remote rows remain available through get() for on-demand responses.
+            iter: Box::new(self.owned_records().filter(|(_, record)| {
+                self.retains(&record.key)
+                    && (self.retention.is_none() || record.publisher == Some(self.local_peer_id))
+            })),
         }
     }
 
@@ -2235,6 +2223,37 @@ mod test {
         assert!(matches!(store.add_provider(rec), Err(Error::ValueTooLarge)));
         assert_eq!(store.num_providers, 0, "rejected record must not bump the provider count");
         assert!(store.providers(&key).is_empty(), "rejected record must not be stored");
+    }
+
+    /// Production enumeration publishes only our row while retained remote rows stay queryable.
+    #[test]
+    fn test_kad_retained_remote_records_are_queryable_but_not_enumerated() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let db = open_db(tmp_dir.path());
+        let key_config = test_key_config();
+        let local = PeerId::random();
+        let remote = PeerId::random();
+        let mut store = KadStore::new(db, local, &key_config, NetworkType::Primary);
+        store.enable_retention()?;
+        let own = Record {
+            key: store.node_key.clone(),
+            value: vec![1],
+            publisher: Some(local),
+            expires: None,
+        };
+        let third = Record {
+            key: RecordKey::new(&remote.to_bytes()),
+            value: vec![2],
+            publisher: Some(remote),
+            expires: None,
+        };
+        store.retain_connected(remote, third.key.clone())?;
+        store.put(own.clone())?;
+        store.put(third.clone())?;
+        assert!(store.get(&third.key).is_some(), "retained remote row stays queryable");
+        let publishing: Vec<_> = store.records().map(|record| record.key.clone()).collect();
+        assert_eq!(publishing, vec![own.key], "remote row is excluded from periodic enumeration");
+        Ok(())
     }
 
     /// Restored rows that no owner retains yet do not block a first-seen connected peer before

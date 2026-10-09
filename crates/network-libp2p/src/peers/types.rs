@@ -1,7 +1,7 @@
 //! Types for managing peers.
 
 use crate::types::NetworkResult;
-use libp2p::{Multiaddr, PeerId};
+use libp2p::{swarm::ConnectionId, Multiaddr, PeerId};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{hash_map::IntoIter, HashMap, HashSet},
@@ -39,7 +39,7 @@ pub(super) enum PeerIdentity {
 #[derive(Debug)]
 pub(crate) enum PeerEvent {
     /// Connected with peer.
-    PeerConnected(PeerId, Multiaddr),
+    PeerConnected(PeerId, ConnectionId, Multiaddr),
     /// Peer was disconnected.
     PeerDisconnected(PeerId),
     /// Disconnect from the peer without exchanging peer information.

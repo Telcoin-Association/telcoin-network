@@ -1,7 +1,7 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
-use crate::peers::types::ConnectionType;
+use crate::{error::NetworkError, peers::types::ConnectionType};
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
@@ -171,7 +171,10 @@ impl NetworkBehaviour for PeerManager {
         self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
-                peer_id, endpoint, ..
+                peer_id,
+                connection_id,
+                endpoint,
+                ..
             }) => {
                 // NOTE: The ConnectionEstablished event must be handled because
                 // NetworkBehaviour::handle_established_inbound_connection and
@@ -179,7 +182,7 @@ impl NetworkBehaviour for PeerManager {
                 //
                 // Another behaviour can terminate the connection early, making it unsafe to
                 // assume a peer is connected until this event is received.
-                self.on_connection_established(peer_id, endpoint)
+                self.on_connection_established(peer_id, connection_id, endpoint)
             }
             FromSwarm::ConnectionClosed(ConnectionClosed {
                 peer_id,
@@ -187,14 +190,14 @@ impl NetworkBehaviour for PeerManager {
                 remaining_established,
                 ..
             }) => self.on_connection_closed(peer_id, endpoint, remaining_established),
-            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id: _ }) => {
-                debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
+            FromSwarm::DialFailure(DialFailure { peer_id, error, connection_id }) => {
+                debug!(target: "peer-manager::dial", ?peer_id, ?connection_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
             }
             FromSwarm::ListenFailure(ListenFailure { error, .. }) => {
-                // Inbound hooks reserve no peer-manager state. Peers are registered only on
-                // ConnectionEstablished, after every behaviour has accepted. The swarm and
-                // connection_limits own pending slots and clean them up on this same event.
+                // Source leases are released by on_source_swarm_event before this match. Peers
+                // are registered only on ConnectionEstablished, after every behaviour accepts.
+                // The swarm and connection_limits release their slots on this same event.
                 // Do not disconnect the peer or complete a concurrent outbound dial here.
                 // Counters replace per-attempt logs on this remotely driven failure path.
                 let reason = match error {
@@ -247,23 +250,39 @@ impl NetworkBehaviour for PeerManager {
         if let Some(request) = self.next_dial_request() {
             let DialRequest { peer_id, multiaddrs, reply } = request;
 
-            debug!(target: "network", ?peer_id, "network behavior processing next dial request");
-
-            // register to send result back to caller
-            self.register_dial_attempt(peer_id, reply);
-
-            // swarm to dial peer
-            return Poll::Ready(ToSwarm::Dial {
-                opts: DialOpts::peer_id(peer_id)
-                    .condition(PeerCondition::Disconnected)
-                    .addresses(multiaddrs)
-                    // Try signed endpoints in order, with one connection attempt at a time.
-                    .override_dial_concurrency_factor(std::num::NonZeroU8::MIN)
-                    .build(),
-            });
+            // A queued request or Kademlia may have started the dial since admission.
+            // Preserve the accepted attempt's reply when rejecting this queued request.
+            let redundant = if self.is_connected(&peer_id) {
+                Some(NetworkError::AlreadyConnected(format!("Already connected {peer_id}")))
+            } else if self.dial_attempt_already_registered(&peer_id) {
+                Some(NetworkError::AlreadyDialing(format!("Already dialing {peer_id}")))
+            } else {
+                None
+            };
+            if let Some(error) = redundant {
+                if let Some(reply) = reply {
+                    if reply.send(Err(error)).is_err() {
+                        debug!(target: "network", ?peer_id, "redundant dial caller dropped its reply");
+                    }
+                }
+                // Another queued request may still need processing on the next poll.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                debug!(target: "network", ?peer_id, "network behavior processing next dial request");
+                self.register_dial_attempt(peer_id, reply);
+                Poll::Ready(ToSwarm::Dial {
+                    opts: DialOpts::peer_id(peer_id)
+                        .condition(PeerCondition::DisconnectedAndNotDialing)
+                        .addresses(multiaddrs)
+                        // Try signed endpoints in order, with one connection attempt at a time.
+                        .override_dial_concurrency_factor(std::num::NonZeroU8::MIN)
+                        .build(),
+                })
+            }
+        } else {
+            Poll::Pending
         }
-
-        Poll::Pending
     }
 }
 
@@ -286,7 +305,12 @@ impl PeerManager {
     ///
     /// Another behavior can terminate the connection early, making it unsafe to
     /// assume a peer is connected until this event is received.
-    fn on_connection_established(&mut self, peer_id: PeerId, endpoint: &ConnectedPoint) {
+    fn on_connection_established(
+        &mut self,
+        peer_id: PeerId,
+        connection_id: ConnectionId,
+        endpoint: &ConnectedPoint,
+    ) {
         debug!(
             target: "peer-manager",
             ?peer_id,
@@ -317,13 +341,15 @@ impl PeerManager {
 
         // check connection limits
         if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
+            self.record_population_rejection(peer_id);
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers
             self.disconnect_peer(peer_id, true);
             return;
         }
 
-        self.push_event(PeerEvent::PeerConnected(peer_id, multiaddr));
+        self.enforce_public_peer_limits();
+        self.push_event(PeerEvent::PeerConnected(peer_id, connection_id, multiaddr));
 
         // log successful connection establishment
         info!(
@@ -364,16 +390,37 @@ impl PeerManager {
     /// NOTE: `AllPeers` is only updated if the peer is _not_ already connected. It's possible that
     /// an outgoing dial attempt fails because the peer connected during the dial.
     pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
-        self.metrics.record_dial_failure();
-        if let Some(peer_id) = peer_id {
-            if !self.is_connected(&peer_id) {
-                self.register_disconnected(&peer_id);
-            }
+        // Swarm broadcasts rejections from every behavior. A redundant condition failure
+        // must not clear the accepted attempt's state or complete its caller.
+        let redundant = peer_id.is_some_and(|peer_id| {
+            self.dial_attempt_already_registered(&peer_id)
+                && matches!(
+                    error,
+                    DialError::DialPeerConditionFalse(
+                        PeerCondition::NotDialing | PeerCondition::DisconnectedAndNotDialing
+                    )
+                )
+        });
+        if !redundant {
+            self.metrics.record_dial_failure();
+            if let Some(peer_id) = peer_id {
+                if !self.is_connected(&peer_id) {
+                    self.register_disconnected(&peer_id);
+                }
 
-            // return the genuine dial error to the dialer. `register_disconnected` no longer
-            // consumes the reply channel with a hardcoded cause, so the real `DialError`
-            // (wrong key, refused, firewall, timeout) reaches the caller.
-            self.notify_dial_result(&peer_id, Err(error.into()));
+                // Preserve the established-transport distinction for readiness callers.
+                let error = if matches!(
+                    error,
+                    DialError::DialPeerConditionFalse(
+                        PeerCondition::Disconnected | PeerCondition::DisconnectedAndNotDialing
+                    )
+                ) {
+                    NetworkError::AlreadyConnected(format!("{peer_id}: {error}"))
+                } else {
+                    error.into()
+                };
+                self.notify_dial_result(&peer_id, Err(error));
+            }
         }
     }
 }

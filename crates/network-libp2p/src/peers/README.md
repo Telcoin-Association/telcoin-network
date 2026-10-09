@@ -32,8 +32,12 @@ The peer policy composes every live trust basis instead of selecting a single ex
 | --- | --- | --- | --- | --- |
 | Ordinary | Public discovery policy | Ordinary | Scored | Scored |
 | Bootstrap or explicit discovery | Authorized | Ordinary | Scored | Scored |
+| Configured DAO observer | Authorized | Protected | Scored | Scored |
 | Operator trusted | Authorized | Protected | Exempt | Scored |
 | Previous, current, or next committee | Authorized | Protected | Exempt | Exempt |
+
+Configured DAO observers reserve retention while retaining ordinary load and protocol scoring.
+Overlapping committee and operator privileges compose independently.
 
 Configured admission eligibility is recorded separately from the existing public discovery
 admission policy. This change supplies the policy dimensions for a configured topology.

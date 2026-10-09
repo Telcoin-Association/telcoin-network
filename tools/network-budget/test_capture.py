@@ -32,7 +32,7 @@ class CaptureTests(unittest.TestCase):
 
     def test_class_metrics_in_summary_and_bucket_form(self):
         text = '\n'.join([
-            'tn_network_inbound_requests_pending{network="primary",class="vote"} 2',
+            'tn_network_inbound_requests_pending_by_class{network="primary",class="vote"} 2',
             'tn_network_inbound_requests_shed_total{network="worker-0",class="batch",reason="queue_full"} 5',
             'tn_network_inbound_request_service_seconds{network="primary",class="vote",quantile="0.99"} 0.25',
             'tn_network_inbound_request_service_seconds_bucket{network="primary",class="epoch_record",le="+Inf"} 7',
@@ -47,6 +47,19 @@ class CaptureTests(unittest.TestCase):
         self.assertNotIn(capture.SERVICE, missing)
         self.assertIn("reth_process_resident_memory_bytes", missing)
         self.assertIn(capture.SERVICE, capture.missing_metrics(values[:2]))
+
+    def test_aggregate_and_class_pending_metrics_remain_distinct(self):
+        text = '\n'.join([
+            'tn_network_inbound_requests_pending{network="primary"} 3',
+            'tn_network_inbound_requests_pending_by_class{network="primary",class="vote"} 2',
+        ])
+        values = capture.observations(text, 1)
+        self.assertEqual(values, [
+            {"metric": "tn_network_inbound_requests_pending", "labels": {"network": "primary"}, "value": 3.0},
+            {"metric": capture.PENDING, "labels": {"network": "primary", "class": "vote"}, "value": 2.0},
+        ])
+        self.assertIn(capture.PENDING, capture.missing_metrics(values[:1]))
+        self.assertNotIn(capture.PENDING, capture.missing_metrics(values))
 
     def test_reason_and_outcome_labels_follow_each_metric_contract(self):
         accepted = '\n'.join([
@@ -76,8 +89,9 @@ class CaptureTests(unittest.TestCase):
             'tn_network_established_connections{network="primary"} -1',
             'reth_process_resident_memory_bytes 1\nreth_process_resident_memory_bytes 2',
             'reth_process_resident_memory_bytes{network="primary"} 1',
-            'tn_network_inbound_requests_pending{network="primary",class="peer-a"} 1',
-            'tn_network_inbound_requests_pending{network="primary"} 1',
+            'tn_network_inbound_requests_pending_by_class{network="primary",class="peer-a"} 1',
+            'tn_network_inbound_requests_pending_by_class{network="primary"} 1',
+            'tn_network_inbound_requests_pending{network="primary",class="vote"} 1',
             'tn_network_inbound_requests_shed_total{network="primary",class="vote",reason="other"} 1',
             'tn_network_inbound_requests_shed_total{network="primary",class="vote",reason="other_limit"} 1',
             'tn_network_inbound_requests_failed_total{network="primary",class="vote",outcome="refused"} 1',

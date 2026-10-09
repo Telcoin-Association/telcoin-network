@@ -1,0 +1,129 @@
+# Carried patch: libp2p-kad
+
+This is the authenticated published `libp2p-kad` 0.49.0 package. The root
+`[patch.crates-io]` selects this copy for the existing libp2p stack. The crate is
+excluded from the workspace to retain upstream lints and style. The existing
+`connection-limits-patch` CI job additionally runs its isolated library tests;
+the original connection-limits step, conditions and aggregate gates remain required.
+
+## Provenance
+
+- Published package: `libp2p-kad` 0.49.0.
+- Original root `Cargo.lock` archive checksum:
+  `973caa45045e53f3cf1cf3d596888b82602b30640fd75485836c81aa66e7c38a`.
+- Published VCS revision: `7171dce2f90c05ba7892d4ba926abb1881db27c7`, path
+  `protocols/kad`, from `.cargo_vcs_info.json`.
+- Original `src/behaviour.rs` SHA256:
+  `bc29c4d2714b3c0c6a2079bcbb1fb183d8418ef76d88541662d8654dc3765d16`.
+- All 29 published members were copied byte for byte before applying the delta.
+  Source copyright notices, licensing metadata, integration tests and every published
+  runtime and dev dependency are retained. The standalone `Cargo.lock` starts from
+  the published lock and adds the restored upstream test helper described below,
+  preserving every existing dependency version and checksum.
+
+The root lockfile selects the path package without changing the Kad version or
+runtime dependency versions. Root workspace integration tests use that root lock.
+The additional unit-test command selects the excluded crate with `--manifest-path`,
+using its standalone lock with the restored test dependency. Mutation
+controls for the carried crate use the same standalone manifest selection. Neither
+lane drops dev dependencies or upstream tests, and both require `--locked`.
+
+### Upstream test support
+
+The registry-normalized manifest omits the `quickcheck` dependency present in
+`Cargo.toml.orig`. At the published VCS revision, the
+[upstream workspace manifest](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/Cargo.toml)
+aliases it to the unpublished `quickcheck-ext` package. The library tests use that
+helper's `GenRange` and `SliceRandom` traits as well as the re-exported QuickCheck
+API. Restoring a registry `quickcheck` dependency alone would omit these extensions.
+
+`test-support/quickcheck-ext` carries that upstream helper solely through a dev
+dependency. Its `src/lib.rs` is byte-identical to
+[the pinned upstream source](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/misc/quickcheck-ext/src/lib.rs).
+Its manifest preserves the original package metadata and dependency requirements,
+materializing only the inherited edition and complete workspace lint tables.
+
+- Pinned workspace `Cargo.toml` SHA256:
+  `86212aada3c65719d93a7f589ef69890a286f9e2d9e5a00909b503e8863c52be`.
+- Original helper `Cargo.toml` SHA256:
+  `35c3b2f9dd9d32ef9261865184f5aaecb90d0571fa68c5782d33c9aa52d08080`.
+- Carried helper `src/lib.rs` SHA256:
+  `4a6dd30f7afcc84e6e1c0dad0738c7bda93ac68561d80b8c00e67aaf05f42d75`.
+
+An isolated package-only lock resolution adds `quickcheck-ext` 0.1.0, `quickcheck`
+1.1.0, `num-traits` 0.2.19, `autocfg` 1.5.1, `env_filter` 2.0.0, `env_logger`
+0.11.11 and `regex` 1.13.1. The `libp2p-kad` entry gains the helper dependency, and
+the `libp2p-swarm` entry gains the test-only Tokio dependency described below.
+Every other prior package entry, version and checksum remains unchanged. The root
+workspace lock and runtime dependency graph are unchanged. Static provenance and
+lock comparisons
+do not establish a unit-test or capacity result; remote validation remains required.
+
+The standalone manifest also restores a `libp2p-swarm` development dependency at
+the existing 0.48.0 version with its `tokio` feature. The retained library-test
+constructor calls `Config::with_tokio_executor`, whose
+[pinned upstream definition](https://github.com/libp2p/rust-libp2p/blob/7171dce2f90c05ba7892d4ba926abb1881db27c7/swarm/src/lib.rs#L1412)
+requires that feature. `Cargo.toml.orig` declares it on the upstream swarm dev
+dependency; the normalized registry manifest omits that declaration. The normal
+swarm dependency remains unchanged. The existing Tokio dev dependency already
+enables the runtime, macro and timer features used by the unit tests. Swarm's
+separate `macros` feature is used only by the retained `client_mode` integration
+test, which the isolated `--lib` command does not select.
+
+The authenticated `libp2p-swarm` 0.48.0 archive checksum is
+`57ccbe1baeaef036ffde4b265871e11c64d29464036bba635378f356bcdca854`;
+its VCS metadata names the same published revision. The inspected `src/lib.rs`
+SHA256 is `ffa84fc0ed5092b8932f2278e5247fe5fafcc576bf6399d674d564ff0e1386f6`.
+Restoring the feature requires only the swarm-to-Tokio edge in the standalone
+lock, with no additional packages or version changes.
+
+## Runtime behavior
+
+`record_received` still computes the same density-attenuated expiry. With
+`StoreInserts::FilterBoth`, it emits the complete attenuated record for application
+authentication even after the DHT lifetime has expired. It does not insert the
+record automatically. `Unfiltered` still discards expired records, and the existing
+protocol acknowledgment, local-publisher guard, provider handling, TTL and replication
+settings are unchanged.
+
+The Telcoin consumer separately accepts an expired identity proof only after its
+existing ban, rate, key, domain, signature and publisher checks. The source must be
+physically connected, have manager status `Connected`, and own the signed advertised
+identity. Admission is limited to a still-anonymous public source and a BLS key absent
+from confirmed bindings, known records, pinned configuration and committee slots.
+Expired proofs cannot rotate existing identities or refresh configured/cache metadata,
+and do not gain DHT storage or connected-record retention. The dedicated promotion uses
+the verified transport key with no advertised addresses, preserving existing observed
+address and connection state without importing expired RPC data. Nonexpired handling is unchanged.
+
+## Test-only delta and regressions
+
+`src/handler.rs` adds a `cfg(test)` request-ID fixture constructor, since upstream's
+request identifier has a private handler-local field. The private behavior regression
+calls the real `record_received` method without sockets or sleeps. It requires filtered
+expired delivery with the attenuated expiry and original acknowledgment, no automatic storage,
+and expired unfiltered rejection. Restoring the original expiry gate must fail the
+filtered-delivery regression. Network consumer regressions exercise real physical
+connections and reject expired relayed, invalid, banned, rate-shed and closing sources.
+
+Remote commands, from the repository root with its pinned toolchain and lockfile:
+
+```sh
+cargo +1.94 test --locked --manifest-path patches/libp2p-kad/Cargo.toml --lib
+cargo +1.94 nextest run --locked -p tn-network-libp2p -E 'test(expired_kad_)' --no-tests fail
+```
+
+## Maintenance and retirement
+
+Telcoin network maintainers own this carried patch with the libp2p dependency stack;
+its qualification evidence is tracked in
+[telcoin-network #1476](https://github.com/Telcoin-Association/telcoin-network/issues/1476).
+No upstream submission or published resolution is claimed here. Record the upstream
+issue or PR when submitted, and keep archive, VCS, source and regression provenance
+current on upgrades.
+
+Retire the override only after a compatible published Kad release delivers expiry-
+attenuated filtered records independently of DHT storage expiry while preserving
+unfiltered expiry and protocol behavior. Run these regressions against that release,
+then remove the override, workspace exclusion, carried source and isolated CI step
+together. Preserve the consumer's authenticated live-self and no-storage regressions.

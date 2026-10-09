@@ -132,9 +132,11 @@ impl AllPeers {
     /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
     fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
         let removed = self.peers.remove(identity);
-        if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
+        if let (PeerIdentity::Confirmed(bls_key), Some(peer)) = (identity, removed.as_ref()) {
             if let Some(peer_id) = peer.peer_id() {
-                self.bls_by_peer_id.remove(&peer_id);
+                let indexed_key = self.bls_by_peer_id.remove(&peer_id);
+                tracing::debug!(target: "network::identity", event = "identity_removed",
+                    ?peer_id, ?bls_key, ?indexed_key, outcome = "evicted");
             }
         }
         removed
@@ -220,17 +222,41 @@ impl AllPeers {
             .flatten()
             .into_iter()
             .for_each(|displaced| self.release_displaced_record(&displaced));
-        self.evict(&confirmed)
+        let prior_confirmed = self.evict(&confirmed);
+        prior_confirmed
+            .as_ref()
             .into_iter()
-            .for_each(|displaced| self.release_displaced_record(&displaced));
+            .for_each(|displaced| self.release_displaced_record(displaced));
         let mut peer = Peer::new_trusted(bls_public_key, network_key, self.score_config.clone());
+        prior_confirmed
+            .as_ref()
+            .into_iter()
+            .for_each(|record| peer.retain_connection_state(record));
         protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
         if peer.reputation().banned() {
             peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
             self.banned_peers.add_banned_peer(&peer);
+        } else {
+            match peer.connection_status() {
+                ConnectionStatus::Disconnected { .. } => {
+                    self.disconnected_peers = self.disconnected_peers.saturating_add(1);
+                }
+                // A trust grant still forgives a load-only ban, as before.
+                ConnectionStatus::Banned { .. } => {
+                    peer.set_connection_status(ConnectionStatus::Unknown);
+                }
+                ConnectionStatus::Disconnecting { .. } => {
+                    peer.set_connection_status(ConnectionStatus::Disconnecting { banned: false });
+                }
+                ConnectionStatus::Connected { .. }
+                | ConnectionStatus::Dialing { .. }
+                | ConnectionStatus::Unknown => {}
+            }
         }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        let previous_key = self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
+        tracing::debug!(target: "network::identity", event = "identity_confirmed",
+            ?peer_id, bls_key = ?bls_public_key, ?previous_key, outcome = "trusted");
     }
 
     /// Create a peer.
@@ -278,8 +304,10 @@ impl AllPeers {
         if carried {
             self.normalize_carried_status(&mut peer);
         }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
+        let previous_key = self.bls_by_peer_id.insert(peer_id, bls_public_key);
         self.peers.insert(confirmed, peer);
+        tracing::debug!(target: "network::identity", event = "identity_confirmed",
+            ?peer_id, bls_key = ?bls_public_key, ?previous_key, outcome = "upserted");
     }
 
     /// Handle reported action.
@@ -351,7 +379,9 @@ impl AllPeers {
             && !self.peers.contains_key(&resolved)
         {
             error!(target: "peer-manager", ?peer_id, "bls_by_peer_id entry found without a confirmed record - repairing index");
-            self.bls_by_peer_id.remove(peer_id);
+            let indexed_key = self.bls_by_peer_id.remove(peer_id);
+            tracing::debug!(target: "network::identity", event = "identity_removed",
+                ?peer_id, ?indexed_key, outcome = "stale_index_repaired");
             PeerIdentity::Unidentified(*peer_id)
         } else {
             resolved
@@ -861,6 +891,21 @@ impl AllPeers {
         self.bls_by_peer_id.get(peer_id).copied()
     }
 
+    /// Whether a BLS identity already owns a peer record.
+    pub(super) fn has_confirmed_identity(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
+    }
+
+    /// Confirm that the current stored identity belongs to this transport peer.
+    /// A reverse-index entry alone is insufficient if its record was lost or rotated.
+    pub(super) fn peer_has_confirmed_identity(&self, peer_id: &PeerId) -> bool {
+        self.bls_by_peer_id.get(peer_id).is_some_and(|bls_key| {
+            self.peers.get(&PeerIdentity::Confirmed(*bls_key)).is_some_and(|peer| {
+                peer.bls_public_key() == Some(*bls_key) && peer.peer_id() == Some(*peer_id)
+            })
+        })
+    }
+
     /// Boolean indicating if this peer is a validator in the previous, current, or next committee.
     ///
     /// Membership spans all three tracked committees so peers from the just-completed epoch are not
@@ -1251,5 +1296,49 @@ impl AllPeers {
     #[cfg(test)]
     pub(super) fn insert_unidentified(&mut self, peer_id: PeerId, peer: Peer) {
         self.peers.insert(PeerIdentity::Unidentified(peer_id), peer);
+    }
+}
+#[cfg(test)]
+mod admission_identity_tests {
+    use super::*;
+    use rand::{rngs::StdRng, SeedableRng as _};
+    use tn_config::KeyConfig;
+    use tn_types::BlsKeypair;
+
+    #[test]
+    fn confirmed_admission_identity_requires_matching_stored_record() {
+        let keys = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed(
+            [211; 32],
+        )));
+        let other = KeyConfig::new_with_testing_key(BlsKeypair::generate(&mut StdRng::from_seed(
+            [212; 32],
+        )));
+        let bls_key = keys.primary_public_key();
+        let peer_id: PeerId = keys.primary_network_public_key().into();
+        let mut peers =
+            AllPeers::new(Duration::from_secs(15), 100, 100, Arc::new(ScoreConfig::default()));
+        peers.bls_by_peer_id.insert(peer_id, bls_key);
+        assert!(!peers.peer_has_confirmed_identity(&peer_id), "an index entry is not a record");
+        peers.upsert_peer(bls_key, keys.primary_network_public_key(), Vec::new());
+        assert!(peers.peer_has_confirmed_identity(&peer_id));
+        peers.peers.remove(&PeerIdentity::Confirmed(bls_key));
+        assert_eq!(peers.bls_for_peer(&peer_id), Some(bls_key));
+        assert!(!peers.peer_has_confirmed_identity(&peer_id));
+        peers.upsert_peer(bls_key, keys.primary_network_public_key(), Vec::new());
+        peers
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_key))
+            .expect("confirmed fixture record exists")
+            .update_net(bls_key, other.primary_network_public_key(), Vec::new());
+        assert!(
+            !peers.peer_has_confirmed_identity(&peer_id),
+            "a rotated record is not this transport"
+        );
+        peers
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_key))
+            .expect("confirmed fixture record exists")
+            .update_net(other.primary_public_key(), keys.primary_network_public_key(), Vec::new());
+        assert!(!peers.peer_has_confirmed_identity(&peer_id), "the stored BLS key must match");
     }
 }

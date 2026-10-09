@@ -6,21 +6,20 @@ use crate::{
     types::{NodeRecord, RecordDomain},
 };
 use libp2p::{multiaddr::Protocol, Multiaddr};
-use std::net::Ipv4Addr;
 use tn_storage::mem_db::MemDatabase;
 use tn_types::{BlsKeypair, NetworkKeypair, Signer as _};
 
 /// Construct an authenticated primary record with an explicitly controlled timestamp.
 fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRecord {
     let domain = RecordDomain::new(2017, NetworkType::Primary);
+    let address = Multiaddr::empty()
+        .with(Protocol::Ip4(std::net::Ipv4Addr::LOCALHOST))
+        .with(Protocol::Udp(8000))
+        .with(Protocol::QuicV1);
     let mut record = NodeRecord::build(
         domain,
         NetworkKeypair::generate_ed25519().public().into(),
-        // Authenticated readers accept only QUIC endpoints, see `validate_advertised_addresses`.
-        Multiaddr::empty()
-            .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
-            .with(Protocol::Udp(8000))
-            .with(Protocol::QuicV1),
+        address,
         None,
         |bytes| key.sign(bytes),
     );
@@ -33,6 +32,10 @@ fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRec
         tn_types::WorkerId::default(),
         &record.info,
     )));
+    assert!(
+        NodeRecord::decode_and_verify(&encode(&record), domain, key.public()).is_some(),
+        "controlled timestamp fixture must verify"
+    );
     record
 }
 

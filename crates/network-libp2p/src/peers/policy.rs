@@ -49,6 +49,8 @@ pub(super) enum ProtocolScoring {
 pub(super) enum TrustBasis {
     /// An operator-provisioned bootstrap or explicit discovery peer.
     Bootstrap,
+    /// An explicitly configured DAO observer with reserved retention and normal load scoring.
+    DaoObserver,
     /// A peer explicitly allowlisted by the operator.
     Operator,
     /// Membership in the previous, current, or next committee.
@@ -78,6 +80,9 @@ impl PeerPolicy {
     pub(super) fn grant(self, basis: TrustBasis) -> Self {
         match basis {
             TrustBasis::Bootstrap => Self { admission: Admission::Authorized, ..self },
+            TrustBasis::DaoObserver => {
+                Self { admission: Admission::Authorized, retention: Retention::Protected, ..self }
+            }
             TrustBasis::Operator => Self {
                 admission: Admission::Authorized,
                 retention: Retention::Protected,
@@ -132,6 +137,13 @@ mod tests {
                 Some(TrustBasis::Bootstrap),
                 Admission::Authorized,
                 Retention::Ordinary,
+                LoadScoring::Apply,
+            ),
+            (
+                "dao observer",
+                Some(TrustBasis::DaoObserver),
+                Admission::Authorized,
+                Retention::Protected,
                 LoadScoring::Apply,
             ),
             (
@@ -206,6 +218,8 @@ mod tests {
         [
             vec![TrustBasis::Validator],
             vec![TrustBasis::Operator, TrustBasis::Validator],
+            vec![TrustBasis::DaoObserver, TrustBasis::Validator],
+            vec![TrustBasis::Validator, TrustBasis::DaoObserver],
             vec![TrustBasis::Validator, TrustBasis::Operator, TrustBasis::Bootstrap],
         ]
         .into_iter()
@@ -224,6 +238,34 @@ mod tests {
         let after_exit = PeerPolicy::from_bases([TrustBasis::Operator]);
         assert!(after_exit.applies(Penalty::Fatal));
         assert!(!after_exit.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
+    }
+
+    /// DAO retention composes with committee scoring in either order and survives committee exit.
+    #[test]
+    fn dao_retention_composes_with_committee_scoring() {
+        let dao = PeerPolicy::from_bases([TrustBasis::DaoObserver]);
+        assert_eq!(dao.admission, Admission::Authorized);
+        assert_eq!(dao.retention, Retention::Protected);
+        assert!(dao.applies(Penalty::Fatal));
+        assert!(dao.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
+
+        let committee = PeerPolicy::from_bases([TrustBasis::Validator]);
+        [
+            [TrustBasis::DaoObserver, TrustBasis::Validator],
+            [TrustBasis::Validator, TrustBasis::DaoObserver],
+        ]
+        .into_iter()
+        .for_each(|bases| {
+            let combined = PeerPolicy::from_bases(bases);
+            assert_eq!(combined, committee);
+            assert!(!combined.applies(Penalty::Fatal));
+            assert!(!combined.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
+        });
+
+        let after_exit = PeerPolicy::from_bases([TrustBasis::DaoObserver]);
+        assert_eq!(after_exit, dao);
+        assert!(after_exit.applies(Penalty::Fatal));
+        assert!(after_exit.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
     }
 
     /// Recomputing from live bases revokes committee privileges without removing operator trust.

@@ -219,6 +219,19 @@ pub struct GossipPayload {
     pub relayer: Option<BlsPublicKey>,
     /// BLS identity of the message author (`GossipMessage::source`), when resolved.
     pub author: Option<BlsPublicKey>,
+    /// Transport receipt metadata, present for messages received from the live swarm.
+    pub receipt: Option<GossipReceipt>,
+}
+
+/// Transport identities and arrival time for an accepted, authenticated gossip message.
+#[derive(Debug, serde::Serialize)]
+pub struct GossipReceipt {
+    /// The production gossipsub message identifier, matching the publisher's observation.
+    pub message_id: String,
+    /// The immediate authenticated QUIC peer that forwarded the message.
+    pub propagation_source: PeerId,
+    /// System-clock microseconds at acceptance, for isolated hosts sharing the same clock.
+    pub received_unix_us: u128,
 }
 
 // ============================================================================
@@ -397,6 +410,13 @@ where
         /// Reply to caller.
         reply: oneshot::Sender<Vec<BlsPublicKey>>,
     },
+    /// Whether the swarm still has an established connection to this peer.
+    IsPeerConnected {
+        /// Physical peer identity to query.
+        peer_id: PeerId,
+        /// Reply to caller, including connections whose close is in progress.
+        reply: oneshot::Sender<bool>,
+    },
     /// Collection of all mesh peers by a certain topic hash.
     MeshPeers {
         /// The topic to filter peers.
@@ -475,6 +495,13 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Option<RpcInfo>>,
     },
+    /// Query the DHT for a signature-validated record in this swarm's chain and role domain.
+    GetNodeRecord {
+        /// The identity whose signed record is requested.
+        key: BlsPublicKey,
+        /// Completion after the query closes, including missing or failed lookups.
+        reply: oneshot::Sender<NetworkResult<NodeRecord>>,
+    },
     /// Snapshot of the current committee's advertised RPCs; triggers kad discovery
     /// for members with no known record.
     GetAllValidatorRpcs {
@@ -518,6 +545,8 @@ where
 {
     /// Sending channel to the network to process commands.
     sender: mpsc::Sender<NetworkCommand<Req, Res>>,
+    /// Persistent swarm owner for bounded sync serving, absent on command-only test handles.
+    sync_task_spawner: Option<tn_types::TaskSpawner>,
 }
 
 impl<Req, Res> NetworkHandle<Req, Res>
@@ -527,13 +556,24 @@ where
 {
     /// Create a new instance of Self.
     pub fn new(sender: mpsc::Sender<NetworkCommand<Req, Res>>) -> Self {
-        Self { sender }
+        Self { sender, sync_task_spawner: None }
+    }
+
+    /// Attach the persistent swarm's owner so admitted sync work survives epoch changes.
+    pub(crate) fn with_sync_task_spawner(mut self, spawner: tn_types::TaskSpawner) -> Self {
+        self.sync_task_spawner = Some(spawner);
+        self
+    }
+
+    /// Return the persistent owner of this swarm's sync serving tasks.
+    pub fn sync_task_spawner(&self) -> Option<&tn_types::TaskSpawner> {
+        self.sync_task_spawner.as_ref()
     }
 
     /// Create a handle to no where for test setup.
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
-        Self { sender }
+        Self::new(sender)
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not
@@ -681,11 +721,20 @@ where
         count.await.map_err(Into::into)
     }
 
-    /// Retrieve a collection of connected peers.
+    /// Retrieve authenticated peers with established connections, excluding pending dials.
     pub async fn connected_peers(&self) -> NetworkResult<Vec<BlsPublicKey>> {
         let (reply, peers) = oneshot::channel();
         self.sender.send(NetworkCommand::ConnectedPeers { reply }).await?;
         peers.await.map_err(Into::into)
+    }
+
+    /// Query whether the swarm has any established connection to this physical peer.
+    ///
+    /// This remains true while a disconnect is in progress and until the last connection closes.
+    pub async fn is_peer_connected(&self, peer_id: PeerId) -> NetworkResult<bool> {
+        let (reply, connected) = oneshot::channel();
+        self.sender.send(NetworkCommand::IsPeerConnected { peer_id, reply }).await?;
+        connected.await.map_err(Into::into)
     }
 
     /// Send a request to a peer.
@@ -737,7 +786,7 @@ where
     ///
     /// This method closes all connections to the peer without waiting for handlers
     /// to complete.
-    pub(crate) async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
+    pub async fn disconnect_peer(&self, peer_id: PeerId) -> NetworkResult<()> {
         let (reply, res) = oneshot::channel();
         self.sender.send(NetworkCommand::DisconnectPeer { peer_id, reply }).await?;
         res.await?.map_err(|_| NetworkError::DisconnectPeer)
@@ -813,6 +862,17 @@ where
         rx.await.map_err(Into::into)
     }
 
+    /// Issue a bounded DHT lookup instead of reading the peer manager's cached RPC metadata.
+    ///
+    /// The result passes the existing key, signature, chain, and swarm-domain validation.
+    /// A query that ends without a valid record is an error. Dropping the caller never adds
+    /// a waiting task, and the Kademlia deadline bounds the retained query.
+    pub async fn get_node_record(&self, key: BlsPublicKey) -> NetworkResult<NodeRecord> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetNodeRecord { key, reply }).await?;
+        rx.await?
+    }
+
     /// Snapshot of the current committee's advertised RPCs.
     ///
     /// Returns the RPC info for every current-committee validator that has
@@ -841,11 +901,13 @@ pub struct KadQuery {
     pub request: BlsPublicKey,
     /// The best result so far.
     pub result: Option<NodeRecord>,
+    /// Optional local application caller, absent for background committee discovery.
+    pub reply: Option<oneshot::Sender<NetworkResult<NodeRecord>>>,
 }
 
 impl From<BlsPublicKey> for KadQuery {
     fn from(request: BlsPublicKey) -> Self {
-        Self { request, result: None }
+        Self { request, result: None, reply: None }
     }
 }
 

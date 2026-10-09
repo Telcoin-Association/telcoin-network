@@ -156,6 +156,7 @@ impl RethEnv {
 
         // copy in case of error
         let batch_digest = payload.batch_digest;
+        let local_output_root = payload.consensus_header_digest;
 
         let mut builder =
             self.inner.evm_config.builder_for_next_block(&mut db, &parent_header, payload)?;
@@ -220,7 +221,13 @@ impl RethEnv {
                     // it's possible that another worker's batch included this transaction
                     debug!(target: "engine", %error, tx_hash = ?recovered.hash(), "skipping invalid transaction");
                     // expected in normal operation - see the reason docs, this is not an alert
-                    record_invalid_tx_skipped(InvalidTxSkipReason::classify(error.as_ref()));
+                    let reason = InvalidTxSkipReason::classify(error.as_ref());
+                    self.inner
+                        .local_recovery
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .nonce_gap(batch_digest, *recovered.hash(), local_output_root);
+                    record_invalid_tx_skipped(reason);
                     continue;
                 }
                 // this is an error that we should treat as fatal for this attempt

@@ -215,7 +215,6 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // without scoring its author: a restart, clock skew, or divergent local anchor must
         // not isolate peers needed for recovery. Cryptographic and structural checks still run.
         HeaderError::TooNew { .. }
-        | HeaderError::TooOld { .. }
         | HeaderError::InvalidTimestamp { .. }
         | HeaderError::InvalidSeedSignature => None,
         // medium
@@ -260,7 +259,7 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // stale header is enough. A fatal penalty here banned every committee peer of a
         // restarted validator. The error carries rounds but no epoch, so a different header for
         // the same round cannot be told apart from a stale request of an earlier epoch.
-        HeaderError::AlreadyVotedForLaterRound { .. } => None,
+        HeaderError::AlreadyVotedForLaterRound { .. } | HeaderError::TooOld { .. } => None,
     }
 }
 

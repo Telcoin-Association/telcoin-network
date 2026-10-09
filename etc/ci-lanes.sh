@@ -93,6 +93,7 @@ lane_clippy() {
 
 lane_test_default() {
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
+    run python3 -B -I -m unittest discover -s tools/hub-capacity -p 'test_*.py'
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib

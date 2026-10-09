@@ -17,9 +17,9 @@ use crate::{
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
-        GossipPayload, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle, NetworkInfo,
-        NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType, NetworkTypeExt,
-        NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
+        GossipPayload, GossipReceipt, KadQuery, NetworkCommand, NetworkEvent, NetworkHandle,
+        NetworkInfo, NetworkResponseMessage, NetworkResponseSender, NetworkResult, NetworkType,
+        NetworkTypeExt, NodeRecord, RecordDomain, ResponseChannel, RpcInfo,
     },
     PeerExchangeMap,
 };
@@ -36,7 +36,7 @@ use libp2p::{
         InboundRequestId, OutboundFailure as ReqResOutboundFailure, OutboundRequestId,
         ProtocolSupport,
     },
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{ConnectionId, NetworkBehaviour, SwarmEvent},
     Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
 };
 use lru::LruCache;
@@ -139,28 +139,17 @@ where
     }
 }
 
-/// Hard cap on the number of distinct peers retained in
-/// [`ConsensusNetwork::published_to_peers`], the de-dup set that records which peers we have
-/// already pushed our [`NodeRecord`] to.
-///
-/// Without a cap this set grows once per distinct `PeerId` ever connected and is never cleaned up
-/// (a `PeerId` is a peer-minted cryptographic identity, so a churn of fresh identities grows it
-/// without bound), which on a RAM-capped node is a slow but guaranteed OOM. Backing the set with a
-/// capacity-bounded LRU caps its resident size to this many entries (~64-80 B each, so well under
-/// 1 MB) while preserving the de-dup intent: an actively (re)connecting peer is promoted on every
-/// connect and so is never the eviction victim, and only a peer absent long enough to fall out of
-/// the LRU is re-pushed to on its eventual return - at worst once, which is self-limiting.
-///
-/// The value is a generous multiple of the live-peer target (`PeerConfig::max_peers()` defaults to
-/// ~33), so the LRU only ever evicts peers well outside the current working set. See issue #828.
-const MAX_PUBLISHED_TO_PEERS: NonZeroUsize = NonZeroUsize::new(10_000).expect("10_000 is nonzero");
-
 /// Maximum encoded kademlia message size in bytes, including the record and protocol overhead.
 ///
 /// Pin the 16 KiB wire limit explicitly so libp2p upgrades cannot silently widen the inbound
 /// bandwidth allowed by the per-source `PutRecord` limits. The codec applies this bound before
 /// records reach the store, whose larger value limit is not the effective wire bound.
 const MAX_KAD_PACKET_SIZE: usize = 16 * 1024;
+
+/// Maximum number of peer identities retained in the record-retrieval cooldown history.
+/// Active and deferred retrievals use their separate live-peer allowance.
+const MAX_RECORD_EXCHANGE_HISTORY: NonZeroUsize =
+    NonZeroUsize::new(10_000).expect("10_000 is nonzero");
 
 /// Whether inbound record processing was completed or deferred by the shared PUT budget.
 enum PutOutcome {
@@ -290,15 +279,54 @@ fn connection_limits_behaviour(
     max_pending_incoming: u32,
     budget: Option<SwarmNetworkBudget>,
 ) -> connection_limits::Behaviour {
-    connection_limits::Behaviour::new(
-        ConnectionLimits::default()
-            .with_max_established_per_peer(Some(
-                budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
-                    budget.connections_per_peer()
-                }),
-            ))
-            .with_max_established(budget.map(|budget| budget.connections()))
-            .with_max_pending_incoming(Some(max_pending_incoming)),
+    connection_limits::Behaviour::new(swarm_connection_limits(max_pending_incoming, budget))
+}
+
+/// Keep the physical caps identical for reserved and legacy admission.
+fn swarm_connection_limits(
+    max_pending_incoming: u32,
+    budget: Option<SwarmNetworkBudget>,
+) -> ConnectionLimits {
+    ConnectionLimits::default()
+        .with_max_established_per_peer(Some(
+            budget.map_or(MAX_ESTABLISHED_CONNECTIONS_PER_PEER, |budget| {
+                budget.connections_per_peer()
+            }),
+        ))
+        .with_max_established(budget.map(|budget| budget.connections()))
+        .with_max_pending_incoming(Some(max_pending_incoming))
+}
+
+/// Install immutable configured bootstrap reservations before the swarm starts admission.
+/// Runtime bootstrap or logical trust changes do not expand this physical reservation set.
+fn bootstrap_connection_limits(
+    network_config: &NetworkConfig,
+    network_type: NetworkType,
+    local_peer: PeerId,
+    budget: Option<SwarmNetworkBudget>,
+) -> NetworkResult<connection_limits::Behaviour> {
+    budget.map_or_else(
+        || Ok(connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, None)),
+        |budget| {
+            let required_peers = network_config
+                .bootstrap_peers()
+                .values()
+                .filter_map(|server| match network_type {
+                    NetworkType::Primary => Some(server.primary.network_key.clone()),
+                    NetworkType::Worker(id) => {
+                        server.worker(id).map(|worker| worker.network_key.clone())
+                    }
+                })
+                .map(PeerId::from)
+                .collect::<Vec<_>>();
+            connection_limits::Behaviour::new_with_required_peers(
+                swarm_connection_limits(MAX_PENDING_INCOMING_CONNECTIONS, Some(budget)),
+                local_peer,
+                &required_peers,
+            )
+            .map_err(std::io::Error::other)
+            .map_err(NetworkError::from)
+        },
     )
 }
 
@@ -417,6 +445,15 @@ enum GoodbyeOutcome {
     FellBack,
 }
 
+/// Public-mode explicit recipients, with provenance retained only while current policy protects it.
+#[derive(Default)]
+struct PublicGossipPeers {
+    ordinary: HashSet<PeerId>,
+    /// Former ordinary recipients retain reconnects while committee or operator policy protects
+    /// them. Demotion, bans and identity displacement remove this bounded provenance.
+    promoted: HashSet<PeerId>,
+}
+
 /// The network type for consensus messages.
 ///
 /// The primary and workers use separate instances of this network to reliably send messages to
@@ -444,6 +481,10 @@ where
     /// This set must be updated at the start of each epoch. It is used to verify messages
     /// published on certain topics. These are updated when the caller subscribes to a topic.
     authorized_publishers: HashMap<String, Option<HashSet<BlsPublicKey>>>,
+    /// Confirmed ordinary peers receiving direct gossip within configured public and swarm
+    /// budgets. Entries are removed before disconnect so gossipsub cannot retain public redial
+    /// privileges.
+    public_gossip_peers: Option<PublicGossipPeers>,
     /// The collection of pending _graceful_ disconnects.
     ///
     /// This node disconnects from new peers if it already has the target number of peers.
@@ -504,16 +545,6 @@ where
     /// Signature-verified bytes for this process and domain, bounded by the live-peer budget.
     /// Persisted records alone never authorize skipping signature verification.
     verified_peer_records: LruCache<kad::RecordKey, Vec<u8>>,
-    /// Peers we have already pushed our [NodeRecord] to.
-    ///
-    /// A peer needs our record before it can resolve our BLS key, so we push it on
-    /// `PeerConnected`. The last-connection close clears this marker because the receiver
-    /// relinquishes connection-owned retention and needs another advertisement on reconnect.
-    ///
-    /// A bounded LRU limits metadata for concurrent connections and failed publication attempts.
-    /// Entries survive intermediate connection closes and are removed on the last close. The
-    /// resident cap is [`MAX_PUBLISHED_TO_PEERS`].
-    published_to_peers: LruCache<PeerId, ()>,
     /// Bounded record retrievals and cooldown history, independent of push suppression.
     record_exchange: RecordExchange,
     /// Heartbeat cadence for retrying deferred retrievals, clamped above zero.
@@ -598,6 +629,9 @@ where
         rpc: Option<RpcInfo>,
     ) -> NetworkResult<Self> {
         let budget = network_config.swarm_budget().map_err(std::io::Error::other)?;
+        let public_gossip_peers = (network_config.public_peer_limit().is_some()
+            && budget.is_some())
+        .then(PublicGossipPeers::default);
         let quic_config = network_config.quic_config().with_budget(budget);
         // Namespace every wire protocol by the genesis chain id so nodes on
         // different chains never negotiate a connection. The id is stamped onto
@@ -609,7 +643,26 @@ where
         // (GHSA-cc64-wfq5-56ph).
         let record_domain = RecordDomain::new(chain_id, network_type);
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
+        let mesh = network_config.gossip_mesh();
+        crate::capacity::CapacitySemaphore::initialize(
+            &network_type,
+            network_config.serve_limits(),
+        );
+        mesh.validate().map_err(std::io::Error::other)?;
+        let mut gossipsub_config = gossipsub::ConfigBuilder::default();
+        if public_gossip_peers.is_some() {
+            // The public and transport populations are bounded. Announce cached messages to every
+            // eligible non-mesh peer each heartbeat so relay delivery does not depend on
+            // repeatedly winning the default random gossip sample. Mesh sizing is unchanged;
+            // confirmed ordinary peers also receive direct payloads. Cached-payload requests remain
+            // subject to gossipsub's control limits and the transport allocation.
+            gossipsub_config.gossip_factor(1.0);
+        }
+        let gossipsub_config = gossipsub_config
+            .mesh_n(mesh.target())
+            .mesh_n_low(mesh.low())
+            .mesh_n_high(mesh.high())
+            .mesh_outbound_min(mesh.outbound_min())
             // explicitly set default
             .heartbeat_interval(Duration::from_secs(1))
             // explicitly set default
@@ -738,7 +791,21 @@ where
             stream_protocol,
         );
         behavior.connection_limits =
-            connection_limits_behaviour(MAX_PENDING_INCOMING_CONNECTIONS, budget);
+            bootstrap_connection_limits(network_config, network_type, peer_id, budget)?;
+        behavior.peer_manager.set_public_peer_limit(network_config.public_peer_limit());
+        if network_config.dao_observers().len() > 8
+            || network_config
+                .dao_observers()
+                .iter()
+                .any(|key| !network_config.bootstrap_peers().contains_key(key))
+        {
+            Err(std::io::Error::other(
+                "DAO observers require at most eight identities in the trusted bootstrap set",
+            ))?;
+        }
+        behavior
+            .peer_manager
+            .set_dao_observers(network_config.dao_observers().iter().copied().collect());
 
         // Promote the surviving records into the local peer cache. The store's contents are
         // peer-fillable (arbitrary signature-valid third-party records held as DHT storage
@@ -752,14 +819,11 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
-            behavior
-                .kademlia
-                .store_mut()
-                .record_timestamp(&crate::kad::node_record_key(&key))
-                .into_iter()
-                .for_each(|timestamp| {
-                    behavior.peer_manager.restore_record_timestamp(key, timestamp);
-                });
+            let timestamp =
+                behavior.kademlia.store_mut().record_timestamp(&crate::kad::node_record_key(&key));
+            timestamp.into_iter().for_each(|timestamp| {
+                behavior.peer_manager.restore_record_timestamp(key, timestamp);
+            });
             restored += 1;
         }
         if restored > 0 {
@@ -818,6 +882,7 @@ where
             commands,
             event_stream,
             authorized_publishers: Default::default(),
+            public_gossip_peers,
             outbound_requests: Default::default(),
             inbound_requests: Default::default(),
             inbound_pending: InboundOccupancy::default(),
@@ -834,9 +899,8 @@ where
                 NonZeroUsize::new(network_config.peer_config().max_peers())
                     .unwrap_or(NonZeroUsize::MIN),
             ),
-            published_to_peers: LruCache::new(MAX_PUBLISHED_TO_PEERS),
             record_exchange: RecordExchange::new(
-                MAX_PUBLISHED_TO_PEERS,
+                MAX_RECORD_EXCHANGE_HISTORY,
                 network_config.peer_config().max_peers(),
                 record_retry_interval,
             ),
@@ -849,7 +913,7 @@ where
 
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_sync_task_spawner(self.task_spawner.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.
@@ -932,7 +996,13 @@ where
     /// Verify the address list in Record was signed by the key and the kad record's publisher
     /// matches the network key.
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
-        let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
+        let key = BlsPublicKey::from_literal_bytes(record.key.as_ref())
+            .inspect_err(|_| {
+                tracing::debug!(target: "network::identity", event = "record_classified",
+                    domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                    value_bytes = record.value.len(), outcome = "invalid_key");
+            })
+            .ok()?;
 
         // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
         let cached = self
@@ -940,13 +1010,22 @@ where
             .peek(&record.key)
             .is_some_and(|value| *value == record.value);
         let (pubkey, node_record) = if cached {
-            (key, NodeRecord::try_decode_compat(&record.value)?)
+            NodeRecord::try_decode_compat(&record.value).map(|node_record| (key, node_record))
         } else {
-            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)?
-        };
+            NodeRecord::decode_and_verify(record.value.as_ref(), self.record_domain, &key)
+        }
+        .or_else(|| {
+            tracing::debug!(target: "network::identity", event = "record_classified",
+                domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                value_bytes = record.value.len(), outcome = "decode_or_signature_failed");
+            None
+        })?;
 
         // The shared decoder validates nonempty, bounded IP/QUIC endpoints before BLS verification.
         if node_record.info.multiaddrs.len() > MAX_ADVERTISED_MULTIADDRS {
+            tracing::debug!(target: "network::identity", event = "record_classified",
+                domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                value_bytes = record.value.len(), outcome = "address_limit");
             warn!(
                 target: "network-kad",
                 count = node_record.info.multiaddrs.len(),
@@ -960,6 +1039,9 @@ where
         // this prevents replay attacks where malicious nodes republish outdated records
         let expected_peer_id: PeerId = node_record.info.pubkey.clone().into();
         if record.publisher != Some(expected_peer_id) {
+            tracing::debug!(target: "network::identity", event = "record_classified",
+                domain = ?self.record_domain, key_bytes = record.key.as_ref().len(),
+                value_bytes = record.value.len(), outcome = "publisher_mismatch");
             warn!(
                 target: "network-kad",
                 "NodeRecord validation failed: publisher {:?} doesn't match network key (expected {:?})",
@@ -991,31 +1073,40 @@ where
         }
     }
 
-    /// Push our [NodeRecord] directly to a newly-connected peer.
-    ///
-    /// Used on first-time connections so the remote peer can resolve our BLS key
-    /// without waiting for the kad publication interval (12h). Callers must
-    /// short-circuit on reconnects - see [`Self::published_to_peers`]
-    fn publish_our_data_to_peer(&mut self, peer: PeerId) {
-        let record = self.get_peer_record();
-        info!(target: "network-kad", "Publishing our record to peer {peer:?}");
-        let _ = self.swarm.behaviour_mut().kademlia.put_record_to(
-            record,
-            vec![peer].into_iter(),
-            kad::Quorum::One,
-        );
+    /// Queue our signed record for this accepted physical connection. Kademlia retains one small
+    /// pending state per live connection and bounds active targeted publications separately.
+    fn publish_our_data_to_peer(&mut self, peer: PeerId, connection: ConnectionId) {
+        self.swarm.behaviour_mut().kademlia.queue_record_to_connection(peer, connection);
+        self.drain_pending_publications();
     }
 
-    /// Record that we have pushed our [`NodeRecord`] to `peer_id`, returning `true` the first time
-    /// we see a peer (i.e. when a direct push is warranted) and `false` for a peer we have already
-    /// pushed to.
-    ///
-    /// Backed by the capacity-bounded [`Self::published_to_peers`] LRU so this de-dup gate cannot
-    /// grow without bound. A hit promotes the peer to most-recently-used, so an actively
-    /// (re)connecting peer is never evicted and never re-pushed to; only a peer absent long enough
-    /// to fall out of the LRU is pushed to again on its eventual return.
-    fn mark_published_to_peer(&mut self, peer_id: PeerId) -> bool {
-        self.published_to_peers.put(peer_id, ()).is_none()
+    /// Create the current signed payload only when an active publication slot is available.
+    /// A saturated query pool leaves the connection pending until completion frees capacity.
+    fn drain_pending_publications(&mut self) {
+        std::iter::from_fn(|| {
+            let (peer, connection) =
+                self.swarm.behaviour().kademlia.next_pending_record_connection()?;
+            if self.swarm.behaviour().peer_manager.peer_banned(&peer) {
+                self.swarm.behaviour_mut().kademlia.cancel_record_to_connection(connection);
+                Some(())
+            } else {
+                let record = self.get_peer_record();
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .put_record_to_connection(record, peer, connection)
+                    .map(|query_id| {
+                        tracing::debug!(target: "network::identity", event = "publication_enqueued",
+                            domain = ?self.record_domain, ?peer, ?connection, ?query_id);
+                    })
+                    .map_err(|error| {
+                        trace!(target: "network-kad", ?peer, ?connection, ?error,
+                            "connection publication remains pending or target is stale");
+                    })
+                    .ok()
+            }
+        })
+        .for_each(|()| ());
     }
 
     /// Run the network loop to process incoming gossip.
@@ -1064,6 +1155,11 @@ where
 
             // refresh in-flight gauges once per loop iteration (scrape-interval freshness)
             self.metrics.set_pending(self.goodbyes_in_flight(), self.outbound_requests.len());
+            self.metrics.set_queues(
+                self.commands.len(),
+                self.inbound_requests.len(),
+                self.kad_record_queries.len(),
+            );
             self.metrics.set_established_connections(
                 self.swarm.network_info().connection_counters().num_established(),
             );
@@ -1080,11 +1176,28 @@ where
         event: SwarmEvent<TNBehaviorEvent<TNCodec<Req, Res>, DB>>,
     ) -> NetworkResult<()> {
         match event {
-            SwarmEvent::ConnectionClosed { peer_id, num_established: 0, .. } => {
-                // Connection-owned rows are gone at the receiver too. A reconnect needs a fresh
-                // direct advertisement even when the bounded publication cache saw this peer
-                // before.
-                self.published_to_peers.pop(&peer_id);
+            SwarmEvent::ConnectionClosed {
+                peer_id,
+                connection_id,
+                cause,
+                num_established: 0,
+                ..
+            } => {
+                self.remove_public_gossip_peer(&peer_id);
+                if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                    let (outcome, io_kind) =
+                        cause.as_ref().map_or(("no_error_cause", None), |cause| match cause {
+                            libp2p::swarm::ConnectionError::IO(error) => {
+                                ("io_error", Some(error.kind()))
+                            }
+                            libp2p::swarm::ConnectionError::KeepAliveTimeout => {
+                                ("keep_alive_timeout", None)
+                            }
+                        });
+                    tracing::debug!(target: "network::identity", event = "connection_closed",
+                        domain = ?self.record_domain, ?peer_id, ?connection_id,
+                        outcome, ?io_kind, remaining_connections = 0_u32);
+                }
                 self.swarm
                     .behaviour_mut()
                     .kademlia
@@ -1145,8 +1258,8 @@ where
             }
             // an inbound connection refused by a `connection_limits` bound (the pending inbound
             // ceiling, the per-peer established ceiling or the total established ceiling); count
-            // it by the bound that the refusal names, and log only the configured limit and the
-            // fixed limit description, never peer-supplied data
+            // each refusal by its bound and warn when repeated denials fill the rolling window,
+            // without peer-supplied data
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
                 ..
@@ -1321,9 +1434,14 @@ where
                 } else {
                     self.swarm.behaviour_mut().gossipsub.publish(TopicHash::from_raw(topic), msg)
                 };
-                if res.is_ok() {
+                res.as_ref().ok().into_iter().for_each(|message_id| {
                     self.metrics.record_gossip_published();
-                }
+                    // Opt-in fixed-target observations have no peer-valued metric labels.
+                    tracing::debug!(target: "network::capacity", event = "gossip_publish",
+                        %message_id, source = %self.swarm.local_peer_id(),
+                        unix_us = %std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)
+                            .map_or(0, |time| time.as_micros()), "capacity observation");
+                });
                 send_or_log_error!(reply, res, "Publish");
             }
             NetworkCommand::Subscribe { topic, publishers, reply } => {
@@ -1356,12 +1474,15 @@ where
                     .swarm
                     .behaviour()
                     .peer_manager
-                    .connected_or_dialing_peers()
+                    .connected_peers()
                     .iter()
                     .flat_map(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id))
                     .collect();
                 debug!(target: "network", ?peers, "peer manager connected peers:");
                 send_or_log_error!(reply, peers, "ConnectedPeers");
+            }
+            NetworkCommand::IsPeerConnected { peer_id, reply } => {
+                send_or_log_error!(reply, self.swarm.is_connected(&peer_id), "IsPeerConnected");
             }
             NetworkCommand::PeerScore { peer_id, reply } => {
                 let opt_score = self.swarm.behaviour().peer_manager.peer_score(&peer_id);
@@ -1443,6 +1564,7 @@ where
                 }
             }
             NetworkCommand::DisconnectPeer { peer_id, reply } => {
+                self.remove_public_gossip_peer(&peer_id);
                 // this is called after timeout for disconnected peer exchanges
                 let res = self.swarm.disconnect_peer_id(peer_id);
                 send_or_log_error!(reply, res, "DisconnectPeer");
@@ -1488,6 +1610,38 @@ where
             NetworkCommand::GetValidatorRpc { bls_key, reply } => {
                 let rpc = self.swarm.behaviour().peer_manager.get_rpc(&bls_key);
                 send_or_log_error!(reply, rpc, "GetValidatorRpc");
+            }
+            NetworkCommand::GetNodeRecord { key, reply } => {
+                // Local application queries have their own finite allocation. Committee discovery
+                // remains independent so a full application allocation cannot block rotation.
+                if self
+                    .kad_record_queries
+                    .values()
+                    .filter(|query| query.query.reply.is_some())
+                    .count()
+                    >= 100
+                {
+                    tracing::debug!(target: "network::identity", event = "query_refused",
+                        domain = ?self.record_domain, target = ?key,
+                        outcome = "application_allocation_exhausted");
+                    let _ = reply.send(Err(std::io::Error::other(
+                        "application node-record query allocation exhausted",
+                    )
+                    .into()));
+                } else {
+                    let query_id =
+                        self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
+                    self.kad_record_queries.insert(
+                        query_id,
+                        PendingKadQuery {
+                            query: KadQuery { request: key, result: None, reply: Some(reply) },
+                            timestamp: None,
+                        },
+                    );
+                    tracing::debug!(target: "network::identity", event = "query_open",
+                        domain = ?self.record_domain, ?query_id, target = ?key,
+                        application = true);
+                }
             }
             NetworkCommand::GetAllValidatorRpcs { reply } => {
                 let rpcs = self.swarm.behaviour_mut().peer_manager.current_committee_rpcs();
@@ -1541,20 +1695,85 @@ where
     ///
     /// Operator trust survives rotation; committee protection ends when the final slot expires.
     fn refresh_explicit_peers(&mut self) {
-        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        let peers: HashSet<_> = self
+            .swarm
+            .connected_peers()
+            .copied()
+            .chain(
+                self.public_gossip_peers
+                    .iter()
+                    .flat_map(|peers| peers.ordinary.iter().chain(peers.promoted.iter()).copied()),
+            )
+            .collect();
         peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
     }
 
-    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    /// Reconcile direct gossip after identity, committee, trust, or connection changes.
+    /// Public delivery never changes ordinary admission or population-pruning policy.
     fn refresh_explicit_peer(&mut self, peer: &PeerId) {
         let manager = &self.swarm.behaviour().peer_manager;
-        let protected = self.swarm.is_connected(peer)
+        let promoted =
+            self.public_gossip_peers.as_ref().is_some_and(|peers| peers.promoted.contains(peer));
+        let was_public =
+            self.public_gossip_peers.as_ref().is_some_and(|peers| peers.ordinary.contains(peer));
+        let protected = (self.swarm.is_connected(peer) || promoted)
             && manager.peer_is_important(peer)
             && !manager.peer_banned(peer);
-        if protected {
+        let public = self.public_gossip_peers.is_some()
+            && self.swarm.is_connected(peer)
+            && manager.is_connected(peer)
+            && manager.peer_is_confirmed_ordinary(peer)
+            && !manager.peer_banned(peer);
+        self.public_gossip_peers.as_mut().into_iter().for_each(|peers| {
+            if protected && (was_public || promoted) {
+                peers.promoted.insert(*peer);
+            } else {
+                peers.promoted.remove(peer);
+            }
+            if public {
+                peers.ordinary.insert(*peer);
+            } else {
+                peers.ordinary.remove(peer);
+            }
+        });
+        if public || (protected && self.swarm.is_connected(peer)) {
             self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
-        } else {
+        } else if !protected {
             self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
+    }
+
+    /// Remove public reconnect privileges while preserving existing important-peer reconnects.
+    fn remove_public_gossip_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let important = manager.peer_is_important(peer) && !manager.peer_banned(peer);
+        let removed = self.public_gossip_peers.as_mut().is_some_and(|peers| {
+            let removed = peers.ordinary.remove(peer);
+            if removed && important {
+                peers.promoted.insert(*peer);
+            }
+            removed
+        });
+        if removed && !important {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
+    }
+
+    /// Identity rekeys can displace another live recipient. Recheck only managed public IDs.
+    fn refresh_public_gossip_peers(&mut self) {
+        let peers: Vec<_> = self
+            .public_gossip_peers
+            .iter()
+            .flat_map(|peers| peers.ordinary.iter().chain(peers.promoted.iter()).copied())
+            .collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// New signed-record hooks affect only nodes configured to serve bounded public peers.
+    fn refresh_public_gossip_identity(&mut self, peer: &PeerId) {
+        if self.public_gossip_peers.is_some() {
+            self.refresh_public_gossip_peers();
+            self.refresh_explicit_peer(peer);
         }
     }
 
@@ -1571,6 +1790,9 @@ where
                 if self.kad_record_queries.values().all(|query| query.query.request != key) {
                     let id = self.swarm.behaviour_mut().kademlia.get_record(node_record_key(&key));
                     self.kad_record_queries.insert(id, key.into());
+                    tracing::debug!(target: "network::identity", event = "query_open",
+                        domain = ?self.record_domain, query_id = ?id, target = ?key,
+                        application = false);
                 }
             });
     }
@@ -1628,11 +1850,20 @@ where
                             .source
                             .as_ref()
                             .and_then(|id| self.swarm.behaviour().peer_manager.peer_to_bls(id));
-                        // forward gossip to handler; a full queue or a queue with no
-                        // subscriber counts as shed
-                        let forwarded = self
-                            .event_stream
-                            .try_send_outcome(accepted_gossip_event(message, relayer, author));
+                        // Forward gossip to the handler; a full queue or a queue with no
+                        // subscriber counts as shed.
+                        let forwarded = self.event_stream.try_send_outcome(accepted_gossip_event(
+                            message,
+                            relayer,
+                            author,
+                            Some(GossipReceipt {
+                                message_id: message_id.to_string(),
+                                propagation_source,
+                                received_unix_us: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map_or(0, |time| time.as_micros()),
+                            }),
+                        ));
                         self.metrics.record_forward(ServiceClass::Gossip, &forwarded);
                         if forwarded.inspect_err(|e| {
                             error!(target: "network", topics=?self.authorized_publishers.keys(), ?propagation_source, ?message_id, ?e, "failed to forward gossip!");
@@ -1830,13 +2061,14 @@ where
                         // transport-level: no penalty
                     }
                     ReqResOutboundFailure::Io(e) => match e.kind() {
-                        ErrorKind::ConnectionReset
+                        ErrorKind::NotConnected
+                        | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
                         | ErrorKind::Interrupted => {
-                            // transport flap on WAN — no penalty
+                            // A transport flap on WAN carries no protocol penalty.
                         }
                         _ => {
                             warn!(
@@ -1885,13 +2117,14 @@ where
                 debug!(target: "network", my_id=?self.swarm.local_peer_id(), "this node");
                 match &error {
                     ReqResInboundFailure::Io(e) => match e.kind() {
-                        ErrorKind::ConnectionReset
+                        ErrorKind::NotConnected
+                        | ErrorKind::ConnectionReset
                         | ErrorKind::ConnectionAborted
                         | ErrorKind::TimedOut
                         | ErrorKind::UnexpectedEof
                         | ErrorKind::BrokenPipe
                         | ErrorKind::Interrupted => {
-                            // transport flap on WAN — no penalty
+                            // A transport flap on WAN carries no protocol penalty.
                         }
                         _ => {
                             warn!(
@@ -2322,6 +2555,7 @@ where
     fn process_peer_manager_event(&mut self, event: PeerEvent) -> NetworkResult<()> {
         match event {
             PeerEvent::DisconnectPeer(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "network", ?peer_id, "peer manager: disconnect peer");
                 // remove from request-response
                 // NOTE: gossipsub handle `FromSwarm::ConnectionClosed`
@@ -2331,6 +2565,7 @@ where
                 self.swarm.behaviour_mut().kademlia.remove_peer(&peer_id);
             }
             PeerEvent::PeerDisconnected(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "network", ?peer_id, "peer disconnected event from peer manager");
 
                 // Check if there are any connections still in the pool
@@ -2368,6 +2603,7 @@ where
                 }
             }
             PeerEvent::DisconnectPeerX(peer_id, peer_exchange) => {
+                self.remove_public_gossip_peer(&peer_id);
                 debug!(target: "peer-manager", this_node=?self.swarm.local_peer_id(), ?peer_id, "disconnecting from peer with exchange info");
 
                 // guard: skip PX if peer already disconnected
@@ -2389,12 +2625,13 @@ where
                 // remove from connected peers
                 self.connected_peers.retain(|peer| *peer != peer_id);
             }
-            PeerEvent::PeerConnected(peer_id, addr) => {
+            PeerEvent::PeerConnected(peer_id, connection_id, addr) => {
                 // Defense in depth: even if the peer-manager `handle_established_*_connection`
                 // path lets a banned peer reach this event (observed in adiri testnet logs),
                 // refuse to register the connection with kademlia/gossipsub. Otherwise the
                 // banned peer ends up in the kad routing table and triggers a redial loop.
                 if self.swarm.behaviour().peer_manager.peer_banned(&peer_id) {
+                    self.remove_public_gossip_peer(&peer_id);
                     debug!(
                         target: "network",
                         ?peer_id,
@@ -2410,11 +2647,9 @@ where
                 // add as a kademlia peer
                 self.swarm.behaviour_mut().kademlia.add_address(&peer_id, addr);
 
-                // Each newly connected peer needs a direct record push. Concurrent connections
-                // share the publication marker; the last close clears it for a reconnect.
-                if self.mark_published_to_peer(peer_id) {
-                    self.publish_our_data_to_peer(peer_id);
-                }
+                // Each accepted physical connection needs its own advertisement, including a
+                // restarted receiver whose old connection with the same identity remains live.
+                self.publish_our_data_to_peer(peer_id, connection_id);
                 // Pull independently of either side's push-cache history. The response
                 // identifies the current BLS key even when it changed while disconnected.
                 self.request_current_record(peer_id);
@@ -2422,12 +2657,13 @@ where
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
 
-                // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
-                if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
-                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                }
+                self.refresh_explicit_peer(&peer_id);
             }
             PeerEvent::Banned(peer_id) => {
+                self.remove_public_gossip_peer(&peer_id);
+                self.public_gossip_peers.as_mut().into_iter().for_each(|peers| {
+                    peers.promoted.remove(&peer_id);
+                });
                 warn!(target: "network", ?peer_id, "peer banned");
                 self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
@@ -2456,6 +2692,9 @@ where
                         let key = node_record_key(&bls_key);
                         let query_id = self.swarm.behaviour_mut().kademlia.get_record(key);
                         self.kad_record_queries.insert(query_id, bls_key.into());
+                        tracing::debug!(target: "network::identity", event = "query_open",
+                            domain = ?self.record_domain, ?query_id, target = ?bls_key,
+                            application = false);
                     } else {
                         trace!(target: "network-kad", ?bls_key, "kad record query already in flight");
                     }
@@ -2484,8 +2723,15 @@ where
                 // Forward the raw stream to the application layer, which reads it
                 // as a typed sync stream.
                 self.swarm.behaviour().peer_manager.peer_to_bls(&peer).map_or_else(
-                    || warn!(target: "network", ?peer, "received inbound stream from unknown peer"),
+                    || {
+                        tracing::debug!(target: "network::identity", event = "stream_identity",
+                            domain = ?self.record_domain, ?peer, outcome = "unidentified");
+                        warn!(target: "network", ?peer, "received inbound stream from unknown peer");
+                    },
                     |bls| {
+                        tracing::debug!(target: "network::identity", event = "stream_identity",
+                            domain = ?self.record_domain, ?peer, bls_key = ?bls,
+                            outcome = "identified");
                         let forwarded = self
                             .event_stream
                             .try_send_outcome(NetworkEvent::InboundStream { peer: bls, stream });
@@ -2519,6 +2765,9 @@ where
 
     /// Process event from kademlia behavior.
     fn process_kad_event(&mut self, event: kad::Event) -> NetworkResult<()> {
+        // Kademlia removes completed, timed-out and closed-target queries before emitting their
+        // terminal event, so this immediately admits waiting live connections into freed slots.
+        self.drain_pending_publications();
         match event {
             kad::Event::InboundRequest { request } => {
                 trace!(target: "network-kad", "inbound {request:?}");
@@ -2559,6 +2808,10 @@ where
                     kad::QueryResult::GetRecord(Ok(kad::GetRecordOk::FoundRecord(
                         kad::PeerRecord { record, peer },
                     ))) => {
+                        tracing::debug!(target: "network::identity",
+                            event = if step.last { "query_terminal" } else { "query_progress" },
+                            domain = ?self.record_domain, ?query_id, outcome = "found_record",
+                            key_bytes = record.key.as_ref().len(), value_bytes = record.value.len());
                         if let Some((key, node_record)) = self.peer_record_valid(&record) {
                             trace!(target: "network-kad", "Got record {key} {node_record:?}");
                             // Only a matching requested key may supply a required store row. Query
@@ -2628,10 +2881,24 @@ where
                     kad::QueryResult::GetRecord(Ok(
                         kad::GetRecordOk::FinishedWithNoAdditionalRecord { cache_candidates },
                     )) => {
+                        tracing::debug!(target: "network::identity", event = "query_terminal",
+                            domain = ?self.record_domain, ?query_id, outcome = "no_additional_record");
                         debug!(target: "network-kad", ?cache_candidates, "FinishedWithNoAdditionalRecord - failed to find record");
                         self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::GetRecord(Err(err)) => {
+                        if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                            let error_class = match &err {
+                                kad::GetRecordError::NotFound {
+                                    key: _key,
+                                    closest_peers: _closest_peers,
+                                } => "not_found",
+                                kad::GetRecordError::Timeout { key: _key } => "timeout",
+                            };
+                            tracing::debug!(target: "network::identity", event = "query_terminal",
+                                domain = ?self.record_domain, ?query_id,
+                                outcome = "get_record_failed", error_class);
+                        }
                         debug!(
                             target: "network-kad",
                             key = ?BlsPublicKey::from_literal_bytes(err.key().as_ref()),
@@ -2641,6 +2908,8 @@ where
                         self.close_kad_query(&query_id);
                     }
                     kad::QueryResult::PutRecord(Ok(kad::PutRecordOk { key })) => {
+                        tracing::debug!(target: "network::identity", event = "publication_outcome",
+                            domain = ?self.record_domain, ?query_id, outcome = "success");
                         debug!(
                             target: "network-kad",
                             key = ?BlsPublicKey::from_literal_bytes(key.as_ref()),
@@ -2648,6 +2917,23 @@ where
                         );
                     }
                     kad::QueryResult::PutRecord(Err(err)) => {
+                        if tracing::enabled!(target: "network::identity", tracing::Level::DEBUG) {
+                            let error_class = match &err {
+                                kad::PutRecordError::QuorumFailed {
+                                    key: _key,
+                                    success: _success,
+                                    quorum: _quorum,
+                                } => "quorum_failed",
+                                kad::PutRecordError::Timeout {
+                                    key: _key,
+                                    success: _success,
+                                    quorum: _quorum,
+                                } => "timeout",
+                            };
+                            tracing::debug!(target: "network::identity", event = "publication_outcome",
+                                domain = ?self.record_domain, ?query_id,
+                                outcome = "failed", error_class);
+                        }
                         debug!(target: "network-kad", "Failed to put record: {err:?}");
                     }
                     kad::QueryResult::StartProviding(Ok(kad::AddProviderOk { key })) => {
@@ -2742,6 +3028,9 @@ where
         mut record: kad::Record,
     ) -> NetworkResult<PutOutcome> {
         // check if source or publisher are banned
+        tracing::debug!(target: "network::identity", event = "advertisement_received",
+            domain = ?self.record_domain, ?source, publisher = ?record.publisher,
+            key_bytes = record.key.as_ref().len(), value_bytes = record.value.len());
         let publisher_is_banned = record
             .publisher
             .map(|peer| self.swarm.behaviour().peer_manager.peer_banned(&peer))
@@ -2750,6 +3039,9 @@ where
 
         // reject record
         if publisher_is_banned || source_is_banned {
+            tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                domain = ?self.record_domain, ?source, publisher_is_banned,
+                source_is_banned, outcome = "banned_or_missing_publisher");
             error!(target: "network-kad", ?publisher_is_banned, ?source_is_banned, ?source, publisher=?record.publisher, "rejecting put request for record");
             // Do NOT `remove_record(&record.key)` on the reject path. Kademlia runs
             // with `StoreInserts::FilterBoth`, so this inbound record was never
@@ -2786,6 +3078,8 @@ where
         // message above the hard cutoff so a sustained flood promptly triggers disconnection.
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
+                tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                    domain = ?self.record_domain, ?source, outcome = "rate_flooding");
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
                 self.swarm
                     .behaviour_mut()
@@ -2794,11 +3088,27 @@ where
                 Ok(PutOutcome::Processed)
             }
             PutRecordRate::Shed => {
+                tracing::debug!(target: "network::identity", event = "advertisement_classified",
+                    domain = ?self.record_domain, ?source, outcome = "rate_shed");
                 trace!(target: "network-kad", ?source, "shedding rate limited put request");
                 Ok(PutOutcome::Shed)
             }
             PutRecordRate::Allowed => {
                 self.peer_record_valid(&record).map(|(key, value)| {
+                    // Publisher validation binds the signed advertised network key. DHT expiry
+                    // still permits a live self-owned identity proof, without storage ownership.
+                    if record.is_expired(Instant::now()) {
+                        let live_self_owned = record.publisher == Some(source)
+                            && self.swarm.is_connected(&source)
+                            && self.swarm.behaviour().peer_manager.is_connected(&source);
+                        if live_self_owned {
+                            self.swarm
+                                .behaviour_mut()
+                                .peer_manager
+                                .confirm_expired_public_identity(source, key, value.info);
+                            self.refresh_public_gossip_identity(&source);
+                        }
+                    } else {
                     // verify record signature and ensure publisher matches record's network key
                     if record.value.len() <= MAX_KAD_PACKET_SIZE {
                         self.verified_peer_records.put(record.key.clone(), record.value.clone());
@@ -2823,6 +3133,8 @@ where
                         true
                     };
                     trace!(target: "network-kad", "Got record {key} {value:?}");
+                    tracing::debug!(target: "network::identity", event = "advertisement_validated",
+                        domain = ?self.record_domain, ?source, bls_key = ?key);
 
                     // Confirm before the fallible store write, including for equal or older records.
                     // The peer manager never reads the store. It caches the record for a committee
@@ -2830,12 +3142,17 @@ where
                     // freshness check waived only while the entry is still a config stub; for any
                     // other key it only confirms the sender's own identity and requires source to
                     // match the advertised one.
+                    let advertised_peer: PeerId = value.info.pubkey.clone().into();
                     self.swarm
                         .behaviour_mut()
                         .peer_manager
                         .add_self_advertised_peer_with_timestamp(
                             source, key, value.info, timestamp, observed,
                         );
+                    self.refresh_public_gossip_identity(&source);
+                    if advertised_peer != source && self.public_gossip_peers.is_some() {
+                        self.refresh_explicit_peer(&advertised_peer);
+                    }
 
                     // Signature and publisher validation preceded confirmation. Only the
                     // authenticated transport source's own live binding gains connection ownership.
@@ -2872,6 +3189,7 @@ where
                             // version. Log only; no penalty.
                             trace!(target: "network-kad", ?source, "ignoring stale but valid kad record");
                         }
+                    }
                     }
                 }).unwrap_or_else(|| {
                     warn!(target: "network-kad", "Received invalid peer record!");
@@ -3015,7 +3333,8 @@ where
         let Some(query) = self.kad_record_queries.get_mut(query_id) else { return };
 
         // ensure returned value matches request
-        if query.query.request == key {
+        let matches_requested_key = query.query.request == key;
+        if matches_requested_key {
             query.consider_with_timestamp(new_record, timestamp, observed);
         } else {
             // assess penalty for returning record that doesn't match key
@@ -3025,8 +3344,33 @@ where
             }
         }
 
-        // handle last step
-        if is_last_step {
+        // Application callers can use the first verified matching record. Cancel the
+        // remaining traversal so unrelated cache candidates cannot delay their reply.
+        // Authority discovery still collects records until the final lookup step.
+        let discovered = matches_requested_key
+            .then_some(())
+            .and(query.query.result.as_ref())
+            .zip(query.timestamp)
+            .map(|(record, timestamp)| (record.info.clone(), timestamp));
+        let application_ready = query.query.reply.is_some() && query.query.result.is_some();
+        discovered.into_iter().for_each(|(info, timestamp)| {
+            let peer: PeerId = info.pubkey.clone().into();
+            self.swarm
+                .behaviour_mut()
+                .peer_manager
+                .add_discovered_peer_with_timestamp(key, info, timestamp);
+            self.refresh_public_gossip_peers();
+            self.refresh_explicit_peer(&peer);
+        });
+        if is_last_step || application_ready {
+            if application_ready {
+                self.swarm
+                    .behaviour_mut()
+                    .kademlia
+                    .query_mut(query_id)
+                    .into_iter()
+                    .for_each(|mut query| query.finish());
+            }
             self.close_kad_query(query_id);
         }
     }
@@ -3052,22 +3396,29 @@ where
     /// [`Self::process_kad_event`]. The query grants no persistent ownership, and third-party
     /// periodic replication is disabled by [`configure_record_jobs`].
     fn close_kad_query(&mut self, query_id: &QueryId) {
-        self.kad_record_queries
-            .remove(query_id)
-            .and_then(|query| {
-                let key = query.query.request;
-                query.into_result().map(|(record, timestamp)| (key, record, timestamp))
-            })
-            .into_iter()
-            .for_each(|(key, node_record, timestamp)| {
+        self.kad_record_queries.remove(query_id).into_iter().for_each(|query| {
+            let PendingKadQuery { query: KadQuery { request, result, reply }, timestamp } = query;
+            tracing::debug!(target: "network::identity", event = "query_close",
+                domain = ?self.record_domain, ?query_id, valid_record = result.is_some(),
+                application = reply.is_some());
+            reply.into_iter().for_each(|reply| {
+                let outcome = result.clone().ok_or_else(|| {
+                    std::io::Error::other("node-record query ended without a valid signed record")
+                        .into()
+                });
+                let _ = reply.send(outcome);
+            });
+            result.zip(timestamp).into_iter().for_each(|(node_record, timestamp)| {
                 let peer: PeerId = node_record.info.pubkey.clone().into();
                 self.swarm.behaviour_mut().peer_manager.add_discovered_peer_with_timestamp(
-                    key,
+                    request,
                     node_record.info,
                     timestamp,
                 );
+                self.refresh_public_gossip_peers();
                 self.refresh_explicit_peer(&peer);
             });
+        });
     }
 }
 
@@ -3108,6 +3459,7 @@ impl PendingKadQuery {
     }
 
     /// Consume the winning record together with its original admission ceiling.
+    #[cfg(test)]
     pub(crate) fn into_result(self) -> Option<(NodeRecord, crate::freshness::RecordTimestamp)> {
         self.query.result.zip(self.timestamp)
     }
@@ -3268,6 +3620,7 @@ fn accepted_gossip_event<Req, Res>(
     message: GossipMessage,
     relayer: Option<BlsPublicKey>,
     author: Option<BlsPublicKey>,
+    receipt: Option<GossipReceipt>,
 ) -> NetworkEvent<Req, Res> {
-    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author }))
+    NetworkEvent::Gossip(Box::new(GossipPayload { message, relayer, author, receipt }))
 }
