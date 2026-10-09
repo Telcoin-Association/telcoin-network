@@ -54,6 +54,11 @@ use crate::{config::UpstreamWorker, proxy::UpstreamOrigin};
 /// to log a heads-up when the shape may have changed.
 const READINESS_VERSION: u32 = 1;
 
+/// Largest readiness body the poller reads, in bytes. The node's payload is a
+/// few dozen bytes per worker; a larger body is a failed poll, so a broken or
+/// hostile health endpoint cannot grow the gateway's memory.
+const MAX_READINESS_BODY_BYTES: usize = 64 * 1024;
+
 /// Mirror of the node's per-worker readiness entry
 /// (`crates/node/src/health.rs`).
 #[derive(Debug, Deserialize)]
@@ -312,10 +317,10 @@ pub(crate) async fn run_poller(
 ) -> Result<(), TaskError> {
     let mut ticker = interval(poll_interval);
     // Skip (do not burst) missed ticks: a cycle that overruns `poll_interval`
-    // (many slow/down upstreams, each bounded by `poll_timeout`, polled
-    // sequentially) must not then fire back-to-back catch-up cycles, which would
-    // pile extra load onto already-failing upstreams. `Skip` keeps at least
-    // `poll_interval` spacing between cycles regardless of cycle duration.
+    // (a hanging upstream with a `poll_timeout` longer than the interval) must
+    // not then fire back-to-back catch-up cycles, which would pile extra load
+    // onto already-failing upstreams. `Skip` keeps at least `poll_interval`
+    // spacing between cycles regardless of cycle duration.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -333,16 +338,20 @@ pub(crate) async fn run_poller(
     Ok(())
 }
 
-/// Run one poll cycle: poll every upstream once and apply each result.
+/// Run one poll cycle: poll every upstream at once, each bounded by
+/// `poll_timeout`, and apply each result as it lands. A cycle lasts at most one
+/// `poll_timeout`, however many upstreams hang, so one hanging upstream cannot
+/// delay the polls of the others.
 ///
 /// [`run_poller`] runs one cycle per tick; tests call it directly to step the
 /// readiness state one cycle at a time.
 async fn poll_cycle(readiness: &GatewayReadiness, client: &Client, poll_timeout: Duration) {
-    for upstream in &readiness.upstreams {
+    let polls = readiness.upstreams.iter().map(|upstream| async move {
         let result =
             poll_one(client, &upstream.readiness_url, upstream.worker_id, poll_timeout).await;
         upstream.record_poll(result, readiness.thresholds);
-    }
+    });
+    futures::future::join_all(polls).await;
 }
 
 /// Poll a single upstream: `Ok` when the worker reports it is accepting
@@ -363,19 +372,31 @@ async fn poll_one(
     }
 }
 
-/// Fetch and parse one upstream's readiness payload.
+/// Fetch and parse one upstream's readiness payload, reading at most
+/// [`MAX_READINESS_BODY_BYTES`] of body.
 async fn fetch_readiness(
     client: &Client,
     url: &Url,
     worker_id: u16,
 ) -> Result<bool, NotReadyCause> {
-    let response = client.get(url.clone()).send().await.map_err(NotReadyCause::connection)?;
+    let mut response = client.get(url.clone()).send().await.map_err(NotReadyCause::connection)?;
     let status = response.status();
     if !status.is_success() {
         return Err(NotReadyCause::Status(status));
     }
-    let bytes = response.bytes().await.map_err(NotReadyCause::connection)?;
-    parse_ready(bytes.as_ref(), worker_id).ok_or(NotReadyCause::MalformedPayload)
+    // refuse a declared oversized body before reading any of it, then bound
+    // the read itself, since a chunked body declares no length
+    if response.content_length().is_some_and(|len| len > MAX_READINESS_BODY_BYTES as u64) {
+        return Err(NotReadyCause::BodyTooLarge);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(NotReadyCause::connection)? {
+        if body.len().saturating_add(chunk.len()) > MAX_READINESS_BODY_BYTES {
+            return Err(NotReadyCause::BodyTooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    parse_ready(&body, worker_id).ok_or(NotReadyCause::MalformedPayload)
 }
 
 /// Parse a readiness payload, returning `Some(accepting)` for the requested
@@ -427,6 +448,8 @@ enum NotReadyCause {
     Connection(&'static str),
     /// The body is not the readiness envelope.
     MalformedPayload,
+    /// The body is larger than [`MAX_READINESS_BODY_BYTES`].
+    BodyTooLarge,
     /// The payload reports the worker as not accepting transactions, or does
     /// not list it.
     NotAccepting,
@@ -457,6 +480,7 @@ impl fmt::Display for NotReadyCause {
             Self::Status(status) => write!(f, "HTTP status {status}"),
             Self::Connection(class) => write!(f, "connection error ({class})"),
             Self::MalformedPayload => f.write_str("malformed payload"),
+            Self::BodyTooLarge => f.write_str("body too large"),
             Self::NotAccepting => f.write_str("worker not accepting transactions"),
             Self::RpcPath => f.write_str("rpc path"),
         }
@@ -466,8 +490,8 @@ impl fmt::Display for NotReadyCause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{response::IntoResponse as _, routing::get, Router};
-    use std::{io, net::SocketAddr, sync::atomic::AtomicU8};
+    use axum::{body::Body, response::IntoResponse as _, routing::get, Router};
+    use std::{io, net::SocketAddr, sync::atomic::AtomicU8, time::Instant};
     use tokio::net::TcpListener;
 
     #[test]
@@ -819,5 +843,96 @@ mod tests {
             readiness.record_rpc_failure(&upstreams[0].rpc_url);
         }
         assert!(readiness.any_ready());
+    }
+
+    #[tokio::test]
+    async fn readiness_polls_run_concurrently() {
+        // three upstreams, each behind its own mock that takes 300 ms to answer
+        let mut upstreams = Vec::new();
+        for worker_id in 0..3u16 {
+            let addr = mock_readiness(Arc::new(AtomicU8::new(SLOW))).await;
+            upstreams.push(upstream_at(worker_id, addr));
+        }
+        let readiness = GatewayReadiness::new(&upstreams, thresholds(3, 1));
+        let client = Client::new();
+
+        let started = Instant::now();
+        poll_cycle(&readiness, &client, Duration::from_secs(2)).await;
+        let elapsed = started.elapsed();
+
+        // polled one after another, the cycle would take at least 900 ms
+        assert!(elapsed < Duration::from_millis(600), "one cycle took {elapsed:?}");
+        assert!(readiness.upstreams.iter().all(UpstreamReadiness::is_ready), "a poll failed");
+    }
+
+    #[tokio::test]
+    async fn oversized_readiness_body_is_a_failed_poll() {
+        /// A ready payload for worker 0, padded to exactly `len` bytes, so
+        /// only the size cap can fail it.
+        fn padded(len: usize) -> String {
+            let head =
+                r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}],"pad":""#;
+            let tail = r#""}"#;
+            format!("{head}{}{tail}", "x".repeat(len - head.len() - tail.len()))
+        }
+        let over_cap = MAX_READINESS_BODY_BYTES + 1;
+        let app = Router::new()
+            .route("/at-cap", get(|| async { padded(MAX_READINESS_BODY_BYTES) }))
+            .route("/declared", get(move || async move { padded(over_cap) }))
+            .route(
+                "/chunked",
+                get(move || async move {
+                    let chunks: Vec<Result<Vec<u8>, io::Error>> = padded(over_cap)
+                        .into_bytes()
+                        .chunks(4096)
+                        .map(|c| Ok(c.to_vec()))
+                        .collect();
+                    Body::from_stream(futures::stream::iter(chunks))
+                }),
+            )
+            .route(
+                "/endless",
+                get(|| async {
+                    Body::from_stream(futures::stream::repeat_with(|| {
+                        Ok::<_, io::Error>(vec![b' '; 4096])
+                    }))
+                }),
+            );
+        let addr = serve_mock(app).await;
+        let client = Client::new();
+        let url = |path: &str| Url::parse(&format!("http://{addr}{path}")).expect("url");
+        let poll = |path: &'static str| {
+            let client = client.clone();
+            let url = url(path);
+            async move { poll_one(&client, &url, 0, Duration::from_secs(2)).await }
+        };
+
+        assert_eq!(poll("/at-cap").await, Ok(()), "a body at the cap is read whole");
+        // refused on its declared length
+        assert_eq!(poll("/declared").await, Err(NotReadyCause::BodyTooLarge));
+        // refused by the bounded read, since a chunked body declares no length
+        let chunked = client.get(url("/chunked")).send().await.expect("send");
+        assert_eq!(chunked.content_length(), None);
+        drop(chunked);
+        assert_eq!(poll("/chunked").await, Err(NotReadyCause::BodyTooLarge));
+        // an endless body shows the read stops at the cap: an unbounded read
+        // would run into the poll timeout instead
+        assert_eq!(
+            poll("/endless").await,
+            Err(NotReadyCause::BodyTooLarge),
+            "the read must stop at the cap"
+        );
+        assert_eq!(NotReadyCause::BodyTooLarge.to_string(), "body too large");
+
+        // and the cycle counts it as a failed poll
+        let upstream = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: Url::parse("http://127.0.0.1:1/").expect("rpc url"),
+            readiness_url: url("/chunked"),
+        };
+        let readiness = GatewayReadiness::new(&[upstream], thresholds(1, 1));
+        readiness.set_ready(0, true);
+        poll_cycle(&readiness, &client, Duration::from_secs(2)).await;
+        assert!(!readiness.any_ready(), "an oversized body must fail the poll");
     }
 }
