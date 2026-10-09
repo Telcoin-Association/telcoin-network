@@ -251,6 +251,15 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST", default_value_t = 0)]
     pub(crate) rate_limit_global_burst: u32,
 
+    /// Sustained gateway-wide rate reserved for requests made only of
+    /// transaction submissions, in requests per second, with a burst of twice
+    /// the rate (default `0` disables it). When set, submissions are metered by
+    /// this budget and every other request by the global rate limit, so a read
+    /// flood that empties the global bucket no longer refuses submissions; the
+    /// per-IP limit still applies to both.
+    #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS", default_value_t = 0)]
+    pub(crate) rate_limit_submissions: u32,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -319,6 +328,8 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_prefix: PrefixPolicy,
     /// Gateway-wide rate limit, or `None` when disabled.
     pub(crate) rate_limit_global: Option<RateLimit>,
+    /// Gateway-wide rate budget for submissions, or `None` when disabled.
+    pub(crate) rate_limit_submissions: Option<RateLimit>,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -436,6 +447,8 @@ impl Cli {
                 self.rate_limit_global,
                 self.rate_limit_global_burst,
             ),
+            // no burst flag: the burst derives like a `0` burst on the others
+            rate_limit_submissions: resolve_rate_limit(self.rate_limit_submissions, 0),
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -819,6 +832,15 @@ mod tests {
             cli_with_flags(&["--rate-limit-per-ip=0", "--rate-limit-global=0"]).into_settings()?;
         assert!(settings.rate_limit_per_ip.is_none());
         assert!(settings.rate_limit_global.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn submission_budget_is_off_by_default_and_derives_its_burst() -> eyre::Result<()> {
+        assert!(cli_with_flags(&[]).into_settings()?.rate_limit_submissions.is_none());
+        let settings = cli_with_flags(&["--rate-limit-submissions=50"]).into_settings()?;
+        let submissions = settings.rate_limit_submissions.expect("submission budget on");
+        assert_eq!((submissions.rate().get(), submissions.burst().get()), (50, 100));
         Ok(())
     }
 

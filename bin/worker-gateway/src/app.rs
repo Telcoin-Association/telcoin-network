@@ -41,6 +41,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_per_ip,
         rate_limit_prefix,
         rate_limit_global,
+        rate_limit_submissions,
         graceful_shutdown_timeout,
         metrics_addr,
     } = settings;
@@ -57,17 +58,21 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     let readiness = Arc::new(GatewayReadiness::new(&upstreams));
 
-    // Edge rate limiters (per-IP and/or global), or `None` when both are
-    // disabled; in that case no rate-limit layer or sweep task is installed.
+    // Edge rate limiters (per-IP, global and the submission budget), or `None`
+    // when all are disabled; in that case no rate-limit layer or sweep task is
+    // installed.
+    let submission_budget = rate_limit_submissions.is_some();
     let rate_limiters = RateLimiters::new(
         rate_limit_per_ip,
         rate_limit_global,
+        rate_limit_submissions,
         DEFAULT_MAX_PER_IP_ENTRIES,
         rate_limit_prefix,
     );
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
+        submission_budget,
         max_request_bytes,
         max_inflight_submissions,
         max_inflight_queries,

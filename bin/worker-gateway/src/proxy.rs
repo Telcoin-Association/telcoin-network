@@ -34,6 +34,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -46,6 +47,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
+    ratelimit::SubmissionBudget,
     server::AppState,
     telemetry,
 };
@@ -106,6 +108,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    submission_budget: Option<Extension<SubmissionBudget>>,
     method: Method,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -154,9 +157,19 @@ pub(crate) async fn proxy(
         return error_response_with_id(&err, id);
     }
 
-    // the class picks the in-flight cap and, with a redirect, the upstream
+    // the class picks the rate budget, the in-flight cap and, with a
+    // redirect, the upstream
     let calls = classify(body.as_ref());
     let class = calls.class();
+
+    // with `--rate-limit-submissions` the edge left the global bucket's verdict
+    // for here: a submission is charged to its own budget whatever that
+    // verdict, and any other request is refused if the global bucket was empty
+    if let Some(Extension(budget)) = &submission_budget {
+        if let Err(err) = budget.charge(class == Class::Submission) {
+            return error_response(&err, body.as_ref());
+        }
+    }
 
     // fail fast rather than queue: a route that has used up its slots (a
     // stalled query upstream, say) must not hold connections the other route

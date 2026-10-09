@@ -669,6 +669,7 @@ mod tests {
         let limiters = RateLimiters::new(
             None,
             Some(RateLimit::new(nz(1), nz(1))),
+            None,
             16,
             PrefixPolicy::default(),
         )
@@ -705,6 +706,7 @@ mod tests {
         let limiters = RateLimiters::new(
             None,
             Some(RateLimit::new(nz(1), nz(1))),
+            None,
             16,
             PrefixPolicy::default(),
         )
@@ -1664,5 +1666,65 @@ mod tests {
         // submission still gets its answer
         let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 5)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+    }
+
+    /// A gateway with a ready worker answering `worker` and a global limit of
+    /// one request (no refill within the test), plus a submission budget when
+    /// `submissions` is given.
+    async fn one_token_gateway(
+        submissions: Option<RateLimit>,
+    ) -> (SocketAddr, Seen, [Notifier; 2]) {
+        let (worker, worker_seen, worker_server) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            submissions,
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (gateway, gateway_server) =
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+        (gateway, worker_seen, [worker_server, gateway_server])
+    }
+
+    #[tokio::test]
+    async fn submission_budget_admits_when_global_is_exhausted() {
+        let (gateway, worker_seen, _servers) =
+            one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
+
+        // a read spends the global bucket's only token
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // a submission still gets through, on its own budget
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // a second read is refused, with its id
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&text), (-32006, serde_json::json!(3)));
+        assert_eq!(worker_seen.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_submission_budget_the_edge_check_is_unchanged() {
+        let (gateway, worker_seen, _servers) = one_token_gateway(None).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // the edge refuses whatever the request holds, before reading its body
+        // (so the id is not echoed), as `over_limit_request_gets_jsonrpc_429`
+        // pins for a read
+        for body in [call("eth_sendRawTransaction", 2), call("eth_chainId", 3)] {
+            let (status, text) = post_rpc(gateway, None, body).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(error_code_and_id(&text), (-32006, serde_json::Value::Null));
+        }
+        assert_eq!(worker_seen.hits(), 1);
     }
 }
