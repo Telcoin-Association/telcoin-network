@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
@@ -1198,7 +1199,7 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
-/// Trusted peers retain load privileges while authenticated protocol faults remain bannable.
+/// Trusted peers bypass load penalties but remain eligible for protocol bans.
 #[tokio::test]
 async fn test_add_trusted_peer() -> eyre::Result<()> {
     let config = ScoreConfig::default();

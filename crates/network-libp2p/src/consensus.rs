@@ -3222,7 +3222,8 @@ where
     /// costs a row decode, merge, re-encode, insert, and a physical MDBX commit,
     /// and repeating `AddProvider` for an already-stored key skips the store's
     /// capacity gate, so an unbounded stream would run that work at line rate;
-    /// over-budget messages are dropped with a [`Penalty::Medium`]. Second, the
+    /// over-budget messages are dropped with `Penalty::Load(LoadPenalty::KademliaRateLimit)`
+    /// at Medium weight. Second, the
     /// expected capacity rejection is logged at `debug!` and never propagated:
     /// once the provider table saturates, `MaxProvidedKeys` is remotely
     /// triggerable, so propagating it would amplify a flood in the run-loop's

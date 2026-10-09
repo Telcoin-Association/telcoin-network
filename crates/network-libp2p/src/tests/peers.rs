@@ -1391,27 +1391,15 @@ fn test_committee_rotation_revokes_validator_exemption() {
     assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
 }
 
-/// Trusted and committee peers retain load privileges while protocol bans survive rotation.
+/// Operator trust preserves protocol bans, but promotion to any committee slot restores liveness.
 #[test]
-fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), NetworkError> {
-    // This regression exercises the two policies with load exemptions.
-    enum LoadExemptBasis {
-        Operator,
-        Validator,
-    }
-
-    [LoadExemptBasis::Operator, LoadExemptBasis::Validator].into_iter().try_for_each(|basis| {
+fn test_committee_promotion_forgives_protocol_bans() -> Result<(), NetworkError> {
+    (0..3).try_for_each(|slot| {
         let mut all_peers =
             AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
         let mut rng = StdRng::from_seed([46; 32]);
         let (bls, net, peer_id) = committee_member(&mut rng);
-        match basis {
-            LoadExemptBasis::Operator => all_peers.add_trusted_peer(bls, net.clone()),
-            LoadExemptBasis::Validator => {
-                all_peers.upsert_peer(bls, net.clone(), vec![]);
-                all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
-            }
-        }
+        all_peers.add_trusted_peer(bls, net.clone());
         let before = all_peers
             .get_peer(&peer_id)
             .ok_or(NetworkError::PeerMissing)?
@@ -1432,14 +1420,46 @@ fn test_privileged_protocol_bans_survive_committee_updates() -> Result<(), Netwo
         let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
         assert!(action.is_ban());
         assert!(all_peers.peer_banned(&peer_id));
-        assert!(all_peers
-            .update_committees(HashSet::from([bls]), HashSet::new(), HashSet::new())
-            .is_empty());
+        all_peers.add_trusted_peer(bls, net);
+        assert!(all_peers.peer_banned(&peer_id), "operator trust must preserve protocol bans");
+        let members = |candidate| {
+            if slot == candidate {
+                HashSet::from([bls])
+            } else {
+                HashSet::new()
+            }
+        };
+        let actions = all_peers.update_committees(members(0), members(1), members(2));
+        assert_eq!(actions.len(), 1, "promotion must emit the swarm unban action");
+        assert!(!all_peers.peer_banned(&peer_id));
+        assert!(all_peers.can_dial(&peer_id));
+        assert_eq!(all_peers.banned_peers.total(), 0);
+        let primed = all_peers
+            .get_peer(&peer_id)
+            .ok_or(NetworkError::PeerMissing)?
+            .score()
+            .aggregate_score();
+        (0..120).for_each(|_| {
+            [Penalty::Mild, Penalty::Medium, Penalty::Severe, Penalty::Fatal].into_iter().for_each(
+                |penalty| {
+                    assert!(!all_peers.process_penalty(&peer_id, penalty).is_ban());
+                },
+            );
+        });
+        assert_eq!(
+            all_peers
+                .get_peer(&peer_id)
+                .ok_or(NetworkError::PeerMissing)?
+                .score()
+                .aggregate_score(),
+            primed
+        );
+        assert!(!all_peers.peer_banned(&peer_id));
         assert!(all_peers.apply_membership_if_committee(bls).is_empty());
         assert!(all_peers.mark_committee_for_dial(HashSet::from([bls])).is_empty());
-        assert!(all_peers.peer_banned(&peer_id), "trust must not forgive a protocol ban");
-        all_peers.add_trusted_peer(bls, net);
-        assert!(all_peers.peer_banned(&peer_id), "trust reload must not forgive a protocol ban");
+        all_peers.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+        assert!(all_peers.process_penalty(&peer_id, Penalty::Fatal).is_ban());
+        assert!(all_peers.peer_banned(&peer_id), "committee exit restores protocol scoring");
         assert_eq!(all_peers.banned_peers.total(), 1);
         Ok(())
     })

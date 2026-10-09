@@ -34,6 +34,16 @@ pub(super) enum LoadScoring {
     Exempt,
 }
 
+/// Treatment of protocol penalties while validator connectivity is required for liveness.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ProtocolScoring {
+    /// Apply protocol penalties, including to operator-trusted peers outside the committee.
+    #[default]
+    Apply,
+    /// Preserve the scoring exemption for the previous, current, and next committees.
+    CommitteeExempt,
+}
+
 /// A live source of peer privileges; overlapping sources compose independently.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum TrustBasis {
@@ -47,7 +57,7 @@ pub(super) enum TrustBasis {
     Validator,
 }
 
-/// Independent admission, retention, and load-scoring decisions for one peer.
+/// Independent admission, retention, load-scoring, and protocol-scoring decisions for one peer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct PeerPolicy {
     /// Configured admission eligibility.
@@ -56,6 +66,8 @@ pub(super) struct PeerPolicy {
     retention: Retention,
     /// Temporary overload treatment, independent of protocol penalties.
     load_scoring: LoadScoring,
+    /// Committee liveness protection, independent of operator trust.
+    protocol_scoring: ProtocolScoring,
 }
 
 impl PeerPolicy {
@@ -71,10 +83,17 @@ impl PeerPolicy {
             TrustBasis::DaoObserver => {
                 Self { admission: Admission::Authorized, retention: Retention::Protected, ..self }
             }
-            TrustBasis::Operator | TrustBasis::Validator => Self {
+            TrustBasis::Operator => Self {
                 admission: Admission::Authorized,
                 retention: Retention::Protected,
                 load_scoring: LoadScoring::Exempt,
+                ..self
+            },
+            TrustBasis::Validator => Self {
+                admission: Admission::Authorized,
+                retention: Retention::Protected,
+                load_scoring: LoadScoring::Exempt,
+                protocol_scoring: ProtocolScoring::CommitteeExempt,
             },
         }
     }
@@ -96,7 +115,8 @@ impl PeerPolicy {
 
     /// Whether the score model should apply an attributable penalty.
     pub(super) fn applies(self, penalty: Penalty) -> bool {
-        !penalty.is_load() || self.load_scoring == LoadScoring::Apply
+        self.protocol_scoring == ProtocolScoring::Apply
+            && (!penalty.is_load() || self.load_scoring == LoadScoring::Apply)
     }
 }
 
@@ -104,7 +124,7 @@ impl PeerPolicy {
 mod tests {
     use super::{
         super::penalty::{LoadPenalty, Penalty},
-        Admission, LoadScoring, PeerPolicy, Retention, TrustBasis,
+        Admission, LoadScoring, PeerPolicy, ProtocolScoring, Retention, TrustBasis,
     };
 
     /// Ordinary, bootstrap, trusted, and all three committee slots have explicit privileges.
@@ -172,13 +192,18 @@ mod tests {
         });
     }
 
-    /// Every possible privilege combination keeps authenticated protocol failures scoreable.
+    /// Admission, retention, and load privileges alone do not suppress protocol penalties.
     #[test]
     fn protocol_penalties_ignore_privileges() {
         [Admission::Discovery, Admission::Authorized].into_iter().for_each(|admission| {
             [Retention::Ordinary, Retention::Protected].into_iter().for_each(|retention| {
                 [LoadScoring::Apply, LoadScoring::Exempt].into_iter().for_each(|load_scoring| {
-                    let policy = PeerPolicy { admission, retention, load_scoring };
+                    let policy = PeerPolicy {
+                        admission,
+                        retention,
+                        load_scoring,
+                        protocol_scoring: ProtocolScoring::Apply,
+                    };
                     [Penalty::Mild, Penalty::Medium, Penalty::Severe, Penalty::Fatal]
                         .into_iter()
                         .for_each(|penalty| assert!(policy.applies(penalty)));
@@ -187,12 +212,47 @@ mod tests {
         });
     }
 
+    /// Committee protection survives overlapping trust in either grant order and ends on exit.
+    #[test]
+    fn committee_scoring_exemption() {
+        [
+            vec![TrustBasis::Validator],
+            vec![TrustBasis::Operator, TrustBasis::Validator],
+            vec![TrustBasis::DaoObserver, TrustBasis::Validator],
+            vec![TrustBasis::Validator, TrustBasis::DaoObserver],
+            vec![TrustBasis::Validator, TrustBasis::Operator, TrustBasis::Bootstrap],
+        ]
+        .into_iter()
+        .for_each(|bases| {
+            let policy = PeerPolicy::from_bases(bases);
+            [
+                Penalty::Mild,
+                Penalty::Medium,
+                Penalty::Severe,
+                Penalty::Fatal,
+                Penalty::Load(LoadPenalty::KademliaFlood),
+            ]
+            .into_iter()
+            .for_each(|penalty| assert!(!policy.applies(penalty)));
+        });
+        let after_exit = PeerPolicy::from_bases([TrustBasis::Operator]);
+        assert!(after_exit.applies(Penalty::Fatal));
+        assert!(!after_exit.applies(Penalty::Load(LoadPenalty::KademliaFlood)));
+    }
+
     /// Recomputing from live bases revokes committee privileges without removing operator trust.
     #[test]
     fn overlapping_bases_and_rotation() {
         let trusted = PeerPolicy::from_bases([TrustBasis::Operator]);
-        assert_eq!(PeerPolicy::from_bases([TrustBasis::Operator, TrustBasis::Validator]), trusted);
-        assert_eq!(PeerPolicy::from_bases([TrustBasis::Validator, TrustBasis::Operator]), trusted);
+        let validator = PeerPolicy::from_bases([TrustBasis::Validator]);
+        assert_eq!(
+            PeerPolicy::from_bases([TrustBasis::Operator, TrustBasis::Validator]),
+            validator
+        );
+        assert_eq!(
+            PeerPolicy::from_bases([TrustBasis::Validator, TrustBasis::Operator]),
+            validator
+        );
         assert_eq!(PeerPolicy::from_bases([TrustBasis::Operator, TrustBasis::Bootstrap]), trusted);
         assert_eq!(PeerPolicy::from_bases([TrustBasis::Bootstrap, TrustBasis::Operator]), trusted);
         assert!(!PeerPolicy::from_bases([]).protects_retention());

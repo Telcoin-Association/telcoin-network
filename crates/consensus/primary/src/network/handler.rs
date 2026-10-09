@@ -833,8 +833,8 @@ where
             ))))
         } else {
             // tier 3: further ahead than the tolerance plus the time a vote request stays open,
-            // more than ordinary clock skew explains. reject this header for good: `Self::vote`
-            // caches the error for its digest and the network layer charges a severe penalty
+            // reject this header for good: `Self::vote` caches the error for its digest.
+            // Clock skew can be local to either peer, so rejection carries no score penalty.
             warn!(
                 target: "primary",
                 "Rejected header {:?} due to timestamp {created_at} ms newer than {now} ms",
