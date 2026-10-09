@@ -75,6 +75,9 @@ pub(crate) struct AppState {
     /// In-flight cap for every other request (`--max-inflight-queries`); see
     /// [`inflight_slots`].
     pub(crate) query_slots: Arc<Semaphore>,
+    /// Cap on concurrent requests forwarded to a worker
+    /// (`--max-upstream-inflight`); see [`inflight_slots`].
+    pub(crate) upstream_slots: Arc<Semaphore>,
 }
 
 /// The semaphore behind an in-flight cap of `cap` requests, where `0` means
@@ -395,6 +398,7 @@ mod tests {
             query_upstream: None,
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
         }
     }
 
@@ -986,6 +990,7 @@ mod tests {
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
         }
     }
 
@@ -1464,5 +1469,148 @@ mod tests {
         // the refused read never reached either upstream
         assert_eq!(saturated.query_hits.load(Ordering::SeqCst), 4);
         assert_eq!(saturated.worker_seen.hits(), 0);
+    }
+
+    /// A worker mock that holds every request until the gate opens, tracking
+    /// how many it holds at once and the most it ever held.
+    struct GatedWorker {
+        addr: SocketAddr,
+        in_flight: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        /// Send `true` to answer every held request (and any later one).
+        gate: tokio::sync::watch::Sender<bool>,
+        /// Keeps the mock alive.
+        _server: Notifier,
+    }
+
+    async fn gated_worker() -> GatedWorker {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let (gate, opened) = tokio::sync::watch::channel(false);
+        let (current, most) = (Arc::clone(&in_flight), Arc::clone(&peak));
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let (current, most, mut opened) =
+                    (Arc::clone(&current), Arc::clone(&most), opened.clone());
+                async move {
+                    let held = current.fetch_add(1, Ordering::SeqCst) + 1;
+                    most.fetch_max(held, Ordering::SeqCst);
+                    // a dropped sender also lets the request through
+                    let _ = opened.wait_for(|open| *open).await;
+                    current.fetch_sub(1, Ordering::SeqCst);
+                    "worker"
+                }
+            }),
+        );
+        let (addr, server) = spawn(mock).await;
+        GatedWorker { addr, in_flight, peak, gate, _server: server }
+    }
+
+    #[tokio::test]
+    async fn submissions_keep_worker_slots_without_a_redirect() {
+        // a worker that answers submissions and never answers anything else
+        let mock = Router::new().route(
+            "/",
+            post(|body: String| async move {
+                if !body.contains("eth_sendRawTransaction") {
+                    future::pending::<()>().await;
+                }
+                "worker"
+            }),
+        );
+        let (worker, _worker_server) = spawn(mock).await;
+        let mut state = redirect_state(worker, None);
+        // a worker cap of 5 without a redirect gives reads a cap of 4 (see
+        // `effective_query_cap` in cli.rs)
+        state.upstream_slots = inflight_slots(5);
+        state.query_slots = inflight_slots(4);
+        state.readiness.set_ready(0, true);
+        let upstream_slots = Arc::clone(&state.upstream_slots);
+        let (gateway, _gateway_server) = spawn(test_router(state)).await;
+
+        for id in 100_u64..104 {
+            tokio::spawn(post_rpc(gateway, None, call("eth_getLogs", id)));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while upstream_slots.available_permits() > 1 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the four stalled reads should hold four worker slots");
+
+        // a fifth read is over the query cap and is refused at once
+        let (status, text) = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_rpc(gateway, None, call("eth_getLogs", 5)),
+        )
+        .await
+        .expect("an over-cap read must not wait");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text), (-32009, serde_json::json!(5)));
+
+        // reads cannot reach the last worker slot, so a submission gets it
+        let (status, text) = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_rpc(gateway, None, call("eth_sendRawTransaction", 1)),
+        )
+        .await
+        .expect("a submission must not wait behind stalled reads");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+    }
+
+    #[tokio::test]
+    async fn worker_never_sees_more_than_max_upstream_inflight() {
+        let worker = gated_worker().await;
+        let mut state = redirect_state(worker.addr, None);
+        state.upstream_slots = inflight_slots(2);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // ten concurrent submissions, each reporting its outcome as it lands
+        let (done, mut outcomes) = tokio::sync::mpsc::unbounded_channel();
+        let client = Client::new();
+        for id in 1..=10_u64 {
+            let request =
+                client.post(format!("http://{gateway}/")).body(call("eth_sendRawTransaction", id));
+            let done = done.clone();
+            tokio::spawn(async move {
+                let response = request.send().await.expect("send");
+                let status = response.status();
+                let _ = done.send((status, response.text().await.expect("text"), id));
+            });
+        }
+
+        // the worker answers nothing until the gate opens, so the eight
+        // submissions over the cap can only land now if they did not wait
+        // for a slot
+        for _ in 0..8 {
+            let (status, text, id) = tokio::time::timeout(Duration::from_secs(5), outcomes.recv())
+                .await
+                .expect("an over-cap submission must not wait for a worker slot")
+                .expect("outcome");
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+            assert_eq!(error_code_and_id(&text), (-32009, serde_json::json!(id)));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker.in_flight.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the two admitted submissions should reach the worker");
+        assert_eq!(worker.peak.load(Ordering::SeqCst), 2);
+
+        // opening the gate answers the two that held a slot
+        worker.gate.send_replace(true);
+        for _ in 0..2 {
+            let (status, text, _) = tokio::time::timeout(Duration::from_secs(5), outcomes.recv())
+                .await
+                .expect("the admitted submissions should be answered")
+                .expect("outcome");
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        }
+        assert!(worker.peak.load(Ordering::SeqCst) <= 2);
     }
 }

@@ -105,6 +105,7 @@ Every flag has an environment-variable fallback.
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). |
+| `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
@@ -352,6 +353,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 | `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
+| `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also

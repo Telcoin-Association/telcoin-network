@@ -20,7 +20,9 @@
 //! `--max-inflight-submissions` and everything else against
 //! `--max-inflight-queries`. A request whose class has no free slot is answered
 //! at once with a `503` overload error instead of waiting, so a stalled route
-//! cannot pile up connections that the other route needs.
+//! cannot pile up connections that the other route needs. A forward to a
+//! worker also takes a slot on `--max-upstream-inflight`, the same way, which
+//! bounds this gateway's share of the worker's RPC connection limit.
 
 use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
 
@@ -190,6 +192,22 @@ pub(crate) async fn proxy(
                 return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
             }
         },
+    };
+
+    // every gateway in front of a worker draws on its one rpc connection
+    // limit, so this gateway holds at most `--max-upstream-inflight` of it,
+    // failing fast like the class caps above. unlike the class slot, this one
+    // is released at the response head: the worker frees its own permit once
+    // it has built the response, before the body is written.
+    let _upstream_slot = match route {
+        Route::Worker => match telemetry::InFlightSlot::upstream(&state.upstream_slots) {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(target: "gateway::proxy", "worker in-flight cap reached; rejecting request");
+                return error_response(&GatewayError::Overloaded, body.as_ref());
+            }
+        },
+        Route::Query => None,
     };
 
     match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)

@@ -27,7 +27,8 @@
 //!
 //! [`InFlightSlot`] pairs a held in-flight permit with the gauge that counts
 //! it, so `tn_worker_gateway_route_inflight{route}` always equals the permits
-//! held on that route's cap.
+//! held on that route's cap, and `tn_worker_gateway_upstream_inflight` the
+//! permits held on the cap of concurrent requests to the worker.
 
 use std::{sync::Arc, time::Instant};
 
@@ -65,6 +66,10 @@ const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
 /// Requests holding a slot on their class's in-flight cap, by `route`
 /// (`submission` or `query`).
 const ROUTE_INFLIGHT: &str = "tn_worker_gateway_route_inflight";
+
+/// Requests this gateway is forwarding to a worker right now, under
+/// `--max-upstream-inflight`.
+const UPSTREAM_INFLIGHT: &str = "tn_worker_gateway_upstream_inflight";
 
 /// RAII guard covering one proxied request.
 ///
@@ -112,6 +117,12 @@ impl InFlightSlot {
     /// or `query`) without waiting, or `None` when every slot is taken.
     pub(crate) fn route(slots: &Arc<Semaphore>, route: &'static str) -> Option<Self> {
         Self::try_acquire(slots, || gauge!(ROUTE_INFLIGHT, "route" => route))
+    }
+
+    /// Take a slot on the cap of concurrent requests to the worker without
+    /// waiting, or `None` when every slot is taken.
+    pub(crate) fn upstream(slots: &Arc<Semaphore>) -> Option<Self> {
+        Self::try_acquire(slots, || gauge!(UPSTREAM_INFLIGHT))
     }
 
     /// Take a permit from `slots` without waiting and raise the gauge `gauge`

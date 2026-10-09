@@ -33,6 +33,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_connections,
         max_inflight_submissions,
         max_inflight_queries,
+        max_upstream_inflight,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
@@ -69,6 +70,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_request_bytes,
         max_inflight_submissions,
         max_inflight_queries,
+        max_upstream_inflight,
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
@@ -129,6 +131,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         query_upstream,
         submission_slots: inflight_slots(max_inflight_submissions),
         query_slots: inflight_slots(max_inflight_queries),
+        upstream_slots: inflight_slots(max_upstream_inflight),
     };
 
     spawner.spawn_critical_task(

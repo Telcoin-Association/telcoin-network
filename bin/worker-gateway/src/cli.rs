@@ -121,11 +121,29 @@ pub(crate) struct Cli {
     pub(crate) max_inflight_submissions: usize,
 
     /// Maximum in-flight requests of every other kind, mixed batches included
-    /// (default 256; `0` means unlimited). A request over the cap is answered
-    /// at once with a `503` overload error instead of waiting, so a stalled
-    /// query upstream cannot take the connection slots submissions need.
-    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_QUERIES", default_value_t = 256)]
-    pub(crate) max_inflight_queries: usize,
+    /// (default 256, or the ceiling below without `--redirect-queries`; `0`
+    /// means unlimited). A request over the cap is answered at once with a
+    /// `503` overload error instead of waiting, so a stalled query upstream
+    /// cannot take the connection slots submissions need; keep it below
+    /// `--max-connections` (the gateway warns at startup otherwise).
+    /// Without `--redirect-queries` every read is forwarded to the worker, so
+    /// the cap is lowered at startup to at most `--max-upstream-inflight` less
+    /// a fifth of it (at least one slot is held back, but the cap stays at
+    /// least 1); `0` counts as above that ceiling, and lowering a value set
+    /// here logs a warning. The slots held back stay free for submissions.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_INFLIGHT_QUERIES")]
+    pub(crate) max_inflight_queries: Option<usize>,
+
+    /// Maximum concurrent requests this gateway forwards to the worker
+    /// (default 100; `0` means unlimited). A request for the worker over the
+    /// cap is answered at once with a `503` overload error instead of waiting.
+    /// Every gateway in front of a worker shares its `--rpc.max-connections`
+    /// (500 by default), so keep the number of gateways times this cap below
+    /// it. Without `--redirect-queries`, reads may hold at most this cap less a
+    /// fifth of it (at least one slot), so the rest stays free for submissions
+    /// (see `--max-inflight-queries`).
+    #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
+    pub(crate) max_upstream_inflight: usize,
 
     /// Transport-stall deadline for inbound connections (`TCP_USER_TIMEOUT`):
     /// a connection whose peer leaves written response data unacknowledged, or
@@ -264,8 +282,11 @@ pub(crate) struct Settings {
     pub(crate) max_connections: NonZeroUsize,
     /// In-flight cap for submission requests (`0` = unlimited).
     pub(crate) max_inflight_submissions: usize,
-    /// In-flight cap for every other request (`0` = unlimited).
+    /// In-flight cap for every other request (`0` = unlimited), as lowered by
+    /// [`effective_query_cap`].
     pub(crate) max_inflight_queries: usize,
+    /// Cap on concurrent requests forwarded to the worker (`0` = unlimited).
+    pub(crate) max_upstream_inflight: usize,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
     /// or `None` when disabled.
     pub(crate) tcp_user_timeout: Option<Duration>,
@@ -326,6 +347,34 @@ impl Cli {
             );
             Ok(())
         })?;
+        let requested_queries = self.max_inflight_queries.unwrap_or(DEFAULT_MAX_INFLIGHT_QUERIES);
+        let max_inflight_queries = effective_query_cap(
+            requested_queries,
+            self.max_upstream_inflight,
+            query_upstream.is_some(),
+        );
+        // lowering the default is the documented behaviour; lowering a value
+        // the operator chose is worth a warning
+        if self.max_inflight_queries.is_some() && max_inflight_queries != requested_queries {
+            warn!(
+                target: "gateway",
+                max_inflight_queries = requested_queries,
+                max_upstream_inflight = self.max_upstream_inflight,
+                effective = max_inflight_queries,
+                "without --redirect-queries reads share --max-upstream-inflight with submissions; \
+                 lowering --max-inflight-queries so a fifth of the worker slots stays free for \
+                 submissions"
+            );
+        }
+        if query_cap_reaches_connections(max_inflight_queries, self.max_connections) {
+            warn!(
+                target: "gateway",
+                max_inflight_queries,
+                max_connections = self.max_connections.get(),
+                "--max-inflight-queries is unlimited or not below --max-connections; a saturated \
+                 query route can then hold every connection and starve submissions"
+            );
+        }
         let rate_limit_prefix = resolve_prefix_policy(
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
@@ -341,7 +390,8 @@ impl Cli {
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
             max_inflight_submissions: self.max_inflight_submissions,
-            max_inflight_queries: self.max_inflight_queries,
+            max_inflight_queries,
+            max_upstream_inflight: self.max_upstream_inflight,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
@@ -388,6 +438,40 @@ impl Cli {
 /// flag's disabled sentinel, mirroring the `0`-disables rate-limit flags).
 fn resolve_optional_duration(value: Duration) -> Option<Duration> {
     (!value.is_zero()).then_some(value)
+}
+
+/// `--max-inflight-queries` when it is not set (before [`effective_query_cap`]).
+const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 256;
+
+/// The query cap the gateway enforces for `--max-inflight-queries`.
+///
+/// Without a redirect every read is a forward to the worker, so the query cap
+/// is also the reads' share of `--max-upstream-inflight`. Left at or above the
+/// worker cap, reads alone could hold every worker slot and every submission
+/// would be refused with `503`. The cap is therefore lowered to the worker cap
+/// less a fifth of it (at least one slot), never below 1 since `0` means
+/// unlimited; an unlimited query cap counts as above that ceiling. With a
+/// redirect, or an unlimited worker cap, the value is kept as given.
+fn effective_query_cap(
+    max_inflight_queries: usize,
+    max_upstream_inflight: usize,
+    redirect: bool,
+) -> usize {
+    if redirect || max_upstream_inflight == 0 {
+        return max_inflight_queries;
+    }
+    let reserve = (max_upstream_inflight / 5).max(1);
+    let ceiling = max_upstream_inflight.saturating_sub(reserve).max(1);
+    match max_inflight_queries {
+        0 => ceiling,
+        cap => cap.min(ceiling),
+    }
+}
+
+/// Whether a query cap of `cap` (`0` = unlimited) lets a saturated query route
+/// take every inbound connection, leaving none for submissions.
+fn query_cap_reaches_connections(cap: usize, max_connections: NonZeroUsize) -> bool {
+    cap == 0 || cap >= max_connections.get()
 }
 
 /// Turn a `(rate, burst)` flag pair into a [`RateLimit`], or `None` when the
@@ -749,17 +833,57 @@ mod tests {
     #[test]
     fn inflight_caps_default_on_and_zero_means_unlimited() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
-        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (256, 256));
+        // without a redirect the query cap keeps a fifth of the worker cap back
+        assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (256, 80));
+        assert_eq!(settings.max_upstream_inflight, 100);
 
-        let settings =
-            cli_with_flags(&["--max-inflight-submissions=0", "--max-inflight-queries=4"])
-                .into_settings()?;
+        let settings = cli_with_flags(&[
+            "--max-inflight-submissions=0",
+            "--max-inflight-queries=4",
+            "--max-upstream-inflight=0",
+        ])
+        .into_settings()?;
         assert_eq!((settings.max_inflight_submissions, settings.max_inflight_queries), (0, 4));
+        assert_eq!(settings.max_upstream_inflight, 0);
         assert_eq!(
             crate::server::inflight_slots(settings.max_inflight_submissions).available_permits(),
             tokio::sync::Semaphore::MAX_PERMITS
         );
         Ok(())
+    }
+
+    #[test]
+    fn without_a_redirect_reads_leave_a_fifth_of_the_worker_slots() -> eyre::Result<()> {
+        let query_cap = |flags: &[&str]| -> eyre::Result<usize> {
+            Ok(cli_with_flags(flags).into_settings()?.max_inflight_queries)
+        };
+        // the default worker cap of 100 keeps 20 slots back from reads
+        assert_eq!(query_cap(&[])?, 80);
+        // a cap at or below the ceiling is kept; unlimited is lowered
+        assert_eq!(query_cap(&["--max-inflight-queries=50"])?, 50);
+        assert_eq!(query_cap(&["--max-inflight-queries=80"])?, 80);
+        assert_eq!(query_cap(&["--max-inflight-queries=0"])?, 80);
+        assert_eq!(query_cap(&["--max-inflight-queries=256"])?, 80);
+        assert_eq!(query_cap(&["--max-upstream-inflight=5"])?, 4);
+        // at least one slot is held back, and the cap never drops to 0
+        assert_eq!(query_cap(&["--max-upstream-inflight=2"])?, 1);
+        assert_eq!(query_cap(&["--max-upstream-inflight=1"])?, 1);
+        // an unlimited worker cap leaves nothing to share
+        assert_eq!(query_cap(&["--max-upstream-inflight=0"])?, 256);
+        assert_eq!(query_cap(&["--max-upstream-inflight=0", "--max-inflight-queries=0"])?, 0);
+        // with a redirect reads never take a worker slot
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        assert_eq!(query_cap(&[redirect])?, 256);
+        assert_eq!(query_cap(&[redirect, "--max-inflight-queries=0"])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn query_cap_warning_covers_unlimited_and_the_connection_cap() {
+        let connections = NonZeroUsize::new(500).expect("nonzero");
+        for (cap, warns) in [(0, true), (80, false), (499, false), (500, true), (600, true)] {
+            assert_eq!(query_cap_reaches_connections(cap, connections), warns, "{cap}");
+        }
     }
 
     #[test]
