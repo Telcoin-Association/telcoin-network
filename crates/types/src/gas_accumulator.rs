@@ -486,6 +486,14 @@ pub struct WorkerBaseFee {
 }
 
 impl WorkerBaseFee {
+    /// Whether this worker still has a slot in the current epoch's accumulator.
+    ///
+    /// Resolve membership on every call so retained RPC modules stop admitting transactions
+    /// immediately on shrink and can admit again when the same worker id is reactivated.
+    pub fn is_active(&self) -> bool {
+        self.accumulator.inner.read().get(usize::from(self.worker_id)).is_some()
+    }
+
     /// Return the worker's current epoch base fee from the slot the accumulator holds now.
     pub fn base_fee(&self) -> u64 {
         let inner = self.accumulator.inner.read();

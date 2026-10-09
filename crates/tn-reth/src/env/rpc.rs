@@ -308,14 +308,16 @@ impl RethEnv {
         // drove its answer to the 500-gwei clamp on adiri (issue #1305).
         let gas_price = GasPriceWithEpochBaseFee::new(base_fee.clone());
         // Simulations use the same epoch fee as quotes and pool admission (#1348).
-        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee);
+        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone());
         // Guard the eth submission methods with the operator's `--rpc.txfeecap` (issue
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
-        // RPC boundary and then delegates to these same reth handlers.
+        // RPC boundary and then delegates to these same reth handlers. The same guard checks
+        // live worker membership before decoding, even while a removed listener is draining.
         let fee_cap_guard = EthSubmitWithCap::new(
             eth_api.clone(),
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
+            base_fee,
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
         // `tn` is selected like reth's modules; it is in the default set and always on IPC.
@@ -431,6 +433,99 @@ mod tests {
             )
             .expect("rpc server with fee-cap guard");
         (server.methods_by(|name| name.starts_with("eth_send")), pool, chain)
+    }
+
+    /// Build production submission handlers backed by one live worker slot and its retained pool.
+    ///
+    /// Disable the fee cap to verify that worker removal independently closes admission.
+    fn submission_methods_for_worker(
+        accumulator: &GasAccumulator,
+        worker_id: WorkerId,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<(Methods, WorkerTxPool, Arc<RethChainSpec>)> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            task_manager,
+            None,
+            reth::args::RpcServerArgs { rpc_tx_fee_cap: 0, ..Default::default() },
+        )?;
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(worker_id))?;
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        reth_env
+            .get_rpc_server(
+                pool.clone(),
+                network,
+                accumulator.worker_base_fee(worker_id),
+                RpcModule::new(()),
+            )
+            .map(|server| (server.methods_by(|name| name.starts_with("eth_send")), pool, chain))
+    }
+
+    /// Shrink closes raw admission before listener shutdown; retained modules reopen on regrow.
+    #[tokio::test]
+    async fn test_removed_worker_rejects_raw_transaction() -> eyre::Result<()> {
+        let removed_dir = TempDir::new()?;
+        let active_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let (removed, removed_pool, chain) =
+            submission_methods_for_worker(&accumulator, 1, &tasks, &removed_dir)?;
+        let (active, active_pool, _) =
+            submission_methods_for_worker(&accumulator, 0, &tasks, &active_dir)?;
+        let mut factory = TransactionFactory::new();
+        let tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let raw = Bytes::from(tx.encoded_2718());
+
+        // Keep the old handlers and pool alive across the boundary, before deactivation runs.
+        accumulator.set_num_workers(1);
+        let error = removed
+            .call::<_, B256>("eth_sendRawTransaction", rpc_params![raw.clone()])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted a transaction"))?;
+        assert!(error.to_string().contains("worker is no longer active"), "{error}");
+        assert!(removed_pool.get(tx.hash()).is_none());
+        assert_eq!(removed_pool.pool_size().pending, 0);
+
+        // Worker zero remains usable at the same boundary.
+        let accepted: B256 =
+            active.call("eth_sendRawTransaction", rpc_params![raw.clone()]).await?;
+        assert_eq!(accepted, *tx.hash());
+        assert!(active_pool.get(tx.hash()).is_some());
+
+        accumulator.set_num_workers(2);
+        let accepted: B256 = removed.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+        assert_eq!(accepted, *tx.hash());
+        assert!(removed_pool.get(tx.hash()).is_some());
+        Ok(())
+    }
+
+    /// Sync submission rejects removal before decoding or waiting for a receipt, even with no cap.
+    #[tokio::test]
+    async fn test_removed_worker_rejects_sync_transaction_before_decoding() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let (methods, pool, _) = submission_methods_for_worker(&accumulator, 1, &tasks, &tmp_dir)?;
+        accumulator.set_num_workers(1);
+        let error = methods
+            .call::<_, serde_json::Value>("eth_sendRawTransactionSync", rpc_params![Bytes::new()])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted sync submission"))?;
+        assert!(error.to_string().contains("worker is no longer active"), "{error}");
+        assert_eq!(pool.pool_size().pending, 0);
+        Ok(())
     }
 
     /// The IPC transport must serve the validated allowlist, not reth's

@@ -213,6 +213,9 @@ where
                 .await?
                 .apply(&gas_accumulator);
         }
+        // Close removed listeners before recovery, replay, and peer discovery can await.
+        // The submission guard already rejects these ids as soon as the resize above runs.
+        engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
@@ -461,6 +464,10 @@ where
                     target_hash,
                 )
                 .await?;
+
+                // Stop removed listeners before writing records or exporting execution state.
+                // Admission is already closed by the accumulator resize inside close_epoch.
+                engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
 
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(current_epoch, engine).await?;
