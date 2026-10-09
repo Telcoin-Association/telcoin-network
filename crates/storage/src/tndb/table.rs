@@ -60,6 +60,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -67,11 +68,14 @@ use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 
 pub use compact::CompactionConfig;
-use compact::{replay_delta, Committed, Compacted, Compaction, Job, REQUESTED_MIN_BYTES};
+use compact::{
+    replay_delta, Committed, Compacted, Compaction, Job, AUTO_BACKOFF_MAX, AUTO_BACKOFF_MIN,
+    DISK_HEADROOM, REQUESTED_MIN_BYTES,
+};
 
 use super::layout::{
-    compact_dir, gen_dir, list_gens, lock_table, remove_spares, spare_dir, sync_dir, KeyMode,
-    TableMeta,
+    available_bytes, compact_dir, gen_dir, list_gens, lock_table, remove_spares, spare_dir,
+    sync_dir, KeyMode, TableMeta,
 };
 use crate::archive::{
     btree_index::{
@@ -392,18 +396,36 @@ struct Writer {
     removals_unsynced: bool,
     /// When and how fast this table compacts.
     config: CompactionConfig,
-    /// Puts in the current generation made dead (overwritten or removed) since it started, or
-    /// since this open (a clean open does not know the older ones): the automatic compaction's
-    /// measure of garbage.
+    /// Puts in the current generation made dead (overwritten or removed): the automatic
+    /// compaction's measure of garbage. Kept in the index header across a clean close
+    /// ([`BtreeIndex::set_owner_value`]), recounted by a rebuild.
     dead: u64,
     /// The running compaction, if any.
     compaction: Option<Compaction>,
+    /// After a failed automatic compaction, when the automatic trigger may try again, and how long
+    /// it waits after the next failure (see [`AUTO_BACKOFF_MIN`]).
+    auto_retry_at: Option<Instant>,
+    auto_backoff: Duration,
     /// Compactions cancelled by a clear, still stopping: joined (and their results discarded)
     /// before the next compaction starts or the table closes.
     cancelled: Vec<std::thread::JoinHandle<eyre::Result<Compacted>>>,
-    /// Test-only: the next compaction's thread waits at each checkpoint for this channel.
+    /// Test-only: the next compaction's thread waits at each checkpoint for this channel, and
+    /// reports reaching each one on the other.
     #[cfg(test)]
     compact_gate: Option<std::sync::mpsc::Receiver<()>>,
+    #[cfg(test)]
+    compact_arrived: Option<std::sync::mpsc::Sender<u32>>,
+    /// Test-only: every compaction thread fails before it builds anything.
+    #[cfg(test)]
+    fail_compactions: bool,
+    /// Test-only: compactions started, and the bytes the last switch replayed under the lock.
+    #[cfg(test)]
+    compactions_started: u32,
+    #[cfg(test)]
+    last_switch_tail: u64,
+    /// Test-only: the free disk space the compaction guard sees.
+    #[cfg(test)]
+    free_space_for_test: Option<u64>,
     /// Test-only: the next compaction switch's directory sync after its rename fails.
     #[cfg(test)]
     fail_next_switch_sync: bool,
@@ -735,6 +757,41 @@ impl Writer {
             && self.config.auto_min_bytes.is_some_and(|min| self.files.data.file_len() >= min)
             && self.dead > 0
             && self.dead >= self.files.idx.as_ref().map_or(0, BtreeIndex::len) as u64
+            && self.auto_retry_at.is_none_or(|at| Instant::now() >= at)
+    }
+
+    /// Hold the automatic trigger off after a failure, doubling the wait each time (a persistent
+    /// cause would otherwise restart a full compaction at every commit).
+    fn back_off(&mut self) {
+        self.auto_retry_at = Some(Instant::now() + self.auto_backoff);
+        self.auto_backoff = (self.auto_backoff * 2).min(AUTO_BACKOFF_MAX);
+    }
+
+    /// Whether the filesystem has room for a compaction's new generation beside the current one:
+    /// the data log's length (the most the live rows can take) plus [`DISK_HEADROOM`]. Logged when
+    /// not; a probe that fails does not block the compaction.
+    fn has_room_to_compact(&self) -> bool {
+        #[cfg(test)]
+        let available =
+            self.free_space_for_test.map_or_else(|| available_bytes(&self.table_dir), Ok);
+        #[cfg(not(test))]
+        let available = available_bytes(&self.table_dir);
+        let needed = self.files.data.file_len() + DISK_HEADROOM;
+        match available {
+            Ok(available) if available < needed => {
+                tracing::warn!(
+                    target: "tndb",
+                    "table {}: compaction skipped: {available} bytes free, {needed} needed",
+                    self.table_dir.display()
+                );
+                false
+            }
+            Ok(_) => true,
+            Err(e) => {
+                tracing::debug!(target: "tndb", "free space unknown ({e}); compacting anyway");
+                true
+            }
+        }
     }
 
     /// Start compacting the current generation from `snapshot`, the last publish (see
@@ -745,7 +802,7 @@ impl Writer {
         if self.compaction.is_some() {
             return true;
         }
-        if self.failed.is_some() || snapshot.gen != self.gen {
+        if self.failed.is_some() || snapshot.gen != self.gen || !self.has_room_to_compact() {
             return false;
         }
         self.reap_cancelled(false);
@@ -760,8 +817,16 @@ impl Writer {
             rate: self.config.bytes_per_sec,
             #[cfg(test)]
             gate: self.compact_gate.take(),
+            #[cfg(test)]
+            arrived: self.compact_arrived.take(),
+            #[cfg(test)]
+            fail_at_start: self.fail_compactions,
         };
         self.compaction = Compaction::start(self.gen, job);
+        #[cfg(test)]
+        {
+            self.compactions_started += u32::from(self.compaction.is_some());
+        }
         self.compaction.is_some()
     }
 
@@ -780,16 +845,26 @@ impl Writer {
         let next_dir = gen_dir(&self.table_dir, next);
         let renamed = compaction
             .join()
-            .and_then(|compacted| self.catch_up(compacted))
+            .and_then(|compacted| {
+                #[cfg(test)]
+                {
+                    let (data, removed) = (&self.files.data, &self.files.removed);
+                    self.last_switch_tail = (data.file_len() - compacted.done.data)
+                        + (removed.file_len() - compacted.done.removed);
+                }
+                self.catch_up(compacted)
+            })
             .and_then(|builder| Ok(fs::rename(builder.dir(), &next_dir).map(|()| builder)?));
         let builder = match renamed {
             Ok(builder) => builder,
             Err(e) => {
-                tracing::warn!(
-                    target: "tndb",
-                    "table {}: compaction abandoned: {e}",
-                    self.table_dir.display()
-                );
+                let table = self.table_dir.display();
+                if compact::is_corruption(&e) {
+                    tracing::error!(target: "tndb", "table {table}: compaction abandoned: {e:#}");
+                } else {
+                    tracing::warn!(target: "tndb", "table {table}: compaction abandoned: {e:#}");
+                }
+                self.back_off();
                 return Ok(false);
             }
         };
@@ -805,6 +880,7 @@ impl Writer {
         }
         let old_dir = self.install_gen(next, files);
         self.dead = dead;
+        (self.auto_retry_at, self.auto_backoff) = (None, AUTO_BACKOFF_MIN);
         remove_in_background(old_dir);
         Ok(true)
     }
@@ -826,19 +902,29 @@ impl Writer {
         Ok(builder)
     }
 
-    /// Stop the running compaction, if any (a clear makes it moot); its thread is joined later.
+    /// Stop the running compaction, if any (a clear makes it moot). One that has already finished
+    /// is discarded at once (its complete copy must not outlive the clear); a running one stops at
+    /// its next check and is joined later.
     fn cancel_compaction(&mut self) {
         if let Some(compaction) = self.compaction.take() {
-            self.cancelled.push(compaction.cancel());
+            let finished = compaction.is_finished();
+            let handle = compaction.cancel();
+            if finished {
+                compact::discard(handle);
+            } else {
+                self.cancelled.push(handle);
+            }
         }
     }
 
-    /// Join the cancelled compactions whose threads have stopped (every one if `wait`),
-    /// discarding their results: a dropped builder deletes its files.
+    /// Discard the cancelled compactions whose threads have stopped (in the background; see
+    /// [`compact::discard`]), or with `wait` (a close) join every one here.
     fn reap_cancelled(&mut self, wait: bool) {
         for handle in std::mem::take(&mut self.cancelled) {
-            if wait || handle.is_finished() {
+            if wait {
                 drop(compact::join(handle));
+            } else if handle.is_finished() {
+                compact::discard(handle);
             } else {
                 self.cancelled.push(handle);
             }
@@ -865,9 +951,10 @@ impl Writer {
             let idx = self.index_mut()?;
             idx.rebuild_from(replay.rows)?;
         }
-        let data_len = self.files.data.file_len();
+        let (data_len, dead) = (self.files.data.file_len(), self.dead);
         if let Some(idx) = self.files.idx.as_mut() {
             idx.set_data_file_length(data_len);
+            idx.set_owner_value(dead);
             idx.sync()?;
             idx.mark_consistent();
         }
@@ -915,9 +1002,10 @@ impl Drop for Writer {
             }
             return;
         }
-        let data_len = self.files.data.file_len();
+        let (data_len, dead) = (self.files.data.file_len(), self.dead);
         if let Some(idx) = self.files.idx.as_mut() {
             idx.set_data_file_length(data_len);
+            idx.set_owner_value(dead);
         }
     }
 }
@@ -1098,9 +1186,21 @@ impl TnTable {
             config,
             dead: 0,
             compaction: None,
+            auto_retry_at: None,
+            auto_backoff: AUTO_BACKOFF_MIN,
             cancelled: Vec::new(),
             #[cfg(test)]
             compact_gate: None,
+            #[cfg(test)]
+            compact_arrived: None,
+            #[cfg(test)]
+            fail_compactions: false,
+            #[cfg(test)]
+            compactions_started: 0,
+            #[cfg(test)]
+            last_switch_tail: 0,
+            #[cfg(test)]
+            free_space_for_test: None,
             #[cfg(test)]
             fail_next_switch_sync: false,
             #[cfg(test)]
@@ -1116,6 +1216,9 @@ impl TnTable {
         };
         if must_rebuild {
             writer.recover()?;
+        } else {
+            // A clean close kept the count in the index header.
+            writer.dead = writer.files.idx.as_ref().map_or(0, BtreeIndex::owner_value);
         }
         writer.prepare_next_spare(None);
         let published = writer.publish();
@@ -1183,7 +1286,38 @@ impl TnTable {
             removed_len: writer.files.removed.file_len(),
             dead: writer.dead,
             running: writer.compaction.is_some(),
+            started: writer.compactions_started,
+            last_switch_tail: writer.last_switch_tail,
         }
+    }
+
+    /// Test-only: [`Self::start_compaction_gated`], also returning the channel the thread reports
+    /// each checkpoint it reaches on.
+    #[cfg(test)]
+    pub(crate) fn start_compaction_observed(
+        &self,
+    ) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<u32>) {
+        let (arrived, arrivals) = std::sync::mpsc::channel();
+        self.inner.writer.lock().compact_arrived = Some(arrived);
+        (self.start_compaction_gated(), arrivals)
+    }
+
+    /// Test-only: make every compaction thread fail before it builds anything (or stop).
+    #[cfg(test)]
+    pub(crate) fn fail_compactions(&self, fail: bool) {
+        self.inner.writer.lock().fail_compactions = fail;
+    }
+
+    /// Test-only: the free disk space the compaction guard sees (`None`: the real probe).
+    #[cfg(test)]
+    pub(crate) fn set_free_space_for_test(&self, bytes: Option<u64>) {
+        self.inner.writer.lock().free_space_for_test = bytes;
+    }
+
+    /// Test-only: lift the automatic compaction's backoff after a failure.
+    #[cfg(test)]
+    pub(crate) fn clear_compaction_backoff(&self) {
+        self.inner.writer.lock().auto_retry_at = None;
     }
 
     /// Insert (or overwrite) `key → value`; readable from the next flush.
@@ -1218,8 +1352,11 @@ impl TnTable {
         let switched = writer.switch_if_compacted();
         // Stored under the writer lock, so snapshots are installed in publish order.
         self.inner.published.store(Arc::new(writer.publish()));
-        if writer.wants_compaction() {
-            writer.start_compaction(self.inner.published.load_full());
+        if writer.wants_compaction() && !writer.start_compaction(self.inner.published.load_full()) {
+            writer.back_off();
+        }
+        if !writer.cancelled.is_empty() {
+            writer.reap_cancelled(false);
         }
         switched
     }
@@ -1341,6 +1478,8 @@ pub(crate) struct CompactionState {
     pub(crate) removed_len: u64,
     pub(crate) dead: u64,
     pub(crate) running: bool,
+    pub(crate) started: u32,
+    pub(crate) last_switch_tail: u64,
 }
 
 /// Log a scan or seek ended by an error. `DBIter` (and a seek's `Option`) cannot carry it, but a
@@ -1388,6 +1527,8 @@ impl TableScan {
 
 #[cfg(test)]
 mod test {
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -2300,5 +2441,242 @@ mod test {
             }
         }
         assert!(switches > 5, "{switches} switches");
+    }
+
+    // ---- compaction: failure, timing and lifetime edges ----
+
+    /// A churned table under a small automatic threshold: every key overwritten once, so the
+    /// trigger is due at the next commit.
+    fn churned_table(dir: &Path, config: CompactionConfig) -> (TnTable, Model) {
+        let table = TnTable::open_with(dir.to_path_buf(), None, config).expect("open");
+        let mut model = Model::new();
+        let tag = "x".repeat(200);
+        for round in 0..2 {
+            for i in 0..400 {
+                put(&table, &mut model, i, &format!("{round}{tag}"));
+            }
+        }
+        (table, model)
+    }
+
+    /// A compaction that fails is not retried at every following commit: the automatic trigger
+    /// backs off, and retries once the backoff is lifted.
+    #[test]
+    fn test_tntable_failed_automatic_compaction_backs_off() {
+        let tmp = TempDir::with_prefix("tntable_compact_backoff").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: Some(64 << 10), bytes_per_sec: 0 };
+        let (table, mut model) = churned_table(&tmp.path().join("t"), config);
+        table.fail_compactions(true);
+        for i in 0..5 {
+            // Overwrites: the trigger stays due (dead puts keep pace with live rows).
+            table.wait_compaction_thread();
+            put(&table, &mut model, i, "y");
+            table.flush().expect("flush");
+        }
+        assert_eq!(table.compaction_state().started, 1, "one attempt, then the backoff");
+
+        table.fail_compactions(false);
+        table.clear_compaction_backoff();
+        table.flush().expect("flush");
+        assert_eq!(table.compaction_state().started, 2, "retried once the backoff is lifted");
+        table.finish_compaction().expect("switch");
+        assert_eq!(table.compaction_state().gen, 1);
+        assert_matches(&table, &model);
+    }
+
+    /// What is committed while the thread syncs its bulk copy is caught up by the thread, not left
+    /// to the switch under the writer lock.
+    #[test]
+    fn test_tntable_compaction_switch_tail_excludes_bulk_sync() {
+        let tmp = TempDir::with_prefix("tntable_compact_tail").expect("temp dir");
+        let table = TnTable::open(tmp.path().join("t"), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..500 {
+            put(&table, &mut model, i, "a");
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        let (gate, arrivals) = table.start_compaction_observed();
+        let wait = |n| assert_eq!(arrivals.recv_timeout(Duration::from_secs(30)), Ok(n));
+        wait(1); // copied
+        gate.send(()).expect("resume");
+        wait(2); // one (empty) catch-up round
+        gate.send(()).expect("resume");
+        wait(3); // the bulk sync is done: commits land here
+        for i in 0..200 {
+            put(&table, &mut model, i, "c");
+        }
+        table.flush().expect("flush");
+        drop(gate);
+        table.finish_compaction().expect("switch");
+        assert_eq!(table.compaction_state().last_switch_tail, 0, "nothing left to the lock");
+        assert_matches(&table, &model);
+    }
+
+    /// A compaction that finished just before a clear is discarded at once, not kept on disk
+    /// until the next compaction or close.
+    #[test]
+    fn test_tntable_clear_discards_finished_compaction() {
+        let tmp = TempDir::with_prefix("tntable_compact_finished_clear").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let mut model = Model::new();
+        for i in 0..500 {
+            put(&table, &mut model, i, "a");
+            put(&table, &mut model, i, "b");
+        }
+        table.flush().expect("flush");
+        drop(table.start_compaction_gated());
+        table.wait_compaction_thread();
+        assert_eq!(compact_dirs(&dir), 1);
+        table.clear().expect("clear");
+        table.flush().expect("flush");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while compact_dirs(&dir) != 0 {
+            assert!(std::time::Instant::now() < deadline, "the finished compaction is discarded");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(table.is_empty().expect("is_empty"));
+    }
+
+    /// The dead-put count survives a clean close: a reopened table full of dead records still
+    /// compacts on its own.
+    #[test]
+    fn test_tntable_dead_count_survives_clean_reopen() {
+        let tmp = TempDir::with_prefix("tntable_dead_count").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
+        let (table, model) = churned_table(&dir, config);
+        table.flush().expect("flush");
+        let dead = table.compaction_state().dead;
+        assert_eq!(dead, 400);
+        drop(table);
+
+        let config = CompactionConfig { auto_min_bytes: Some(64 << 10), bytes_per_sec: 0 };
+        let table = TnTable::open_with(dir, None, config).expect("reopen");
+        assert!(!table.rebuilt_on_open());
+        assert_eq!(table.compaction_state().dead, dead, "the count is kept");
+        table.flush().expect("flush");
+        assert!(table.compaction_state().running, "the automatic trigger fires");
+        table.finish_compaction().expect("switch");
+        assert_matches(&table, &model);
+    }
+
+    /// A compaction does not start without room for the new generation beside the old one.
+    #[test]
+    fn test_tntable_compaction_needs_disk_space() {
+        let tmp = TempDir::with_prefix("tntable_compact_space").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: Some(64 << 10), bytes_per_sec: 0 };
+        let (table, model) = churned_table(&tmp.path().join("t"), config);
+        table.set_free_space_for_test(Some(1 << 20));
+        table.flush().expect("flush");
+        assert!(!table.compaction_state().running, "automatic: no room");
+        assert!(!table.compact(), "requested: no room");
+        assert!(table.compact_now().is_err(), "immediate: no room");
+
+        table.set_free_space_for_test(None);
+        table.compact_now().expect("room again");
+        assert_eq!(table.compaction_state().gen, 1);
+        assert_matches(&table, &model);
+    }
+
+    /// A close does not wait out a paced compaction's sleep: it stops the thread promptly.
+    #[test]
+    fn test_tntable_close_interrupts_paced_compaction() {
+        let tmp = TempDir::with_prefix("tntable_compact_close").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 10 };
+        let table = TnTable::open_with(tmp.path().join("t"), None, config).expect("open");
+        let tag = "x".repeat(1_000);
+        let mut model = Model::new();
+        for i in 0..1_500 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        assert!(table.inner.writer.lock().start_compaction(table.inner.published.load_full()));
+        // The first megabyte copies at once; then the thread sleeps toward 1 KiB/s.
+        std::thread::sleep(Duration::from_millis(300));
+        let (closed, done) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(table);
+            let _ = closed.send(());
+        });
+        assert!(done.recv_timeout(Duration::from_secs(3)).is_ok(), "the close stopped the thread");
+    }
+
+    /// Readers on other threads keep reading consistent values (and each scan one committed
+    /// state) while automatic compactions switch generations under them.
+    #[test]
+    fn test_tntable_readers_across_compaction_switches() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        const KEYS: u64 = 400;
+        let value = |i: u64, generation: u64| {
+            let mut v = generation.to_le_bytes().to_vec();
+            v.extend_from_slice(&i.to_le_bytes());
+            v.resize(256, (i % 251) as u8);
+            v
+        };
+        let tmp = TempDir::with_prefix("tntable_compact_readers_mt").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: Some(256 << 10), bytes_per_sec: 0 };
+        let table = TnTable::open_with(tmp.path().join("t"), None, config).expect("open");
+        for i in 0..KEYS {
+            table.insert(&kv(i).0, &value(i, 0)).expect("insert");
+        }
+        table.flush().expect("flush");
+        let committed = Arc::new(AtomicU64::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let readers: Vec<_> = (0..4u64)
+            .map(|t| {
+                let (table, committed, stop) = (table.clone(), committed.clone(), stop.clone());
+                std::thread::spawn(move || {
+                    let mut x = t + 1;
+                    let mut reads = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let floor = committed.load(Ordering::Acquire);
+                        x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                        let i = (x >> 33) % KEYS;
+                        let v = table.get_with(&kv(i).0, |b| b.to_vec()).expect("get");
+                        let v = v.expect("every key is always present");
+                        let generation = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
+                        assert!(generation >= floor, "read generation {generation} < {floor}");
+                        assert_eq!(v, value(i, generation), "a torn or foreign value");
+                        if reads.is_multiple_of(32) {
+                            let mut scan = table.scan(ScanKind::Forward);
+                            let mut gens = Vec::new();
+                            while let Some((ok, g)) = scan.next_with(|k, v| {
+                                let g = u64::from_le_bytes(v[..8].try_into().expect("8 bytes"));
+                                (v == value(key_u64(k), g).as_slice(), g)
+                            }) {
+                                assert!(ok, "a torn value in a scan");
+                                gens.push(g);
+                                if t == 0 && gens.len() == KEYS as usize / 2 {
+                                    std::thread::sleep(Duration::from_millis(2));
+                                }
+                            }
+                            assert_eq!(gens.len(), KEYS as usize);
+                            assert!(gens.iter().all(|&g| g == gens[0]), "a scan mixed states");
+                        }
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+
+        let mut generation = 0;
+        while table.compaction_state().gen < 3 {
+            generation += 1;
+            assert!(generation < 5_000, "three switches");
+            for i in 0..KEYS {
+                table.insert(&kv(i).0, &value(i, generation)).expect("overwrite");
+            }
+            table.flush().expect("commit");
+            committed.store(generation, Ordering::Release);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for reader in readers {
+            assert!(reader.join().expect("reader") > 0);
+        }
     }
 }

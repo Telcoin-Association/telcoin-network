@@ -41,6 +41,9 @@ pub(crate) struct BtreeHeader {
     /// Not maintained (see the module docs); kept for the on-disk layout.
     pub(crate) last_leaf: u32,
     pub(crate) data_file_length: u64,
+    /// A value the owner keeps with the index (tndb: the generation's dead puts), durable with the
+    /// header; 0 in a file that never set it.
+    pub(crate) owner_value: u64,
 }
 
 impl BtreeHeader {
@@ -62,6 +65,7 @@ impl BtreeHeader {
             first_leaf: 1,
             last_leaf: 1,
             data_file_length: DATA_HEADER_BYTES as u64,
+            owner_value: 0,
         }
     }
 
@@ -95,6 +99,7 @@ impl BtreeHeader {
             first_leaf: rd32(50),
             last_leaf: rd32(54),
             data_file_length: rd64(58),
+            owner_value: rd64(66),
         })
     }
 
@@ -116,6 +121,7 @@ impl BtreeHeader {
         buf[50..54].copy_from_slice(&self.first_leaf.to_le_bytes());
         buf[54..58].copy_from_slice(&self.last_leaf.to_le_bytes());
         buf[58..66].copy_from_slice(&self.data_file_length.to_le_bytes());
+        buf[66..74].copy_from_slice(&self.owner_value.to_le_bytes());
         add_crc32(&mut buf);
         buf
     }

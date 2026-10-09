@@ -468,6 +468,20 @@ impl BtreeIndex {
         self.header.data_file_length
     }
 
+    /// Set the owner's value (any `u64` the owner keeps with the index; tndb keeps its dead-put
+    /// count); persisted with the header on the next [`Index::sync`].
+    pub fn set_owner_value(&mut self, value: u64) {
+        if self.header.owner_value != value {
+            self.header.owner_value = value;
+            self.synced = false;
+        }
+    }
+
+    /// The owner's value as last set and synced (0 if never set).
+    pub fn owner_value(&self) -> u64 {
+        self.header.owner_value
+    }
+
     /// Classify the data pages by their trailing CRC — an off-hot-path integrity/verification hook
     /// (reads themselves never verify a CRC). Lets a pack wrapper decide whether to
     /// [`Self::rebuild_from`]: `dirty > 0` = unsynced writes, `corrupt > 0` = on-disk corruption.
@@ -1690,6 +1704,33 @@ mod tests {
         let reader: BtreeIndex =
             BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("open ro");
         assert_eq!(reader.data_file_length(), 12_345, "the synced length is visible");
+    }
+
+    /// The owner's value round-trips through the header like `data_file_length`: 0 in a fresh
+    /// index, durable only at a sync, and kept across a reopen without disturbing the tree.
+    #[test]
+    fn test_archive_btx_owner_value_durable_at_sync() {
+        let tmp = TempDir::with_prefix("test_archive_btx_owner").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+        assert_eq!(idx.owner_value(), 0, "unset in a fresh index");
+        idx.save(&key_of(1), 1).expect("save");
+        idx.sync().expect("sync");
+
+        idx.set_owner_value(u64::MAX - 7);
+        let reader: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, true).expect("open ro");
+        assert_eq!(reader.owner_value(), 0, "an unsynced value is not visible");
+        drop(reader);
+
+        idx.sync().expect("sync");
+        drop(idx);
+        let idx: BtreeIndex =
+            BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen");
+        assert_eq!(idx.owner_value(), u64::MAX - 7, "the synced value is kept");
+        assert_eq!(idx.load(&key_of(1)).expect("load"), 1, "the tree is unchanged");
     }
 
     /// Every entry of the tree `src` reads, in scan order, through a fresh cursor.

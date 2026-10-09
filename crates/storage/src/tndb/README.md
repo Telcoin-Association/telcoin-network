@@ -186,7 +186,9 @@ miss costs nothing). The removal log is read only by recovery and by compaction'
 - **The mode is fixed when the table is created** (in `meta`). Opening it in the other mode is an
   error.
 - **`key_of` must hold for every row:** the key passed to `insert` must equal `key_of(&value)`, or a
-  rebuild would file the row under a different key. Debug builds check it on every insert
+  rebuild would file the row under a different key. A rebuild is not the only reader of `key_of`:
+  every compaction derives the keys of the rows written while it ran, so a violation re-keys rows
+  at an ordinary switch, not only after a crash. Debug builds check it on every insert
   (`debug_assert`); release builds do not, to keep the hot path free.
 - **Opens are idempotent.** Re-opening an open table keeps it. `open_table` after
   `open_table_with_key` keeps the derived table (so a wrapper such as `LayeredDatabase` can open
@@ -363,8 +365,8 @@ background and switches to it; the old generation, dead records and all, is then
 
 - **Automatically**, at a commit, once the data log is at least `CompactionConfig::auto_min_bytes`
   (default 64 MiB) and at least half the generation's puts are dead (`dead ≥ live`). `dead` counts
-  overwrites and successful removes since the generation started; a crash rebuild counts them
-  exactly, a clean open starts at 0. The check is O(1).
+  overwrites and successful removes since the generation started; a clean close keeps it in the
+  index header (`owner_value`) and a crash rebuild recounts it. The check is O(1).
 - **On request**: `Database::compact()` starts one for every table with dead puts and a log of at
   least 1 MiB, and returns at once (`LayeredDatabase` calls it at startup and daily).
 - **Now**: `TnDatabase::compact_table_now::<T>()` compacts regardless and waits (tooling, tests).
@@ -385,7 +387,9 @@ turns the automatic trigger off.
    logs' committed tails through their lock-free views, merging puts and removals by position as
    recovery does. Removals go to the new removal log against the new data log's length, so the new
    generation replays on its own. Rounds repeat until one has at most 1 MiB to replay (at most 8).
-3. **Sync** the new logs (removal log first) and the directory.
+3. **Sync** the new logs (removal log first) and the directory. That bulk sync can take a while for
+   a large table, so one more catch-up round then replays what was committed during it, followed
+   by a (small) sync of that.
 4. **Switch** (the writer, at the first commit after the thread finishes, between that commit and
    its publish): replay the last tail (all of it committed by then), commit and sync it, check the
    new generation holds exactly the table's rows, rename the directory to `gen-<N+1>` and `fsync`
@@ -394,12 +398,24 @@ turns the automatic trigger off.
    the new one.
 
 **Pacing.** The copy and catch-up pause between 1 MiB batches to hold
-`CompactionConfig::bytes_per_sec` (default 64 MiB/s; 0 is unpaced), leaving the disk to commits.
+`CompactionConfig::bytes_per_sec` (default 64 MiB/s; 0 is unpaced), leaving the disk to commits. A
+pacing sleep checks for a cancellation every 10 ms.
 
 **Cost.** Readers are unaffected: they keep their snapshot and move to the new generation at the
-next publish. The writer is delayed only by the switch: a replay of what was committed since the
-thread's last round (normally at most about 1 MiB), an `msync`, a rename and a directory `fsync`. On
-the hot path, compaction adds a counter per write and two O(1) checks per commit.
+next publish. The writer is delayed only by the switch: a replay of what was committed during the
+thread's final small sync, an `msync`, a rename and a directory `fsync`. On the hot path,
+compaction adds a counter per write and a few O(1) checks per commit.
+
+**Disk space.** A compaction starts only when the filesystem has room for the new generation beside
+the old one: at least the data log's length (the most its live rows can take) plus 128 MiB (the new
+log's growth preallocation). Otherwise it is skipped and logged; a failed probe does not block it.
+
+**Failures.** A compaction that fails (an I/O error, a failed CRC, a row-count mismatch at the
+switch, no room, no thread) is dropped, its files deleted, and the table carries on in its old
+generation. It is logged as an error when it read damaged committed data, else as a warning. The
+automatic trigger then backs off (1 minute, doubling to 1 hour, reset by the next successful
+switch), so a lasting cause does not restart a full compaction at every commit; requested and
+immediate compactions are not held back.
 
 **Crash safety.** Before the rename, a compaction is a `compact-*` directory, never a generation:
 the next open deletes it, and the table is as it was. After the rename, the new generation is the
@@ -409,11 +425,10 @@ directory sync) stops the writer, as a failed clear does.
 
 **Interplay.**
 
-- A **clear** cancels a running compaction: its thread stops at its next batch and deletes its
-  directory, and is joined before the next compaction starts or at close.
+- A **clear** cancels a running compaction: its thread stops at its next check and deletes its
+  directory, and is reaped (in the background) at a later commit, or joined at close. A compaction
+  that had already finished is discarded at once, its copy deleted in the background.
 - A **clean close** switches to a compaction that has finished, and stops one that has not.
-- A compaction that **fails** (an I/O error, a row-count mismatch at the switch) is dropped and
-  logged; the table carries on in its old generation.
 - **Disk:** while a compaction runs, the table holds both generations (the old one whole, the new
   one's live rows).
 
@@ -469,9 +484,6 @@ Crate-internal building blocks (`table.rs`, `table/compact.rs`, `layout.rs`): `T
 
 ## Limitations and future work
 
-- **The dead count after a clean restart.** It starts at 0, so a table reopened full of garbage
-  compacts on its own only once new dead puts reach its live rows (a requested compaction runs as
-  soon as there is one). Persisting the count (e.g. in the index header) would close this.
 - **A switch waits for a commit.** A finished compaction of a table that is not written again
   switches at its next commit or clean close.
 - **Cross-table atomicity.** Each table commits separately (see transactions).
@@ -528,7 +540,13 @@ key check):
   - a clear cancels a running compaction; a derived-key table compacts;
   - the automatic trigger, a requested compaction needing dead puts, and pacing;
   - a switch failing after its rename stops the writer, and the reopen has every row;
-  - randomized compactions, clears, commits, crashes and clean reopens against a model.
+  - randomized compactions, clears, commits, crashes and clean reopens against a model;
+  - a failed automatic compaction backs off instead of restarting at every commit;
+  - what is committed during the thread's bulk sync is caught up by the thread, not the switch;
+  - a compaction that finished before a clear is discarded at once;
+  - the dead count survives a clean reopen; a compaction needs disk room; a close interrupts a
+    paced compaction's sleep;
+  - readers on other threads keep consistent values and scans across automatic switches.
 - **`layout.rs`:** `meta` round trip and corruption, generation listing.
 
 Crash simulation leaks the database (`std::mem::forget`), so no file is sealed and no index synced,

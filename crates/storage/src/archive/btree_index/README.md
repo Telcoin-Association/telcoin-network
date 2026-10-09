@@ -127,7 +127,8 @@ height-3 tree holds on the order of 10⁵–10⁶ keys depending on fill.
 | 50 | 4 | `first_leaf` | not maintained (layout only) |
 | 54 | 4 | `last_leaf` | not maintained (layout only) |
 | 58 | 8 | `data_file_length` | the data log length this index covers (set by the owner) |
-| 66 | … | — | zero |
+| 66 | 8 | `owner_value` | any value the owner keeps with the index (tndb: dead puts); 0 if never set |
+| 74 | … | — | zero |
 | 4092 | 4 | CRC32 | over bytes `0..4092` (always a real CRC: the header is the commit marker) |
 
 All integers are little-endian. A fresh index is `page_count = 2`: the header and one empty root
@@ -262,7 +263,7 @@ last**:
 1. `publish_pages()`: CRC-stamp the private pages.
 2. `msync` the whole file (`MmapDataFile::sync_all`).
 3. Rewrite page 0 from the in-memory header (root, height, page count, key count,
-   `data_file_length`), then `msync` just that page (`sync_range(0, 4096)`).
+   `data_file_length`, `owner_value`), then `msync` just that page (`sync_range(0, 4096)`).
 
 So a durable header never names pages that did not reach disk with it.
 
@@ -273,7 +274,8 @@ index that was not sealed is never trusted (next section).
 
 `set_data_file_length(len)` records, in memory, the data log length the index covers; it becomes
 durable with the header at the next `sync()`. Owners compare it with the log's length on open to
-detect an index that lags its log.
+detect an index that lags its log. `set_owner_value(v)` does the same for one `u64` the owner keeps
+with the index (tndb keeps its dead-put count there); it reads 0 until first set.
 
 `set_remove_on_drop()` deletes the file when the handle drops, skipping the sync (used to discard a
 cleared or abandoned index).
@@ -367,6 +369,7 @@ Public (`pub`) unless marked crate-internal.
 | `len` / `is_empty` / `height` / `ksize` | tree stats |
 | `opened_unclean` / `mark_consistent` | the crash-consistency handshake |
 | `set_data_file_length` / `data_file_length` | the covered log length (owner bookkeeping) |
+| `set_owner_value` / `owner_value` | one `u64` the owner keeps with the index, durable at `sync` |
 | `set_remove_on_drop` | delete on drop, skipping the sync |
 | `page_crc_scan -> PageCrcReport` | off-path full CRC classification |
 | `publish(&mut) -> IndexSnapshot` *(crate)* | publish the working tree for lock-free readers |
@@ -412,8 +415,8 @@ Tests live in `index.rs` (`test_archive_btx_*`) and `iter.rs`:
   corrupt root page on a clean open;
 - torn tails stay unclean until rebuilt; a zeroed page is neither laundered by a sync nor
   answered silently, and writes into it are refused;
-- `data_file_length` becomes durable only at `sync`; remove-on-drop skips the sync; a read-only
-  open does not create the directory;
+- `data_file_length` and `owner_value` become durable only at `sync`; remove-on-drop skips the
+  sync; a read-only open does not create the directory;
 - copy-on-write matches a model under random operations; published snapshots are immutable;
 - reclaim never reuses a page a live snapshot can reach, bounds file growth, and handles snapshots
   released out of order; `clear` retires the old tree; reopen recovers free pages; reset is refused

@@ -6,7 +6,8 @@
 //!    overwritten records are never reached, so they are not copied;
 //! 2. it catches up on what was committed since, in rounds, by replaying the old logs' committed
 //!    tails ([`replay_delta`]), until a round has little left;
-//! 3. it makes the new generation durable and hands it back.
+//! 3. it makes the new generation durable (a bulk sync, then one more round for what was committed
+//!    during it and a small sync), and hands it back.
 //!
 //! It reads the old generation the way a reader does — a published snapshot and the logs' mapped
 //! views — so it takes no lock, and the writer feeds it each publish's committed log lengths
@@ -18,6 +19,9 @@
 //! retires the old generation as a clear does. Both generations hold the same committed rows from
 //! the moment the new one is renamed into place, so a crash on either side of the rename loses
 //! nothing; a `compact-*` directory is never a generation, and an open deletes a leftover one.
+//!
+//! A compaction starts only with room for the new generation on disk; one that fails is dropped
+//! and the automatic trigger backs off (see `Writer::back_off`).
 
 use std::{
     ops::Range,
@@ -69,6 +73,18 @@ const CATCHUP_BYTES: u64 = 1 << 20;
 
 /// Most background catch-up rounds before handing over to the writer regardless.
 const MAX_CATCHUP_ROUNDS: usize = 8;
+
+/// The longest a pacing sleep goes without checking for a cancellation.
+const PACE_SLICE: Duration = Duration::from_millis(10);
+
+/// Room a compaction needs beyond the current data log's length (the most its live rows can
+/// take): the new log's growth preallocation, at most this much past its data.
+pub(super) const DISK_HEADROOM: u64 = 128 << 20;
+
+/// After a failed automatic compaction, the automatic trigger waits this long before trying again,
+/// doubling with each further failure up to [`AUTO_BACKOFF_MAX`].
+pub(super) const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
+pub(super) const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// Where a generation's committed records end, in its data and removal logs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -236,20 +252,31 @@ impl Builder {
         (self.files.take().expect("a builder holds its files until it finishes"), self.dead)
     }
 
-    /// Pace the copy and honour a cancellation, once per [`BATCH_BYTES`].
+    /// Pace the copy and honour a cancellation, once per [`BATCH_BYTES`]. A pacing sleep is cut
+    /// into slices of at most [`PACE_SLICE`], each followed by a cancellation check, so a clear or
+    /// close never waits out a long sleep.
     fn pace(&mut self) -> eyre::Result<()> {
         if self.written < self.next_check {
             return Ok(());
         }
         self.next_check = self.written + BATCH_BYTES;
-        if self.cancel.as_ref().is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-            bail!("tndb: compaction cancelled");
-        }
+        self.check_cancel()?;
         if self.rate > 0 {
             let due = Duration::from_secs_f64(self.written as f64 / self.rate as f64);
-            if let Some(ahead) = due.checked_sub(self.started.elapsed()) {
-                std::thread::sleep(ahead);
+            let mut ahead = due.saturating_sub(self.started.elapsed());
+            while !ahead.is_zero() {
+                let slice = ahead.min(PACE_SLICE);
+                std::thread::sleep(slice);
+                ahead -= slice;
+                self.check_cancel()?;
             }
+        }
+        Ok(())
+    }
+
+    fn check_cancel(&self) -> eyre::Result<()> {
+        if self.cancel.as_ref().is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
+            bail!("tndb: compaction cancelled");
         }
         Ok(())
     }
@@ -354,6 +381,12 @@ pub(super) struct Job {
     /// Test-only: the thread waits at each checkpoint for a message (or the sender's drop).
     #[cfg(test)]
     pub(super) gate: Option<std::sync::mpsc::Receiver<()>>,
+    /// Test-only: told each checkpoint's number as the thread reaches it.
+    #[cfg(test)]
+    pub(super) arrived: Option<std::sync::mpsc::Sender<u32>>,
+    /// Test-only: the thread fails before it builds anything.
+    #[cfg(test)]
+    pub(super) fail_at_start: bool,
 }
 
 /// The writer's handle on a running compaction.
@@ -412,9 +445,57 @@ pub(super) fn join(handle: JoinHandle<eyre::Result<Compacted>>) -> eyre::Result<
     handle.join().unwrap_or_else(|_| Err(eyre::eyre!("tndb: the compaction thread panicked")))
 }
 
-/// Wait at a test checkpoint (for the test's next message, or its sender's drop).
+/// Discard a finished compaction thread's result on a short-lived thread: a dropped builder
+/// deletes its files, and unlinking a large copy is kept off the caller's (the writer's) path. If
+/// no thread can be started the result is dropped here, with the handle.
+pub(super) fn discard(handle: JoinHandle<eyre::Result<Compacted>>) {
+    let _ =
+        std::thread::Builder::new().name("tndb-reap".to_string()).spawn(move || drop(join(handle)));
+}
+
+/// True when `e` comes from reading damaged committed data (a failed CRC, a corrupt record),
+/// rather than from the environment.
+pub(super) fn is_corruption(e: &eyre::Report) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FetchError>(),
+            Some(FetchError::CrcFailed | FetchError::CorruptIndex(_))
+        )
+    })
+}
+
+/// Replay what was committed in the old generation since `done` (as of the last publish the
+/// writer reported) and commit it in `out`. Returns the bytes it had to replay.
+fn catch_up_round(
+    out: &mut Builder,
+    data_view: &MapView,
+    removed_view: &MapView,
+    progress: &Mutex<Committed>,
+    done: &mut Committed,
+) -> eyre::Result<u64> {
+    let now = *progress.lock();
+    let behind = (now.data - done.data) + (now.removed - done.removed);
+    if behind > 0 {
+        let (data, removed) = (done.data..now.data, done.removed..now.removed);
+        replay_delta(out, data_view, data, removed_view, removed)?;
+        out.commit_record()?;
+        *done = now;
+    }
+    Ok(behind)
+}
+
+/// A test checkpoint: report reaching checkpoint `n`, then wait for the test's next message (or
+/// its sender's drop). Checkpoints: 1 after the copy, 2 after each catch-up round, 3 after the
+/// bulk sync.
 #[cfg(test)]
-fn checkpoint(gate: &Option<std::sync::mpsc::Receiver<()>>) {
+fn checkpoint(
+    n: u32,
+    gate: &Option<std::sync::mpsc::Receiver<()>>,
+    arrived: &Option<std::sync::mpsc::Sender<u32>>,
+) {
+    if let Some(arrived) = arrived {
+        let _ = arrived.send(n);
+    }
     if let Some(gate) = gate {
         let _ = gate.recv_timeout(Duration::from_secs(30));
     }
@@ -434,7 +515,15 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
         rate,
         #[cfg(test)]
         gate,
+        #[cfg(test)]
+        arrived,
+        #[cfg(test)]
+        fail_at_start,
     } = job;
+    #[cfg(test)]
+    if fail_at_start {
+        bail!("tndb: injected compaction failure");
+    }
     // Keeps the old generation's files open (and so both views valid) until the thread ends.
     let _alive = alive;
     let mut out = Builder::new(dir, meta, key_fn, Arc::clone(cancel), rate)?;
@@ -452,29 +541,28 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
     drop(snapshot);
     out.commit_record()?;
     #[cfg(test)]
-    checkpoint(&gate);
+    checkpoint(1, &gate, &arrived);
 
     // 2. What was committed since, in rounds, until a round has little left to replay.
     for _ in 0..MAX_CATCHUP_ROUNDS {
-        if cancel.load(Ordering::Relaxed) {
-            bail!("tndb: compaction cancelled");
-        }
-        let now = *progress.lock();
-        let behind = (now.data - done.data) + (now.removed - done.removed);
-        if behind > 0 {
-            let (data, removed) = (done.data..now.data, done.removed..now.removed);
-            replay_delta(&mut out, &*data_view, data, &*removed_view, removed)?;
-            out.commit_record()?;
-            done = now;
-        }
+        out.check_cancel()?;
+        let behind = catch_up_round(&mut out, &data_view, &removed_view, progress, &mut done)?;
         #[cfg(test)]
-        checkpoint(&gate);
+        checkpoint(2, &gate, &arrived);
         if behind <= CATCHUP_BYTES {
             break;
         }
     }
 
-    // 3. Durable before the writer can rename it into place.
+    // 3. Durable before the writer can rename it into place: the bulk sync, then one more round
+    // for what was committed during it and a (small) sync of that, so the writer's catch-up
+    // under its lock holds only what lands during the small sync.
     out.sync()?;
+    #[cfg(test)]
+    checkpoint(3, &gate, &arrived);
+    out.check_cancel()?;
+    if catch_up_round(&mut out, &data_view, &removed_view, progress, &mut done)? > 0 {
+        out.sync()?;
+    }
     Ok(Compacted { builder: out.unpaced(), done })
 }

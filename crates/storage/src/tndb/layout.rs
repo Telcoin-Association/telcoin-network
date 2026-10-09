@@ -152,6 +152,23 @@ pub(crate) fn lock_table(table: &Path) -> eyre::Result<fs::File> {
     Ok(file)
 }
 
+/// Bytes available to this process on the filesystem holding `dir` (`statvfs`: free blocks
+/// available to unprivileged users times the fragment size).
+pub(crate) fn available_bytes(dir: &Path) -> io::Result<u64> {
+    use std::os::unix::ffi::OsStrExt as _;
+
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
+    // SAFETY: an all-zero `statvfs` is a valid value of the plain C struct the call fills in.
+    let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and outlives the call; `stat` is a valid out-parameter.
+    if unsafe { libc::statvfs(path.as_ptr(), &mut stat) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The field types differ by platform (`u32` block counts on macOS, `u64` on Linux).
+    #[allow(clippy::unnecessary_cast)]
+    Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
 /// The directory of generation `n`.
 pub(crate) fn gen_dir(table: &Path, n: u64) -> PathBuf {
     table.join(format!("gen-{n}"))
