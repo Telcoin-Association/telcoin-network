@@ -114,6 +114,7 @@ TnTable (table.rs)                          one table; a cheap Clone handle over
 ```text
 <root>/                                 TnDatabase::open(root)
   <TableName>/                          one directory per table (Table::NAME)
+    LOCK                                flock'd by the table's one open writer
     meta                                key mode + encoded key size (16 bytes, CRC'd)
     gen-<N>/                            the current generation (exactly one after a clean open)
       data                              data log (Pack, uncompressed) ── + clean-close seal
@@ -193,15 +194,20 @@ miss costs nothing). The removal log is read only by recovery (and, later, compa
 
 | `Database` method | behaviour |
 |---|---|
-| `get`, `contains_key` | published snapshot, lock-free; `get` decodes straight from the mapped log |
-| `iter`, `reverse_iter`, `skip_to` | lazy `DBIter` owning a snapshot and a B+tree cursor; holds no lock, so the table can be written (and committed) during a scan; the scan keeps its starting snapshot |
-| `record_prior_to`, `last_record` | a single seek in the snapshot |
+| `get`, `contains_key` | published snapshot, lock-free; `get` decodes straight from the mapped log; a damaged index is an error, never "absent" |
+| `iter`, `reverse_iter`, `skip_to` | lazy `DBIter` owning a snapshot and a B+tree cursor; holds no lock, so the table can be written (and committed) during a scan; the scan keeps its starting snapshot. `DBIter` cannot carry an error, so a scan ended by damage logs `tracing::error!` before it stops |
+| `record_prior_to`, `last_record` | a single seek in the snapshot (an error ends it the same way, logged) |
 | `is_empty` | snapshot key count (an absent table reads as not empty) |
 | `insert`, `remove` | **autocommit**: write, then commit (durable) and publish before returning |
 | `clear_table` | switch to an empty generation (durable on return), then publish |
 | `read_txn` → `TnDbTx` | reads go straight to the published snapshots (`multi_get` uses the trait default) |
 | `write_txn` → `TnDbTxMut` | see below |
 | `persist`, `sync_persist`, `compact` | trait defaults (no-ops): every commit is already durable when it returns |
+
+Every op that returns a `Result` on a table that was never opened is an **error** ("table … is not
+open"), as with MDBX: a write is never silently dropped. Each `insert` and `remove` is all or
+nothing: if its index step fails, its log record is taken back out, so a later commit cannot make
+durable a write the caller saw fail.
 
 **Write transactions are loose**, as in `MemDatabase`:
 
@@ -240,9 +246,11 @@ commits don't use either. So on macOS tndb (like MDBX's `Durable` mode with `wri
 full power-loss barrier, and its numbers there understate the production (Linux) sync cost.
 `MmapDataFile`'s own growth `fsync` still uses `sync_all`.
 
-**A clean close** commits anything uncommitted (a dropped transaction's writes, for example),
-records the final log length in the index header, syncs the index, and seals all three files. The
-next open needs no rebuild.
+**A clean close** commits anything uncommitted through the ordinary commit (so the removal log is
+synced before the commit record), for example a dropped transaction's writes. A close that cannot
+commit leaves the index marked stale, so the next open rebuilds and drops the uncommitted records.
+Otherwise the close records the final log length in the index header, syncs the index, and seals
+all three files, and the next open needs no rebuild.
 
 ---
 
@@ -272,8 +280,9 @@ Any of:
      transaction**: they are discarded. Log pages can reach disk through OS writeback before their
      commit, so without commit records a crash could apply half a transaction.
 2. **Fail closed.** Any of these makes the open fail, with nothing changed:
-   - a tear (bad frame), or records after the last commit, in a log that was **sealed** by a clean
-     close: a sealed log must replay whole;
+   - a tear (bad frame) in a log that was **sealed** by a clean close: a sealed log must replay
+     whole (it may end in uncommitted records, from a close that could not commit; those are
+     dropped);
    - in an **unclean** log, a stop *below* the log's commit marker: that is damage to committed
      data, not a crash tail;
    - a malformed record (shorter than the key; a removal of the wrong size), a removal log out of
@@ -320,10 +329,16 @@ generation, because only `gen-*` directories are generations.
    short-lived `tndb-reap` thread, off the path of whoever dropped it.
 
 **Open** removes any leftover `spare-*`, uses the newest `gen-*`, and deletes older ones. More than
-one generation exists only after a crash during a clear: the clear either happened (the newest
-opens: it is current) or did not (the newest does not open, i.e. it crashed while being created:
-it is deleted and the older one stays current). A new table starts at `gen-0`. Deleting leftovers
-is best-effort (logged) except for a broken newest generation, which must go.
+one generation exists only after a crash during a clear; the newest is current (a clear renames a
+complete generation into place, and a partly created one opens as empty). A newest generation that
+does not open is an **error**: it is never deleted and an older generation is never brought back
+in its place, since that would erase committed data or resurrect cleared data. A new table starts
+at `gen-0`. Deleting older generations and leftover spares is best-effort (logged).
+
+**A failed clear** that may have changed which generation the next open picks (the rename into
+place succeeded but its directory sync failed, or a fallback creation failed part-way) **stops the
+writer**: later writes and commits fail until a restart, instead of committing to a generation the
+restart would discard.
 
 **Close** waits for a spare still being prepared, then discards it, so no background thread writes
 into a closed table's directory.
@@ -336,6 +351,10 @@ into a closed table's directory.
   per-thread slot, no shared refcount write, no lock). A point read is one index descent plus a
   slice of the mapped log.
 - **Writers** serialize per table on the writer mutex; different tables are written in parallel.
+- **One writer per table directory.** An open takes an exclusive `flock` on `<table>/LOCK` for the
+  writer's life, so a second open of the table (another `TnDatabase` in this process, a reopen while
+  an iterator from a dropped instance keeps the old writer alive, or another process) fails instead
+  of becoming a second writer on the same logs. A crash releases it with the process.
 - **Mappings outlive their readers.** A `MapView` does not own its mapping, so a file must stay
   open while any reader can reach it. Snapshots and scans hold `Arc`s that guarantee this:
   - the current generation's files live in the table's `Writer`, which a `TableScan` keeps alive;
@@ -402,17 +421,24 @@ key check):
   - fail-closed corruption, in a sealed log and below the commit marker;
   - randomized crash recovery against a model (puts, removes, clears, commits, crashes, clean
     closes);
-  - `LayeredDatabase` over tndb after a crash.
+  - `LayeredDatabase` over tndb after a crash;
+  - ops on a table that isn't open are errors; a damaged index makes `contains_key` an error;
+  - a second open of the same table is refused until the first closes;
+  - a close that cannot commit drops its uncommitted writes and the table still opens.
 - **`table.rs`:**
   - byte-level table operations and scans;
   - snapshots under concurrent commits, and page reuse;
-  - crash mid-clear (after or before the new generation is complete);
+  - crash mid-clear after the new generation is complete; an unopenable newest generation fails the
+    open and nothing is deleted;
+  - a clear failing after its rename stops the writer, and a reopen sees the clear;
+  - a put or remove whose index step fails leaves no log record (checked through a crash rebuild);
   - a clear activates the prepared spare (with its index ready once the key size is known);
   - a leftover spare is removed on open.
 - **`layout.rs`:** `meta` round trip and corruption, generation listing.
 
 Crash simulation leaks the database (`std::mem::forget`), so no file is sealed and no index synced,
-as after a killed process.
+as after a killed process; it first releases the tables' locks (`release_locks_for_crash`, test
+only), as a dead process's are.
 
 ---
 

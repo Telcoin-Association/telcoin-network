@@ -1,6 +1,7 @@
 //! The on-disk layout of a tndb table directory:
 //!
 //! ```text
+//! <table>/LOCK             held (flock) by the table's one open writer
 //! <table>/meta             the key mode (keyed | derived) and the encoded key size
 //! <table>/gen-<N>/data     the value log: keyed records [key | value], derived records [value],
 //!                          and an empty record at each commit
@@ -124,6 +125,28 @@ impl TableMeta {
         sync_dir(table)?;
         Ok(())
     }
+}
+
+/// Lock table directory `table` for one writer: an exclusive, non-blocking `flock` on
+/// `<table>/LOCK`, held until the returned file is dropped (a crash releases it with the process).
+/// A second open of the table, from this process or another, fails instead of becoming a second
+/// writer on the same logs.
+pub(crate) fn lock_table(table: &Path) -> eyre::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(table.join("LOCK"))
+        .wrap_err("tndb: open the table lock file")?;
+    // SAFETY: `flock` on a valid, open file descriptor borrowed for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            bail!("tndb: table {} is already open (its LOCK is held)", table.display());
+        }
+        return Err(e).wrap_err("tndb: lock the table");
+    }
+    Ok(file)
 }
 
 /// The directory of generation `n`.

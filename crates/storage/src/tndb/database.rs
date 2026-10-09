@@ -106,18 +106,27 @@ fn with_table<R>(store: &StoreType, name: &str, f: impl FnOnce(&TableStore) -> R
     store.load().get(name).map(f)
 }
 
+/// Run `f` on table `T`; a table that was never opened is an error (as with MDBX), never a silent
+/// no-op that would drop a write or pass for an empty table.
+fn with_open_table<T: Table, R>(
+    store: &StoreType,
+    f: impl FnOnce(&TableStore) -> eyre::Result<R>,
+) -> eyre::Result<R> {
+    with_table(store, T::NAME, f)
+        .unwrap_or_else(|| Err(eyre::eyre!("tndb: table {} is not open", T::NAME)))
+}
+
 /// Look up a key: read its value bytes from the table, then decode.
 fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-    with_table(store, T::NAME, |entry| {
+    with_open_table::<T, _>(store, |entry| {
         // Decode `T::Value` straight from the log's mmap (no intermediate `Vec`).
         with_read_key(key, |key| entry.table.get_with(key, |bytes| decode::<T::Value>(bytes)))
     })
-    .unwrap_or(Ok(None))
 }
 
 /// Insert `key → value` (no durability flush; callers flush explicitly).
 fn insert<T: Table>(store: &StoreType, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-    with_table(store, T::NAME, |entry| -> eyre::Result<()> {
+    with_open_table::<T, _>(store, |entry| {
         let mut bufs = entry.bufs.lock();
         let EncodeBufs { key: key_buf, value: value_buf } = &mut *bufs;
         key_buf.clear();
@@ -126,38 +135,35 @@ fn insert<T: Table>(store: &StoreType, key: &T::Key, value: &T::Value) -> eyre::
         encode_into_buffer(value_buf, value)?;
         entry.table.insert(key_buf, value_buf)
     })
-    .unwrap_or(Ok(()))
 }
 
 /// Remove a key: the table logs the removal (in its removal log) and drops the key from its index.
 /// The removed row's bytes stay in the data log until the table is cleared (compaction is a later
 /// step).
 fn remove<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<()> {
-    with_table(store, T::NAME, |entry| -> eyre::Result<()> {
+    with_open_table::<T, _>(store, |entry| {
         let mut bufs = entry.bufs.lock();
         bufs.key.clear();
         encode_key_into(&mut bufs.key, key)?;
         entry.table.remove(&bufs.key)?;
         Ok(())
     })
-    .unwrap_or(Ok(()))
 }
 
 /// Reset a table to empty: it switches to a new, empty generation and deletes the old one's files
 /// (see `table.rs`).
 fn clear_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    with_table(store, T::NAME, |entry| entry.table.clear()).unwrap_or(Ok(()))
+    with_open_table::<T, _>(store, |entry| entry.table.clear())
 }
 
 /// Commit a table's writes (durably, at a commit record in its log), then publish them to readers.
 fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    with_table(store, T::NAME, |entry| entry.table.flush()).unwrap_or(Ok(()))
+    with_open_table::<T, _>(store, |entry| entry.table.flush())
 }
 
-/// True if the table contains `key`.
+/// True if the table contains `key` (a damaged index is an error, not "absent").
 fn contains_key<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<bool> {
-    with_table(store, T::NAME, |entry| with_read_key(key, |key| entry.table.contains(key)))
-        .unwrap_or(Ok(false))
+    with_open_table::<T, _>(store, |entry| with_read_key(key, |key| entry.table.contains(key)))
 }
 
 /// True if the table is open and empty (an absent or unreadable table reads as not empty).
@@ -257,6 +263,21 @@ impl TnDatabase {
     fn rebuilt_on_open<T: Table>(&self) -> bool {
         with_table(&self.store, T::NAME, |entry| entry.table.rebuilt_on_open()).unwrap_or(false)
     }
+
+    /// Test-only: make table `T`'s next commit fail before it writes anything.
+    #[cfg(test)]
+    fn fail_next_flush_for_test<T: Table>(&self) {
+        with_table(&self.store, T::NAME, |entry| entry.table.fail_next_flush());
+    }
+
+    /// Test-only, for a simulated crash (a leaked handle): release every open table's lock, as a
+    /// crashed process would, so the tables can be reopened.
+    #[cfg(test)]
+    pub(crate) fn release_locks_for_crash(&self) {
+        for entry in self.store.load().values() {
+            entry.table.release_lock_for_crash();
+        }
+    }
 }
 
 /// Read-only transaction: reads go straight to the shared store (like [`crate::mem_db`]).
@@ -293,12 +314,11 @@ impl TnDbTxMut {
 impl DbTx for TnDbTxMut {
     /// Reads the table's working state, so this transaction's own uncommitted writes are visible.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        with_table(&self.store, T::NAME, |entry| {
+        with_open_table::<T, _>(&self.store, |entry| {
             with_read_key(key, |key| {
                 entry.table.get_working_with(key, |bytes| decode::<T::Value>(bytes))
             })
         })
-        .unwrap_or(Ok(None))
     }
 }
 
@@ -407,7 +427,7 @@ impl Database for TnDatabase {
 #[cfg(test)]
 mod test {
     use tempfile::TempDir;
-    use tn_types::{Database as _, DbTxMut as _};
+    use tn_types::{Database as _, DbTx as _, DbTxMut as _};
 
     use super::TnDatabase;
     use crate::test::*;
@@ -725,9 +745,16 @@ mod test {
     }
 
     /// Simulate a crash: the database's tables are never dropped, so no file is sealed and no
-    /// index is synced (their mappings stay, as a crashed process's page cache would).
-    fn crash<D>(db: D) {
+    /// index is synced (their mappings stay, as a crashed process's page cache would); their locks
+    /// are released, as a crashed process's are.
+    fn crash(db: TnDatabase) {
+        db.release_locks_for_crash();
         std::mem::forget(db);
+    }
+
+    /// A write transaction abandoned by the crash.
+    fn crash_txn(txn: super::TnDbTxMut) {
+        std::mem::forget(txn);
     }
 
     fn gen_path(base: &std::path::Path, table: &str, generation: u64) -> std::path::PathBuf {
@@ -806,7 +833,7 @@ mod test {
             txn.insert::<TestTable>(&100, &"uncommitted".to_string()).expect("insert");
             txn.remove::<TestTable>(&30).expect("remove");
             txn.insert::<TestTable>(&11, &"uncommitted".to_string()).expect("overwrite");
-            crash(txn);
+            crash_txn(txn);
             crash(db);
         }
         let db = TnDatabase::open(tmp.path()).expect("reopen");
@@ -950,7 +977,7 @@ mod test {
             for i in 20..25u64 {
                 txn.insert::<TestTable>(&i, &format!("v{i}")).expect("uncommitted");
             }
-            crash(txn);
+            crash_txn(txn);
             crash(db);
         }
         let data = gen_path(tmp.path(), "TestTable", 0).join("data");
@@ -992,7 +1019,7 @@ mod test {
             for i in 10..13u64 {
                 txn.remove::<TestTable>(&i).expect("uncommitted remove");
             }
-            crash(txn);
+            crash_txn(txn);
             crash(db);
         }
         let removed = gen_path(tmp.path(), "TestTable", 0).join("removed");
@@ -1108,7 +1135,7 @@ mod test {
                 drop(db);
                 committed = pending;
             } else {
-                crash(txn);
+                crash_txn(txn);
                 crash(db);
             }
         }
@@ -1125,17 +1152,93 @@ mod test {
         let tmp = TempDir::with_prefix("tndb_layered_crash").expect("temp dir");
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         {
-            let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("open"), true);
+            let tn = TnDatabase::open(tmp.path()).expect("open");
+            let db = LayeredDatabase::open(tn.clone(), true);
             db.open_table::<TestTable>().expect("open table");
             for i in 0..300u64 {
                 db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
             }
             rt.block_on(db.persist::<TestTable>()).expect("persist");
-            crash(db);
+            std::mem::forget(db);
+            crash(tn);
         }
         let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("reopen"), true);
         db.open_table::<TestTable>().expect("reopen table");
         assert_eq!(db.iter::<TestTable>().count(), 300);
         assert_eq!(db.get::<TestTable>(&123).expect("get"), Some("v123".to_string()));
+    }
+
+    // ---- review fixes ----
+
+    /// Ops on a table that was never opened are errors (as with MDBX), never a silent no-op that
+    /// drops the write.
+    #[test]
+    fn test_tndb_ops_on_unopened_table_error() {
+        let tmp = TempDir::with_prefix("tndb_unopened").expect("temp dir");
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        assert!(db.insert::<TestTable>(&1, &"x".to_string()).is_err());
+        assert!(db.remove::<TestTable>(&1).is_err());
+        assert!(db.clear_table::<TestTable>().is_err());
+        assert!(db.get::<TestTable>(&1).is_err());
+        assert!(db.contains_key::<TestTable>(&1).is_err());
+        let mut txn = db.write_txn().expect("txn");
+        assert!(txn.insert::<TestTable>(&1, &"x".to_string()).is_err());
+        assert!(txn.get::<TestTable>(&1).is_err());
+    }
+
+    /// A lookup that hits a damaged index page is an error, not "absent".
+    #[test]
+    fn test_tndb_contains_key_reports_corruption() {
+        let tmp = TempDir::with_prefix("tndb_corrupt_contains").expect("temp dir");
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        for i in 0..10u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        // Zero every node page's CRC trailer through the file (the index is mapped shared), so
+        // whichever page the published tree's root is reads as damaged.
+        let index = gen_path(tmp.path(), "TestTable", 0).join("btx").join("index.btx");
+        let pages = std::fs::metadata(&index).expect("index").len() / 4096;
+        use std::os::unix::fs::FileExt as _;
+        let file = std::fs::OpenOptions::new().write(true).open(&index).expect("open index");
+        for page in 1..pages {
+            file.write_all_at(&[0; 4], page * 4096 + 4092).expect("zero the CRC");
+        }
+
+        assert!(db.contains_key::<TestTable>(&3).is_err(), "corruption is not absence");
+        assert!(db.get::<TestTable>(&3).is_err());
+    }
+
+    /// A table directory is opened by one writer at a time: a second database on the same path
+    /// cannot open the table until the first closes it.
+    #[test]
+    fn test_tndb_table_open_twice_is_refused() {
+        let tmp = TempDir::with_prefix("tndb_lock").expect("temp dir");
+        let first = TnDatabase::open(tmp.path()).expect("open");
+        first.open_table::<TestTable>().expect("open table");
+        let second = TnDatabase::open(tmp.path()).expect("open");
+        assert!(second.open_table::<TestTable>().is_err(), "the table is locked");
+        drop(first);
+        second.open_table::<TestTable>().expect("free once the first closes");
+    }
+
+    /// A close that cannot commit leaves its uncommitted writes out, and the table still opens.
+    #[test]
+    fn test_tndb_close_without_commit_reopens() {
+        let tmp = TempDir::with_prefix("tndb_close_fail").expect("temp dir");
+        {
+            let db = TnDatabase::open(tmp.path()).expect("open");
+            db.open_table::<TestTable>().expect("open table");
+            db.insert::<TestTable>(&1, &"committed".to_string()).expect("insert");
+            let mut txn = db.write_txn().expect("txn");
+            txn.insert::<TestTable>(&2, &"pending".to_string()).expect("insert");
+            txn.remove::<TestTable>(&1).expect("remove");
+            drop(txn);
+            db.fail_next_flush_for_test::<TestTable>();
+        }
+        let db = TnDatabase::open(tmp.path()).expect("reopen");
+        db.open_table::<TestTable>().expect("the table opens");
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("committed".to_string()));
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), None);
     }
 }

@@ -34,7 +34,13 @@
 //! the logs up to the last commit point, so a crash keeps every committed write and no part of an
 //! uncommitted one (see [`recover`]). Recovery fails closed: it changes nothing until both logs
 //! have been read and checked, a tear in a sealed log or below a log's commit marker is an error,
-//! and a failed recovery leaves the logs as they were.
+//! and a failed recovery leaves the logs as they were. Each write is all or nothing: a put or
+//! remove whose index step fails takes its log record back out.
+//!
+//! One writer per table: an open holds the table's `LOCK` (`flock`) for the writer's life, so a
+//! second open of the same table (this process or another) fails. A clear that fails after the
+//! next open would pick its new generation stops the writer: later writes and commits fail until a
+//! restart, rather than commit to a generation the restart discards.
 //!
 //! Clearing a table starts a new, empty generation and deletes the old one's files, so cleared
 //! data leaves the disk. Snapshots of the old generation keep its files open (its mappings valid)
@@ -53,7 +59,9 @@ use arc_swap::ArcSwap;
 use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 
-use super::layout::{gen_dir, list_gens, remove_spares, spare_dir, sync_dir, KeyMode, TableMeta};
+use super::layout::{
+    gen_dir, list_gens, lock_table, remove_spares, spare_dir, sync_dir, KeyMode, TableMeta,
+};
 use crate::archive::{
     btree_index::{
         index::IndexSnapshot,
@@ -111,7 +119,9 @@ impl ScanKind {
 /// The value bytes of a data record: past the key in a keyed table (`value_offset` = key size),
 /// the whole record in a derived-key one (0).
 fn record_value(record: &[u8], value_offset: usize) -> Result<&[u8], FetchError> {
-    record.get(value_offset..).ok_or(FetchError::CrcFailed)
+    record
+        .get(value_offset..)
+        .ok_or_else(|| FetchError::CorruptIndex("a data record is shorter than its key".into()))
 }
 
 /// A byte log: the data log or the removal log.
@@ -227,9 +237,9 @@ enum DataRecord {
 /// - a put becomes live only at the commit record after it, and a removal applies only when it was
 ///   made before the last commit (its data length is at most that commit record's position), so a
 ///   crash keeps no part of an uncommitted flush;
-/// - a sealed (cleanly closed) log must read whole and end committed; an unclean log may end in a
-///   tear or uncommitted records, but not below its commit marker (that is damage to committed
-///   data, not a crash tail);
+/// - a sealed (cleanly closed) log must read whole (no tear); any log may end in uncommitted
+///   records (a close that could not commit), which are dropped; an unclean log may also end in a
+///   tear, but not below its commit marker (that is damage to committed data, not a crash tail);
 /// - a malformed record, or a key function failure, is an error.
 fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Result<Replay> {
     let ksize = meta.ksize as usize;
@@ -275,7 +285,7 @@ fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Re
             }
         }
     }
-    check_log_end("data", &files.data, torn || !pending.is_empty(), data_end)?;
+    check_log_end("data", &files.data, torn, data_end)?;
 
     // The removal log: committed removals, in order (their data lengths never decrease).
     let mut removed_end = header;
@@ -308,16 +318,15 @@ fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Re
             uncommitted = true;
         }
     }
-    check_log_end("removal", &files.removed, torn || uncommitted, removed_end)?;
+    check_log_end("removal", &files.removed, torn, removed_end)?;
 
     Ok(Replay { rows, data_end, removed_end })
 }
 
-/// Fail closed on a log whose replay stopped short of its end (a tear, or records past the last
-/// commit) when that cannot be a crash tail: the log was sealed by a clean close, or the stop lies
-/// below the log's commit marker.
-fn check_log_end(name: &str, log: &Log, short: bool, end: u64) -> eyre::Result<()> {
-    if short && !log.opened_unclean() {
+/// Fail closed on a log whose replay hit a bad frame (`torn`) when that cannot be a crash tail:
+/// the log was sealed by a clean close; or whose committed records stop below its commit marker.
+fn check_log_end(name: &str, log: &Log, torn: bool, end: u64) -> eyre::Result<()> {
+    if torn && !log.opened_unclean() {
         bail!("tndb: the {name} log was closed cleanly but does not replay to its end (corrupt)");
     }
     if log.opened_unclean() && log.committed_end().is_some_and(|committed| end < committed) {
@@ -353,6 +362,19 @@ struct Writer {
     /// Clears that renamed a prepared spare into place (for tests).
     #[cfg(test)]
     clears_from_spare: u32,
+    /// Test-only: the next clear's directory sync after its rename fails.
+    #[cfg(test)]
+    fail_next_clear_sync: bool,
+    /// Test-only: the next commit fails before writing anything.
+    #[cfg(test)]
+    fail_next_flush: bool,
+    /// Set when a clear failed after it may have changed which generation the next open picks:
+    /// writing on here would commit to a generation a restart discards, so every later write and
+    /// commit fails (restart to recover).
+    failed: Option<String>,
+    /// The table's `flock` (see [`lock_table`]), released when the writer drops. Declared last so
+    /// it is released after the files close. `None` only after a test's simulated crash.
+    _lock: Option<fs::File>,
 }
 
 impl std::fmt::Debug for Writer {
@@ -401,7 +423,19 @@ impl Writer {
         Ok(())
     }
 
+    /// Refuse writes once a failed clear stopped this writer (see `failed`).
+    fn check_failed(&self) -> eyre::Result<()> {
+        match &self.failed {
+            Some(cause) => bail!(
+                "tndb: table {} stopped after a failed clear ({cause}); restart to recover",
+                self.table_dir.display()
+            ),
+            None => Ok(()),
+        }
+    }
+
     fn insert(&mut self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
+        self.check_failed()?;
         self.check_ksize(key)?;
         let pos = match &self.key_fn {
             None => self.files.data.append_raw_parts(&[key, value])?,
@@ -417,8 +451,13 @@ impl Writer {
                 self.files.data.append_raw(value)?
             }
         };
+        // All or nothing: a failed index step takes its record back out of the log, or a later
+        // commit would make durable a put the index (and the caller) never had.
+        if let Err(e) = self.index_mut().and_then(|idx| Ok(idx.save(key, pos)?)) {
+            self.files.data.rewind_to(pos);
+            return Err(e);
+        }
         self.uncommitted = true;
-        self.index_mut()?.save(key, pos)?;
         Ok(())
     }
 
@@ -436,20 +475,29 @@ impl Writer {
         Ok(Some(decode(record_value(record, self.value_offset())?)))
     }
 
-    /// Remove `key`, logging the removal first (only a present key is logged).
+    /// Remove `key`, logging the removal first. The record is taken back out when the key is
+    /// absent (only a present key stays logged) or the index step fails (all or nothing).
     fn remove(&mut self, key: &[u8]) -> eyre::Result<bool> {
-        let Some(idx) = self.files.idx.as_ref() else { return Ok(false) };
-        match idx.load(key) {
-            Ok(_) => {}
-            Err(FetchError::NotFound) => return Ok(false),
-            Err(e) => return Err(e.into()),
-        }
+        self.check_failed()?;
+        let Some(idx) = self.files.idx.as_mut() else { return Ok(false) };
+        let record = self.files.removed.file_len();
         let data_len = self.files.data.file_len().to_le_bytes();
         self.files.removed.append_raw_parts(&[key, &data_len])?;
-        self.removals_unsynced = true;
-        self.uncommitted = true;
-        self.index_mut()?.remove(key)?;
-        Ok(true)
+        match idx.remove(key) {
+            Ok(true) => {
+                self.removals_unsynced = true;
+                self.uncommitted = true;
+                Ok(true)
+            }
+            Ok(false) => {
+                self.files.removed.rewind_to(record);
+                Ok(false)
+            }
+            Err(e) => {
+                self.files.removed.rewind_to(record);
+                Err(e.into())
+            }
+        }
     }
 
     /// Start preparing the spare for the next generation on a background thread, after deleting
@@ -491,22 +539,36 @@ impl Writer {
 
     /// Start a new, empty generation and delete the current one's files (see the module docs).
     fn clear(&mut self) -> eyre::Result<()> {
+        self.check_failed()?;
         let next = self.gen + 1;
+        let next_dir = gen_dir(&self.table_dir, next);
         let files = match self.take_spare() {
             // Its files are already synced: renaming it into place, durably, is the clear.
             Some((dir, files)) => {
-                fs::rename(&dir, gen_dir(&self.table_dir, next))?;
-                sync_dir(&self.table_dir)?;
+                fs::rename(&dir, &next_dir)?;
+                // From here the next open picks the new generation, so a failure stops this
+                // writer rather than let it commit to the generation a restart discards.
+                #[cfg(test)]
+                if std::mem::take(&mut self.fail_next_clear_sync) {
+                    return Err(self.stop("injected directory sync failure".into()));
+                }
+                if let Err(e) = sync_dir(&self.table_dir) {
+                    return Err(self.stop(format!("sync the renamed generation: {e}")));
+                }
                 #[cfg(test)]
                 {
                     self.clears_from_spare += 1;
                 }
                 files
             }
-            None => {
-                let (data, removed) = create_gen(&self.table_dir, next)?;
-                GenFiles { data, removed, idx: None }
-            }
+            None => match create_gen(&self.table_dir, next) {
+                Ok((data, removed)) => GenFiles { data, removed, idx: None },
+                // A partly created generation the next open would pick stops this writer too.
+                Err(e) if next_dir.exists() => {
+                    return Err(self.stop(format!("create the new generation: {e}")));
+                }
+                Err(e) => return Err(e),
+            },
         };
         let old_dir = std::mem::replace(&mut self.gen_dir, gen_dir(&self.table_dir, next));
         let mut old = std::mem::replace(&mut self.files, files);
@@ -529,11 +591,28 @@ impl Writer {
         Ok(())
     }
 
+    /// Stop this writer (see `failed`) and return the error saying why.
+    fn stop(&mut self, cause: String) -> eyre::Report {
+        tracing::error!(
+            target: "tndb",
+            "table {}: {cause}; writes stop until a restart",
+            self.table_dir.display()
+        );
+        let report = eyre::eyre!("tndb: {cause}");
+        self.failed = Some(cause);
+        report
+    }
+
     /// Commit: sync the removal log (if it changed), append the commit record, and sync the data
     /// log. A flush with nothing to commit does nothing.
     fn flush(&mut self) -> eyre::Result<()> {
+        self.check_failed()?;
         if !self.uncommitted {
             return Ok(());
+        }
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_next_flush) {
+            eyre::bail!("injected commit failure");
         }
         // The removals are durable before the commit record that makes them count.
         let removals = self.removals_unsynced;
@@ -606,8 +685,9 @@ impl Writer {
 }
 
 impl Drop for Writer {
-    /// A clean close commits whatever is uncommitted (it is sealed into the log either way) and
-    /// records the log length the index matches, so the next open needs no rebuild.
+    /// A clean close commits whatever is uncommitted, the ordinary way, and records the log length
+    /// the index matches, so the next open needs no rebuild; a close that cannot commit makes the
+    /// next open rebuild instead, which drops the uncommitted records.
     fn drop(&mut self) {
         // Let a spare being prepared finish (so no thread writes in the table directory after it
         // closes), then discard it: the next open prepares its own.
@@ -620,8 +700,15 @@ impl Drop for Writer {
             drop(spare);
             let _ = fs::remove_dir_all(dir);
         }
-        if self.uncommitted {
-            let _ = self.files.data.append_raw(COMMIT);
+        // Commit what is uncommitted the ordinary way (the removal log synced before the commit
+        // record that makes its removals count).
+        if self.flush().is_err() {
+            // The close could not commit: make the next open rebuild from the logs (a length the
+            // log never has), which drops the uncommitted tail.
+            if let Some(idx) = self.files.idx.as_mut() {
+                idx.set_data_file_length(u64::MAX);
+            }
+            return;
         }
         let data_len = self.files.data.file_len();
         if let Some(idx) = self.files.idx.as_mut() {
@@ -659,8 +746,13 @@ impl Published {
         Ok(Some(decode(self.value_at(pos)?)))
     }
 
-    fn contains(&self, key: &[u8]) -> bool {
-        self.index.as_ref().is_some_and(|index| index.load(key).is_ok())
+    fn contains(&self, key: &[u8]) -> Result<bool, FetchError> {
+        let Some(index) = &self.index else { return Ok(false) };
+        match index.load(key) {
+            Ok(_) => Ok(true),
+            Err(FetchError::NotFound) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn len(&self) -> usize {
@@ -674,6 +766,8 @@ impl Published {
 struct Inner {
     writer: Mutex<Writer>,
     published: ArcSwap<Published>,
+    /// The table directory, for error logs.
+    label: String,
 }
 
 /// A cheap `Clone` handle to a table.  Reads take no lock (they load the published snapshot);
@@ -685,27 +779,22 @@ pub(crate) struct TnTable {
     inner: Arc<Inner>,
 }
 
-/// The current generation of the table at `dir`, opened: the newest generation whose logs open,
-/// with every older one deleted (more than one exists only after a crash during a clear, which then
-/// either finished or never happened); a new table gets generation 0.
+/// The current generation of the table at `dir`, opened: the newest generation (an error if it
+/// does not open), with every older one deleted (more than one exists only after a crash during a
+/// clear); a new table gets generation 0.
 fn open_current_gen(dir: &Path) -> eyre::Result<(u64, Log, Log)> {
-    let mut gens = list_gens(dir)?;
+    let gens = list_gens(dir)?;
     let Some(&newest) = gens.last() else {
         let (data, removed) = create_gen(dir, 0)?;
         return Ok((0, data, removed));
     };
-    let (current, logs) = match open_logs(&gen_dir(dir, newest)) {
-        Ok(logs) => (newest, logs),
-        // A newest generation that does not open, beside an older one, is a clear that crashed
-        // while creating it: the older generation is still current.
-        Err(_) if gens.len() > 1 => {
-            fs::remove_dir_all(gen_dir(dir, newest))?;
-            gens.pop();
-            let current = *gens.last().expect("an older generation");
-            (current, open_logs(&gen_dir(dir, current))?)
-        }
-        Err(e) => return Err(e),
-    };
+    // The newest generation is current. One that does not open is an error, never a reason to
+    // delete it or to fall back to an older one: a clear renames a complete generation into place,
+    // and a partly created one opens as empty (a missing log is created, a zeroed one reset), so a
+    // failure here is damage or an environment error, and older data must not come back.
+    let current = newest;
+    let logs = open_logs(&gen_dir(dir, current))
+        .wrap_err_with(|| format!("tndb: open generation {current} of {}", dir.display()))?;
     // An older generation is never opened again (the newest is current), so one that cannot be
     // deleted now (logged) is only garbage for a later open to remove.
     for &old in gens.iter().filter(|&&n| n < current) {
@@ -722,6 +811,7 @@ impl TnTable {
     /// error). Rebuilds the index from the logs when the table was not closed cleanly.
     pub(crate) fn open(dir: PathBuf, key_fn: Option<KeyFn>) -> eyre::Result<Self> {
         fs::create_dir_all(&dir)?;
+        let lock = lock_table(&dir)?;
         let mode = if key_fn.is_some() { KeyMode::Derived } else { KeyMode::Keyed };
         let meta = match TableMeta::read(&dir)? {
             Some(meta) if meta.mode == mode => meta,
@@ -789,16 +879,24 @@ impl TnTable {
             rebuilt: false,
             #[cfg(test)]
             clears_from_spare: 0,
+            #[cfg(test)]
+            fail_next_clear_sync: false,
+            #[cfg(test)]
+            fail_next_flush: false,
+            failed: None,
+            _lock: Some(lock),
         };
         if must_rebuild {
             writer.recover()?;
         }
         writer.prepare_next_spare(None);
         let published = writer.publish();
+        let label = writer.table_dir.display().to_string();
         Ok(Self {
             inner: Arc::new(Inner {
                 writer: Mutex::new(writer),
                 published: ArcSwap::from_pointee(published),
+                label,
             }),
         })
     }
@@ -807,6 +905,19 @@ impl TnTable {
     #[cfg(test)]
     pub(crate) fn rebuilt_on_open(&self) -> bool {
         self.inner.writer.lock().rebuilt
+    }
+
+    /// Test-only: make the next commit fail before it writes anything.
+    #[cfg(test)]
+    pub(crate) fn fail_next_flush(&self) {
+        self.inner.writer.lock().fail_next_flush = true;
+    }
+
+    /// Test-only, for a simulated crash (a leaked handle): release the table's lock, as a crashed
+    /// process would, so the table can be reopened.
+    #[cfg(test)]
+    pub(crate) fn release_lock_for_crash(&self) {
+        self.inner.writer.lock()._lock = None;
     }
 
     /// Insert (or overwrite) `key → value`; readable from the next flush.
@@ -855,9 +966,10 @@ impl TnTable {
         self.inner.writer.lock().get_with(key, decode)
     }
 
-    /// True if `key` is present in the published snapshot.
+    /// True if `key` is present in the published snapshot. A damaged index is an error, not
+    /// "absent".
     pub(crate) fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
-        Ok(self.inner.published.load().contains(key))
+        Ok(self.inner.published.load().contains(key)?)
     }
 
     /// True if the published snapshot has no entries.
@@ -876,7 +988,13 @@ impl TnTable {
     /// lock (see the module docs); a table with no index yet scans empty.
     pub(crate) fn scan(&self, kind: ScanKind) -> TableScan {
         let published = self.inner.published.load_full();
-        let cursor = published.index.as_ref().and_then(|index| kind.cursor(index).ok());
+        let cursor = published.index.as_ref().and_then(|index| match kind.cursor(index) {
+            Ok(cursor) => Some(cursor),
+            Err(e) => {
+                scan_error(&self.inner.label, &e);
+                None
+            }
+        });
         TableScan { published, cursor, _table: Arc::clone(&self.inner) }
     }
 
@@ -889,9 +1007,26 @@ impl TnTable {
     ) -> Option<R> {
         let published = self.inner.published.load();
         let index = published.index.as_ref()?;
-        let (key, pos) = kind.cursor(index).ok()?.next(index)?.ok()?;
-        Some(f(key, published.value_at(pos).ok()?))
+        let found = kind.cursor(index).and_then(|mut cursor| {
+            let Some(item) = cursor.next(index) else { return Ok(None) };
+            let (key, pos) = item?;
+            Ok(Some((key, published.value_at(pos)?)))
+        });
+        match found {
+            Ok(Some((key, value))) => Some(f(key, value)),
+            Ok(None) => None,
+            Err(e) => {
+                scan_error(&self.inner.label, &e);
+                None
+            }
+        }
     }
+}
+
+/// Log a scan or seek ended by an error. `DBIter` (and a seek's `Option`) cannot carry it, but a
+/// damaged table must not pass for a shorter one in silence.
+fn scan_error(table: &str, e: &FetchError) {
+    tracing::error!(target: "tndb", "scan of table {table} ended by an error: {e}");
 }
 
 /// A lazy, key-ordered scan of a published snapshot (see [`TnTable::scan`]), stepped with
@@ -912,14 +1047,18 @@ impl TableScan {
     pub(crate) fn next_with<R>(&mut self, f: impl FnOnce(&[u8], &[u8]) -> R) -> Option<R> {
         let published = &*self.published;
         let index = published.index.as_ref()?;
-        let row = self.cursor.as_mut()?.next(index).and_then(|item| {
-            let (key, pos) = item.ok()?;
-            Some((key, published.value_at(pos).ok()?))
+        let row = self.cursor.as_mut()?.next(index).map(|item| {
+            let (key, pos) = item?;
+            Ok((key, published.value_at(pos)?))
         });
         match row {
-            Some((key, value)) => Some(f(key, value)),
+            Some(Ok((key, value))) => Some(f(key, value)),
+            Some(Err(e)) => {
+                scan_error(&self._table.label, &e);
+                self.cursor = None;
+                None
+            }
             None => {
-                // Exhausted, or a fetch failure ended the scan.
                 self.cursor = None;
                 None
             }
@@ -1273,10 +1412,10 @@ mod test {
         assert_eq!(table.get_with(&k, |v| v.to_vec()).expect("get"), Some(v));
     }
 
-    /// If the crash interrupted the new generation's creation (its logs do not open), the clear
-    /// never happened: the older generation is current and the broken one is deleted.
+    /// A newest generation that does not open is an error, never a reason to delete it: nothing
+    /// is removed, and the older generation is not brought back.
     #[test]
-    fn test_tntable_crash_mid_clear_before_new_generation() {
+    fn test_tntable_unopenable_newest_generation_fails_closed() {
         let tmp = TempDir::with_prefix("tntable_mid_clear_torn").expect("temp dir");
         let dir = tmp.path().join("t");
         {
@@ -1288,11 +1427,11 @@ mod test {
             table.flush().expect("flush");
         }
         fs::create_dir(gen_dir(&dir, 1)).expect("mkdir");
-        fs::write(gen_dir(&dir, 1).join("data"), b"half a header").expect("torn header");
+        fs::write(gen_dir(&dir, 1).join("data"), [0xAB_u8; 64]).expect("damaged header");
 
-        let table = TnTable::open(dir.clone(), None).expect("reopen");
-        assert!(!gen_dir(&dir, 1).exists(), "the broken generation is deleted");
-        assert_eq!(keys_of(table.scan(ScanKind::Forward)), (0..10).collect::<Vec<_>>());
+        assert!(TnTable::open(dir.clone(), None).is_err(), "the open fails closed");
+        assert!(gen_dir(&dir, 1).exists(), "the newest generation is not deleted");
+        assert!(gen_dir(&dir, 0).exists(), "the older generation is left as it was");
     }
 
     /// A clear renames the spare prepared in the background into place, and the spare prepared
@@ -1362,5 +1501,67 @@ mod test {
         let table = TnTable::open(dir.clone(), None).expect("reopen");
         assert!(!leftover.exists(), "the leftover spare is deleted");
         assert_eq!(keys_of(table.scan(ScanKind::Forward)), (0..5).collect::<Vec<_>>());
+    }
+
+    /// A clear that fails after renaming the new generation into place (its directory sync
+    /// failed) stops the writer: the next open will pick the new generation, so writing on in the
+    /// old one would lose every later commit at restart. A reopen sees the clear.
+    #[test]
+    fn test_tntable_clear_failing_after_rename_latches() {
+        let tmp = TempDir::with_prefix("tntable_clear_latch").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let (k, v) = kv(1);
+        table.insert(&k, &v).expect("insert");
+        table.flush().expect("flush");
+
+        table.inner.writer.lock().fail_next_clear_sync = true;
+        assert!(table.clear().is_err(), "the injected sync failure surfaces");
+        let (k2, v2) = kv(2);
+        assert!(table.insert(&k2, &v2).is_err(), "writes after the failed clear are refused");
+        assert!(table.flush().is_err(), "and so are commits");
+        drop(table);
+
+        let table = TnTable::open(dir, None).expect("reopen");
+        assert!(table.is_empty().expect("is_empty"), "the reopen picks the cleared generation");
+    }
+
+    /// A put or remove whose index step fails leaves nothing behind in the logs: after a later
+    /// commit and a crash rebuild, the failed put is absent and the failed remove's key present.
+    #[test]
+    fn test_tntable_failed_index_step_leaves_no_log_record() {
+        let tmp = TempDir::with_prefix("tntable_index_fail").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        for i in 0..10 {
+            let (k, v) = kv(i);
+            table.insert(&k, &v).expect("insert");
+        }
+        table.flush().expect("flush");
+
+        // After a publish every write copies the root first, so it allocates a page.
+        let fail_next = |table: &TnTable| {
+            let mut writer = table.inner.writer.lock();
+            writer.files.idx.as_mut().expect("index").fail_allocations_after(Some(0));
+        };
+        let (k_new, v_new) = kv(100);
+        fail_next(&table);
+        assert!(table.insert(&k_new, &v_new).is_err(), "the index step fails");
+        let (k_old, _) = kv(5);
+        assert!(table.remove(&k_old).is_err(), "the index step fails");
+        table.inner.writer.lock().files.idx.as_mut().expect("index").fail_allocations_after(None);
+        // An unrelated write commits whatever the failed calls left in the logs.
+        let (k_other, v_other) = kv(200);
+        table.insert(&k_other, &v_other).expect("insert");
+        table.flush().expect("flush");
+        // Crash (the lock released, as a dead process's is): the next open rebuilds from the logs.
+        table.release_lock_for_crash();
+        std::mem::forget(table);
+
+        let table = TnTable::open(dir, None).expect("reopen");
+        assert!(table.rebuilt_on_open());
+        assert_eq!(table.get_with(&k_new, |v| v.to_vec()).expect("get"), None, "failed put");
+        assert!(table.contains(&k_old).expect("contains"), "failed remove");
+        assert!(table.contains(&k_other).expect("contains"));
     }
 }

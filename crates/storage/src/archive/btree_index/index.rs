@@ -400,6 +400,12 @@ impl BtreeIndex {
         Ok(index)
     }
 
+    /// Test-only: make the page allocation after `n` more fail (`None` clears it).
+    #[cfg(test)]
+    pub(crate) fn fail_allocations_after(&mut self, n: Option<usize>) {
+        self.fail_allocs_after = n;
+    }
+
     /// Pages in the file, including free ones (the allocation high-water mark).
     #[cfg(test)]
     pub(crate) fn page_count(&self) -> u32 {

@@ -919,13 +919,13 @@ fn count_epoch_rows<DB: Database>(db: &DB) -> usize {
 
 /// Populate a late-epoch database with `open`, close it, then time two reopens: the raw backend
 /// (open plus `open_table`) and the full-memory layer over it (which loads every row into memory).
-/// With `crash`, also time both reopens after a crash (a handle dropped without closing, so the
-/// next open recovers). Returns the raw and layered report columns.
+/// With `crash` (how to abandon an open handle as a crashed process would, so the next open
+/// recovers), also time both reopens after a crash. Returns the raw and layered report columns.
 fn reload<DB: Database>(
     name: &str,
     dir: &Path,
     open: impl Fn(&Path) -> DB,
-    crash: bool,
+    crash: Option<fn(DB)>,
 ) -> [Column; 2] {
     println!("  populating {name} ...");
     let rows = {
@@ -950,16 +950,16 @@ fn reload<DB: Database>(
     drop(db);
 
     // After a crash: the files are left unclosed (the handle is leaked), so each reopen recovers.
-    let crashed = crash.then(|| {
+    let crashed = crash.map(|crash| {
         let db = open(dir);
         open_epoch_tables(&db);
-        std::mem::forget(db);
+        crash(db);
         let start = Instant::now();
         let db = open(dir);
         open_epoch_tables(&db);
         let raw = start.elapsed();
         assert_eq!(count_epoch_rows(&db), rows, "{name}: every row recovered after a crash");
-        std::mem::forget(db);
+        crash(db);
         let start = Instant::now();
         let db = LayeredDatabase::open(open(dir), true);
         open_epoch_tables(&db);
@@ -1000,14 +1000,18 @@ fn workload_startup_reload() {
         "TnDb",
         &tmp.path().join("tndb"),
         |dir| TnDatabase::open(dir).expect("open tndb"),
-        true,
+        // A leaked handle with its table locks released, as after a crashed process.
+        Some(|db: TnDatabase| {
+            db.release_locks_for_crash();
+            std::mem::forget(db);
+        }),
     ));
     #[cfg(feature = "reth-libmdbx")]
     cols.extend(reload(
         "MDBX-prod",
         &tmp.path().join("mdbx_prod"),
         |dir| open_mdbx_prod(dir, 8, PROD_EPOCH_MAX, PROD_GROWTH),
-        false,
+        None,
     ));
     print_table(
         &format!(
