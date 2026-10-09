@@ -10,7 +10,7 @@ use std::{
 
 use parking_lot::Mutex;
 use tn_config::ConsensusConfig;
-use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
+use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp, EpochPackRequest};
 use tn_storage::{consensus::ConsensusChain, tables::ConsensusCache};
 use tn_types::{
     ConsensusHeaderDigest, ConsensusNumHash, Database as TNDatabase, Epoch, EpochRecord, Noticer,
@@ -482,16 +482,22 @@ pub async fn spawn_fetch_consensus(
     task_index: u32, // Task index for logging.
     consensus_chain: ConsensusChain,
 ) {
+    // requests this worker gave up on while the queue was full. a worker never waits for room in
+    // the queue it drains, so it holds them here and offers them back after taking each request
+    // and every retry interval while idle
+    let mut deferred = Vec::new();
     // Get the epoch of our last executed consensus.
     loop {
         tokio::select! {
-            Some((previous_epoch_record, mut epoch_record)) = consensus_bus.get_next_epoch_pack_file_request() => {
-                let epoch = epoch_record.epoch;
+            Some(mut request) = consensus_bus.get_next_epoch_pack_file_request() => {
+                // taking this request freed a slot for a held one
+                requeue_deferred(&consensus_bus, &mut deferred);
+                let epoch = request.epoch();
                 let already_streaming = consensus_chain.already_streaming_epoch(epoch);
-                if already_streaming || consensus_chain.is_epoch_complete(&epoch_record).await {
-                    // If we have already streamed this epoch or are in process of streaming then continue.
-                    // Note, it is a lot less complex to do this check here than to make sure we don't request
-                    // the same pack more than once so do it this way.
+                if already_streaming || consensus_chain.is_epoch_complete(request.epoch_record()).await {
+                    // skip a pack we already have or are streaming in. the queue refuses a second
+                    // request for an epoch while one is queued or fetched, but the pack can still
+                    // finish or start importing another way while this request waits in the queue
                     info!(target: "state-sync", "epoch consensus fetcher {task_index} skipping epoch {epoch} we are streaming {already_streaming} or already have");
                     continue;
                 }
@@ -500,30 +506,30 @@ pub async fn spawn_fetch_consensus(
                 let mut attempts = 1;
                 loop {
                     tokio::select! {
-                        result = network.request_epoch_pack(&epoch_record, &previous_epoch_record, &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
+                        result = network.request_epoch_pack(request.epoch_record(), request.previous_epoch_record(), &consensus_chain, Duration::from_secs(PACK_RECORD_TIMEOUT_SECS)) => {
                             match result {
                                 Ok(_) => {
                                     // After a successful pack download, signal spawn_stream_consensus_headers
                                     // that locally-available blocks are ready. This unblocks streaming even
                                     // when the gossip/network path (request_consensus) is slow or unresponsive.
                                     match consensus_chain
-                                        .consensus_header_by_number(epoch_record.final_consensus.number)
+                                        .consensus_header_by_number(request.epoch_record().final_consensus.number)
                                         .await {
                                         Ok(Some(final_header)) => {
                                             let number = final_header.number;
                                             if consensus_bus.send_last_consensus_header_if_newer(final_header) {
                                                 info!(target: "state-sync",
-                                                    epoch = epoch_record.epoch,
+                                                    epoch,
                                                     final_header_number = number,
                                                     "epoch pack downloaded, signaling stream to process locally available blocks");
                                             }
                                             break;
                                         }
                                         Ok(None) => error!(target: "state-sync",
-                                            epoch = epoch_record.epoch,
+                                            epoch,
                                             "Unable to find header by number for new pack file"),
                                         Err(e) => error!(target: "state-sync",
-                                            epoch = epoch_record.epoch,
+                                            epoch,
                                             ?e,
                                             "Unable to find header by number for new pack file"),
                                     }
@@ -544,20 +550,34 @@ pub async fn spawn_fetch_consensus(
                         // But put it back on the queue and try another one since this one is not getting anywhere.
                         error!(target: "state-sync",
                             "failed to request epoch pack for epoch {epoch}, after {attempts}, will try to again later (WE ARE STUCK)");
-                        consensus_bus.request_epoch_pack_file(previous_epoch_record, epoch_record).await;
+                        if let Some(request) = consensus_bus.try_requeue_epoch_pack_file(request) {
+                            warn!(target: "state-sync",
+                                "epoch request queue full, holding epoch {epoch} until there is room");
+                            deferred.push(request);
+                        }
                         break;
                     }
                     // The epoch record may have been a dummy (final_consensus.number=0)
                     // when first queued at startup. Refresh from DB so subsequent
                     // retries use the real signed cert if it has since arrived.
+                    // The previous epoch's record is never refreshed: epoch records are
+                    // checkpoints, final on this node once stored. A stored record could only
+                    // differ from its peers' copies through malicious nodes or a
+                    // state-determinism bug, and a stall is preferred over a fork, so a stored
+                    // record is never replaced. The epoch 0 dummy does not matter here: epoch 0's
+                    // previous record takes only the committee, which the dummy shares with the
+                    // real record.
                     if let Some(fresh) = consensus_chain.epochs().record_by_epoch(epoch).await {
-                        if fresh.final_consensus.number > epoch_record.final_consensus.number {
+                        let current = request.epoch_record().final_consensus.number;
+                        let fresh_number = fresh.final_consensus.number;
+                        if fresh_number > current && request.set_epoch_record(fresh) {
                             info!(target: "state-sync",
-                                "refreshed epoch {epoch} record for retry: final_consensus {} -> {}",
-                                epoch_record.final_consensus.number, fresh.final_consensus.number);
-                            epoch_record = fresh;
+                                "refreshed epoch {epoch} record for retry: final_consensus {current} -> {fresh_number}");
                         }
                     }
+                    // this worker is about to wait; offer the requests it holds back first so they
+                    // do not wait with it
+                    requeue_deferred(&consensus_bus, &mut deferred);
                     // Wait a beat before we try again, may have a network issue.
                     // Wait time will increase as attempts grow.
                     tokio::select! {
@@ -571,9 +591,23 @@ pub async fn spawn_fetch_consensus(
                     attempts += 1;
                 }
             }
+            // a held request is not stranded if the queue empties while this worker waits on it
+            _ = tokio::time::sleep(Duration::from_secs(PACK_DOWNLOAD_RETRY_SECS)), if !deferred.is_empty() => {
+                requeue_deferred(&consensus_bus, &mut deferred);
+            }
             _ = &rx_shutdown => {
                 break;
             }
+        }
+    }
+}
+
+/// Offer each request a fetch worker holds back to the epoch request queue, keeping the ones the
+/// full queue hands back.
+fn requeue_deferred(consensus_bus: &ConsensusBusApp, deferred: &mut Vec<EpochPackRequest>) {
+    for request in std::mem::take(deferred) {
+        if let Some(request) = consensus_bus.try_requeue_epoch_pack_file(request) {
+            deferred.push(request);
         }
     }
 }
@@ -892,12 +926,13 @@ mod tests {
     use tn_network_libp2p::types::NetworkCommand;
     use tn_primary::{
         network::{PrimaryRequest, PrimaryResponse},
-        NodeMode,
+        NodeMode, EPOCH_REQUEST_QUEUE_CAPACITY,
     };
     use tn_storage::mem_db::MemDatabase;
     use tn_test_utils_committee::CommitteeFixture;
     use tn_types::{
-        CommittedSubDag, ConsensusOutput, EpochSeedChainValue, ReputationScores, TaskManager,
+        CommittedSubDag, ConsensusOutput, EpochSeedChainValue, ReputationScores, ShutdownNotifier,
+        TaskManager,
     };
     use tokio::sync::mpsc::{self, error::TryRecvError};
 
@@ -1128,14 +1163,14 @@ mod tests {
 
         assert_eq!(current_fetch_epoch, 1, "every known record was visited");
         assert!(consensus_bus.last_consensus_header().borrow().is_none());
-        let (_, record) = tokio::time::timeout(
+        let request = tokio::time::timeout(
             Duration::from_millis(100),
             consensus_bus.get_next_epoch_pack_file_request(),
         )
         .await
         .expect("the incomplete pack is requested")
         .expect("request queue open");
-        assert_eq!(record.epoch, 0);
+        assert_eq!(request.epoch(), 0);
         assert!(
             tokio::time::timeout(
                 Duration::from_millis(100),
@@ -1145,6 +1180,124 @@ mod tests {
             .is_err(),
             "exactly one request is queued"
         );
+    }
+
+    /// A fetch worker that gives up on an epoch while the request queue is full must keep taking
+    /// requests. Before the fix it waited for room in its own queue; once every worker waited
+    /// there nothing drained the queue, so every producer (node startup included) waited forever
+    /// and shutdown could not stop the workers (#1563). One worker makes the outcome
+    /// deterministic.
+    #[tokio::test(start_paused = true)]
+    async fn fetch_worker_keeps_consuming_after_giving_up_on_a_full_queue() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        // epoch 0 ends at 3, so every synthetic final number below maps to epoch 1, which has no
+        // pack: the completeness check misses at once and the record refresh finds nothing
+        save_epoch0_record(&chain, 3, ConsensusHeaderDigest::default()).await;
+        let (network, mut rx) = test_network();
+        let consensus_bus = ConsensusBusApp::new();
+        let shutdown = ShutdownNotifier::new();
+        let worker = tokio::spawn(spawn_fetch_consensus(
+            shutdown.subscribe(),
+            consensus_bus.clone(),
+            network,
+            0,
+            chain.clone(),
+        ));
+
+        let record = |epoch: Epoch| EpochRecord {
+            epoch,
+            final_consensus: ConsensusNumHash::new(
+                1_000 + u64::from(epoch),
+                ConsensusHeaderDigest::default(),
+            ),
+            ..EpochRecord::default()
+        };
+        // the last send completes only once the worker has taken epoch 1, which leaves the queue
+        // full with epochs 2..=capacity + 1
+        let capacity =
+            Epoch::try_from(EPOCH_REQUEST_QUEUE_CAPACITY).expect("the capacity fits an epoch");
+        for epoch in 1..=capacity + 1 {
+            consensus_bus.request_epoch_pack_file(EpochRecord::default(), record(epoch)).await;
+        }
+
+        // phase 1: fail all 101 attempts at epoch 1 by dropping each attempt's peer query. no
+        // timer may be pending here: each retry refreshes the record through a background thread,
+        // and a paused clock jumps to the next pending timer while the runtime waits on another
+        // thread. the 100 backoffs add up to 2,800 virtual seconds
+        for attempt in 1..=101 {
+            let command = rx.recv().await.expect("network handle open");
+            assert!(
+                matches!(command, NetworkCommand::ConnectedPeers { .. }),
+                "attempt {attempt} starts with a peer query"
+            );
+        }
+
+        // phase 2: having given up on epoch 1, the worker goes on to epoch 2
+        let command = tokio::time::timeout(Duration::from_secs(600), rx.recv())
+            .await
+            .expect("fetch worker stuck re-queueing into its own full queue (#1563)")
+            .expect("network handle open");
+        assert!(
+            matches!(command, NetworkCommand::ConnectedPeers { .. }),
+            "epoch 2's first attempt starts with a peer query"
+        );
+
+        // phase 3: shutdown stops the worker while epoch 2's peer query is still unanswered
+        shutdown.notify();
+        tokio::time::timeout(Duration::from_secs(600), worker)
+            .await
+            .expect("the worker stops on shutdown")
+            .expect("the worker does not panic");
+        drop(command);
+
+        // phase 4: epoch 1 went back on the queue once, behind everything queued before it
+        let mut epochs = Vec::new();
+        while let Ok(request) = tokio::time::timeout(
+            Duration::from_millis(100),
+            consensus_bus.get_next_epoch_pack_file_request(),
+        )
+        .await
+        {
+            epochs.push(request.expect("request queue open").epoch());
+        }
+        assert_eq!(epochs.last(), Some(&1), "the given-up epoch drains last");
+        assert_eq!(
+            epochs.iter().filter(|epoch| **epoch == 1).count(),
+            1,
+            "the given-up epoch is queued once"
+        );
+    }
+
+    /// Startup and the first gossip both walk the incomplete epochs from the latest consensus
+    /// epoch. Before the fix each walk queued its own request for the same pack, so a backlog
+    /// filled the queue at half its capacity and two fetch workers could retry one epoch side by
+    /// side (#1563); now the epoch is queued once.
+    #[tokio::test]
+    async fn startup_and_gossip_request_an_incomplete_epoch_once() {
+        let dir = TempDir::new().expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain = test_chain(&dir, &fixture).await;
+        save_chained_outputs(&chain, &fixture, 3).await;
+        // the record ends the epoch at 5, past the last local output
+        save_epoch0_record(&chain, 5, ConsensusHeaderDigest::default()).await;
+        let consensus_bus = ConsensusBusApp::new();
+
+        request_missing_packs(&consensus_bus, &chain).await;
+        let mut current_fetch_epoch = chain.latest_consensus_epoch();
+        request_epochs(&mut current_fetch_epoch, &chain, &consensus_bus).await;
+
+        let mut epochs = Vec::new();
+        while let Ok(request) = tokio::time::timeout(
+            Duration::from_millis(100),
+            consensus_bus.get_next_epoch_pack_file_request(),
+        )
+        .await
+        {
+            epochs.push(request.expect("request queue open").epoch());
+        }
+        assert_eq!(epochs, vec![0], "the incomplete epoch is requested once");
     }
 
     /// The shared walk ledger is what keeps a catch-up gap fill from racing a walk that already
