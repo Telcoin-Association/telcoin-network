@@ -1000,6 +1000,18 @@ where
         let mut network_config = NetworkConfig::read_config(&self.tn_datadir)?;
         self.bootstrap_servers = network_config
             .resolve_bootstrap_peers(&self.bootstrap_servers, self.builder.bootstrap_peers());
+        let node_info = &self.builder.tn_config.node_info;
+        network_config.validate_committee_peers(&committee, &self.bootstrap_servers)?;
+        network_config.validate_local_committee_peer(
+            public_key,
+            None,
+            &node_info.p2p_info.primary,
+        )?;
+        (0..=WorkerId::MAX).zip(node_info.p2p_info.workers.iter()).try_for_each(
+            |(id, worker)| {
+                network_config.validate_local_committee_peer(public_key, Some(id), worker)
+            },
+        )?;
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         let (primary_address, worker_addresses) = self
             .spawn_node_networks(
@@ -1053,15 +1065,66 @@ where
                     .collect(),
             )
             .await?;
+        primary_network_handle
+            .inner_handle()
+            .seed_committee_peers(
+                network_config
+                    .committee_peers()
+                    .iter()
+                    .filter(|(key, _)| **key != public_key)
+                    .map(|(key, peer)| (*key, peer.primary.clone()))
+                    .collect(),
+            )
+            .await?;
+        // Validate cached bindings on every swarm before opening any listener or starting dials.
+        let committee_peers = network_config.committee_peers();
+        let startup_bootstrap = &self.bootstrap_servers;
+        let startup_members: HashSet<_> = committee.bls_keys().iter().copied().collect();
+        primary_network_handle
+            .inner_handle()
+            .update_committees(HashSet::new(), startup_members.clone(), HashSet::new())
+            .await?;
+        let startup_members = &startup_members;
+        futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
+            .try_for_each(|network_handle| async move {
+                let worker_id = network_handle.worker_id();
+                let bootstrap_peers = startup_bootstrap
+                    .iter()
+                    .filter_map(|(key, peer)| {
+                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
+                    })
+                    .collect();
+                network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers).await?;
+                let peers = committee_peers
+                    .iter()
+                    .filter(|(key, _)| **key != public_key)
+                    .filter_map(|(key, peer)| {
+                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
+                    })
+                    .collect();
+                network_handle.inner_handle().seed_committee_peers(peers).await?;
+                network_handle
+                    .inner_handle()
+                    .update_committees(HashSet::new(), startup_members.clone(), HashSet::new())
+                    .await
+                    .map_err(Into::into)
+            })
+            .await?;
         info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
         primary_network_handle.inner_handle().start_listening(primary_address).await?;
-        self.bootstrap_servers.keys().copied().for_each(|key| {
-            self.dial_peer_bls(
-                primary_network_handle.inner_handle().clone(),
-                key,
-                node_task_spawner.clone(),
-            );
-        });
+        self.bootstrap_servers
+            .keys()
+            .chain(network_config.committee_peers().keys())
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .for_each(|key| {
+                self.dial_peer_bls(
+                    primary_network_handle.inner_handle().clone(),
+                    key,
+                    node_task_spawner.clone(),
+                );
+            });
 
         let manager = &*self;
         let startup_spawner = &node_task_spawner;
@@ -1077,19 +1140,30 @@ where
                         peer.worker(worker_id).cloned().map(|worker| (*key, worker))
                     })
                     .collect();
-                network_handle.inner_handle().add_bootstrap_peers(bootstrap_peers.clone()).await?;
+                let seeded_peers: BTreeMap<_, _> = committee_peers
+                    .iter()
+                    .filter(|(key, _)| **key != public_key)
+                    .filter_map(|(key, peer)| {
+                        peer.worker(worker_id).cloned().map(|worker| (*key, worker))
+                    })
+                    .collect();
                 let worker_address = worker_addresses
                     .get(&worker_id)
                     .cloned()
                     .ok_or_else(|| eyre!("no resolved listener for worker {worker_id}"))?;
                 network_handle.inner_handle().start_listening(worker_address).await?;
-                bootstrap_peers.into_keys().for_each(|key| {
-                    manager.dial_peer_bls(
-                        network_handle.inner_handle().clone(),
-                        key,
-                        startup_spawner.clone(),
-                    );
-                });
+                bootstrap_peers
+                    .into_keys()
+                    .chain(seeded_peers.into_keys())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .for_each(|key| {
+                        manager.dial_peer_bls(
+                            network_handle.inner_handle().clone(),
+                            key,
+                            startup_spawner.clone(),
+                        );
+                    });
                 Ok(())
             })
             .await?;
@@ -2348,5 +2422,35 @@ mod tests {
         let header = ConsensusHeader::default();
         check_restore_consistency(&tip_at(5, 7), Some(&header))
             .expect("populated tip with a resolved producing header must not be refused");
+    }
+
+    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
+    /// there: the on-disk state an `EpochManager` is built from.
+    pub(super) fn reth_config_and_db<P>(
+        config: &tn_config::Config,
+        committee: &tn_types::Committee,
+        datadir: &P,
+    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
+    where
+        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
+    {
+        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
+        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
+
+        tn_reth::init_reth_defaults();
+        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
+        let node_config = RethConfig::new(
+            RethCommand {
+                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                txpool: Default::default(),
+                db: Default::default(),
+            },
+            None,
+            datadir,
+            true,
+            std::sync::Arc::new(config.chain_spec()),
+        );
+        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
+        Ok((node_config, reth_db))
     }
 }

@@ -27,6 +27,11 @@ pub(crate) struct StateSyncMetrics {
     /// returned an error (for example a consensus header digest mismatch) or a failed startup read
     /// of the last consensus header. A steadily rising count means the stream cannot advance.
     pub(crate) stream_errors_total: Counter,
+    /// Warn intervals the catch-up loop spent blocked on the bounded `sync_output` send: the
+    /// queue was full for the whole interval and the subscriber took nothing. Through an
+    /// empty-output stretch that queue is the loop's only throttle, so a steadily rising count
+    /// means the subscriber is not draining catch-up output.
+    pub(crate) output_send_stalls_total: Counter,
 }
 
 #[cfg(test)]
@@ -46,6 +51,7 @@ mod tests {
             metrics.epoch_pack_fetches_total.increment(1);
             metrics.catch_up_redrives_total.increment(1);
             metrics.stream_errors_total.increment(1);
+            metrics.output_send_stalls_total.increment(1);
         });
 
         let snapshot = snapshotter.snapshot().into_vec();
@@ -62,5 +68,6 @@ mod tests {
         find("tn_state_sync.epoch_pack_fetches_total");
         find("tn_state_sync.catch_up_redrives_total");
         find("tn_state_sync.stream_errors_total");
+        find("tn_state_sync.output_send_stalls_total");
     }
 }
