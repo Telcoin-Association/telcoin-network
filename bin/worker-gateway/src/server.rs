@@ -341,6 +341,7 @@ mod tests {
         config::UpstreamWorker,
         proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        readiness::ReadinessThresholds,
     };
     use axum::{
         http::{header, HeaderMap},
@@ -373,9 +374,14 @@ mod tests {
         test_state_with_client(upstreams, Client::builder().build().expect("build client"))
     }
 
+    /// The CLI's default readiness thresholds.
+    fn test_thresholds() -> ReadinessThresholds {
+        ReadinessThresholds { failure: nz(3), success: nz(2) }
+    }
+
     fn test_state_with_client(upstreams: &[UpstreamWorker], client: Client) -> AppState {
         AppState {
-            readiness: Arc::new(GatewayReadiness::new(upstreams)),
+            readiness: Arc::new(GatewayReadiness::new(upstreams, test_thresholds())),
             http: client,
             query_upstream: None,
         }
@@ -963,7 +969,7 @@ mod tests {
         client: Client,
     ) -> AppState {
         AppState {
-            readiness: Arc::new(GatewayReadiness::new(&[upstream(worker)])),
+            readiness: Arc::new(GatewayReadiness::new(&[upstream(worker)], test_thresholds())),
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),

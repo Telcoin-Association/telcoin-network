@@ -11,7 +11,7 @@ use crate::{
     cli::Settings,
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
-    readiness::{run_poller, GatewayReadiness},
+    readiness::{run_poller, GatewayReadiness, ReadinessThresholds},
     server::{serve, AppState, ServerLimits},
 };
 
@@ -27,6 +27,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         query_upstream,
         readiness_poll_interval,
         readiness_poll_timeout,
+        readiness_failure_threshold,
+        readiness_success_threshold,
         upstream_connect_timeout,
         upstream_request_timeout,
         header_read_timeout,
@@ -51,7 +53,11 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         "starting worker gateway"
     );
 
-    let readiness = Arc::new(GatewayReadiness::new(&upstreams));
+    let thresholds = ReadinessThresholds {
+        failure: readiness_failure_threshold,
+        success: readiness_success_threshold,
+    };
+    let readiness = Arc::new(GatewayReadiness::new(&upstreams, thresholds));
 
     // Edge rate limiters (per-IP and/or global), or `None` when both are
     // disabled; in that case no rate-limit layer or sweep task is installed.

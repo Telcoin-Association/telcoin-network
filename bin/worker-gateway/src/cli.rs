@@ -68,8 +68,8 @@ pub(crate) struct Cli {
     )]
     pub(crate) readiness_poll_interval: Duration,
 
-    /// Per-poll timeout for the readiness endpoint (a slow or failed poll marks
-    /// the upstream not-ready).
+    /// Per-poll timeout for the readiness endpoint (a poll that overruns it
+    /// counts as failed; see `--readiness-failure-threshold`).
     #[arg(
         long,
         env = "WORKER_GATEWAY_READINESS_POLL_TIMEOUT",
@@ -77,6 +77,18 @@ pub(crate) struct Cli {
         value_parser = humantime::parse_duration
     )]
     pub(crate) readiness_poll_timeout: Duration,
+
+    /// Consecutive failed readiness polls that turn a ready upstream not-ready
+    /// (default 3), so one slow or failed poll alone leaves readiness
+    /// unchanged. Must be at least 1; `0` is rejected at startup.
+    #[arg(long, env = "WORKER_GATEWAY_READINESS_FAILURE_THRESHOLD", default_value = "3")]
+    pub(crate) readiness_failure_threshold: NonZeroU32,
+
+    /// Consecutive successful readiness polls that turn a not-ready upstream
+    /// ready, at startup too (default 2). Must be at least 1; `0` is rejected
+    /// at startup.
+    #[arg(long, env = "WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD", default_value = "2")]
+    pub(crate) readiness_success_threshold: NonZeroU32,
 
     /// Connect timeout when forwarding a request to an upstream: a worker, or the
     /// `--redirect-queries` endpoint.
@@ -240,6 +252,10 @@ pub(crate) struct Settings {
     pub(crate) readiness_poll_interval: Duration,
     /// Readiness poll timeout.
     pub(crate) readiness_poll_timeout: Duration,
+    /// Consecutive failed polls that turn a ready upstream not-ready.
+    pub(crate) readiness_failure_threshold: NonZeroU32,
+    /// Consecutive successful polls that turn a not-ready upstream ready.
+    pub(crate) readiness_success_threshold: NonZeroU32,
     /// Upstream connect timeout.
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
@@ -318,6 +334,8 @@ impl Cli {
             query_upstream,
             readiness_poll_interval: self.readiness_poll_interval,
             readiness_poll_timeout: self.readiness_poll_timeout,
+            readiness_failure_threshold: self.readiness_failure_threshold,
+            readiness_success_threshold: self.readiness_success_threshold,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
@@ -599,6 +617,30 @@ mod tests {
         ])
         .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
+    }
+
+    #[test]
+    fn thresholds_of_zero_are_rejected_at_startup() {
+        for flag in ["--readiness-failure-threshold=0", "--readiness-success-threshold=0"] {
+            let result = Cli::try_parse_from([
+                "worker-gateway",
+                "--upstream-rpc-url=http://10.0.0.7:8545",
+                "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+                flag,
+            ]);
+            assert!(result.is_err(), "{flag} must fail startup");
+        }
+
+        // the defaults are 3 failures and 2 successes, and any positive value is accepted
+        let defaults = cli_with_flags(&[]).into_settings().expect("defaults");
+        assert_eq!(defaults.readiness_failure_threshold.get(), 3);
+        assert_eq!(defaults.readiness_success_threshold.get(), 2);
+        let ones =
+            cli_with_flags(&["--readiness-failure-threshold=1", "--readiness-success-threshold=1"])
+                .into_settings()
+                .expect("thresholds of 1");
+        assert_eq!(ones.readiness_failure_threshold.get(), 1);
+        assert_eq!(ones.readiness_success_threshold.get(), 1);
     }
 
     #[test]
