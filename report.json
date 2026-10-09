@@ -1,0 +1,126 @@
+{
+  "plan_sha256": "63463df5fdeae6c0770b7ee96ceba2f3a6ea488a7f1d35a38942d4871a132c3a",
+  "baseline": {
+    "passed": false,
+    "failures": [
+      "concurrent_sync: workload threshold exceeded",
+      "gossip_two_hops: workload threshold exceeded",
+      "hub-0/primary: declared public population was never measured",
+      "hub-0/worker-0: declared public population was never measured",
+      "hub-0/worker-1: declared public population was never measured",
+      "hub-0: swarm allocation or queue threshold exceeded",
+      "hub-1/primary: declared public population was never measured",
+      "hub-1/worker-0: declared public population was never measured",
+      "hub-1/worker-1: declared public population was never measured",
+      "hub-1: swarm allocation or queue threshold exceeded",
+      "public_join: workload threshold exceeded",
+      "record_lookup: workload threshold exceeded",
+      "shared_nat_reconnect: workload threshold exceeded",
+      "submit_url_lookup: workload threshold exceeded"
+    ],
+    "scenarios": {
+      "committee_progress": {
+        "attempts": 13120,
+        "cancelled": 815,
+        "success_rate": 1.0,
+        "p99_ms": 301.207
+      },
+      "concurrent_sync": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 0.15625,
+        "p99_ms": 10288.06000299994
+      },
+      "dao_connectivity": {
+        "attempts": 512,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 174.85804900002222
+      },
+      "gossip_two_hops": {
+        "attempts": 4096,
+        "cancelled": 0,
+        "success_rate": 0.5693359375,
+        "p99_ms": 29039.821250000045
+      },
+      "public_join": {
+        "attempts": 64,
+        "cancelled": 0,
+        "success_rate": 0.046875,
+        "p99_ms": 29042.030612000075
+      },
+      "record_lookup": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 0.484375,
+        "p99_ms": 17312.520483999946
+      },
+      "shared_nat_reconnect": {
+        "attempts": 64,
+        "cancelled": 0,
+        "success_rate": 0.359375,
+        "p99_ms": 24772.468419000004
+      },
+      "submit_url_lookup": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 0.484375,
+        "p99_ms": 17310.471568000026
+      }
+    }
+  },
+  "candidate": {
+    "passed": true,
+    "failures": [],
+    "scenarios": {
+      "committee_progress": {
+        "attempts": 11915,
+        "cancelled": 202,
+        "success_rate": 1.0,
+        "p99_ms": 433.786
+      },
+      "concurrent_sync": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 2576.042247999794
+      },
+      "dao_connectivity": {
+        "attempts": 512,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 261.16449300002387
+      },
+      "gossip_two_hops": {
+        "attempts": 4096,
+        "cancelled": 0,
+        "success_rate": 0.999267578125,
+        "p99_ms": 311.298
+      },
+      "public_join": {
+        "attempts": 64,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 1809.8087750001923
+      },
+      "record_lookup": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 535.7668010001362
+      },
+      "shared_nat_reconnect": {
+        "attempts": 64,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 1885.6178609999006
+      },
+      "submit_url_lookup": {
+        "attempts": 256,
+        "cancelled": 0,
+        "success_rate": 1.0,
+        "p99_ms": 433.99669200016433
+      }
+    }
+  }
+}

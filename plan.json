@@ -1,0 +1,575 @@
+{
+  "plan": {
+    "adapter_command": "python3 -B -I /tools/workload.py /qualification/plan.json /qualification/manifest.json --manifest-sha256 e1b977845cb9383a755dc74f9782b0cc8d8a155a00ce19f6967f258ea869de8d",
+    "baseline": {
+      "binary_sha256": {
+        "hub-capacity-peer": "fbc4c14da5ee06dd1c9117b0aba9c679c584092ab778c60d30ee4f6b9805d5e3",
+        "node-record-api": "30b62b140d4f1db440cbd6da1be99022c5bbb69057c934cff14b0d710b074865",
+        "telcoin-network": "451c8cac38382a1748ff3142a7a530b115afa9ec769cb0337c06d812af370677"
+      },
+      "build_command": "cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api; cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer",
+      "profile": {
+        "bootstrap_peers": {
+          "22kYXHsFn8eX8Xq3VurD4AxoCphBjoK5Y1cU2K7oLu5nwhhfMwcP96X1zTBk6NuqTKwomo996Y19N7TtpPErRWzjT5abhcDA3dvxwwUq52eR5NzNt3GQcXCUBFHX6YZ384Xa": {
+            "primary": {
+              "network_address": "/ip4/10.147.0.11/udp/40000/quic-v1",
+              "network_key": "4XTTMGgaoK3GuXgwLtsXUNoyB4umyPft31DLJjPy9aL3PeJN2",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.0.11/udp/40001/quic-v1",
+                "network_key": "4XTTM2kKpsUTEtVFvdMJHchkYXFW5RfLmvAQvYE29p25AxDhx",
+                "rpc": {
+                  "http": "http://10.147.0.11:8545",
+                  "ws": null
+                }
+              },
+              {
+                "network_address": "/ip4/10.147.0.11/udp/40002/quic-v1",
+                "network_key": "4XTTM2pXvduK9WbFxkAkjiwXCwam8BU1WHEA8Ho6AJkqCW9jR",
+                "rpc": {
+                  "http": "http://10.147.0.11:8545",
+                  "ws": null
+                }
+              }
+            ]
+          },
+          "22kcF8hGWZH7MxLqhpn9aRgtubbAvp7MyvtCBoLtxt4SPdFgY897sYWQtJrewhAJdWo4bz4oc2Pe15vGpyUFeyJVm4rwW4Ggt55bhbQY9GJryiKusqx1YPv3UTnifNSxqSN6": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.6/udp/40000/quic-v1",
+              "network_key": "4XTTM5FdMgcPcdB1rB9t6AobyJk9od3HXJ5act5bpfmWBud5H",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.6/udp/40001/quic-v1",
+                "network_key": "4XTTMDAGpgAWfoX3xVxoh8GPJN9ggQKrMDcDxEMndu8Eyegd8",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.6/udp/40002/quic-v1",
+                "network_key": "4XTTM9TqzwZevzX1ERUPJkX8Dd4EGMg2ZjXTfjoiogS4v2F6S",
+                "rpc": null
+              }
+            ]
+          },
+          "23yDgHxHm8yaX6NTVTuvhyF8st91PJav6XRWtPBvDtAP8RwdCFkwAVRvPbXW4HGXXigakf74oyQtZAVLUgnUbHredkzaPcZ2GrKv7gbnh83RXyaDrGqbKt2dtyFo7oQwmb4k": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.1/udp/40000/quic-v1",
+              "network_key": "4XTTM8BEf1kNcgo83TCLnzUvcfXRE9aHnbnqZaJ7SXMdFMbrj",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.1/udp/40001/quic-v1",
+                "network_key": "4XTTMFt4mfVgb4xx5DxjsBVxrk6z6vEvmyRvTUVKjHweHSXqN",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.1/udp/40002/quic-v1",
+                "network_key": "4XTTM9wycSyjj1EZcMhtA8txF7xM73WhbtiXbiP2RvKavSLU2",
+                "rpc": null
+              }
+            ]
+          },
+          "268hF88YhpaPRhhc7CxgKhEx1ExsvyFAVhDHCMHUBZLDMXKqJqdTKdpAPWidGoAcbfixKVy6t1BkXWqag4Y3Motg26UAvxidZ3EzUnYHrbdZLdWk8Cyr1mickZpVoFeCx23V": {
+            "primary": {
+              "network_address": "/ip4/10.147.0.10/udp/40000/quic-v1",
+              "network_key": "4XTTMErLndv7EvLaRzXpaq753isEGvajt8xqarGWSpTQtz497",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.0.10/udp/40001/quic-v1",
+                "network_key": "4XTTM1NkKriWmDixWP2zixLfbiKNtaAGW3mcZ9cWD8XGbzPcs",
+                "rpc": {
+                  "http": "http://10.147.0.10:8545",
+                  "ws": null
+                }
+              },
+              {
+                "network_address": "/ip4/10.147.0.10/udp/40002/quic-v1",
+                "network_key": "4XTTMH9SbE3bGR7XHarwt4QQFknskZ5iMmnM5ZZo4zgm23q4n",
+                "rpc": {
+                  "http": "http://10.147.0.10:8545",
+                  "ws": null
+                }
+              }
+            ]
+          },
+          "n9oEZqizrYSfZcqMUVK8av4W39s3M2EBpbdYSdqL4cBbyVkGLMT95hAmBJvP4XTZwu87jWrpfyFUaHAB6YeCBhEwPVcm3Xi2x5ZYBAyyhJvwuCjP5yPxdnZJNPBuE4AmQ6d": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.5/udp/40000/quic-v1",
+              "network_key": "4XTTMExFCGMgbMA53A1MCpFMFbcJrwFhQELH3mGqeDXpCwL34",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.5/udp/40001/quic-v1",
+                "network_key": "4XTTMDdQiE1Q6k9eJUkhaRXqN42xTFhLeoU8ABidFtHvNyPtQ",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.5/udp/40002/quic-v1",
+                "network_key": "4XTTM6MRUnVrh7DSB5Wz6fzgHZEnJECULWwt2GyD8HM1dza6q",
+                "rpc": null
+              }
+            ]
+          },
+          "nQQqEd2FtkEYpK1gut1fdUa1kqLKgD652xHYspbDekgfWqQZhmE6yJG88kC633Rsu1aUhYmWTioy5oMGRiEF1yiVWi6duAUhgwKm1g5gzDPUHrwqWa4dTMKUv8jJD1G6Btv": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.8/udp/40000/quic-v1",
+              "network_key": "4XTTM3mnZg4CMy8cQ4DxgJMwj9fZWj9UMEULHoQzdc9GijV4y",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.8/udp/40001/quic-v1",
+                "network_key": "4XTTMEiVHgdi5ibz3FsbaCTRAqacJ2hCPNy7J9r6JUwoRh3hQ",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.8/udp/40002/quic-v1",
+                "network_key": "4XTTME6Bs55xvzyiqkf4U51VmQpq3QwAHnNh4XvaNg5X5n9ht",
+                "rpc": null
+              }
+            ]
+          },
+          "o7j3368vmq28Rzu1Wv9PMDsMQXL3FdMP2pBpDqn2jKETkvVtxBKXkmsaLYTC19WPdk5yJ5nYWnh9nyhYV23k67A2o23n6vfZzfMq54S9qXaqai8t53a733duTokaLRx2k9e": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.3/udp/40000/quic-v1",
+              "network_key": "4XTTM8znYxiSvtQWN91xpr6XaNwtXQJnxhGChHggFuqoGq7TF",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.3/udp/40001/quic-v1",
+                "network_key": "4XTTM4N3Yg6LrQRxazHGuGMDMerBfa7ofMPwCahtBWQAHAWsM",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.3/udp/40002/quic-v1",
+                "network_key": "4XTTM7xbFEkDB6t51ezq4MSQNuoLBzMW5AAFdZz6T4Bp1137U",
+                "rpc": null
+              }
+            ]
+          },
+          "oAtFPRo8A3iMpetSoD1tohHz1s4bys42KinCKCixDgRbZCsFkpNjEAG6hbrurTKpsnrF4ZzmWquBUNp59n1wruLSiVeuB9H6SNyCCWFcX5ghxH93mCr6WCqKtcvDCY728WT": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.2/udp/40000/quic-v1",
+              "network_key": "4XTTMAFRVi3GCmuNoaobt5Do6xqstyhSPbbo3QveoET3poHdo",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.2/udp/40001/quic-v1",
+                "network_key": "4XTTM2ysFSzFuiabzpaY5keLPv6bECxM7nJjB9jU3D8of93dj",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.2/udp/40002/quic-v1",
+                "network_key": "4XTTM5dwQsxbaXjtGKDsRnn7jFVsy2Z4yjxQVwzNhdAkLVz5B",
+                "rpc": null
+              }
+            ]
+          },
+          "oZgyiRSGcRke26mTbGZ1U4jyJtUNWmARv3xuJ6QAHMg8TiTRVpnEkrYGq7fJsZXvydX1D6YkWa4eWLoniQSKrA52GTAWtLn6gqjFhFmUgsD9exLSCRWLL1aTeRy575aMnJ5": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.7/udp/40000/quic-v1",
+              "network_key": "4XTTMDY871yA5ZJg2W8TTXPqQUjoeytnQBgHzu22QKd5XTKWi",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.7/udp/40001/quic-v1",
+                "network_key": "4XTTM5wt9DsAJ2VfwN5dWRJcNyz2omzPdkqkgCpmnHonktip1",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.7/udp/40002/quic-v1",
+                "network_key": "4XTTMHzWhm2NL1Sj8Hi7FeoXDKHU8AJP4ofxAZhRGiVrkDmaS",
+                "rpc": null
+              }
+            ]
+          },
+          "yKFnXYLtvaK7Rck4D2ehrLPAKWNMNou4R5RBYcv46As3tp6C3S3SwDen2EhizxdNQ2m8UwQND5QxR4ZHJjjstjw57FCL3EeLSjtaY1bXsq3CYxXGAVmtnfkxzeKzgcZD5H9": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.4/udp/40000/quic-v1",
+              "network_key": "4XTTMHnBjLLyyeaSfHS9vPFc6LxCvK2vqTinPLe69iUzji61f",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.4/udp/40001/quic-v1",
+                "network_key": "4XTTM5iQDktFpgf6Rat81fPfEcqCoyBEKYxt35CZo4L8td3XN",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.4/udp/40002/quic-v1",
+                "network_key": "4XTTM6otcgZdtnX4gehs1DkBs5kAvSZYxkXFkJyQanmv6126P",
+                "rpc": null
+              }
+            ]
+          }
+        },
+        "dao_observers": [
+          "23yDgHxHm8yaX6NTVTuvhyF8st91PJav6XRWtPBvDtAP8RwdCFkwAVRvPbXW4HGXXigakf74oyQtZAVLUgnUbHredkzaPcZ2GrKv7gbnh83RXyaDrGqbKt2dtyFo7oQwmb4k",
+          "oAtFPRo8A3iMpetSoD1tohHz1s4bys42KinCKCixDgRbZCsFkpNjEAG6hbrurTKpsnrF4ZzmWquBUNp59n1wruLSiVeuB9H6SNyCCWFcX5ghxH93mCr6WCqKtcvDCY728WT",
+          "o7j3368vmq28Rzu1Wv9PMDsMQXL3FdMP2pBpDqn2jKETkvVtxBKXkmsaLYTC19WPdk5yJ5nYWnh9nyhYV23k67A2o23n6vfZzfMq54S9qXaqai8t53a733duTokaLRx2k9e",
+          "yKFnXYLtvaK7Rck4D2ehrLPAKWNMNou4R5RBYcv46As3tp6C3S3SwDen2EhizxdNQ2m8UwQND5QxR4ZHJjjstjw57FCL3EeLSjtaY1bXsq3CYxXGAVmtnfkxzeKzgcZD5H9",
+          "n9oEZqizrYSfZcqMUVK8av4W39s3M2EBpbdYSdqL4cBbyVkGLMT95hAmBJvP4XTZwu87jWrpfyFUaHAB6YeCBhEwPVcm3Xi2x5ZYBAyyhJvwuCjP5yPxdnZJNPBuE4AmQ6d",
+          "22kcF8hGWZH7MxLqhpn9aRgtubbAvp7MyvtCBoLtxt4SPdFgY897sYWQtJrewhAJdWo4bz4oc2Pe15vGpyUFeyJVm4rwW4Ggt55bhbQY9GJryiKusqx1YPv3UTnifNSxqSN6",
+          "oZgyiRSGcRke26mTbGZ1U4jyJtUNWmARv3xuJ6QAHMg8TiTRVpnEkrYGq7fJsZXvydX1D6YkWa4eWLoniQSKrA52GTAWtLn6gqjFhFmUgsD9exLSCRWLL1aTeRy575aMnJ5",
+          "nQQqEd2FtkEYpK1gut1fdUa1kqLKgD652xHYspbDekgfWqQZhmE6yJG88kC633Rsu1aUhYmWTioy5oMGRiEF1yiVWi6duAUhgwKm1g5gzDPUHrwqWa4dTMKUv8jJD1G6Btv"
+        ],
+        "libp2p_config": {
+          "chain_id": 4476
+        }
+      },
+      "qualification_revision": "ca02e454b4f2fa5f5e1a47db8e346fb1bec00666",
+      "revision": "ca02e454b4f2fa5f5e1a47db8e346fb1bec00666"
+    },
+    "candidate": {
+      "binary_sha256": {
+        "hub-capacity-peer": "fbc4c14da5ee06dd1c9117b0aba9c679c584092ab778c60d30ee4f6b9805d5e3",
+        "node-record-api": "30b62b140d4f1db440cbd6da1be99022c5bbb69057c934cff14b0d710b074865",
+        "telcoin-network": "451c8cac38382a1748ff3142a7a530b115afa9ec769cb0337c06d812af370677"
+      },
+      "build_command": "cargo +1.94 build --locked -p telcoin-network -p tn-node-record-api; cargo +1.94 build --locked -p tn-node-record-api --example hub-capacity-peer",
+      "profile": {
+        "bootstrap_peers": {
+          "22kYXHsFn8eX8Xq3VurD4AxoCphBjoK5Y1cU2K7oLu5nwhhfMwcP96X1zTBk6NuqTKwomo996Y19N7TtpPErRWzjT5abhcDA3dvxwwUq52eR5NzNt3GQcXCUBFHX6YZ384Xa": {
+            "primary": {
+              "network_address": "/ip4/10.147.0.11/udp/40000/quic-v1",
+              "network_key": "4XTTMGgaoK3GuXgwLtsXUNoyB4umyPft31DLJjPy9aL3PeJN2",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.0.11/udp/40001/quic-v1",
+                "network_key": "4XTTM2kKpsUTEtVFvdMJHchkYXFW5RfLmvAQvYE29p25AxDhx",
+                "rpc": {
+                  "http": "http://10.147.0.11:8545",
+                  "ws": null
+                }
+              },
+              {
+                "network_address": "/ip4/10.147.0.11/udp/40002/quic-v1",
+                "network_key": "4XTTM2pXvduK9WbFxkAkjiwXCwam8BU1WHEA8Ho6AJkqCW9jR",
+                "rpc": {
+                  "http": "http://10.147.0.11:8545",
+                  "ws": null
+                }
+              }
+            ]
+          },
+          "22kcF8hGWZH7MxLqhpn9aRgtubbAvp7MyvtCBoLtxt4SPdFgY897sYWQtJrewhAJdWo4bz4oc2Pe15vGpyUFeyJVm4rwW4Ggt55bhbQY9GJryiKusqx1YPv3UTnifNSxqSN6": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.6/udp/40000/quic-v1",
+              "network_key": "4XTTM5FdMgcPcdB1rB9t6AobyJk9od3HXJ5act5bpfmWBud5H",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.6/udp/40001/quic-v1",
+                "network_key": "4XTTMDAGpgAWfoX3xVxoh8GPJN9ggQKrMDcDxEMndu8Eyegd8",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.6/udp/40002/quic-v1",
+                "network_key": "4XTTM9TqzwZevzX1ERUPJkX8Dd4EGMg2ZjXTfjoiogS4v2F6S",
+                "rpc": null
+              }
+            ]
+          },
+          "23yDgHxHm8yaX6NTVTuvhyF8st91PJav6XRWtPBvDtAP8RwdCFkwAVRvPbXW4HGXXigakf74oyQtZAVLUgnUbHredkzaPcZ2GrKv7gbnh83RXyaDrGqbKt2dtyFo7oQwmb4k": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.1/udp/40000/quic-v1",
+              "network_key": "4XTTM8BEf1kNcgo83TCLnzUvcfXRE9aHnbnqZaJ7SXMdFMbrj",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.1/udp/40001/quic-v1",
+                "network_key": "4XTTMFt4mfVgb4xx5DxjsBVxrk6z6vEvmyRvTUVKjHweHSXqN",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.1/udp/40002/quic-v1",
+                "network_key": "4XTTM9wycSyjj1EZcMhtA8txF7xM73WhbtiXbiP2RvKavSLU2",
+                "rpc": null
+              }
+            ]
+          },
+          "268hF88YhpaPRhhc7CxgKhEx1ExsvyFAVhDHCMHUBZLDMXKqJqdTKdpAPWidGoAcbfixKVy6t1BkXWqag4Y3Motg26UAvxidZ3EzUnYHrbdZLdWk8Cyr1mickZpVoFeCx23V": {
+            "primary": {
+              "network_address": "/ip4/10.147.0.10/udp/40000/quic-v1",
+              "network_key": "4XTTMErLndv7EvLaRzXpaq753isEGvajt8xqarGWSpTQtz497",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.0.10/udp/40001/quic-v1",
+                "network_key": "4XTTM1NkKriWmDixWP2zixLfbiKNtaAGW3mcZ9cWD8XGbzPcs",
+                "rpc": {
+                  "http": "http://10.147.0.10:8545",
+                  "ws": null
+                }
+              },
+              {
+                "network_address": "/ip4/10.147.0.10/udp/40002/quic-v1",
+                "network_key": "4XTTMH9SbE3bGR7XHarwt4QQFknskZ5iMmnM5ZZo4zgm23q4n",
+                "rpc": {
+                  "http": "http://10.147.0.10:8545",
+                  "ws": null
+                }
+              }
+            ]
+          },
+          "n9oEZqizrYSfZcqMUVK8av4W39s3M2EBpbdYSdqL4cBbyVkGLMT95hAmBJvP4XTZwu87jWrpfyFUaHAB6YeCBhEwPVcm3Xi2x5ZYBAyyhJvwuCjP5yPxdnZJNPBuE4AmQ6d": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.5/udp/40000/quic-v1",
+              "network_key": "4XTTMExFCGMgbMA53A1MCpFMFbcJrwFhQELH3mGqeDXpCwL34",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.5/udp/40001/quic-v1",
+                "network_key": "4XTTMDdQiE1Q6k9eJUkhaRXqN42xTFhLeoU8ABidFtHvNyPtQ",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.5/udp/40002/quic-v1",
+                "network_key": "4XTTM6MRUnVrh7DSB5Wz6fzgHZEnJECULWwt2GyD8HM1dza6q",
+                "rpc": null
+              }
+            ]
+          },
+          "nQQqEd2FtkEYpK1gut1fdUa1kqLKgD652xHYspbDekgfWqQZhmE6yJG88kC633Rsu1aUhYmWTioy5oMGRiEF1yiVWi6duAUhgwKm1g5gzDPUHrwqWa4dTMKUv8jJD1G6Btv": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.8/udp/40000/quic-v1",
+              "network_key": "4XTTM3mnZg4CMy8cQ4DxgJMwj9fZWj9UMEULHoQzdc9GijV4y",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.8/udp/40001/quic-v1",
+                "network_key": "4XTTMEiVHgdi5ibz3FsbaCTRAqacJ2hCPNy7J9r6JUwoRh3hQ",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.8/udp/40002/quic-v1",
+                "network_key": "4XTTME6Bs55xvzyiqkf4U51VmQpq3QwAHnNh4XvaNg5X5n9ht",
+                "rpc": null
+              }
+            ]
+          },
+          "o7j3368vmq28Rzu1Wv9PMDsMQXL3FdMP2pBpDqn2jKETkvVtxBKXkmsaLYTC19WPdk5yJ5nYWnh9nyhYV23k67A2o23n6vfZzfMq54S9qXaqai8t53a733duTokaLRx2k9e": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.3/udp/40000/quic-v1",
+              "network_key": "4XTTM8znYxiSvtQWN91xpr6XaNwtXQJnxhGChHggFuqoGq7TF",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.3/udp/40001/quic-v1",
+                "network_key": "4XTTM4N3Yg6LrQRxazHGuGMDMerBfa7ofMPwCahtBWQAHAWsM",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.3/udp/40002/quic-v1",
+                "network_key": "4XTTM7xbFEkDB6t51ezq4MSQNuoLBzMW5AAFdZz6T4Bp1137U",
+                "rpc": null
+              }
+            ]
+          },
+          "oAtFPRo8A3iMpetSoD1tohHz1s4bys42KinCKCixDgRbZCsFkpNjEAG6hbrurTKpsnrF4ZzmWquBUNp59n1wruLSiVeuB9H6SNyCCWFcX5ghxH93mCr6WCqKtcvDCY728WT": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.2/udp/40000/quic-v1",
+              "network_key": "4XTTMAFRVi3GCmuNoaobt5Do6xqstyhSPbbo3QveoET3poHdo",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.2/udp/40001/quic-v1",
+                "network_key": "4XTTM2ysFSzFuiabzpaY5keLPv6bECxM7nJjB9jU3D8of93dj",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.2/udp/40002/quic-v1",
+                "network_key": "4XTTM5dwQsxbaXjtGKDsRnn7jFVsy2Z4yjxQVwzNhdAkLVz5B",
+                "rpc": null
+              }
+            ]
+          },
+          "oZgyiRSGcRke26mTbGZ1U4jyJtUNWmARv3xuJ6QAHMg8TiTRVpnEkrYGq7fJsZXvydX1D6YkWa4eWLoniQSKrA52GTAWtLn6gqjFhFmUgsD9exLSCRWLL1aTeRy575aMnJ5": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.7/udp/40000/quic-v1",
+              "network_key": "4XTTMDY871yA5ZJg2W8TTXPqQUjoeytnQBgHzu22QKd5XTKWi",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.7/udp/40001/quic-v1",
+                "network_key": "4XTTM5wt9DsAJ2VfwN5dWRJcNyz2omzPdkqkgCpmnHonktip1",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.7/udp/40002/quic-v1",
+                "network_key": "4XTTMHzWhm2NL1Sj8Hi7FeoXDKHU8AJP4ofxAZhRGiVrkDmaS",
+                "rpc": null
+              }
+            ]
+          },
+          "yKFnXYLtvaK7Rck4D2ehrLPAKWNMNou4R5RBYcv46As3tp6C3S3SwDen2EhizxdNQ2m8UwQND5QxR4ZHJjjstjw57FCL3EeLSjtaY1bXsq3CYxXGAVmtnfkxzeKzgcZD5H9": {
+            "primary": {
+              "network_address": "/ip4/10.147.3.4/udp/40000/quic-v1",
+              "network_key": "4XTTMHnBjLLyyeaSfHS9vPFc6LxCvK2vqTinPLe69iUzji61f",
+              "rpc": null
+            },
+            "workers": [
+              {
+                "network_address": "/ip4/10.147.3.4/udp/40001/quic-v1",
+                "network_key": "4XTTM5iQDktFpgf6Rat81fPfEcqCoyBEKYxt35CZo4L8td3XN",
+                "rpc": null
+              },
+              {
+                "network_address": "/ip4/10.147.3.4/udp/40002/quic-v1",
+                "network_key": "4XTTM6otcgZdtnX4gehs1DkBs5kAvSZYxkXFkJyQanmv6126P",
+                "rpc": null
+              }
+            ]
+          }
+        },
+        "dao_observers": [
+          "23yDgHxHm8yaX6NTVTuvhyF8st91PJav6XRWtPBvDtAP8RwdCFkwAVRvPbXW4HGXXigakf74oyQtZAVLUgnUbHredkzaPcZ2GrKv7gbnh83RXyaDrGqbKt2dtyFo7oQwmb4k",
+          "oAtFPRo8A3iMpetSoD1tohHz1s4bys42KinCKCixDgRbZCsFkpNjEAG6hbrurTKpsnrF4ZzmWquBUNp59n1wruLSiVeuB9H6SNyCCWFcX5ghxH93mCr6WCqKtcvDCY728WT",
+          "o7j3368vmq28Rzu1Wv9PMDsMQXL3FdMP2pBpDqn2jKETkvVtxBKXkmsaLYTC19WPdk5yJ5nYWnh9nyhYV23k67A2o23n6vfZzfMq54S9qXaqai8t53a733duTokaLRx2k9e",
+          "yKFnXYLtvaK7Rck4D2ehrLPAKWNMNou4R5RBYcv46As3tp6C3S3SwDen2EhizxdNQ2m8UwQND5QxR4ZHJjjstjw57FCL3EeLSjtaY1bXsq3CYxXGAVmtnfkxzeKzgcZD5H9",
+          "n9oEZqizrYSfZcqMUVK8av4W39s3M2EBpbdYSdqL4cBbyVkGLMT95hAmBJvP4XTZwu87jWrpfyFUaHAB6YeCBhEwPVcm3Xi2x5ZYBAyyhJvwuCjP5yPxdnZJNPBuE4AmQ6d",
+          "22kcF8hGWZH7MxLqhpn9aRgtubbAvp7MyvtCBoLtxt4SPdFgY897sYWQtJrewhAJdWo4bz4oc2Pe15vGpyUFeyJVm4rwW4Ggt55bhbQY9GJryiKusqx1YPv3UTnifNSxqSN6",
+          "oZgyiRSGcRke26mTbGZ1U4jyJtUNWmARv3xuJ6QAHMg8TiTRVpnEkrYGq7fJsZXvydX1D6YkWa4eWLoniQSKrA52GTAWtLn6gqjFhFmUgsD9exLSCRWLL1aTeRy575aMnJ5",
+          "nQQqEd2FtkEYpK1gut1fdUa1kqLKgD652xHYspbDekgfWqQZhmE6yJG88kC633Rsu1aUhYmWTioy5oMGRiEF1yiVWi6duAUhgwKm1g5gzDPUHrwqWa4dTMKUv8jJD1G6Btv"
+        ],
+        "gossip_mesh": {
+          "high": 16,
+          "low": 8,
+          "outbound_min": 4,
+          "target": 12
+        },
+        "libp2p_config": {
+          "chain_id": 4476
+        },
+        "peer_config": {
+          "max_banned_peers": 512,
+          "max_disconnected_peers": 512,
+          "max_temporarily_banned_peers": 512,
+          "min_outbound_only_factor": 0.1,
+          "peer_excess_factor": 0.0,
+          "priority_peer_excess": 0.0,
+          "target_num_peers": 86,
+          "target_outbound_only_factor": 0.2
+        },
+        "process_budget": {
+          "max_established_connections": 516,
+          "max_established_connections_per_peer": 2,
+          "max_inbound_streams": 4128,
+          "max_receive_credit_bytes": 1073741824,
+          "swarm_count": 3
+        },
+        "public_peer_limit": 64,
+        "serve_limits": {
+          "batch_stream": 5,
+          "epoch_record": 5,
+          "epoch_stream": 5,
+          "prefetch": 8,
+          "primary_shed": 8,
+          "worker_shed": 8
+        },
+        "source_admission": {
+          "ipv4_prefix_length": 24,
+          "ipv6_prefix_length": 64,
+          "max_connections": 516,
+          "max_connections_per_address": 128,
+          "max_connections_per_peer": 6,
+          "max_connections_per_prefix": 384,
+          "max_sources": 516
+        }
+      },
+      "qualification_revision": "ca02e454b4f2fa5f5e1a47db8e346fb1bec00666",
+      "revision": "ca02e454b4f2fa5f5e1a47db8e346fb1bec00666"
+    },
+    "envelope": {
+      "committee_peers": 4,
+      "cpus_per_hub": 1,
+      "dao_observers": 8,
+      "duration_seconds": 600,
+      "hardware": "Docker Linux arm64, 4 CPUs, 16722010112 bytes RAM; image sha256:a58a1a9005b11d1d76d93fb85bac7ae3aeebc5928b51b64b3987f650e038e29e; preset github-actions; hub CPUs [[0], [1]]; coordinator CPUs 2-3",
+      "link_mbps": 25,
+      "loss_percent": 0.1,
+      "network_setup": "docker-run.py and netns.py at the recorded source revision; isolated internal bridge; 25 Mbit/s and 25 ms netem per participant egress, 0.1 percent loss; sixteen namespace peers share kernel SNAT at 10.147.0.20",
+      "public_peers": 64,
+      "ram_bytes_per_hub": 3221225472,
+      "rtt_ms": 50,
+      "shared_nat_peers": 16,
+      "workers_per_hub": 2
+    },
+    "hubs": [
+      "hub-0",
+      "hub-1"
+    ],
+    "threshold_owner": "PR author, using requester-authorized engineering judgment",
+    "thresholds": {
+      "max_cpu_cores": 0.75,
+      "max_progress_stall_seconds": 15,
+      "max_queue_occupancy": 100,
+      "max_rss_bytes": 2147483648,
+      "scenarios": {
+        "committee_progress": {
+          "max_cancelled_fraction": 0.35,
+          "max_p99_ms": 1500,
+          "minimum_attempts": 512,
+          "minimum_success_rate": 0.99
+        },
+        "concurrent_sync": {
+          "max_p99_ms": 30000,
+          "minimum_attempts": 256,
+          "minimum_success_rate": 0.99
+        },
+        "dao_connectivity": {
+          "max_p99_ms": 1000,
+          "minimum_attempts": 512,
+          "minimum_success_rate": 0.99
+        },
+        "gossip_two_hops": {
+          "max_p99_ms": 3000,
+          "minimum_attempts": 4096,
+          "minimum_success_rate": 0.99
+        },
+        "public_join": {
+          "max_p99_ms": 8000,
+          "minimum_attempts": 64,
+          "minimum_success_rate": 0.99
+        },
+        "record_lookup": {
+          "max_p99_ms": 3000,
+          "minimum_attempts": 256,
+          "minimum_success_rate": 0.99
+        },
+        "shared_nat_reconnect": {
+          "max_p99_ms": 20000,
+          "minimum_attempts": 64,
+          "minimum_success_rate": 0.99
+        },
+        "submit_url_lookup": {
+          "max_p99_ms": 3000,
+          "minimum_attempts": 256,
+          "minimum_success_rate": 0.99
+        }
+      }
+    },
+    "version": 1
+  },
+  "plan_sha256": "63463df5fdeae6c0770b7ee96ceba2f3a6ea488a7f1d35a38942d4871a132c3a"
+}
