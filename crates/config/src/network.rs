@@ -18,6 +18,57 @@ pub use quic::QuicConfig;
 
 impl ConfigTrait for NetworkConfig {}
 
+/// Admission and discovery policy for a primary or worker swarm.
+///
+/// Open preserves public discovery for observers and hubs. Grace restores discovery during
+/// recovery. Closed permits connections to configured peers and resolved committee members.
+/// Selecting Closed is an explicit policy-owner decision, not an inference of readiness.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkMode {
+    /// Discover and connect to public peers, preserving compatibility.
+    #[default]
+    Open,
+    /// Resume public discovery while the policy owner repairs missing or stale inputs.
+    Grace,
+    /// Resolve committee records through configured peers without public discovery.
+    Closed,
+}
+
+impl NetworkMode {
+    /// Whether public discovery and public connection admission are enabled.
+    pub fn permits_public_discovery(self) -> bool {
+        match self {
+            Self::Open | Self::Grace => true,
+            Self::Closed => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod network_mode_tests {
+    //! Compatibility and serialization tests for the shared swarm policy.
+
+    use super::*;
+
+    /// Older configuration files remain Open and every explicit mode survives a round trip.
+    #[test]
+    fn network_mode_defaults_open_and_round_trips() -> eyre::Result<()> {
+        let legacy: NetworkConfig = serde_yaml::from_str("{}")?;
+        assert_eq!(legacy.network_mode(), NetworkMode::Open);
+        [NetworkMode::Open, NetworkMode::Grace, NetworkMode::Closed].into_iter().try_for_each(
+            |mode| -> eyre::Result<()> {
+                let mut config = NetworkConfig::default();
+                config.set_network_mode(mode);
+                let decoded: NetworkConfig =
+                    serde_yaml::from_str(&serde_yaml::to_string(&config)?)?;
+                assert_eq!(decoded.network_mode(), mode);
+                assert_eq!(mode.permits_public_discovery(), mode != NetworkMode::Closed);
+                Ok(())
+            },
+        )
+    }
+}
+
 /// The container for all network configurations.
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(default)]
@@ -34,6 +85,8 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Initial policy, shared by primary and worker swarms. Open preserves compatibility.
+    network_mode: NetworkMode,
     /// Optional process-wide accounting of established connections by observed source.
     /// No production limits are assumed when this configuration is absent.
     source_admission: Option<SourceAdmissionConfig>,
@@ -158,6 +211,16 @@ impl fmt::Display for CommitteePeerError {
 impl std::error::Error for CommitteePeerError {}
 
 impl NetworkConfig {
+    /// Return the initial swarm policy.
+    pub fn network_mode(&self) -> NetworkMode {
+        self.network_mode
+    }
+
+    /// Set the initial policy before constructing primary and worker swarms.
+    pub fn set_network_mode(&mut self, mode: NetworkMode) {
+        self.network_mode = mode;
+    }
+
     /// Return explicit deployment limits for source admission, when configured.
     pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
         self.source_admission.as_ref()

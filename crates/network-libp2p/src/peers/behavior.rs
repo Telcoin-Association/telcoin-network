@@ -55,6 +55,7 @@ impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
     type ToSwarm = PeerEvent;
 
+    /// Apply the current policy before accepting either manager or Kademlia dials.
     fn handle_pending_outbound_connection(
         &mut self,
         _connection_id: ConnectionId,
@@ -62,6 +63,7 @@ impl NetworkBehaviour for PeerManager {
         addresses: &[Multiaddr], // kad may dial by PeerId only
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        self.ensure_connection_authorized(maybe_peer.as_ref())?;
         // kademlia can initiate dial attempts
         //
         // ensure PeerId isn't banned if known and register dial attempt
@@ -118,6 +120,7 @@ impl NetworkBehaviour for PeerManager {
         self.sanitize_ip_addr(remote_addr)
     }
 
+    /// Recheck the authenticated inbound identity against the current policy.
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -132,6 +135,7 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::LocalPeer));
         }
         // ensure banned peers are not accepted
+        self.ensure_connection_authorized(Some(&peer))?;
         if self.peer_banned(&peer) {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
@@ -140,6 +144,7 @@ impl NetworkBehaviour for PeerManager {
         Ok(ConnectionHandler)
     }
 
+    /// Recheck the authenticated outbound identity after any intervening mode change.
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -155,6 +160,7 @@ impl NetworkBehaviour for PeerManager {
             debug!(target: "peer-manager", ?peer, ?addr, "denying outbound self-connection");
             return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
         }
+        self.ensure_connection_authorized(Some(&peer))?;
         if self.peer_banned(&peer) {
             error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
@@ -229,10 +235,12 @@ impl NetworkBehaviour for PeerManager {
         // "dummy handler" - no events
     }
 
+    /// Remember the swarm waker so policy recovery can schedule fresh discovery immediately.
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<ToSwarm<Self::ToSwarm, THandlerInEvent<Self>>> {
+        self.register_discovery_waker(cx);
         // poll heartbeat
         while self.heartbeat_ready(cx) {
             self.heartbeat();

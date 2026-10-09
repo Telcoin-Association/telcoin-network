@@ -11,6 +11,7 @@ use libp2p::{
     Multiaddr, PeerId, Stream, StreamProtocol, TransportError,
 };
 use std::collections::{BTreeMap, HashMap, HashSet};
+use tn_config::NetworkMode;
 use tn_types::{BlsPublicKey, NetworkPublicKey, P2pNode};
 // Re-export the shared RPC endpoint type so callers can keep referring to
 // `network_libp2p::types::RpcInfo`. The canonical definition lives in `tn_types`.
@@ -232,6 +233,13 @@ where
     Req: TNMessage,
     Res: TNMessage,
 {
+    /// Change admission and discovery together on this swarm.
+    SetNetworkMode {
+        /// Policy selected by the caller responsible for committee readiness and recovery.
+        mode: NetworkMode,
+        /// Acknowledge after queued public work has been canceled.
+        reply: oneshot::Sender<()>,
+    },
     /// Start listening on the provided multiaddr.
     ///
     /// Return the result to caller.
@@ -534,6 +542,16 @@ where
     pub fn new_for_test() -> Self {
         let (sender, _) = mpsc::channel(100);
         Self { sender }
+    }
+
+    /// Apply a policy change and wait until this swarm has discarded disallowed queued work.
+    ///
+    /// The policy owner must update every primary and worker handle. Missing or stale inputs
+    /// should select Grace; this method does not decide whether a committee is ready to close.
+    pub async fn set_network_mode(&self, mode: NetworkMode) -> NetworkResult<()> {
+        let (reply, ack) = oneshot::channel();
+        self.sender.send(NetworkCommand::SetNetworkMode { mode, reply }).await?;
+        ack.await.map_err(Into::into)
     }
 
     /// Start swarm listening on the given address. Returns an error if the address is not

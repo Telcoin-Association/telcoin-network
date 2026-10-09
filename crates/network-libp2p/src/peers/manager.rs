@@ -17,18 +17,21 @@ use crate::{
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
-    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
-    PeerId,
+    core::ConnectedPoint,
+    kad::PeerInfo,
+    multiaddr::Protocol,
+    swarm::{ConnectionDenied, ConnectionId},
+    Multiaddr, PeerId,
 };
 use rand::seq::IteratorRandom as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
     net::IpAddr,
     sync::Arc,
-    task::Context,
+    task::{Context, Waker},
     time::Duration,
 };
-use tn_config::PeerConfig;
+use tn_config::{NetworkMode, PeerConfig};
 use tn_types::{now, BlsPublicKey};
 use tokio::{sync::oneshot, time::Instant};
 use tracing::{debug, error, trace, warn};
@@ -36,6 +39,10 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/closed_discovery.rs"]
+mod closed_discovery;
 
 #[cfg(test)]
 #[path = "../tests/listen_failure.rs"]
@@ -153,6 +160,10 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Current policy, consulted again at every dial and discovery boundary.
+    network_mode: NetworkMode,
+    /// Last poll's waker, so reopening discovery does not wait for a heartbeat.
+    discovery_waker: Option<Waker>,
     /// Leases owned by this swarm using optional process-wide source accounting.
     source_connections: SourceConnections,
     /// The interval to perform maintenance.
@@ -330,6 +341,8 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            network_mode: NetworkMode::Open,
+            discovery_waker: None,
             source_connections: SourceConnections::default(),
             heartbeat,
             peers,
@@ -397,6 +410,27 @@ impl PeerManager {
 
     /// Process the request to dial a peer.
     pub(crate) fn dial_peer(
+        &mut self,
+        peer_id: PeerId,
+        multiaddrs: Vec<Multiaddr>,
+        reply: Option<oneshot::Sender<NetworkResult<()>>>,
+    ) {
+        if self.is_local_peer(&peer_id) || self.connection_authorized(Some(&peer_id)) {
+            self.dial_authorized_peer(peer_id, multiaddrs, reply);
+        } else {
+            reply.into_iter().for_each(|reply| {
+                send_or_log_error!(
+                    reply,
+                    Err(NetworkError::Dial("peer is outside the Closed policy".into())),
+                    "DialPeer- Closed policy",
+                    peer = peer_id
+                );
+            });
+        }
+    }
+
+    /// Schedule a dial after the shared policy has authorized its target.
+    fn dial_authorized_peer(
         &mut self,
         peer_id: PeerId,
         multiaddrs: Vec<Multiaddr>,
@@ -495,7 +529,92 @@ impl PeerManager {
 
     /// Return the next dial request if it exists.
     pub(super) fn next_dial_request(&mut self) -> Option<DialRequest> {
+        self.discard_unauthorized_dials();
         self.dial_requests.pop_front()
+    }
+
+    /// Return the current admission and public discovery policy.
+    pub(crate) fn network_mode(&self) -> NetworkMode {
+        self.network_mode
+    }
+
+    /// Authorize a known identity using configured peers and the three committee slots.
+    ///
+    /// Network-learned identities must come from verified records. Unknown outbound identities
+    /// are denied in Closed. The established hook rechecks the authenticated identity.
+    pub(super) fn connection_authorized(&self, peer: Option<&PeerId>) -> bool {
+        self.network_mode.permits_public_discovery()
+            || peer.is_some_and(|peer| {
+                self.known_peers.iter().any(|(key, info)| {
+                    PeerId::from(info.pubkey.clone()) == *peer
+                        && (self.pinned_peers.contains(key) || self.peers.is_committee_member(key))
+                })
+            })
+    }
+
+    /// Reject targets outside the shared connection policy before registering peer state.
+    pub(super) fn ensure_connection_authorized(
+        &self,
+        peer: Option<&PeerId>,
+    ) -> Result<(), ConnectionDenied> {
+        self.connection_authorized(peer)
+            .then_some(())
+            .ok_or_else(|| ConnectionDenied::new("peer is outside the Closed policy"))
+    }
+
+    /// Whether a record lookup is permitted by the current policy.
+    pub(crate) fn record_query_authorized(&self, key: &BlsPublicKey) -> bool {
+        self.network_mode.permits_public_discovery()
+            || self.peers.is_committee_member(key)
+            || self.pinned_peers.contains(key)
+    }
+
+    /// Save the current task's waker for immediate discovery recovery.
+    pub(super) fn register_discovery_waker(&mut self, cx: &Context<'_>) {
+        self.discovery_waker = Some(cx.waker().clone());
+    }
+
+    /// Apply a mode change without retaining public work across a Closed interval.
+    ///
+    /// Configured reconnects and committee record requests survive closure. Reopening schedules
+    /// fresh discovery and wakes an idle swarm instead of replaying old candidates.
+    pub(crate) fn set_network_mode(&mut self, mode: NetworkMode) {
+        if self.network_mode != mode {
+            self.network_mode = mode;
+            if mode.permits_public_discovery() {
+                self.events.push_back(PeerEvent::Discovery);
+            } else {
+                self.discovery_peers.clear();
+                self.events.retain(|event| !matches!(event, PeerEvent::Discovery));
+                self.discard_unauthorized_dials();
+            }
+            self.discovery_waker.take().into_iter().for_each(Waker::wake);
+        }
+    }
+
+    /// Complete queued callers whose targets no longer satisfy the current policy.
+    fn discard_unauthorized_dials(&mut self) {
+        if !self.network_mode.permits_public_discovery() {
+            let requests = std::mem::take(&mut self.dial_requests);
+            self.dial_requests = requests
+                .into_iter()
+                .filter_map(|request| {
+                    if self.connection_authorized(Some(&request.peer_id)) {
+                        Some(request)
+                    } else {
+                        request.reply.into_iter().for_each(|reply| {
+                            send_or_log_error!(
+                                reply,
+                                Err(NetworkError::Dial("peer is outside the Closed policy".into())),
+                                "DialPeer- Policy changed",
+                                peer = request.peer_id
+                            );
+                        });
+                        None
+                    }
+                })
+                .collect();
+        }
     }
 
     /// Notify the caller that a dial attempt was successful.
@@ -921,7 +1040,7 @@ impl PeerManager {
         let current_count = self.discovery_peers.len();
 
         // seed discovery peers from peer exchange
-        if current_count < max_discovery_peers {
+        if self.network_mode.permits_public_discovery() && current_count < max_discovery_peers {
             // reservoir-sample the missing target number of eligible peers so the
             // collected buffer and the shuffle stay bounded by the open discovery
             // slots; the per-entry eligibility pass still visits each codec-bounded entry
@@ -976,10 +1095,15 @@ impl PeerManager {
     }
 
     /// Whether retention policy protects this peer from population pruning and mesh treatment.
+    ///
+    /// In Closed, every identity the connection policy authorizes is also protected, so
+    /// configured recovery peers are not pruned while public discovery is off.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
         let policy = self.peer_policy(peer_id);
         trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
         policy.protects_retention()
+            || (!self.network_mode.permits_public_discovery()
+                && self.connection_authorized(Some(peer_id)))
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.
@@ -1674,7 +1798,8 @@ impl PeerManager {
         // never add our own identity to the discovery feed; a self entry (learned
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
-        !self.is_local_peer(&info.peer_id)
+        self.network_mode.permits_public_discovery()
+            && !self.is_local_peer(&info.peer_id)
             // reject entries with more addresses than an honest peer can share. An honest
             // exchange entry is a copy of a sender's stored set for that peer, which holds the
             // one address the peer most recently presented (MAX_MULTIADDRS_PER_PEER, see its
@@ -1720,6 +1845,13 @@ impl PeerManager {
 
     /// Check peer counts and initiate dial attempts to maintain connection targets.
     fn discovery_heartbeat(&mut self) {
+        if self.network_mode.permits_public_discovery() {
+            self.open_discovery_heartbeat();
+        }
+    }
+
+    /// Maintain the public candidate pool only in Open or Grace.
+    fn open_discovery_heartbeat(&mut self) {
         // take discovery peers and filter ineligble peers
         let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
         discovery_peers.retain(|peer_id, addrs| {
