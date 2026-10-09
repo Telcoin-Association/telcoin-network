@@ -843,9 +843,15 @@ impl AllPeers {
                     error!(target: "peer-manager", ?peer_id, "unbanning a connected peer");
                 }
             }
-        }
 
-        PeerAction::NoAction
+            // the reputation owner released the identity whatever its connection status, so the
+            // gossip blacklist entry must still be released; the banned-IP counts were already
+            // released when the status left `Banned`, so no addresses are carried, and the manager
+            // drops the notification at dequeue while the reconnect cache still holds the peer
+            PeerAction::Unban(Vec::new())
+        } else {
+            PeerAction::NoAction
+        }
     }
 
     /// Return the [Peer] by [PeerId] if it is known.
@@ -1029,7 +1035,11 @@ impl AllPeers {
         excess_peers
     }
 
-    /// Prune excess number of banned peers to prevent exhausting memory.
+    /// Evict the oldest reputation-ban entries on capacity overflow to bound memory.
+    ///
+    /// This explicitly ends this store's identity/IP ban ownership. The manager must consult its
+    /// independent reconnect cache before publishing `Unbanned`; disconnected-table eviction
+    /// neither calls this path nor owns ban forgiveness.
     fn prune_banned_peers(&mut self) -> Vec<(PeerId, Vec<IpAddr>)> {
         let excess = self.banned_peers.total().saturating_sub(self.max_banned_peers);
         let mut unbanned = Vec::with_capacity(excess);

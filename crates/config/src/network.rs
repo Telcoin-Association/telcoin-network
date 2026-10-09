@@ -729,11 +729,21 @@ pub struct PeerConfig {
     /// NOTE: Self::min_outbound_only_factor must be < Self::target_outbound_only_factor.
     pub min_outbound_only_factor: f32,
     /// The minimum amount of time before peers are allowed to reconnect after this node
-    /// disconnects due to too many peers.
+    /// disconnects them with peer exchange: heartbeat pruning above `target_num_peers`, or the
+    /// `peer_exchange_at_capacity` hand-off.
     ///
-    /// If peers try to connect before the reconnection timeout passes, the swarm denies the
-    /// connection attempt. This essentially results in a temporary ban at the swarm level.
+    /// If peers try to connect before the reconnection timeout passes, the peer manager denies
+    /// the connection after the handshake. This essentially results in a temporary ban at the
+    /// swarm level. Peers refused at capacity without a hand-off are not temporarily banned.
     pub excess_peers_reconnection_timeout: Duration,
+    /// Accept a new inbound peer at capacity only to disconnect it with peer exchange.
+    ///
+    /// When `false` (the default), a new inbound peer at `Self::max_peers` is refused before
+    /// the connection is accepted. Bootstrap nodes, which sit at capacity and onboard new
+    /// peers, enable this so a refused newcomer leaves with other peers to try. The hand-off
+    /// holds no population slot and applies `Self::excess_peers_reconnection_timeout`.
+    /// Validators keep it off. Outbound connections are refused at capacity in both modes.
+    pub peer_exchange_at_capacity: bool,
     /// The maximum number of banned peers to maintain before pruning.
     pub max_banned_peers: usize,
     /// The maximum number of disconnected peers to maintain before pruning.
@@ -764,6 +774,7 @@ impl Default for PeerConfig {
             target_outbound_only_factor: 0.3,
             min_outbound_only_factor: 0.2,
             excess_peers_reconnection_timeout: Duration::from_secs(600),
+            peer_exchange_at_capacity: false,
             max_banned_peers: 100,
             max_disconnected_peers: 100,
             max_temporarily_banned_peers: 100,
@@ -773,6 +784,12 @@ impl Default for PeerConfig {
 }
 
 impl PeerConfig {
+    /// Whether a new inbound peer at capacity is handed off with peer exchange instead of
+    /// refused. See `Self::peer_exchange_at_capacity`.
+    pub fn peer_exchange_at_capacity(&self) -> bool {
+        self.peer_exchange_at_capacity
+    }
+
     /// The maximum number of peers allowed to connect to this node.
     pub fn max_peers(&self) -> usize {
         (self.target_num_peers as f32 * (1.0 + self.peer_excess_factor)).ceil() as usize

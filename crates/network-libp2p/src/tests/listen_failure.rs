@@ -89,6 +89,10 @@ async fn test_listen_failure_reasons_and_accounting() -> eyre::Result<()> {
                 "other_behaviour_denied",
             ),
             (
+                ListenError::Denied { cause: ConnectionDenied::new(PeerCapacityReached) },
+                "peer_manager_peer_capacity",
+            ),
+            (
                 ListenError::Transport(TransportError::Other(io::Error::other("failed"))),
                 "transport",
             ),

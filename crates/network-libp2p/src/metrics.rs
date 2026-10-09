@@ -155,7 +155,8 @@ impl ConnectionLimitReason {
     }
 }
 
-/// The `connection_limits` bound that refused an inbound connection.
+/// The bound that refused an inbound connection: a `connection_limits` bound or the peer
+/// manager's population limit.
 ///
 /// The swarm classifies the refusal by its text ([`ConnectionLimitReason`]), not by the peer
 /// id: both established ceilings refuse after authentication, so a peer id cannot tell them
@@ -168,6 +169,8 @@ pub(crate) enum InboundDenial {
     EstablishedPerPeerLimit,
     /// The total established ceiling refused an authenticated connection.
     EstablishedTotalLimit,
+    /// The peer manager refused a new authenticated identity at its population limit.
+    PeerCapacity,
     /// Any other `connection_limits` bound. The swarms configure none, so this stays zero
     /// unless the refusal text is unknown.
     Other,
@@ -175,10 +178,11 @@ pub(crate) enum InboundDenial {
 
 impl InboundDenial {
     /// Every denial, in label order.
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::PendingIncomingLimit,
         Self::EstablishedPerPeerLimit,
         Self::EstablishedTotalLimit,
+        Self::PeerCapacity,
         Self::Other,
     ];
 
@@ -201,6 +205,7 @@ impl InboundDenial {
             Self::PendingIncomingLimit => "pending_incoming_limit",
             Self::EstablishedPerPeerLimit => "established_per_peer_limit",
             Self::EstablishedTotalLimit => "established_total_limit",
+            Self::PeerCapacity => "peer_capacity",
             Self::Other => "other_limit",
         }
     }
@@ -423,6 +428,8 @@ struct PerDenial<T> {
     established_per_peer: T,
     /// The handle for [`InboundDenial::EstablishedTotalLimit`].
     established_total: T,
+    /// The handle for [`InboundDenial::PeerCapacity`].
+    peer_capacity: T,
     /// The handle for [`InboundDenial::Other`].
     other: T,
 }
@@ -434,6 +441,7 @@ impl<T> PerDenial<T> {
             pending_incoming: resolve(InboundDenial::PendingIncomingLimit),
             established_per_peer: resolve(InboundDenial::EstablishedPerPeerLimit),
             established_total: resolve(InboundDenial::EstablishedTotalLimit),
+            peer_capacity: resolve(InboundDenial::PeerCapacity),
             other: resolve(InboundDenial::Other),
         }
     }
@@ -444,6 +452,7 @@ impl<T> PerDenial<T> {
             InboundDenial::PendingIncomingLimit => &self.pending_incoming,
             InboundDenial::EstablishedPerPeerLimit => &self.established_per_peer,
             InboundDenial::EstablishedTotalLimit => &self.established_total,
+            InboundDenial::PeerCapacity => &self.peer_capacity,
             InboundDenial::Other => &self.other,
         }
     }
@@ -753,7 +762,8 @@ impl SwarmMetrics {
         self.labeled.outbound_failed.get(failure).increment(1);
     }
 
-    /// Record an inbound connection refused by a `connection_limits` bound, by bound.
+    /// Record an inbound connection refused by a `connection_limits` bound or by the peer
+    /// population limit, by bound.
     pub(crate) fn record_inbound_denied(&self, denial: &InboundDenial) {
         self.labeled.inbound_denied.get(*denial).increment(1);
     }
