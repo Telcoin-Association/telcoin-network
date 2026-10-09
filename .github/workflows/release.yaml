@@ -1,332 +1,244 @@
+# Public releases: check a release tag, open a draft release for it, and check the
+# release again once a maintainer has published it.
+#
+# CI validates and drafts; it never builds. The binary and the image are built on a
+# maintainer's host by `make release-build`, from a commit whose full local suite, e2e
+# included, was attested on-chain. CI cannot run that suite, and a job that compiled
+# the workspace would run every dependency's build code next to a token that can write
+# releases. The only job here with a write token runs etc/release.sh and gh, nothing
+# else, and no token in CI can sign: the signatures on the tag and on SHA256SUMS come
+# from maintainer keys that never touch a runner. The procedure:
+# https://docs.telcoin.network/maintainers/releasing.html
+#
+# Every job checks out main as it stands when the job starts, never the tagged tree,
+# and takes etc/release.sh, .github/scripts/verify_commit_hash.sh and the key allowlist
+# (.github/maintainer-gpg-keys) from there, for the reason the `attest` job in pr.yaml
+# gives: a tag on a commit that edits a script or adds a key would otherwise be judged
+# by its own edit. This file itself is not covered by that. GitHub reads the job
+# definitions from the tagged commit (for a dispatch, from the branch it is run on), so
+# who may push a `v*` tag is decided by the tag ruleset, a repository setting
+# (.github/ACTIONS.md, "Release workflow").
+#
+# The post-publish check (`verify-release`) is detective only. The release is already
+# public when it runs, so a failure is an alarm for a maintainer, not a gate.
+#
+# No job here may share its name with the single required check, the `ci-success` job
+# in pr.yaml. GitHub matches that check by name on a commit, whatever workflow
+# reported it, and a tag can be pushed on any commit, a pull request's head included.
 name: Release
 
 on:
+  # Deliberately broader than the tag grammar: a malformed `v` tag runs and fails
+  # visibly in validate-tag instead of being ignored. etc/release.sh is the authority
+  # on what a release tag is.
   push:
-    tags:
-      - 'v[0-9]+.[0-9]+.[0-9]+'           # mainnet: strict semver, no suffix
-      - 'v[0-9]+.[0-9]+.[0-9]+-adiri'     # adiri (testnet)
-      - 'v[0-9]+.[0-9]+.[0-9]+-rc[0-9]+'  # rc channel (no :latest)
+    tags: ["v*"]
+  # `published` also fires when a draft is published as a prerelease, which every adiri
+  # and rc release is; `prereleased` does not fire for those. The maintainer publishes
+  # with their own gh login, so the event fires (one caused by a GITHUB_TOKEN would
+  # start no workflow).
+  release:
+    types: [published]
+  # Runs only once this file is on the default branch. `validate` repeats the tag
+  # checks and drafts nothing; run on an old, unsigned tag it fails, which shows the
+  # gate fails closed. `verify` repeats the post-publish check; the token cannot see
+  # draft releases, so it works on published ones only.
+  # If the attestation was missing when a tag was pushed, run `make attest` and re-run
+  # the failed jobs instead: there is no need to re-tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.16.0-adiri"
+        required: true
+        type: string
+      mode:
+        description: "validate: the tag checks; verify: the post-publish check"
+        required: true
+        type: choice
+        options: [validate, verify]
+        default: validate
 
+# Everything here reads the repository; draft-release alone adds the write it needs to
+# create the draft (least privilege, CodeQL actions/missing-workflow-permissions).
 permissions:
-  contents: write       # create draft release, upload assets
-  packages: write       # push to ghcr.io
-  id-token: write       # OIDC for keyless provenance
-  attestations: write   # actions/attest-build-provenance
+  contents: read
 
+# One run per tag at a time, queued rather than cancelled: a cancelled run would leave a
+# pushed tag without its draft, or a published release unchecked.
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# The steps read the tag from here and nowhere else. Every `run:` below uses
+# "$RELEASE_TAG" and interpolates no expression, so the tag reaches the shell as data,
+# and etc/release.sh rejects anything outside the tag grammar before it uses it.
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: telcoin-association/telcoin-network
-  RUST_TOOLCHAIN: '1.94'
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
 
 jobs:
-  meta:
+  # Proves: the tag is an annotated tag signed by a key in the allowlist on main; it
+  # points at a commit on main whose Cargo version and CHANGELOG section match the tag;
+  # and that commit's hash is in the attestation registry on adiri (hence `cast`). The
+  # step summary shows the notes the draft will carry.
+  # Does not prove: who pushed the tag, or that it cannot be moved or deleted later.
+  # That is the tag ruleset's job, a repository setting no workflow can check.
+  validate-tag:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'validate')
     runs-on: ubuntu-latest
-    outputs:
-      channel: ${{ steps.c.outputs.channel }}
-      version: ${{ steps.c.outputs.version }}
-      tag: ${{ github.ref_name }}
-      docker_tags: ${{ steps.c.outputs.docker_tags }}
+    timeout-minutes: 15
     steps:
-      - name: checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
+      # The scripts and the allowlist come from main, never from the tag; the header
+      # says why. `refs/heads/main` is fully qualified so that a tag named `main` cannot
+      # be picked up, as in pr.yaml's `attest` job. fetch-depth: 0 brings every tag and
+      # refs/remotes/origin/main, which the signature, ancestry and version checks read;
+      # the scripts fetch nothing in CI. The job definition, the Foundry pin below
+      # included, comes from the tagged commit instead, and what stops a tag on a commit
+      # that edits it is the tag ruleset (see the header).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/heads/main
           fetch-depth: 0
-          fetch-tags: true
+          persist-credentials: false
 
-      - name: guard against placeholder release keys
-        run: |
-          set -euo pipefail
-          for f in .github/release-keys/grantkee.pem .github/release-keys/sstanfield.pem; do
-            if [[ ! -s "$f" ]]; then
-              echo "::error file=$f::release-key file is missing or empty" >&2
-              exit 1
-            fi
-            if grep -q 'PLACEHOLDER' "$f"; then
-              echo "::error file=$f::release-key file is still a placeholder — provision a real PEM before tagging a release" >&2
-              exit 1
-            fi
-          done
-
-      - name: verify GPG-signed tag against maintainer allowlist
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which comes from the tagged
+      # commit, so they guard against a change upstream and not against a tag on a commit
+      # that edits them; the comment above the checkout says what stops that.
+      - name: Install Foundry
         env:
-          TAG: ${{ github.ref_name }}
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
         run: |
           set -euo pipefail
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
 
-          # Refuse to run against placeholder GPG keys for the same reason as
-          # the release-keys guard: cosmetic CI pass with no real signature
-          # check is worse than no check at all.
-          shopt -s nullglob
-          allowlist=(.github/maintainer-gpg-keys/*.asc)
-          if [[ ${#allowlist[@]} -eq 0 ]]; then
-            echo "::error::no maintainer GPG keys found in .github/maintainer-gpg-keys/" >&2
-            exit 1
-          fi
-          for f in "${allowlist[@]}"; do
-            if [[ ! -s "$f" ]]; then
-              echo "::error file=$f::maintainer-gpg-keys file is missing or empty" >&2
-              exit 1
-            fi
-            if grep -q 'PLACEHOLDER' "$f"; then
-              echo "::error file=$f::maintainer-gpg-keys file is still a placeholder — provision a real key before tagging a release" >&2
-              exit 1
-            fi
-          done
+      - name: Check the tag
+        run: ./etc/release.sh check-tag "$RELEASE_TAG"
 
-          # Build a throwaway GPG keyring containing only the allowlisted keys.
-          GNUPGHOME="$(mktemp -d)"
-          chmod 700 "$GNUPGHOME"
-          export GNUPGHOME
+      - name: Release notes
+        run: ./etc/release.sh notes "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
 
-          allowed_fpr=()
-          for f in "${allowlist[@]}"; do
-            gpg --batch --quiet --import "$f"
-            while IFS= read -r line; do
-              # `fpr` lines from --with-colons: fpr:::::::::FINGERPRINT::
-              fpr="$(echo "$line" | awk -F: '$1=="fpr" {print $10; exit}')"
-              if [[ -n "$fpr" ]]; then
-                allowed_fpr+=("$fpr")
-              fi
-            done < <(gpg --batch --with-colons --import-options show-only --import "$f")
-          done
-
-          if [[ ${#allowed_fpr[@]} -eq 0 ]]; then
-            echo "::error::failed to extract any allowlisted GPG fingerprints" >&2
-            exit 1
-          fi
-
-          # Verify the tag is signed and capture gpg's output.
-          verify_out="$(git tag -v "$TAG" 2>&1)" || {
-            echo "::error::git tag -v failed for $TAG:" >&2
-            echo "$verify_out" >&2
-            exit 1
-          }
-
-          if ! grep -q 'Good signature' <<< "$verify_out"; then
-            echo "::error::tag $TAG does not carry a Good signature" >&2
-            echo "$verify_out" >&2
-            exit 1
-          fi
-
-          # Extract the full 40-char primary-key fingerprint. GPG prints it on
-          # a "Primary key fingerprint:" line with spaces between groups of
-          # four hex chars; strip the spaces to get the bare fingerprint.
-          # Reject the 16-char short key id form — it is collision-prone.
-          signing_fpr="$(echo "$verify_out" \
-            | grep 'Primary key fingerprint:' \
-            | head -n1 \
-            | sed -E 's/.*Primary key fingerprint:[[:space:]]*//' \
-            | tr -d ' ')"
-          if [[ -z "$signing_fpr" ]]; then
-            echo "::error::could not extract Primary key fingerprint from gpg output" >&2
-            echo "$verify_out" >&2
-            exit 1
-          fi
-
-          matched=0
-          for fpr in "${allowed_fpr[@]}"; do
-            if [[ "$fpr" == "$signing_fpr" ]]; then
-              matched=1
-              break
-            fi
-          done
-          if [[ $matched -eq 0 ]]; then
-            echo "::error::tag $TAG signed by $signing_fpr — not in maintainer allowlist" >&2
-            printf '  allowed: %s\n' "${allowed_fpr[@]}" >&2
-            exit 1
-          fi
-
-          echo ">>> tag $TAG verified against maintainer key $signing_fpr"
-
-      - id: c
-        env:
-          TAG: ${{ github.ref_name }}
-        run: |
-          set -euo pipefail
-          case "$TAG" in
-            v[0-9]*.[0-9]*.[0-9]*-adiri)
-              CHANNEL=adiri
-              VERSION="${TAG%-adiri}"
-              VERSION="${VERSION#v}"
-              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:adiri"
-              ;;
-            v[0-9]*.[0-9]*.[0-9]*-rc[0-9]*)
-              CHANNEL=rc
-              VERSION="${TAG#v}"
-              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"
-              ;;
-            v[0-9]*.[0-9]*.[0-9]*)
-              CHANNEL=mainnet
-              VERSION="${TAG#v}"
-              DOCKER_TAGS="${REGISTRY}/${IMAGE_NAME}:${TAG}"$'\n'"${REGISTRY}/${IMAGE_NAME}:latest"
-              ;;
-            *)
-              echo "::error::tag $TAG does not match any release channel pattern" >&2
-              exit 1
-              ;;
-          esac
-          {
-            echo "channel=$CHANNEL"
-            echo "version=$VERSION"
-            echo "docker_tags<<EOF"
-            echo "$DOCKER_TAGS"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
-
-  build-binary:
-    needs: meta
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-22.04-arm
-    runs-on: ${{ matrix.runner }}
-    steps:
-      - name: checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          submodules: recursive
-
-      - name: install build deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libclang-dev pkg-config libssl-dev libapr1-dev
-
-      - name: install rust toolchain
-        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable @ 2026-03-27
-        with:
-          toolchain: ${{ env.RUST_TOOLCHAIN }}
-          targets: ${{ matrix.target }}
-
-      - name: cargo build
-        run: cargo build --bin telcoin-network --release --target ${{ matrix.target }}
-
-      - name: package tarball + sha256
-        run: |
-          set -euo pipefail
-          BIN="target/${{ matrix.target }}/release/telcoin-network"
-          strip "$BIN"
-          NAME="telcoin-network-${{ needs.meta.outputs.tag }}-${{ matrix.target }}"
-          mkdir -p dist
-          tar -C "$(dirname "$BIN")" -czf "dist/${NAME}.tar.gz" "$(basename "$BIN")"
-          ( cd dist && sha256sum "${NAME}.tar.gz" > "${NAME}.tar.gz.sha256" )
-
-      - name: attest build provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-path: 'dist/*.tar.gz'
-
-      - name: upload artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: bin-${{ matrix.target }}
-          path: dist/
-
-  build-image:
-    needs: meta
-    runs-on: ubuntu-latest
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
-    steps:
-      - name: checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-        with:
-          submodules: recursive
-
-      - name: setup qemu
-        uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3.7.0
-
-      - name: setup buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: registry login
-        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
-        with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: build & push
-        id: push
-        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
-        with:
-          context: .
-          file: etc/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: ${{ needs.meta.outputs.docker_tags }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/telcoin-association/telcoin-network
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ needs.meta.outputs.tag }}
-          provenance: mode=max
-          sbom: true
-
-      - name: attest image provenance
-        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2.4.0
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true
-
+  # Proves nothing of its own: it runs only after validate-tag passed for the same push,
+  # and creates the draft release with the notes, or refreshes the notes of a draft it
+  # created before. The draft carries no assets; the maintainer's `make release-build`
+  # uploads them and `make release-publish` makes the release public.
+  # Does not prove: that the draft stays as written. Anyone with write access can edit a
+  # draft, so every later step re-verifies the assets and signatures rather than trusting
+  # it, and keeping a published release from changing is the job of immutable releases,
+  # a repository setting.
   draft-release:
-    needs: [meta, build-binary, build-image]
+    needs: validate-tag
+    if: github.event_name == 'push'
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The only write in this workflow. It lets the token create and edit releases; it
+    # cannot sign one, and an operator's check rejects a release without signatures.
+    permissions:
+      contents: write
     steps:
-      - name: checkout
-        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5.0.1
-
-      - name: download artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+      # From main, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: dist
-          pattern: bin-*
-          merge-multiple: true
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
 
-      - name: aggregate checksums
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./etc/release.sh draft "$RELEASE_TAG"
+
+  # Proves: the published release is still what the maintainer verified before
+  # publishing. It repeats the tag checks, then checks the asset set and SHA256SUMS, the
+  # maintainer signatures on SHA256SUMS against the allowlist on main, the image digest
+  # against the registry, and that the binary in the image is the one in the tarball and
+  # reports the tagged commit.
+  # Does not prove anything in advance: the release is public before this runs, so a
+  # failure is an alarm, not a gate. Keeping the release from changing after this check
+  # is the job of immutable releases, a repository setting.
+  verify-release:
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'verify')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # From main, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which comes from the tagged
+      # commit, so they guard against a change upstream and not against a tag on a commit
+      # that edits them; the comment above the checkout says what stops that.
+      - name: Install Foundry
+        env:
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
         run: |
           set -euo pipefail
-          ( cd dist && sha256sum *.tar.gz > SHA256SUMS )
-          ls -la dist/
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
 
-      - name: build release notes
+      - name: Verify the published release
         env:
-          DIGEST: ${{ needs.build-image.outputs.digest }}
-          TAG: ${{ needs.meta.outputs.tag }}
-          CHANNEL: ${{ needs.meta.outputs.channel }}
-        run: |
-          cat > release-notes.md <<EOF
-          ## Channel
-          ${CHANNEL}
-
-          ## Image
-          \`${REGISTRY}/${IMAGE_NAME}@${DIGEST}\`
-
-          Pull tags:
-          ${{ needs.meta.outputs.docker_tags }}
-
-          ## Verification
-          See [docs/INSTALL.md](https://github.com/telcoin-association/telcoin-network/blob/${TAG}/docs/INSTALL.md).
-
-          This release is **DRAFT** until two maintainer countersignatures land.
-          The CI build provenance below is bound to the workflow + commit; the
-          maintainer signatures attest that two independent humans approved the
-          tagged commit before it ships.
-          EOF
-
-      - name: create draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.meta.outputs.tag }}
-        run: |
-          set -euo pipefail
-          gh release create "$TAG" \
-            --draft \
-            --generate-notes \
-            --title "$TAG" \
-            --notes-file release-notes.md \
-            dist/*.tar.gz dist/*.sha256 dist/SHA256SUMS
+          GH_TOKEN: ${{ github.token }}
+        run: ./etc/release.sh verify "$RELEASE_TAG"
