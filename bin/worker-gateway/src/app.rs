@@ -38,6 +38,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_prefix,
         rate_limit_global,
         trusted_proxies,
+        proxy_protocol,
         graceful_shutdown_timeout,
         metrics_addr,
     } = settings;
@@ -75,6 +76,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         trusted_proxies = trusted_proxies.len(),
+        proxy_protocol,
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
@@ -155,6 +157,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
+        // `into_settings` rejects `--proxy-protocol` without trusted proxies
+        proxy_protocol: proxy_protocol.then(|| Arc::clone(&trusted_proxies)),
     };
 
     // Sweep idle per-IP buckets while the gateway runs (only when a limiter is

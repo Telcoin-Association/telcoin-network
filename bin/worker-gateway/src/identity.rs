@@ -24,10 +24,16 @@
 //! in the peer, in a forwarded entry and in a trusted range alike, so an IPv4
 //! proxy matches an IPv4 range on any listener and a mapped entry cannot dodge
 //! a trusted-range check. An IPv6 range matches native IPv6 addresses only.
+//!
+//! With `--proxy-protocol`, a connection from a trusted peer must open with a
+//! PROXY protocol v2 header ([`read_proxy_header`]), and the source address it
+//! names stands in for the peer: it becomes the connection's `ConnectInfo`, and
+//! the rule above then runs against it, so `X-Forwarded-For` is believed only
+//! when that source is itself a trusted proxy.
 
 use std::{
-    fmt,
-    net::{IpAddr, SocketAddr},
+    fmt, io,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     str::FromStr,
     sync::Arc,
 };
@@ -38,6 +44,7 @@ use axum::{
     middleware::Next,
     response::Response,
 };
+use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::ratelimit::{mask_v4, mask_v6, PrefixLen};
 
@@ -50,6 +57,32 @@ pub(crate) const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forw
 /// The scheme reported upstream unless a trusted proxy says otherwise: the
 /// gateway itself only serves plain HTTP.
 const DEFAULT_PROTO: &str = "http";
+
+/// The 12 bytes every PROXY protocol v2 header starts with.
+const PROXY_V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+
+/// The version a PROXY protocol header carries in the high nibble of its 13th
+/// byte.
+const PROXY_V2_VERSION: u8 = 2;
+
+/// The `LOCAL` command: the proxy's own connection (a health check, say),
+/// carrying no client address.
+const PROXY_V2_LOCAL: u8 = 0x0;
+
+/// The `PROXY` command: a relayed connection, carrying the client's address.
+const PROXY_V2_PROXY: u8 = 0x1;
+
+/// Address family and transport byte for TCP over IPv4.
+const PROXY_V2_TCP4: u8 = 0x11;
+
+/// Address family and transport byte for TCP over IPv6.
+const PROXY_V2_TCP6: u8 = 0x21;
+
+/// Length of the TCP over IPv4 address block: two addresses and two ports.
+const PROXY_V2_TCP4_LEN: u16 = 12;
+
+/// Length of the TCP over IPv6 address block: two addresses and two ports.
+const PROXY_V2_TCP6_LEN: u16 = 36;
 
 /// The address a request is attributed to, and so the address the per-IP rate
 /// limit keys on: the peer, or the client a trusted proxy forwarded the request
@@ -101,6 +134,11 @@ impl TrustedProxies {
     /// The number of configured ranges.
     pub(crate) fn len(&self) -> usize {
         self.0.len()
+    }
+
+    /// Whether no range is configured.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
     }
 
     /// Whether a range spans a whole address family (`/0`, or the IPv4-mapped
@@ -227,6 +265,71 @@ pub(crate) async fn identify(
     next.run(request).await
 }
 
+/// Read the PROXY protocol v2 header a trusted proxy sends ahead of a
+/// connection's first byte, returning the client address it carries, or `None`
+/// for a `LOCAL` header (the proxy's own connection, which keeps the proxy's
+/// address).
+///
+/// Only the header's own bytes are read, never past the length it declares, so
+/// the HTTP request behind it stays in the stream; TLVs after the address
+/// block are read and discarded. Anything else is an error and the caller
+/// closes the connection: no v2 signature (plain HTTP, or a v1 text header),
+/// another version, an unknown command, an address block shorter than its
+/// family needs, and a `PROXY` header for anything but TCP over IPv4 or IPv6
+/// (a front sending one is misconfigured, and serving the connection as the
+/// front's own would merge its clients into the front's rate-limit key). The
+/// caller bounds the read with the header read timeout.
+pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<Option<SocketAddr>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut fixed = [0_u8; 16];
+    stream.read_exact(&mut fixed).await?;
+    let [signature @ .., version_command, family, len_high, len_low] = fixed;
+    if signature != PROXY_V2_SIGNATURE {
+        return Err(invalid_proxy_header("missing the PROXY protocol v2 signature"));
+    }
+    if version_command >> 4 != PROXY_V2_VERSION {
+        return Err(invalid_proxy_header("unsupported PROXY protocol version"));
+    }
+    let len = u16::from_be_bytes([len_high, len_low]);
+    let (source, block_len) = match (version_command & 0x0f, family) {
+        (PROXY_V2_LOCAL, _) => (None, 0),
+        (PROXY_V2_PROXY, PROXY_V2_TCP4) if len >= PROXY_V2_TCP4_LEN => {
+            let source = Ipv4Addr::from(stream.read_u32().await?);
+            let _destination = stream.read_u32().await?;
+            let port = stream.read_u16().await?;
+            let _destination_port = stream.read_u16().await?;
+            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP4_LEN)
+        }
+        (PROXY_V2_PROXY, PROXY_V2_TCP6) if len >= PROXY_V2_TCP6_LEN => {
+            let source = Ipv6Addr::from(stream.read_u128().await?);
+            let _destination = stream.read_u128().await?;
+            let port = stream.read_u16().await?;
+            let _destination_port = stream.read_u16().await?;
+            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP6_LEN)
+        }
+        (PROXY_V2_PROXY, PROXY_V2_TCP4 | PROXY_V2_TCP6) => {
+            return Err(invalid_proxy_header("PROXY protocol address block is too short"));
+        }
+        (PROXY_V2_PROXY, _) => {
+            return Err(invalid_proxy_header("PROXY protocol header is not for TCP over IP"));
+        }
+        _ => return Err(invalid_proxy_header("unknown PROXY protocol command")),
+    };
+    // skip the tlvs (and a local header's address block) up to the declared
+    // length and no further: the request behind the header must stay unread
+    let rest = u64::from(len.saturating_sub(block_len));
+    if rest > 0 {
+        let skipped =
+            tokio::io::copy(&mut (&mut *stream).take(rest), &mut tokio::io::sink()).await?;
+        if skipped < rest {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+    }
+    Ok(source)
+}
+
 /// One trusted range: a network address with its host bits clear, and its
 /// prefix length. IPv4-mapped ranges are stored as IPv4.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -313,6 +416,11 @@ fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
         .map(|ip| ip.to_canonical())
 }
 
+/// A PROXY protocol header the gateway will not accept.
+fn invalid_proxy_header(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, reason)
+}
+
 /// The scheme a trusted peer reported in `X-Forwarded-Proto`: the right-most
 /// entry of its last line (the one the nearest proxy wrote) when that names
 /// `http` or `https`, ignoring case; `None` for anything else.
@@ -326,6 +434,25 @@ fn forwarded_proto(headers: &HeaderMap) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// A PROXY protocol v2 `PROXY` header for a TCP connection from `source` to a
+/// loopback destination, with `tlvs` after the address block.
+#[cfg(test)]
+pub(crate) fn proxy_v2_header(source: SocketAddr, tlvs: &[u8]) -> Vec<u8> {
+    let ports = [source.port().to_be_bytes(), 8545_u16.to_be_bytes()].concat();
+    let (family, block) = match source {
+        SocketAddr::V4(source) => (
+            PROXY_V2_TCP4,
+            [&source.ip().octets()[..], &Ipv4Addr::LOCALHOST.octets(), &ports].concat(),
+        ),
+        SocketAddr::V6(source) => (
+            PROXY_V2_TCP6,
+            [&source.ip().octets()[..], &Ipv6Addr::LOCALHOST.octets(), &ports].concat(),
+        ),
+    };
+    let len = u16::try_from(block.len() + tlvs.len()).expect("header length");
+    [&PROXY_V2_SIGNATURE[..], &[0x21, family], &len.to_be_bytes(), &block, tlvs].concat()
 }
 
 #[cfg(test)]
@@ -539,5 +666,77 @@ mod tests {
         assert_eq!(proto("10.0.0.0/8", &["http, https"]), "https");
         assert_eq!(proto("10.0.0.0/8", &["https, ftp"]), "http");
         assert_eq!(proto("10.0.0.0/8", &["http", "https"]), "https");
+    }
+
+    fn addr(addr: &str) -> SocketAddr {
+        addr.parse().expect("socket addr")
+    }
+
+    /// A v2 header with the given version and command byte, family and
+    /// transport byte, and address block.
+    fn raw_header(version_command: u8, family: u8, block: &[u8]) -> Vec<u8> {
+        let len = u16::try_from(block.len()).expect("header length");
+        [&PROXY_V2_SIGNATURE[..], &[version_command, family], &len.to_be_bytes(), block].concat()
+    }
+
+    /// Run the reader over `bytes`, returning its verdict and the bytes it left
+    /// unread.
+    async fn read_header(bytes: &[u8]) -> (io::Result<Option<SocketAddr>>, Vec<u8>) {
+        let mut reader = bytes;
+        let verdict = read_proxy_header(&mut reader).await;
+        (verdict, reader.to_vec())
+    }
+
+    #[tokio::test]
+    async fn proxy_v2_header_yields_the_source_and_leaves_the_request_unread() {
+        let request = b"POST / HTTP/1.1\r\n";
+        for (source, tlvs) in [
+            (addr("198.51.100.1:4711"), &[][..]),
+            (addr("[2001:db8::7]:4711"), &[][..]),
+            // a noop tlv after the address block is read and discarded
+            (addr("198.51.100.1:4711"), &[0x04, 0x00, 0x02, 0xaa, 0xbb][..]),
+        ] {
+            let bytes = [proxy_v2_header(source, tlvs), request.to_vec()].concat();
+            let (verdict, rest) = read_header(&bytes).await;
+            assert_eq!(verdict.expect("valid header"), Some(source));
+            assert_eq!(rest, request);
+        }
+    }
+
+    #[tokio::test]
+    async fn local_proxy_v2_header_keeps_the_peer() {
+        // a local header may still carry an address block, which is skipped
+        for block in [&[][..], &[0_u8; 12][..]] {
+            let bytes = [raw_header(0x20, 0x00, block), b"GET".to_vec()].concat();
+            let (verdict, rest) = read_header(&bytes).await;
+            assert_eq!(verdict.expect("valid header"), None);
+            assert_eq!(rest, b"GET");
+        }
+    }
+
+    #[tokio::test]
+    async fn unacceptable_proxy_headers_are_errors() {
+        let valid = proxy_v2_header(addr("198.51.100.1:4711"), &[]);
+        let tcp4_block = &valid[16..];
+        let mut truncated_tlv =
+            proxy_v2_header(addr("198.51.100.1:4711"), &[0x04, 0, 4, 1, 2, 3, 4]);
+        truncated_tlv.truncate(truncated_tlv.len() - 2);
+        for (case, bytes) in [
+            ("plain http", b"POST / HTTP/1.1\r\nHost: gateway\r\n\r\n".to_vec()),
+            ("v1 text header", b"PROXY TCP4 198.51.100.1 127.0.0.1 4711 8545\r\n".to_vec()),
+            ("version 1", raw_header(0x11, PROXY_V2_TCP4, tcp4_block)),
+            ("unknown command", raw_header(0x22, PROXY_V2_TCP4, tcp4_block)),
+            ("udp over ipv4", raw_header(0x21, 0x12, tcp4_block)),
+            ("unspecified family", raw_header(0x21, 0x00, &[])),
+            ("unix stream", raw_header(0x21, 0x31, &[0; 216])),
+            ("short ipv4 block", raw_header(0x21, PROXY_V2_TCP4, &tcp4_block[..8])),
+            ("short ipv6 block", raw_header(0x21, PROXY_V2_TCP6, tcp4_block)),
+            ("truncated block", valid[..20].to_vec()),
+            ("truncated tlv", truncated_tlv),
+            ("empty", Vec::new()),
+        ] {
+            let (verdict, _) = read_header(&bytes).await;
+            assert!(verdict.is_err(), "{case}");
+        }
     }
 }

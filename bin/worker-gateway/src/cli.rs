@@ -100,7 +100,10 @@ pub(crate) struct Cli {
     pub(crate) upstream_request_timeout: Duration,
 
     /// How long a new connection may take to send its complete request headers
-    /// before it is disconnected (slow-loris guard).
+    /// before it is disconnected (slow-loris guard). With `--proxy-protocol`, a
+    /// connection from a trusted proxy first gets this long for its PROXY
+    /// header, so its request headers may complete up to twice this long after
+    /// accept.
     #[arg(
         long,
         env = "WORKER_GATEWAY_HEADER_READ_TIMEOUT",
@@ -138,8 +141,10 @@ pub(crate) struct Cli {
     /// still in flight when a long-lived keep-alive session hits the cap is
     /// cut off mid-stream, so size the cap well above the longest legitimate
     /// transfer. Must be at least the gateway's own single-request bound
-    /// (`--header-read-timeout` plus the whole-request deadline) so the first
-    /// request on a connection can never be cut off. `0` disables.
+    /// (`--header-read-timeout`, twice with `--proxy-protocol`, plus the
+    /// whole-request deadline `--upstream-request-timeout` +
+    /// `--header-read-timeout`) so the first request on a connection can never
+    /// be cut off. `0` disables.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_CONNECTION_DURATION",
@@ -221,6 +226,19 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_TRUSTED_PROXIES")]
     pub(crate) trusted_proxies: Option<String>,
 
+    /// Expect a PROXY protocol v2 header (the binary form, for TCP over IPv4
+    /// or IPv6) at the start of every connection from a peer in
+    /// `--trusted-proxies`, and take the client address from it;
+    /// `X-Forwarded-For` is then believed only when that address is itself in
+    /// `--trusted-proxies`. A connection from a trusted peer whose header is
+    /// missing, malformed or not complete within `--header-read-timeout` is
+    /// closed; any other peer is served as plain HTTP. Off by default; requires
+    /// `--trusted-proxies`. Turn it on only once every listed proxy sends the
+    /// header on every connection: from a listed proxy that does not, a
+    /// client's own first bytes are read as the header.
+    #[arg(long, env = "WORKER_GATEWAY_PROXY_PROTOCOL")]
+    pub(crate) proxy_protocol: bool,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -282,6 +300,9 @@ pub(crate) struct Settings {
     /// Proxies whose `X-Forwarded-For` identifies the client; empty when no
     /// proxy is trusted.
     pub(crate) trusted_proxies: TrustedProxies,
+    /// Whether a trusted proxy's connection opens with a PROXY protocol v2
+    /// header naming the client.
+    pub(crate) proxy_protocol: bool,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -309,19 +330,24 @@ impl Cli {
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
         // service's whole-request deadline (see [`crate::app`]) is even armed,
-        // plus that deadline itself. A connection cap below this bound could
-        // cut off a request the gateway still considers live, so reject the
-        // combination at startup.
+        // plus that deadline itself. With `--proxy-protocol` a trusted front's
+        // connection may first spend up to another `header_read_timeout` on its
+        // PROXY header. A connection cap below this bound could cut off a
+        // request the gateway still considers live, so reject the combination
+        // at startup.
+        let proxy_header_bound =
+            if self.proxy_protocol { self.header_read_timeout } else { Duration::ZERO };
         let single_request_bound = self
             .header_read_timeout
-            .saturating_add(self.upstream_request_timeout.saturating_add(self.header_read_timeout));
+            .saturating_add(self.upstream_request_timeout.saturating_add(self.header_read_timeout))
+            .saturating_add(proxy_header_bound);
         max_connection_duration.map_or(Ok(()), |cap| {
             eyre::ensure!(
                 cap >= single_request_bound,
                 "--max-connection-duration ({}) is shorter than the gateway's own \
-                 single-request bound (--header-read-timeout plus the whole-request deadline \
-                 --upstream-request-timeout + --header-read-timeout = {}); raise the cap or \
-                 set it to 0 to disable it",
+                 single-request bound (--header-read-timeout, twice with --proxy-protocol, plus \
+                 the whole-request deadline --upstream-request-timeout + --header-read-timeout \
+                 = {}); raise the cap or set it to 0 to disable it",
                 humantime::format_duration(cap),
                 humantime::format_duration(single_request_bound),
             );
@@ -337,6 +363,11 @@ impl Cli {
             .unwrap_or_default()
             .parse::<TrustedProxies>()
             .map_err(|err| eyre::eyre!("invalid --trusted-proxies: {err}"))?;
+        eyre::ensure!(
+            !self.proxy_protocol || !trusted_proxies.is_empty(),
+            "--proxy-protocol requires --trusted-proxies: the PROXY header is read only from a \
+             trusted proxy, so with none listed it would never be read"
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -360,6 +391,7 @@ impl Cli {
                 self.rate_limit_global_burst,
             ),
             trusted_proxies,
+            proxy_protocol: self.proxy_protocol,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -784,6 +816,32 @@ mod tests {
             };
             assert!(message.contains("--trusted-proxies"), "{list}: {message}");
         }
+    }
+
+    #[test]
+    fn proxy_protocol_without_trusted_proxies_is_rejected_at_startup() -> eyre::Result<()> {
+        assert!(!cli_with_flags(&[]).into_settings()?.proxy_protocol, "off by default");
+        let message = match cli_with_flags(&["--proxy-protocol"]).into_settings() {
+            Ok(_) => panic!("--proxy-protocol with no trusted proxy must fail startup"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("--trusted-proxies"), "{message}");
+        let settings = cli_with_flags(&["--proxy-protocol", "--trusted-proxies=10.0.0.0/8"])
+            .into_settings()?;
+        assert!(settings.proxy_protocol);
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_counts_its_header_in_the_single_request_bound() {
+        // 10s for the proxy header, then the default 50s bound
+        let flags = ["--proxy-protocol", "--trusted-proxies=10.0.0.0/8"];
+        let below = cli_with_flags(&[&flags[..], &["--max-connection-duration=50s"]].concat())
+            .into_settings();
+        assert!(below.is_err(), "the proxy header's read time must count toward the bound");
+        let boundary = cli_with_flags(&[&flags[..], &["--max-connection-duration=60s"]].concat())
+            .into_settings();
+        assert!(boundary.is_ok(), "a cap equal to the bound must be accepted");
     }
 
     #[test]
