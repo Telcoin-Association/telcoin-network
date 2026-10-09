@@ -37,7 +37,7 @@ use serde::{
     Deserialize, Deserializer,
 };
 use serde_json::de::SliceRead;
-use tn_types::{Decodable2718, PooledTransaction};
+use tn_types::{Decodable2718, PooledTransaction, Typed2718};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -1051,7 +1051,7 @@ fn screen_transaction(raw: &RawTransaction<'_>) -> Option<GatewayError> {
         match PooledTransaction::decode_2718(&mut buf) {
             Err(_) => Some(GatewayError::InvalidTransaction),
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
-                Some(GatewayError::UnsupportedTransactionType)
+                Some(GatewayError::UnsupportedTransactionType(tx.ty()))
             }
             Ok(_) => None,
         }
@@ -1173,7 +1173,7 @@ mod tests {
         match PooledTransaction::decode_2718(&mut buf) {
             Err(_) => Some((GatewayError::InvalidTransaction, id)),
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
-                Some((GatewayError::UnsupportedTransactionType, id))
+                Some((GatewayError::UnsupportedTransactionType(tx.ty()), id))
             }
             Ok(_) => None,
         }
@@ -1390,7 +1390,7 @@ mod tests {
         .into_bytes();
 
         let (err, id) = screen_raw_transaction(&body).expect("disallowed type must be rejected");
-        assert!(matches!(err, GatewayError::UnsupportedTransactionType));
+        assert!(matches!(err, GatewayError::UnsupportedTransactionType(4)));
         assert_eq!(id, RequestId::from_id(serde_json::json!(42)));
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
     }
@@ -1468,7 +1468,7 @@ mod tests {
         let disallowed = sync(&format!("[\"{}\"]", eip7702_raw_hex()), "10");
         assert!(matches!(
             screen_err(disallowed.as_bytes()),
-            Some(GatewayError::UnsupportedTransactionType)
+            Some(GatewayError::UnsupportedTransactionType(4))
         ));
         let valid = sync(&format!("[\"{EIP155_LEGACY_TX}\"]"), "11");
         assert!(screen_err(valid.as_bytes()).is_none());
@@ -1519,7 +1519,7 @@ mod tests {
         assert!(screen_err(&as_array(EIP155_LEGACY_TX)).is_none(), "valid bytes are forwarded");
         assert!(matches!(
             screen_err(&as_array(&eip7702_raw_hex())),
-            Some(GatewayError::UnsupportedTransactionType)
+            Some(GatewayError::UnsupportedTransactionType(4))
         ));
         for params in ["[[222,173,190,239]]", "[[]]", "[[123]]"] {
             let err = screen_err(&send_raw(params));

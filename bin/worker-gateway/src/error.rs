@@ -44,12 +44,19 @@ mod code {
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
+    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
+    /// transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
 }
+
+/// The EIP-2718 type byte of an EIP-4844 blob transaction.
+const EIP4844_TX_TYPE: u8 = 3;
+
+/// The EIP-2718 type byte of an EIP-7702 set-code transaction.
+const EIP7702_TX_TYPE: u8 = 4;
 
 /// A gateway-side failure surfaced to the client as a JSON-RPC error.
 #[derive(Debug)]
@@ -75,8 +82,9 @@ pub(crate) enum GatewayError {
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
-    UnsupportedTransactionType,
+    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
+    /// transaction). Carries the EIP-2718 type byte, which the message names.
+    UnsupportedTransactionType(u8),
     /// The request body could not be read (e.g. the client aborted mid-body).
     /// Also answers a batch the gateway cannot read to its end, whose length,
     /// and so its cost, is unknown.
@@ -94,7 +102,9 @@ impl GatewayError {
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
+            Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -110,14 +120,16 @@ impl GatewayError {
             Self::RequestTimeout => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
-            Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
 
-    /// A human-readable message paired with this error.
-    fn message(&self) -> &'static str {
-        match self {
+    /// A human-readable message paired with this error. Every message is
+    /// static except the one for a transaction type without a name here,
+    /// which the screen cannot produce today (it refuses only types 3 and 4).
+    fn message(&self) -> Cow<'static, str> {
+        let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
             Self::UpstreamUnreachable => "upstream unreachable",
             Self::UpstreamTimeout => "upstream request timed out",
@@ -129,11 +141,20 @@ impl GatewayError {
             Self::RequestTimeout => "request did not complete within the gateway's deadline",
             Self::RateLimited => "rate limit exceeded; slow down and retry",
             Self::InvalidTransaction => "raw transaction could not be decoded",
-            Self::UnsupportedTransactionType => {
+            Self::UnsupportedTransactionType(EIP4844_TX_TYPE) => {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
+            Self::UnsupportedTransactionType(EIP7702_TX_TYPE) => {
+                "unsupported transaction type: EIP-7702 set-code transactions are not accepted"
+            }
+            Self::UnsupportedTransactionType(ty) => {
+                return Cow::Owned(format!(
+                    "unsupported transaction type: type {ty:#04x} transactions are not accepted"
+                ));
+            }
             Self::UnreadableBody => "request body could not be read",
-        }
+        };
+        Cow::Borrowed(message)
     }
 
     /// A stable, machine-readable reason label for the
@@ -151,7 +172,7 @@ impl GatewayError {
             Self::RequestTimeout => "request_timeout",
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
-            Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -529,7 +550,7 @@ mod tests {
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            error_response(&GatewayError::UnsupportedTransactionType, b"{}").status(),
+            error_response(&GatewayError::UnsupportedTransactionType(4), b"{}").status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -541,7 +562,8 @@ mod tests {
         assert_eq!(GatewayError::BatchTooLong.code(), -32003);
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
-        assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::UnsupportedTransactionType(3).code(), -32008);
+        assert_eq!(GatewayError::UnsupportedTransactionType(4).code(), -32008);
     }
 
     /// An over-length batch shares the "too large" code and status with an
@@ -563,6 +585,36 @@ mod tests {
         assert_eq!(body["id"], Value::Null);
     }
 
+    /// WG-52: an EIP-7702 rejection used to be reported as "EIP-4844 blob".
+    /// The message names the type that was refused; the code and reason stay
+    /// one per variant, so dashboards and clients are unaffected.
+    #[tokio::test]
+    async fn rejected_type_is_named() {
+        let message = |ty| GatewayError::UnsupportedTransactionType(ty).message();
+        assert_eq!(
+            message(4),
+            "unsupported transaction type: EIP-7702 set-code transactions are not accepted"
+        );
+        assert_eq!(
+            message(3),
+            "unsupported transaction type: EIP-4844 blob transactions are not accepted"
+        );
+        assert_eq!(
+            message(0x7f),
+            "unsupported transaction type: type 0x7f transactions are not accepted"
+        );
+
+        let response = error_response_with_id(
+            &GatewayError::UnsupportedTransactionType(4),
+            RequestId(json!(1)),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], json!(-32008));
+        let rendered = body["error"]["message"].as_str().expect("message");
+        assert!(rendered.contains("EIP-7702") && !rendered.contains("EIP-4844"), "{rendered}");
+    }
+
     #[test]
     fn reason_labels_are_stable() {
         // The reason labels are the `tn_worker_gateway_rejections_total{reason}`
@@ -578,7 +630,7 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");
         assert_eq!(GatewayError::InvalidTransaction.reason(), "invalid_transaction");
         assert_eq!(
-            GatewayError::UnsupportedTransactionType.reason(),
+            GatewayError::UnsupportedTransactionType(4).reason(),
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");

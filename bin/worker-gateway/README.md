@@ -317,7 +317,7 @@ echoed when it can be recovered.
 | Request deadline exceeded | `408` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
-| Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
+| Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
 
 The gateway's own codes sit in the JSON-RPC server-error range
