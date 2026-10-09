@@ -24,6 +24,203 @@ use tn_test_utils::CommitteeFixture;
 use tn_types::{now, BlsKeypair, NetworkKeypair, NetworkPublicKey};
 use tokio::time::{sleep, timeout};
 
+/// Convert a configured dial hint into the peer manager's record format.
+fn launch_peer_info(peer: &tn_types::P2pNode) -> NetworkInfo {
+    NetworkInfo {
+        pubkey: peer.network_key.clone(),
+        multiaddrs: vec![peer.network_address.clone()],
+        timestamp: now(),
+        rpc: peer.rpc.clone(),
+    }
+}
+
+/// Seeding preserves unrelated bootstrap/trusted peers and survives committee rotation.
+#[tokio::test]
+async fn committee_seeding_unions_bootstrap_and_trusted_peers() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let mut entries = peers.into_iter();
+    let (seed_key, seed) = entries.next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (bootstrap_key, bootstrap) =
+        entries.next().ok_or_else(|| eyre::eyre!("missing bootstrap"))?;
+    let (trusted_key, trusted) =
+        entries.next().ok_or_else(|| eyre::eyre!("missing trusted peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    manager.add_bootstrap_peer(bootstrap_key, launch_peer_info(&bootstrap.primary));
+    let (reply, _receiver) = tokio::sync::oneshot::channel();
+    manager.add_trusted_peer_and_dial(trusted_key, launch_peer_info(&trusted.primary), reply);
+    // Matching duplicate bootstrap hints deterministically use the launch address.
+    let mut old_info = launch_peer_info(&seed.primary);
+    old_info.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
+    manager.add_bootstrap_peer(seed_key, old_info);
+    manager.seed_committee_peers(BTreeMap::from([(seed_key, seed.primary.clone())]))?;
+    manager.seed_committee_peers(BTreeMap::from([(seed_key, seed.primary.clone())]))?;
+    manager.update_committees(HashSet::new(), HashSet::from([seed_key]), HashSet::new());
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert_eq!(manager.known_peers.len(), 3);
+    assert_eq!(
+        manager.known_peers.get(&seed_key).map(|info| &info.multiaddrs),
+        Some(&vec![seed.primary.network_address])
+    );
+    assert_eq!(
+        manager.known_peers.get(&bootstrap_key).map(|info| &info.pubkey),
+        Some(&bootstrap.primary.network_key)
+    );
+    assert_eq!(
+        manager.known_peers.get(&trusted_key).map(|info| &info.pubkey),
+        Some(&trusted.primary.network_key)
+    );
+    Ok(())
+}
+
+/// A configured stub that contradicts the inventory rejects the whole seed batch.
+#[tokio::test]
+async fn committee_seeding_rejects_conflicting_configured_stub_atomically() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let other = peers.values().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    manager.add_bootstrap_peer(*key, launch_peer_info(&other.primary));
+    let inventory = peers.iter().map(|(key, peer)| (*key, peer.primary.clone())).collect();
+    assert!(manager.seed_committee_peers(inventory).is_err());
+    assert_eq!(manager.known_peers.len(), 1);
+    assert!(manager.committee_peers.is_empty());
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&other.primary.network_key)
+    );
+    assert_ne!(peer.primary.network_key, other.primary.network_key);
+    Ok(())
+}
+
+/// A restored record under a key outside the inventory cannot stop seeding.
+#[tokio::test]
+async fn committee_seeding_drops_planted_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (outside_key, _) = peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    // the persisted kad store is peer-fillable: a row can bind any key to a seeded network key
+    manager.add_restored_peer(*outside_key, launch_peer_info(&peer.primary));
+    manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
+    assert!(!manager.known_peers.contains_key(outside_key));
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&peer.primary.network_key)
+    );
+    assert_eq!(
+        manager.peers.bls_for_peer(&PeerId::from(peer.primary.network_key.clone())),
+        Some(*key),
+    );
+    Ok(())
+}
+
+/// A stale restored record under an inventory key gives way to the launch bindings.
+#[tokio::test]
+async fn committee_seeding_replaces_stale_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (other_key, other) =
+        peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    manager.add_restored_peer(*key, launch_peer_info(&other.primary));
+    let inventory = peers.iter().map(|(key, peer)| (*key, peer.primary.clone())).collect();
+    manager.seed_committee_peers(inventory)?;
+    assert_eq!(manager.known_peers.len(), peers.len());
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&peer.primary.network_key)
+    );
+    assert_eq!(
+        manager.known_peers.get(other_key).map(|info| &info.pubkey),
+        Some(&other.primary.network_key)
+    );
+    assert_eq!(
+        manager.peers.bls_for_peer(&PeerId::from(other.primary.network_key.clone())),
+        Some(*other_key),
+    );
+    Ok(())
+}
+
+/// Seeding preserves a restored record's signed metadata and rejects older relayed records.
+#[tokio::test]
+async fn committee_seeding_keeps_matching_restored_record() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let mut manager = create_test_peer_manager(None);
+    let mut restored = launch_peer_info(&peer.primary);
+    restored.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
+    restored.timestamp = 1_000;
+    let rpc = RpcInfo {
+        http: "https://validator.example.com:8545/".parse()?,
+        ws: Some("wss://validator.example.com:8546/".parse()?),
+    };
+    restored.rpc = Some(rpc.clone());
+    let signed = restored.timestamp;
+    manager.add_restored_peer(*key, restored);
+    manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
+    let cached = manager.known_peers.get(key).ok_or_else(|| eyre::eyre!("missing record"))?;
+    assert_eq!(cached.timestamp, signed);
+    assert_eq!(cached.rpc.as_ref(), Some(&rpc));
+    assert_eq!(cached.multiaddrs, vec![peer.primary.network_address.clone()]);
+    assert!(!manager.stub_records.contains(key));
+    assert!(manager.pinned_peers.contains(key));
+    let mut stale = cached.clone();
+    stale.timestamp = signed.saturating_sub(1);
+    stale.rpc = None;
+    manager.add_self_advertised_peer(PeerId::random(), *key, stale);
+    let cached = manager.known_peers.get(key).ok_or_else(|| eyre::eyre!("missing record"))?;
+    assert_eq!(cached.timestamp, signed);
+    assert_eq!(cached.rpc.as_ref(), Some(&rpc));
+    Ok(())
+}
+
+/// Discovery cannot silently re-key or move a seeded launch validator.
+#[tokio::test]
+async fn committee_seeding_keeps_identity_and_address_fixed() -> eyre::Result<()> {
+    let committee: tn_types::Committee = serde_yaml::from_str(tn_types::MAINNET_COMMITTEE)?;
+    let peers = committee.bootstrap_servers();
+    let (key, peer) = peers.iter().next().ok_or_else(|| eyre::eyre!("missing seed"))?;
+    let (other_key, other) =
+        peers.iter().nth(1).ok_or_else(|| eyre::eyre!("missing other peer"))?;
+    let mut manager = create_test_peer_manager(None);
+    manager.seed_committee_peers(BTreeMap::from([(*key, peer.primary.clone())]))?;
+    let mut changed_seed = peer.primary.clone();
+    changed_seed.network_address = "/ip4/127.0.0.1/udp/1/quic-v1".parse()?;
+    assert!(manager.seed_committee_peers(BTreeMap::from([(*key, changed_seed)])).is_err());
+    let (reply, receiver) = oneshot::channel();
+    manager.add_trusted_peer_and_dial(*key, launch_peer_info(&other.primary), reply);
+    assert!(receiver.await?.is_err());
+    manager.cache_known_peer(*key, launch_peer_info(&other.primary));
+    manager.cache_known_peer(*other_key, launch_peer_info(&peer.primary));
+    manager.add_self_advertised_peer(
+        PeerId::from(peer.primary.network_key.clone()),
+        *other_key,
+        launch_peer_info(&peer.primary),
+    );
+    assert!(!manager.known_peers.contains_key(other_key));
+    assert_eq!(
+        manager.peers.bls_for_peer(&PeerId::from(peer.primary.network_key.clone())),
+        Some(*key),
+    );
+    let mut moved = launch_peer_info(&peer.primary);
+    moved.multiaddrs = vec!["/ip4/127.0.0.1/udp/1/quic-v1".parse()?];
+    manager.cache_known_peer(*key, moved);
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.pubkey),
+        Some(&peer.primary.network_key)
+    );
+    assert_eq!(
+        manager.known_peers.get(key).map(|info| &info.multiaddrs),
+        Some(&vec![peer.primary.network_address.clone()])
+    );
+    Ok(())
+}
+
 fn create_test_peer_manager(network_config: Option<NetworkConfig>) -> PeerManager {
     let network_config = network_config.unwrap_or_default();
     let all_nodes =
@@ -1340,6 +1537,62 @@ async fn test_learned_pinned_record_not_regressed_by_older_push() {
     assert_eq!(cached.timestamp, 1_000, "older replay must not regress the cached timestamp");
     assert_eq!(cached.multiaddrs, real_addrs, "older replay must not regress the multiaddrs");
     assert_eq!(cached.rpc, Some(rpc), "older replay must not drop the advertised rpc");
+}
+
+/// A corrected self-advertisement repairs a pinned record and its live identity and RPC info.
+#[tokio::test]
+async fn test_self_advertised_future_record_repair() -> Result<(), &'static str> {
+    let mut manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([80; 32])).public();
+    manager.add_bootstrap_peer(bls, random_network_info());
+    let mut future = random_network_info();
+    future.timestamp = u64::MAX;
+    manager.add_self_advertised_peer(future.pubkey.clone().into(), bls, future);
+    let (mut corrected, rpc) = random_network_info_with_rpc();
+    corrected.timestamp = now();
+    let peer: PeerId = corrected.pubkey.clone().into();
+    manager.add_self_advertised_peer(peer, bls, corrected.clone());
+    let cached = manager.known_peers.get(&bls).ok_or("missing corrected record")?;
+    assert_eq!(cached.pubkey, corrected.pubkey);
+    assert_eq!(cached.multiaddrs, corrected.multiaddrs);
+    assert_eq!(cached.rpc, Some(rpc));
+    assert_eq!(manager.auth_to_peer(bls).map(|(peer, _)| peer), Some(peer));
+    let mut replay = random_network_info();
+    replay.timestamp = corrected.timestamp.saturating_sub(1);
+    manager.add_self_advertised_peer(replay.pubkey.clone().into(), bls, replay);
+    assert_eq!(manager.known_peers.get(&bls).map(|info| &info.pubkey), Some(&corrected.pubkey));
+    Ok(())
+}
+
+/// A query correction repairs restored metadata and updates committee and pinned copies.
+#[tokio::test]
+async fn test_discovered_future_record_repair_after_restore() -> Result<(), &'static str> {
+    let mut manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([81; 32])).public();
+    manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+    let mut future = random_network_info();
+    future.timestamp = u64::MAX;
+    manager.add_restored_peer(bls, future);
+    manager
+        .restore_record_timestamp(bls, crate::freshness::RecordTimestamp::admit(u64::MAX, 1_000));
+    manager.add_bootstrap_peer(bls, random_network_info());
+    let (mut corrected, rpc) = random_network_info_with_rpc();
+    corrected.timestamp = u64::MAX - 1;
+    let timestamp = crate::freshness::RecordTimestamp::admit(corrected.timestamp, 1_000);
+    manager.add_discovered_peer_with_timestamp(bls, corrected.clone(), timestamp);
+    assert_eq!(manager.record_timestamp(&bls, corrected.timestamp), Some(timestamp));
+    let cached = manager.known_peers.get(&bls).ok_or("missing corrected record")?;
+    assert_eq!(cached.pubkey, corrected.pubkey);
+    assert_eq!(cached.multiaddrs, corrected.multiaddrs);
+    assert_eq!(cached.rpc, Some(rpc));
+    assert_eq!(
+        manager.auth_to_peer(bls).map(|(peer, _)| peer),
+        Some(corrected.pubkey.clone().into())
+    );
+    manager.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+    assert!(manager.known_peers.contains_key(&bls), "pinned correction survives rotation");
+    assert!(manager.known_timestamps.contains_key(&bls));
+    Ok(())
 }
 
 #[tokio::test]
