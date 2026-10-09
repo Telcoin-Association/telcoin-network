@@ -279,6 +279,13 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Seed fixed launch bindings without granting committee membership.
+    SeedCommitteePeers {
+        /// This swarm's operator-owned BLS/network/address bindings.
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+        /// Reply after validation and insertion, before startup dials.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Dial a peer to establish a connection.
     Dial {
         /// The peer's id.
@@ -602,6 +609,16 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Seed fixed operator-owned launch bindings before dialing committee peers.
+    pub async fn seed_committee_peers(
+        &self,
+        peers: BTreeMap<BlsPublicKey, P2pNode>,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::SeedCommitteePeers { peers, reply }).await?;
         rx.await?
     }
 
