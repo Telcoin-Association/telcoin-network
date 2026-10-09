@@ -47,7 +47,7 @@ use tn_types::{
 // The canonical worker-attribution helper lives in `tn-types` (one implementation, no drift);
 // re-export so the crate-internal call sites and tests keep referring to it by bare name.
 pub(crate) use tn_types::gas_accumulator::worker_id_from_header;
-use tn_worker::{WorkerNetworkHandle, WorkerRequest, WorkerResponse};
+use tn_worker::{WorkerEventChannel, WorkerNetworkHandle, WorkerRequest, WorkerResponse};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
@@ -283,7 +283,8 @@ pub(crate) struct EpochManager<P, DB> {
     /// Persistent event streams for the long-running worker networks, one per configured worker
     /// and indexed by [`WorkerId`](tn_types::WorkerId). Outlive any single epoch so the worker
     /// swarms do not have to be rebuilt on each transition.
-    worker_event_streams: Vec<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>,
+    worker_event_streams:
+        Vec<WorkerEventChannel<QueChannel<NetworkEvent<WorkerRequest, WorkerResponse>>>>,
 
     /// Final consensus header of the epoch that just closed, carried into the next epoch so it can
     /// be used as the starting point for the new epoch's chain.
@@ -805,7 +806,7 @@ where
             ConsensusBusApp::new_with_recent_blocks(builder.tn_config.parameters.gc_depth);
         // one event stream per configured worker, indexed by worker id
         let worker_event_streams = (0..builder.tn_config.node_info.p2p_info.num_workers())
-            .map(|_| QueChannel::new())
+            .map(|_| WorkerEventChannel::new(QueChannel::new()))
             .collect();
         // Spawn the state exporter once, only when the feature is enabled.
         let exec_state_exporter =
@@ -1617,7 +1618,7 @@ where
                 let worker_network = ConsensusNetwork::new_for_worker(
                     worker_id,
                     network_config,
-                    event_stream,
+                    event_stream.clone(),
                     self.key_config.clone(),
                     self.consensus_db.clone(),
                     node_task_spawner.clone(),
@@ -1626,7 +1627,16 @@ where
                 )?
                 .with_source_admission_budget(source_budget.clone())
                 .with_advertised_addresses(advertised)?;
-                let worker_network_handle = worker_network.network_handle();
+                // The epoch task spawner is refreshed on each epoch; ingress expiry uses the
+                // node-lifetime spawner retained by the network handle.
+                let worker_network_handle = WorkerNetworkHandle::new(
+                    worker_network.network_handle(),
+                    node_task_spawner.clone(),
+                    worker_id,
+                    epoch,
+                    network_config.chain_id(),
+                );
+                event_stream.bind(&worker_network_handle, network_config.serve_limits(), worker_id);
                 let node_shutdown = self.node_shutdown.subscribe();
 
                 // spawn long-running worker network task
@@ -1645,14 +1655,7 @@ where
                     },
                 );
 
-                // set temporary task spawner - this is updated with each epoch
-                Ok(WorkerNetworkHandle::new(
-                    worker_network_handle,
-                    node_task_spawner.clone(),
-                    worker_id,
-                    epoch,
-                    network_config.chain_id(),
-                ))
+                Ok(worker_network_handle)
             })
             .collect::<eyre::Result<Vec<_>>>()?;
 

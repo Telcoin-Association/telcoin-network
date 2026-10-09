@@ -130,8 +130,12 @@ Admitted sync streams and bounded rejection responses retain the node's task
 owner across epoch changes. Their stream, per-peer, and rejection-task admission
 pools are shared by consecutive epoch handlers, so an old response still consumes
 the same capacity after a new epoch starts. Existing transfer timeouts and node
-shutdown still end these tasks. This protects admitted transfers; the event
-receiver handoff can still reject a stream before admission.
+shutdown still end these tasks. Worker sync streams acquire the same global and
+per-peer permits before entering a separate queue that survives the epoch event
+receiver handoff. Queued and active streams share the five-stream limit, and the
+request-read deadline starts at admission. Independent expiry releases queued
+permits even when the next epoch receiver is delayed. Worker RPC and gossip
+events retain their epoch-scoped receiver and do not enter this queue.
 
 Concurrent committee vote requests can arrive after the receiver has processed a later round or
 collected the requested round. These requests are rejected without lowering the author's peer
@@ -185,8 +189,9 @@ certifier's cancellation of obsolete proposals and requests after quorum.
 For GitHub Actions, whole-process RSS must stay at or below 2 GiB and CPU at or
 below 0.75 cores per sample interval. The workstation limits are 4 GiB and three
 cores. Both require queue occupancy at or below 100 and DAO connectivity at eight
-on the primary and each worker throughout measurement. Executed-chain progress
-must never regress or stall for more than fifteen seconds.
+on the primary and each worker throughout measurement. Successful engine output
+completions must never regress or stall for more than fifteen seconds, including
+empty outputs that intentionally produce no block.
 
 ## Collection and concurrent workload
 
@@ -348,7 +353,16 @@ restarts from ordinary joins.
 limits, declared revision, exact profile and frozen driver command. It measures
 whole-process user and system CPU, RSS, primary and both worker allocations,
 class tasks, queues, rejection counters and source-accounting rows. Its progress
-selector is `tn_engine_canonical_height`, updated after consensus execution.
+selector is `tn_engine_outputs_executed_total`, incremented only after the engine
+successfully handles a consensus output. This includes an intentional empty-output
+skip after its engine update is sent, as well as successful block execution. A
+blocked or failed execution does not increment it, and execution is serial, so later
+empty outputs cannot mask a blocked block. The same 15-second progress limit applies
+through measurement and drain. Canonical height remains in the raw telemetry, but
+can legitimately stay constant when empty non-closing outputs produce no block.
+The selector is recorded in the deployment before either phase starts. Results from
+the previous canonical-height binding remain results of that binding and require a
+fresh run to qualify with completed-output progress.
 Process restarts, missing metrics, sparse sampling, invalid observations and
 incomplete workloads fail collection.
 

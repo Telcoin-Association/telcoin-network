@@ -16,6 +16,8 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parent
+# Successful engine completions include empty outputs that intentionally produce no block.
+APPLICATION_PROGRESS_METRIC = "tn_engine_outputs_executed_total"
 
 
 def runner_resources(name):
@@ -312,7 +314,7 @@ def run_phase(docker, coordinator, hubs, population, phase, plan, revision):
                 "pid": int((phase_dir / f"{node['name']}.pid").read_text()), "revision": revision,
                 "argv": command["argv"], "cpu_affinity": hub_cpu_set(docker.resources, index),
                 "profile_path": f"{container_dir}/{node['name']}/network-config",
-                "metrics_url": f"http://{node['ip']}:9000", "progress": {"name": "tn_engine_canonical_height"}}
+                "metrics_url": f"http://{node['ip']}:9000", "progress": {"name": APPLICATION_PROGRESS_METRIC}}
         write_json(phase_dir / "bindings.json", bindings)
         processes.append(docker.background_execute(coordinator, f"{phase}-transactions", "python3", "-B", "-I",
             "/tools/traffic.py", "stream", "--fixture", "/qualification/transactions.json",

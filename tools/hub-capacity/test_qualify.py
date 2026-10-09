@@ -18,6 +18,9 @@ SPEC.loader.exec_module(QUALIFY)
 COLLECT_SPEC = importlib.util.spec_from_file_location("compact_collect", ROOT / "collect.py")
 COLLECT = importlib.util.module_from_spec(COLLECT_SPEC)
 COLLECT_SPEC.loader.exec_module(COLLECT)
+RUNNER_SPEC = importlib.util.spec_from_file_location("progress_runner", ROOT / "docker-run.py")
+RUNNER = importlib.util.module_from_spec(RUNNER_SPEC)
+RUNNER_SPEC.loader.exec_module(RUNNER)
 COMMITTEE_SPEC = importlib.util.spec_from_file_location("committee_fixture", ROOT / "test_committee.py")
 COMMITTEE_FIXTURE = importlib.util.module_from_spec(COMMITTEE_SPEC)
 COMMITTEE_SPEC.loader.exec_module(COMMITTEE_FIXTURE)
@@ -89,6 +92,36 @@ class QualificationTests(unittest.TestCase):
     def setUp(self):
         self.plan = declaration()
         self.run = evidence(self.plan)
+
+    def progress_samples(self, completed, height):
+        """Sample the deployment's real selector through the collector and unchanged scorer."""
+        run = evidence(self.plan)
+        for index, sample in enumerate(run["samples"]):
+            raw = (f"tn_engine_canonical_height {height(index)}\n"
+                   f"tn_engine_outputs_executed_total {completed(index)}\n")
+            metrics = COLLECT.capacity_metrics(raw, RUNNER.APPLICATION_PROGRESS_METRIC)
+            progress = COLLECT.select(metrics, RUNNER.APPLICATION_PROGRESS_METRIC)
+            for hub in sample["hubs"].values():
+                hub["progress"] = progress
+        QUALIFY.validate_evidence(self.plan, run, "candidate")
+        return QUALIFY.score(self.plan, run)
+
+    def test_completed_empty_outputs_advance_application_progress(self):
+        # Idle engine completions must count even when no canonical block is produced.
+        self.assertTrue(self.progress_samples(lambda index: index + 1, lambda _: 454)["passed"])
+
+    def test_completed_output_counter_stalls_and_regressions_fail(self):
+        for completed in (lambda _: 1, lambda index: index + 1 if index < 120 else 1):
+            with self.subTest(completed=completed):
+                result = self.progress_samples(completed, lambda index: 454 + index)
+                self.assertFalse(result["passed"])
+                self.assertTrue(any("application progress" in failure for failure in result["failures"]))
+
+    def test_missing_completed_output_counter_does_not_fall_back_to_height(self):
+        metrics = COLLECT.capacity_metrics("tn_engine_canonical_height 454\n",
+                                          RUNNER.APPLICATION_PROGRESS_METRIC)
+        with self.assertRaisesRegex(ValueError, "missing metric"):
+            COLLECT.select(metrics, RUNNER.APPLICATION_PROGRESS_METRIC)
 
     def test_compact_producer_roundtrip_preserves_validation_and_score(self):
         QUALIFY.validate_plan(self.plan)

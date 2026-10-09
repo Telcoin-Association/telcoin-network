@@ -5,6 +5,9 @@ use futures::{AsyncWrite, AsyncWriteExt as _};
 use handle::max_sync_frame_size;
 pub use handle::WorkerNetworkHandle;
 use handler::RequestHandler;
+pub use ingress::{
+    AdmittedSyncStream, WorkerEventChannel, WorkerEventReceiver, WorkerIngressEvent,
+};
 pub use message::{WorkerRequest, WorkerResponse};
 use parking_lot::Mutex;
 use std::{
@@ -36,6 +39,7 @@ mod epoch_sync_tests;
 pub(crate) mod error;
 pub(crate) mod handle;
 pub(crate) mod handler;
+mod ingress;
 pub(crate) mod message;
 pub(crate) mod primary;
 pub(crate) mod stream_codec;
@@ -238,9 +242,11 @@ fn shed_sync_stream<S>(
 
 /// Handle inter-node communication between primaries.
 #[derive(Debug)]
-pub struct WorkerNetwork<DB, Events> {
+pub struct WorkerNetwork<DB, Events, Event = NetworkEvent<Req, Res>> {
     /// Receiver for network events.
     network_events: Events,
+    /// Input type retains support for legacy raw-event receivers.
+    input: std::marker::PhantomData<fn() -> Event>,
     /// Network handle to send commands.
     network_handle: WorkerNetworkHandle,
     /// Request handler to process requests and return responses.
@@ -298,10 +304,11 @@ impl WorkerSyncAdmission {
     }
 }
 
-impl<DB, Events> WorkerNetwork<DB, Events>
+impl<DB, Events, Event> WorkerNetwork<DB, Events, Event>
 where
     DB: Database,
-    Events: TnReceiver<NetworkEvent<Req, Res>> + 'static,
+    Events: TnReceiver<Event> + 'static,
+    Event: Into<WorkerIngressEvent> + Send + 'static,
 {
     /// Create a new instance of Self.
     pub fn new(
@@ -318,6 +325,7 @@ where
         let sync_admission = network_handle.sync_admission(&serve).clone();
         Self {
             network_events,
+            input: std::marker::PhantomData,
             network_handle,
             request_handler,
             batch_stream_semaphore: sync_admission.stream_semaphore,
@@ -334,7 +342,10 @@ where
             loop {
                 match self.network_events.recv().await {
                     Some(event) => {
-                        self.process_network_event(event);
+                        match event.into() {
+                            WorkerIngressEvent::Network(event) => self.process_network_event(event),
+                            WorkerIngressEvent::Sync(stream) => self.process_admitted_sync_stream(stream),
+                        }
                     }
                     None => {
                         warn!(target: "worker::network", "critical worker network events channel dropped");
@@ -472,6 +483,12 @@ where
             self.shed_inbound_sync_stream(peer, stream);
             return;
         };
+        self.process_admitted_sync_stream(AdmittedSyncStream::new(peer, stream, permit));
+    }
+
+    /// Serve an ingress-admitted stream without reacquiring or extending its admission.
+    fn process_admitted_sync_stream(&self, admitted: AdmittedSyncStream) {
+        let (peer, stream, permit, _arrived, deadline) = admitted.into_parts();
         let request_handler = self.request_handler.clone();
         let consensus_chain = self.consensus_chain.clone();
         let epoch = self.network_handle.epoch();
@@ -487,8 +504,8 @@ where
             // or sends a malformed one (io error) is dropped after releasing the
             // permit. Collapse the timeout/io results rather than nesting matches.
             let (mut decode_buffer, mut decompress_buffer) = (Vec::new(), Vec::new());
-            let request = tokio::time::timeout(
-                SYNC_REQUEST_READ_TIMEOUT,
+            let request = tokio::time::timeout_at(
+                deadline,
                 read_frame::<_, WorkerSyncRequest>(
                     &mut stream,
                     &mut decode_buffer,
@@ -498,7 +515,8 @@ where
             )
             .await
             .ok()
-            .and_then(Result::ok);
+            .and_then(Result::ok)
+            .filter(|_| tokio::time::Instant::now() < deadline);
             let Some(request) = request else {
                 warn!(target: "worker::network", %peer, "no readable sync request frame");
                 // bound the best-effort close so a peer that sent no readable frame
