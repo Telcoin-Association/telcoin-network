@@ -376,7 +376,7 @@ mod tests {
 
     /// The CLI's default readiness thresholds.
     fn test_thresholds() -> ReadinessThresholds {
-        ReadinessThresholds { failure: nz(3), success: nz(2) }
+        ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: Some(nz(3)) }
     }
 
     fn test_state_with_client(upstreams: &[UpstreamWorker], client: Client) -> AppState {
@@ -1257,5 +1257,174 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// Gateway state over `upstreams`, every one marked ready, using the
+    /// production proxy client and passive health at `rpc_failure` failed
+    /// forwards in a row.
+    fn passive_health_state(upstreams: &[UpstreamWorker], rpc_failure: u32) -> AppState {
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        let thresholds =
+            ReadinessThresholds { rpc_failure: Some(nz(rpc_failure)), ..test_thresholds() };
+        let readiness = Arc::new(GatewayReadiness::new(upstreams, thresholds));
+        upstreams.iter().for_each(|upstream| readiness.set_ready(upstream.worker_id, true));
+        AppState { readiness, http: client, query_upstream: None }
+    }
+
+    /// Worker 0 with a closed RPC port (nothing listens on port 1), then
+    /// worker 1 at `second`.
+    fn dead_then_live(second: SocketAddr) -> [UpstreamWorker; 2] {
+        [
+            upstream("127.0.0.1:1".parse().expect("addr")),
+            UpstreamWorker { worker_id: 1, ..upstream(second) },
+        ]
+    }
+
+    async fn ready_status(gateway: SocketAddr) -> StatusCode {
+        Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send").status()
+    }
+
+    #[tokio::test]
+    async fn rpc_connection_failures_mark_the_upstream_not_ready() {
+        // nothing listens on port 1, so every forward fails to connect while
+        // the upstream stays marked ready by its (unpolled) health listener
+        let state = passive_health_state(&[upstream("127.0.0.1:1".parse().expect("addr"))], 2);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(1)));
+        assert_eq!(
+            ready_status(gateway).await,
+            StatusCode::OK,
+            "one failure is below the threshold"
+        );
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(2)));
+        assert_eq!(ready_status(gateway).await, StatusCode::SERVICE_UNAVAILABLE);
+
+        // with no ready upstream left, the next request is refused unsent
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text), (-32000, serde_json::json!(3)));
+    }
+
+    #[tokio::test]
+    async fn requests_reach_the_second_upstream_after_the_threshold() {
+        let (second, second_seen, _second) = named_mock("second").await;
+        let state = passive_health_state(&dead_then_live(second), 2);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // configured order sends the first two requests to the dead worker
+        for id in 1..=2 {
+            let (status, _) = post_rpc(gateway, None, call("eth_chainId", id)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "request {id}");
+        }
+
+        for id in 3..=4 {
+            let (status, text) = post_rpc(gateway, None, call("eth_chainId", id)).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "second"), "request {id}");
+        }
+        assert_eq!(second_seen.hits(), 2);
+        assert_eq!(ready_status(gateway).await, StatusCode::OK, "the second upstream is ready");
+    }
+
+    #[tokio::test]
+    async fn a_failed_request_is_not_retried_on_another_upstream() {
+        let (second, second_seen, _second) = named_mock("second").await;
+        let state = passive_health_state(&dead_then_live(second), 2);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // each failing request, including the one that reaches the threshold,
+        // is answered with its own error and never resent to the live worker
+        for id in 1..=2 {
+            let (status, text) = post_rpc(gateway, None, call("eth_chainId", id)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "request {id}");
+            assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(id)));
+            assert_eq!(second_seen.hits(), 0, "request {id} was retried on the second upstream");
+        }
+
+        // only a request sent after the mark goes to the second upstream
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "second"));
+        assert_eq!(second_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn slow_worker_responses_do_not_mark_the_upstream() {
+        // the worker accepts every request but answers after the proxy
+        // client's deadline, as it does for eth_sendRawTransactionSync while
+        // a transaction waits for inclusion
+        let slow = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (worker, _worker) = spawn(slow).await;
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+        let readiness = Arc::new(GatewayReadiness::new(
+            &[upstream(worker)],
+            ReadinessThresholds { rpc_failure: Some(nz(1)), ..test_thresholds() },
+        ));
+        readiness.set_ready(0, true);
+        let state = AppState { readiness, http: client, query_upstream: None };
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        for id in 1..=3 {
+            let (status, _) = post_rpc(gateway, None, call("eth_sendRawTransactionSync", id)).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "request {id}");
+        }
+        assert_eq!(ready_status(gateway).await, StatusCode::OK, "a timeout must not mark");
+    }
+
+    #[tokio::test]
+    async fn a_forward_that_gets_a_response_restarts_the_failure_run() {
+        // reserve a loopback port, then free it so forwards to it are refused
+        let addr = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind")
+            .local_addr()
+            .expect("local addr");
+        // no idle connections, so every forward opens a new one and the third
+        // is refused rather than sent on the second's connection
+        let client = Client::builder()
+            .pool_max_idle_per_host(0)
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(5))
+            .build()
+            .expect("client");
+        let readiness = Arc::new(GatewayReadiness::new(
+            &[upstream(addr)],
+            ReadinessThresholds { rpc_failure: Some(nz(2)), ..test_thresholds() },
+        ));
+        readiness.set_ready(0, true);
+        let state = AppState { readiness, http: client, query_upstream: None };
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "nothing listens on the freed port");
+
+        // the worker answers once on the same port, then goes away again
+        let listener = TcpListener::bind(addr).await.unwrap_or_else(|err| {
+            panic!("rebinding the freed port {addr} failed, another process took it: {err}")
+        });
+        let worker = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/", post(|| async { "ok" }))).await
+        });
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "ok"));
+        worker.abort();
+        let _ = worker.await;
+
+        // one refused forward after the response: the run restarted, so the
+        // count is 1, below the threshold of 2
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(ready_status(gateway).await, StatusCode::OK, "the response reset the count");
     }
 }

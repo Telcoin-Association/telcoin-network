@@ -29,6 +29,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         readiness_poll_timeout,
         readiness_failure_threshold,
         readiness_success_threshold,
+        upstream_failure_threshold,
         upstream_connect_timeout,
         upstream_request_timeout,
         header_read_timeout,
@@ -56,6 +57,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     let thresholds = ReadinessThresholds {
         failure: readiness_failure_threshold,
         success: readiness_success_threshold,
+        rpc_failure: upstream_failure_threshold,
     };
     let readiness = Arc::new(GatewayReadiness::new(&upstreams, thresholds));
 

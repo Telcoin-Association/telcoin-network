@@ -21,12 +21,20 @@
 //! starts not-ready, so the gateway fails closed until its first run of
 //! successes, and one slow poll alone no longer drops every gateway that polls
 //! the same node.
+//!
+//! The poll measures the node's health listener, not the worker's RPC port, so
+//! the proxy also reports each worker forward here: after
+//! `--upstream-failure-threshold` forwards in a row that fail to connect (a
+//! connect timeout included), the upstream is marked not-ready until the poller
+//! sees a fresh run of successful polls, and later requests go to the next
+//! ready upstream. A timeout after the request was sent does not count, since
+//! the method and params decide how long the worker takes.
 
 use std::{
     fmt,
     num::NonZeroU32,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
     },
     time::Duration,
@@ -76,6 +84,10 @@ struct UpstreamReadiness {
     ready: AtomicBool,
     /// The run of consecutive poll results that drives transitions.
     streak: Mutex<PollStreak>,
+    /// Forwards in a row that failed to connect (a connect timeout included);
+    /// reset by a forward that gets a response and when the upstream turns
+    /// ready.
+    rpc_failures: AtomicU32,
 }
 
 impl UpstreamReadiness {
@@ -108,6 +120,7 @@ impl UpstreamReadiness {
                     && !self.ready.swap(true, Ordering::Relaxed)
                 {
                     streak.first_failure_logged = true;
+                    self.rpc_failures.store(0, Ordering::Relaxed);
                     info!(
                         target: "gateway::readiness",
                         worker_id = self.worker_id,
@@ -150,6 +163,30 @@ impl UpstreamReadiness {
         crate::telemetry::set_upstream_ready(self.worker_id, self.is_ready());
     }
 
+    /// Count one forward that failed to connect (a connect timeout included).
+    /// On the `threshold`-th in a row the upstream is marked not-ready, and the
+    /// poller must then see a fresh run of successful polls before it turns
+    /// ready.
+    fn record_rpc_failure(&self, threshold: NonZeroU32) {
+        let failures = self
+            .rpc_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                Some(count.saturating_add(1))
+            })
+            // the update never declines, so both arms hold the previous count
+            .unwrap_or_else(|count| count)
+            .saturating_add(1);
+        if failures < threshold.get() {
+            return;
+        }
+        let mut streak = self.streak();
+        streak.successes = 0;
+        if self.ready.swap(false, Ordering::Relaxed) {
+            crate::telemetry::set_upstream_ready(self.worker_id, false);
+            self.log_not_ready(NotReadyCause::RpcPath);
+        }
+    }
+
     /// Log a transition to not-ready, with its cause, at warn.
     fn log_not_ready(&self, cause: NotReadyCause) {
         warn!(
@@ -183,6 +220,7 @@ impl GatewayReadiness {
                 readiness_url: upstream.readiness_url.clone(),
                 ready: AtomicBool::new(false),
                 streak: Mutex::new(PollStreak::default()),
+                rpc_failures: AtomicU32::new(0),
             })
             .collect();
         Self { upstreams, thresholds }
@@ -199,6 +237,40 @@ impl GatewayReadiness {
     /// Whether any upstream is currently ready.
     pub(crate) fn any_ready(&self) -> bool {
         self.upstreams.iter().any(UpstreamReadiness::is_ready)
+    }
+
+    /// Count a forward to the worker at `rpc_url` that failed to connect (a
+    /// connect timeout included). At `--upstream-failure-threshold` failures in
+    /// a row the upstream is marked not-ready (cause "rpc path") until the
+    /// poller sees `--readiness-success-threshold` successful polls in a row,
+    /// so later requests go to the next ready upstream. A no-op when passive
+    /// health is off.
+    ///
+    /// A timeout after the request was sent is not reported here, since the
+    /// method and params decide how long the worker takes.
+    pub(crate) fn record_rpc_failure(&self, rpc_url: &Url) {
+        if let Some(threshold) = self.thresholds.rpc_failure {
+            self.upstreams_at(rpc_url).for_each(|upstream| upstream.record_rpc_failure(threshold));
+        }
+    }
+
+    /// Reset the failure count of the worker at `rpc_url` after a forward to
+    /// it got a response.
+    pub(crate) fn record_rpc_success(&self, rpc_url: &Url) {
+        self.upstreams_at(rpc_url)
+            // skip the store when there is nothing to reset, so the common
+            // path stays a read
+            .filter(|upstream| upstream.rpc_failures.load(Ordering::Relaxed) != 0)
+            .for_each(|upstream| upstream.rpc_failures.store(0, Ordering::Relaxed));
+    }
+
+    /// The upstreams whose JSON-RPC URL is `rpc_url`. A forward's result
+    /// belongs to every entry that shares the endpoint.
+    fn upstreams_at<'a>(
+        &'a self,
+        rpc_url: &'a Url,
+    ) -> impl Iterator<Item = &'a UpstreamReadiness> + 'a {
+        self.upstreams.iter().filter(move |upstream| &upstream.rpc_url == rpc_url)
     }
 
     /// Test-only: force an upstream's readiness state.
@@ -222,6 +294,10 @@ pub(crate) struct ReadinessThresholds {
     /// Successful polls in a row that turn a not-ready upstream ready
     /// (`--readiness-success-threshold`).
     pub(crate) success: NonZeroU32,
+    /// Worker forwards in a row that fail to connect (a connect timeout
+    /// included) before the upstream is marked not-ready
+    /// (`--upstream-failure-threshold`), or `None` when passive health is off.
+    pub(crate) rpc_failure: Option<NonZeroU32>,
 }
 
 /// Poll every upstream's readiness endpoint on `poll_interval` until `shutdown`
@@ -337,8 +413,9 @@ struct PollStreak {
     first_failure_logged: bool,
 }
 
-/// Why an upstream is not ready: the cause of a failed poll. Rendered as the
-/// `cause` field of the readiness logs; it never carries a URL.
+/// Why an upstream is not ready: the cause of a failed poll, or a mark from the
+/// rpc path. Rendered as the `cause` field of the readiness logs; it never
+/// carries a URL.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NotReadyCause {
     /// The poll did not finish within `--readiness-poll-timeout`.
@@ -353,6 +430,9 @@ enum NotReadyCause {
     /// The payload reports the worker as not accepting transactions, or does
     /// not list it.
     NotAccepting,
+    /// Forwards to the worker kept failing to connect (a connect timeout
+    /// included).
+    RpcPath,
 }
 
 impl NotReadyCause {
@@ -378,6 +458,7 @@ impl fmt::Display for NotReadyCause {
             Self::Connection(class) => write!(f, "connection error ({class})"),
             Self::MalformedPayload => f.write_str("malformed payload"),
             Self::NotAccepting => f.write_str("worker not accepting transactions"),
+            Self::RpcPath => f.write_str("rpc path"),
         }
     }
 }
@@ -485,10 +566,12 @@ mod tests {
     /// Poll timeout for a [`SLOW`] step, well under the mock's 300 ms delay.
     const SLOW_STEP_TIMEOUT: Duration = Duration::from_millis(100);
 
+    /// Poll thresholds with passive health off.
     fn thresholds(failure: u32, success: u32) -> ReadinessThresholds {
         ReadinessThresholds {
             failure: NonZeroU32::new(failure).expect("nonzero"),
             success: NonZeroU32::new(success).expect("nonzero"),
+            rpc_failure: None,
         }
     }
 
@@ -691,5 +774,50 @@ mod tests {
             "{lines:#?}"
         );
         assert!(lines.iter().all(|line| !line.contains("/health/workers")), "url leaked");
+    }
+
+    #[tokio::test]
+    async fn rpc_path_mark_lasts_until_m_successful_polls() {
+        let mode = Arc::new(AtomicU8::new(READY));
+        let addr = mock_readiness(Arc::clone(&mode)).await;
+        let upstreams = [upstream_at(0, addr)];
+        let rpc_url = upstreams[0].rpc_url.clone();
+        let readiness = GatewayReadiness::new(
+            &upstreams,
+            ReadinessThresholds { rpc_failure: NonZeroU32::new(2), ..thresholds(3, 2) },
+        );
+        let client = Client::new();
+        step(&readiness, &client, &mode, 2).await;
+        assert!(readiness.any_ready());
+
+        // a forward that gets a response restarts the failure run
+        readiness.record_rpc_failure(&rpc_url);
+        readiness.record_rpc_success(&rpc_url);
+        readiness.record_rpc_failure(&rpc_url);
+        assert!(readiness.any_ready(), "the success restarted the failure run");
+        readiness.record_rpc_failure(&rpc_url);
+        assert!(!readiness.any_ready(), "two failures in a row mark the upstream not-ready");
+
+        // the health listener still answers, but the poller needs a fresh run
+        // of successes, not the two it had before the mark
+        step(&readiness, &client, &mode, 1).await;
+        assert!(!readiness.any_ready(), "one success is below the success threshold");
+        step(&readiness, &client, &mode, 1).await;
+        assert!(readiness.any_ready());
+
+        // turning ready starts the failure count over
+        readiness.record_rpc_failure(&rpc_url);
+        assert!(readiness.any_ready());
+    }
+
+    #[test]
+    fn rpc_failures_are_ignored_with_passive_health_off() {
+        let upstreams = [upstream_at(0, "127.0.0.1:1".parse().expect("addr"))];
+        let readiness = GatewayReadiness::new(&upstreams, thresholds(3, 2));
+        readiness.set_ready(0, true);
+        for _ in 0..10 {
+            readiness.record_rpc_failure(&upstreams[0].rpc_url);
+        }
+        assert!(readiness.any_ready());
     }
 }

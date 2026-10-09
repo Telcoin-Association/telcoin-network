@@ -90,6 +90,18 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD", default_value = "2")]
     pub(crate) readiness_success_threshold: NonZeroU32,
 
+    /// Consecutive forwards to an upstream worker that fail to connect (a
+    /// connect timeout included) before that upstream is marked not-ready
+    /// (default 3). A timeout after the request was sent does not count, since
+    /// the method and params decide how long the worker takes. The upstream
+    /// stays not-ready until the readiness poller sees
+    /// `--readiness-success-threshold` successful polls in a row, and later
+    /// requests go to the next ready upstream; the failing requests are
+    /// answered with their error, never retried. A forward that gets any
+    /// response resets the count. `0` disables this passive health check.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD", default_value_t = 3)]
+    pub(crate) upstream_failure_threshold: u32,
+
     /// Connect timeout when forwarding a request to an upstream: a worker, or the
     /// `--redirect-queries` endpoint.
     #[arg(
@@ -256,6 +268,9 @@ pub(crate) struct Settings {
     pub(crate) readiness_failure_threshold: NonZeroU32,
     /// Consecutive successful polls that turn a not-ready upstream ready.
     pub(crate) readiness_success_threshold: NonZeroU32,
+    /// Consecutive failed worker forwards that mark an upstream not-ready, or
+    /// `None` when passive health checking is off.
+    pub(crate) upstream_failure_threshold: Option<NonZeroU32>,
     /// Upstream connect timeout.
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
@@ -336,6 +351,7 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             readiness_failure_threshold: self.readiness_failure_threshold,
             readiness_success_threshold: self.readiness_success_threshold,
+            upstream_failure_threshold: NonZeroU32::new(self.upstream_failure_threshold),
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
@@ -641,6 +657,15 @@ mod tests {
                 .expect("thresholds of 1");
         assert_eq!(ones.readiness_failure_threshold.get(), 1);
         assert_eq!(ones.readiness_success_threshold.get(), 1);
+    }
+
+    #[test]
+    fn zero_upstream_failure_threshold_disables_passive_health() -> eyre::Result<()> {
+        let defaults = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(defaults.upstream_failure_threshold.map(NonZeroU32::get), Some(3));
+        let off = cli_with_flags(&["--upstream-failure-threshold=0"]).into_settings()?;
+        assert_eq!(off.upstream_failure_threshold, None);
+        Ok(())
     }
 
     #[test]
