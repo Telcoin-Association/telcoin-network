@@ -1,4 +1,4 @@
-name: CI118 reported capacity diagnostics
+name: CI118 CPU interval diagnostics
 
 "on":
   workflow_dispatch:
@@ -91,6 +91,8 @@ jobs:
           pins = {
               "1476-ci118-remote-diagnostic-acquire.py": "3f0a1c989ee521461626b3e844da6cfe4bc67efbf8661a48b6f8d2989bdf38e0",
               "1476-ci118-remote-diagnostic-reader.py": "9407dcb7890ef678872486eda61ab6a16e0e2a65f8ae60e0ecfe58e34f9113ff",
+              "1476-ci118-cpu-reader.py": "274aa5a6af994f175fd36997b287fe8c640f433ba6ae17048bbd6f166487aed4",
+              "1476-ci118-cpu-test.py": "1211de8339e91a78db9729499bc8575ecf420c7c708a0a25cfb45e3981f73a33",
               "1476-ci118-remote-diagnostic-test.py": "7859166951654d6a1ad8725ab8d8def0579b43f9a4772a2c4fcc940a7cd41291",
               "1476-ci118-remote-diagnostic-artifact-metadata.json": "ad1ae221ede54300de425b5a99e5fde495c25e6cc5ea0db3ea6c83cb838000ba",
           }
@@ -107,13 +109,14 @@ jobs:
                             "independently_rescored": False, "input_sha256": pins,
                             "qualification_source_head": "4556f835e3d4a6f803afc941f4cfcd9cfd7faad1",
                             "accepted_acquirer_source_sha256": "ade9e6a11d79e23873d20238fe104ce6bf4a7b5ebc61b01b518d3c3d8ef30d0c",
-                            "scorer_source_sha256": "41f8bd3a1611ae92446f9562a8430805611a5b7121961bccc014f2338f4cfb64"}, sort_keys=True))
+                            "scorer_source_sha256": "41f8bd3a1611ae92446f9562a8430805611a5b7121961bccc014f2338f4cfb64",
+                            "collector_source_sha256": "773d5e3c9f47c704357ff1669077d02c477c7a13654e1d9a987ad9efa389a699"}, sort_keys=True))
           PY
       - name: Acquire the exact official CI118 capacity artifact
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 -B -I tools/ci118-diagnostic/1476-ci118-remote-diagnostic-acquire.py
-      - name: Read the CI-produced report without extraction or rescoring
+      - name: Read CPU intervals and raw timing without extraction or qualification
         shell: bash
-        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-remote-diagnostic-reader.py
+        run: python3 -B -I tools/ci118-diagnostic/1476-ci118-cpu-reader.py
