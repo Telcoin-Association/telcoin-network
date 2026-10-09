@@ -28,6 +28,7 @@ mod quic_incoming;
 mod record_exchange;
 mod retention;
 mod service_class;
+pub mod source_admission;
 pub mod stream;
 mod sync;
 pub mod types;

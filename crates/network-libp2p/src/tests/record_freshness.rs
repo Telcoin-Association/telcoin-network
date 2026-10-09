@@ -2,6 +2,8 @@
 
 use super::*;
 use crate::types::{KadQuery, NodeRecord, RecordDomain};
+use libp2p::{multiaddr::Protocol, Multiaddr};
+use std::net::Ipv4Addr;
 use tn_storage::mem_db::MemDatabase;
 use tn_types::{BlsKeypair, NetworkKeypair, Signer as _};
 
@@ -11,7 +13,11 @@ fn signed_record(key: &BlsKeypair, timestamp: tn_types::TimestampSec) -> NodeRec
     let mut record = NodeRecord::build(
         domain,
         NetworkKeypair::generate_ed25519().public().into(),
-        crate::common::create_multiaddr(None),
+        // Authenticated readers accept only QUIC endpoints, see `validate_advertised_addresses`.
+        Multiaddr::empty()
+            .with(Protocol::Ip4(Ipv4Addr::LOCALHOST))
+            .with(Protocol::Udp(8000))
+            .with(Protocol::QuicV1),
         None,
         |bytes| key.sign(bytes),
     );

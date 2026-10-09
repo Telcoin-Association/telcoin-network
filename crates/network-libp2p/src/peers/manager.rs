@@ -13,10 +13,15 @@ use crate::{
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
+    source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
-    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::DialError, Multiaddr, PeerId,
+    core::ConnectedPoint,
+    kad::PeerInfo,
+    multiaddr::Protocol,
+    swarm::{ConnectionId, DialError},
+    Multiaddr, PeerId,
 };
 use rand::seq::IteratorRandom as _;
 use std::{
@@ -176,6 +181,8 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Leases owned by this swarm using optional process-wide source accounting.
+    source_connections: SourceConnections,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// All peers for the manager.
@@ -296,6 +303,42 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Install a shared budget before any swarm is polled.
+    pub(crate) fn set_source_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
+        self.source_connections.set_budget(budget);
+    }
+
+    /// Forward swarm lifecycle events to the connection lease owner.
+    pub(crate) fn on_source_swarm_event(&mut self, event: &libp2p::swarm::FromSwarm<'_>) {
+        self.source_connections.on_swarm_event(event);
+    }
+
+    /// Reserve source occupancy at the authenticated established-connection boundary.
+    ///
+    /// Every denial is counted and logged. The importance signal is computed here so that
+    /// a later protected-capacity policy can use it; today important peers are only
+    /// logged at a higher level.
+    pub(crate) fn reserve_source(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        address: &Multiaddr,
+        direction: &'static str,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let important = self.peer_is_important(&peer);
+        self.source_connections.reserve(connection, peer, address).map_err(|error| {
+            self.metrics.record_source_admission_denied(direction, error.label());
+            if matches!(error, AdmissionError::Poisoned) {
+                error!(target: "peer-manager", %error, "source admission accounting poisoned");
+            } else if important {
+                warn!(target: "peer-manager", ?peer, direction, %error, "source budget refused important peer");
+            } else {
+                debug!(target: "peer-manager", ?peer, direction, %error, "source budget refused connection");
+            }
+            libp2p::swarm::ConnectionDenied::new(error)
+        })
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -319,6 +362,7 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            source_connections: SourceConnections::default(),
             heartbeat,
             peers,
             known_peers: Default::default(),

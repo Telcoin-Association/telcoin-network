@@ -126,10 +126,10 @@ impl NetworkBehaviour for PeerManager {
 
     fn handle_established_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         _local_addr: &Multiaddr,
-        _remote_addr: &Multiaddr,
+        remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
@@ -142,12 +142,13 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
 
+        self.reserve_source(connection_id, peer, remote_addr, "in")?;
         Ok(ConnectionHandler)
     }
 
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         addr: &Multiaddr,
         _role_override: Endpoint,
@@ -168,10 +169,12 @@ impl NetworkBehaviour for PeerManager {
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
 
+        self.reserve_source(connection_id, peer, addr, "out")?;
         Ok(ConnectionHandler)
     }
 
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
+        self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id, endpoint, ..
