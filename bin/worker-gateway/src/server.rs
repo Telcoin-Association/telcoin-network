@@ -1415,4 +1415,70 @@ mod tests {
             assert_eq!(metrics.value(routed, &[("route", route), ("result", "forwarded")]), 0.0);
         }
     }
+
+    /// Read one HTTP/1.1 request, its head plus a `Content-Length` body, off
+    /// `stream`, so that closing the stream afterwards sends a clean FIN rather
+    /// than a reset over unread bytes.
+    async fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buf).await.expect("read");
+            assert!(read > 0, "the gateway closed before its request ended");
+            request.extend_from_slice(&buf[..read]);
+            let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|length| length.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A mock upstream that answers one request with `200` and a
+    /// `Content-Length` of 1000, sends 34 bytes of body and closes.
+    async fn truncating_mock() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 1000\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":\"0x1\",\"i",
+                )
+                .await
+                .expect("write");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn mid_stream_upstream_failure_is_counted() {
+        let mut metrics = CapturedMetrics::install();
+        let state = redirect_state(truncating_mock().await, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        // the status went out before the body broke off, so the client gets a
+        // 200 whose body cannot be read to the end
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.bytes().await.is_err(), "a truncated body must not read as complete");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "body_failed")]), 1.0);
+        assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "forwarded")]), 1.0);
+    }
 }

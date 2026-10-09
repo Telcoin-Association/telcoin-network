@@ -19,7 +19,14 @@
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt,
+    net::SocketAddr,
+    pin::Pin,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -30,6 +37,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
 };
+use futures::Stream;
 use reqwest::{redirect::Policy, Client};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -188,7 +196,7 @@ pub(crate) async fn proxy(
         Ok(upstream) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
-            relay(upstream)
+            relay(upstream, route, upstream_url)
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -310,7 +318,10 @@ fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
 
 /// Adapt an upstream response back into an axum response, preserving the
 /// status, body, and content type.
-fn relay(upstream: reqwest::Response) -> Response {
+///
+/// The body streams through an [`UpstreamBody`], so a failure after the head
+/// has gone out is still logged and counted against `route`.
+fn relay(upstream: reqwest::Response, route: Route, upstream_url: Url) -> Response {
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
 
@@ -324,12 +335,58 @@ fn relay(upstream: reqwest::Response) -> Response {
     // the body and the poll-driven timeout never fires. That side is bounded
     // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
     // connection-lifetime cap (see [`crate::server::accept_loop`]).
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let body = UpstreamBody { inner: upstream.bytes_stream(), route, upstream_url };
+    let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     if let Some(content_type) = upstream_content_type {
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
     response
+}
+
+/// An upstream's response body on its way to the client, logging and counting
+/// a failure mid-stream.
+///
+/// By the time the body fails, its status and headers have gone to the
+/// client, which therefore sees a truncated response (a chunked body without
+/// its final chunk) whatever the gateway does. The failure is logged at debug,
+/// naming the upstream by origin, and counted as
+/// `routed_requests_total{route, result="body_failed"}` next to the
+/// `forwarded` result the head already recorded.
+struct UpstreamBody<S> {
+    /// The upstream's body stream.
+    inner: S,
+    /// The route the request took.
+    route: Route,
+    /// The upstream the body comes from, only ever logged by origin.
+    upstream_url: Url,
+}
+
+impl<S> Stream for UpstreamBody<S>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Err(err))) => {
+                // a reqwest error's display can carry the request url, so the
+                // cause is rendered with it removed
+                let err = err.without_url();
+                telemetry::record_routed(self.route.label(), "body_failed");
+                debug!(
+                    target: "gateway::proxy",
+                    route = self.route.label(),
+                    upstream = %UpstreamOrigin(&self.upstream_url),
+                    cause = %ErrorChain(&err),
+                    "upstream response body failed mid-stream"
+                );
+                Poll::Ready(Some(Err(err)))
+            }
+            polled => polled,
+        }
+    }
 }
 
 /// Build the client that forwards requests on both routes.

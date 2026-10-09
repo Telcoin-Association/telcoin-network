@@ -326,6 +326,13 @@ replaced by the `-32012` error, which echoes the request `id`. The
 whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
 itself a worker-saturation signal.
 
+An upstream body that fails after the status and headers have gone out (the
+upstream closes or resets mid-stream) cannot be turned into an error any more:
+the client gets the upstream's status with a truncated body (a chunked
+response without its final chunk), and the gateway logs the failure at debug
+and counts it as `result="body_failed"` in
+`tn_worker_gateway_routed_requests_total`.
+
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
 disambiguate by HTTP status and message, not by code alone (`-32600` is the
@@ -357,7 +364,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout`) | Forward attempts by route, with their result. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded

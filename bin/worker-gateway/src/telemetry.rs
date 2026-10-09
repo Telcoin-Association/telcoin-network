@@ -26,7 +26,8 @@
 //! gauge and request counters reflect real client load only.
 //!
 //! [`record_routed`] counts every forward attempt by route and result, which
-//! splits the load between the worker and the query upstream, and
+//! splits the load between the worker and the query upstream (a relayed body
+//! that fails mid-stream is counted again, as `body_failed`), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 
@@ -57,7 +58,8 @@ const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_secon
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
 
 /// Forward attempts by `route` (`worker` or `query`) and `result`
-/// (`forwarded`, `upstream_error`, `unreachable` or `timeout`).
+/// (`forwarded`, `upstream_error`, `unreachable` or `timeout`), plus
+/// `body_failed` for a forwarded response whose body then failed mid-stream.
 const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 
 /// Batches sent whole to the query upstream because they mixed submissions
@@ -113,7 +115,8 @@ pub(crate) fn record_upstream_error(reason: &'static str) {
 }
 
 /// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`).
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or a
+/// forwarded response whose body then failed (`body_failed`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }
