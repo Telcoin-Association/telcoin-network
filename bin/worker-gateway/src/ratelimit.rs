@@ -7,6 +7,10 @@
 //! budget. An over-limit request receives the gateway's JSON-RPC "rate limit
 //! exceeded" envelope (HTTP `429`), never a bare connection reset.
 //!
+//! A JSON-RPC batch costs one token per call. The edge layer charges the first
+//! before the body is read; the proxy handler charges the rest once it has
+//! read the body and counted the calls (see [`RateLimiters::charge`]).
+//!
 //! The per-client key is the peer address masked to a configurable prefix
 //! ([`PrefixPolicy`]), not the bare address. Keyed on the bare address, a client
 //! that rotates its source address gets a fresh, full bucket per address and so
@@ -89,7 +93,7 @@ impl RateLimit {
         self.rate
     }
 
-    #[cfg(test)]
+    /// Bucket capacity: the most tokens one request can be charged at once.
     pub(crate) fn burst(&self) -> NonZeroU32 {
         self.burst
     }
@@ -125,17 +129,24 @@ impl Bucket {
         (self.tokens + elapsed * rate).min(capacity)
     }
 
-    /// Refill for the elapsed time, then spend one token if one is available.
-    /// Returns whether the request is admitted.
-    fn try_admit(&mut self, now: Instant, rate: f64, capacity: f64) -> bool {
+    /// Refill for the elapsed time, then spend `cost` tokens if that many are
+    /// available; nothing is spent otherwise. Returns whether the request is
+    /// admitted.
+    fn try_admit(&mut self, now: Instant, rate: f64, capacity: f64, cost: f64) -> bool {
         self.tokens = self.replenished(now, rate, capacity);
         self.last_refill = now;
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        if self.tokens >= cost {
+            self.tokens -= cost;
             true
         } else {
             false
         }
+    }
+
+    /// Give back `cost` tokens spent on a request that was then refused
+    /// elsewhere, never past `capacity`.
+    fn refund(&mut self, cost: f64, capacity: f64) {
+        self.tokens = (self.tokens + cost).min(capacity);
     }
 
     /// Whether the bucket has refilled to capacity by `now`. An idle bucket
@@ -322,9 +333,9 @@ struct PerIpLimiter {
 }
 
 impl PerIpLimiter {
-    /// Admit or reject a request from `ip`, creating the bucket for its network
-    /// prefix on first sight.
-    fn admit(&self, now: Instant, ip: IpAddr) -> bool {
+    /// Admit or reject a request from `ip` that costs `cost` tokens, creating
+    /// the bucket for its network prefix on first sight.
+    fn admit(&self, now: Instant, ip: IpAddr, cost: f64) -> bool {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
         // Every address in one allocation collapses onto this key, so a rotating
@@ -333,10 +344,20 @@ impl PerIpLimiter {
         let mut buckets = lock(&self.buckets);
         // Bind the existing-bucket outcome first so its borrow of `buckets` ends
         // before the new-IP path takes `&mut buckets`.
-        let existing = buckets.get_mut(&key).map(|bucket| bucket.try_admit(now, rate, capacity));
+        let existing =
+            buckets.get_mut(&key).map(|bucket| bucket.try_admit(now, rate, capacity, cost));
         existing.unwrap_or_else(|| {
-            admit_new_ip(&mut buckets, self.max_entries, now, key, rate, capacity)
+            admit_new_ip(&mut buckets, self.max_entries, now, key, rate, capacity, cost)
         })
+    }
+
+    /// Give back `cost` tokens to the bucket for `ip`'s network prefix, if it
+    /// is tracked.
+    fn refund(&self, ip: IpAddr, cost: f64) {
+        let key = self.prefix.key(ip);
+        if let Some(bucket) = lock(&self.buckets).get_mut(&key) {
+            bucket.refund(cost, self.limit.capacity());
+        }
     }
 }
 
@@ -355,10 +376,11 @@ fn admit_new_ip(
     ip: IpAddr,
     rate: f64,
     capacity: f64,
+    cost: f64,
 ) -> bool {
     if buckets.len() < max_entries {
         let mut bucket = Bucket::full(now, capacity);
-        let admitted = bucket.try_admit(now, rate, capacity);
+        let admitted = bucket.try_admit(now, rate, capacity, cost);
         buckets.insert(ip, bucket);
         admitted
     } else {
@@ -429,11 +451,49 @@ impl<C: Clock> RateLimiters<C> {
                 now,
                 global.limit.tokens_per_sec(),
                 global.limit.capacity(),
+                1.0,
             )
         });
         let allowed = global_ok
-            && self.per_ip.as_ref().zip(peer).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip));
+            && self.per_ip.as_ref().zip(peer).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip, 1.0));
         allowed.then_some(()).ok_or(GatewayError::RateLimited)
+    }
+
+    /// Charge `tokens` more to a request from `peer` that [`Self::check`]
+    /// already admitted: the calls its batch carries beyond the first.
+    ///
+    /// The per-IP bucket is charged first and the global bucket only when the
+    /// per-IP bucket admits the charge, so a client over its own limit never
+    /// spends the shared budget; when the global bucket then refuses, the
+    /// per-IP tokens are given back. Each bucket is charged all or nothing: one
+    /// without `tokens` left keeps what it has. A `None` peer skips the per-IP
+    /// bucket. Charging nothing touches no bucket, so a single call costs only
+    /// its edge token.
+    pub(crate) fn charge(&self, peer: Option<IpAddr>, tokens: usize) -> Result<(), GatewayError> {
+        if tokens == 0 {
+            return Ok(());
+        }
+        let cost = f64::from(u32::try_from(tokens).unwrap_or(u32::MAX));
+        let now = self.clock.now();
+        let per_ip = self.per_ip.as_ref().zip(peer);
+        if !per_ip.is_none_or(|(per_ip, ip)| per_ip.admit(now, ip, cost)) {
+            return Err(GatewayError::RateLimited);
+        }
+        let global_ok = self.global.as_ref().is_none_or(|global| {
+            lock(&global.bucket).try_admit(
+                now,
+                global.limit.tokens_per_sec(),
+                global.limit.capacity(),
+                cost,
+            )
+        });
+        if !global_ok {
+            if let Some((per_ip, ip)) = per_ip {
+                per_ip.refund(ip, cost);
+            }
+            return Err(GatewayError::RateLimited);
+        }
+        Ok(())
     }
 
     /// Drop idle (fully-refilled) per-IP buckets to bound memory. Called
@@ -478,9 +538,13 @@ pub(crate) async fn run_gc(
 
 /// Axum middleware: rate-limit by peer IP and globally, rejecting an over-limit
 /// request with the gateway's JSON-RPC `429` envelope before its body is read.
+///
+/// An admitted request carries the limiters on to the proxy handler as a
+/// request extension, so the handler can charge a batch for its calls beyond
+/// the first once it has counted them (see [`RateLimiters::charge`]).
 pub(crate) async fn rate_limit(
     State(limiters): State<Arc<RateLimiters>>,
-    request: Request,
+    mut request: Request,
     next: Next,
 ) -> Response {
     // Orchestration probes are never rate-limited: a liveness/readiness check
@@ -494,7 +558,10 @@ pub(crate) async fn rate_limit(
     // combinator closure cannot do.
     match rejection {
         Some(err) => error_response(&err, b""),
-        None => next.run(request).await,
+        None => {
+            request.extensions_mut().insert(limiters);
+            next.run(request).await
+        }
     }
 }
 
@@ -553,6 +620,17 @@ mod tests {
     impl<C: Clock> RateLimiters<C> {
         fn per_ip_len(&self) -> usize {
             self.per_ip.as_ref().map(|per_ip| lock(&per_ip.buckets).len()).unwrap_or(0)
+        }
+
+        /// The tokens left in the bucket for `ip`'s prefix, if it is tracked.
+        fn per_ip_tokens(&self, ip: IpAddr) -> Option<f64> {
+            let per_ip = self.per_ip.as_ref()?;
+            lock(&per_ip.buckets).get(&per_ip.prefix.key(ip)).map(|bucket| bucket.tokens)
+        }
+
+        /// The tokens left in the global bucket, if it is enabled.
+        fn global_tokens(&self) -> Option<f64> {
+            self.global.as_ref().map(|global| lock(&global.bucket).tokens)
         }
     }
 
@@ -652,6 +730,54 @@ mod tests {
         // The table is full (cap 1): a new IP is admitted untracked, not rejected.
         assert!(limiters.check(Some(ip(2))).is_ok());
         assert_eq!(limiters.per_ip_len(), 1);
+    }
+
+    /// A single call is charged only the edge token `check` took: charging it
+    /// nothing spends nothing and creates no bucket.
+    #[test]
+    fn single_request_charges_no_extra_token() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 2)), Some(limit(1, 2)), 16);
+        assert!(limiters.charge(Some(ip(1)), 0).is_ok());
+        assert_eq!(limiters.per_ip_len(), 0, "charging nothing creates no bucket");
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.charge(Some(ip(1)), 0).is_ok());
+        assert!(limiters.check(Some(ip(1))).is_ok(), "a zero charge spends no token");
+        assert!(limiters.check(Some(ip(1))).is_err());
+    }
+
+    #[test]
+    fn charge_spends_all_or_nothing() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 4)), None, 16);
+        assert!(limiters.check(Some(ip(1))).is_ok()); // 3 left
+                                                      // a charge the bucket cannot cover in full spends nothing
+        assert!(matches!(limiters.charge(Some(ip(1)), 4), Err(GatewayError::RateLimited)));
+        assert!(limiters.charge(Some(ip(1)), 3).is_ok()); // 0 left
+        assert!(limiters.check(Some(ip(1))).is_err());
+        // a charge without a peer skips the per-IP bucket
+        assert!(limiters.charge(None, 100).is_ok());
+    }
+
+    #[test]
+    fn charge_runs_per_ip_first_and_refunds_on_a_global_refusal() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 4)), Some(limit(1, 3)), 16);
+        assert!(limiters.check(Some(ip(1))).is_ok()); // per-ip 3, global 2
+                                                      // over its own limit: refused before the global bucket is touched
+        assert!(limiters.charge(Some(ip(1)), 4).is_err());
+        assert_eq!(
+            (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
+            (Some(3.0), Some(2.0))
+        );
+        // refused by the global bucket: the per-IP tokens come back
+        assert!(limiters.charge(Some(ip(1)), 3).is_err());
+        assert_eq!(
+            (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
+            (Some(3.0), Some(2.0))
+        );
+        assert!(limiters.charge(Some(ip(1)), 2).is_ok());
+        assert_eq!(
+            (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
+            (Some(1.0), Some(0.0))
+        );
     }
 
     #[test]

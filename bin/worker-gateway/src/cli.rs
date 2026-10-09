@@ -162,7 +162,9 @@ pub(crate) struct Cli {
     /// Maximum number of calls in one JSON-RPC batch (default 50; `0` means
     /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
     /// long" error (`413`, `-32003`) before it is screened or forwarded, on
-    /// either route.
+    /// either route. The effective cap never exceeds the smallest enabled
+    /// rate-limit burst: a batch needs one token per call at once, so a longer
+    /// one could never pass.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_BATCH_LEN",
@@ -171,9 +173,10 @@ pub(crate) struct Cli {
     pub(crate) max_batch_len: usize,
 
     /// Sustained per-client-IP request rate, in requests per second (`0`
-    /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
-    /// run the gateway directly edge-facing, not behind an untrusted proxy that
-    /// hides it (see the README).
+    /// disables per-IP rate limiting); a batch counts one request per call.
+    /// The client IP is the immediate TCP peer; run the gateway directly
+    /// edge-facing, not behind an untrusted proxy that hides it (see the
+    /// README).
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP", default_value_t = 100)]
     pub(crate) rate_limit_per_ip: u32,
 
@@ -207,7 +210,8 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_v4_prefix: u8,
 
     /// Sustained gateway-wide request rate across all clients, in requests per
-    /// second (`0` disables the global rate limit).
+    /// second (`0` disables the global rate limit); a batch counts one request
+    /// per call.
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL", default_value_t = 3_000)]
     pub(crate) rate_limit_global: u32,
 
@@ -325,6 +329,32 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        let rate_limit_per_ip =
+            resolve_rate_limit(self.rate_limit_per_ip, self.rate_limit_per_ip_burst);
+        let rate_limit_global =
+            resolve_rate_limit(self.rate_limit_global, self.rate_limit_global_burst);
+        // a batch of k calls needs k tokens at once and no bucket ever holds
+        // more than its burst, so a batch longer than the smallest enabled
+        // burst could only ever get a 429 that no retry satisfies; cap batches
+        // there so such a batch gets the final 413 instead
+        let smallest_burst = [rate_limit_per_ip, rate_limit_global]
+            .iter()
+            .flatten()
+            .filter_map(|limit| NonZeroUsize::try_from(limit.burst()).ok())
+            .min();
+        let max_batch_len = match (NonZeroUsize::new(self.max_batch_len), smallest_burst) {
+            (cap, Some(burst)) if cap.is_none_or(|cap| burst < cap) => {
+                warn!(
+                    target: "gateway",
+                    max_batch_len = self.max_batch_len,
+                    burst = burst.get(),
+                    "--max-batch-len is above the smallest rate-limit burst, and a batch needs \
+                     one token per call at once; capping batches at the burst"
+                );
+                Some(burst)
+            }
+            (cap, _) => cap,
+        };
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -338,16 +368,10 @@ impl Cli {
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
-            max_batch_len: NonZeroUsize::new(self.max_batch_len),
-            rate_limit_per_ip: resolve_rate_limit(
-                self.rate_limit_per_ip,
-                self.rate_limit_per_ip_burst,
-            ),
+            max_batch_len,
+            rate_limit_per_ip,
             rate_limit_prefix,
-            rate_limit_global: resolve_rate_limit(
-                self.rate_limit_global,
-                self.rate_limit_global_burst,
-            ),
+            rate_limit_global,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -752,8 +776,47 @@ mod tests {
     fn max_batch_len_is_configurable_and_zero_is_unlimited() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-batch-len=7"]).into_settings()?;
         assert_eq!(settings.max_batch_len, NonZeroUsize::new(7));
-        let settings = cli_with_flags(&["--max-batch-len=0"]).into_settings()?;
+        let settings = cli_with_flags(&[
+            "--max-batch-len=0",
+            "--rate-limit-per-ip=0",
+            "--rate-limit-global=0",
+        ])
+        .into_settings()?;
         assert_eq!(settings.max_batch_len, None);
+        Ok(())
+    }
+
+    /// A batch needs one token per call at once and no bucket holds more than
+    /// its burst, so the effective cap stops at the smallest enabled burst: a
+    /// longer batch gets the final `413`, not a `429` no retry can satisfy.
+    #[test]
+    fn max_batch_len_is_capped_at_the_smallest_burst() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[
+            "--max-batch-len=500",
+            "--rate-limit-per-ip-burst=300",
+            "--rate-limit-global-burst=400",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(300));
+        // `0` means unlimited before the clamp, so the defaults cap it at the
+        // per-ip burst, or at the global one with per-ip limiting off
+        let settings = cli_with_flags(&["--max-batch-len=0"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(200));
+        let settings =
+            cli_with_flags(&["--max-batch-len=0", "--rate-limit-per-ip=0"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(6_000));
+        // a cap within every burst is kept
+        let settings = cli_with_flags(&["--max-batch-len=200"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(200));
+        // with both limiters off the cap is as given
+        for (flag, cap) in
+            [("--max-batch-len=500", NonZeroUsize::new(500)), ("--max-batch-len=0", None)]
+        {
+            let settings =
+                cli_with_flags(&[flag, "--rate-limit-per-ip=0", "--rate-limit-global=0"])
+                    .into_settings()?;
+            assert_eq!(settings.max_batch_len, cap, "{flag}");
+        }
         Ok(())
     }
 

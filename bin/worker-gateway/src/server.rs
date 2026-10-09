@@ -1006,6 +1006,37 @@ mod tests {
         format!("[{}]", (1..=len).map(|id| call(method, id)).collect::<Vec<_>>().join(","))
     }
 
+    /// A batch of K calls costs K rate-limit tokens: one at the edge, before
+    /// the body is read, and K - 1 once the handler has counted the calls. A
+    /// per-IP burst of K - 1 refuses it; a burst of K admits it.
+    #[tokio::test]
+    async fn batch_of_k_elements_costs_k_tokens() {
+        const K: u32 = 5;
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        for (burst, expected) in [(K - 1, StatusCode::TOO_MANY_REQUESTS), (K, StatusCode::OK)] {
+            let state = redirect_state(worker, None);
+            state.readiness.set_ready(0, true);
+            let limiters = RateLimiters::new(
+                Some(RateLimit::new(nz(1), nz(burst))),
+                None,
+                16,
+                PrefixPolicy::default(),
+            )
+            .expect("limiters");
+            let (gateway, _shutdown) =
+                spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters)))
+                    .await;
+
+            let (status, text) =
+                post_rpc(gateway, None, batch("eth_getBalance", u64::from(K))).await;
+            assert_eq!(status, expected, "per-IP burst {burst}");
+            if expected == StatusCode::TOO_MANY_REQUESTS {
+                assert_eq!(error_code_and_id(&text), (-32006, serde_json::Value::Null));
+            }
+        }
+        assert_eq!(worker_seen.hits(), 1, "only the batch within the burst is forwarded");
+    }
+
     #[tokio::test]
     async fn over_length_batch_gets_413_batch_too_long() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;

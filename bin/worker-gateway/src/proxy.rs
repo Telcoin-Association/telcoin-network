@@ -17,7 +17,8 @@
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
 use std::{
-    borrow::Cow, fmt, marker::PhantomData, net::SocketAddr, num::NonZeroUsize, time::Duration,
+    borrow::Cow, fmt, marker::PhantomData, net::SocketAddr, num::NonZeroUsize, sync::Arc,
+    time::Duration,
 };
 
 use axum::{
@@ -28,6 +29,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -41,6 +43,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
+    ratelimit::RateLimiters,
     server::AppState,
     telemetry,
 };
@@ -107,6 +110,8 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
 ///
+/// `limiters` is present when the rate-limit layer is installed and admitted
+/// the request on its first token (see [`crate::ratelimit::rate_limit`]).
 /// `body` is the final extractor (it consumes the request body), so it must
 /// stay last in the parameter list.
 pub(crate) async fn proxy(
@@ -114,6 +119,7 @@ pub(crate) async fn proxy(
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     method: Method,
     headers: HeaderMap,
+    limiters: Option<Extension<Arc<RateLimiters>>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
@@ -159,8 +165,8 @@ pub(crate) async fn proxy(
     // A batch the scan could not read to its end has an unknown length: the
     // worker skips an element serde's typed readers refuse (an out-of-range
     // number, an unpaired surrogate escape) and runs the rest, so forwarding
-    // it would dodge the length cap. It is refused whole and has no single id
-    // to echo.
+    // it would dodge the length cap and the per-call charge. It is refused
+    // whole, before it is charged, and has no single id to echo.
     if scan.unreadable_batch {
         warn!(target: "gateway::proxy", "rejecting a batch the gateway cannot read to its end");
         return error_response(&GatewayError::UnreadableBody, b"");
@@ -171,6 +177,17 @@ pub(crate) async fn proxy(
     if state.max_batch_len.is_some_and(|max| scan.len > max.get()) {
         warn!(target: "gateway::proxy", "rejecting a batch longer than --max-batch-len");
         return error_response(&GatewayError::BatchTooLong, b"");
+    }
+
+    // The rate-limit layer charged one token before the body was read; a
+    // batch pays one more for each call beyond its first before it is
+    // screened or forwarded. Like the layer's own refusal, this one cannot
+    // name an id.
+    let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
+        limiters.charge(Some(peer.ip()), scan.len.saturating_sub(1))
+    });
+    if let Err(err) = charged {
+        return error_response(&err, b"");
     }
 
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
