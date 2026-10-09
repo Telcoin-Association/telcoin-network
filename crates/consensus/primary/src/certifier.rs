@@ -502,7 +502,37 @@ impl<DB: Database> Certifier<DB> {
             // We have already processed this certificate, doing so again could produce signature
             // equivocation and destroy deterministic randomness (based on the leader
             // signature). Since we got here try to re-publish the certificate on gossip
-            // network
+            // network, but only once the record is durable.
+            //
+            // The record can still be memory-only here. The proposal task that formed it releases
+            // the proposal lock right after its insert, before its own barrier acks, so this task
+            // can read the row while its disk write is still queued. The proposer's `LastProposed`
+            // barrier for a same-digest reproposal does not cover that write: `persist` queues its
+            // barrier when called and the runner acks in FIFO order, so a barrier covers only the
+            // writes queued before it, and the reproposal's barrier can be queued before the
+            // insert. Gossiping a memory-only record lets a crash or a failed commit lose it, so a
+            // restart misses this guard and certifies the header again, possibly over a different
+            // 2f+1 subset and with a different aggregate signature (#963, #964). This task read
+            // the row, so the row's insert was queued before the barrier below, and the barrier
+            // covers it. This is the same fence #979 put on the vote fast-recast (issue #1530).
+            //
+            // Release the lock first. This path inserts nothing, so it needs no exclusion, and
+            // holding the lock across a whole-DB barrier would stall every other proposal (see
+            // the comment where the formed-certificate path drops the lock).
+            //
+            // If the barrier fails, the epoch DB has latched a failed commit (or its runner is
+            // gone), so the record can be lost on restart. Refuse to republish and fail-stop the
+            // node. This task is not critical, so returning the error alone would not stop it.
+            drop(_guard);
+            self.config
+                .node_storage()
+                .persist::<ProposedCertificates>()
+                .await
+                .inspect_err(|e| {
+                    error!(target: "primary::certifier", "durable barrier failed for already-certified certificate, refusing to re-publish; initiating node shutdown: {e}");
+                    self.config.shutdown().notify();
+                })
+                .map_err(|e| TaskError::from_message(e.to_string()))?;
             if let Err(e) = self.network.publish_certificate(cert).await {
                 error!(target: "primary::certifier", ?e, "failed to re-gossip certificate");
             }
@@ -520,8 +550,14 @@ impl<DB: Database> Certifier<DB> {
             proposal_result = self.propose_header(header, reissue_failed) => {
                 match proposal_result {
                     Ok(mut certificate) => {
+                        // A failed insert leaves no guard record, so a later proposal of this header
+                        // could certify it again with a different aggregate. Fail-stop the node:
+                        // this task is spawned as a non-critical task, and the task manager
+                        // discards a non-critical task's error, so returning it alone would not
+                        // stop the node (issue #1530).
                         if let Err(e) = self.config.node_storage().insert::<ProposedCertificates>(&header_digest, &certificate) {
-                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate: {e}");
+                            error!(target: "primary::certifier", "error accepting own certificate, unable to save the certificate; initiating node shutdown: {e}");
+                            self.config.shutdown().notify();
                             return Err(TaskError::from_message(e.to_string()));
                         }
 
@@ -555,15 +591,17 @@ impl<DB: Database> Certifier<DB> {
                         // record is not on disk, so the internal processing and gossip publish below
                         // would externalize a certificate whose guard record can be lost on restart -
                         // exactly the re-proposal and leader-signature perturbation this barrier
-                        // exists to prevent. Refuse and fail the task (mirroring the insert failure
-                        // handled above) rather than externalize a non-durable certificate
-                        // (issue #975).
+                        // exists to prevent. Refuse rather than externalize a non-durable certificate
+                        // (issue #975), and fail-stop the node as the vote barriers do (#979):
+                        // returning the error from this non-critical task alone would not stop it
+                        // (issue #1530).
                         self.config
                             .node_storage()
                             .persist::<ProposedCertificates>()
                             .await
                             .map_err(|e| {
-                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize: {e}");
+                                error!(target: "primary::certifier", "durable barrier failed for own certificate, refusing to externalize; initiating node shutdown: {e}");
+                                self.config.shutdown().notify();
                                 TaskError::from_message(e.to_string())
                             })?;
 
