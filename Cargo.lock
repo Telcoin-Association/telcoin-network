@@ -12565,6 +12565,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "metrics",
+ "metrics-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

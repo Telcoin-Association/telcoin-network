@@ -29,7 +29,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
   identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
   the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
-  gets the upstream status, body, and `Content-Type`. All other headers are
+  gets the upstream status, body, and `Content-Type` (an error status without a
+  JSON body gets a JSON-RPC error body; see "Behaviour on failure"). All other headers are
   dropped in both directions; in particular CORS is not terminated here, so
   browser dApps need CORS handled at the ingress (or a later PR).
 - The request path and query string are not forwarded: every request goes to
@@ -271,7 +272,7 @@ The public RPC accepts submissions too, so the client loses nothing, but a submi
 Routing happens after the [transaction screen](#transaction-screening), so an undecodable submission is still refused at the gateway.
 Calls sent to the query URL carry `X-TN-Gateway-Redirect: 1`, `X-Forwarded-For` and `X-Forwarded-Proto`, but not `X-TN-Gateway`, so a public RPC behind a gateway of its own does not reject them as a loop.
 A gateway with `--redirect-queries` set answers an inbound request carrying `X-TN-Gateway-Redirect` with `508` / `-32004`, which catches a query URL that leads back to a redirecting gateway; a gateway without the flag forwards such a request normally.
-The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client as is, without its `Location` header, so a query upstream cannot bounce a read onto the worker.
+The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
 `/ready` still means "this gateway can take submissions".
@@ -314,6 +315,23 @@ echoed when it can be recovered.
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
+| Upstream answered an error status without a JSON body | the upstream's | `-32012` |
+
+An upstream error answer with a JSON body (`application/json` or any `+json`
+subtype) is the upstream's own JSON-RPC error and passes through unchanged:
+status, body and content type. Any other non-2xx answer (a worker's `403`,
+`415` or `429` text/plain, or a `3xx`) keeps its status but has its body
+replaced by the `-32012` error, which echoes the request `id`. The
+`upstream_error` outcome also covers refusals a client can cause (a request
+whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
+itself a worker-saturation signal.
+
+An upstream body that fails after the status and headers have gone out (the
+upstream closes or resets mid-stream) cannot be turned into an error any more:
+the client gets the upstream's status with a truncated body (a chunked
+response without its final chunk), and the gateway logs the failure at debug
+and counts it as `result="body_failed"` in
+`tn_worker_gateway_routed_requests_total`.
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
@@ -341,16 +359,26 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight; the intended autoscaling signal. |
-| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected`) | Proxied requests by terminal outcome. |
-| `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
-| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
-| `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
+| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight, a relayed response counting until its body has finished streaming; the intended autoscaling signal. |
+| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream answered an error status without a JSON body. |
+| `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
+| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency, up to the end of the response body. |
+| `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker readiness as last polled (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
-from these series, so they reflect real client load only. The scrape also
+from these series, so they reflect real client load only.
+
+Per-request warnings (a proxy or redirect loop, a screened transaction, no
+ready upstream, an oversized body, and, per route, a forwarding failure or an
+upstream error answer) are throttled per call site, so neither clients nor a
+failing upstream can turn request volume into log volume: the first is logged,
+then at most one line per 10 s, whose `suppressed` field counts the warnings
+skipped since the previous line. A burst that stops is summarized within 20 s
+by a line that names its call site (`site`) and the count it suppressed. The
+counters above still count every request, including the rejections that log
+nothing per request (`429`, `408` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.

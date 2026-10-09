@@ -18,7 +18,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     middleware::{from_fn_with_state, map_response},
     response::{IntoResponse, Response},
     routing::get,
@@ -144,10 +144,16 @@ pub(crate) fn router(
 
 /// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
 /// envelope. The request `id` is unrecoverable here (the body never finished
-/// arriving), so it echoes as `null`, per spec. Workers do not emit `408` for
-/// JSON-RPC, so this cannot clobber a real upstream response in practice.
+/// arriving), so it echoes as `null`, per spec.
+///
+/// The timeout layer's response is the only `408` without a `Content-Type`:
+/// every response the proxy returns carries one (the gateway's own envelope,
+/// or an upstream answer relayed because its body is JSON), so an upstream's
+/// own `408` reaches the client as the proxy shaped it and is counted once.
 async fn envelope_request_timeout(response: Response) -> Response {
-    if response.status() == StatusCode::REQUEST_TIMEOUT {
+    if response.status() == StatusCode::REQUEST_TIMEOUT
+        && !response.headers().contains_key(header::CONTENT_TYPE)
+    {
         return error_response(&GatewayError::RequestTimeout, b"");
     }
     response
@@ -341,6 +347,7 @@ mod tests {
         config::UpstreamWorker,
         proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        telemetry::test_utils::CapturedMetrics,
     };
     use axum::{
         http::{header, HeaderMap},
@@ -1221,7 +1228,8 @@ mod tests {
     /// The proxy client follows no redirect. A query upstream answering `307`
     /// or `308` (which reqwest would otherwise follow, replaying the POST
     /// body) must not bounce a read onto the worker; the status passes through
-    /// to the client like any other, without the `Location` header.
+    /// to the client like any other, without the `Location` header and, the
+    /// body not being JSON, with the gateway's JSON-RPC error in its place.
     #[tokio::test]
     async fn query_upstream_redirects_are_not_followed() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
@@ -1248,8 +1256,473 @@ mod tests {
                 .expect("send");
             assert_eq!(response.status(), status);
             assert!(response.headers().get(header::LOCATION).is_none());
-            assert_eq!(response.text().await.expect("text"), "moved");
+            let text = response.text().await.expect("text");
+            assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(1)));
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A mock upstream that answers every POST with `status`, `content_type`
+    /// and `body`. The `Notifier` keeps it alive.
+    async fn answering_mock(
+        status: StatusCode,
+        content_type: &'static str,
+        body: &'static str,
+    ) -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(move || async move { (status, [(header::CONTENT_TYPE, content_type)], body) }),
+        );
+        spawn(mock).await
+    }
+
+    /// The content type of a gateway response, as a string.
+    fn content_type(response: &reqwest::Response) -> Option<String> {
+        response
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string)
+    }
+
+    /// A worker's jsonrpsee answers `403`, `415` and `429` with text/plain
+    /// bodies; the client gets the status with a JSON-RPC error carrying its id.
+    #[tokio::test]
+    async fn text_plain_429_from_upstream_becomes_a_jsonrpc_error_with_the_id() {
+        let (worker, _worker) = answering_mock(
+            StatusCode::TOO_MANY_REQUESTS,
+            "text/plain; charset=utf-8",
+            "Too many connections",
+        )
+        .await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 21))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(content_type(&response).as_deref(), Some("application/json"));
+        let text = response.text().await.expect("text");
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(21)));
+        assert!(text.contains("upstream returned 429 without a JSON-RPC body"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn json_error_body_from_upstream_passes_through_unchanged() {
+        let cases = [
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "application/json",
+                r#"{"jsonrpc":"2.0","error":{"code":-32603,"message":"internal"},"id":1}"#,
+            ),
+            (
+                StatusCode::BAD_REQUEST,
+                "Application/Problem+JSON; charset=utf-8",
+                r#"{"title":"bad request"}"#,
+            ),
+        ];
+        for (status, upstream_content_type, body) in cases {
+            let (worker, _worker) = answering_mock(status, upstream_content_type, body).await;
+            let state = redirect_state(worker, None);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+            let response = Client::new()
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_chainId", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), status);
+            assert_eq!(content_type(&response).as_deref(), Some(upstream_content_type));
+            assert_eq!(response.text().await.expect("text"), body);
+        }
+    }
+
+    /// An upstream's own `408` is not the gateway's request deadline: a
+    /// text/plain one gets the `-32012` envelope with the request's id, a JSON
+    /// one passes through unchanged, and each is counted once.
+    #[tokio::test]
+    async fn upstream_408_is_not_rewritten_as_a_request_timeout() {
+        let mut metrics = CapturedMetrics::install();
+
+        let (plain, _plain) =
+            answering_mock(StatusCode::REQUEST_TIMEOUT, "text/plain", "late").await;
+        let state = redirect_state(plain, None);
+        state.readiness.set_ready(0, true);
+        let (first, _first) = spawn(test_router(state)).await;
+        let (status, text) = post_rpc(first, None, call("eth_chainId", 7)).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(7)));
+
+        let json_body = r#"{"jsonrpc":"2.0","error":{"code":-32000,"message":"slow"},"id":8}"#;
+        let (json, _json) =
+            answering_mock(StatusCode::REQUEST_TIMEOUT, "application/json", json_body).await;
+        let state = redirect_state(json, None);
+        state.readiness.set_ready(0, true);
+        let (second, _second) = spawn(test_router(state)).await;
+        let (status, text) = post_rpc(second, None, call("eth_chainId", 8)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::REQUEST_TIMEOUT, json_body));
+
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.value(requests, &[("outcome", "upstream_error")]), 1.0);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
+        assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 0.0);
+        assert_eq!(
+            metrics.value("tn_worker_gateway_rejections_total", &[("reason", "request_timeout")]),
+            0.0
+        );
+    }
+
+    #[tokio::test]
+    async fn upstream_error_is_counted_under_its_own_outcome() {
+        let mut metrics = CapturedMetrics::install();
+        let (worker, _worker) =
+            answering_mock(StatusCode::TOO_MANY_REQUESTS, "text/plain", "Too many connections")
+                .await;
+        let (query, _query) = answering_mock(StatusCode::FORBIDDEN, "text/plain", "denied").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(1)));
+        let (status, text) = post_rpc(gateway, None, call("eth_call", 2)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(2)));
+
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.value(requests, &[("outcome", "upstream_error")]), 2.0);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 0.0);
+        assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 0.0);
+        assert_eq!(
+            metrics.value("tn_worker_gateway_rejections_total", &[("reason", "upstream_error")]),
+            2.0
+        );
+        let routed = "tn_worker_gateway_routed_requests_total";
+        for route in ["worker", "query"] {
+            assert_eq!(
+                metrics.value(routed, &[("route", route), ("result", "upstream_error")]),
+                1.0,
+                "{route}"
+            );
+            assert_eq!(metrics.value(routed, &[("route", route), ("result", "forwarded")]), 0.0);
+        }
+    }
+
+    /// Read one HTTP/1.1 request, its head plus a `Content-Length` body, off
+    /// `stream`, so that closing the stream afterwards sends a clean FIN rather
+    /// than a reset over unread bytes.
+    async fn read_request(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 4096];
+        loop {
+            let read = stream.read(&mut buf).await.expect("read");
+            assert!(read > 0, "the gateway closed before its request ended");
+            request.extend_from_slice(&buf[..read]);
+            let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+            if let Some(head_end) = text.find("\r\n\r\n") {
+                let length = text[..head_end]
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|length| length.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= head_end + 4 + length {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// A mock upstream that answers one request with `200` and a
+    /// `Content-Length` of 1000, sends 34 bytes of body and closes.
+    async fn truncating_mock() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                      Content-Length: 1000\r\n\r\n{\"jsonrpc\":\"2.0\",\"result\":\"0x1\",\"i",
+                )
+                .await
+                .expect("write");
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn mid_stream_upstream_failure_is_counted() {
+        let mut metrics = CapturedMetrics::install();
+        let state = redirect_state(truncating_mock().await, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        // the status went out before the body broke off, so the client gets a
+        // 200 whose body cannot be read to the end
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.bytes().await.is_err(), "a truncated body must not read as complete");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "body_failed")]), 1.0);
+        assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "forwarded")]), 1.0);
+    }
+
+    /// A relayed response stays in the in-flight gauge until its body has
+    /// finished streaming, not just until the handler returns its head.
+    #[tokio::test]
+    async fn inflight_gauge_drops_after_the_body_streams() {
+        let mut metrics = CapturedMetrics::install();
+        // a mock that sends the head and a first chunk, then holds the rest of
+        // the body until released
+        let release = Arc::new(tokio::sync::Notify::new());
+        let held = Arc::clone(&release);
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let held = Arc::clone(&held);
+                async move {
+                    let head = futures::stream::once(async {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
+                            br#"{"jsonrpc":"2.0","#,
+                        ))
+                    });
+                    let tail = futures::stream::once(async move {
+                        held.notified().await;
+                        Ok(axum::body::Bytes::from_static(br#""result":"0x1","id":1}"#))
+                    });
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        axum::body::Body::from_stream(futures::StreamExt::chain(head, tail)),
+                    )
+                }
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let mut response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let mut body = response.chunk().await.expect("chunk").expect("first chunk").to_vec();
+
+        // the handler has long returned the head, but the body still streams
+        let inflight = "tn_worker_gateway_inflight_requests";
+        let duration = "tn_worker_gateway_request_duration_seconds";
+        assert_eq!(metrics.value(inflight, &[]), 1.0);
+        assert_eq!(metrics.value(duration, &[]), 0.0, "no duration before the body ends");
+
+        release.notify_one();
+        while let Some(chunk) = response.chunk().await.expect("chunk") {
+            body.extend_from_slice(&chunk);
+        }
+        assert_eq!(body, br#"{"jsonrpc":"2.0","result":"0x1","id":1}"#);
+        // the gateway drops the body after its last frame; allow for the
+        // client reading the end first
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(inflight, &[]) > 0.5 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the in-flight gauge drops once the body has streamed");
+        assert_eq!(metrics.value(inflight, &[]), 0.0);
+        assert_eq!(metrics.value(duration, &[]), 1.0, "one duration sample, at the body's end");
+    }
+
+    /// Send a request head promising a 100-byte body, and the first bytes of
+    /// that body, on a raw connection; then stall or stop sending as `then`
+    /// says, and return everything the gateway answers before it closes.
+    async fn partial_request(gateway: SocketAddr, then: Abort) -> String {
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        stream
+            .write_all(
+                b"POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+                  Content-Length: 100\r\n\r\n{\"id\":",
+            )
+            .await
+            .expect("write");
+        if then == Abort::CloseWrites {
+            stream.shutdown().await.expect("shutdown");
+        }
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the gateway answers within the test's deadline")
+            .expect("read");
+        String::from_utf8_lossy(&response).into_owned()
+    }
+
+    /// What a client does after sending part of a request body.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Abort {
+        /// Stall, leaving the request deadline to fire.
+        Stall,
+        /// Stop sending: the body ends early.
+        CloseWrites,
+    }
+
+    /// Every kind of rejection, including the ones that log nothing per
+    /// request (`429`, `408` and an aborted body), is counted under its reason.
+    #[tokio::test]
+    async fn every_reject_kind_is_counted() {
+        let mut metrics = CapturedMetrics::install();
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+
+        // 429: a global limit of one request with no burst headroom
+        let limited = redirect_state(worker, None);
+        limited.readiness.set_ready(0, true);
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (limited, _limited) =
+            spawn(router(limited, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+        let (status, _) = post_rpc(limited, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = post_rpc(limited, None, call("eth_chainId", 2)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+
+        // 408: a body that stalls past a short request deadline
+        let slow = redirect_state(worker, None);
+        slow.readiness.set_ready(0, true);
+        let (slow, _slow) =
+            spawn(router(slow, Duration::from_millis(300), MAX_REQUEST_BYTES, None)).await;
+        let response = partial_request(slow, Abort::Stall).await;
+        assert!(response.starts_with("HTTP/1.1 408"), "{response}");
+
+        // the rest on a gateway whose only worker is not ready
+        let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, None))).await;
+        // an aborted body: the client stops sending part-way through
+        let response = partial_request(gateway, Abort::CloseWrites).await;
+        assert!(response.starts_with("HTTP/1.1 400"), "{response}");
+        assert!(response.contains("-32600"), "{response}");
+        // a loop
+        let (status, _) = post_rpc(gateway, Some("x-tn-gateway"), call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
+        // a screened transaction
+        let junk =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":4}"#;
+        let (status, _) = post_rpc(gateway, None, junk.to_string()).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        // no upstream ready
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 5)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let reasons = [
+            "rate_limited",
+            "request_timeout",
+            "unreadable_body",
+            "loop_detected",
+            "invalid_transaction",
+            "no_upstream_ready",
+        ];
+        for reason in reasons {
+            assert_eq!(
+                metrics.value("tn_worker_gateway_rejections_total", &[("reason", reason)]),
+                1.0,
+                "{reason}"
+            );
+        }
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), reasons.len() as f64);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
+    }
+
+    /// `routed_requests_total{route, result}` counts every forward attempt
+    /// under its route and result, and `mixed_batches_total` counts each batch
+    /// sent to the query upstream only because it mixed submissions with reads.
+    #[tokio::test]
+    async fn routed_and_mixed_batch_counters_are_recorded() {
+        let mut metrics = CapturedMetrics::install();
+        let submission = call("eth_sendRawTransaction", 1);
+        let read = call("eth_getLogs", 2);
+
+        // forwarded on both routes, two of the batches mixed
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (query, _query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        for (body, expected) in [
+            (submission.clone(), "worker"),
+            (format!("[{submission},{submission}]"), "worker"),
+            (read.clone(), "query"),
+            (format!("[{submission},{read}]"), "query"),
+            (format!("[{read},{submission}]"), "query"),
+        ] {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, expected), "{body}");
+        }
+
+        // unreachable on both routes: nothing listens on port 1
+        let dead: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let state = redirect_state(dead, Some(dead));
+        state.readiness.set_ready(0, true);
+        let (unreachable, _unreachable) = spawn(test_router(state)).await;
+        for body in [submission.clone(), read.clone()] {
+            let (status, _) = post_rpc(unreachable, None, body).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+        }
+
+        // timed out on both routes
+        let slow = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (slow, _slow) = spawn(slow).await;
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+        let state = redirect_state_with_client(slow, Some(slow), client);
+        state.readiness.set_ready(0, true);
+        let (timing_out, _timing_out) = spawn(test_router(state)).await;
+        for body in [submission.clone(), read.clone()] {
+            let (status, _) = post_rpc(timing_out, None, body).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        }
+
+        let series = |route: &str, result: &str| {
+            vec![
+                ("result".to_string(), result.to_string()),
+                ("route".to_string(), route.to_string()),
+            ]
+        };
+        let mut expected = vec![
+            (series("worker", "forwarded"), 2.0),
+            (series("query", "forwarded"), 3.0),
+            (series("worker", "unreachable"), 1.0),
+            (series("query", "unreachable"), 1.0),
+            (series("worker", "timeout"), 1.0),
+            (series("query", "timeout"), 1.0),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(metrics.series("tn_worker_gateway_routed_requests_total"), expected);
+        assert_eq!(metrics.value("tn_worker_gateway_mixed_batches_total", &[]), 2.0);
     }
 }
