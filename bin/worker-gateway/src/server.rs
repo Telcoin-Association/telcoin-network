@@ -1651,4 +1651,78 @@ mod tests {
         assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), reasons.len() as f64);
         assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
     }
+
+    /// `routed_requests_total{route, result}` counts every forward attempt
+    /// under its route and result, and `mixed_batches_total` counts each batch
+    /// sent to the query upstream only because it mixed submissions with reads.
+    #[tokio::test]
+    async fn routed_and_mixed_batch_counters_are_recorded() {
+        let mut metrics = CapturedMetrics::install();
+        let submission = call("eth_sendRawTransaction", 1);
+        let read = call("eth_getLogs", 2);
+
+        // forwarded on both routes, two of the batches mixed
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (query, _query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        for (body, expected) in [
+            (submission.clone(), "worker"),
+            (format!("[{submission},{submission}]"), "worker"),
+            (read.clone(), "query"),
+            (format!("[{submission},{read}]"), "query"),
+            (format!("[{read},{submission}]"), "query"),
+        ] {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, expected), "{body}");
+        }
+
+        // unreachable on both routes: nothing listens on port 1
+        let dead: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let state = redirect_state(dead, Some(dead));
+        state.readiness.set_ready(0, true);
+        let (unreachable, _unreachable) = spawn(test_router(state)).await;
+        for body in [submission.clone(), read.clone()] {
+            let (status, _) = post_rpc(unreachable, None, body).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+        }
+
+        // timed out on both routes
+        let slow = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (slow, _slow) = spawn(slow).await;
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+        let state = redirect_state_with_client(slow, Some(slow), client);
+        state.readiness.set_ready(0, true);
+        let (timing_out, _timing_out) = spawn(test_router(state)).await;
+        for body in [submission.clone(), read.clone()] {
+            let (status, _) = post_rpc(timing_out, None, body).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        }
+
+        let series = |route: &str, result: &str| {
+            vec![
+                ("result".to_string(), result.to_string()),
+                ("route".to_string(), route.to_string()),
+            ]
+        };
+        let mut expected = vec![
+            (series("worker", "forwarded"), 2.0),
+            (series("query", "forwarded"), 3.0),
+            (series("worker", "unreachable"), 1.0),
+            (series("query", "unreachable"), 1.0),
+            (series("worker", "timeout"), 1.0),
+            (series("query", "timeout"), 1.0),
+        ];
+        expected.sort_by(|left, right| left.0.cmp(&right.0));
+        assert_eq!(metrics.series("tn_worker_gateway_routed_requests_total"), expected);
+        assert_eq!(metrics.value("tn_worker_gateway_mixed_batches_total", &[]), 2.0);
+    }
 }
