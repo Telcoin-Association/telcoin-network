@@ -17,6 +17,7 @@
   * [Discovery](network/discovery.md)
   * [Peers](network/peers.md)
   * [Established Source Admission](network/source-admission.md)
+  * [Local Committee Inventory](network/committee-seeding.md)
   * [Request-response](network/request-response.md)
   * [Sync streams](network/sync-streams.md)
 * [Getting Started](getting-started/README.md)

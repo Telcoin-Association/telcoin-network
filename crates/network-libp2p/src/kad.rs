@@ -2,6 +2,7 @@
 
 use crate::{
     consensus::MAX_ADVERTISED_MULTIADDRS,
+    freshness::RecordTimestamp,
     retention::{RecordRetention, RetentionBudget},
     types::NetworkType,
 };
@@ -24,7 +25,7 @@ use tn_config::KeyConfig;
 use tn_storage::tables::{
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords,
 };
-use tn_types::{encode, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
+use tn_types::{encode, now, try_decode, BlockHash, BlsPublicKey, Database, DefaultHashFunction};
 use tracing::{error, warn};
 
 /// A record stored in the DHT.
@@ -65,6 +66,37 @@ impl KadRecord {
         matches!(self.expires, Some(exp) if exp <= now)
     }
 }
+
+/// Local persistence envelope, never transmitted as part of a signed node record.
+#[derive(Serialize, Deserialize)]
+struct StoredKadRecord {
+    /// Original record, including unchanged authenticated bytes and normal DHT expiry.
+    record: KadRecord,
+    /// Fixed local admission metadata for signed node records.
+    timestamp: Option<RecordTimestamp>,
+}
+
+impl StoredKadRecord {
+    /// Decode current envelopes or recover legacy rows without renewing a future ceiling.
+    fn decode(raw: &[u8]) -> Option<Self> {
+        try_decode::<Self>(raw)
+            .ok()
+            .or_else(|| {
+                try_decode::<KadRecord>(raw).ok().map(|record| Self { record, timestamp: None })
+            })
+            .map(|mut stored| {
+                stored.timestamp = stored.timestamp.or_else(|| {
+                    crate::types::NodeRecord::try_decode_compat(&stored.record.value)
+                        .map(|node| RecordTimestamp::legacy(node.info.timestamp, now()))
+                });
+                stored
+            })
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/record_freshness.rs"]
+mod record_freshness_tests;
 
 impl KadProviderRecord {
     /// Returns true if the provider record carries an expiry that has already passed.
@@ -514,7 +546,87 @@ impl<DB: Database> KadStore<DB> {
 
     /// Decode a discovery row only when its persisted key matches this store's namespace.
     fn decode_record(&self, hash: &BlockHash, raw: &[u8]) -> Option<KadRecord> {
-        try_decode::<KadRecord>(raw).ok().filter(|record| self.owns(&record.key, hash))
+        StoredKadRecord::decode(raw)
+            .map(|stored| stored.record)
+            .filter(|record| self.owns(&record.key, hash))
+    }
+
+    /// Read the original local admission ceiling, including after a process restart.
+    pub(crate) fn record_timestamp(&self, key: &RecordKey) -> Option<RecordTimestamp> {
+        let hash = self.key_to_hash(key);
+        match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&hash),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&hash),
+        }
+        .inspect_err(|error| {
+            error!(target: "network-kad", ?error, "failed to read record freshness metadata");
+        })
+        .ok()
+        .flatten()
+        .and_then(|raw| StoredKadRecord::decode(&raw))
+        .filter(|stored| stored.record.key == *key)
+        .and_then(|stored| stored.timestamp)
+    }
+
+    /// Persist a record with its fixed admission metadata, preserving identical republishes.
+    pub(crate) fn put_with_timestamp(
+        &mut self,
+        r: Record,
+        timestamp: Option<RecordTimestamp>,
+    ) -> libp2p::kad::store::Result<()> {
+        self.retains(&r.key).then_some(()).ok_or(Error::MaxRecords)?;
+        if r.value.len() >= self.config.max_value_bytes {
+            return Err(Error::ValueTooLarge);
+        }
+
+        let key = self.key_to_hash(&r.key);
+        let kr: KadRecord = r.into();
+        let stored = match self.kad_type {
+            NetworkType::Primary => self.db.get::<KadRecords>(&key),
+            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
+        }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
+            Error::ValueTooLarge
+        })?;
+        // Startup excludes unreadable records, so repairing one is an insertion for capacity
+        // accounting. Replacing a readable owned row keeps the existing count.
+        let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
+        // Our own key holds the slot that `RecordRetention::new` reserves, so it never competes
+        // for capacity. Restored rows that no owner retains yet extend the owners' capacity
+        // until the first committee prune deletes them.
+        let own = kr.key == self.node_key;
+        let max_records = self.retention.as_ref().map_or(self.config.max_records, |retention| {
+            retention.max_records().saturating_add(self.startup_unretained)
+        });
+        if new_record && !own && self.num_records >= max_records {
+            // Try to free a slot by evicting any records whose TTL has passed.
+            self.evict_expired_records();
+            if self.num_records >= max_records {
+                return Err(Error::MaxRecords);
+            }
+        }
+        // Byte-identical republishes may refresh DHT expiry, but never the admission ceiling.
+        let timestamp = stored
+            .as_deref()
+            .and_then(StoredKadRecord::decode)
+            .filter(|stored| stored.record.value == kr.value)
+            .and_then(|stored| stored.timestamp)
+            .or(timestamp);
+        let encoded = encode(&StoredKadRecord { record: kr, timestamp });
+        match self.kad_type {
+            NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encoded),
+            NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encoded),
+        }
+        .map_err(|error| {
+            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
+            Error::ValueTooLarge
+        })?;
+        if new_record {
+            self.num_records += 1;
+            self.update_records_gauge();
+        }
+        Ok(())
     }
 
     /// Enumerate this swarm's rows, including expired records needed for accounting.
@@ -683,58 +795,18 @@ impl<DB: Database> RecordStore for KadStore<DB> {
         })
         .ok()?;
         let raw = record?;
-        try_decode::<KadRecord>(&raw)
-            .ok()
+        StoredKadRecord::decode(&raw)
+            .map(|stored| stored.record)
             .filter(|record| record.key == *k && !record.is_expired(SystemTime::now()))
             .map(|record| Cow::Owned(record.into()))
     }
 
     fn put(&mut self, r: Record) -> libp2p::kad::store::Result<()> {
-        self.retains(&r.key).then_some(()).ok_or(Error::MaxRecords)?;
-        if r.value.len() >= self.config.max_value_bytes {
-            return Err(Error::ValueTooLarge);
-        }
-
-        let key = self.key_to_hash(&r.key);
-        let kr: KadRecord = r.into();
-        let stored = match self.kad_type {
-            NetworkType::Primary => self.db.get::<KadRecords>(&key),
-            NetworkType::Worker(_) => self.db.get::<KadWorkerRecords>(&key),
-        }
-        .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to read Kademlia record before insert");
-            Error::ValueTooLarge
-        })?;
-        // Startup excludes unreadable records, so repairing one is an insertion for capacity
-        // accounting. Replacing a readable owned row keeps the existing count.
-        let new_record = stored.as_deref().and_then(|raw| self.decode_record(&key, raw)).is_none();
-        // Our own key holds the slot that `RecordRetention::new` reserves, so it never competes
-        // for capacity. Restored rows that no owner retains yet extend the owners' capacity
-        // until the first committee prune deletes them.
-        let own = kr.key == self.node_key;
-        let max_records = self.retention.as_ref().map_or(self.config.max_records, |retention| {
-            retention.max_records().saturating_add(self.startup_unretained)
-        });
-        if new_record && !own && self.num_records >= max_records {
-            // Try to free a slot by evicting any records whose TTL has passed.
-            self.evict_expired_records();
-            if self.num_records >= max_records {
-                return Err(Error::MaxRecords);
-            }
-        }
-        match self.kad_type {
-            NetworkType::Primary => self.db.insert::<KadRecords>(&key, &encode(&kr)),
-            NetworkType::Worker(_) => self.db.insert::<KadWorkerRecords>(&key, &encode(&kr)),
-        }
-        .map_err(|error| {
-            error!(target: "network-kad", ?error, kad_type = ?self.kad_type, "failed to insert Kademlia record");
-            Error::ValueTooLarge
-        })?;
-        if new_record {
-            self.num_records += 1;
-            self.update_records_gauge();
-        }
-        Ok(())
+        let timestamp = (r.value.len() < self.config.max_value_bytes)
+            .then(|| crate::types::NodeRecord::try_decode_compat(&r.value))
+            .flatten()
+            .map(|node| RecordTimestamp::admit(node.info.timestamp, now()));
+        self.put_with_timestamp(r, timestamp)
     }
 
     fn remove(&mut self, k: &RecordKey) {
