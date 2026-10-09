@@ -1,6 +1,7 @@
 # Validator production operations
 
-This page defines the production controls that sit around the node software. The node does not configure the host firewall, distribute releases, or provide an HSM or remote BLS signer.
+This page defines the production controls that sit around the node software.
+The node does not configure the host firewall, update itself, or provide an HSM or remote BLS signer.
 
 ## Network topology
 
@@ -77,17 +78,23 @@ BLS identity rotation affects committee registration and peer identity. Treat it
 
 ## Release and network update process
 
-There is no automatic binary release or node update channel in this repository. Operators currently build from source. Before a mainnet rollout, define one signed release manifest containing:
+Releases are published as signed git tags.
+Each release has a Linux x86_64 tarball on its GitHub release page and a `linux/amd64` image at `ghcr.io/telcoin-association/telcoin-network`.
+There is no automatic update: operators decide when to install a release.
+[Installing a release](installing-a-release.md) shows how to download and verify one, and [Release notes](release-notes.md) lists what changed in each.
 
-- the release version, source commit, and every first-party submodule commit;
-- a SHA-256 digest for each immutable artifact and container image;
-- build provenance and an SBOM;
-- supported network and configuration schema versions;
-- any fork epoch or activation condition;
-- rollback compatibility and the final safe rollback point;
-- signatures from the required release owners.
+A release provides:
 
-Verify the manifest and artifact digest on the target host before installation. Record the installed digest and node version in operator inventory.
+- a git tag signed with a maintainer key from `.github/maintainer-gpg-keys/`;
+- a `SHA256SUMS` file covering the tarball and the `IMAGE_DIGEST` file, with detached maintainer signatures in `SHA256SUMS.asc`;
+- the image digest in `IMAGE_DIGEST`, so the image can be pulled by digest instead of by tag;
+- the changelog section for that tag, also shown on the release notes page.
+
+A release does not yet provide an SBOM, third-party build provenance, reproducible builds, or machine-readable activation data.
+Activation conditions and the final safe rollback point arrive through the authenticated operator channel and the release notes.
+
+Verify the signature and the digests on the target host before installation.
+Record the installed tarball checksum or image digest and the `--version` output in operator inventory.
 
 Use this rollout order:
 
@@ -95,10 +102,12 @@ Use this rollout order:
 2. Upgrade an observer or sentry canary and check sync, RPC, metrics, and peer behavior.
 3. Upgrade one validator and observe at least one normal consensus cycle.
 4. Continue in stake-weighted batches without taking enough stake offline to break quorum.
-5. Compare every node's running version, configuration digest, peer set, and chain progress with the release manifest.
+5. Compare every node's running version, configuration digest, peer set, and chain progress with the release's signed checksums and release notes.
 6. Stop before the rollback cutoff if acceptance checks fail, restore the prior artifact and configuration, and verify recovery.
 
-For an emergency patch, name an incident owner, a release owner, and an independent verifier. Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signed manifest and digest checks, and record each validator's completion. A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
+For an emergency patch, name an incident owner, a release owner, and an independent verifier.
+Freeze unrelated rollout changes, state the affected versions and activation deadline, use the same signature and digest checks, and record each validator's completion.
+A protocol fork needs a separately approved activation plan and explicit readiness evidence from enough validator stake.
 
 ## Capacity monitoring
 
@@ -140,7 +149,7 @@ Alert on how fast it climbs during load and after restarts, not only on the leve
 - firewall policy tested from allowed and denied source networks;
 - signed address manifest distribution and rollback rehearsal;
 - BLS backup and isolated recovery rehearsal;
-- signed artifact verification on every target platform;
+- release signature and digest verification on every target host;
 - canary, phased rollout, and rollback rehearsal;
 - quorum dashboard based on validator stake and running version;
 - incident contacts and an out-of-band coordination channel.
