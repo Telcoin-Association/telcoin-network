@@ -82,6 +82,20 @@ an acceptance decision, including how it composes with [#1448](https://github.co
 The established ceiling bounds concurrency, rather than every process resource: pending
 handshakes, stream buffers, RPC work, and the execution engine need their own finite budgets.
 
+Every denial increments `tn_network.source_admission_denied_total` with `network`,
+`direction` (`in` or `out`), and `reason` labels. The reason is the snake-case
+`AdmissionError` variant, for example `peer_full` or `process_full`. A denial logs at
+`warn` when the peer manager treats the peer as important (for example a committee
+member), at `error` when the accounting lock is poisoned, and at `debug` otherwise.
+
+A full budget refuses committee members on inbound connections and on our own outbound
+dials. Node startup therefore logs a warning when this budget is configured. Do not
+enable it on a validator until a protected-capacity policy exists. Candidate policies:
+reserve a share of `max_connections` for important peers; admit important peers past
+`ProcessFull` and `SourcesFull` while they are still charged; or evict the lowest-scored
+ordinary lease. A committee member is important only after the peer manager learns its
+network key.
+
 ## Qualification still required
 
 Record the hardware, memory and descriptor headroom, supported worker counts, honest

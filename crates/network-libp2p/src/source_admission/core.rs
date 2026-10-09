@@ -82,6 +82,23 @@ pub enum AdmissionError {
     Poisoned,
 }
 
+impl AdmissionError {
+    /// Stable metric label for this denial reason.
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::InvalidLimits => "invalid_limits",
+            Self::ProcessFull => "process_full",
+            Self::PeerFull => "peer_full",
+            Self::AddressFull => "address_full",
+            Self::PrefixFull => "prefix_full",
+            Self::SourcesFull => "sources_full",
+            Self::UnsupportedAddress => "unsupported_address",
+            Self::DuplicateConnection => "duplicate_connection",
+            Self::Poisoned => "poisoned",
+        }
+    }
+}
+
 impl fmt::Display for AdmissionError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {

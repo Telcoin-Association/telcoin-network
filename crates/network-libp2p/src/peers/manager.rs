@@ -13,7 +13,7 @@ use crate::{
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
-    source_admission::{SourceAdmissionBudget, SourceConnections},
+    source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
@@ -287,14 +287,28 @@ impl PeerManager {
     }
 
     /// Reserve source occupancy at the authenticated established-connection boundary.
+    ///
+    /// Every denial is counted and logged. The importance signal is computed here so that
+    /// a later protected-capacity policy can use it; today important peers are only
+    /// logged at a higher level.
     pub(crate) fn reserve_source(
         &mut self,
         connection: ConnectionId,
         peer: PeerId,
         address: &Multiaddr,
+        direction: &'static str,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let important = self.peer_is_important(&peer);
         self.source_connections.reserve(connection, peer, address).map_err(|error| {
             self.metrics.record_source_rejection(error);
+            self.metrics.record_source_admission_denied(direction, error.label());
+            if matches!(error, AdmissionError::Poisoned) {
+                error!(target: "peer-manager", %error, "source admission accounting poisoned");
+            } else if important {
+                warn!(target: "peer-manager", ?peer, direction, %error, "source budget refused important peer");
+            } else {
+                debug!(target: "peer-manager", ?peer, direction, %error, "source budget refused connection");
+            }
             libp2p::swarm::ConnectionDenied::new(error)
         })
     }

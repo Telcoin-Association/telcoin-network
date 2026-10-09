@@ -136,7 +136,7 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
 
-        self.reserve_source(connection_id, peer, remote_addr)?;
+        self.reserve_source(connection_id, peer, remote_addr, "in")?;
         Ok(ConnectionHandler)
     }
 
@@ -163,7 +163,7 @@ impl NetworkBehaviour for PeerManager {
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
 
-        self.reserve_source(connection_id, peer, addr)?;
+        self.reserve_source(connection_id, peer, addr, "out")?;
         Ok(ConnectionHandler)
     }
 
