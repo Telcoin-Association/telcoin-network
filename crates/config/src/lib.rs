@@ -29,6 +29,8 @@ mod observers;
 pub use observers::{
     DaoObserverProfile, ObserverConfigError, TrustedNode, MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
 };
+mod source_admission;
+pub use source_admission::SourceAdmissionConfig;
 mod retry;
 pub use retry::*;
 pub mod pid_lock;

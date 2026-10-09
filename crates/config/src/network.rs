@@ -2,7 +2,7 @@
 
 use crate::{
     ConfigFmt, ConfigTrait, DaoObserverProfile, NetworkBudgetError, NetworkProcessBudget,
-    ObserverConfigError, SwarmNetworkBudget, TelcoinDirs, TrustedNode,
+    ObserverConfigError, SourceAdmissionConfig, SwarmNetworkBudget, TelcoinDirs, TrustedNode,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -34,6 +34,9 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
     ///
     /// Network readiness is sampled continuously and no longer delays epoch startup.
@@ -188,6 +191,11 @@ impl NetworkConfig {
             workers,
             self.peer_config.max_priority_peers(),
         )
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
     }
 
     /// Return the local launch inventory. Membership remains derived from chain state.
