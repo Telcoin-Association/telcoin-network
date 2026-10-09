@@ -874,7 +874,9 @@ where
     /// These tables hold only the working state of a single epoch — proposals,
     /// votes, certificates and their indexes, and the batch cache — so they are
     /// reset at every boundary. Complete historic data lives in the
-    /// `ConsensusChain` store and is unaffected.
+    /// `ConsensusChain` store and is unaffected. Committed batches already left
+    /// the batch cache when their output was forwarded to execution
+    /// (`process_output`), so the clear mostly drops batches never committed.
     ///
     /// [`OurNodeBatchesCache`] is deliberately left intact: `orphan_batches`
     /// still reads it to recover our un-consensed batches and clears it itself
