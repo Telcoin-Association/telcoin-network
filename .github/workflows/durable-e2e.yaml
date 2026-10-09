@@ -1,109 +1,99 @@
-# Scheduled Durable-mode e2e lane (#1149, follow-up to #982 / #917).
-#
-# PR CI runs the e2e suites with the test-build MDBX default (`SafeNoSync`, no hot-path
-# fsync; see crates/storage/src/mdbx/database.rs). That removed the Durable timing regime
-# -- where the externalization barriers (`persist().await` before a certificate, header,
-# or vote goes on the wire) wait on a real per-commit flush that races the proposer
-# timers -- from every test run. This lane restores that regime on a schedule by
-# exporting TN_TEST_MDBX_SYNC=durable, which every spawned node process inherits, at
-# zero wall-clock cost to PR CI. An invalid value fails MdbxDatabase::open outright, so
-# a typo here cannot green-run the wrong sync regime.
-#
-# The timings of the two suite steps, compared against a `safe-no-sync` dispatch run on
-# the same runner class, give the #917 acceptance measurement (Durable-vs-SafeNoSync
-# wall clock on a CI disk): post the first numbers on #1149. The untimed build step ahead
-# of them absorbs every compile (node binary and all test binaries) plus the cache state,
-# so the timed steps measure test execution only and the A/B pair stays comparable even
-# when one side runs cold.
-name: Durable e2e
+name: CI118 verification runner preflight
 
-on:
-  schedule:
-    # Nightly at 08:17 UTC, off the top of the hour to dodge the scheduled-load spike.
-    - cron: "17 8 * * *"
-  workflow_dispatch:
-    inputs:
-      hub_capacity:
-        description: "Run full manual hub-capacity qualification instead of durable e2e"
-        type: boolean
-        default: false
-      sync_mode:
-        description: "TN_TEST_MDBX_SYNC value for the spawned nodes"
-        type: choice
-        options:
-          - durable
-          - safe-no-sync
-        default: durable
+"on": workflow_dispatch
 
-# The job only reads the repository (checkout + build + test); the token gets no
-# write scopes (least privilege, CodeQL actions/missing-workflow-permissions).
 permissions:
+  actions: read
   contents: read
 
-env:
-  CARGO_INCREMENTAL: 0
-  RUSTFLAGS: "-D warnings -D unused_extern_crates"
-  CARGO_TERM_COLOR: always
-  RUST_BACKTRACE: 1
-  CARGO_PROFILE_DEV_DEBUG: 0
-  CARGO_PROFILE_TEST_DEBUG: 0
-
 jobs:
-  hub-capacity-manual:
-    name: Manual hub capacity qualification
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.hub_capacity }}
-    uses: ./.github/workflows/hub-capacity-manual.yaml
-    permissions:
-      contents: read
-
-  durable-e2e:
-    if: ${{ github.event_name != 'workflow_dispatch' || !inputs.hub_capacity }}
-    runs-on: ubuntu-latest
-    # Covers a cold cache: full workspace test-binary build plus both e2e suites run
-    # serialized (nextest pins the e2e group to max-threads 1) in the slower Durable regime.
-    timeout-minutes: 240
+  preflight:
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch' &&
+          github.repository == 'Telcoin-Association/telcoin-network' &&
+          github.ref == 'refs/heads/work/1476-ci118-verification' }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 4
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: recursive
-          fetch-depth: 1
-
-      - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
-
-      - name: Install cargo-nextest
-        uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
-        with:
-          tool: cargo-nextest
-
-      - name: Cache dependencies
-        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          shared-key: durable-e2e-cache
-          cache-on-failure: "true"
-
-      # Untimed: absorbs the node-binary build and every workspace test-binary compile, and
-      # validates the committed lockfile (`fetch --locked` fails on drift, matching the
-      # `--locked` discipline of pr.yaml), so the timed suite steps below are compile-free.
-      # TN_TEST_MDBX_SYNC is scoped to the suite steps, not exported job-wide: a build needs
-      # no override, and a future "variable must be unset" test (the
-      # TN_*_FORK_EPOCH pattern in the Makefile) must not inherit it.
-      - name: Build node binary and test binaries (untimed)
+      - name: Probe disk and pinned run metadata
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EXPECTED_REPOSITORY: Telcoin-Association/telcoin-network
+          EXPECTED_REPOSITORY_ID: "780459444"
+          EXPECTED_HEAD: "4556f835e3d4a6f803afc941f4cfcd9cfd7faad1"
+          EXPECTED_RUN: "37914665470"
+          EXPECTED_REF: refs/heads/work/1476-ci118-verification
+          ACTUAL_REPOSITORY: ${{ github.repository }}
+          ACTUAL_REF: ${{ github.ref }}
+          ACTUAL_EVENT: ${{ github.event_name }}
+          ACTUAL_RUN_ID: ${{ github.run_id }}
+          ACTUAL_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ACTUAL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          ACTUAL_WORKFLOW_COMMIT: ${{ github.sha }}
         run: |
-          cargo fetch --locked
-          make build-e2e-bin
-          cargo nextest run --no-run --locked --workspace
+          python3 -B -I - <<'PY'
+          import json
+          import os
+          import platform
+          import shutil
+          import subprocess
 
-      - name: Run restart e2e tests
-        env:
-          # Scheduled runs get `durable`; a manual dispatch may select either side of the A/B.
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
-        run: make test-restarts
-
-      - name: Run epoch e2e tests
-        env:
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
-        run: make test-epochs
-
-      - name: Assert lockfile unchanged
-        run: git diff --exit-code -- Cargo.lock
+          env = os.environ
+          floor = 32 * 1024**3
+          failures = []
+          report = {"diagnostic_only": True, "capacity_qualified": False,
+                    "workflow_ref": env["ACTUAL_WORKFLOW_REF"],
+                    "workflow_commit": env["ACTUAL_WORKFLOW_COMMIT"],
+                    "run_id": env["ACTUAL_RUN_ID"], "run_attempt": env["ACTUAL_RUN_ATTEMPT"],
+                    "architecture": platform.machine(), "minimum_free_bytes": floor,
+                    "filesystems": {}, "metadata_verified": False, "metadata_requests": 0}
+          identity_ok = (env["ACTUAL_REPOSITORY"] == env["EXPECTED_REPOSITORY"]
+                         and env["ACTUAL_REF"] == env["EXPECTED_REF"]
+                         and env["ACTUAL_EVENT"] == "workflow_dispatch"
+                         and env["ACTUAL_WORKFLOW_REF"] == env["EXPECTED_REPOSITORY"]
+                         + "/.github/workflows/durable-e2e.yaml@" + env["EXPECTED_REF"])
+          if not identity_ok:
+              failures.append("unexpected_repository_ref_or_workflow")
+          if platform.system() != "Linux" or platform.machine() not in ("aarch64", "arm64"):
+              failures.append("unsupported_runner_architecture")
+          for label, key in (("runner_temp", "RUNNER_TEMP"), ("workspace", "GITHUB_WORKSPACE")):
+              try:
+                  usage = shutil.disk_usage(env[key])
+                  enough = usage.free >= floor
+                  report["filesystems"][label] = {"path": env[key], "free_bytes": usage.free,
+                                                   "total_bytes": usage.total, "at_least_32_gib_free": enough}
+                  if not enough:
+                      failures.append(label + "_below_32_gib")
+              except (KeyError, OSError):
+                  failures.append(label + "_disk_probe_unavailable")
+          if identity_ok and "unsupported_runner_architecture" not in failures:
+              endpoint = "repos/" + env["EXPECTED_REPOSITORY"] + "/actions/runs/" + env["EXPECTED_RUN"]
+              fields = "{id,head_sha,run_attempt,event,workflow_id,path,repository_id:.repository.id,head_repository_id:.head_repository.id,status,conclusion}"
+              try:
+                  report["metadata_requests"] = 1
+                  result = subprocess.run(["gh", "api", "--method", "GET", endpoint, "--jq", fields],
+                                          capture_output=True, timeout=20)
+                  if result.returncode or len(result.stdout) > 4096 or len(result.stderr) > 2048:
+                      failures.append("metadata_get_failed_or_output_exceeded_bound")
+                  else:
+                      meta = json.loads(result.stdout)
+                      report["metadata_verified"] = (isinstance(meta, dict)
+                          and meta.get("id") == int(env["EXPECTED_RUN"])
+                          and meta.get("head_sha") == env["EXPECTED_HEAD"]
+                          and meta.get("repository_id") == meta.get("head_repository_id") == int(env["EXPECTED_REPOSITORY_ID"])
+                          and meta.get("run_attempt") == 1 and meta.get("event") == "workflow_dispatch"
+                          and meta.get("workflow_id") == 333176895
+                          and meta.get("path") == ".github/workflows/durable-e2e.yaml")
+                      if report["metadata_verified"]:
+                          report["pinned_run"] = meta
+                      else:
+                          failures.append("metadata_source_repository_or_caller_mismatch")
+              except (FileNotFoundError, subprocess.TimeoutExpired, ValueError):
+                  failures.append("metadata_get_unavailable_timeout_or_invalid_json")
+          report["failures"] = failures
+          report["preflight_passed"] = not failures
+          print(json.dumps(report, sort_keys=True))
+          if failures:
+              raise SystemExit("runner preflight failed: " + ",".join(failures))
+          PY
