@@ -110,7 +110,7 @@ git -C ../tn-release rev-parse HEAD
 The tarball holds one directory, `telcoin-network-<TAG>-x86_64-unknown-linux-gnu/`, with `telcoin-network`, `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` in it.
 The `--version` output must include these lines:
 
-- `Version: X.Y.Z`, the tag without its leading `v` and without `-adiri` or `-rcN` (`Version: 0.17.0` for `v0.17.0-adiri`);
+- `Version: X.Y.Z` on the first line, after the program name, where `X.Y.Z` is the tag without its leading `v` and without `-adiri` or `-rcN` (`telcoin-network-cli Version: 0.17.0` for `v0.17.0-adiri`);
 - `Commit SHA:` followed by the commit that `git rev-parse` printed;
 - `Build Features:` containing `adiri` for an `-adiri` tag, and not containing it for any other tag.
 

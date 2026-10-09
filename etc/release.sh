@@ -919,7 +919,8 @@ check_version_output() {
     local ref=$1 out version sha features flist has_adiri=no
     out=$(docker run --rm --network none --platform linux/amd64 "$ref" telcoin --version) ||
         die 1 "$ref: telcoin --version failed"
-    version=$(printf '%s\n' "$out" | sed -n 's/^Version: //p')
+    # clap prints the program name before the first line: "telcoin-network-cli Version: X.Y.Z".
+    version=$(printf '%s\n' "$out" | sed -n 's/^\([^ ]* \)\{0,1\}Version: //p')
     sha=$(printf '%s\n' "$out" | sed -n 's/^Commit SHA: //p')
     features=$(printf '%s\n' "$out" | sed -n 's/^Build Features: //p')
     [ "$version" = "$VERSION" ] || die 1 "$ref reports 'Version: $version'; expected $VERSION"
