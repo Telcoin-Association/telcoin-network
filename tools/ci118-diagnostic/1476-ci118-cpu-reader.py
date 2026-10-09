@@ -300,10 +300,10 @@ def diagnose(metadata, archive):
         zipped, _ = base.inventory(archive)
         with zipped:
             members = {member.filename: member for member in zipped.infolist()}
-            candidates = [name for name in members if name == "candidate/evidence.json" or name.endswith("/candidate/evidence.json")]
-            require(len(candidates) <= 1, "multiple candidate/evidence.json members")
+            candidates = [name for name in members if name == "candidate-evidence/evidence.json" or name.endswith("/candidate-evidence/evidence.json")]
+            require(len(candidates) <= 1, "multiple candidate-evidence/evidence.json members")
             if not candidates:
-                return result | {"cpu_diagnostic_status": "missing", "reason": "candidate/evidence.json is absent"}
+                return result | {"cpu_diagnostic_status": "missing", "reason": "candidate-evidence/evidence.json is absent"}
             member = members[candidates[0]]
             raw = read_member(zipped, member, MAX_PHASE)
             phase = base.strict_json(raw)

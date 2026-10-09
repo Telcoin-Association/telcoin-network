@@ -91,8 +91,8 @@ jobs:
           pins = {
               "1476-ci118-remote-diagnostic-acquire.py": "3f0a1c989ee521461626b3e844da6cfe4bc67efbf8661a48b6f8d2989bdf38e0",
               "1476-ci118-remote-diagnostic-reader.py": "9407dcb7890ef678872486eda61ab6a16e0e2a65f8ae60e0ecfe58e34f9113ff",
-              "1476-ci118-cpu-reader.py": "274aa5a6af994f175fd36997b287fe8c640f433ba6ae17048bbd6f166487aed4",
-              "1476-ci118-cpu-test.py": "1211de8339e91a78db9729499bc8575ecf420c7c708a0a25cfb45e3981f73a33",
+              "1476-ci118-cpu-reader.py": "a751aee10b5a490235f6c1369a89ed295c3b908c85770bea1cb6c07c690ad458",
+              "1476-ci118-cpu-test.py": "298d7adbc61558933d8f719b7e01d16a89c48f0aa932657c722c6f84b1212bc9",
               "1476-ci118-remote-diagnostic-test.py": "7859166951654d6a1ad8725ab8d8def0579b43f9a4772a2c4fcc940a7cd41291",
               "1476-ci118-remote-diagnostic-artifact-metadata.json": "ad1ae221ede54300de425b5a99e5fde495c25e6cc5ea0db3ea6c83cb838000ba",
           }

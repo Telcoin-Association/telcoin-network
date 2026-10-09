@@ -64,8 +64,8 @@ def evidence_archive(value=None, rows=None, prefix="proof/"):
     raw = b"".join(json.dumps(row).encode() + b"\n" for row in rows)
     value["artifacts"] = [{"path": "telemetry-000.jsonl", "sha256": hashlib.sha256(raw).hexdigest()}]
     return previous.archive([(prefix + "report.json", json.dumps(ci_report()).encode()),
-                             (prefix + "candidate/evidence.json", json.dumps(value).encode()),
-                             (prefix + "candidate/telemetry-000.jsonl", raw)])
+                             (prefix + "candidate-evidence/evidence.json", json.dumps(value).encode()),
+                             (prefix + "candidate-evidence/telemetry-000.jsonl", raw)])
 
 
 class CpuTests(unittest.TestCase):
@@ -181,8 +181,8 @@ class CpuTests(unittest.TestCase):
         raw = b"".join(json.dumps(row).encode() + b"\n" for row in raw_rows(value))
         value["artifacts"] = [{"path": "telemetry-000.jsonl", "sha256": "0" * 64}]
         zipped = previous.archive([("report.json", json.dumps(previous.report()).encode()),
-                                   ("candidate/evidence.json", json.dumps(value).encode()),
-                                   ("candidate/telemetry-000.jsonl", raw)])
+                                   ("candidate-evidence/evidence.json", json.dumps(value).encode()),
+                                   ("candidate-evidence/telemetry-000.jsonl", raw)])
         self.invalid(self.diagnose(zipped), "artifact SHA256 mismatch")
 
     def test_raw_byte_and_line_bounds(self):
@@ -193,11 +193,11 @@ class CpuTests(unittest.TestCase):
     def test_missing_candidate_or_raw_is_explicit(self):
         result = self.diagnose(previous.archive())
         self.assertEqual(result["cpu_diagnostic_status"], "missing")
-        self.assertIn("candidate/evidence.json", result["reason"])
+        self.assertIn("candidate-evidence/evidence.json", result["reason"])
         value = phase()
         value["artifacts"] = [{"path": "telemetry-000.jsonl", "sha256": "0" * 64}]
         raw = previous.archive([("report.json", json.dumps(previous.report()).encode()),
-                                ("candidate/evidence.json", json.dumps(value).encode())])
+                                ("candidate-evidence/evidence.json", json.dumps(value).encode())])
         result = self.diagnose(raw)
         self.assertEqual(result["raw_telemetry"]["status"], "missing")
         self.assertEqual(result["cpu_diagnostic_status"], "incomplete")
@@ -249,6 +249,22 @@ class CpuTests(unittest.TestCase):
         self.assertEqual(result["cpu_diagnostic_status"], "inconsistent")
         self.assertEqual(result["report_cpu_attribution"]["reported_cpu_failure_hubs"], ["hub-1"])
         self.assertEqual(result["report_cpu_attribution"]["observed_cpu_breach_hubs"], [])
+
+    def test_canonical_phase_and_raw_paths_at_archive_root_or_prefix(self):
+        for prefix in ("", "qualification/"):
+            with self.subTest(prefix=prefix):
+                result = self.diagnose(evidence_archive(prefix=prefix))
+                self.assertEqual(result["cpu_diagnostic_status"], "present")
+                self.assertEqual(result["candidate_member"], prefix + "candidate-evidence/evidence.json")
+                self.assertEqual(result["raw_telemetry"]["segments"][0]["member"],
+                                 prefix + "candidate-evidence/telemetry-000.jsonl")
+
+    def test_incorrect_legacy_phase_directory_is_not_selected(self):
+        value = phase()
+        raw = previous.archive([("report.json", json.dumps(ci_report()).encode()),
+                                ("candidate/evidence.json", json.dumps(value).encode())])
+        result = self.diagnose(raw)
+        self.assertEqual(result["cpu_diagnostic_status"], "missing")
 
 
 if __name__ == "__main__":
