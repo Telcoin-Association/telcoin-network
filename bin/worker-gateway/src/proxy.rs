@@ -210,9 +210,7 @@ pub(crate) async fn proxy(
         Route::Query => None,
     };
 
-    match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
-        .await
-    {
+    match forward(&state, route, method, &headers, body.clone(), upstream_url.clone(), peer).await {
         Ok(response) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
@@ -283,12 +281,15 @@ fn hold_until_body_ends(response: Response, slot: telemetry::InFlightSlot) -> Re
 /// into an axum response, preserving the status, body, and content type.
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
-/// [`REDIRECT_HEADER`] toward the query upstream, never both.
+/// [`REDIRECT_HEADER`] toward the query upstream, never both. The query route
+/// also gets its own deadline (`--query-request-timeout`) in place of the
+/// client's, so a stalled query upstream frees its slots sooner; the worker
+/// route keeps the client's `--upstream-request-timeout`.
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
-    client: &Client,
+    state: &AppState,
     route: Route,
     method: Method,
     headers: &HeaderMap,
@@ -307,15 +308,21 @@ async fn forward(
         Route::Query => REDIRECT_HEADER,
     };
 
-    let upstream = client
+    let request = state
+        .http
         .request(method, upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
         .header(X_FORWARDED_FOR, forwarded_for(headers, peer))
         .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
-        .body(body)
-        .send()
-        .await?;
+        .body(body);
+    // a per-request timeout replaces the client's total timeout for this
+    // request only
+    let request = match (route, state.query_request_timeout) {
+        (Route::Query, Some(timeout)) => request.timeout(timeout),
+        _ => request,
+    };
+    let upstream = request.send().await?;
 
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();

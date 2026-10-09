@@ -69,6 +69,9 @@ pub(crate) struct AppState {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers. It is not readiness-gated.
     pub(crate) query_upstream: Option<Url>,
+    /// Per-request deadline on the query route (`--query-request-timeout`), or
+    /// `None` when it follows the client's own (`--upstream-request-timeout`).
+    pub(crate) query_request_timeout: Option<Duration>,
     /// In-flight cap for requests made only of submissions
     /// (`--max-inflight-submissions`); see [`inflight_slots`].
     pub(crate) submission_slots: Arc<Semaphore>,
@@ -396,6 +399,7 @@ mod tests {
             readiness: Arc::new(GatewayReadiness::new(upstreams)),
             http: client,
             query_upstream: None,
+            query_request_timeout: None,
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -988,6 +992,7 @@ mod tests {
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+            query_request_timeout: None,
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -1612,5 +1617,52 @@ mod tests {
             assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         }
         assert!(worker.peak.load(Ordering::SeqCst) <= 2);
+    }
+
+    /// A mock upstream that answers `name` after `delay`.
+    async fn slow_mock(name: &'static str, delay: Duration) -> (SocketAddr, Notifier) {
+        spawn(Router::new().route(
+            "/",
+            post(move || async move {
+                tokio::time::sleep(delay).await;
+                name
+            }),
+        ))
+        .await
+    }
+
+    #[tokio::test]
+    async fn query_route_times_out_at_query_request_timeout() {
+        // both upstreams take 1s; the client's own deadline is 5s
+        let (worker, _worker) = slow_mock("worker", Duration::from_secs(1)).await;
+        let (query, _query) = slow_mock("query", Duration::from_secs(1)).await;
+        let mut state = redirect_state(worker, Some(query));
+        state.query_request_timeout = Some(Duration::from_millis(200));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // without the query deadline the read would get the late answer after
+        // 1s; with it the read times out after about 200ms
+        let client = Client::new();
+        let started = tokio::time::Instant::now();
+        let response = client
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 4))
+            .send()
+            .await
+            .expect("send");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+        let text = response.text().await.expect("text");
+        assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(4)));
+        assert!(
+            elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(1),
+            "the read timed out after {elapsed:?}"
+        );
+
+        // the worker route keeps the client's 5s deadline, so the slow
+        // submission still gets its answer
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 5)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
     }
 }

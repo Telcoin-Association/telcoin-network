@@ -88,8 +88,9 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_connect_timeout: Duration,
 
-    /// Overall per-request deadline when forwarding to an upstream: a worker, or
-    /// the `--redirect-queries` endpoint.
+    /// Overall per-request deadline when forwarding to an upstream: a worker,
+    /// or the `--redirect-queries` endpoint when `--query-request-timeout` is
+    /// `0`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
@@ -97,6 +98,19 @@ pub(crate) struct Cli {
         value_parser = humantime::parse_duration
     )]
     pub(crate) upstream_request_timeout: Duration,
+
+    /// Overall per-request deadline when forwarding to the `--redirect-queries`
+    /// endpoint (default 10s; `0` disables it, and the query route then uses
+    /// `--upstream-request-timeout`). A stalled query upstream frees each read's
+    /// slot this soon, while submissions keep the longer worker deadline. With
+    /// `--redirect-queries` set it must not exceed `--upstream-request-timeout`.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT",
+        default_value = "10s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) query_request_timeout: Duration,
 
     /// How long a new connection may take to send its complete request headers
     /// before it is disconnected (slow-loris guard).
@@ -276,6 +290,9 @@ pub(crate) struct Settings {
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
     pub(crate) upstream_request_timeout: Duration,
+    /// Per-request deadline on the query route, or `None` when it follows the
+    /// upstream per-request deadline.
+    pub(crate) query_request_timeout: Option<Duration>,
     /// Inbound header read deadline (slow-loris guard).
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
@@ -325,6 +342,20 @@ impl Cli {
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
             .transpose()?;
+        let query_request_timeout = resolve_optional_duration(self.query_request_timeout);
+        // the query deadline exists to shorten the query route; one longer than
+        // the worker's would not, and could outlast the whole-request deadline
+        // built from `--upstream-request-timeout`. without a redirect the flag
+        // is unused, so it is not checked.
+        if let Some(query_timeout) = query_request_timeout.filter(|_| query_upstream.is_some()) {
+            eyre::ensure!(
+                query_timeout <= self.upstream_request_timeout,
+                "--query-request-timeout ({}) exceeds --upstream-request-timeout ({}); lower it, \
+                 or set it to 0 so the query route uses --upstream-request-timeout",
+                humantime::format_duration(query_timeout),
+                humantime::format_duration(self.upstream_request_timeout),
+            );
+        }
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
@@ -387,6 +418,7 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
+            query_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
             max_inflight_submissions: self.max_inflight_submissions,
@@ -911,6 +943,43 @@ mod tests {
             let settings = cli_with_flags(&[flag.as_str()]).into_settings()?;
             assert_eq!(settings.query_upstream, Some(Url::parse(url)?), "{url}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn query_timeout_above_upstream_timeout_is_rejected_at_startup() -> eyre::Result<()> {
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        let result = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=6s",
+        ])
+        .into_settings();
+        assert!(result.is_err(), "a query deadline above the worker's must fail startup");
+        // the 10s default is above a 5s worker deadline too
+        let result = cli_with_flags(&[redirect, "--upstream-request-timeout=5s"]).into_settings();
+        assert!(result.is_err(), "the default query deadline must still be checked");
+
+        // the boundary, the default, and the disabled sentinel are accepted
+        let settings = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=5s",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(5)));
+        let settings = cli_with_flags(&[redirect]).into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(10)));
+        let settings = cli_with_flags(&[
+            redirect,
+            "--upstream-request-timeout=5s",
+            "--query-request-timeout=0",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.query_request_timeout, None);
+
+        // without a redirect the flag is unused and not checked
+        cli_with_flags(&["--upstream-request-timeout=5s"]).into_settings()?;
         Ok(())
     }
 
