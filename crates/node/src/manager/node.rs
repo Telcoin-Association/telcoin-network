@@ -2441,20 +2441,36 @@ mod tests {
     where
         P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
     {
+        reth_config_and_db_with_rpc_port(config, committee, datadir, None)
+    }
+
+    /// Write `committee` as the genesis committee file and open a reth database under `datadir`.
+    /// A fixed `http_port` pins the HTTP port that worker RPC ports derive from; without one,
+    /// reth chooses unused RPC ports for testing.
+    pub(super) fn reth_config_and_db_with_rpc_port<P>(
+        config: &tn_config::Config,
+        committee: &tn_types::Committee,
+        datadir: &P,
+        http_port: Option<u16>,
+    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
+    where
+        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
+    {
         use tn_config::{Config, ConfigFmt, ConfigTrait as _};
         use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
 
         tn_reth::init_reth_defaults();
         Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
+        let rpc = RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
         let node_config = RethConfig::new(
             RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+                rpc: RpcServerArgs { http_port: http_port.unwrap_or(rpc.http_port), ..rpc },
                 txpool: Default::default(),
                 db: Default::default(),
             },
             None,
             datadir,
-            true,
+            http_port.is_none(),
             std::sync::Arc::new(config.chain_spec()),
         );
         let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
