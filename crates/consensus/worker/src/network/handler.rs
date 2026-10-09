@@ -164,9 +164,13 @@ where
                 // bodies for the epochs it is missing inside the epoch packs / consensus output
                 // it syncs (`crates/state-sync`), not through a later per-batch fetch.
                 ensure!(my_epoch == epoch, WorkerNetworkError::BatchEpochMismatch(epoch, my_epoch));
-                // Since we are precaching Batches for the current epoch we only need to check if it
-                // is in the local cache. There should not have been an opertunity
-                // for it to be in the consensus chain yet.
+                // Gossip normally arrives before the batch is committed, so only the cache is
+                // checked. A late gossip for a batch that is already committed and evicted
+                // refetches it and caches it again until the epoch ends, at most once per digest.
+                // `WorkerNetwork` holds the consensus chain and could pass it into this call, as
+                // it already does for sync streams, to also check the pack with
+                // `ConsensusChain::contains_current_batch`. That check is left out because it
+                // would add a pack-actor round trip to every first-arrival gossip.
                 if !matches!(
                     get_batch_local_cache(batch_hash, self.consensus_config.node_storage(),),
                     Ok(Some(_))
