@@ -896,6 +896,21 @@ impl PeerManagerMetrics {
         .increment(1);
     }
 
+    /// Record a source-budget denial by direction ({`in`, `out`}) and reason.
+    pub(crate) fn record_source_admission_denied(
+        &self,
+        direction: &'static str,
+        reason: &'static str,
+    ) {
+        metrics::counter!(
+            "tn_network.source_admission_denied_total",
+            "network" => self.network.clone(),
+            "direction" => direction,
+            "reason" => reason,
+        )
+        .increment(1);
+    }
+
     /// Record a closed connection.
     pub(crate) fn record_connection_closed(&self) {
         self.handles.connections_closed_total.increment(1);
@@ -913,11 +928,11 @@ impl PeerManagerMetrics {
 
     /// Record an application-layer penalty by severity.
     pub(crate) fn record_penalty(&self, penalty: &Penalty) {
-        let severity = match penalty {
-            Penalty::Mild => "mild",
-            Penalty::Medium => "medium",
-            Penalty::Severe => "severe",
-            Penalty::Fatal => "fatal",
+        let severity = match penalty.severity() {
+            crate::peers::Severity::Mild => "mild",
+            crate::peers::Severity::Medium => "medium",
+            crate::peers::Severity::Severe => "severe",
+            crate::peers::Severity::Fatal => "fatal",
         };
         metrics::counter!(
             "tn_network.peer_penalties_total",

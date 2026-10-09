@@ -13,9 +13,13 @@ use crate::{
     metrics::PeerManagerMetrics,
     peers::status::ConnectionStatus,
     send_or_log_error,
+    source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
     types::{NetworkInfo, NetworkResult, RpcInfo},
 };
-use libp2p::{core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, Multiaddr, PeerId};
+use libp2p::{
+    core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
+    PeerId,
+};
 use rand::seq::IteratorRandom as _;
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
@@ -152,6 +156,8 @@ pub(crate) struct PeerManager {
     local_peer_id: PeerId,
     /// Config
     config: PeerConfig,
+    /// Leases owned by this swarm using optional process-wide source accounting.
+    source_connections: SourceConnections,
     /// The interval to perform maintenance.
     heartbeat: tokio::time::Interval,
     /// Last scheduled committee refresh, independent of cache presence and dial state.
@@ -270,6 +276,42 @@ pub(crate) struct PeerManager {
 }
 
 impl PeerManager {
+    /// Install a shared budget before any swarm is polled.
+    pub(crate) fn set_source_budget(&mut self, budget: Option<SourceAdmissionBudget>) {
+        self.source_connections.set_budget(budget);
+    }
+
+    /// Forward swarm lifecycle events to the connection lease owner.
+    pub(crate) fn on_source_swarm_event(&mut self, event: &libp2p::swarm::FromSwarm<'_>) {
+        self.source_connections.on_swarm_event(event);
+    }
+
+    /// Reserve source occupancy at the authenticated established-connection boundary.
+    ///
+    /// Every denial is counted and logged. The importance signal is computed here so that
+    /// a later protected-capacity policy can use it; today important peers are only
+    /// logged at a higher level.
+    pub(crate) fn reserve_source(
+        &mut self,
+        connection: ConnectionId,
+        peer: PeerId,
+        address: &Multiaddr,
+        direction: &'static str,
+    ) -> Result<(), libp2p::swarm::ConnectionDenied> {
+        let important = self.peer_is_important(&peer);
+        self.source_connections.reserve(connection, peer, address).map_err(|error| {
+            self.metrics.record_source_admission_denied(direction, error.label());
+            if matches!(error, AdmissionError::Poisoned) {
+                error!(target: "peer-manager", %error, "source admission accounting poisoned");
+            } else if important {
+                warn!(target: "peer-manager", ?peer, direction, %error, "source budget refused important peer");
+            } else {
+                debug!(target: "peer-manager", ?peer, direction, %error, "source budget refused connection");
+            }
+            libp2p::swarm::ConnectionDenied::new(error)
+        })
+    }
+
     /// Create a new instance of Self.
     pub(crate) fn new(
         local_peer_id: PeerId,
@@ -293,6 +335,7 @@ impl PeerManager {
         Self {
             local_peer_id,
             config: *config,
+            source_connections: SourceConnections::default(),
             heartbeat,
             last_committee_refresh: Instant::now(),
             peers,
@@ -313,7 +356,8 @@ impl PeerManager {
 
     /// Explicitly add a "trusted" peer and dial it.
     ///
-    /// These peers are considered "trusted" and do not receive penalties.
+    /// These peers retain connections under population pressure and bypass load scoring.
+    /// Protocol and cryptographic violations remain eligible for penalties and bans.
     /// This does not unban ips and should only be called during initialization.
     pub(crate) fn add_trusted_peer_and_dial(
         &mut self,
@@ -843,15 +887,11 @@ impl PeerManager {
             return;
         }
 
-        // filter peers that are validators
+        // Retention protection does not exempt any peer from protocol bans or resource budgets.
         let ready_to_prune = connected_peers
             .iter()
-            .filter_map(|(peer_id, peer)| {
-                if !self.is_peer_validator(peer_id) && !peer.is_operator_allowlisted() {
-                    Some(*peer_id)
-                } else {
-                    None
-                }
+            .filter_map(|(peer_id, _)| {
+                (!self.peer_policy(peer_id).protects_retention()).then_some(*peer_id)
             })
             .collect::<Vec<_>>();
 
@@ -935,10 +975,22 @@ impl PeerManager {
         self.peers.get_peer(peer_id).map(|peer| peer.score().aggregate_score())
     }
 
-    /// Bool indicating if the peer is operator-allowlisted or a validator.
+    /// Derive independent privileges from live committee membership and operator configuration.
+    ///
+    /// Bootstrap and explicitly configured discovery peers gain admission eligibility alone.
+    /// Operator allowlisting remains sticky; committee privileges expire with the last slot.
+    pub(super) fn peer_policy(&self, peer_id: &PeerId) -> super::policy::PeerPolicy {
+        let policy = self.peers.peer_policy(peer_id);
+        self.peer_to_bls(peer_id)
+            .filter(|key| self.pinned_peers.contains(key))
+            .map_or(policy, |_| policy.grant(super::policy::TrustBasis::Bootstrap))
+    }
+
+    /// Whether retention policy protects this peer from population pruning and mesh treatment.
     pub(crate) fn peer_is_important(&self, peer_id: &PeerId) -> bool {
-        self.is_peer_validator(peer_id)
-            || self.peers.get_peer(peer_id).map(|p| p.is_operator_allowlisted()).unwrap_or_default()
+        let policy = self.peer_policy(peer_id);
+        trace!(target: "peer-manager", ?peer_id, admission=?policy.admission(), ?policy, "peer privileges");
+        policy.protects_retention()
     }
 
     /// Set the previous/current/next committees directly from authoritative state, every epoch.

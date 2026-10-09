@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     common::{create_multiaddr, random_ip_addr},
     consensus::partial_peers_from_get_closest_timeout,
+    LoadPenalty,
 };
 use assert_matches::assert_matches;
 use libp2p::{
@@ -328,6 +329,7 @@ async fn test_register_disconnected_with_banned_peer() {
     assert!(peer_manager.peer_banned(&peer_id), "Peer should remain banned after disconnection");
 }
 
+/// Trusted peers bypass load penalties but remain eligible for protocol bans.
 #[tokio::test]
 async fn test_add_trusted_peer() {
     let config = ScoreConfig::default();
@@ -361,11 +363,14 @@ async fn test_add_trusted_peer() {
     assert_eq!(dial_request.peer_id, peer_id);
     assert_eq!(dial_request.multiaddrs, vec![multiaddr]);
 
-    // assert penalty doesn't affect trusted peer
-    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    // Load penalties do not affect a trusted peer's score or ban status.
+    peer_manager.process_penalty(peer_id, Penalty::Load(LoadPenalty::Timeout));
     assert!(!peer_manager.peer_banned(&peer_id));
-    let score = peer_manager.peer_score(&peer_id).unwrap();
-    assert_eq!(score, config.max_score);
+    assert_eq!(peer_manager.peer_score(&peer_id), Some(config.max_score));
+
+    // Protocol violations can still ban a trusted peer.
+    peer_manager.process_penalty(peer_id, Penalty::Fatal);
+    assert!(peer_manager.peer_banned(&peer_id));
 }
 
 #[tokio::test]
@@ -3198,4 +3203,64 @@ async fn test_kad_rate_windows_hard_cap_preserves_live_budgets() {
     let newcomer = PeerId::random();
     assert_eq!(peer_manager.put_record_rate_limited(newcomer), PutRecordRate::Allowed);
     assert!(!peer_manager.add_provider_rate_limited(newcomer));
+}
+
+/// A source-budget denial is counted with its direction and reason.
+#[tokio::test]
+async fn test_source_admission_denial_metric_records_reason() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use serde::Deserialize as _;
+
+    // One connection per peer, room for two everywhere else: the second lease is `PeerFull`.
+    let fields = [
+        ("max_connections", 2u64),
+        ("max_connections_per_peer", 1),
+        ("max_connections_per_address", 2),
+        ("max_connections_per_prefix", 2),
+        ("max_sources", 2),
+        ("ipv4_prefix_length", 24),
+        ("ipv6_prefix_length", 64),
+    ];
+    let config =
+        tn_config::SourceAdmissionConfig::deserialize(serde::de::value::MapDeserializer::<
+            _,
+            serde::de::value::Error,
+        >::new(fields.into_iter()))
+        .expect("valid source limits");
+    let endpoint = libp2p::Multiaddr::empty()
+        .with(libp2p::multiaddr::Protocol::Ip4(std::net::Ipv4Addr::new(192, 0, 2, 1)))
+        .with(libp2p::multiaddr::Protocol::Udp(9000))
+        .with(libp2p::multiaddr::Protocol::QuicV1);
+    let peer = PeerId::random();
+
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut peer_manager = create_test_peer_manager(None);
+        let budget = crate::source_admission::SourceAdmissionBudget::new(&config)
+            .expect("valid source budget");
+        peer_manager.set_source_budget(Some(budget));
+        assert!(peer_manager
+            .reserve_source(ConnectionId::new_unchecked(1), peer, &endpoint, "in")
+            .is_ok());
+        assert!(peer_manager
+            .reserve_source(ConnectionId::new_unchecked(2), peer, &endpoint, "in")
+            .is_err());
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let denied = snapshot
+        .iter()
+        .find(|(key, ..)| {
+            key.key().name() == "tn_network.source_admission_denied_total"
+                && key.key().labels().any(|l| l.key() == "direction" && l.value() == "in")
+                && key.key().labels().any(|l| l.key() == "reason" && l.value() == "peer_full")
+        })
+        .map(|(_, _, _, value)| match value {
+            DebugValue::Counter(c) => *c,
+            DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                panic!("source admission denial metric must be a counter")
+            }
+        });
+    assert_eq!(denied, Some(1));
 }

@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
+    SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -34,6 +34,9 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
     ///
     /// Network readiness is sampled continuously and no longer delays epoch startup.
@@ -155,6 +158,11 @@ impl fmt::Display for CommitteePeerError {
 impl std::error::Error for CommitteePeerError {}
 
 impl NetworkConfig {
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
+    }
+
     /// Return the local launch inventory. Membership remains derived from chain state.
     pub fn committee_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.committee_peers
@@ -604,7 +612,8 @@ pub struct SyncConfig {
     /// - Beyond this tolerance but within this tolerance plus [`crate::Parameters::vote_timeout`],
     ///   it answers with a retryable response and charges no penalty. The proposer retries the
     ///   request, and by then the lead may be back within tolerance.
-    /// - Further ahead, it rejects the header and penalizes the proposer.
+    /// - Further ahead, it rejects the header without a score penalty. Clock skew may be local to
+    ///   either peer, so rejecting the header must not prevent recovery through that peer.
     ///
     /// Defaults to 250 ms, and [`NetworkConfig::read_config`] logs a warning for values above one
     /// second.

@@ -10,7 +10,7 @@ use crate::{
         ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
         SwarmMetrics,
     },
-    peers::{self, PeerEvent, PeerManager, Penalty, PutRecordRate},
+    peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
@@ -754,11 +754,14 @@ where
                 continue;
             }
             behavior.peer_manager.add_restored_peer(key, info);
-            kad_store.record_timestamp(&crate::kad::node_record_key(&key)).into_iter().for_each(
-                |timestamp| {
+            behavior
+                .kademlia
+                .store_mut()
+                .record_timestamp(&crate::kad::node_record_key(&key))
+                .into_iter()
+                .for_each(|timestamp| {
                     behavior.peer_manager.restore_record_timestamp(key, timestamp);
-                },
-            );
+                });
             restored += 1;
         }
         if restored > 0 {
@@ -850,6 +853,19 @@ where
     /// Return a [NetworkHandle] to send commands to this network.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
         NetworkHandle::new(self.handle.clone())
+    }
+
+    /// Attach the process-wide source budget before starting the swarm.
+    ///
+    /// Pass clones of the same instance to the primary and every worker. The budget
+    /// charges only established QUIC endpoints, after the authenticated handshake.
+    #[must_use]
+    pub fn with_source_admission_budget(
+        mut self,
+        budget: Option<crate::source_admission::SourceAdmissionBudget>,
+    ) -> Self {
+        self.swarm.behaviour_mut().peer_manager.set_source_budget(budget);
+        self
     }
 
     /// Configure ordered externally reachable endpoints independently of the swarm's listeners.
@@ -1208,6 +1224,7 @@ where
                         },
                         reply,
                     );
+                    self.refresh_explicit_peers();
                     self.query_missing_required_records();
                 } else {
                     let _ = reply.send(admission);
@@ -1460,6 +1477,7 @@ where
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
                 let members = self.swarm.behaviour().peer_manager.committee_members();
                 self.committee_record_attempts.retain(|key, _| members.contains(key));
+                self.refresh_explicit_peers();
                 self.query_missing_required_records();
                 retention?;
             }
@@ -1527,6 +1545,27 @@ where
         }
 
         Ok(())
+    }
+
+    /// Reconcile gossip mesh privileges for connected peers after committee rotation.
+    ///
+    /// Operator trust survives rotation; committee protection ends when the final slot expires.
+    fn refresh_explicit_peers(&mut self) {
+        let peers: Vec<_> = self.swarm.connected_peers().copied().collect();
+        peers.iter().for_each(|peer| self.refresh_explicit_peer(peer));
+    }
+
+    /// Reconcile one connected peer's mesh privileges after discovery, trust changes, or a ban.
+    fn refresh_explicit_peer(&mut self, peer: &PeerId) {
+        let manager = &self.swarm.behaviour().peer_manager;
+        let protected = self.swarm.is_connected(peer)
+            && manager.peer_is_important(peer)
+            && !manager.peer_banned(peer);
+        if protected {
+            self.swarm.behaviour_mut().gossipsub.add_explicit_peer(peer);
+        } else {
+            self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(peer);
+        }
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already
@@ -1678,7 +1717,10 @@ where
             }
             GossipEvent::SlowPeer { peer_id, failed_messages } => {
                 trace!(target: "network", topics=?self.authorized_publishers.keys(), ?peer_id, ?failed_messages, "gossipsub event - slow peer");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(peer_id, Penalty::Mild);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(peer_id, Penalty::Load(LoadPenalty::SlowPeer));
             }
         }
 
@@ -1821,7 +1863,7 @@ where
                         self.swarm
                             .behaviour_mut()
                             .peer_manager
-                            .process_penalty(peer, Penalty::Mild);
+                            .process_penalty(peer, Penalty::Load(LoadPenalty::Timeout));
                     }
                     // Not penalized. Failing to negotiate a common protocol is honest
                     // version/role skew (the peer runs a different/older/role-distinct
@@ -2396,6 +2438,7 @@ where
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");
+                self.swarm.behaviour_mut().gossipsub.remove_explicit_peer(&peer_id);
                 // blacklist gossipsub
                 self.swarm.behaviour_mut().gossipsub.blacklist_peer(&peer_id);
                 // remove from kad routing table
@@ -2737,7 +2780,10 @@ where
         match self.swarm.behaviour_mut().peer_manager.put_record_rate_limited(source) {
             PutRecordRate::Flooding => {
                 debug!(target: "network-kad", ?source, "put record flood: penalizing source");
-                self.swarm.behaviour_mut().peer_manager.process_penalty(source, Penalty::Severe);
+                self.swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .process_penalty(source, Penalty::Load(LoadPenalty::KademliaFlood));
                 Ok(PutOutcome::Processed)
             }
             PutRecordRate::Shed => {
@@ -2851,7 +2897,8 @@ where
     /// costs a row decode, merge, re-encode, insert, and a physical MDBX commit,
     /// and repeating `AddProvider` for an already-stored key skips the store's
     /// capacity gate, so an unbounded stream would run that work at line rate;
-    /// over-budget messages are dropped with a [`Penalty::Medium`]. Second, the
+    /// over-budget messages are dropped with `Penalty::Load(LoadPenalty::KademliaRateLimit)`
+    /// at Medium weight. Second, the
     /// expected capacity rejection is logged at `debug!` and never propagated:
     /// once the provider table saturates, `MaxProvidedKeys` is remotely
     /// triggerable, so propagating it would amplify a flood in the run-loop's
@@ -2870,7 +2917,7 @@ where
             if self.swarm.behaviour_mut().peer_manager.add_provider_rate_limited(provider) {
                 trace!(target: "network-kad", ?provider, "rate limiting inbound add provider");
                 self.metrics.record_add_provider_rate_limited();
-                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Medium);
+                self.swarm.behaviour_mut().peer_manager.process_penalty(provider, Penalty::Load(LoadPenalty::KademliaRateLimit));
             } else {
                 self.swarm.behaviour_mut().kademlia.store_mut().add_provider(record).unwrap_or_else(
                     |error| match error {
@@ -3044,6 +3091,7 @@ where
             })
             .into_iter()
             .for_each(|(key, node_record, timestamp)| {
+                let peer: PeerId = node_record.info.pubkey.clone().into();
                 let member =
                     self.swarm.behaviour().peer_manager.committee_members().contains(&key);
                 let previous_rpc = self.swarm.behaviour().peer_manager.get_rpc(&key);
@@ -3059,6 +3107,7 @@ where
                 if member && previous_rpc != current_rpc {
                     self.metrics.record_committee_refresh("rpc_updated");
                 }
+                self.refresh_explicit_peer(&peer);
             });
     }
 }
