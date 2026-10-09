@@ -38,6 +38,8 @@ pub(super) enum PeerIdentity {
 /// Events for the `PeerManager`.
 #[derive(Debug)]
 pub(crate) enum PeerEvent {
+    /// Reconcile gossip pins against the latest policy and verified identity mappings.
+    ReconcileExplicitPeers,
     /// Connected with peer.
     PeerConnected(PeerId, Multiaddr),
     /// Peer was disconnected.

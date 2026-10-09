@@ -995,15 +995,19 @@ async fn test_unsupported_protocol_does_not_penalize() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Gossip delivery survives live committee rotation and independent configured-reason removal.
 #[tokio::test]
 async fn test_publish_to_one_peer() -> eyre::Result<()> {
     // start honest cvv network
     let TestTypes { peer1, peer2, .. } =
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
-    let NetworkPeer { config: config_1, network_handle: cvv, network, .. } = peer1;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    let NetworkPeer {
+        config: config_1,
+        network_handle: cvv,
+        network_events: mut cvv_network_events,
+        network,
+    } = peer1;
+    drop(tokio::spawn(async move { network.run().await }));
 
     // start honest nvv network
     let NetworkPeer {
@@ -1012,23 +1016,65 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
         network_events: mut nvv_network_events,
         network,
     } = peer2;
-    tokio::spawn(async move {
-        network.run().await.expect("network run failed!");
-    });
+    drop(tokio::spawn(async move { network.run().await }));
 
     // start swarm listening on default any address
     cvv.start_listening(config_1.primary_address()).await?;
     nvv.start_listening(config_2.primary_address()).await?;
-    let cvv_addr = cvv.listeners().await?.first().expect("peer2 listen addr").clone();
+    let cvv_addr = cvv
+        .listeners()
+        .await?
+        .first()
+        .cloned()
+        .ok_or_else(|| eyre!("publisher has no listener"))?;
 
     // subscribe
     nvv.subscribe_with_publishers(TEST_TOPIC.into(), config_1.committee_pub_keys()).await?;
 
     // dial cvv
-    nvv.add_trusted_peer_and_dial(
-        config_1.key_config().primary_public_key(),
-        config_1.key_config().primary_network_public_key(),
-        cvv_addr,
+    let cvv_bls = config_1.key_config().primary_public_key();
+    let cvv_net = config_1.key_config().primary_network_public_key();
+    let cvv_id: PeerId = cvv_net.clone().into();
+    nvv.add_trusted_peer_and_dial(cvv_bls, cvv_net.clone(), cvv_addr.clone()).await?;
+
+    // A live connection is pinned once its signed record upgrades the configuration hint.
+    let handle = &nvv;
+    wait_until(
+        Duration::from_secs(5),
+        "verified trusted peer receives a gossip pin",
+        move || async move { Ok(handle.explicit_peers().await? == HashSet::from([cvv_id])) },
+    )
+    .await?;
+    nvv.add_explicit_peer(cvv_bls, cvv_net, cvv_addr).await?;
+    nvv.update_committees(HashSet::new(), HashSet::from([cvv_bls]), HashSet::new()).await?;
+    nvv.update_committees(HashSet::from([cvv_bls]), HashSet::new(), HashSet::new()).await?;
+    nvv.update_committees(HashSet::new(), HashSet::new(), HashSet::new()).await?;
+    nvv.remove_configured_peer(cvv_bls, crate::ConfiguredPeerKind::Trusted).await?;
+    assert_eq!(nvv.explicit_peers().await?, HashSet::from([cvv_id]));
+
+    // The required peer also subscribes, exercising explicit-peer delivery from nvv to cvv.
+    let nvv_bls = config_2.key_config().primary_public_key();
+    let nvv_id: PeerId = config_2.key_config().primary_network_public_key().into();
+    cvv.subscribe_with_publishers(TEST_TOPIC.into(), HashSet::from([nvv_bls])).await?;
+    cvv.update_committees(HashSet::new(), HashSet::from([nvv_bls]), HashSet::new()).await?;
+    let publisher = &nvv;
+    let receiver = &cvv;
+    wait_until(
+        Duration::from_secs(5),
+        "both signed mappings and subscription are ready",
+        move || async move {
+            let (peers, pins) = tokio::join!(publisher.all_peers(), receiver.explicit_peers());
+            peers
+                .and_then(|peers| {
+                    pins.map(|pins| {
+                        pins == HashSet::from([nvv_id])
+                            && peers.get(&cvv_id).is_some_and(|topics| {
+                                topics.contains(&TopicHash::from_raw(TEST_TOPIC))
+                            })
+                    })
+                })
+                .map_err(Into::into)
+        },
     )
     .await?;
 
@@ -1059,15 +1105,33 @@ async fn test_publish_to_one_peer() -> eyre::Result<()> {
 
     // publish correct message and wait to receive
     let _message_id = cvv.publish(TEST_TOPIC.into(), expected_result.clone()).await?;
-    let event =
-        timeout(Duration::from_secs(2), nvv_network_events.recv()).await?.expect("batch received");
+    let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
+        .await?
+        .ok_or_else(|| eyre!("network event channel closed"))?;
 
     // assert gossip message
-    if let NetworkEvent::Gossip(gossip) = event {
-        assert_eq!(gossip.message.data, expected_result);
-    } else {
-        panic!("unexpected network event received");
-    }
+    assert_matches!(event, NetworkEvent::Gossip(gossip) if gossip.message.data == expected_result);
+
+    let reverse_message = [expected_result.clone(), vec![1]].concat();
+    nvv.publish(TEST_TOPIC.into(), reverse_message.clone()).await?;
+    let event = timeout(Duration::from_secs(2), cvv_network_events.recv())
+        .await?
+        .ok_or_else(|| eyre!("publisher event channel closed"))?;
+    assert_matches!(event, NetworkEvent::Gossip(gossip) if gossip.message.data == reverse_message);
+
+    nvv.remove_configured_peer(cvv_bls, crate::ConfiguredPeerKind::Explicit).await?;
+    let handle = &nvv;
+    wait_until(Duration::from_secs(5), "obsolete explicit peer is removed", move || async move {
+        Ok(handle.explicit_peers().await?.is_empty())
+    })
+    .await?;
+    // Removing a pin leaves the live connection usable for ordinary gossip delivery.
+    let second_message = [expected_result, vec![0]].concat();
+    cvv.publish(TEST_TOPIC.into(), second_message.clone()).await?;
+    let event = timeout(Duration::from_secs(2), nvv_network_events.recv())
+        .await?
+        .ok_or_else(|| eyre!("network event channel closed"))?;
+    assert_matches!(event, NetworkEvent::Gossip(gossip) if gossip.message.data == second_message);
 
     Ok(())
 }

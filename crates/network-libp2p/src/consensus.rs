@@ -1267,6 +1267,10 @@ where
                 let result = self.swarm.behaviour_mut().peer_manager.seed_committee_peers(peers);
                 let _ = reply.send(result);
             }
+            NetworkCommand::RemoveConfiguredPeer { bls_pubkey, kind, reply } => {
+                self.swarm.behaviour_mut().peer_manager.remove_configured_peer(bls_pubkey, kind);
+                let _ = reply.send(Ok(()));
+            }
             NetworkCommand::Dial { peer_id, peer_addr, reply } => {
                 self.swarm.behaviour_mut().peer_manager.dial_peer(
                     peer_id,
@@ -1361,6 +1365,10 @@ where
                     .collect();
 
                 send_or_log_error!(reply, collection, "AllPeers");
+            }
+            #[cfg(test)]
+            NetworkCommand::ExplicitPeers { reply } => {
+                let _ = reply.send(self.swarm.behaviour().peer_manager.explicit_peer_ids());
             }
             NetworkCommand::MeshPeers { topic, reply } => {
                 let topic: IdentTopic = Topic::new(&topic);
@@ -2405,11 +2413,19 @@ where
 
                 // manage connected peers for
                 self.connected_peers.push_back(peer_id);
-
-                // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
-                if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
-                    self.swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
-                }
+            }
+            PeerEvent::ReconcileExplicitPeers => {
+                let behaviour = self.swarm.behaviour_mut();
+                behaviour.peer_manager.reconcile_explicit_peers().into_iter().for_each(|change| {
+                    match change {
+                        crate::peers::MeshPeerChange::Remove(peer) => {
+                            behaviour.gossipsub.remove_explicit_peer(&peer);
+                        }
+                        crate::peers::MeshPeerChange::Add(peer) => {
+                            behaviour.gossipsub.add_explicit_peer(&peer);
+                        }
+                    }
+                });
             }
             PeerEvent::Banned(peer_id) => {
                 warn!(target: "network", ?peer_id, "peer banned");

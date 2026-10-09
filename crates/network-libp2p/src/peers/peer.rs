@@ -516,6 +516,16 @@ impl Peer {
         self.operator_allowlisted
     }
 
+    /// Grant operator trust without replacing the live connection or its identity.
+    pub(super) fn grant_operator_trust(&mut self) {
+        self.operator_allowlisted = true;
+    }
+
+    /// Revoke operator trust while leaving committee membership to the live committee policy.
+    pub(super) fn revoke_operator_trust(&mut self) {
+        self.operator_allowlisted = false;
+    }
+
     /// Extract relevant information for peer exchange.
     pub(super) fn exchange_info(&self) -> Option<(NetworkPublicKey, HashSet<Multiaddr>)> {
         self.network_key.as_ref().map(|network_key| (network_key.clone(), self.multiaddrs.clone()))

@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, ConfiguredPeerKind, GossipMessage,
+    PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -278,6 +279,15 @@ where
         /// Reply for connection outcome.
         reply: oneshot::Sender<NetworkResult<()>>,
     },
+    /// Remove one configured peer classification and reconcile gossip retention.
+    RemoveConfiguredPeer {
+        /// The domain identity whose configured reason is being removed.
+        bls_pubkey: BlsPublicKey,
+        /// The single reason to remove, leaving overlapping reasons intact.
+        kind: ConfiguredPeerKind,
+        /// Acknowledge the policy update.
+        reply: oneshot::Sender<NetworkResult<()>>,
+    },
     /// Seed fixed launch bindings without granting committee membership.
     SeedCommitteePeers {
         /// This swarm's operator-owned BLS/network/address bindings.
@@ -381,6 +391,12 @@ where
     AllPeers {
         /// Reply to caller.
         reply: oneshot::Sender<HashMap<PeerId, Vec<TopicHash>>>,
+    },
+    /// Inspect the explicit-peer set applied by the running swarm in regression tests.
+    #[cfg(test)]
+    ExplicitPeers {
+        /// Return the applied mesh-pin set.
+        reply: oneshot::Sender<HashSet<PeerId>>,
     },
     /// Peer IDs connected or currently being dialed by the peer manager.
     ConnectedPeerIds {
@@ -592,6 +608,21 @@ where
     ) -> NetworkResult<()> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::AddBootstrapPeers { peers, reply }).await?;
+        rx.await?
+    }
+
+    /// Remove one configured peer reason during an operator policy reload.
+    ///
+    /// Other configured reasons and previous/current/next committee membership still retain the
+    /// peer. Removing `Trusted` also revokes the operator's scoring exemption. Gossip pins are
+    /// reconciled by the swarm against the latest policy, including peers already connected.
+    pub async fn remove_configured_peer(
+        &self,
+        bls_pubkey: BlsPublicKey,
+        kind: ConfiguredPeerKind,
+    ) -> NetworkResult<()> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::RemoveConfiguredPeer { bls_pubkey, kind, reply }).await?;
         rx.await?
     }
 
@@ -894,6 +925,14 @@ where
         let (reply, all_peers) = oneshot::channel();
         self.sender.send(NetworkCommand::AllPeers { reply }).await?;
         all_peers.await.map_err(Into::into)
+    }
+
+    /// Inspect the explicit-peer set applied by the running swarm.
+    #[cfg(test)]
+    pub(crate) async fn explicit_peers(&self) -> NetworkResult<HashSet<PeerId>> {
+        let (reply, peers) = oneshot::channel();
+        self.sender.send(NetworkCommand::ExplicitPeers { reply }).await?;
+        peers.await.map_err(Into::into)
     }
 
     /// Collection of all mesh peers by a certain topic hash.

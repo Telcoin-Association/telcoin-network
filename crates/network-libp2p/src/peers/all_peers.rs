@@ -195,6 +195,8 @@ impl AllPeers {
     ///
     /// Operator configuration grants retention and load privileges. Recorded protocol penalties,
     /// domain bans, and bounded observed-IP evidence survive reload and network-key rotation.
+    /// Preserve live connection state for an unchanged mapping. A replacement mapping displaces
+    /// the old record and releases its status bookkeeping.
     pub(super) fn add_trusted_peer(
         &mut self,
         bls_public_key: BlsPublicKey,
@@ -203,34 +205,50 @@ impl AllPeers {
         let peer_id: PeerId = network_key.clone().into();
         let confirmed = PeerIdentity::Confirmed(bls_public_key);
         let current = self.identity_for(&peer_id);
-        // overwrite any prior record: anonymous under this peer id, confirmed under a different
-        // bls key that previously presented this network key, or confirmed under a previous
-        // network key; each displaced record is removed through `evict` / released so no
-        // `bls_by_peer_id` entry or status counter goes stale
-        let protocol_records: Vec<_> = self
-            .peers
-            .get(&confirmed)
-            .into_iter()
-            .chain(self.peers.get(&current).filter(|_| current != confirmed))
-            .filter(|peer| !peer.permits_load_forgiveness())
-            .cloned()
-            .collect();
-        (current != confirmed)
-            .then(|| self.evict(&current))
-            .flatten()
-            .into_iter()
-            .for_each(|displaced| self.release_displaced_record(&displaced));
-        self.evict(&confirmed)
-            .into_iter()
-            .for_each(|displaced| self.release_displaced_record(&displaced));
-        let mut peer = Peer::new_trusted(bls_public_key, network_key, self.score_config.clone());
-        protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
-        if peer.reputation().banned() {
-            peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
-            self.banned_peers.add_banned_peer(&peer);
+        if current == confirmed
+            && self.peers.get(&confirmed).is_some_and(|peer| !peer.reputation().banned())
+        {
+            // A trust reload for the same mapping preserves the already-live connection.
+            let _ = self.peers.get_mut(&confirmed).map(Peer::grant_operator_trust);
+        } else {
+            // overwrite any prior record: anonymous under this peer id, confirmed under a different
+            // bls key that previously presented this network key, or confirmed under a previous
+            // network key; each displaced record is removed through `evict` / released so no
+            // `bls_by_peer_id` entry or status counter goes stale
+            let protocol_records: Vec<_> = self
+                .peers
+                .get(&confirmed)
+                .into_iter()
+                .chain(self.peers.get(&current).filter(|_| current != confirmed))
+                .filter(|peer| !peer.permits_load_forgiveness())
+                .cloned()
+                .collect();
+            (current != confirmed)
+                .then(|| self.evict(&current))
+                .flatten()
+                .into_iter()
+                .for_each(|displaced| self.release_displaced_record(&displaced));
+            self.evict(&confirmed)
+                .into_iter()
+                .for_each(|displaced| self.release_displaced_record(&displaced));
+            let mut peer =
+                Peer::new_trusted(bls_public_key, network_key, self.score_config.clone());
+            protocol_records.iter().for_each(|record| peer.retain_protocol_reputation(record));
+            if peer.reputation().banned() {
+                peer.set_connection_status(ConnectionStatus::Banned { instant: Instant::now() });
+                self.banned_peers.add_banned_peer(&peer);
+            }
+            self.bls_by_peer_id.insert(peer_id, bls_public_key);
+            self.peers.insert(confirmed, peer);
         }
-        self.bls_by_peer_id.insert(peer_id, bls_public_key);
-        self.peers.insert(confirmed, peer);
+    }
+
+    /// Revoke operator trust without removing the peer or its committee reasons.
+    pub(super) fn remove_operator_trust(&mut self, bls_public_key: BlsPublicKey) {
+        let _ = self
+            .peers
+            .get_mut(&PeerIdentity::Confirmed(bls_public_key))
+            .map(Peer::revoke_operator_trust);
     }
 
     /// Create a peer.
