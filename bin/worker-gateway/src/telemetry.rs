@@ -24,6 +24,10 @@
 //! splits the load between the worker and the query upstream, and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
+//!
+//! [`record_connection_refused`] counts inbound connections the accept loop
+//! closed without serving, by `reason`. They never carry a request to the
+//! proxy, so they appear in neither request counter.
 
 use std::time::Instant;
 
@@ -56,6 +60,11 @@ const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 /// Batches sent whole to the query upstream because they mixed submissions
 /// with other calls.
 const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
+
+/// Inbound connections closed at accept without being served, by `reason`
+/// (`per_ip_cap`: the client's prefix already held `--max-connections-per-ip`
+/// connections).
+const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
 
 /// RAII guard covering one proxied request.
 ///
@@ -106,6 +115,12 @@ pub(crate) fn record_routed(route: &'static str, result: &'static str) {
 /// submissions with other calls.
 pub(crate) fn record_mixed_batch() {
     counter!(MIXED_BATCHES_TOTAL).increment(1);
+}
+
+/// Record an inbound connection closed at accept without being served, keyed
+/// by a stable machine-readable `reason`.
+pub(crate) fn record_connection_refused(reason: &'static str) {
+    counter!(CONNECTIONS_REFUSED_TOTAL, "reason" => reason).increment(1);
 }
 
 /// Publish a worker's current readiness as a `0`/`1` gauge.

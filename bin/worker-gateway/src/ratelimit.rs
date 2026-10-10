@@ -225,8 +225,9 @@ impl PrefixLen {
 }
 
 /// The network prefix each address family is masked to before it keys a per-IP
-/// bucket, so a client rotating addresses inside one allocation shares a single
-/// bucket instead of minting a fresh one per address.
+/// bucket and the accept loop's per-client connection count, so a client
+/// rotating addresses inside one allocation shares one bucket and one count
+/// instead of minting a fresh one per address.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrefixPolicy {
     /// Prefix applied to IPv4 client addresses.
@@ -253,15 +254,16 @@ impl PrefixPolicy {
         self.v6.bits()
     }
 
-    /// The bucket key for `ip`: the address with its host bits cleared, per this
-    /// policy's prefix for the address's family.
+    /// The client key for `ip`: the address with its host bits cleared, per this
+    /// policy's prefix for the address's family. It keys both the per-IP bucket
+    /// and the accept loop's per-client connection cap (see [`crate::server`]).
     ///
     /// A dual-stack listener reports an IPv4 peer as the mapped `::ffff:a.b.c.d`
     /// form. Every such address shares the same fixed top 96 bits, so masking
     /// them as IPv6 would collapse *all* IPv4 clients onto one bucket; they are
     /// unmapped first and keyed by the IPv4 prefix, exactly as an IPv4-only
     /// listener would key them.
-    fn key(&self, ip: IpAddr) -> IpAddr {
+    pub(crate) fn key(&self, ip: IpAddr) -> IpAddr {
         match ip {
             IpAddr::V4(addr) => IpAddr::V4(mask_v4(addr, self.v4)),
             IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or_else(
@@ -687,6 +689,17 @@ mod tests {
         // allocation, not across allocations.
         assert!(limiters.check(Some(ip6(2, 1))).is_ok());
         assert_eq!(limiters.per_ip_len(), 2);
+    }
+
+    #[test]
+    fn v6_prefix_keys_the_cap() {
+        // The per-client connection cap counts by this key, so every address a
+        // client can pick inside its own /64 must land on one key, while another
+        // /64 is another client.
+        let policy = PrefixPolicy::default();
+        assert_eq!(policy.key(ip6(1, 1)), policy.key(ip6(1, 2)), "one /64 is one client");
+        assert_eq!(policy.key(ip6(1, 1)), ip6(1, 0), "the key is the masked /64");
+        assert_ne!(policy.key(ip6(1, 1)), policy.key(ip6(2, 1)), "another /64 is another client");
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_request_timeout,
         header_read_timeout,
         max_connections,
+        max_connections_per_ip,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
@@ -64,6 +65,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
+        ?max_connections_per_ip,
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
@@ -141,6 +143,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // any connection-lifetime cap is at least this deadline.)
         request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
         max_connections,
+        max_connections_per_ip,
+        // The per-client cap keys clients by the rate limiter's prefix
+        // policy, which applies here even when per-IP rate limiting is off.
+        client_prefix: rate_limit_prefix,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
