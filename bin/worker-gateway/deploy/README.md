@@ -53,16 +53,15 @@ A Grafana dashboard for the metrics these expose lives at
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
   **separate** listener from the client port.
 
-The container has a `preStop` hook that sleeps 5s before the kubelet sends
-SIGTERM. The gateway stops accepting connections as soon as SIGTERM arrives, so
-the sleep gives the endpoint controller and any load balancer time to stop
-routing new requests to a terminating pod. The
-`terminationGracePeriodSeconds: 40` in the Deployment covers the preStop sleep
-plus the gateway's own `--graceful-shutdown-timeout`
-(`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s), 36s in total with the
-gateway's 1s join margin, so the process has room to drain in-flight proxied
-requests before the kubelet escalates to SIGKILL. If you raise the gateway's
-drain timeout or the preStop sleep, raise this too.
+Whatever exposes the `rpc` port must preserve client addresses: the gateway keys `--max-connections-per-ip` and the per-IP rate limit (`--rate-limit-per-ip`) on the TCP peer, so behind an L4 front that does not, both apply to the front's own address and every client shares one budget.
+
+The Deployment sets `WORKER_GATEWAY_SHUTDOWN_DELAY` (equivalently `--shutdown-delay`) to `5s`.
+After SIGTERM the gateway keeps accepting and serving for those 5s while `/ready` answers `503` with `{"ready": false, "draining": true}`; then it drains in-flight requests.
+The 5s covers the endpoint controller dropping the terminating pod from the Service, which happens when the pod is deleted whatever `/ready` says, and that change reaching kube-proxy and any load balancer fed from the endpoints.
+An external load balancer or DNS health check that probes `/ready` stops routing here within those 5s only if its interval times its unhealthy threshold (plus the record TTL for DNS) fits in them; for a slower front, raise the delay and the grace period below with it.
+The container has no `preStop` sleep: a sleep only postpones SIGTERM, and fronts outside Kubernetes never learn from it that the pod is going away.
+The `terminationGracePeriodSeconds: 40` in the Deployment covers the delay plus the gateway's own `--graceful-shutdown-timeout` (`WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT`, default 30s) and its 1s join margin, 36s in total, so the process has room to drain in-flight proxied requests before the kubelet escalates to SIGKILL.
+If you raise the delay or the drain timeout, raise this too.
 
 ## Readiness and reads
 
