@@ -50,14 +50,33 @@ pub(crate) struct Cli {
     pub(crate) worker_id: u16,
 
     /// JSON-RPC endpoint (`http` or `https`) that serves every call except
-    /// transaction submissions, typically a public RPC. When set, only
-    /// `eth_sendRawTransaction` and `eth_sendRawTransactionSync`, alone or in a
-    /// batch made only of them, reach the worker; everything else, including a
-    /// batch that mixes submissions with other calls, goes here, with no
-    /// readiness gate and no fallback to the worker. Must not point at the
-    /// gateway itself or at a worker's RPC host and port.
+    /// transaction submissions and the few reads only the worker's pool can
+    /// answer, typically a public RPC. When set, only `eth_sendRawTransaction`
+    /// and `eth_sendRawTransactionSync`, alone or in a batch made only of them,
+    /// reach the worker, plus a single `eth_getTransactionCount` at `pending`
+    /// and a single lookup of a submission forwarded recently (see
+    /// `--recent-submission-ttl`); everything else, including a batch that
+    /// mixes submissions with other calls, goes here, with no readiness gate
+    /// and no fallback to the worker. Must not point at the gateway itself or
+    /// at a worker's RPC host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
     pub(crate) redirect_queries: Option<Url>,
+
+    /// How long, with `--redirect-queries` set, the gateway remembers the hash
+    /// of an `eth_sendRawTransaction` that a worker accepted: until then,
+    /// `eth_getTransactionByHash` and `eth_getTransactionReceipt` for that hash
+    /// go to the worker, whose pool holds the transaction, instead of the
+    /// `--redirect-queries` endpoint, which has not seen it. At most 10,000
+    /// hashes are remembered at once. Default 60 s; `0` disables the hash
+    /// routing (a nonce read at `pending` goes to the worker either way).
+    /// Ignored without `--redirect-queries`.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_RECENT_SUBMISSION_TTL",
+        default_value = "60s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) recent_submission_ttl: Duration,
 
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
@@ -233,9 +252,12 @@ pub(crate) struct Settings {
     pub(crate) listen_addr: SocketAddr,
     /// Upstream workers, in preference order.
     pub(crate) upstreams: Vec<UpstreamWorker>,
-    /// Endpoint serving every non-submission call (`--redirect-queries`), or
-    /// `None` when every call goes to the workers.
+    /// Endpoint serving every call the worker does not (`--redirect-queries`),
+    /// or `None` when every call goes to the workers.
     pub(crate) query_upstream: Option<Url>,
+    /// How long a forwarded submission's hash keeps its lookups on the worker
+    /// under `--redirect-queries`, or `None` when that routing is disabled.
+    pub(crate) recent_submission_ttl: Option<Duration>,
     /// Readiness poll interval.
     pub(crate) readiness_poll_interval: Duration,
     /// Readiness poll timeout.
@@ -316,6 +338,7 @@ impl Cli {
             listen_addr: self.listen_addr,
             upstreams,
             query_upstream,
+            recent_submission_ttl: resolve_optional_duration(self.recent_submission_ttl),
             readiness_poll_interval: self.readiness_poll_interval,
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
@@ -736,6 +759,17 @@ mod tests {
     #[test]
     fn no_query_redirect_by_default() -> eyre::Result<()> {
         assert_eq!(cli_with_flags(&[]).into_settings()?.query_upstream, None);
+        Ok(())
+    }
+
+    #[test]
+    fn recent_submission_ttl_defaults_to_a_minute_and_zero_disables() -> eyre::Result<()> {
+        let default = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(default.recent_submission_ttl, Some(Duration::from_secs(60)));
+        let disabled = cli_with_flags(&["--recent-submission-ttl=0"]).into_settings()?;
+        assert_eq!(disabled.recent_submission_ttl, None);
+        let custom = cli_with_flags(&["--recent-submission-ttl=5s"]).into_settings()?;
+        assert_eq!(custom.recent_submission_ttl, Some(Duration::from_secs(5)));
         Ok(())
     }
 

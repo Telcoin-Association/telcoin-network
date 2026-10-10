@@ -12,7 +12,7 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState, ServerLimits},
+    server::{serve, AppState, RecentSubmissions, ServerLimits, RECENT_SUBMISSIONS_CAPACITY},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -25,6 +25,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         listen_addr,
         upstreams,
         query_upstream,
+        recent_submission_ttl,
         readiness_poll_interval,
         readiness_poll_timeout,
         upstream_connect_timeout,
@@ -48,6 +49,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         redirect_queries = %query_upstream
             .as_ref()
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
+        ?recent_submission_ttl,
         "starting worker gateway"
     );
 
@@ -119,7 +121,16 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
+    // submissions are remembered only for the redirect's hash routing
+    let recent_submissions = recent_submission_ttl
+        .filter(|_| query_upstream.is_some())
+        .map(|ttl| Arc::new(RecentSubmissions::new(ttl, RECENT_SUBMISSIONS_CAPACITY)));
+    let state = AppState {
+        readiness: Arc::clone(&readiness),
+        http: proxy_client,
+        query_upstream,
+        recent_submissions,
+    };
 
     spawner.spawn_critical_task(
         "readiness-poller",
