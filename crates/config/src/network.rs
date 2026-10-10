@@ -1,8 +1,8 @@
 //! Configuration for network variables.
 
 use crate::{
-    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SwarmNetworkBudget,
-    TelcoinDirs,
+    ConfigFmt, ConfigTrait, NetworkBudgetError, NetworkProcessBudget, SourceAdmissionConfig,
+    SwarmNetworkBudget, TelcoinDirs,
 };
 use libp2p::{kad::K_VALUE, multiaddr::Protocol, PeerId};
 use serde::{
@@ -36,6 +36,9 @@ pub struct NetworkConfig {
     peer_config: PeerConfig,
     /// Connection admission policy shared by the primary and every worker swarm.
     admission: AdmissionConfig,
+    /// Optional process-wide accounting of established connections by observed source.
+    /// No production limits are assumed when this configuration is absent.
+    source_admission: Option<SourceAdmissionConfig>,
     /// Legacy startup peer-wait budget, retained for configuration compatibility.
     ///
     /// Network readiness is sampled continuously and no longer delays epoch startup.
@@ -160,6 +163,11 @@ impl NetworkConfig {
     /// Return this node's connection admission configuration.
     pub fn admission(&self) -> &AdmissionConfig {
         &self.admission
+    }
+
+    /// Return explicit deployment limits for source admission, when configured.
+    pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
+        self.source_admission.as_ref()
     }
 
     /// Return the local launch inventory. Membership remains derived from chain state.
