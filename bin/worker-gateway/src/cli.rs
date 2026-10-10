@@ -113,6 +113,19 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
 
+    /// Maximum concurrently-open inbound connections from one client (default
+    /// 32; `0` disables the cap). A client is its network prefix, masked by
+    /// `--rate-limit-per-ip-v4-prefix` / `--rate-limit-per-ip-v6-prefix` exactly
+    /// as the per-IP rate limiter masks it, even when per-IP rate limiting is
+    /// off. A connection over the cap is closed at once, without a response,
+    /// so one client cannot hold every `--max-connections` slot.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP",
+        default_value_t = crate::server::DEFAULT_MAX_CONNECTIONS_PER_IP
+    )]
+    pub(crate) max_connections_per_ip: usize,
+
     /// Transport-stall deadline for inbound connections (`TCP_USER_TIMEOUT`):
     /// a connection whose peer leaves written response data unacknowledged, or
     /// its receive window closed, for this long is forcibly closed by the
@@ -172,10 +185,12 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_burst: u32,
 
     /// IPv6 network prefix, in bits, that a client address is masked to before
-    /// it keys its per-IP bucket. The default `/64` is the smallest subnet
-    /// routed to one customer, so a client rotating addresses inside its own
-    /// allocation keeps spending one bucket instead of minting a fresh one per
-    /// address. Widen it (up to `/128`) only to meter individual addresses.
+    /// it keys its per-IP bucket and its `--max-connections-per-ip` count (the
+    /// cap uses it even when per-IP rate limiting is off). The default `/64` is
+    /// the smallest subnet routed to one customer, so a client rotating
+    /// addresses inside its own allocation keeps spending one bucket instead of
+    /// minting a fresh one per address. Widen it (up to `/128`) only to meter
+    /// individual addresses.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX",
@@ -184,10 +199,12 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_v6_prefix: u8,
 
     /// IPv4 network prefix, in bits, that a client address is masked to before
-    /// it keys its per-IP bucket. The default `/32` is a single address: it
-    /// preserves the gateway's per-address behaviour and never groups unrelated
-    /// customers that share one carrier-grade NAT. Narrow it only for a
-    /// deployment whose clients genuinely map to larger IPv4 allocations.
+    /// it keys its per-IP bucket and its `--max-connections-per-ip` count (the
+    /// cap uses it even when per-IP rate limiting is off). The default `/32` is
+    /// a single address: it preserves the gateway's per-address behaviour and
+    /// never groups unrelated customers that share one carrier-grade NAT.
+    /// Narrow it only for a deployment whose clients genuinely map to larger
+    /// IPv4 allocations.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX",
@@ -248,6 +265,9 @@ pub(crate) struct Settings {
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// Maximum concurrently-open inbound connections per client prefix (keyed
+    /// by `rate_limit_prefix`), or `None` when the cap is disabled.
+    pub(crate) max_connections_per_ip: Option<NonZeroUsize>,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
     /// or `None` when disabled.
     pub(crate) tcp_user_timeout: Option<Duration>,
@@ -312,6 +332,23 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        // A per-client cap at or above the global cap never refuses anything,
+        // since the global permit runs out first. Warn rather than reject:
+        // raising the cap that far is a legitimate way to neutralise it behind
+        // a front that hides client addresses.
+        let max_connections_per_ip = NonZeroUsize::new(self.max_connections_per_ip);
+        if let Some(per_ip) =
+            max_connections_per_ip.filter(|per_ip| *per_ip >= self.max_connections)
+        {
+            warn!(
+                target: "gateway",
+                max_connections = %self.max_connections,
+                max_connections_per_ip = %per_ip,
+                "--max-connections-per-ip is at least --max-connections, so one client prefix can \
+                 still hold every connection slot; lower it below --max-connections, or set it to \
+                 0 to disable the cap explicitly"
+            );
+        }
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -322,6 +359,7 @@ impl Cli {
             upstream_request_timeout: self.upstream_request_timeout,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            max_connections_per_ip,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
@@ -674,6 +712,25 @@ mod tests {
         let global = settings.rate_limit_global.expect("global limit on by default");
         assert_eq!(global.rate().get(), 3_000);
         assert_eq!(global.burst().get(), 6_000);
+        Ok(())
+    }
+
+    #[test]
+    fn per_ip_connection_cap_defaults_to_32_and_zero_disables_it() -> eyre::Result<()> {
+        let default = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(default.max_connections_per_ip, NonZeroUsize::new(32));
+        let disabled = cli_with_flags(&["--max-connections-per-ip=0"]).into_settings()?;
+        assert_eq!(disabled.max_connections_per_ip, None);
+        Ok(())
+    }
+
+    #[test]
+    fn per_ip_connection_cap_at_the_global_cap_is_kept() -> eyre::Result<()> {
+        // Warned about at startup, not rejected: raising the cap that far is
+        // how a gateway behind an address-hiding front neutralises it.
+        let settings = cli_with_flags(&["--max-connections=8", "--max-connections-per-ip=8"])
+            .into_settings()?;
+        assert_eq!(settings.max_connections_per_ip, NonZeroUsize::new(8));
         Ok(())
     }
 
