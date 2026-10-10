@@ -301,6 +301,7 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
 connection reset) when the gateway cannot serve them. The request `id` is
 echoed when it can be recovered.
+An `id` that is an array, an object, a boolean or a string over 256 bytes is echoed as `null`.
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |
