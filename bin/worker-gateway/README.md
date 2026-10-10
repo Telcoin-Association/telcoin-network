@@ -267,6 +267,7 @@ Everything else counts as a query: `eth_sendTransaction` (no node configures a s
 The URL may be `http` or `https`; worker URLs stay `http` only.
 An `https` URL needs the system CA certificates, which the image installs.
 The URL must not point at the gateway itself or at a worker's RPC host and port, and plain `http` to a host that is not a loopback or private address logs a warning at startup.
+A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
 A batch goes to the worker only when every element is a submission.
 A batch that mixes submissions with other calls goes, whole, to the query URL; otherwise a client could put one submission in front of any number of reads and push them all onto the validator.

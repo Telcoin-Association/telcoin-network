@@ -58,7 +58,7 @@ pub(crate) struct Cli {
     /// readiness gate and no fallback to the worker. Must not point at the
     /// gateway itself or at a worker's RPC host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
-    pub(crate) redirect_queries: Option<Url>,
+    pub(crate) redirect_queries: Option<String>,
 
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
@@ -295,7 +295,10 @@ impl Cli {
         })?;
         let query_upstream = self
             .redirect_queries
-            .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
+            .map(|value| {
+                let url = parse_query_upstream(&value)?;
+                ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url)
+            })
             .transpose()?;
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
@@ -455,6 +458,21 @@ fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
     Ok(())
 }
 
+/// Parse the `--redirect-queries` value into a URL.
+///
+/// The flag is taken as a string and parsed here rather than by clap, because
+/// clap's parse error repeats the rejected value whole, and a hosted RPC URL
+/// can carry an API key in its userinfo, path or query. The error names what
+/// is wrong without echoing the value.
+fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
+    Url::parse(value).map_err(|err| {
+        eyre::eyre!(
+            "--redirect-queries is not a valid URL ({err}); write it as \
+             http(s)://host[:port][/path]"
+        )
+    })
+}
+
 /// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
 /// fragment, not the gateway itself, and not on any worker's RPC host and port.
 ///
@@ -470,10 +488,11 @@ fn ensure_query_upstream(
     url: &Url,
     upstreams: &[UpstreamWorker],
 ) -> eyre::Result<()> {
+    // the scheme is not echoed either: a value written without one, such as
+    // `key:secret@host`, parses with part of the credential as its scheme
     eyre::ensure!(
         matches!(url.scheme(), "http" | "https"),
-        "unsupported URL scheme `{}` in --redirect-queries: use http or https",
-        url.scheme()
+        "unsupported URL scheme in --redirect-queries: use http or https"
     );
     eyre::ensure!(url.has_host(), "--redirect-queries URL has no host");
     eyre::ensure!(
@@ -980,6 +999,36 @@ mod tests {
                 Err(err) => format!("{err:?}"),
             };
             for secret in ["s3cr3t", "k3y", "t0k3n"] {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+        }
+    }
+
+    /// clap no longer parses `--redirect-queries`, so it cannot echo a value
+    /// it rejects; the startup error says what is wrong without the value.
+    #[test]
+    fn bad_redirect_value_is_not_echoed() {
+        for (value, problem) in [
+            ("https://user:s3cr3t@rpc.example.com:99999/k3y?token=t0k3n", "invalid port number"),
+            ("rpc.example.com/k3y?token=t0k3n", "relative URL without a base"),
+            ("http://[::1/k3y?token=t0k3n", "invalid IPv6 address"),
+            ("http://user:s3cr3t@/k3y?token=t0k3n", "empty host"),
+            ("user:s3cr3t@rpc.example.com/k3y?token=t0k3n", "unsupported URL scheme"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "worker-gateway".to_string(),
+                "--upstream-rpc-url=http://10.0.0.7:8545".to_string(),
+                "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
+                format!("--redirect-queries={value}"),
+            ])
+            .unwrap_or_else(|err| panic!("clap must take any value; it rejected one: {err}"));
+            let message = match cli.into_settings() {
+                Ok(_) => panic!("{value} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("--redirect-queries"), "{message}");
+            assert!(message.contains(problem), "`{problem}` missing from: {message}");
+            for secret in ["user", "s3cr3t", "k3y", "t0k3n", "rpc.example.com"] {
                 assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
             }
         }
