@@ -146,14 +146,14 @@ impl NetworkBehaviour for PeerManager {
         }
 
         self.sanitize_ip_addr(&peer, remote_addr)?;
-
+        self.reserve_source(connection_id, peer, remote_addr, "in")?;
         Ok(ConnectionHandler)
     }
 
     /// Recheck the authenticated identity and actual outbound address against live policy.
     fn handle_established_outbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         peer: PeerId,
         addr: &Multiaddr,
         _role_override: Endpoint,
@@ -174,11 +174,13 @@ impl NetworkBehaviour for PeerManager {
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(&peer, addr)?;
 
+        self.reserve_source(connection_id, peer, addr, "out")?;
         Ok(ConnectionHandler)
     }
 
     /// Reconcile peer lifecycle and release pre-authentication slots after listen failures.
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
+        self.on_source_swarm_event(&event);
         match event {
             FromSwarm::ConnectionEstablished(ConnectionEstablished {
                 peer_id, endpoint, ..
