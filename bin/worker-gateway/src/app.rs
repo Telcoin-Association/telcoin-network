@@ -1,11 +1,14 @@
 //! Gateway wiring: build the shared state, spawn the server and readiness
 //! poller as managed tasks, and run until shutdown.
 
-use std::sync::Arc;
+use std::{
+    num::{NonZeroU32, NonZeroUsize},
+    sync::Arc,
+};
 
 use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     cli::Settings,
@@ -34,6 +37,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
+        max_inflight_request_bytes,
         rate_limit_per_ip,
         rate_limit_prefix,
         rate_limit_global,
@@ -65,10 +69,24 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
+        max_inflight_request_bytes = max_inflight_request_bytes.map_or(0, NonZeroU32::get),
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
     );
+    if let Some(idle_heads) =
+        idle_heads_exhausting_budget(max_inflight_request_bytes, max_request_bytes, max_connections)
+    {
+        warn!(
+            target: "gateway",
+            idle_heads,
+            max_connections = max_connections.get(),
+            "this many idle requests, fewer than --max-connections, can hold the whole in-flight \
+             byte budget until the request deadline by sending only their headers, and every \
+             other request body is then refused; raise --max-inflight-request-bytes, or lower \
+             --max-request-bytes or --max-connections"
+        );
+    }
 
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
@@ -144,6 +162,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
+        max_inflight_request_bytes,
     };
 
     // Sweep idle per-IP buckets while the gateway runs (only when a limiter is
@@ -169,4 +188,54 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     task_manager.join_until_exit(shutdown).await?;
     Ok(())
+}
+
+/// How many requests that send only their headers hold the whole in-flight
+/// byte budget, when that is fewer than `--max-connections`.
+///
+/// Each such request reserves up to `--max-request-bytes` from its head (the
+/// whole cap when chunked) and keeps it until the request deadline, so this
+/// many idle connections refuse every other request body. Returns `None` when
+/// the connection cap binds first, the budget is unlimited, or the cap is `0`
+/// (nothing can then be reserved).
+fn idle_heads_exhausting_budget(
+    max_inflight_request_bytes: Option<NonZeroU32>,
+    max_request_bytes: usize,
+    max_connections: NonZeroUsize,
+) -> Option<usize> {
+    let budget = usize::try_from(max_inflight_request_bytes?.get()).unwrap_or(usize::MAX);
+    let cap = NonZeroUsize::new(max_request_bytes)?;
+    let idle_heads = budget.div_ceil(cap.get());
+    (idle_heads < max_connections.get()).then_some(idle_heads)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: usize = 1024 * 1024;
+
+    fn idle_heads(budget_mib: u32, cap: usize, connections: usize) -> Option<usize> {
+        idle_heads_exhausting_budget(
+            NonZeroU32::new(budget_mib * 1024 * 1024),
+            cap,
+            NonZeroUsize::new(connections).expect("nonzero"),
+        )
+    }
+
+    #[test]
+    fn idle_heads_are_reported_only_below_the_connection_cap() {
+        // the defaults: 512 idle requests are needed, more than 500 connections
+        assert_eq!(idle_heads(512, MIB, 500), None);
+        // a 15 MiB cap: 35 idle requests hold the default budget
+        assert_eq!(idle_heads(512, 15 * MIB, 500), Some(35));
+        // a 256 MiB budget, unless --max-connections is lowered with it
+        assert_eq!(idle_heads(256, MIB, 500), Some(256));
+        assert_eq!(idle_heads(256, MIB, 256), None);
+        // more connections than the default budget covers
+        assert_eq!(idle_heads(512, MIB, 2000), Some(512));
+        // an unlimited budget or a zero cap cannot be exhausted from heads
+        assert_eq!(idle_heads(0, MIB, 500), None);
+        assert_eq!(idle_heads(512, 0, 500), None);
+    }
 }

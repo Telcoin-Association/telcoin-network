@@ -24,6 +24,9 @@
 //! splits the load between the worker and the query upstream, and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
+//!
+//! [`RequestBytesHeld`] keeps a gauge of the request-body bytes held against
+//! the in-flight byte budget (`--max-inflight-request-bytes`).
 
 use std::time::Instant;
 
@@ -57,6 +60,11 @@ const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 /// with other calls.
 const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
 
+/// Request-body bytes currently held against the in-flight byte budget
+/// (`--max-inflight-request-bytes`): what admitted requests reserved before
+/// their bodies were read, until they are forwarded or rejected.
+const INFLIGHT_REQUEST_BYTES: &str = "tn_worker_gateway_inflight_request_bytes";
+
 /// RAII guard covering one proxied request.
 ///
 /// Entering bumps the in-flight gauge and starts the duration timer; dropping
@@ -81,6 +89,32 @@ impl Drop for RequestInFlight {
     fn drop(&mut self) {
         gauge!(INFLIGHT_REQUESTS).decrement(1.0);
         histogram!(REQUEST_DURATION_SECONDS).record(self.start.elapsed().as_secs_f64());
+    }
+}
+
+/// RAII guard covering the bytes one request holds against the in-flight byte
+/// budget.
+///
+/// Entering raises the held-bytes gauge by the reservation; dropping lowers it
+/// by the same amount, so every exit path (forwarded, rejected, timed out, or
+/// cancelled by a client disconnect) is covered by one decrement.
+#[derive(Debug)]
+pub(crate) struct RequestBytesHeld {
+    /// The reservation this guard accounts for, in bytes.
+    bytes: u32,
+}
+
+impl RequestBytesHeld {
+    /// Account for `bytes` newly held against the budget.
+    pub(crate) fn enter(bytes: u32) -> Self {
+        gauge!(INFLIGHT_REQUEST_BYTES).increment(f64::from(bytes));
+        Self { bytes }
+    }
+}
+
+impl Drop for RequestBytesHeld {
+    fn drop(&mut self) {
+        gauge!(INFLIGHT_REQUEST_BYTES).decrement(f64::from(self.bytes));
     }
 }
 

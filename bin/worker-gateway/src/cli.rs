@@ -149,15 +149,30 @@ pub(crate) struct Cli {
 
     /// Maximum request body the gateway will accept, in bytes (default 1 MiB).
     /// Requests whose body exceeds this are rejected with a JSON-RPC "request
-    /// too large" error before being forwarded. Each open connection can buffer
-    /// one body this large, so keep `--max-connections` times this value well
-    /// under the process memory limit.
+    /// too large" error before being forwarded, and a declared
+    /// `Content-Length` over it is rejected before the body is read. The total
+    /// buffered across connections is bounded by
+    /// `--max-inflight-request-bytes`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_REQUEST_BYTES",
         default_value_t = crate::proxy::MAX_REQUEST_BYTES
     )]
     pub(crate) max_request_bytes: usize,
+
+    /// Budget of request-body bytes held across all in-flight requests, in
+    /// bytes (default 512 MiB, at most 4294967295; `0` disables). Each request
+    /// reserves its `Content-Length`, or `--max-request-bytes` when the body is
+    /// chunked, before the body is read, and holds it until the request has
+    /// been forwarded or rejected. A request that does not fit in what is left
+    /// is answered at once with a JSON-RPC "in-flight bytes exhausted" error
+    /// (`503`) instead of waiting. Must be at least `--max-request-bytes`.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES",
+        default_value_t = crate::server::MAX_INFLIGHT_REQUEST_BYTES
+    )]
+    pub(crate) max_inflight_request_bytes: u32,
 
     /// Sustained per-client-IP request rate, in requests per second (`0`
     /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
@@ -256,6 +271,9 @@ pub(crate) struct Settings {
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
+    /// Budget of request-body bytes held across all in-flight requests, or
+    /// `None` when unlimited.
+    pub(crate) max_inflight_request_bytes: Option<NonZeroU32>,
     /// Per-client-IP rate limit, or `None` when disabled.
     pub(crate) rate_limit_per_ip: Option<RateLimit>,
     /// Network prefix each client address is masked to before it keys a
@@ -312,6 +330,8 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        let max_inflight_request_bytes =
+            resolve_inflight_byte_budget(self.max_inflight_request_bytes, self.max_request_bytes)?;
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -325,6 +345,7 @@ impl Cli {
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
+            max_inflight_request_bytes,
             rate_limit_per_ip: resolve_rate_limit(
                 self.rate_limit_per_ip,
                 self.rate_limit_per_ip_burst,
@@ -380,6 +401,25 @@ fn resolve_rate_limit(rate: u32, burst: u32) -> Option<RateLimit> {
         // the (non-zero) rate rather than panic if that ever fails to hold.
         RateLimit::new(rate, NonZeroU32::new(burst).unwrap_or(rate))
     })
+}
+
+/// Turn `--max-inflight-request-bytes` into a budget, or `None` when `0`
+/// (unlimited). A budget below `--max-request-bytes` is a startup error: a
+/// chunked request reserves the whole per-request cap, so it could never be
+/// admitted, and a declared body between the two would always be refused with
+/// a `503` that tells the client to retry.
+fn resolve_inflight_byte_budget(
+    budget: u32,
+    max_request_bytes: usize,
+) -> eyre::Result<Option<NonZeroU32>> {
+    let Some(budget) = NonZeroU32::new(budget) else { return Ok(None) };
+    eyre::ensure!(
+        usize::try_from(budget.get()).is_ok_and(|budget| budget >= max_request_bytes),
+        "--max-inflight-request-bytes ({budget}) is below --max-request-bytes \
+         ({max_request_bytes}), so a chunked request could never be admitted; raise the budget \
+         or set it to 0 to disable it"
+    );
+    Ok(Some(budget))
 }
 
 /// Validate the two per-IP prefix flags into a [`PrefixPolicy`]. A length wider
@@ -731,6 +771,33 @@ mod tests {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
         Ok(())
+    }
+
+    #[test]
+    fn inflight_byte_budget_defaults_on_and_zero_disables() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(settings.max_inflight_request_bytes.map(NonZeroU32::get), Some(536_870_912));
+        let settings = cli_with_flags(&["--max-inflight-request-bytes=0"]).into_settings()?;
+        assert_eq!(settings.max_inflight_request_bytes, None);
+        Ok(())
+    }
+
+    #[test]
+    fn inflight_byte_budget_must_cover_the_request_cap_and_fit_a_u32() {
+        // a chunked request reserves the whole per-request cap, so a smaller
+        // budget could never admit one
+        let below = cli_with_flags(&["--max-inflight-request-bytes=1048575"]).into_settings();
+        assert!(below.is_err(), "a budget below --max-request-bytes must fail startup");
+        let equal = cli_with_flags(&["--max-inflight-request-bytes=1048576"]).into_settings();
+        assert!(equal.is_ok(), "a budget equal to --max-request-bytes must be accepted");
+        // one permit per byte, counted in a u32
+        let past_u32 = Cli::try_parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+            "--max-inflight-request-bytes=4294967296",
+        ]);
+        assert!(past_u32.is_err(), "a budget past u32::MAX must fail startup");
     }
 
     #[test]
