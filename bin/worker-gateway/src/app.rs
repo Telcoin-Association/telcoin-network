@@ -3,13 +3,12 @@
 
 use std::sync::Arc;
 
-use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
 use tracing::info;
 
 use crate::{
     cli::Settings,
-    proxy::{proxy_client, UpstreamOrigin},
+    proxy::{client_builder, proxy_client, readiness_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
     server::{serve, AppState, ServerLimits},
@@ -70,11 +69,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         "edge protections configured"
     );
 
-    // Dedicated clients: the proxy enforces connect + per-request deadlines and
-    // never follows redirects (see `proxy_client`); the poller bounds each
-    // probe with its own tokio timeout.
-    let proxy_client = proxy_client(upstream_connect_timeout, upstream_request_timeout)?;
-    let readiness_client = Client::builder().connect_timeout(upstream_connect_timeout).build()?;
+    // Dedicated clients, both started from `client_builder` so they share the
+    // connect timeout, TLS and the no-proxy policy, and neither follows
+    // redirects: the proxy also enforces a per-request deadline (see
+    // `proxy_client`); the poller bounds each probe with its own tokio timeout.
+    let proxy_client =
+        proxy_client(client_builder(upstream_connect_timeout), upstream_request_timeout)?;
+    let readiness_client = readiness_client(client_builder(upstream_connect_timeout))?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
     // Let in-flight requests drain within the graceful deadline (plus a small

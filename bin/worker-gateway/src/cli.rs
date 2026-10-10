@@ -1,6 +1,7 @@
 //! Command-line interface and resolved runtime settings.
 
 use std::{
+    collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
@@ -55,9 +56,9 @@ pub(crate) struct Cli {
     /// batch made only of them, reach the worker; everything else, including a
     /// batch that mixes submissions with other calls, goes here, with no
     /// readiness gate and no fallback to the worker. Must not point at the
-    /// gateway itself or at a worker's RPC host and port.
+    /// gateway itself or at a worker's RPC or readiness host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
-    pub(crate) redirect_queries: Option<Url>,
+    pub(crate) redirect_queries: Option<String>,
 
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
@@ -274,8 +275,18 @@ impl Cli {
     /// Resolve the CLI into [`Settings`], loading the YAML upstream list or
     /// building a single inline upstream from the `--upstream-*` flags.
     pub(crate) fn into_settings(self) -> eyre::Result<Settings> {
+        [
+            ("--readiness-poll-interval", self.readiness_poll_interval),
+            ("--readiness-poll-timeout", self.readiness_poll_timeout),
+            ("--upstream-connect-timeout", self.upstream_connect_timeout),
+            ("--upstream-request-timeout", self.upstream_request_timeout),
+            ("--header-read-timeout", self.header_read_timeout),
+        ]
+        .into_iter()
+        .try_for_each(|(flag, value)| ensure_non_zero(flag, value))?;
         let upstreams = self.resolve_upstreams()?;
         eyre::ensure!(!upstreams.is_empty(), "no upstream workers configured");
+        ensure_unique_worker_ids(&upstreams)?;
         upstreams.iter().try_for_each(|upstream| {
             ensure_http_scheme(&upstream.rpc_url)?;
             ensure_http_scheme(&upstream.readiness_url)?;
@@ -284,7 +295,10 @@ impl Cli {
         })?;
         let query_upstream = self
             .redirect_queries
-            .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
+            .map(|value| {
+                let url = parse_query_upstream(&value)?;
+                ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url)
+            })
             .transpose()?;
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
@@ -364,6 +378,29 @@ impl Cli {
     }
 }
 
+/// Reject a zero value for a duration flag that has no disabled sentinel. A
+/// zero readiness poll interval panics the poller (`tokio::time::interval`),
+/// and a zero timeout or deadline fails every poll, forward or request it
+/// bounds, so either is a configuration error reported at startup.
+fn ensure_non_zero(flag: &str, value: Duration) -> eyre::Result<()> {
+    eyre::ensure!(!value.is_zero(), "{flag} must be greater than zero");
+    Ok(())
+}
+
+/// Reject an upstream list that names one worker id twice. Readiness
+/// transitions, their log lines and the `tn_worker_gateway_upstream_ready`
+/// gauge are keyed by worker id, so two entries with one id would be reported
+/// as a single worker whose state flips with whichever entry was polled last.
+fn ensure_unique_worker_ids(upstreams: &[UpstreamWorker]) -> eyre::Result<()> {
+    let mut seen = BTreeSet::new();
+    match upstreams.iter().map(|upstream| upstream.worker_id).find(|id| !seen.insert(*id)) {
+        Some(id) => eyre::bail!(
+            "worker id {id} appears more than once in the upstream list; list each worker once"
+        ),
+        None => Ok(()),
+    }
+}
+
 /// Turn a duration flag into `Some(duration)`, or `None` when zero (the
 /// flag's disabled sentinel, mirroring the `0`-disables rate-limit flags).
 fn resolve_optional_duration(value: Duration) -> Option<Duration> {
@@ -400,36 +437,66 @@ fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
 /// the gateway carries a TLS backend for `--redirect-queries`, but TLS to
 /// workers (and to their readiness endpoints) is not supported, so an `https`
 /// worker URL is a configuration error reported here rather than a surprise at
-/// runtime.
+/// runtime. The message names the URL by origin only, since a worker URL can
+/// carry a credential in its userinfo, path or query.
+///
+/// A scheme the URL standard does not define is named not at all: a value
+/// written without one, such as `key:secret@host:port`, parses with part of
+/// the credential as its scheme (and so as its origin).
 fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
     eyre::ensure!(
+        url.is_special(),
+        "a worker upstream URL has no http:// scheme; write it as http://host:port[/path]"
+    );
+    eyre::ensure!(
         url.scheme() == "http",
-        "unsupported URL scheme `{}` in `{url}`: worker upstreams are HTTP-only; TLS is \
+        "unsupported URL scheme `{}` in `{}`: worker upstreams are HTTP-only; TLS is \
          supported only for --redirect-queries",
-        url.scheme()
+        url.scheme(),
+        UpstreamOrigin(url)
     );
     Ok(())
 }
 
+/// Parse the `--redirect-queries` value into a URL.
+///
+/// The flag is taken as a string and parsed here rather than by clap, because
+/// clap's parse error repeats the rejected value whole, and a hosted RPC URL
+/// can carry an API key in its userinfo, path or query. The error names what
+/// is wrong without echoing the value.
+fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
+    Url::parse(value).map_err(|err| {
+        eyre::eyre!(
+            "--redirect-queries is not a valid URL ({err}); write it as \
+             http(s)://host[:port][/path]"
+        )
+    })
+}
+
 /// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
-/// fragment, not the gateway itself, and not on any worker's RPC host and port.
+/// fragment, not the gateway itself, and not on any worker's RPC or readiness
+/// host and port.
 ///
 /// The last check is an error rather than a warning because reads sent to a
-/// worker land on the validator, which is the load the redirect exists to
-/// remove. It compares host and port whatever the scheme, so an `https` URL on
-/// a worker's `http` socket is caught too. Plain `http` to a host that is not a
-/// loopback or private address literal is accepted with a warning: the reads
-/// and their answers then cross the network unencrypted. Messages name the URL
-/// by origin only, since a hosted RPC URL can carry an API key in its path.
+/// worker's node land on the validator, which is the load the redirect exists
+/// to remove. It compares host and port whatever the scheme, so an `https` URL
+/// on a worker's `http` socket is caught too, and an IPv4-mapped IPv6 literal
+/// matches the IPv4 address it names. A URL on a worker's host but another
+/// port is accepted with a warning, since that port may serve a separate node
+/// on the validator's machine. Plain `http` to a host that is not a loopback
+/// or private address literal is accepted with a warning: the reads and their
+/// answers then cross the network unencrypted. Messages name the URL by origin
+/// only, since a hosted RPC URL can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
     upstreams: &[UpstreamWorker],
 ) -> eyre::Result<()> {
+    // the scheme is not echoed either: a value written without one, such as
+    // `key:secret@host`, parses with part of the credential as its scheme
     eyre::ensure!(
         matches!(url.scheme(), "http" | "https"),
-        "unsupported URL scheme `{}` in --redirect-queries: use http or https",
-        url.scheme()
+        "unsupported URL scheme in --redirect-queries: use http or https"
     );
     eyre::ensure!(url.has_host(), "--redirect-queries URL has no host");
     eyre::ensure!(
@@ -438,14 +505,29 @@ fn ensure_query_upstream(
         UpstreamOrigin(url)
     );
     ensure_not_gateway(listen_addr, url)?;
-    if let Some(worker) =
-        upstreams.iter().find(|upstream| same_host_and_port(url, &upstream.rpc_url))
-    {
-        eyre::bail!(
-            "--redirect-queries `{}` is worker {}'s RPC host and port, so reads would still \
-             reach the validator; point it at a separate JSON-RPC endpoint",
-            UpstreamOrigin(url),
-            worker.worker_id
+    upstreams.iter().try_for_each(|upstream| {
+        [("RPC", &upstream.rpc_url), ("readiness", &upstream.readiness_url)]
+            .into_iter()
+            .try_for_each(|(endpoint, worker_url)| {
+                eyre::ensure!(
+                    !same_host_and_port(url, worker_url),
+                    "--redirect-queries `{}` is worker {}'s {endpoint} host and port, so reads \
+                     would still reach the validator; point it at a separate JSON-RPC endpoint",
+                    UpstreamOrigin(url),
+                    upstream.worker_id
+                );
+                Ok(())
+            })
+    })?;
+    if let Some(worker) = upstreams.iter().find(|upstream| {
+        same_host(url, &upstream.rpc_url) || same_host(url, &upstream.readiness_url)
+    }) {
+        warn!(
+            target: "gateway",
+            upstream = %UpstreamOrigin(url),
+            worker_id = worker.worker_id,
+            "--redirect-queries is on a worker's host at another port; unless that port serves \
+             a separate node, reads still reach the validator's machine"
         );
     }
     if plaintext_to_public_host(url) {
@@ -461,11 +543,18 @@ fn ensure_query_upstream(
 
 /// Whether two URLs name the same host and port, whatever their schemes.
 fn same_host_and_port(a: &Url, b: &Url) -> bool {
-    a.port_or_known_default() == b.port_or_known_default()
-        && match (url_host_ip(a), url_host_ip(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => a.host() == b.host(),
-        }
+    a.port_or_known_default() == b.port_or_known_default() && same_host(a, b)
+}
+
+/// Whether two URLs name the same host. An IPv4-mapped IPv6 literal
+/// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names, and `localhost`
+/// matches the IPv4 loopback address (see [`url_host_ip`]); other domain names
+/// match only as written.
+fn same_host(a: &Url, b: &Url) -> bool {
+    match (url_host_ip(a), url_host_ip(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.host() == b.host(),
+    }
 }
 
 /// Whether `url` is plain `http` to anything but a loopback or private address
@@ -485,9 +574,13 @@ fn plaintext_to_public_host(url: &Url) -> bool {
 /// worker's default RPC port, so a single-host setup left on defaults hits
 /// this. The runtime hop-header guard (see [`crate::proxy`]) catches the
 /// loops this startup check cannot see, e.g. a VIP that fronts the gateways.
+///
+/// An IPv4-mapped IPv6 address (`[::ffff:127.0.0.1]`) is compared as the IPv4
+/// address it names, on either side (the URL's through [`url_host_ip`]), since
+/// a dual-stack socket reaches the same listener through both spellings.
 fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
     let same_port = url.port_or_known_default() == Some(listen_addr.port());
-    let listen_ip = listen_addr.ip();
+    let listen_ip = listen_addr.ip().to_canonical();
     let hits_gateway = url_host_ip(url)
         .map(|ip| {
             let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
@@ -506,20 +599,26 @@ fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
 }
 
 /// The upstream host as an IP when it names one (`localhost` counts; other
-/// domain names cannot be checked without resolving them).
+/// domain names cannot be checked without resolving them). An IPv4-mapped IPv6
+/// literal is returned as the IPv4 address it names, so every caller compares
+/// and classifies it the same way.
 fn url_host_ip(url: &Url) -> Option<IpAddr> {
     url.host().and_then(|host| match host {
         url::Host::Domain(name) => {
             name.eq_ignore_ascii_case("localhost").then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         }
         url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip).to_canonical()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        io::Write as _,
+        sync::{Arc, Mutex},
+    };
 
     fn cli_with(config: Option<&str>, rpc: Option<&str>, readiness: Option<&str>) -> Cli {
         let mut argv = vec!["worker-gateway".to_string()];
@@ -649,6 +748,138 @@ mod tests {
         )
         .into_settings();
         assert!(result.is_err());
+    }
+
+    /// Startup errors about a worker URL name it by origin only: a scheme error
+    /// and a self-pointing error, for both the RPC and the readiness URL. A
+    /// value written without a scheme parses with part of its credential as
+    /// the scheme, so its error names neither the scheme nor the origin.
+    #[test]
+    fn startup_errors_name_origins_only() {
+        let ready = "http://10.0.0.7:8551/health/workers";
+        let userinfo = ["user", "pw@", "/path"].as_slice();
+        let schemeless = ["apikey", "s3cr3t"].as_slice();
+        for (rpc, readiness, secrets, origin) in [
+            ("ftp://user:pw@host/path", ready, userinfo, Some("`ftp://host:21`")),
+            ("http://10.0.0.7:8544", "ftp://user:pw@host/path", userinfo, Some("`ftp://host:21`")),
+            (
+                "http://user:pw@127.0.0.1:8545/path",
+                ready,
+                userinfo,
+                Some("`http://127.0.0.1:8545`"),
+            ),
+            (
+                "http://10.0.0.7:8544",
+                "http://user:pw@127.0.0.1:8545/path",
+                userinfo,
+                Some("`http://127.0.0.1:8545`"),
+            ),
+            ("apikey:s3cr3t@10.0.0.7:8545", ready, schemeless, None),
+            ("http://10.0.0.7:8544", "apikey:s3cr3t@10.0.0.7:8545", schemeless, None),
+        ] {
+            let message = match cli_with(None, Some(rpc), Some(readiness)).into_settings() {
+                Ok(_) => panic!("{rpc} / {readiness} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            for secret in secrets {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+            if let Some(origin) = origin {
+                assert!(message.contains(origin), "the origin is missing from: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn zero_poll_interval_is_rejected() {
+        let message = match cli_with_flags(&["--readiness-poll-interval=0s"]).into_settings() {
+            Ok(_) => panic!("a zero poll interval must fail startup, not panic the poller"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("--readiness-poll-interval"), "{message}");
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() -> eyre::Result<()> {
+        for flag in [
+            "--readiness-poll-timeout",
+            "--upstream-connect-timeout",
+            "--upstream-request-timeout",
+            "--header-read-timeout",
+        ] {
+            let zero = format!("{flag}=0s");
+            let message = match cli_with_flags(&[zero.as_str()]).into_settings() {
+                Ok(_) => panic!("{zero} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(flag), "{message}");
+            // the smallest non-zero value is still accepted
+            let tiny = format!("{flag}=1ms");
+            cli_with_flags(&[tiny.as_str()]).into_settings()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_worker_ids_are_rejected() -> eyre::Result<()> {
+        let config = |second_id: u16| -> eyre::Result<tempfile::NamedTempFile> {
+            let mut file = tempfile::NamedTempFile::new()?;
+            write!(
+                file,
+                r#"upstreams:
+  - worker_id: 0
+    rpc_url: "http://10.0.0.7:8545"
+    readiness_url: "http://10.0.0.7:8551/health/workers"
+  - worker_id: {second_id}
+    rpc_url: "http://10.0.0.8:8545"
+    readiness_url: "http://10.0.0.8:8551/health/workers"
+"#
+            )?;
+            Ok(file)
+        };
+        let duplicate = config(0)?;
+        let path = duplicate.path().display().to_string();
+        let message = match cli_with(Some(&path), None, None).into_settings() {
+            Ok(_) => panic!("two upstreams with worker id 0 must be rejected"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("worker id 0"), "{message}");
+
+        let distinct = config(1)?;
+        let path = distinct.path().display().to_string();
+        assert_eq!(cli_with(Some(&path), None, None).into_settings()?.upstreams.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_ipv6_self_url_is_rejected() -> eyre::Result<()> {
+        let ready = "http://10.0.0.7:8551/health/workers";
+        for (listen, rpc, readiness) in [
+            ("127.0.0.1:8545", "http://[::ffff:127.0.0.1]:8545/", ready),
+            ("127.0.0.1:8545", "http://10.0.0.7:8544", "http://[::ffff:127.0.0.1]:8545/health"),
+            ("0.0.0.0:8545", "http://[::ffff:127.0.0.1]:8545/", ready),
+            ("0.0.0.0:8545", "http://[::ffff:0.0.0.0]:8545/", ready),
+        ] {
+            let result = Cli::parse_from([
+                "worker-gateway".to_string(),
+                format!("--listen-addr={listen}"),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={readiness}"),
+            ])
+            .into_settings();
+            assert!(result.is_err(), "{rpc} / {readiness} is the gateway on {listen}");
+        }
+        // a mapped address of another host, or on another port, is accepted
+        for rpc in ["http://[::ffff:10.0.0.7]:8545/", "http://[::ffff:127.0.0.1]:8544/"] {
+            Cli::parse_from([
+                "worker-gateway".to_string(),
+                "--listen-addr=127.0.0.1:8545".to_string(),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={ready}"),
+            ])
+            .into_settings()?;
+        }
+        Ok(())
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does
@@ -803,11 +1034,137 @@ mod tests {
         }
     }
 
+    /// clap no longer parses `--redirect-queries`, so it cannot echo a value
+    /// it rejects; the startup error says what is wrong without the value.
+    #[test]
+    fn bad_redirect_value_is_not_echoed() {
+        for (value, problem) in [
+            ("https://user:s3cr3t@rpc.example.com:99999/k3y?token=t0k3n", "invalid port number"),
+            ("rpc.example.com/k3y?token=t0k3n", "relative URL without a base"),
+            ("http://[::1/k3y?token=t0k3n", "invalid IPv6 address"),
+            ("http://user:s3cr3t@/k3y?token=t0k3n", "empty host"),
+            ("user:s3cr3t@rpc.example.com/k3y?token=t0k3n", "unsupported URL scheme"),
+        ] {
+            let cli = Cli::try_parse_from([
+                "worker-gateway".to_string(),
+                "--upstream-rpc-url=http://10.0.0.7:8545".to_string(),
+                "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
+                format!("--redirect-queries={value}"),
+            ])
+            .unwrap_or_else(|err| panic!("clap must take any value; it rejected one: {err}"));
+            let message = match cli.into_settings() {
+                Ok(_) => panic!("{value} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("--redirect-queries"), "{message}");
+            assert!(message.contains(problem), "`{problem}` missing from: {message}");
+            for secret in ["user", "s3cr3t", "k3y", "t0k3n", "rpc.example.com"] {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+        }
+    }
+
     #[test]
     fn redirect_with_a_fragment_is_rejected() {
         let result =
             cli_with_flags(&["--redirect-queries=https://rpc.example.com/#frag"]).into_settings();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn redirect_on_a_readiness_host_and_port_is_rejected() {
+        // the worker in `cli_with_flags` serves readiness on 10.0.0.7:8551
+        for url in [
+            "http://10.0.0.7:8551/",
+            "http://10.0.0.7:8551/k3y?token=t0k3n",
+            "https://10.0.0.7:8551/",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("{url} is the worker's readiness endpoint and must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("worker 0's readiness host and port"), "{message}");
+            for secret in ["k3y", "t0k3n"] {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+        }
+    }
+
+    /// Collects everything a fmt subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Resolve `cli` while recording the gateway's log lines, and return the
+    /// settings with what was logged.
+    fn into_settings_logged(cli: Cli) -> (eyre::Result<Settings>, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=debug")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let settings = tracing::subscriber::with_default(subscriber, || cli.into_settings());
+        let logs = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("utf-8 logs");
+        (settings, logs)
+    }
+
+    #[test]
+    fn redirect_on_a_worker_host_with_another_port_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--redirect-queries is on a worker's host at another port";
+        // the worker in `cli_with_flags` is 10.0.0.7 (RPC 8545, readiness 8551)
+        for url in [
+            "http://10.0.0.7:9545/k3y?token=t0k3n",
+            "https://10.0.0.7/k3y?token=t0k3n",
+            "http://[::ffff:10.0.0.7]:9545/k3y?token=t0k3n",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[flag.as_str()]));
+            settings?;
+            assert!(logs.contains(WARNING), "{url} must warn: {logs}");
+            assert!(logs.contains("worker_id=0"), "{logs}");
+            for secret in ["k3y", "t0k3n"] {
+                assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+            }
+        }
+        // another host does not warn
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--redirect-queries=http://10.0.0.9:8545/"]));
+        settings?;
+        assert!(!logs.contains(WARNING), "{logs}");
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_ipv6_redirect_matches_an_ipv4_worker() {
+        // the worker in `cli_with_flags` is 10.0.0.7 (RPC 8545, readiness 8551)
+        for url in ["http://[::ffff:10.0.0.7]:8545/", "http://[::ffff:10.0.0.7]:8551/"] {
+            let flag = format!("--redirect-queries={url}");
+            let result = cli_with_flags(&[flag.as_str()]).into_settings();
+            assert!(result.is_err(), "{url} is the worker and must be rejected");
+        }
+        // and the other way round: a worker written as a mapped literal
+        let result = Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://[::ffff:10.0.0.7]:8545",
+            "--upstream-readiness-url=http://[::ffff:10.0.0.7]:8551/health/workers",
+            "--redirect-queries=http://10.0.0.7:8545/",
+        ])
+        .into_settings();
+        assert!(result.is_err(), "10.0.0.7:8545 is the mapped worker and must be rejected");
     }
 
     #[test]
@@ -824,6 +1181,9 @@ mod tests {
             ("http://192.168.1.10:8545/", false),
             ("http://[::1]:8545/", false),
             ("http://[fd00::7]:8545/", false),
+            ("http://[::ffff:10.0.0.7]:8545/", false),
+            ("http://[::ffff:127.0.0.1]:8545/", false),
+            ("http://[::ffff:203.0.113.5]:8545/", true),
         ] {
             assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
         }

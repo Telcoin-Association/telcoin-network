@@ -27,7 +27,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
 };
-use reqwest::{redirect::Policy, Client};
+use reqwest::{redirect::Policy, Client, ClientBuilder};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserializer,
@@ -280,7 +280,39 @@ async fn forward(
     Ok(response)
 }
 
-/// Build the client that forwards requests on both routes.
+/// Start a client for the upstream hop with the settings every upstream client
+/// shares: rustls with the platform's native root store, no proxy, and the
+/// upstream connect timeout.
+///
+/// The forwarding client ([`proxy_client`]) and the readiness poller's client
+/// ([`readiness_client`]) both start here and can only be built from here, so
+/// a setting that governs how the gateway reaches an upstream cannot reach one
+/// hop and silently miss the other. Both finish the builder with redirects
+/// off, so neither hop follows a `3xx` anywhere.
+///
+/// Proxies are off. reqwest otherwise sends every request through
+/// `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` from the environment, loopback
+/// and private addresses included unless `NO_PROXY` lists them, so a variable
+/// set for some other program would carry forwarded calls, readiness polls
+/// and the upstreams' answers through a host the operator never chose.
+///
+/// TLS is rustls with the platform's native root store, which only the query
+/// route can use (worker URLs must be `http`). An image without CA
+/// certificates still builds the clients, but every `https` request then
+/// fails.
+pub(crate) fn client_builder(connect_timeout: Duration) -> UpstreamClientBuilder {
+    UpstreamClientBuilder(
+        Client::builder().use_rustls_tls().no_proxy().connect_timeout(connect_timeout),
+    )
+}
+
+/// A builder that only [`client_builder`] can make (the field is private to
+/// this module), so both upstream hops share every upstream setting and one
+/// added there later, such as TLS, reaches both.
+pub(crate) struct UpstreamClientBuilder(ClientBuilder);
+
+/// Finish `builder` (see [`client_builder`]) into the client that forwards
+/// requests on both routes.
 ///
 /// Redirects are never followed. reqwest follows up to ten by default and
 /// replays a POST body on `307`/`308`, so a query upstream answering with a
@@ -289,21 +321,28 @@ async fn forward(
 /// host the gateway can reach. A `3xx` from either upstream is passed through
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either.
-///
-/// TLS is rustls with the platform's native root store, which only the query
-/// route can use (worker URLs must be `http`). An image without CA
-/// certificates still builds the client, but every `https` request then fails.
 pub(crate) fn proxy_client(
-    connect_timeout: Duration,
+    builder: UpstreamClientBuilder,
     request_timeout: Duration,
 ) -> reqwest::Result<Client> {
-    Client::builder()
-        .use_rustls_tls()
-        .redirect(Policy::none())
-        .user_agent(USER_AGENT)
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .build()
+    builder.0.redirect(Policy::none()).user_agent(USER_AGENT).timeout(request_timeout).build()
+}
+
+/// Finish `builder` (see [`client_builder`]) into the readiness poller's
+/// client.
+///
+/// Redirects are never followed here either. A readiness endpoint answering
+/// with a redirect would otherwise send the poller to whatever host its
+/// `Location` names, any internal host the gateway can reach included, and a
+/// ready payload served there would mark the worker ready on another node's
+/// word. The poll gets the `3xx` response itself instead and counts it as
+/// not ready, so only a `2xx` answer from the configured readiness URL can
+/// mark its worker ready.
+///
+/// There is no request timeout: the poller bounds each poll with
+/// `--readiness-poll-timeout` (see [`crate::readiness::run_poller`]).
+pub(crate) fn readiness_client(builder: UpstreamClientBuilder) -> reqwest::Result<Client> {
+    builder.0.redirect(Policy::none()).build()
 }
 
 /// The `X-Forwarded-For` value for the upstream hop: the immediate peer
@@ -1368,7 +1407,9 @@ mod tests {
     fn rustls_backend_is_compiled_in() {
         let bare = Client::builder().use_rustls_tls().build();
         assert!(bare.is_ok(), "{bare:?}");
-        let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1));
+        let proxy = proxy_client(client_builder(Duration::from_secs(1)), Duration::from_secs(1));
         assert!(proxy.is_ok(), "{proxy:?}");
+        let readiness = readiness_client(client_builder(Duration::from_secs(1)));
+        assert!(readiness.is_ok(), "{readiness:?}");
     }
 }
