@@ -885,10 +885,14 @@ mod tests {
 
     /// The new reader must agree with the old `Value` parse on every shape, so
     /// the fix is a memory change and not a behaviour change. In particular it
-    /// must not start rejecting anything it used to forward. The single
-    /// documented exception is an `id` nested past serde_json's recursion
-    /// limit, pinned by
-    /// [`deeply_nested_id_rejects_locally_where_the_old_parse_forwarded`].
+    /// must not start rejecting anything it used to forward. There are two
+    /// documented exceptions. An `id` nested past serde_json's recursion limit
+    /// is pinned by
+    /// [`deeply_nested_id_rejects_locally_where_the_old_parse_forwarded`]. An
+    /// `id` outside the echo bound on a rejected request echoes `null` where
+    /// the old parse echoed it whole: an array or object id is pinned by
+    /// [`structured_id_on_a_rejection_echoes_null`], a long string or boolean id
+    /// by the bound tests in `error.rs`.
     #[test]
     fn extraction_matches_the_previous_value_parse() {
         let valid = format!("[\"{EIP155_LEGACY_TX}\"]");
@@ -922,12 +926,9 @@ mod tests {
                 r#"{{"method":"eth_chainId","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":1}}"#
             )
             .into_bytes(),
-            // Structured ids, on the reject and the forward verdict. The screen
-            // no longer reads the id while parsing; these prove the id it
-            // recovers on rejection is still the one the old parse echoed.
-            br#"{"method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":[1,2,3]}"#.to_vec(),
-            br#"{"method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":{"n":{"id":7}}}"#
-                .to_vec(),
+            // A structured id on the forward verdict. The screen no longer
+            // reads the id while parsing; on a rejection a structured id echoes
+            // `null` by design (see `structured_id_on_a_rejection_echoes_null`).
             format!(
                 r#"{{"method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":[1,2,3]}}"#
             )
@@ -963,8 +964,8 @@ mod tests {
     /// recursion limit, not by a verdict. The new reader skips the id
     /// iteratively, with no depth bound, so the transaction is now screened on
     /// its merits and a reject-worthy payload is rejected locally.
-    /// `RequestId::recover` materializes the id as a `Value` and hits the same
-    /// limit, so the rejection echoes `null`. Only bodies the worker would
+    /// `RequestId::recover` reads an array `id` as `null` without building it,
+    /// so the rejection echoes `null`. Only bodies the worker would
     /// reject anyway change verdict; a valid transaction forwards under both
     /// readers, so the no-false-rejection invariant is unchanged.
     #[test]
@@ -980,7 +981,7 @@ mod tests {
         assert_eq!(verdict(reference_screen(&body)), None);
 
         // The new reader skips the id, rejects the undecodable transaction,
-        // and id recovery falls back to `null` at the same recursion limit.
+        // and id recovery echoes `null` for an array id.
         let (err, id) = screen_raw_transaction(&body).expect("undecodable tx must be rejected");
         assert!(matches!(err, GatewayError::InvalidTransaction));
         assert_eq!(id, RequestId::from_id(Value::Null));
@@ -992,6 +993,25 @@ mod tests {
         .into_bytes();
         assert_eq!(verdict(screen_raw_transaction(&valid_body)), None);
         assert_eq!(verdict(reference_screen(&valid_body)), None);
+    }
+
+    /// A rejected request's id is recovered within the echo bound: an array or
+    /// object id echoes `null` where the old parse echoed it whole, and the
+    /// verdict is the one the old parse reached.
+    #[test]
+    fn structured_id_on_a_rejection_echoes_null() {
+        let bodies = [
+            br#"{"method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":[1,2,3]}"#.to_vec(),
+            br#"{"method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":{"n":{"id":7}}}"#
+                .to_vec(),
+        ];
+        bodies.iter().for_each(|body| {
+            let (err, id) = screen_raw_transaction(body).expect("undecodable tx must be rejected");
+            assert!(matches!(err, GatewayError::InvalidTransaction));
+            assert_eq!(id, RequestId::from_id(Value::Null));
+            let (reference_err, _) = reference_screen(body).expect("the old parse rejected it too");
+            assert_eq!(format!("{err:?}"), format!("{reference_err:?}"));
+        });
     }
 
     /// A body whose only mention of the method is inside a huge unrelated member
