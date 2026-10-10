@@ -73,11 +73,17 @@ The same choice applies to an external load balancer or DNS health check.
 
 ## Memory limit
 
-The gateway buffers each request body whole before it forwards it, and every open connection can hold one body.
-A held body costs more than its size, because the connection's read buffer (up to about 400 KiB) stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB.
-Size the container's memory limit as 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB for the process baseline and response streaming.
-At the defaults that is 1.5 × 500 × 1 MiB + 64 MiB, about 814 MiB, and the Deployment's 1Gi limit leaves about 300 MiB over the measured peak.
-If you raise either flag, raise the limit with it; if the limit has to stay lower, lower one of the flags until the product fits (`--max-connections 256` needs about 448 MiB).
+The gateway buffers each request body whole before it forwards it, and `--max-inflight-request-bytes` (default 512 MiB) bounds the bytes all in-flight requests hold at once; a request that does not fit is refused with `503` / `-32010` instead of being buffered.
+A body with a declared length is read into one buffer of exactly that size, so a held body costs about its reservation.
+Each open connection also keeps a read buffer of up to `--http1-max-buf-size` (default 64 KiB).
+Size the container's memory limit as `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming.
+At the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, and the Deployment's 1Gi limit leaves about 416 MiB over that.
+In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process, about 1.3 times the budget, the read buffers of all three sides' connections included.
+Each extra connection adds at most `--http1-max-buf-size`.
+Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 40 s by default) even if no body byte arrives.
+About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
+On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); a per-IP connection cap is tracked in #1599.
+If the limit has to stay lower, lower the budget (`--max-inflight-request-bytes 268435456`, 256 MiB, needs about 352 MiB); a 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it (about 336 MiB).
 
 ## Metrics scraping (ServiceMonitor)
 

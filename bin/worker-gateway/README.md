@@ -250,11 +250,19 @@ Size it from both ends:
   plus a little for the JSON envelope. There is no point going above the
   worker's own request cap, 15 MiB (the node's `--rpc.max-request-size`
   default of `15`, in MiB): the worker rejects anything larger anyway.
-- **Small enough for memory.** The whole body is buffered before it is forwarded, and every open connection can hold one, so peak request memory is about `--max-connections` × `--max-request-bytes` plus per-connection and runtime overhead.
-  Keep that well under the container's memory limit.
-  A held body costs more than its size, because the connection's read buffer stays allocated while the request is in flight: 500 held 1 MiB bodies peaked at about 712 MiB, so budget about 1.5 × `--max-connections` × `--max-request-bytes` plus 64 MiB.
-  With the defaults that is about 814 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
-  If you raise either flag, raise the limit with it, or lower one of the two flags until the product fits, for example `--max-connections 128` for about 128 MiB.
+- **Small enough for memory.** The whole body is buffered before it is forwarded, and `--max-inflight-request-bytes` bounds the bytes all in-flight requests hold at once, whatever the connection count.
+  A body with a declared length is read into one buffer of exactly that size, so a held body costs about its reservation.
+  Each open connection also keeps a read buffer of up to `--http1-max-buf-size`.
+  So peak request memory is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming; keep that under the container's memory limit.
+  With the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
+  In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process over five runs, about 1.3 times the budget.
+  That excess includes the read buffers of the client's, the gateway's and the upstream's connections, whose number the test scales with the budget, so the gateway's own share was not measured separately.
+  Each extra connection adds at most `--http1-max-buf-size`.
+  Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 40 s by default) even if no body byte arrives.
+  About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
+  On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); a per-IP connection cap is tracked in #1599.
+  If the limit has to stay lower, lower the budget, for example `--max-inflight-request-bytes 268435456` (256 MiB) for about 352 MiB.
+  A 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it, which brings the figure to about 336 MiB.
 
 ### Transaction screening
 
@@ -391,7 +399,7 @@ Every limit is per process, so the worker sees the sum over all gateways.
 - **Worker connections.** N × `--max-connections` can exceed the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
   With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s.
   Raise the worker's limit above N × `--max-connections`, or accept that a flood of Sync calls through one gateway can make the worker refuse submissions from the others.
-- **Memory.** Peak request memory per gateway is about `--max-connections` × `--max-request-bytes` plus overhead (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
+- **Memory.** Peak request memory per gateway is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 
 ### Split routing
 
