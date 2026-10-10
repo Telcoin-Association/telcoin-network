@@ -12,7 +12,7 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState, ServerLimits},
+    server::{serve, AccessLog, AppState, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -39,6 +39,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_global,
         graceful_shutdown_timeout,
         metrics_addr,
+        access_log_sample,
     } = settings;
 
     info!(
@@ -61,12 +62,16 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         DEFAULT_MAX_PER_IP_ENTRIES,
         rate_limit_prefix,
     );
+    // The sampled access log keys clients by the same prefix as the per-IP
+    // limiter, or `None` when `--access-log-sample` is `0`.
+    let access_log = AccessLog::new(access_log_sample, rate_limit_prefix);
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
+        access_log_sample,
         "edge protections configured"
     );
 
@@ -162,6 +167,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             state,
             limits,
             rate_limiters,
+            access_log,
             graceful_shutdown_timeout,
             shutdown.subscribe(),
         ),
