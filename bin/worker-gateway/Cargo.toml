@@ -64,6 +64,11 @@ socket2 = { workspace = true }
 # transaction type the tests build comes through `tn-types` re-exports.
 alloy = { workspace = true }
 tempfile = { workspace = true }
+# test certificate authority, server and client certificates for the TLS
+# upstream tests, and the TLS mock upstream that serves them; both versions are
+# already in the lockfile, and `ring` keeps the build on reqwest's provider
+rcgen = { version = "0.13.2" }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring"] }
 
 [lints]
 workspace = true

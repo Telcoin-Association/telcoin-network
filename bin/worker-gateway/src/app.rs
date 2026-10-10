@@ -3,13 +3,13 @@
 
 use std::sync::Arc;
 
-use reqwest::Client;
+use eyre::WrapErr as _;
 use tn_types::{ShutdownNotifier, TaskManager};
 use tracing::info;
 
 use crate::{
     cli::Settings,
-    proxy::{proxy_client, UpstreamOrigin},
+    proxy::{client_builder, proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
     server::{serve, AppState, ServerLimits},
@@ -21,14 +21,19 @@ use crate::{
 /// [`TaskManager`] and blocks on `join_until_exit`, which installs the
 /// SIGTERM/ctrl-c handler and drains the tasks on shutdown.
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
+    // Both upstream clients start from the same TLS settings (see
+    // `client_builder`); they are finished below.
+    let proxy_client_builder = client_builder(&settings);
+    let readiness_client_builder = client_builder(&settings);
     let Settings {
         listen_addr,
         upstreams,
         query_upstream,
         readiness_poll_interval,
         readiness_poll_timeout,
-        upstream_connect_timeout,
+        upstream_connect_timeout: _,
         upstream_request_timeout,
+        upstream_ca_certs: _,
         header_read_timeout,
         max_connections,
         tcp_user_timeout,
@@ -73,8 +78,11 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
     // probe with its own tokio timeout.
-    let proxy_client = proxy_client(upstream_connect_timeout, upstream_request_timeout)?;
-    let readiness_client = Client::builder().connect_timeout(upstream_connect_timeout).build()?;
+    let proxy_client = proxy_client(proxy_client_builder, upstream_request_timeout)
+        .wrap_err("cannot build the upstream client; check --upstream-ca-cert")?;
+    let readiness_client = readiness_client_builder
+        .build()
+        .wrap_err("cannot build the readiness client; check --upstream-ca-cert")?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
     // Let in-flight requests drain within the graceful deadline (plus a small

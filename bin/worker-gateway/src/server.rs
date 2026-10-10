@@ -338,23 +338,39 @@ fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Res
 mod tests {
     use super::*;
     use crate::{
+        cli::{Cli, Settings},
         config::UpstreamWorker,
-        proxy::{proxy_client, MAX_REQUEST_BYTES},
+        proxy::{client_builder, proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        readiness::run_poller,
     };
     use axum::{
         http::{header, HeaderMap},
         routing::post,
     };
+    use clap::Parser as _;
+    use rcgen::{
+        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+        KeyUsagePurpose,
+    };
     use reqwest::redirect::Policy;
     use std::{
+        io::Write as _,
         num::NonZeroU32,
         sync::atomic::{AtomicUsize, Ordering},
     };
+    use tempfile::NamedTempFile;
     use tn_types::Notifier;
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
+    };
+    use tokio_rustls::{
+        rustls::{
+            crypto::ring::default_provider, pki_types::PrivatePkcs8KeyDer,
+            server::WebPkiClientVerifier, RootCertStore, ServerConfig,
+        },
+        TlsAcceptor,
     };
 
     /// Generous limits so only the behavior under test can trip.
@@ -953,7 +969,11 @@ mod tests {
     /// `--redirect-queries` pointing at `query`, using the production proxy
     /// client. The worker starts not ready.
     fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
-        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        let client = proxy_client(
+            Client::builder().connect_timeout(Duration::from_secs(2)),
+            Duration::from_secs(5),
+        )
+        .expect("client");
         redirect_state_with_client(worker, query, client)
     }
 
@@ -1112,8 +1132,11 @@ mod tests {
             }),
         );
         let (query, _query) = spawn(slow).await;
-        let client =
-            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+        let client = proxy_client(
+            Client::builder().connect_timeout(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
         let state = redirect_state_with_client(worker, Some(query), client);
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
@@ -1251,5 +1274,360 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A throwaway certificate authority for the TLS upstream tests.
+    struct TestCa {
+        cert: rcgen::Certificate,
+        key: KeyPair,
+    }
+
+    impl TestCa {
+        fn new(name: &str) -> Self {
+            let key = KeyPair::generate().expect("ca key");
+            let mut params = CertificateParams::new(Vec::<String>::new()).expect("ca params");
+            params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+            params.distinguished_name.push(DnType::CommonName, name);
+            params.key_usages =
+                vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::DigitalSignature];
+            let cert = params.self_signed(&key).expect("self-signed ca");
+            Self { cert, key }
+        }
+
+        /// A leaf certificate for `127.0.0.1` (an IP SAN) signed by this CA,
+        /// with its key.
+        fn leaf(&self, usage: ExtendedKeyUsagePurpose) -> (rcgen::Certificate, KeyPair) {
+            self.leaf_for("127.0.0.1", usage)
+        }
+
+        /// A leaf certificate for `name` (an IP SAN when it parses as an
+        /// address, a DNS SAN otherwise) signed by this CA, with its key.
+        fn leaf_for(
+            &self,
+            name: &str,
+            usage: ExtendedKeyUsagePurpose,
+        ) -> (rcgen::Certificate, KeyPair) {
+            let key = KeyPair::generate().expect("leaf key");
+            let mut params = CertificateParams::new(vec![name.to_string()]).expect("leaf params");
+            params.distinguished_name.push(DnType::CommonName, name);
+            params.extended_key_usages = vec![usage];
+            let cert = params.signed_by(&key, &self.cert, &self.key).expect("signed leaf");
+            (cert, key)
+        }
+
+        /// The CA certificate as a PEM file, as `--upstream-ca-cert` takes it.
+        fn pem_file(&self) -> NamedTempFile {
+            pem_file(&self.cert.pem())
+        }
+    }
+
+    /// Write `pem` to a temporary file that lives as long as the handle.
+    fn pem_file(pem: &str) -> NamedTempFile {
+        let mut file = NamedTempFile::new().expect("temp file");
+        file.write_all(pem.as_bytes()).expect("write pem");
+        file
+    }
+
+    /// A rustls server configuration presenting a `127.0.0.1` leaf signed by
+    /// `ca`, requiring a client certificate signed by `client_ca` when given.
+    fn tls_server_config(ca: &TestCa, client_ca: Option<&TestCa>) -> Arc<ServerConfig> {
+        tls_server_config_for(ca, "127.0.0.1", client_ca)
+    }
+
+    /// [`tls_server_config`] with a leaf issued to `name` instead. The
+    /// provider is explicit so no process-wide default is needed.
+    fn tls_server_config_for(
+        ca: &TestCa,
+        name: &str,
+        client_ca: Option<&TestCa>,
+    ) -> Arc<ServerConfig> {
+        let provider = Arc::new(default_provider());
+        let (leaf, key) = ca.leaf_for(name, ExtendedKeyUsagePurpose::ServerAuth);
+        let builder = ServerConfig::builder_with_provider(Arc::clone(&provider))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions");
+        let builder = match client_ca {
+            Some(client_ca) => {
+                let mut roots = RootCertStore::empty();
+                roots.add(client_ca.cert.der().clone()).expect("client ca root");
+                let verifier =
+                    WebPkiClientVerifier::builder_with_provider(Arc::new(roots), provider)
+                        .build()
+                        .expect("client verifier");
+                builder.with_client_cert_verifier(verifier)
+            }
+            None => builder.with_no_client_auth(),
+        };
+        let config = builder
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivatePkcs8KeyDer::from(key.serialize_der()).into(),
+            )
+            .expect("server certificate");
+        Arc::new(config)
+    }
+
+    /// Serve `app` over TLS with `config` on an ephemeral port, mirroring
+    /// [`accept_loop`]'s per-connection hyper service without its limits.
+    /// The counter counts finished TLS handshakes, failed ones included, so a
+    /// test can wait for a poll to have been refused. The `Notifier` keeps the
+    /// server alive.
+    async fn spawn_tls(
+        app: Router,
+        config: Arc<ServerConfig>,
+    ) -> (SocketAddr, Arc<AtomicUsize>, Notifier) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let acceptor = TlsAcceptor::from(config);
+        let handshakes = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&handshakes);
+        let shutdown = Notifier::new();
+        let noticer = shutdown.subscribe();
+        tokio::spawn(async move {
+            loop {
+                let accepted = tokio::select! {
+                    () = &noticer => break,
+                    accepted = listener.accept() => accepted,
+                };
+                let Ok((stream, peer_addr)) = accepted else { continue };
+                let (acceptor, app, counter) =
+                    (acceptor.clone(), app.clone(), Arc::clone(&counter));
+                tokio::spawn(async move {
+                    let tls = acceptor.accept(stream).await;
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    // a refused handshake (unknown CA, missing client
+                    // certificate) just drops the connection
+                    let Ok(tls) = tls else { return };
+                    let service =
+                        TowerToHyperService::new(app.layer(Extension(ConnectInfo(peer_addr))));
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        (addr, handshakes, shutdown)
+    }
+
+    /// A worker RPC mock (`POST /` answers `worker`) and a readiness mock
+    /// (`GET /health/workers` reports worker 0 accepting), each on its own port.
+    struct WorkerMocks {
+        rpc: SocketAddr,
+        rpc_hits: Arc<AtomicUsize>,
+        readiness: SocketAddr,
+        readiness_handshakes: Arc<AtomicUsize>,
+        _servers: [Notifier; 2],
+    }
+
+    fn worker_mock_routers() -> (Router, Router, Arc<AtomicUsize>) {
+        let rpc_hits = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&rpc_hits);
+        let rpc = Router::new().route(
+            "/",
+            post(move || {
+                let hits = Arc::clone(&hits);
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    "worker"
+                }
+            }),
+        );
+        let readiness = Router::new().route(
+            "/health/workers",
+            get(|| async {
+                r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
+            }),
+        );
+        (rpc, readiness, rpc_hits)
+    }
+
+    /// Both worker mocks over TLS with `config`.
+    async fn tls_worker_mocks(config: Arc<ServerConfig>) -> WorkerMocks {
+        let (rpc, readiness, rpc_hits) = worker_mock_routers();
+        let (rpc, _, rpc_server) = spawn_tls(rpc, Arc::clone(&config)).await;
+        let (readiness, readiness_handshakes, readiness_server) =
+            spawn_tls(readiness, config).await;
+        WorkerMocks {
+            rpc,
+            rpc_hits,
+            readiness,
+            readiness_handshakes,
+            _servers: [rpc_server, readiness_server],
+        }
+    }
+
+    /// Resolve the gateway's settings through the CLI, as `main` does, for one
+    /// worker whose RPC and readiness mocks listen on `rpc` and `readiness`
+    /// and are reached over `scheme`, plus `flags`.
+    fn worker_settings(
+        scheme: &str,
+        rpc: SocketAddr,
+        readiness: SocketAddr,
+        flags: &[String],
+    ) -> Settings {
+        let mut argv = vec![
+            "worker-gateway".to_string(),
+            format!("--upstream-rpc-url={scheme}://{rpc}/"),
+            format!("--upstream-readiness-url={scheme}://{readiness}/health/workers"),
+        ];
+        argv.extend(flags.iter().cloned());
+        Cli::parse_from(argv).into_settings().expect("settings")
+    }
+
+    /// The gateway state with the production upstream client built from
+    /// `settings`, as `app::run` builds it, with every worker not ready.
+    fn production_state(settings: &Settings) -> AppState {
+        let http = proxy_client(client_builder(settings), settings.upstream_request_timeout)
+            .expect("proxy client");
+        test_state_with_client(&settings.upstreams, http)
+    }
+
+    /// Serve a gateway for `settings` with a live readiness poller using the
+    /// production readiness client, as `app::run` wires it. The two
+    /// `Notifier`s keep the server and the poller alive.
+    async fn spawn_polled_gateway(settings: &Settings) -> (SocketAddr, Notifier, Notifier) {
+        let state = production_state(settings);
+        let readiness_client = client_builder(settings).build().expect("readiness client");
+        let poller = Notifier::new();
+        tokio::spawn(run_poller(
+            Arc::clone(&state.readiness),
+            readiness_client,
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+            poller.subscribe(),
+        ));
+        let (gateway, shutdown) = spawn(test_router(state)).await;
+        (gateway, shutdown, poller)
+    }
+
+    /// The status of the gateway's `GET /ready`.
+    async fn ready_status(gateway: SocketAddr) -> StatusCode {
+        Client::new().get(format!("http://{gateway}/ready")).send().await.expect("send").status()
+    }
+
+    /// Wait up to five seconds for the gateway's `/ready` to answer `200`.
+    async fn wait_until_ready(gateway: SocketAddr) {
+        for _ in 0..100 {
+            if ready_status(gateway).await == StatusCode::OK {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the upstream never became ready");
+    }
+
+    /// Wait up to five seconds for `counter` to reach `target`.
+    async fn wait_for_count(counter: &AtomicUsize, target: usize) {
+        for _ in 0..100 {
+            if counter.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("count never reached {target}");
+    }
+
+    #[tokio::test]
+    async fn https_worker_with_a_custom_ca_forwards_and_polls() {
+        let ca = TestCa::new("worker test ca");
+        let mocks = tls_worker_mocks(tls_server_config(&ca, None)).await;
+        let ca_file = ca.pem_file();
+        let settings = worker_settings(
+            "https",
+            mocks.rpc,
+            mocks.readiness,
+            &[format!("--upstream-ca-cert={}", ca_file.path().display())],
+        );
+        let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+
+        // the poller reached the readiness mock over tls and believed it
+        wait_until_ready(gateway).await;
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(mocks.rpc_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wrong_ca_makes_the_upstream_not_ready() {
+        let worker_ca = TestCa::new("worker test ca");
+        let other_ca = TestCa::new("unrelated test ca");
+        let mocks = tls_worker_mocks(tls_server_config(&worker_ca, None)).await;
+        let ca_file = other_ca.pem_file();
+        let settings = worker_settings(
+            "https",
+            mocks.rpc,
+            mocks.readiness,
+            &[format!("--upstream-ca-cert={}", ca_file.path().display())],
+        );
+        let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+
+        // two refused handshakes: the first poll has finished and been recorded
+        wait_for_count(&mocks.readiness_handshakes, 2).await;
+        assert_eq!(ready_status(gateway).await, StatusCode::SERVICE_UNAVAILABLE);
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 2)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text), (-32000, serde_json::json!(2)));
+
+        // forced ready (no poller), the forward itself still refuses the
+        // certificate and never reaches the worker's handler
+        let state = production_state(&settings);
+        state.readiness.set_ready(0, true);
+        let (forced, _forced) = spawn(test_router(state)).await;
+        let (status, text) = post_rpc(forced, None, call("eth_sendRawTransaction", 3)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(3)));
+        assert_eq!(mocks.rpc_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn certificate_for_another_host_makes_the_upstream_not_ready() {
+        let ca = TestCa::new("worker test ca");
+        let ca_file = ca.pem_file();
+        // signed by the trusted CA, but for a DNS name and for another
+        // address, while the URLs name 127.0.0.1
+        for name in ["worker.test", "127.0.0.2"] {
+            let mocks = tls_worker_mocks(tls_server_config_for(&ca, name, None)).await;
+            let settings = worker_settings(
+                "https",
+                mocks.rpc,
+                mocks.readiness,
+                &[format!("--upstream-ca-cert={}", ca_file.path().display())],
+            );
+            let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+            wait_for_count(&mocks.readiness_handshakes, 2).await;
+            assert_eq!(ready_status(gateway).await, StatusCode::SERVICE_UNAVAILABLE, "{name}");
+
+            // forced ready, the forward itself refuses the name and never
+            // reaches the worker's handler
+            let state = production_state(&settings);
+            state.readiness.set_ready(0, true);
+            let (forced, _forced) = spawn(test_router(state)).await;
+            let (status, text) = post_rpc(forced, None, call("eth_sendRawTransaction", 3)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{name}");
+            assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(3)), "{name}");
+            assert_eq!(mocks.rpc_hits.load(Ordering::SeqCst), 0, "{name}");
+        }
+    }
+
+    #[tokio::test]
+    async fn http_worker_urls_still_work() {
+        // plain http mocks, with an extra CA configured: the rustls client
+        // built for https upstreams still polls and forwards over http
+        let (rpc, readiness, rpc_hits) = worker_mock_routers();
+        let (rpc, _rpc) = spawn(rpc).await;
+        let (readiness, _readiness) = spawn(readiness).await;
+        let ca_file = TestCa::new("unused test ca").pem_file();
+        let settings = worker_settings(
+            "http",
+            rpc,
+            readiness,
+            &[format!("--upstream-ca-cert={}", ca_file.path().display())],
+        );
+        let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+
+        wait_until_ready(gateway).await;
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(rpc_hits.load(Ordering::SeqCst), 1);
     }
 }
