@@ -16,7 +16,7 @@
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{borrow::Cow, fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use axum::{
     body::{Body, Bytes},
@@ -37,6 +37,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
+    dns::CachingResolver,
     error::{error_response, error_response_with_id, GatewayError, RequestId},
     server::AppState,
     telemetry,
@@ -293,9 +294,15 @@ async fn forward(
 /// TLS is rustls with the platform's native root store, which only the query
 /// route can use (worker URLs must be `http`). An image without CA
 /// certificates still builds the client, but every `https` request then fails.
+///
+/// Upstream names resolve through `resolver`, which caches each host's
+/// addresses and caps how many lookups run at once (see [`crate::dns`]); a
+/// lookup it refuses fails the connection at once, which [`classify_error`]
+/// reports as `UpstreamUnreachable`.
 pub(crate) fn proxy_client(
     connect_timeout: Duration,
     request_timeout: Duration,
+    resolver: Arc<CachingResolver>,
 ) -> reqwest::Result<Client> {
     Client::builder()
         .use_rustls_tls()
@@ -303,6 +310,7 @@ pub(crate) fn proxy_client(
         .user_agent(USER_AGENT)
         .connect_timeout(connect_timeout)
         .timeout(request_timeout)
+        .dns_resolver(resolver)
         .build()
 }
 
@@ -1368,7 +1376,12 @@ mod tests {
     fn rustls_backend_is_compiled_in() {
         let bare = Client::builder().use_rustls_tls().build();
         assert!(bare.is_ok(), "{bare:?}");
-        let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1));
+        let resolver = Arc::new(CachingResolver::new(
+            Arc::new(crate::dns::SystemLookup),
+            Duration::from_secs(30),
+            std::num::NonZeroUsize::new(8).expect("nonzero"),
+        ));
+        let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1), resolver);
         assert!(proxy.is_ok(), "{proxy:?}");
     }
 }

@@ -101,6 +101,8 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
+| `--dns-cache-ttl` | `WORKER_GATEWAY_DNS_CACHE_TTL` | `30s` | How long an upstream host's resolved addresses are reused (`0` disables the cache); see [DNS and the DDoS front](#dns-and-the-ddos-front). |
+| `--max-concurrent-dns-lookups` | `WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS` | `8` | Upstream DNS lookups that may run at once, for the proxy and the readiness poller each (at least `1`); a lookup over the cap fails at once. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
@@ -348,6 +350,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
+| `tn_worker_gateway_dns_lookups_total` | counter | `result` (`hit` / `miss` / `error` / `rejected`) | Upstream name resolutions: answered from the cache (fresh or stale), lookup started, lookup failed, or refused because every lookup slot was busy. A request that waits on a lookup already running for its host adds nothing. A stale answer whose background refresh is refused counts as both `hit` and `rejected`, and the request is still answered. The proxy and the readiness poller share the series. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also
@@ -394,6 +397,24 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
 - Absorb packet floods in front of the gateways.
   A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer; use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
 - If you use a front, firewall the gateways so that only the front reaches them; a gateway reachable directly bypasses it.
+
+The gateway resolves the names in its own upstream URLs (worker RPC and readiness URLs, `--redirect-queries`) through a cache with a cap on concurrent lookups.
+Without one, a `--redirect-queries` host that resolved slowly under steady reads filled the process's blocking pool with stuck lookups, readiness polls timed out behind them, and submissions got `503`.
+
+- Each host's answer is reused for `--dns-cache-ttl` (30 s by default), and only one lookup per host runs at a time; requests that need the same name wait for the lookup already running, for up to `--upstream-connect-timeout`, and then get `504`.
+  A failed connection does not discard the cached answer, so an upstream that moves to a new address is followed only once its answer expires.
+- At most `--max-concurrent-dns-lookups` lookups (8 by default) run at once for the proxy, and as many again for the readiness poller.
+  A request that needs a new lookup while every slot is busy fails at once as an unreachable upstream (`502`) instead of queueing.
+  A lookup keeps its slot until the system resolver answers, even after the request that started it has given up, so slow lookups never hold more than twice the cap in threads.
+- An expired answer is still served while one lookup refreshes it in the background, and it keeps being served when the refresh fails or cannot start, for up to a day past its expiry.
+  A name that stays unresolvable longer than that is dropped, and requests to it fail until it resolves again.
+  This includes a record you delete on purpose: the gateway keeps sending submissions and readiness polls to its last addresses for up to a day, so restart the gateway after retiring an upstream's DNS name.
+- The readiness poller has its own cache and its own cap of the same size, so query traffic to a slow host can never delay or refuse a readiness poll and turn into `503`s for submissions.
+  The node's health listener closes the connection after each response, so without the cache a hostname readiness URL needs a lookup on every poll.
+- `--dns-cache-ttl=0` turns the cache off: every new upstream connection looks its host up again, still one lookup per host at a time and within the cap.
+  Upstream URLs with IP literals never use the resolver.
+- A steady rate of `tn_worker_gateway_dns_lookups_total{result="rejected"}` means more upstream names are resolving slowly at once than the cap allows.
+  Fix the resolver before raising the cap: every slot is a thread blocked in the system resolver.
 
 ### Firewalling
 
