@@ -45,8 +45,9 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
-    /// The request body could not be read. This is the spec-defined
-    /// "Invalid Request" code, not a gateway-range code.
+    /// The request body could not be read, or the request was not a `POST`.
+    /// This is the spec-defined "Invalid Request" code, not a gateway-range
+    /// code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
 }
 
@@ -82,6 +83,10 @@ pub(crate) enum GatewayError {
     UnsupportedTransactionType,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
+    /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is
+    /// `POST` only, so the request is answered locally, without reading its
+    /// body or forwarding it.
+    NonPostMethod,
 }
 
 impl GatewayError {
@@ -97,6 +102,7 @@ impl GatewayError {
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
+            Self::NonPostMethod => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -112,7 +118,7 @@ impl GatewayError {
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
-            Self::UnreadableBody => code::INVALID_REQUEST,
+            Self::UnreadableBody | Self::NonPostMethod => code::INVALID_REQUEST,
         }
     }
 
@@ -139,6 +145,7 @@ impl GatewayError {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
             Self::UnreadableBody => "request body could not be read",
+            Self::NonPostMethod => "only POST is accepted",
         }
     }
 
@@ -158,6 +165,7 @@ impl GatewayError {
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
             Self::UnreadableBody => "unreadable_body",
+            Self::NonPostMethod => "method_not_post",
         }
     }
 }
@@ -479,6 +487,10 @@ mod tests {
             error_response(&GatewayError::UnsupportedTransactionType, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            error_response(&GatewayError::NonPostMethod, b"{}").status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 
     #[test]
@@ -488,6 +500,7 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::NonPostMethod.code(), -32600);
     }
 
     #[test]
@@ -515,5 +528,18 @@ mod tests {
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
+        assert_eq!(GatewayError::NonPostMethod.reason(), "method_not_post");
+    }
+
+    #[test]
+    fn non_post_code_and_reason_are_stable() {
+        // A non-POST request shares the spec's "Invalid Request" code with an
+        // unreadable body; its status, message and reason label tell the two
+        // apart, so pin all of them.
+        let err = GatewayError::NonPostMethod;
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(err.code(), -32600);
+        assert_eq!(err.message(), "only POST is accepted");
+        assert_eq!(err.reason(), "method_not_post");
     }
 }

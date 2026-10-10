@@ -3,7 +3,7 @@
 A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
 It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
 With `--redirect-queries` it sends only transaction submissions to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
-"Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
+"Unchanged" applies to the JSON-RPC body and content type of a `POST`, the only method the gateway forwards; the header contract is deliberately minimal (see Scope).
 
 Because every instance is stateless and identical, the gateway can be scaled
 horizontally: any replica can serve any request. This is PR4 of the epic
@@ -25,14 +25,12 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   With `--redirect-queries`, only `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the worker and every other call goes to the query URL (see [Query redirect](#query-redirect)).
 - TLS termination and auth/API keys are out of scope; run the gateway behind
   your own ingress/mTLS.
-- Header forwarding is minimal. Upstream gets the request method, body, and
-  `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
-  identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
-  the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
-  gets the upstream status, body, and `Content-Type`. All other headers are
-  dropped in both directions; in particular CORS is not terminated here, so
-  browser dApps need CORS handled at the ingress (or a later PR).
-- The request path and query string are not forwarded: every request goes to
+- Header forwarding is minimal.
+  Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead).
+  The client gets the upstream status, body, and `Content-Type`; from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
+  All other headers are dropped in both directions; in particular CORS is not terminated here, so browser dApps need CORS handled at the ingress (or a later PR).
+  Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
+- The request path and query string are not forwarded: every `POST` goes to
   the configured upstream base URL (JSON-RPC carries its method in the body,
   so `POST /` is the whole HTTP surface).
 
@@ -303,6 +301,9 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
 connection reset) when the gateway cannot serve them. The request `id` is
 echoed when it can be recovered.
+
+The exception is a request whose head hyper, the HTTP library underneath, cannot parse.
+Hyper answers it itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |

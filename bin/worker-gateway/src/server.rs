@@ -1,8 +1,10 @@
 //! The gateway's HTTP surface: the JSON-RPC proxy plus liveness / readiness.
 //!
-//! A single server serves all three on one address: any request that is not
-//! `GET /health` or `GET /ready` falls through to the proxy, so JSON-RPC
-//! (`POST /`) is forwarded while orchestration probes hit the health routes.
+//! A single server serves all three on one address: `GET` (or `HEAD`) on
+//! `/health` and `/ready` are the orchestration probes, a `POST` to any other
+//! path is JSON-RPC and goes to the proxy, and every other request gets a
+//! `405` JSON-RPC error envelope without reaching an upstream. Every response
+//! the service produces carries `X-Content-Type-Options: nosniff`.
 //!
 //! The accept loop is hand-rolled over hyper's HTTP/1 connection builder
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
@@ -18,8 +20,8 @@ use std::{net::SocketAddr, num::NonZeroUsize, pin::pin, sync::Arc, time::Duratio
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::StatusCode,
-    middleware::{from_fn_with_state, Next},
+    http::{header, HeaderValue, Method, StatusCode},
+    middleware::{from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -41,7 +43,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    proxy::{proxy, ForwardingStarted},
+    proxy::{proxy, reject_non_post, ForwardingStarted},
     ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
 };
@@ -125,9 +127,15 @@ struct ReadyBody {
 /// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
 /// caps the buffered request body.
 ///
-/// When `rate_limiters` is present it is installed as the outermost layer, so
-/// an over-limit request is shed with a JSON-RPC `429` before its body is
-/// buffered or forwarded.
+/// The probe paths answer `GET` and `HEAD`; any other method on them, `POST`
+/// included, gets the same `405` envelope as a non-`POST` request anywhere
+/// else, with axum's `Allow: GET,HEAD` in place of the proxy's `Allow: POST`.
+/// A `POST` to a probe path is not proxied because the rate limiter exempts
+/// those paths, so proxying it would let JSON-RPC skip the limits.
+///
+/// When `rate_limiters` is present it wraps every layer but the `nosniff`
+/// one, so an over-limit request is shed with a JSON-RPC `429` before its body
+/// is buffered or forwarded, and that `429` still carries `nosniff`.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -137,15 +145,34 @@ pub(crate) fn router(
     let router = Router::new()
         .route(HEALTH_PATH, get(liveness))
         .route(READY_PATH, get(readiness))
+        .method_not_allowed_fallback(probe_method_not_allowed)
         .fallback(proxy)
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(from_fn_with_state(request_deadline, enforce_request_deadline));
-    // Add the rate-limit layer last so it runs first, ahead of the body read.
+    // Add the rate-limit layer after the deadline and body limit so it runs
+    // before them, ahead of the body read.
     let router = match rate_limiters {
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
         None => router,
     };
-    router.with_state(state)
+    // Outermost, so every response the service produces carries it, the
+    // rate limiter's included.
+    router.layer(map_response(set_nosniff)).with_state(state)
+}
+
+/// Mark a response `X-Content-Type-Options: nosniff`, so a browser takes its
+/// `Content-Type` as given and never sniffs a body served on the validator's
+/// origin into HTML or script.
+async fn set_nosniff(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
+/// Answer a probe path requested with a method other than `GET` or `HEAD`.
+async fn probe_method_not_allowed(method: Method) -> Response {
+    reject_non_post(&method)
 }
 
 /// Bound a whole request by `deadline`, answering an overrun with the
@@ -507,19 +534,24 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
-            .post(format!("http://{gateway_addr}/"))
-            .header("content-type", "application/json")
-            .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
-            .send()
-            .await
-            .expect("send");
+        // the gateway does not forward the path, so the mock's `/` route
+        // answers a POST to any path
+        for path in ["/", "/anything"] {
+            let response = Client::new()
+                .post(format!("http://{gateway_addr}{path}"))
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
+                .send()
+                .await
+                .expect("send");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.text().await.expect("text"),
-            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
-        );
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.text().await.expect("text"),
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -683,6 +715,10 @@ mod tests {
             .expect("send");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
         let body: serde_json::Value = response.json().await.expect("json");
         assert_eq!(body["error"]["code"], -32003);
     }
@@ -797,7 +833,11 @@ mod tests {
             .expect("read");
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 408"), "expected 408, got: {response}");
-        let (_head, body) = response.split_once("\r\n\r\n").expect("response head and body");
+        let (head, body) = response.split_once("\r\n\r\n").expect("response head and body");
+        assert!(
+            head.to_ascii_lowercase().contains("\r\nx-content-type-options: nosniff"),
+            "gateway 408 must carry nosniff: {head}"
+        );
         let body: serde_json::Value = serde_json::from_str(body).expect("json error body");
         assert_eq!(body["error"]["code"], -32005);
         // the body never finished arriving, so nothing was forwarded and the
@@ -1492,5 +1532,171 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn non_post_requests_get_a_405_envelope() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // Every body below is over this 8-byte limit, so a 405 rather than a
+        // 413 shows the method is checked before the body is read.
+        let (gateway, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None)).await;
+
+        let client = Client::new();
+        // a POST to a probe path is refused too: the rate limiter exempts
+        // those paths, so it must not reach the proxy
+        for (method, path, allow) in [
+            (Method::GET, "/", "POST"),
+            (Method::PUT, "/", "POST"),
+            (Method::DELETE, "/x", "POST"),
+            (Method::PUT, "/health", "GET,HEAD"),
+            (Method::POST, "/ready", "GET,HEAD"),
+        ] {
+            let response = client
+                .request(method.clone(), format!("http://{gateway}{path}"))
+                .body(call("eth_chainId", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+            assert_eq!(
+                response.headers().get(header::ALLOW),
+                Some(&HeaderValue::from_static(allow)),
+                "{method} {path}"
+            );
+            let body: serde_json::Value = response.json().await.expect("json error body");
+            assert_eq!(body["error"]["code"], -32600, "{method} {path}");
+            assert_eq!(body["error"]["message"], "only POST is accepted", "{method} {path}");
+            assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a non-POST request must never reach the upstream");
+
+        // the probes still answer GET
+        let response = client.get(format!("http://{gateway}/health")).send().await.expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A query upstream that answers every POST with an HTML page labelled
+    /// `content_type` (no `Content-Type` at all when `None`).
+    async fn labelled_query_mock(content_type: Option<&'static str>) -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                let mut response =
+                    Response::new(axum::body::Body::from("<html><script>alert(1)</script></html>"));
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+                }
+                response
+            }),
+        );
+        spawn(mock).await
+    }
+
+    /// POST a query through a gateway whose `--redirect-queries` URL answers
+    /// with `content_type`, and return the response the client gets.
+    async fn query_through_labelled_upstream(
+        content_type: Option<&'static str>,
+    ) -> reqwest::Response {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (query, _query) = labelled_query_mock(content_type).await;
+        let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, Some(query)))).await;
+        Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_call", 1))
+            .send()
+            .await
+            .expect("send")
+    }
+
+    #[tokio::test]
+    async fn query_route_non_json_content_type_is_replaced() {
+        for content_type in [
+            Some("text/html; charset=utf-8"),
+            Some("text/plain"),
+            Some("image/svg+xml"),
+            Some("application/javascript"),
+            Some("application/jsonp"),
+            Some("application/json-seq"),
+            Some("text/foo+json"),
+            Some("application/json;a=b,text/html"),
+            Some("application/json;,text/html"),
+            Some("application/json, text/html"),
+            None,
+        ] {
+            let response = query_through_labelled_upstream(content_type).await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type:?}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "{content_type:?}"
+            );
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{content_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_route_json_content_type_passes_through() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/problem+json",
+        ] {
+            let response = query_through_labelled_upstream(Some(content_type)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_nosniff() {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // one request a second with no burst headroom, so the second POST is
+        // shed by the rate limiter, the layer just inside the nosniff one
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (gateway, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+
+        let client = Client::new();
+        let url = |path: &str| format!("http://{gateway}{path}");
+        let cases = [
+            ("proxied", client.post(url("/")).body(call("eth_chainId", 1)), StatusCode::OK),
+            (
+                "rate limited",
+                client.post(url("/")).body(call("eth_chainId", 2)),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ("liveness", client.get(url("/health")), StatusCode::OK),
+            ("readiness", client.get(url("/ready")), StatusCode::OK),
+            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
+        ];
+        for (case, request, status) in cases {
+            let response = request.send().await.expect("send");
+            assert_eq!(response.status(), status, "{case}");
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{case}"
+            );
+        }
     }
 }
