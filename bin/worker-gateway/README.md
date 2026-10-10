@@ -30,9 +30,7 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   The client gets the upstream status, body, and `Content-Type`; from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
   All other headers are dropped in both directions; in particular CORS is not terminated here, so browser dApps need CORS handled at the ingress (or a later PR).
   Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
-- The request path and query string are not forwarded: every `POST` goes to
-  the configured upstream base URL (JSON-RPC carries its method in the body,
-  so `POST /` is the whole HTTP surface).
+- The request path and query string are not forwarded: a `POST` to any path but `/health` and `/ready` goes to the configured upstream base URL, since JSON-RPC carries its method in the body (see [Gateway endpoints](#gateway-endpoints)).
 
 ## Readiness contract
 
@@ -293,8 +291,10 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
   `503` with `{"ready": false}`.
-- everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
-  with `--redirect-queries`, to the query URL unless it is a submission.
+- `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker, or, with `--redirect-queries`, to the query URL unless it is a submission.
+  The path is not forwarded, so `POST /` and `POST /anything` are the same call.
+- Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
+  On `/health` and `/ready` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
 
 ## Behaviour on failure
 
@@ -371,7 +371,10 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
-from these series, so they reflect real client load only. The scrape also
+from these series, so they reflect real client load only. A request to
+`/health` or `/ready` with a method other than `GET` or `HEAD` is refused
+with the `405`, counted as a `method_not_post` rejection, and is not
+rate-limited. The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
