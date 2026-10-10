@@ -316,9 +316,9 @@ pub(crate) fn client_builder(settings: &Settings) -> ClientBuilder {
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either.
 ///
-/// TLS and the connect timeout come from `builder`. An image without CA
-/// certificates still builds the client, but every `https` request to an
-/// upstream outside the `--upstream-ca-cert` roots then fails.
+/// TLS and the connect timeout come from `builder`. reqwest builds a client
+/// over an empty native root store without complaint, so startup checks the
+/// store itself when an `https` upstream depends on it (see [`crate::app`]).
 pub(crate) fn proxy_client(
     builder: ClientBuilder,
     request_timeout: Duration,

@@ -12567,6 +12567,7 @@ dependencies = [
  "metrics",
  "rcgen",
  "reqwest 0.12.28",
+ "rustls-native-certs",
  "serde",
  "serde_json",
  "socket2",

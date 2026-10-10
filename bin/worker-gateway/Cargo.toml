@@ -38,6 +38,10 @@ hyper-util = { workspace = true }
 # --redirect-queries url and is already in the dependency graph (node-record-api enables
 # the same feature), so this adds no new crate
 reqwest = { workspace = true, features = ["stream", "rustls-tls-native-roots"] }
+# the native root store reqwest loads, checked at startup so an `https` upstream
+# on a host without CA certificates fails there instead of on every call; the
+# same version reqwest already pulls in, so this adds no new crate
+rustls-native-certs = { version = "0.8.3" }
 tower-http = { workspace = true }
 
 # metrics

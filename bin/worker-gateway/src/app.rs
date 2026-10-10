@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use eyre::WrapErr as _;
 use tn_types::{ShutdownNotifier, TaskManager};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     cli::Settings,
@@ -28,6 +28,8 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 /// [`TaskManager`] and blocks on `join_until_exit`, which installs the
 /// SIGTERM/ctrl-c handler and drains the tasks on shutdown.
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
+    ensure_root_store(&settings, native_root_count)?;
+
     // Both upstream clients start from the same TLS settings (see
     // `client_builder`); they are finished below.
     let proxy_client_builder = client_builder(&settings);
@@ -183,4 +185,92 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     task_manager.join_until_exit(shutdown).await?;
     Ok(())
+}
+
+/// Fail startup when an `https` upstream would be verified against the native
+/// root store alone and that store is empty.
+///
+/// reqwest builds a client over an empty native root store without complaint,
+/// so on a host without CA certificates every `https` call would fail at
+/// runtime instead, and a worker would just never become ready. The check
+/// applies only when some configured URL (a worker's RPC or readiness URL, or
+/// `--redirect-queries`) is `https` and no `--upstream-ca-cert` is given: the
+/// extra CA is something to verify against on its own. `native_root_count`
+/// loads the store, and is called only when the check applies.
+fn ensure_root_store(
+    settings: &Settings,
+    native_root_count: impl FnOnce() -> usize,
+) -> eyre::Result<()> {
+    let https = settings
+        .upstreams
+        .iter()
+        .flat_map(|upstream| [&upstream.rpc_url, &upstream.readiness_url])
+        .chain(settings.query_upstream.as_ref())
+        .any(|url| url.scheme() == "https");
+    if !https || !settings.upstream_ca_certs.is_empty() {
+        return Ok(());
+    }
+    eyre::ensure!(
+        native_root_count() > 0,
+        "an https upstream is configured but the system root store holds no CA certificates, \
+         so every https call would fail; install the ca-certificates package, point \
+         SSL_CERT_FILE or SSL_CERT_DIR at a CA bundle, or pass --upstream-ca-cert"
+    );
+    Ok(())
+}
+
+/// Load the platform's native root store the way reqwest does when it builds a
+/// client, and count the certificates found. A file that fails to load is
+/// logged and skipped, as reqwest skips it.
+fn native_root_count() -> usize {
+    let loaded = rustls_native_certs::load_native_certs();
+    loaded.errors.iter().for_each(|err| {
+        warn!(target: "gateway", %err, "failed to load part of the system root store");
+    });
+    loaded.certs.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+    use clap::Parser as _;
+
+    fn settings(flags: &[&str]) -> Settings {
+        let argv = std::iter::once("worker-gateway").chain(flags.iter().copied());
+        Cli::parse_from(argv).into_settings().expect("settings")
+    }
+
+    #[test]
+    fn empty_root_store_is_a_startup_error() -> eyre::Result<()> {
+        const HTTP_RPC: &str = "--upstream-rpc-url=http://10.0.0.7:8545";
+        const HTTPS_RPC: &str = "--upstream-rpc-url=https://10.0.0.7:8545";
+        const HTTP_READY: &str = "--upstream-readiness-url=http://10.0.0.7:8551/health/workers";
+        const HTTPS_READY: &str = "--upstream-readiness-url=https://10.0.0.7:8551/health/workers";
+
+        let https_worker = settings(&[HTTPS_RPC, HTTP_READY]);
+        let message = match ensure_root_store(&https_worker, || 0) {
+            Ok(()) => panic!("an https worker over an empty root store must fail startup"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("ca-certificates"), "{message}");
+        assert!(ensure_root_store(&https_worker, || 1).is_ok());
+
+        // an https readiness url, or an https redirect, needs the store too
+        assert!(ensure_root_store(&settings(&[HTTP_RPC, HTTPS_READY]), || 0).is_err());
+        let https_redirect =
+            settings(&[HTTP_RPC, HTTP_READY, "--redirect-queries=https://rpc.example.com/"]);
+        assert!(ensure_root_store(&https_redirect, || 0).is_err());
+
+        // plain http everywhere, or an extra CA, never loads the store
+        let http_only = settings(&[HTTP_RPC, HTTP_READY]);
+        assert!(ensure_root_store(&http_only, || panic!("the store must not be loaded")).is_ok());
+        let ca_file = tempfile::NamedTempFile::new()?;
+        let ca = rcgen::generate_simple_self_signed(vec!["ca.test".to_string()])?;
+        std::fs::write(ca_file.path(), ca.cert.pem())?;
+        let ca_flag = format!("--upstream-ca-cert={}", ca_file.path().display());
+        let with_ca = settings(&[HTTPS_RPC, HTTPS_READY, ca_flag.as_str()]);
+        assert!(ensure_root_store(&with_ca, || panic!("the store must not be loaded")).is_ok());
+        Ok(())
+    }
 }

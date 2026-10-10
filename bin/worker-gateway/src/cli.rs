@@ -311,6 +311,15 @@ impl Cli {
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        plaintext_worker_urls(&upstreams).for_each(|(worker_id, url)| {
+            warn!(
+                target: "gateway",
+                worker_id,
+                upstream = %UpstreamOrigin(url),
+                "worker upstream uses plain http to a host that is not a loopback or private \
+                 address; submissions, reads and readiness cross the network unencrypted"
+            );
+        });
         let query_upstream = self
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
@@ -589,6 +598,23 @@ fn ensure_query_upstream(
         );
     }
     Ok(())
+}
+
+/// The worker RPC and readiness URLs that use plain `http` to a host that is
+/// not a loopback or private address literal, each with its worker id.
+///
+/// Such a hop may cross a network the operator does not control, where an
+/// on-path attacker can drop submissions behind their computable hash and
+/// forge reads and readiness. Startup warns about each one, as
+/// [`ensure_query_upstream`] does for the redirect, rather than refusing it:
+/// the address may still be on a private network the check cannot see.
+fn plaintext_worker_urls(upstreams: &[UpstreamWorker]) -> impl Iterator<Item = (u16, &Url)> + '_ {
+    upstreams
+        .iter()
+        .flat_map(|upstream| {
+            [(upstream.worker_id, &upstream.rpc_url), (upstream.worker_id, &upstream.readiness_url)]
+        })
+        .filter(|(_, url)| plaintext_to_public_host(url))
 }
 
 /// Whether two URLs name the same host and port, whatever their schemes.
@@ -1088,6 +1114,35 @@ mod tests {
         let result =
             cli_with_flags(&["--redirect-queries=https://rpc.example.com/#frag"]).into_settings();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plaintext_to_public_worker_host_warns() -> eyre::Result<()> {
+        let worker = |worker_id, rpc: &str, readiness: &str| -> eyre::Result<UpstreamWorker> {
+            Ok(UpstreamWorker {
+                worker_id,
+                rpc_url: Url::parse(rpc)?,
+                readiness_url: Url::parse(readiness)?,
+            })
+        };
+        let upstreams = [
+            worker(0, "http://10.0.0.7:8545", "http://10.0.0.7:8551/health/workers")?,
+            worker(1, "http://203.0.113.5:8545", "https://203.0.113.5:8551/health/workers")?,
+            worker(2, "https://worker.example.com/", "http://worker.example.com:8551/health")?,
+            worker(3, "https://203.0.113.9:8545", "https://203.0.113.9:8551/health/workers")?,
+            worker(4, "http://localhost:8545", "http://[::1]:8551/health/workers")?,
+        ];
+        let warned: Vec<(u16, String)> = plaintext_worker_urls(&upstreams)
+            .map(|(worker_id, url)| (worker_id, UpstreamOrigin(url).to_string()))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                (1, "http://203.0.113.5:8545".to_string()),
+                (2, "http://worker.example.com:8551".to_string())
+            ]
+        );
+        Ok(())
     }
 
     #[test]
