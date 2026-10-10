@@ -28,7 +28,7 @@ tokio = { workspace = true, features = [
     "io-util",
 ] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std", "json"] }
 
 # http server + client
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
