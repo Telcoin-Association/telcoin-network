@@ -2,50 +2,12 @@
   "capacity_run_id": 37990571919,
   "changed_destination_set_relative_to_parent": [
     ".github/workflows/durable-e2e.yaml",
-    "tools/ci122-verification/1476-ci105-quic-verification-result.json",
-    "tools/ci122-verification/1476-ci105-quic-verify-v1.proposed.py",
-    "tools/ci122-verification/1476-ci110-verify-qualified-bindings-v2.proposed.py",
-    "tools/ci122-verification/1476-ci117-artifact-readers-preparation-root-verified.json",
-    "tools/ci122-verification/1476-ci122-binary-artifact-official.json",
-    "tools/ci122-verification/1476-ci122-capacity-acquire.proposed.py",
-    "tools/ci122-verification/1476-ci122-capacity-artifacts-terminal-official.json",
-    "tools/ci122-verification/1476-ci122-capacity-evidence-artifact-official.json",
-    "tools/ci122-verification/1476-ci122-capacity-jobs-terminal-official.json",
-    "tools/ci122-verification/1476-ci122-capacity-livejob-success-official.json",
-    "tools/ci122-verification/1476-ci122-capacity-livejob-success.log",
-    "tools/ci122-verification/1476-ci122-capacity-run-terminal-official.json",
-    "tools/ci122-verification/1476-ci122-full-verify-test.py",
-    "tools/ci122-verification/1476-ci122-full-verify.py",
     "tools/ci122-verification/1476-ci122-helper-inputs.json",
-    "tools/ci122-verification/1476-ci122-mutation-artifact-official.json",
-    "tools/ci122-verification/1476-ci122-official-codejob-fixture.json",
-    "tools/ci122-verification/1476-ci122-pr-official.json",
-    "tools/ci122-verification/1476-ci122-publication-test.py",
-    "tools/ci122-verification/1476-ci122-publication.py",
-    "tools/ci122-verification/1476-ci122-publish-evidence.proposed.py",
-    "tools/ci122-verification/1476-ci122-publisher-test.py",
-    "tools/ci122-verification/1476-ci122-quic-artifact-metadata-official.json",
-    "tools/ci122-verification/1476-ci122-quic-artifacts-official.json",
-    "tools/ci122-verification/1476-ci122-quic-job.log",
-    "tools/ci122-verification/1476-ci122-quic-jobs-official.json",
-    "tools/ci122-verification/1476-ci122-quic-run-official.json",
-    "tools/ci122-verification/1476-ci122-source-commit-official.json",
-    "tools/ci122-verification/1476-ci122-source-tree-official.json",
-    "tools/ci122-verification/1476-ci122-staging-ref-official.json",
-    "tools/ci122-verification/1476-ci122-stream-qualified-evidence-v3.proposed.py",
-    "tools/ci122-verification/binary-verify.py",
-    "tools/ci122-verification/ci122_runner_identity.py",
-    "tools/ci122-verification/mutation-acquire.py",
-    "tools/ci122-verification/mutation-extract.py",
-    "tools/ci122-verification/mutation-verify.py",
-    "tools/ci122-verification/quic-acquire.py",
-    "tools/ci122-verification/quic-assemble.py",
-    "tools/ci122-verification/quic-verify.py",
-    "tools/ci122-verification/source-pins.json"
+    "tools/ci122-verification/binary-verify.py"
   ],
   "execution_boundary": "Actual binary SHA map and all current archive proofs are generated only on the authenticated runner. No local pending map is a proof.",
   "helper_destination": "tools/ci122-verification/1476-ci122-helper-inputs.json",
-  "helper_parent": "eb053d0b4d97e300cd898e557157d61886e7e158",
+  "helper_parent": "4bdd4aa5817e6c38678f1441655c8e2434882cfa",
   "pending_roles": [],
   "publication_branch": "evidence/hub-capacity-1476-37990571919",
   "publication_default": false,
@@ -69,7 +31,7 @@
       "name": "1476-ci122-binary-artifact-official.json",
       "pending": false,
       "sha256": "90e4e59ecb50c4d0fba838e8ea9a24dabceb2bbb7c59a6a709abbd125e8b4d47",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-binary-artifact-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-binary-artifact-official.json"
     },
     "binary_verifier": {
       "bytes": 15231,
@@ -77,8 +39,8 @@
       "independent_review_pending": true,
       "name": "binary-verify.py",
       "pending": false,
-      "sha256": "51020b6231b1d09a0972d5ffd0145f639260b7ccb746ccc098abda59037a6378",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/binary-verify.py"
+      "sha256": "7016f1c3ecf5380836b920719cdcf303e96df42b85504f01d5d110f684306912",
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/binary-verify.py"
     },
     "bindings": {
       "bytes": 15783,
@@ -87,7 +49,7 @@
       "name": "1476-ci110-verify-qualified-bindings-v2.proposed.py",
       "pending": false,
       "sha256": "75d9a1285b78384b5db0e7aac1f344a527b6c7206f61949f82b8144c55b77a20",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci110-verify-qualified-bindings-v2.proposed.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci110-verify-qualified-bindings-v2.proposed.py"
     },
     "capacity_acquirer": {
       "bytes": 5258,
@@ -96,7 +58,7 @@
       "name": "1476-ci122-capacity-acquire.proposed.py",
       "pending": false,
       "sha256": "761150b7d4af0962247bf933e261c18b87e781d23a3992392a0531248cdfc5c7",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-acquire.proposed.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-acquire.proposed.py"
     },
     "capacity_artifacts": {
       "bytes": 4038,
@@ -105,7 +67,7 @@
       "name": "1476-ci122-capacity-artifacts-terminal-official.json",
       "pending": false,
       "sha256": "9dfa76a9d6a096915bf0b7861baeb02e30dc339f1115700fdf0d886d2d7ee44e",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-artifacts-terminal-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-artifacts-terminal-official.json"
     },
     "capacity_jobs": {
       "bytes": 15334,
@@ -114,7 +76,7 @@
       "name": "1476-ci122-capacity-jobs-terminal-official.json",
       "pending": false,
       "sha256": "110b286a0be056cb84f0721fb6922ead4d5cb0b0f17217f2281dab31b78ac618",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-jobs-terminal-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-jobs-terminal-official.json"
     },
     "capacity_live_job": {
       "bytes": 2662,
@@ -123,7 +85,7 @@
       "name": "1476-ci122-capacity-livejob-success-official.json",
       "pending": false,
       "sha256": "0c0ed8246202e956aa4513f59f0770c5bb6f303e61c8ef45e90be6bb3aabe4ca",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-livejob-success-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-livejob-success-official.json"
     },
     "capacity_live_log": {
       "bytes": 94908,
@@ -132,7 +94,7 @@
       "name": "1476-ci122-capacity-livejob-success.log",
       "pending": false,
       "sha256": "933ae67e5b39c03144ed58c07e9a2b63566e45684fb53bbccaab1df14302bea5",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-livejob-success.log"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-livejob-success.log"
     },
     "capacity_metadata": {
       "bytes": 796,
@@ -141,7 +103,7 @@
       "name": "1476-ci122-capacity-evidence-artifact-official.json",
       "pending": false,
       "sha256": "a7732546a16d368098ce30ba30ed48280b2995084722799f9a6d9f677d84844c",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-evidence-artifact-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-evidence-artifact-official.json"
     },
     "capacity_run": {
       "bytes": 14809,
@@ -150,7 +112,7 @@
       "name": "1476-ci122-capacity-run-terminal-official.json",
       "pending": false,
       "sha256": "175c955fe5295876ae100f7f2d60ab6deb444b61f7a2e8a05eb229ef92f8ef99",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-capacity-run-terminal-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-capacity-run-terminal-official.json"
     },
     "full_verifier": {
       "bytes": 41080,
@@ -159,7 +121,7 @@
       "name": "1476-ci122-stream-qualified-evidence-v3.proposed.py",
       "pending": false,
       "sha256": "94288c366996f8873119b8459ddfd6b3cdf363d48c14c1a422a7badecab567fd",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-stream-qualified-evidence-v3.proposed.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-stream-qualified-evidence-v3.proposed.py"
     },
     "mutation_acquirer": {
       "bytes": 4930,
@@ -168,7 +130,7 @@
       "name": "mutation-acquire.py",
       "pending": false,
       "sha256": "19db3a358fdc5e88314c9d2fa7523e62554153cc9cf50157b363f6af562b8d02",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/mutation-acquire.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/mutation-acquire.py"
     },
     "mutation_extractor": {
       "bytes": 5398,
@@ -177,7 +139,7 @@
       "name": "mutation-extract.py",
       "pending": false,
       "sha256": "8aa92a572eac0aa4a8df1fc98123c0569b51646fc9c03b289faa7c32ed3bda29",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/mutation-extract.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/mutation-extract.py"
     },
     "mutation_metadata": {
       "bytes": 784,
@@ -186,7 +148,7 @@
       "name": "1476-ci122-mutation-artifact-official.json",
       "pending": false,
       "sha256": "f72a22b02d1c85d682a08ec22b90fb6aa193d664fbd3197116de4e7876908b4b",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-mutation-artifact-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-mutation-artifact-official.json"
     },
     "mutation_verifier": {
       "bytes": 25698,
@@ -195,7 +157,7 @@
       "name": "mutation-verify.py",
       "pending": false,
       "sha256": "b2352724f610081f2b247999ea1d983ee2d5074151ace2f8aa6d265a942fe6af",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/mutation-verify.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/mutation-verify.py"
     },
     "official_codejob_fixture": {
       "bytes": 3481,
@@ -204,7 +166,7 @@
       "name": "1476-ci122-official-codejob-fixture.json",
       "pending": false,
       "sha256": "0eff490af7988c6b6f072b2eb9139220a8e51a8fb63c8a99990ab7cea0d3c756",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-official-codejob-fixture.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-official-codejob-fixture.json"
     },
     "publication": {
       "bytes": 10232,
@@ -213,7 +175,7 @@
       "name": "1476-ci122-publication.py",
       "pending": false,
       "sha256": "1848455659b40972b3c71e56b64b0b9c37e772d00281c86d91cd5f65b2690970",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-publication.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-publication.py"
     },
     "publication_tests": {
       "bytes": 7775,
@@ -222,7 +184,7 @@
       "name": "1476-ci122-publication-test.py",
       "pending": false,
       "sha256": "4f5e6c186d66dbadce17c395ad8d3e989083931eeeebac0483d9ef66c54f5309",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-publication-test.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-publication-test.py"
     },
     "publisher": {
       "bytes": 15335,
@@ -231,7 +193,7 @@
       "name": "1476-ci122-publish-evidence.proposed.py",
       "pending": false,
       "sha256": "a9cad66e1b86a2d0bd0e465e23a150f5790214b0daafaf643ed55bb4f57c8348",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-publish-evidence.proposed.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-publish-evidence.proposed.py"
     },
     "publisher_tests": {
       "bytes": 4138,
@@ -240,7 +202,7 @@
       "name": "1476-ci122-publisher-test.py",
       "pending": false,
       "sha256": "0cc61a8eb5b00fc1c1598ab137e9beaad64be5c2a733fcdf9389a1840949505b",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-publisher-test.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-publisher-test.py"
     },
     "quic_acquirer": {
       "bytes": 5872,
@@ -249,7 +211,7 @@
       "name": "quic-acquire.py",
       "pending": false,
       "sha256": "f0382e5dcb11e75b2389898fef6ddeccfbb342ab45cb98a2c137bc406a8dc003",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/quic-acquire.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/quic-acquire.py"
     },
     "quic_api_job_log": {
       "bytes": 47381,
@@ -258,7 +220,7 @@
       "name": "1476-ci122-quic-job.log",
       "pending": false,
       "sha256": "7c1409980c2bb6c80e4c3d50ca73a6ffc078b420e3b16e2a388c1a89e8673c11",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-quic-job.log"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-quic-job.log"
     },
     "quic_api_pr": {
       "bytes": 36555,
@@ -267,7 +229,7 @@
       "name": "1476-ci122-pr-official.json",
       "pending": false,
       "sha256": "1e7a82d7f61ede71a0304419a891ec710b3e706aa74191be83457458b414c421",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-pr-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-pr-official.json"
     },
     "quic_api_source_commit": {
       "bytes": 5953,
@@ -276,7 +238,7 @@
       "name": "1476-ci122-source-commit-official.json",
       "pending": false,
       "sha256": "49dbe6455f034b6ba47b6677b746ffae801813afd2b677c12eebefee413d0b59",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-source-commit-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-source-commit-official.json"
     },
     "quic_api_staging": {
       "bytes": 451,
@@ -285,7 +247,7 @@
       "name": "1476-ci122-staging-ref-official.json",
       "pending": false,
       "sha256": "b3484cc38528117e798a4832d38dd4c5dc344bbbad78462516699e80d87e7d13",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-staging-ref-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-staging-ref-official.json"
     },
     "quic_api_tree": {
       "bytes": 296267,
@@ -294,7 +256,7 @@
       "name": "1476-ci122-source-tree-official.json",
       "pending": false,
       "sha256": "7efeb6d996832b2218c124bd8cae2bb44c8f3e0a20b3672770359c1620ae7bc5",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-source-tree-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-source-tree-official.json"
     },
     "quic_artifact": {
       "bytes": 742,
@@ -303,7 +265,7 @@
       "name": "1476-ci122-quic-artifact-metadata-official.json",
       "pending": false,
       "sha256": "701de1996a6272b0ba9a52bba3da517b9b02876da3d38c3f8c75467a02f26088",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-quic-artifact-metadata-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-quic-artifact-metadata-official.json"
     },
     "quic_artifacts": {
       "bytes": 774,
@@ -312,7 +274,7 @@
       "name": "1476-ci122-quic-artifacts-official.json",
       "pending": false,
       "sha256": "87876ba251e092217cd570251ed59e1674dbe0c7b64de9663dc58b0a47dd2455",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-quic-artifacts-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-quic-artifacts-official.json"
     },
     "quic_jobs": {
       "bytes": 2667,
@@ -321,7 +283,7 @@
       "name": "1476-ci122-quic-jobs-official.json",
       "pending": false,
       "sha256": "550526df4dd1a93ae11ba72cc6161df9b22e2535489e07a7c2a6553761273645",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-quic-jobs-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-quic-jobs-official.json"
     },
     "quic_metadata_assembler": {
       "bytes": 9914,
@@ -330,7 +292,7 @@
       "name": "quic-assemble.py",
       "pending": false,
       "sha256": "48ac61b060886465c821ac732d251f5fd5aa97ad20985e2b5fc593c0a17f88a8",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/quic-assemble.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/quic-assemble.py"
     },
     "quic_prior_preparation": {
       "bytes": 22798,
@@ -339,7 +301,7 @@
       "name": "1476-ci117-artifact-readers-preparation-root-verified.json",
       "pending": false,
       "sha256": "8efabd5306f33894a7ee2445baa1d6b7ca9e73b661058007b003e3a19c65e542",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci117-artifact-readers-preparation-root-verified.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci117-artifact-readers-preparation-root-verified.json"
     },
     "quic_prior_result": {
       "bytes": 10841,
@@ -348,7 +310,7 @@
       "name": "1476-ci105-quic-verification-result.json",
       "pending": false,
       "sha256": "f67333ccabab62fdd1b23f7cffac282f9bafcfc5427d1dadd0bcaa869bade364",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci105-quic-verification-result.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci105-quic-verification-result.json"
     },
     "quic_prior_verifier": {
       "bytes": 24934,
@@ -357,7 +319,7 @@
       "name": "1476-ci105-quic-verify-v1.proposed.py",
       "pending": false,
       "sha256": "9f9a87b1afe4652b054dabd6e695f14b27bfc255c52a76e18455edfb9834ed4b",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci105-quic-verify-v1.proposed.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci105-quic-verify-v1.proposed.py"
     },
     "quic_run": {
       "bytes": 14615,
@@ -366,7 +328,7 @@
       "name": "1476-ci122-quic-run-official.json",
       "pending": false,
       "sha256": "ab6f9667602c7358a98eca1716f89977d88025aa7cec71ee80d33ccee1664ad5",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-quic-run-official.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-quic-run-official.json"
     },
     "quic_source_pins": {
       "bytes": 3781,
@@ -375,7 +337,7 @@
       "name": "source-pins.json",
       "pending": false,
       "sha256": "f16ed2d416372431d6dca405a6bd2fce75cddd27dc683295b8a4ddd059d3889c",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/source-pins.json"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/source-pins.json"
     },
     "quic_verifier": {
       "bytes": 34696,
@@ -384,7 +346,7 @@
       "name": "quic-verify.py",
       "pending": false,
       "sha256": "6d60e443c6269ebe2fb444b3d73a3dae780593c18ef68795050b8ab6c8426ec6",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/quic-verify.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/quic-verify.py"
     },
     "runner_identity": {
       "bytes": 930,
@@ -393,7 +355,7 @@
       "name": "ci122_runner_identity.py",
       "pending": false,
       "sha256": "649197fc31e9ecf5dadb5de5675c19c8ed28e0e0b6f947fb7ac5b3d985f97413",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/ci122_runner_identity.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/ci122_runner_identity.py"
     },
     "verification_entrypoint": {
       "bytes": 13025,
@@ -402,7 +364,7 @@
       "name": "1476-ci122-full-verify.py",
       "pending": false,
       "sha256": "bc70473b6fe61a886e8da9c1b16b7235978a8886757fc84ab1a7910e6562a624",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-full-verify.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-full-verify.py"
     },
     "verification_tests": {
       "bytes": 7561,
@@ -411,7 +373,7 @@
       "name": "1476-ci122-full-verify-test.py",
       "pending": false,
       "sha256": "7aefb87875a76140fc5ab9bc31a4538fe4a62f9904392f5d6627eb224bc5fb6e",
-      "source_path": "/private/tmp/1476-ci122-helper-source-v8/1476-ci122-full-verify-test.py"
+      "source_path": "/private/tmp/1476-ci122-helper-source-v10/1476-ci122-full-verify-test.py"
     }
   },
   "source_preparation": {
@@ -437,49 +399,25 @@
     },
     "capacity_completed_roles_manifest": "/private/tmp/1476-ci122-terminal-acquisitions/partial-v2/manifest.json",
     "capacity_completed_roles_manifest_sha256": "5ec67ef641554d8161d6b109adb02851d4775af16ea7c163a5e30e282cc9b75c",
+    "current_source_workflow_bindings": {
+      ".github/workflows/hub-capacity-manual.yaml": {
+        "bytes": 10852,
+        "git_blob_sha": "9e138c65f97fd221f1ceebd13a50bcb2e32c5707",
+        "sha256": "acb17364ed627366f398ca84301cf5dac8fbedca6a8c072d8b7943626cd2e0ae"
+      },
+      ".github/workflows/pr.yaml": {
+        "bytes": 39651,
+        "git_blob_sha": "ad37179b8e45e0238a4a0b53a9d72b01faec79a5",
+        "sha256": "9148a4a5a5927caa2c6016ffac91a20d97203ff321b59098ece66c79c36b1c65"
+      }
+    },
     "direct_source_path_count": 1,
     "exact_diffs": [
       {
-        "bytes": 871,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_acquirer.v7-to-v8.exact.diff",
-        "role": "capacity_acquirer",
-        "sha256": "d178879bbcd278884c524405f8ede3f8e9e467081257ab7a82c2156ea8b4f42f"
-      },
-      {
-        "bytes": 4194,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_artifacts.v7-to-v8.exact.diff",
-        "role": "capacity_artifacts",
-        "sha256": "4aad566c77dc1749aed6c5eb6c0a4b00f4fcdcbd891a8c2992d1815c5c1e929c"
-      },
-      {
-        "bytes": 15485,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_jobs.v7-to-v8.exact.diff",
-        "role": "capacity_jobs",
-        "sha256": "e8160d9d3b38402c85cb9fe1868fe06ddfe3826c8f391b788d15f239b3a18624"
-      },
-      {
-        "bytes": 2815,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_live_job.v7-to-v8.exact.diff",
-        "role": "capacity_live_job",
-        "sha256": "482cf8c8ef5620bcf76062fbf967f5a94f1f111dcfd5550b0769567d83d16f21"
-      },
-      {
-        "bytes": 96030,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_live_log.v7-to-v8.exact.diff",
-        "role": "capacity_live_log",
-        "sha256": "9a0b2d16ecc775f585cd6aa78db6dc0c29b3fbdcfb54312b8f73ade0ca5cad35"
-      },
-      {
-        "bytes": 951,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_metadata.v7-to-v8.exact.diff",
-        "role": "capacity_metadata",
-        "sha256": "56a3cac18f8f088cbdb4a9f1490334e56302c0e09cb31fbc0e4a0a819be805d7"
-      },
-      {
-        "bytes": 14959,
-        "path": "/private/tmp/1476-ci122-helper-source-v8/capacity_run.v7-to-v8.exact.diff",
-        "role": "capacity_run",
-        "sha256": "ba40c8aba94e273dcff0bc061515a1a140fdf2bedc624b9a0ee82ac2cbd1ef05"
+        "bytes": 636,
+        "path": "/private/tmp/1476-ci122-helper-source-v9/binary_verifier.v8-to-v9.exact.diff",
+        "role": "binary_verifier",
+        "sha256": "fdd2cfcbfad99e2224d6565c71329141e4ac4e37aaed9dc2c3e97a2701b64fa0"
       }
     ],
     "final_official_metadata_manifest": "/private/tmp/1476-ci122-terminal-acquisitions/final-v1/manifest.json",
@@ -504,9 +442,13 @@
     "official_quic_metadata_manifest": "/private/tmp/1476-ci122-terminal-acquisitions/partial-v1/manifest.json",
     "official_quic_metadata_manifest_sha256": "41452db9f42a846871d62c285f91e8a6ae13804280f5c37997591fb9e90e27f7",
     "official_terminal_metadata_bound": true,
+    "parent_helper_sha": "4bdd4aa5817e6c38678f1441655c8e2434882cfa",
     "previous_manifest": "/private/tmp/1476-ci122-helper-source-v4/1476-ci122-helper-inputs.json",
     "previous_manifest_sha256": "5bdd5987e042742f6475d91e89b435b237c5c47066f450f7a35c844aff292bde",
+    "previous_pins_sha256": "b2e4786671406f1f4cfa625f0b395d1d078cad9c8f1afe92026393af1c97b331",
+    "reader_source_review_and_binding_pending": true,
     "run_base": "07d6feaa86475479993475fe3fdf368eabc695b7",
+    "source_binding_repair": "binary verifier qualified PR workflow SHA256 only",
     "source_blob_closure_count": 80,
     "source_chain": [
       "cd4433858bc0c3b85d753169c0a2284f0adcc005",

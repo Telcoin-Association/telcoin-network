@@ -100,7 +100,7 @@ jobs:
           root = Path("tools/ci122-verification")
           pins = {"1476-ci122-full-verify.py": "bc70473b6fe61a886e8da9c1b16b7235978a8886757fc84ab1a7910e6562a624",
                   "1476-ci122-publication.py": "1848455659b40972b3c71e56b64b0b9c37e772d00281c86d91cd5f65b2690970",
-                  "1476-ci122-helper-inputs.json": "c2836faa6a1400228a0865e0e1ea9c4dbc5d2b50af60f84a7f8be5b7f24ba163"}
+                  "1476-ci122-helper-inputs.json": "f41503b987fea2c6e2288f817e1de3ea6bf25f28e87f1b5d3f3bd85648f63d29"}
           for name, expected in pins.items():
               path = root / name
               if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024**2 or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
@@ -114,7 +114,7 @@ jobs:
         run: >-
           python3 -B -I tools/ci122-verification/1476-ci122-full-verify.py
           --manifest tools/ci122-verification/1476-ci122-helper-inputs.json
-          --manifest-sha256 c2836faa6a1400228a0865e0e1ea9c4dbc5d2b50af60f84a7f8be5b7f24ba163
+          --manifest-sha256 f41503b987fea2c6e2288f817e1de3ea6bf25f28e87f1b5d3f3bd85648f63d29
           --source-checkout "$GITHUB_WORKSPACE/qualification-source"
       - name: Retain exact public bundle and bounded independent proof
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
