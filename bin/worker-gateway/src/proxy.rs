@@ -16,7 +16,16 @@
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -26,6 +35,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -98,6 +108,7 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    forwarding: Option<Extension<ForwardingStarted>>,
     method: Method,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -161,6 +172,12 @@ pub(crate) async fn proxy(
             }
         },
     };
+
+    // from here on the upstream may receive the request, so a deadline that
+    // fires later can no longer tell the client it was not delivered
+    if let Some(Extension(forwarding)) = &forwarding {
+        forwarding.mark();
+    }
 
     match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
         .await
@@ -324,6 +341,27 @@ fn classify_error(err: &reqwest::Error) -> GatewayError {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
+    }
+}
+
+/// Whether [`proxy`] has started sending a request upstream.
+///
+/// The request-deadline middleware ([`crate::server::router`]) puts a fresh
+/// flag in every request's extensions and reads it when the deadline fires: a
+/// request that never started forwarding cannot have reached an upstream, one
+/// that did may have, and the client is told which.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForwardingStarted(Arc<AtomicBool>);
+
+impl ForwardingStarted {
+    /// Record that the request is about to be sent upstream.
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the request may have reached an upstream.
+    pub(crate) fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 

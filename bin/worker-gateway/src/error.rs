@@ -65,7 +65,13 @@ pub(crate) enum GatewayError {
     /// The request already carried the gateway's hop marker (forwarding loop).
     LoopDetected,
     /// The request did not complete within the gateway's request deadline.
-    RequestTimeout,
+    RequestTimeout {
+        /// Whether the gateway had started sending the request upstream when
+        /// the deadline fired. If it had, the upstream may have received and
+        /// acted on it, so the client cannot treat the error as "not
+        /// delivered".
+        forwarding_started: bool,
+    },
     /// The client exceeded the gateway's per-IP or global rate limit.
     RateLimited,
     /// An `eth_sendRawTransaction` payload could not be decoded as a
@@ -87,7 +93,7 @@ impl GatewayError {
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
-            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
@@ -102,7 +108,7 @@ impl GatewayError {
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
             Self::RequestTooLarge => code::REQUEST_TOO_LARGE,
             Self::LoopDetected => code::LOOP_DETECTED,
-            Self::RequestTimeout => code::REQUEST_TIMEOUT,
+            Self::RequestTimeout { .. } => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
@@ -120,7 +126,13 @@ impl GatewayError {
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"
             }
-            Self::RequestTimeout => "request did not complete within the gateway's deadline",
+            Self::RequestTimeout { forwarding_started: false } => {
+                "request did not complete within the gateway's deadline"
+            }
+            Self::RequestTimeout { forwarding_started: true } => {
+                "request did not complete within the gateway's deadline; the request may have \
+                 reached the upstream"
+            }
             Self::RateLimited => "rate limit exceeded; slow down and retry",
             Self::InvalidTransaction => "raw transaction could not be decoded",
             Self::UnsupportedTransactionType => {
@@ -141,7 +153,7 @@ impl GatewayError {
             Self::UpstreamTimeout => "upstream_timeout",
             Self::RequestTooLarge => "request_too_large",
             Self::LoopDetected => "loop_detected",
-            Self::RequestTimeout => "request_timeout",
+            Self::RequestTimeout { .. } => "request_timeout",
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
@@ -447,7 +459,8 @@ mod tests {
             StatusCode::LOOP_DETECTED
         );
         assert_eq!(
-            error_response(&GatewayError::RequestTimeout, b"{}").status(),
+            error_response(&GatewayError::RequestTimeout { forwarding_started: false }, b"{}")
+                .status(),
             StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(
@@ -487,7 +500,14 @@ mod tests {
         assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
-        assert_eq!(GatewayError::RequestTimeout.reason(), "request_timeout");
+        assert_eq!(
+            GatewayError::RequestTimeout { forwarding_started: false }.reason(),
+            "request_timeout"
+        );
+        assert_eq!(
+            GatewayError::RequestTimeout { forwarding_started: true }.reason(),
+            "request_timeout"
+        );
         assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");
         assert_eq!(GatewayError::InvalidTransaction.reason(), "invalid_transaction");
         assert_eq!(

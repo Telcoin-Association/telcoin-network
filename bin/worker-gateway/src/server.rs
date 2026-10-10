@@ -17,9 +17,9 @@
 use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::StatusCode,
-    middleware::{from_fn_with_state, map_response},
+    middleware::{from_fn_with_state, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -37,16 +37,19 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
 };
-use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    proxy::proxy,
+    proxy::{proxy, ForwardingStarted},
     ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
 };
+
+// the manifest still declares tower-http, but nothing in the crate uses it
+// since the request deadline moved to a middleware of its own
+use tower_http as _;
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
 /// error (e.g. fd exhaustion) cannot spin the loop hot.
@@ -109,14 +112,15 @@ struct ReadyBody {
 
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
-/// `request_deadline` bounds each whole request; the bare `408` the timeout
-/// layer produces is rewritten into the gateway's JSON-RPC error envelope so
-/// the "always a well-formed JSON-RPC error" contract holds. Streamed
-/// *response* bodies are written after the handler returns, outside this
-/// deadline; they are bounded by the accept loop's transport-stall deadline
-/// and connection-lifetime cap (the upstream client's total timeout is only
-/// checked when the body is polled, which a slow-reading client can prevent;
-/// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
+/// `request_deadline` bounds each whole request, and an overrun is answered
+/// with the gateway's own `408` JSON-RPC error envelope (see
+/// [`enforce_request_deadline`]); a `408` from an upstream passes through
+/// untouched. Streamed *response* bodies are written after the handler
+/// returns, outside this deadline; they are bounded by the accept loop's
+/// transport-stall deadline and connection-lifetime cap (the upstream
+/// client's total timeout is only checked when the body is polled, which a
+/// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
+/// caps the buffered request body.
 ///
 /// When `rate_limiters` is present it is installed as the outermost layer, so
 /// an over-limit request is shed with a JSON-RPC `429` before its body is
@@ -132,8 +136,7 @@ pub(crate) fn router(
         .route(READY_PATH, get(readiness))
         .fallback(proxy)
         .layer(DefaultBodyLimit::max(max_request_bytes))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
-        .layer(map_response(envelope_request_timeout));
+        .layer(from_fn_with_state(request_deadline, enforce_request_deadline));
     // Add the rate-limit layer last so it runs first, ahead of the body read.
     let router = match rate_limiters {
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
@@ -142,15 +145,29 @@ pub(crate) fn router(
     router.with_state(state)
 }
 
-/// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
-/// envelope. The request `id` is unrecoverable here (the body never finished
-/// arriving), so it echoes as `null`, per spec. Workers do not emit `408` for
-/// JSON-RPC, so this cannot clobber a real upstream response in practice.
-async fn envelope_request_timeout(response: Response) -> Response {
-    if response.status() == StatusCode::REQUEST_TIMEOUT {
-        return error_response(&GatewayError::RequestTimeout, b"");
+/// Bound a whole request by `deadline`, answering an overrun with the
+/// gateway's `408` JSON-RPC error envelope.
+///
+/// Only an overrun of this deadline produces the envelope; the response of a
+/// request that finishes in time, an upstream's own `408` included, passes
+/// through unchanged. The request `id` is not recovered (the body may never
+/// have finished arriving), so it echoes as `null`, per spec. The message
+/// says whether the request may have reached an upstream, from the
+/// [`ForwardingStarted`] flag the proxy sets just before it forwards.
+async fn enforce_request_deadline(
+    State(deadline): State<Duration>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let forwarding = ForwardingStarted::default();
+    request.extensions_mut().insert(forwarding.clone());
+    match tokio::time::timeout(deadline, next.run(request)).await {
+        Ok(response) => response,
+        Err(_elapsed) => error_response(
+            &GatewayError::RequestTimeout { forwarding_started: forwarding.is_marked() },
+            b"",
+        ),
     }
-    response
 }
 
 /// Liveness probe: always `200 OK` while the process is running.
@@ -714,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_body_gets_enveloped_timeout() {
+    async fn gateway_408_before_forwarding_says_not_delivered() {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         state.readiness.set_ready(0, true);
         // Short whole-request deadline; generous header timeout so only the
@@ -741,7 +758,78 @@ mod tests {
             .expect("read");
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 408"), "expected 408, got: {response}");
-        assert!(response.contains("-32005"), "expected enveloped timeout code, got: {response}");
+        let (_head, body) = response.split_once("\r\n\r\n").expect("response head and body");
+        let body: serde_json::Value = serde_json::from_str(body).expect("json error body");
+        assert_eq!(body["error"]["code"], -32005);
+        // the body never finished arriving, so nothing was forwarded and the
+        // message must not hedge about delivery
+        assert_eq!(
+            body["error"]["message"],
+            "request did not complete within the gateway's deadline"
+        );
+        assert_eq!(body["id"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn gateway_408_after_forwarding_says_delivery_unknown() {
+        // A worker slower than the whole-request deadline: the request reaches
+        // it, then the deadline fires while the gateway waits for the answer.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        // the forwarding client has no timeout of its own, so only the
+        // gateway's deadline can end the request
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) =
+            spawn(router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 3)).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+        assert_eq!(body["error"]["code"], -32005);
+        assert_eq!(
+            body["error"]["message"],
+            "request did not complete within the gateway's deadline; the request may have \
+             reached the upstream"
+        );
+        assert_eq!(body["id"], serde_json::Value::Null);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the request reached the upstream");
+    }
+
+    #[tokio::test]
+    async fn upstream_408_passes_through_unchanged() {
+        // Only the gateway's own deadline produces its 408 envelope; a 408
+        // from an upstream is relayed like any other upstream status.
+        const UPSTREAM_BODY: &str =
+            r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"upstream timeout"},"id":1}"#;
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    UPSTREAM_BODY,
+                )
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::REQUEST_TIMEOUT, UPSTREAM_BODY));
     }
 
     #[tokio::test]
