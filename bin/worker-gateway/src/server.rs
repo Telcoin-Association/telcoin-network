@@ -14,7 +14,13 @@
 //! body streams to it): a transport-stall deadline (`TCP_USER_TIMEOUT`) and a
 //! hard cap on total connection lifetime.
 
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    collections::{HashSet, VecDeque},
+    net::SocketAddr,
+    num::NonZeroUsize,
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
@@ -32,7 +38,7 @@ use hyper_util::{
 };
 use reqwest::Client;
 use serde::Serialize;
-use tn_types::{Noticer, TaskError};
+use tn_types::{Noticer, TaskError, B256};
 use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
@@ -58,6 +64,12 @@ pub(crate) const HEALTH_PATH: &str = "/health";
 /// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
 pub(crate) const READY_PATH: &str = "/ready";
 
+/// Most submission hashes a [`RecentSubmissions`] set remembers at once; past
+/// it the oldest is forgotten first. An entry costs a 32-byte hash and an
+/// `Instant` in the queue plus the hash again in the index, so a full set
+/// stays around a megabyte.
+pub(crate) const RECENT_SUBMISSIONS_CAPACITY: usize = 10_000;
+
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -66,9 +78,14 @@ pub(crate) struct AppState {
     /// Client used to forward requests on both routes (built by
     /// [`crate::proxy::proxy_client`] outside tests).
     pub(crate) http: Client,
-    /// Endpoint serving every non-submission call (`--redirect-queries`), or
-    /// `None` when every call goes to the workers. It is not readiness-gated.
+    /// Endpoint serving every call the worker does not (`--redirect-queries`),
+    /// or `None` when every call goes to the workers. It is not
+    /// readiness-gated.
     pub(crate) query_upstream: Option<Url>,
+    /// Hashes of the submissions recently forwarded to a worker, whose lookups
+    /// follow them there under `--redirect-queries`, or `None` when that
+    /// routing is off (no redirect, or `--recent-submission-ttl 0`).
+    pub(crate) recent_submissions: Option<Arc<RecentSubmissions>>,
 }
 
 /// Inbound connection limits enforced by the accept loop and router (derived
@@ -98,6 +115,90 @@ pub(crate) struct ServerLimits {
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
+}
+
+/// Hashes of the submissions this gateway forwarded to a worker within the
+/// last `ttl`, so that with `--redirect-queries` a lookup of one goes to the
+/// worker whose pool holds the transaction instead of the query upstream,
+/// which has not seen it (see [`crate::proxy`]).
+///
+/// The set is per process and best effort: a lookup that lands on another
+/// gateway replica, or arrives after its hash was forgotten, goes to the query
+/// upstream as it would without the set. It is bounded by age and by count, so
+/// a flood of submissions can only push older hashes out early, never grow
+/// memory past [`RECENT_SUBMISSIONS_CAPACITY`] entries.
+#[derive(Debug)]
+pub(crate) struct RecentSubmissions {
+    /// How long a hash is remembered after its submission was forwarded.
+    ttl: Duration,
+    /// Most hashes remembered at once.
+    capacity: usize,
+    /// The remembered hashes, behind one lock so the queue and its index never
+    /// disagree.
+    entries: Mutex<RecentEntries>,
+}
+
+impl RecentSubmissions {
+    /// An empty set that remembers each hash for `ttl`, and at most `capacity`
+    /// hashes at once.
+    pub(crate) fn new(ttl: Duration, capacity: usize) -> Self {
+        Self { ttl, capacity, entries: Mutex::new(RecentEntries::default()) }
+    }
+
+    /// Remember `hash` as forwarded now, forgetting the oldest hash when the
+    /// set is full. A hash already remembered keeps its first time, so
+    /// resubmitting a transaction does not extend how long it is remembered.
+    pub(crate) fn record(&self, hash: B256) {
+        let mut entries = self.lock();
+        // read the clock under the lock so the queue stays in time order
+        let now = Instant::now();
+        entries.forget_expired(now, self.ttl);
+        if entries.index.insert(hash) {
+            entries.order.push_back((hash, now));
+            if entries.order.len() > self.capacity {
+                entries.forget_oldest();
+            }
+        }
+    }
+
+    /// Whether `hash` was forwarded within the last `ttl`.
+    pub(crate) fn contains(&self, hash: &B256) -> bool {
+        let mut entries = self.lock();
+        entries.forget_expired(Instant::now(), self.ttl);
+        entries.index.contains(hash)
+    }
+
+    /// Lock the entries, recovering the guard if a previous holder panicked:
+    /// the set only steers routing, so a poisoned lock is safe to reuse.
+    fn lock(&self) -> MutexGuard<'_, RecentEntries> {
+        self.entries.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// The queue and index behind [`RecentSubmissions`]: every hash in `index` has
+/// exactly one entry in `order`, and the other way round.
+#[derive(Debug, Default)]
+struct RecentEntries {
+    /// Remembered hashes with the time each was forwarded, oldest first.
+    order: VecDeque<(B256, Instant)>,
+    /// The hashes in `order`, for constant-time lookup.
+    index: HashSet<B256>,
+}
+
+impl RecentEntries {
+    /// Forget every hash remembered for `ttl` or longer as of `now`.
+    fn forget_expired(&mut self, now: Instant, ttl: Duration) {
+        while self.order.front().is_some_and(|(_, at)| now.saturating_duration_since(*at) >= ttl) {
+            self.forget_oldest();
+        }
+    }
+
+    /// Forget the oldest remembered hash, if any.
+    fn forget_oldest(&mut self) {
+        if let Some((hash, _)) = self.order.pop_front() {
+            self.index.remove(&hash);
+        }
+    }
 }
 
 /// JSON body of the gateway's `/ready` response.
@@ -162,8 +263,9 @@ async fn liveness() -> impl IntoResponse {
 /// `503`.
 ///
 /// It means "this gateway can take submissions". With `--redirect-queries`
-/// set, reads keep working while it reports `503`, and a failing query
-/// upstream does not change it: that upstream is never probed.
+/// set, reads other than the few kept on the worker keep working while it
+/// reports `503`, and a failing query upstream does not change it: that
+/// upstream is never probed.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     let ready = state.readiness.any_ready();
     let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
@@ -339,10 +441,11 @@ mod tests {
     use super::*;
     use crate::{
         config::UpstreamWorker,
-        proxy::{proxy_client, MAX_REQUEST_BYTES},
+        proxy::{proxy_client, MAX_REQUEST_BYTES, SUBMISSION_ANSWER_SLACK},
         ratelimit::{PrefixPolicy, RateLimit},
     };
     use axum::{
+        body::Bytes,
         http::{header, HeaderMap},
         routing::post,
     };
@@ -378,6 +481,7 @@ mod tests {
             readiness: Arc::new(GatewayReadiness::new(upstreams)),
             http: client,
             query_upstream: None,
+            recent_submissions: None,
         }
     }
 
@@ -915,14 +1019,34 @@ mod tests {
         }
     }
 
+    /// A worker's answer to a submission it admitted: a JSON-RPC `result`
+    /// holding the transaction hash, whose value the gateway never reads.
+    const ACCEPTED: &str = r#"{"jsonrpc":"2.0","result":"0x1111111111111111111111111111111111111111111111111111111111111111","id":1}"#;
+
     /// A mock upstream that answers every POST with `name` as the body and
     /// counts what it receives. The `Notifier` keeps it alive.
     async fn named_mock(name: &'static str) -> (SocketAddr, Seen, Notifier) {
+        counting_mock(name, false).await
+    }
+
+    /// A worker mock like [`named_mock`] that admits every single
+    /// `eth_sendRawTransaction`, answering it with [`ACCEPTED`] so the gateway
+    /// remembers its hash. Every other call, a batch of submissions included,
+    /// gets `worker`.
+    async fn accepting_worker_mock() -> (SocketAddr, Seen, Notifier) {
+        counting_mock("worker", true).await
+    }
+
+    /// The mock behind [`named_mock`] and [`accepting_worker_mock`].
+    async fn counting_mock(
+        name: &'static str,
+        accept_submissions: bool,
+    ) -> (SocketAddr, Seen, Notifier) {
         let seen = Seen::default();
         let counters = seen.clone();
         let mock = Router::new().route(
             "/",
-            post(move |headers: HeaderMap| {
+            post(move |headers: HeaderMap, body: Bytes| {
                 let counters = counters.clone();
                 async move {
                     let get = |name: &str| {
@@ -941,7 +1065,15 @@ mod tests {
                     {
                         counters.identified.fetch_add(1, Ordering::SeqCst);
                     }
-                    name
+                    // a batch is an array, whose `method` reads as null
+                    let admitted = accept_submissions
+                        && serde_json::from_slice::<serde_json::Value>(&body)
+                            .is_ok_and(|call| call["method"] == "eth_sendRawTransaction");
+                    if admitted {
+                        ACCEPTED
+                    } else {
+                        name
+                    }
                 }
             }),
         );
@@ -951,7 +1083,8 @@ mod tests {
 
     /// Gateway state with one worker at `worker` and, when given,
     /// `--redirect-queries` pointing at `query`, using the production proxy
-    /// client. The worker starts not ready.
+    /// client and the default 60 s recent-submission set. The worker starts
+    /// not ready.
     fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
         let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
         redirect_state_with_client(worker, query, client)
@@ -967,6 +1100,10 @@ mod tests {
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+            recent_submissions: Some(Arc::new(RecentSubmissions::new(
+                Duration::from_secs(60),
+                RECENT_SUBMISSIONS_CAPACITY,
+            ))),
         }
     }
 
@@ -1251,5 +1388,422 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// The canonical EIP-155 example transaction (a signed legacy transfer):
+    /// the screen decodes it and forwards it, handing back its hash.
+    const SIGNED_TX: &str = "0xf86c098504a817c800825208943535353535353535353535353535353535353535880de0b6b3a76400008025a028ef61340bd939bc2195fe537567866003e1a15d3c71ff63e1590620aa636276a067cbe9d8997f761aecb703304b3800ccf555c9f3dc64214b297fb1966a3b6d83";
+
+    /// The account the nonce reads below ask about.
+    const ADDRESS: &str = "0x3535353535353535353535353535353535353535";
+
+    /// A JSON-RPC call to `method` with the given params and id.
+    fn call_with(method: &str, params: &str, id: u64) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":{id}}}"#)
+    }
+
+    /// A single `eth_sendRawTransaction` of [`SIGNED_TX`].
+    fn submission(id: u64) -> String {
+        call_with("eth_sendRawTransaction", &format!(r#"["{SIGNED_TX}"]"#), id)
+    }
+
+    /// The hash of [`SIGNED_TX`].
+    fn submitted_hash() -> B256 {
+        let raw = tn_types::hex::decode(&SIGNED_TX[2..]).expect("fixture hex");
+        tn_types::keccak256(raw)
+    }
+
+    /// `eth_getTransactionCount` for [`ADDRESS`] at `block`.
+    fn nonce_read(block: &str, id: u64) -> String {
+        call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}","{block}"]"#), id)
+    }
+
+    /// A lookup by hash (`eth_getTransactionByHash` or
+    /// `eth_getTransactionReceipt`) of `hash`.
+    fn lookup(method: &str, hash: &str, id: u64) -> String {
+        call_with(method, &format!(r#"["{hash}"]"#), id)
+    }
+
+    /// The issue's acceptance case: a client that submits and then asks for
+    /// its pending nonce must reach the worker that took the submission, whose
+    /// pool counts it, not the query upstream, which has not seen it.
+    #[tokio::test]
+    async fn pending_nonce_read_goes_to_the_worker_under_redirect() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        let (status, text) = post_rpc(gateway, None, nonce_read("pending", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        assert_eq!((worker_seen.hits(), worker_seen.hop_marker()), (2, 2));
+        assert_eq!(query_seen.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn latest_nonce_read_goes_to_the_query_upstream() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, "worker");
+        let reads = [
+            nonce_read("latest", 2),
+            nonce_read("0x10", 3),
+            // the block parameter defaults to latest
+            call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}"]"#), 4),
+            // the tag matches case-sensitively, like the method names
+            nonce_read("Pending", 5),
+        ];
+        for body in &reads {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), 1);
+        assert_eq!(query_seen.hits(), reads.len());
+    }
+
+    #[tokio::test]
+    async fn other_pending_reads_stay_on_the_query_upstream() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let target = format!(r#"{{"to":"{ADDRESS}"}}"#);
+        let reads = [
+            call_with("eth_call", &format!(r#"[{target},"pending"]"#), 1),
+            call_with("eth_getBalance", &format!(r#"["{ADDRESS}","pending"]"#), 2),
+            call_with("eth_estimateGas", &format!(r#"[{target},"pending"]"#), 3),
+        ];
+        for body in &reads {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{body}");
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, reads.len()));
+    }
+
+    #[tokio::test]
+    async fn recently_forwarded_hash_lookup_goes_to_the_worker() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        let hash = submitted_hash().to_string();
+        // the hash is matched by value, so its hex case does not matter
+        let upper = format!("0x{}", hash[2..].to_uppercase());
+        let lookups = [
+            lookup("eth_getTransactionByHash", &hash, 2),
+            lookup("eth_getTransactionReceipt", &hash, 3),
+            lookup("eth_getTransactionReceipt", &upper, 4),
+        ];
+        for body in &lookups {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), 1 + lookups.len());
+        assert_eq!(query_seen.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn unknown_hash_lookup_goes_to_the_query_upstream() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        let unknown = B256::repeat_byte(0x22).to_string();
+        let lookups = [
+            lookup("eth_getTransactionByHash", &unknown, 2),
+            lookup("eth_getTransactionReceipt", &unknown, 3),
+            // not a hash at all
+            lookup("eth_getTransactionByHash", "0x1234", 4),
+        ];
+        for body in &lookups {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{body}");
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, lookups.len()));
+    }
+
+    #[tokio::test]
+    async fn recent_hash_expires_after_ttl() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        // short enough to wait out, long enough that the first lookup, one
+        // local round trip after the submission, lands well inside it
+        state.recent_submissions = Some(Arc::new(RecentSubmissions::new(
+            Duration::from_secs(1),
+            RECENT_SUBMISSIONS_CAPACITY,
+        )));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 2);
+        let (_, text) = post_rpc(gateway, None, receipt.clone()).await;
+        assert_eq!(text, "worker", "a lookup inside the ttl follows the submission");
+
+        tokio::time::sleep(Duration::from_millis(1_200)).await;
+        let (status, text) = post_rpc(gateway, None, receipt).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "the hash has expired");
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (2, 1));
+    }
+
+    /// `--recent-submission-ttl 0` turns off only the hash routing.
+    #[tokio::test]
+    async fn without_recent_submissions_only_the_pending_nonce_read_stays_on_the_worker() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        state.recent_submissions = None;
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 2);
+        let (_, text) = post_rpc(gateway, None, receipt).await;
+        assert_eq!(text, "query");
+        let (_, text) = post_rpc(gateway, None, nonce_read("pending", 3)).await;
+        assert_eq!(text, "worker");
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (2, 1));
+    }
+
+    #[tokio::test]
+    async fn rejected_submission_is_not_recorded() {
+        // a worker that refuses with a 4xx, as one over its connection limit
+        // answers every call
+        let refusing =
+            Router::new().route("/", post(|| async { (StatusCode::TOO_MANY_REQUESTS, "worker") }));
+        let (worker, _worker) = spawn(refusing).await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::TOO_MANY_REQUESTS, "worker"));
+        assert!(!recent.contains(&submitted_hash()));
+
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 2);
+        let (status, text) = post_rpc(gateway, None, receipt).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!(query_seen.hits(), 1);
+    }
+
+    /// jsonrpsee answers a transaction the worker refuses (unfunded, nonce too
+    /// low, an already-mined transaction replayed) with a `200` and a JSON-RPC
+    /// `error`, so the status alone cannot tell a refusal from an admission.
+    #[tokio::test]
+    async fn submission_rejected_inside_a_200_is_not_recorded() {
+        const REFUSED: &str =
+            r#"{"jsonrpc":"2.0","error":{"code":-32003,"message":"insufficient funds"},"id":1}"#;
+        let rejecting = Router::new()
+            .route("/", post(|| async { ([(header::CONTENT_TYPE, "application/json")], REFUSED) }));
+        let (worker, _worker) = spawn(rejecting).await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, REFUSED));
+        assert!(!recent.contains(&submitted_hash()));
+
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 2);
+        let (status, text) = post_rpc(gateway, None, receipt).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!(query_seen.hits(), 1);
+    }
+
+    /// Reading the answer whole to look for a `result` must not change what
+    /// the client gets: the worker's status, content type and bytes.
+    #[tokio::test]
+    async fn accepted_submission_is_recorded_and_its_answer_passed_through() {
+        const CONTENT_TYPE: &str = "application/json; charset=utf-8";
+        let accepting = Router::new().route(
+            "/",
+            post(|| async {
+                (StatusCode::ACCEPTED, [(header::CONTENT_TYPE, CONTENT_TYPE)], ACCEPTED)
+            }),
+        );
+        let (worker, _worker) = spawn(accepting).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(submission(1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some(CONTENT_TYPE)
+        );
+        assert_eq!(response.bytes().await.expect("bytes").as_ref(), ACCEPTED.as_bytes());
+        assert!(recent.contains(&submitted_hash()));
+    }
+
+    /// The answer echoes the client's `id`, so the read cap grows with the
+    /// request: a submission whose id alone is past the fixed slack is still
+    /// remembered, and its answer reaches the client whole.
+    #[tokio::test]
+    async fn submission_with_a_long_id_is_recorded() {
+        let echoing = Router::new().route(
+            "/",
+            post(|body: Bytes| async move {
+                let call: serde_json::Value = serde_json::from_slice(&body).expect("json call");
+                format!(r#"{{"jsonrpc":"2.0","result":"0x11","id":{}}}"#, call["id"])
+            }),
+        );
+        let (worker, _worker) = spawn(echoing).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let id = "i".repeat(4 * SUBMISSION_ANSWER_SLACK);
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{SIGNED_TX}"],"id":"{id}"}}"#
+        );
+        let (status, text) = post_rpc(gateway, None, body).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(text, format!(r#"{{"jsonrpc":"2.0","result":"0x11","id":"{id}"}}"#));
+        assert!(recent.contains(&submitted_hash()));
+    }
+
+    /// An answer past the request's length plus the slack is not one a healthy
+    /// worker sends; the gateway stops reading, so the answer is lost and the
+    /// client gets an unreachable-upstream error rather than a truncated body.
+    #[tokio::test]
+    async fn submission_answer_past_the_cap_is_lost() {
+        let padding = "p".repeat(64 * 1024);
+        let bloated = Router::new().route(
+            "/",
+            post(move || async move {
+                format!(r#"{{"jsonrpc":"2.0","result":"0x11","padding":"{padding}","id":1}}"#)
+            }),
+        );
+        let (worker, _worker) = spawn(bloated).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, submission(7)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert!(!recent.contains(&submitted_hash()));
+    }
+
+    #[tokio::test]
+    async fn batches_keep_the_existing_classification() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // remember the submission, so only the batch shape decides below
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        let pending = nonce_read("pending", 2);
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 3);
+        let batches = [
+            (format!("[{pending}]"), "query"),
+            (format!("[{receipt}]"), "query"),
+            (format!("[{pending},{receipt}]"), "query"),
+            (format!("[{},{pending}]", submission(4)), "query"),
+            (format!("[{}]", submission(5)), "worker"),
+        ];
+        for (body, expected) in &batches {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, *expected), "{body}");
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (2, 4));
+    }
+
+    #[tokio::test]
+    async fn worker_bound_reads_are_readiness_gated() {
+        let (worker, worker_seen, _worker) = accepting_worker_mock().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        let readiness = Arc::clone(&state.readiness);
+        readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // remember a submission while the worker is up, then lose the worker
+        let (_, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!(text, ACCEPTED);
+        readiness.set_ready(0, false);
+
+        let receipt = lookup("eth_getTransactionReceipt", &submitted_hash().to_string(), 3);
+        for (body, id) in [(nonce_read("pending", 2), 2), (receipt, 3)] {
+            let (status, text) = post_rpc(gateway, None, body).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error_code_and_id(&text), (-32000, serde_json::json!(id)));
+        }
+        // with no fallback to the query upstream, which has not seen the pool;
+        // every other read keeps working there
+        let (status, text) = post_rpc(gateway, None, nonce_read("latest", 4)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+    }
+
+    #[test]
+    fn recent_submissions_forget_the_oldest_past_capacity() {
+        let recent = RecentSubmissions::new(Duration::from_secs(60), 2);
+        let [first, second, third] = [1, 2, 3].map(B256::repeat_byte);
+        recent.record(first);
+        recent.record(second);
+        // already remembered: neither queued twice nor refreshed
+        recent.record(first);
+        recent.record(third);
+        assert!(!recent.contains(&first));
+        assert!(recent.contains(&second));
+        assert!(recent.contains(&third));
+    }
+
+    /// The expiry boundary, driven with synthetic instants instead of a sleep:
+    /// the hash is recorded the way the proxy records it, its forward time is
+    /// read back from the queue, and the entries are then aged by hand.
+    #[test]
+    fn recent_submissions_forget_a_hash_at_its_ttl() {
+        let ttl = Duration::from_secs(60);
+        let recent = RecentSubmissions::new(ttl, RECENT_SUBMISSIONS_CAPACITY);
+        let hash = B256::repeat_byte(1);
+        recent.record(hash);
+
+        let mut entries = recent.lock();
+        let (_, start) = *entries.order.front().expect("hash recorded");
+        entries.forget_expired(start + ttl - Duration::from_nanos(1), ttl);
+        assert!(entries.index.contains(&hash), "kept a nanosecond short of the ttl");
+        entries.forget_expired(start + ttl, ttl);
+        assert!(!entries.index.contains(&hash), "forgotten at exactly the ttl");
+        assert!(entries.order.is_empty(), "the queue and the index agree");
     }
 }

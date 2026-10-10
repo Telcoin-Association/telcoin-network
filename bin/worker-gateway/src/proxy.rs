@@ -7,14 +7,18 @@
 //! `X-Forwarded-Proto` (client identity for worker-side logs and the PR3 rate
 //! limits) and the `X-TN-Gateway` hop marker (loop protection; an inbound
 //! request that already carries it is rejected instead of forwarded). The
-//! upstream response body is streamed through, never buffered whole. When no
-//! upstream is ready, or the upstream cannot be reached / times out, the
-//! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
+//! upstream response body is streamed through, never buffered whole, except
+//! the small answer to a submission whose hash the gateway would remember (see
+//! [`submission_accepted`]). When no upstream is ready, or the upstream cannot
+//! be reached / times out, the client receives a well-formed JSON-RPC error
+//! instead (see [`crate::error`]).
 //!
-//! With `--redirect-queries` set, only transaction submissions go to the
-//! worker; every other call goes to the query upstream (see [`classify`]),
-//! which is not readiness-gated, never falls back to the worker, and gets the
-//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! With `--redirect-queries` set, transaction submissions go to the worker,
+//! and so do the few single reads only its pool can answer: a nonce at the
+//! `pending` tag, and a lookup of a submission this gateway forwarded recently
+//! (see [`classify`] and [`is_pool_read`]). Every other call goes to the query
+//! upstream, which is not readiness-gated, never falls back to the worker, and
+//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 
 use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
 
@@ -32,13 +36,13 @@ use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserializer,
 };
-use tn_types::{Decodable2718, PooledTransaction};
+use tn_types::{Decodable2718, PooledTransaction, B256};
 use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
-    server::AppState,
+    server::{AppState, RecentSubmissions},
     telemetry,
 };
 
@@ -57,13 +61,37 @@ pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// forwarding (a raw-transaction submission).
 const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
 
-/// The JSON-RPC methods that submit a transaction, and so the only calls a
-/// gateway with `--redirect-queries` sends to the worker. They are exactly the
+/// The JSON-RPC methods that submit a transaction, and so the calls a gateway
+/// with `--redirect-queries` always sends to the worker. They are exactly the
 /// two methods the node's fee-cap guard replaces
 /// (`crates/tn-reth/src/env/rpc.rs`), matched exactly and case-sensitively, as
 /// jsonrpsee matches method names. Both contain [`SEND_RAW_TRANSACTION`], so
 /// its substring test is a fast path for either.
 const SUBMISSION_METHODS: [&str; 2] = ["eth_sendRawTransaction", "eth_sendRawTransactionSync"];
+
+/// The nonce read a gateway with `--redirect-queries` keeps on the worker when
+/// its block parameter is [`PENDING_TAG`] (see [`is_pool_read`]).
+const GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
+
+/// The lookups by hash a gateway with `--redirect-queries` keeps on the worker
+/// for a submission it forwarded recently (see [`is_pool_read`]).
+const LOOKUPS_BY_HASH: [&str; 2] = ["eth_getTransactionByHash", "eth_getTransactionReceipt"];
+
+/// The prefix [`GET_TRANSACTION_COUNT`] and both [`LOOKUPS_BY_HASH`] share, so
+/// its substring test is a fast path for all three.
+const POOL_READ_PREFIX: &str = "eth_getTransaction";
+
+/// The block tag that asks for the chain state plus the node's pool.
+const PENDING_TAG: &str = "pending";
+
+/// Bytes beyond the request's own length that the proxy reads of a worker's
+/// answer to a submission whose hash it would remember (see
+/// [`submission_accepted`]). The answer is a transaction hash or a short error
+/// object plus the request's `id` echoed back, and the id is the client's to
+/// make as long as the request cap allows, so a fixed cap would turn a valid
+/// submission with a long id into an error. A healthy worker stays far below
+/// the request's length plus this.
+pub(crate) const SUBMISSION_ANSWER_SLACK: usize = 4 * 1024;
 
 /// The proxy client's `User-Agent`, so the operator of a query upstream can
 /// tell gateway traffic apart.
@@ -140,17 +168,22 @@ pub(crate) async fn proxy(
     // Shallow pre-flight for raw-transaction submissions: reject a payload the
     // worker would also reject (undecodable, or an EIP-4844 blob) before paying
     // for an upstream round-trip. The screen recovers the request id itself on
-    // the paths that reject, so nothing here re-parses the body.
-    if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
-        warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
-        return error_response_with_id(&err, id);
-    }
+    // the paths that reject, so nothing here re-parses the body, and hands back
+    // the hash of a submission it decoded, so nothing decodes it twice either.
+    let submitted = match screen_raw_transaction(body.as_ref()) {
+        Ok(submitted) => submitted,
+        Err((err, id)) => {
+            warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
+            return error_response_with_id(&err, id);
+        }
+    };
 
-    // with a redirect configured, every call but a submission goes to the
-    // query upstream, with no readiness gate and no fallback to the worker: a
-    // fallback would put the read load on the validator exactly when the
-    // public rpc is struggling.
-    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(body.as_ref()));
+    // with a redirect configured, every call but a submission or a read only
+    // the worker's pool can answer goes to the query upstream, with no
+    // readiness gate and no fallback to the worker: a fallback would put the
+    // read load on the validator exactly when the public rpc is struggling.
+    let recent = state.recent_submissions.as_deref();
+    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(body.as_ref(), recent));
     let (route, upstream_url) = match query_upstream {
         Some(query_upstream) => (Route::Query, query_upstream.clone()),
         None => match state.readiness.first_ready_rpc_url() {
@@ -166,9 +199,47 @@ pub(crate) async fn proxy(
         .await
     {
         Ok(response) => {
-            telemetry::record_forwarded();
-            telemetry::record_routed(route.label(), "forwarded");
-            response
+            let forwarded = || {
+                telemetry::record_forwarded();
+                telemetry::record_routed(route.label(), "forwarded");
+            };
+            // a submission the worker took is remembered, so that a lookup of
+            // its hash follows it to the worker's pool (see [`is_pool_read`]).
+            // the worker answers a transaction it refused with a 2xx as well,
+            // carrying a json-rpc `error`, so only a json-rpc `result` counts:
+            // the answer is read whole to tell, and only on this path
+            let remember = recent
+                .zip(submitted)
+                .filter(|_| route == Route::Worker && response.status().is_success());
+            let Some((recent, hash)) = remember else {
+                forwarded();
+                return response;
+            };
+            let (parts, answer) = response.into_parts();
+            let cap = body.len().saturating_add(SUBMISSION_ANSWER_SLACK);
+            match axum::body::to_bytes(answer, cap).await {
+                Ok(answer) => {
+                    if submission_accepted(&answer) {
+                        recent.record(hash);
+                    }
+                    forwarded();
+                    Response::from_parts(parts, Body::from(answer))
+                }
+                Err(_) => {
+                    // over the cap, or the upstream stream broke or ran past
+                    // the request timeout: the answer is lost. the cause is
+                    // left out because reqwest renders it with the url. it
+                    // counts once, as a forward that failed, like the arm below
+                    telemetry::record_routed(route.label(), "unreachable");
+                    warn!(
+                        target: "gateway::proxy",
+                        route = route.label(),
+                        upstream = %UpstreamOrigin(&upstream_url),
+                        "reading the worker's answer to a submission failed"
+                    );
+                    error_response(&GatewayError::UpstreamUnreachable, body.as_ref())
+                }
+            }
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -196,13 +267,35 @@ pub(crate) async fn proxy(
 }
 
 /// Whether a request goes to the query upstream rather than the worker,
-/// counting a mixed batch on the way (see [`classify`]).
-fn is_query(body: &[u8]) -> bool {
+/// counting a mixed batch on the way: anything but submissions (see
+/// [`classify`]) and the reads only the worker's pool can answer (see
+/// [`is_pool_read`]).
+fn is_query(body: &[u8], recent: Option<&RecentSubmissions>) -> bool {
     let calls = classify(body);
     if calls == Calls::MixedBatch {
         telemetry::record_mixed_batch();
     }
-    calls.route() == Route::Query
+    calls.route() == Route::Query && !is_pool_read(body, recent)
+}
+
+/// Whether a worker's answer to one submission is a JSON-RPC success: an
+/// object with a non-null `result` member and no `error` member (a `null`
+/// `error` counts as none). Anything else, an answer that is not JSON
+/// included, means the worker did not take the transaction.
+fn submission_accepted(answer: &[u8]) -> bool {
+    /// The two members that tell a JSON-RPC success from an error; every other
+    /// member is skipped in place.
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        result: Option<IgnoredAny>,
+        error: Option<IgnoredAny>,
+    }
+
+    // a derived struct also deserializes from a json array, taking its
+    // members in order, so an answer that is not an object is refused first
+    answer.trim_ascii_start().starts_with(b"{")
+        && serde_json::from_slice::<Answer>(answer)
+            .is_ok_and(|answer| answer.result.is_some() && answer.error.is_none())
 }
 
 /// Answer a body-buffering failure: a length-limit trip is a client error worth
@@ -370,9 +463,9 @@ impl fmt::Display for ErrorChain<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     /// The first ready worker: every call without `--redirect-queries`, and
-    /// only submissions with it.
+    /// with it only submissions and the reads only its pool can answer.
     Worker,
-    /// The `--redirect-queries` endpoint: every call that is not a submission.
+    /// The `--redirect-queries` endpoint: every other call.
     Query,
 }
 
@@ -562,13 +655,133 @@ fn read_method<'de, A: MapAccess<'de>>(mut members: A) -> Result<Option<String>,
     Ok(method)
 }
 
+/// Whether `body` is a single read that only the worker's pool can answer, and
+/// that a gateway with `--redirect-queries` therefore keeps on the worker:
+/// `eth_getTransactionCount` whose block parameter is the string `"pending"`,
+/// or `eth_getTransactionByHash` / `eth_getTransactionReceipt` for the hash of
+/// a submission this gateway forwarded recently (`recent`; `None` turns that
+/// half off).
+///
+/// The query upstream has not seen the worker's pool, whose transactions are
+/// not gossiped (`propagate: false` in `crates/tn-reth/src/txn_pool.rs`), so
+/// it answers these from the state before a client's own submissions, and a
+/// client that sends transactions back to back reuses a nonce. Every other
+/// read at `pending` (`eth_call`, `eth_getBalance`, `eth_estimateGas`) stays
+/// on the query upstream. So does a batch: only a single call object is read,
+/// as in the transaction screen, so a batch keeps the route [`classify`] gives
+/// it. Method names and the tag match exactly and case-sensitively.
+fn is_pool_read(body: &[u8], recent: Option<&RecentSubmissions>) -> bool {
+    // fast path: a body that never names one of the three methods is not one
+    // of these reads, and nothing is parsed
+    if !std::str::from_utf8(body).is_ok_and(|text| text.contains(POOL_READ_PREFIX)) {
+        return false;
+    }
+    let Ok(call) = serde_json::from_slice::<PoolReadFields>(body) else {
+        return false;
+    };
+    let [first, second] = call.params;
+    match call.method.as_deref() {
+        Some(GET_TRANSACTION_COUNT) => second.as_deref() == Some(PENDING_TAG),
+        Some(method) if LOOKUPS_BY_HASH.contains(&method) => recent
+            .zip(first.and_then(|hash| hash.parse::<B256>().ok()))
+            .is_some_and(|(recent, hash)| recent.contains(&hash)),
+        _ => false,
+    }
+}
+
+/// The members [`is_pool_read`] reads from a single call object, read like
+/// [`ScreenFields`]: every other member is skipped in place, and a batch (a
+/// JSON array) is a type error, so it is never one of these reads.
+struct PoolReadFields {
+    /// Top-level `method`, when it is a string.
+    method: Option<String>,
+    /// The first two elements of `params`, each when it is a string.
+    params: [Option<String>; 2],
+}
+
+impl<'de> serde::Deserialize<'de> for PoolReadFields {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_map(PoolReadFieldsVisitor)
+    }
+}
+
+/// Visitor behind [`PoolReadFields`].
+struct PoolReadFieldsVisitor;
+
+impl<'de> Visitor<'de> for PoolReadFieldsVisitor {
+    type Value = PoolReadFields;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC request object")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<Self::Value, A::Error> {
+        let mut fields = PoolReadFields { method: None, params: [None, None] };
+        // a repeated member keeps the last occurrence, as in the screen
+        while let Some(member) = members.next_key::<Cow<'_, str>>()? {
+            match member.as_ref() {
+                "method" => fields.method = members.next_value::<MaybeString>()?.into_option(),
+                "params" => fields.params = members.next_value::<LeadingParams>()?.0,
+                _ => {
+                    members.next_value::<IgnoredAny>()?;
+                }
+            }
+        }
+        Ok(fields)
+    }
+}
+
+/// A `params` array reduced to its first two elements, each kept when it is a
+/// string. As with [`FirstParam`], the remaining elements drain through the
+/// ignored-value sink, and `params` given as an object has no positional
+/// elements.
+struct LeadingParams([Option<String>; 2]);
+
+impl<'de> serde::Deserialize<'de> for LeadingParams {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LeadingParamsVisitor)
+    }
+}
+
+/// Visitor behind [`LeadingParams`].
+struct LeadingParamsVisitor;
+
+impl<'de> Visitor<'de> for LeadingParamsVisitor {
+    type Value = LeadingParams;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC params array")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
+        let mut leading = [None, None];
+        for slot in &mut leading {
+            match elements.next_element::<MaybeString>()? {
+                Some(element) => *slot = element.into_option(),
+                None => return Ok(LeadingParams(leading)),
+            }
+        }
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(LeadingParams(leading))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, mut members: A) -> Result<Self::Value, A::Error> {
+        while members.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+        Ok(LeadingParams([None, None]))
+    }
+}
+
 /// Shallow pre-flight for `eth_sendRawTransaction`.
 ///
-/// Returns `Some((error, id))` only when `body` is a single
+/// Returns `Err((error, id))` only when `body` is a single
 /// `eth_sendRawTransaction` call whose raw transaction cannot be decoded, or
 /// decodes to an EIP-4844 blob transaction (which the network does not accept).
 /// Every other request — including batches, other methods, and any
-/// structurally-off submission — returns `None` and is forwarded unchanged.
+/// structurally-off submission — returns `Ok` and is forwarded unchanged. The
+/// `Ok` carries the transaction's hash when `body` is a single
+/// `eth_sendRawTransaction` whose transaction decoded and passed, so the caller
+/// can remember the submission (see [`RecentSubmissions`]) without decoding it
+/// again.
 ///
 /// The `id` rides along with the rejection so the response path does not have
 /// to parse the body again. Only the reject paths recover it, and they read it
@@ -580,25 +793,29 @@ fn read_method<'de, A: MapAccess<'de>>(mut members: A) -> Result<Option<String>,
 /// never recovers the signer, so it cannot reject a transaction the worker
 /// would have accepted (no false rejections); it only front-runs a rejection
 /// the worker would issue anyway.
-fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
+fn screen_raw_transaction(body: &[u8]) -> Result<Option<B256>, (GatewayError, RequestId)> {
     // Fast path: skip JSON parsing entirely unless the method name is present.
     if !mentions_send_raw_transaction(body) {
-        return None;
+        return Ok(None);
     }
     // Only the two members the screen reads are materialized; everything else
     // is skipped in place. Parsing into a `Value` here would build a tree several
     // times the size of the request, and the substring test above is satisfied by
     // the method name appearing anywhere (a string value, a key, padding), so the
     // request reaching this point is attacker-shaped and attacker-sized.
-    let fields: ScreenFields = serde_json::from_slice(body).ok()?;
+    let Ok(fields) = serde_json::from_slice::<ScreenFields>(body) else {
+        return Ok(None);
+    };
     // Single-call objects only; a batch (a JSON array) fails the map visitor and
     // is forwarded, left to the worker to validate per element.
     if fields.method.as_deref() != Some(SEND_RAW_TRANSACTION) {
-        return None;
+        return Ok(None);
     }
     // A submission whose params are structurally off (missing / not a string)
     // is forwarded so the worker returns its own canonical parameter error.
-    let raw_hex = fields.raw_transaction.as_deref()?;
+    let Some(raw_hex) = fields.raw_transaction.as_deref() else {
+        return Ok(None);
+    };
 
     // From here the payload is unambiguously a raw transaction, so a decode
     // failure is a real rejection rather than a reason to forward. Only a
@@ -606,17 +823,17 @@ fn screen_raw_transaction(body: &[u8]) -> Option<(GatewayError, RequestId)> {
     // call site below: one more scan of bytes the screen has already read once.
     // The forward path, which is where an attacker-shaped request lands after
     // costing the screen its parse, allocates nothing for the id.
-    let raw_tx_error = decode_hex(raw_hex).map_or(Some(GatewayError::InvalidTransaction), |raw| {
+    let screened = decode_hex(raw_hex).ok_or(GatewayError::InvalidTransaction).and_then(|raw| {
         let mut buf = raw.as_slice();
         match PooledTransaction::decode_2718(&mut buf) {
-            Err(_) => Some(GatewayError::InvalidTransaction),
+            Err(_) => Err(GatewayError::InvalidTransaction),
             Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
-                Some(GatewayError::UnsupportedTransactionType)
+                Err(GatewayError::UnsupportedTransactionType)
             }
-            Ok(_) => None,
+            Ok(tx) => Ok(*tx.hash()),
         }
     });
-    raw_tx_error.map(|err| (err, RequestId::recover(body)))
+    screened.map(Some).map_err(|err| (err, RequestId::recover(body)))
 }
 
 /// Whether `body` is valid UTF-8 mentioning the raw-transaction method. JSON is
@@ -846,7 +1063,7 @@ mod tests {
 
     /// The screen's verdict alone, for the cases that do not assert on the id.
     fn screen_err(body: &[u8]) -> Option<GatewayError> {
-        screen_raw_transaction(body).map(|(err, _)| err)
+        screen_raw_transaction(body).err().map(|(err, _)| err)
     }
 
     /// A comparable projection of a screen verdict. `GatewayError` is not
@@ -947,7 +1164,7 @@ mod tests {
 
         for body in bodies {
             assert_eq!(
-                verdict(screen_raw_transaction(&body)),
+                verdict(screen_raw_transaction(&body).err()),
                 verdict(reference_screen(&body)),
                 "screen disagreed with the previous parse on: {}",
                 String::from_utf8_lossy(&body)
@@ -981,7 +1198,7 @@ mod tests {
 
         // The new reader skips the id, rejects the undecodable transaction,
         // and id recovery falls back to `null` at the same recursion limit.
-        let (err, id) = screen_raw_transaction(&body).expect("undecodable tx must be rejected");
+        let (err, id) = screen_raw_transaction(&body).expect_err("undecodable tx must be rejected");
         assert!(matches!(err, GatewayError::InvalidTransaction));
         assert_eq!(id, RequestId::from_id(Value::Null));
 
@@ -990,7 +1207,7 @@ mod tests {
             r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":{deep_id}}}"#
         )
         .into_bytes();
-        assert_eq!(verdict(screen_raw_transaction(&valid_body)), None);
+        assert_eq!(verdict(screen_raw_transaction(&valid_body).err()), None);
         assert_eq!(verdict(reference_screen(&valid_body)), None);
     }
 
@@ -1010,8 +1227,8 @@ mod tests {
         .into_bytes();
         assert!(body.len() > 800_000, "fixture should be large: {}", body.len());
 
-        assert_eq!(verdict(screen_raw_transaction(&body)), None);
-        assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+        assert_eq!(verdict(screen_raw_transaction(&body).err()), None);
+        assert_eq!(verdict(screen_raw_transaction(&body).err()), verdict(reference_screen(&body)));
     }
 
     /// The review payload for this commit: all of the bulk in `id`, past the
@@ -1034,8 +1251,11 @@ mod tests {
         ];
         bodies.iter().for_each(|body| {
             assert!(body.len() > 800_000, "fixture should be large: {}", body.len());
-            assert_eq!(verdict(screen_raw_transaction(body)), None);
-            assert_eq!(verdict(screen_raw_transaction(body)), verdict(reference_screen(body)));
+            assert_eq!(verdict(screen_raw_transaction(body).err()), None);
+            assert_eq!(
+                verdict(screen_raw_transaction(body).err()),
+                verdict(reference_screen(body))
+            );
         });
     }
 
@@ -1050,7 +1270,7 @@ mod tests {
         )
         .into_bytes();
 
-        let (err, id) = screen_raw_transaction(&body).expect("undecodable tx must be rejected");
+        let (err, id) = screen_raw_transaction(&body).expect_err("undecodable tx must be rejected");
         assert!(matches!(err, GatewayError::InvalidTransaction));
         assert_eq!(id, RequestId::from_id(serde_json::json!(7)));
     }
@@ -1058,6 +1278,19 @@ mod tests {
     #[test]
     fn valid_legacy_transaction_is_forwarded() {
         assert!(screen_err(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).is_none());
+    }
+
+    /// The forward verdict on a valid submission carries its transaction hash,
+    /// which the proxy remembers once the worker takes it; nothing else does.
+    #[test]
+    fn valid_submission_hands_back_its_hash() {
+        let raw = decode_hex(EIP155_LEGACY_TX).expect("fixture hex");
+        let screened = screen_raw_transaction(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]")));
+        assert_eq!(screened.ok(), Some(Some(tn_types::keccak256(raw))));
+        let sync = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransactionSync","params":["{EIP155_LEGACY_TX}"],"id":1}}"#
+        );
+        assert!(matches!(screen_raw_transaction(sync.as_bytes()), Ok(None)));
     }
 
     #[test]
@@ -1090,10 +1323,11 @@ mod tests {
         )
         .into_bytes();
 
-        let (err, id) = screen_raw_transaction(&body).expect("disallowed type must be rejected");
+        let (err, id) =
+            screen_raw_transaction(&body).expect_err("disallowed type must be rejected");
         assert!(matches!(err, GatewayError::UnsupportedTransactionType));
         assert_eq!(id, RequestId::from_id(serde_json::json!(42)));
-        assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+        assert_eq!(verdict(screen_raw_transaction(&body).err()), verdict(reference_screen(&body)));
     }
 
     #[test]
@@ -1116,7 +1350,7 @@ mod tests {
             br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":[7,8]}"#.to_vec(),
         ];
         bodies.iter().for_each(|body| {
-            let (_, id) = screen_raw_transaction(body).expect("rejected");
+            let (_, id) = screen_raw_transaction(body).expect_err("rejected");
             assert_eq!(id, RequestId::recover(body), "{}", String::from_utf8_lossy(body));
         });
     }
@@ -1130,7 +1364,7 @@ mod tests {
             r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{payload}"],"id":31}}"#
         )
         .into_bytes();
-        let (err, id) = screen_raw_transaction(&body).expect("rejected");
+        let (err, id) = screen_raw_transaction(&body).expect_err("rejected");
         assert!(matches!(err, GatewayError::InvalidTransaction));
         assert_eq!(id, RequestId::recover(&body));
     }
@@ -1138,7 +1372,7 @@ mod tests {
     #[test]
     fn other_methods_are_forwarded() {
         let body = br#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
-        assert!(screen_raw_transaction(body).is_none());
+        assert!(matches!(screen_raw_transaction(body), Ok(None)));
     }
 
     #[test]
@@ -1148,23 +1382,26 @@ mod tests {
         let body = format!(
             r#"[{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":1}}]"#
         );
-        assert!(screen_raw_transaction(body.as_bytes()).is_none());
+        assert!(matches!(screen_raw_transaction(body.as_bytes()), Ok(None)));
     }
 
     #[test]
     fn missing_params_are_forwarded() {
-        assert!(screen_raw_transaction(&send_raw("[]")).is_none());
+        assert!(matches!(screen_raw_transaction(&send_raw("[]")), Ok(None)));
     }
 
     #[test]
     fn non_json_body_is_forwarded() {
         // Mentions the method name but is not JSON: nothing to inspect, forward.
-        assert!(screen_raw_transaction(b"garbage eth_sendRawTransaction garbage").is_none());
+        assert!(matches!(
+            screen_raw_transaction(b"garbage eth_sendRawTransaction garbage"),
+            Ok(None)
+        ));
     }
 
     #[test]
     fn unrelated_body_skips_parsing() {
-        assert!(screen_raw_transaction(br#"{"method":"net_version","id":1}"#).is_none());
+        assert!(matches!(screen_raw_transaction(br#"{"method":"net_version","id":1}"#), Ok(None)));
     }
 
     #[test]
@@ -1357,6 +1594,102 @@ mod tests {
         assert_eq!(classify(last_read.as_bytes()), Calls::Queries);
         let batch = format!("[{last_read},{}]", call("eth_sendRawTransaction"));
         assert_eq!(classify(batch.as_bytes()), Calls::MixedBatch);
+    }
+
+    /// A JSON-RPC call to `method` with the given params.
+    fn call_with(method: &str, params: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":1}}"#)
+    }
+
+    /// The test address every nonce read below asks about.
+    const ADDRESS: &str = "0x3535353535353535353535353535353535353535";
+
+    #[test]
+    fn only_a_single_pending_nonce_read_is_a_pool_read() {
+        for (params, pool_read) in [
+            (format!(r#"["{ADDRESS}","pending"]"#), true),
+            (format!(r#"["{ADDRESS}","pending","extra"]"#), true),
+            (format!(r#"["{ADDRESS}","latest"]"#), false),
+            (format!(r#"["{ADDRESS}","Pending"]"#), false),
+            (format!(r#"["{ADDRESS}","0x10"]"#), false),
+            (format!(r#"["{ADDRESS}"]"#), false),
+            (format!(r#"["{ADDRESS}",{{"blockNumber":"pending"}}]"#), false),
+            (r#"{"address":"pending"}"#.to_string(), false),
+            ("null".to_string(), false),
+        ] {
+            let body = call_with("eth_getTransactionCount", &params);
+            assert_eq!(is_pool_read(body.as_bytes(), None), pool_read, "{body}");
+        }
+        let pending = call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}","pending"]"#));
+        // a batch keeps the route `classify` gives it
+        assert!(!is_pool_read(format!("[{pending}]").as_bytes(), None));
+        assert!(!is_pool_read(format!("{pending} trailing").as_bytes(), None));
+        // every other read at the pending tag stays on the query upstream
+        for method in ["eth_call", "eth_getBalance", "eth_estimateGas", "eth_gettransactioncount"] {
+            let body = call_with(method, &format!(r#"["{ADDRESS}","pending"]"#));
+            assert!(!is_pool_read(body.as_bytes(), None), "{method}");
+        }
+    }
+
+    #[test]
+    fn only_a_remembered_hash_lookup_is_a_pool_read() {
+        let remembered = B256::repeat_byte(0x11);
+        let recent = RecentSubmissions::new(Duration::from_secs(60), 16);
+        recent.record(remembered);
+        for method in LOOKUPS_BY_HASH {
+            let hit = call_with(method, &format!(r#"["{remembered}"]"#));
+            assert!(is_pool_read(hit.as_bytes(), Some(&recent)), "{method}");
+            // the same lookup with the hash routing off
+            assert!(!is_pool_read(hit.as_bytes(), None), "{method}");
+            for params in [
+                format!(r#"["{}"]"#, B256::repeat_byte(0x22)),
+                r#"["0x1234"]"#.to_string(),
+                "[]".to_string(),
+                "[17]".to_string(),
+            ] {
+                let miss = call_with(method, &params);
+                assert!(!is_pool_read(miss.as_bytes(), Some(&recent)), "{miss}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_with_a_result_is_an_accepted_submission() {
+        let hash = B256::repeat_byte(0x11);
+        for answer in [
+            format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":1}}"#),
+            // member order and surrounding whitespace do not matter
+            format!(" \n{{\"id\":\"abc\",\"result\":\"{hash}\",\"jsonrpc\":\"2.0\"}}\n"),
+            // a null error is no error
+            format!(r#"{{"jsonrpc":"2.0","result":"{hash}","error":null,"id":1}}"#),
+        ] {
+            assert!(submission_accepted(answer.as_bytes()), "{answer}");
+        }
+    }
+
+    #[test]
+    fn an_answer_without_a_lone_result_is_not_an_accepted_submission() {
+        let error = r#"{"code":-32003,"message":"insufficient funds"}"#;
+        for answer in [
+            // an error, as jsonrpsee answers a refused transaction with a 200
+            format!(r#"{{"jsonrpc":"2.0","error":{error},"id":1}}"#),
+            // a null result
+            r#"{"jsonrpc":"2.0","result":null,"id":1}"#.to_string(),
+            // both members
+            format!(r#"{{"jsonrpc":"2.0","result":"0x01","error":{error},"id":1}}"#),
+            // neither member
+            r#"{"jsonrpc":"2.0","id":1}"#.to_string(),
+            // not json
+            "worker".to_string(),
+            String::new(),
+            r#"{"jsonrpc":"2.0","result":"0x01""#.to_string(),
+            // a json array, a batch answer included, even one whose elements
+            // would fill the two members in order
+            r#"[{"jsonrpc":"2.0","result":"0x01","id":1}]"#.to_string(),
+            r#"["0x01",null]"#.to_string(),
+        ] {
+            assert!(!submission_accepted(answer.as_bytes()), "{answer}");
+        }
     }
 
     /// `use_rustls_tls` exists only when a rustls feature is enabled on
