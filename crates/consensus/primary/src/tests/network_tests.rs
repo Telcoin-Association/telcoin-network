@@ -624,6 +624,74 @@ async fn test_vote_non_committee_member_returns_error() -> eyre::Result<()> {
     Ok(())
 }
 
+/// An inactive CVV does not sign votes at any round (#1517).
+///
+/// Round 1 used to succeed: its parents are the genesis certificates, so the parent lookups
+/// that refuse later rounds never run. Both rounds now return [`HeaderError::NotActiveCvv`],
+/// with no peer penalty and no stored vote. The refusal is recoverable and is not cached, so
+/// the same round-1 header is voted after the node becomes `CvvActive`. A signature stored
+/// while active is still recast after a later demotion.
+#[tokio::test]
+async fn test_inactive_cvv_does_not_vote() -> eyre::Result<()> {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, parent, consensus_bus, task_manager: _task_manager } =
+        create_test_types(temp_dir.path()).await;
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    assert!(consensus_bus.is_cvv_inactive());
+
+    let execution = BlockNumHash::new(parent.number(), parent.hash());
+    let peer = *committee.last_authority().authority().protocol_key();
+    let author_id = committee.last_authority().id();
+    let header_round1 = committee
+        .header_builder_last_authority()
+        .latest_execution_block(execution)
+        .created_at(1)
+        .build();
+    let header_round2 = committee
+        .header_builder_last_authority()
+        .round(2)
+        .latest_execution_block(execution)
+        .created_at(2)
+        .build();
+
+    let refuse = |res: Result<PrimaryResponse, PrimaryNetworkError>| {
+        let err = res.expect_err("an inactive CVV must not sign a vote");
+        assert_matches!(err, PrimaryNetworkError::InvalidHeader(HeaderError::NotActiveCvv));
+        let penalty: Option<Penalty> = (&err).into();
+        assert!(penalty.is_none(), "refusing while CvvInactive must not penalize the peer");
+        assert_matches!(
+            PrimaryResponse::into_error_ref(&err),
+            PrimaryResponse::RecoverableError(_),
+            "the refusal must stay retryable so a rejoin can still vote this header"
+        );
+    };
+
+    refuse(handler.vote(peer, header_round1.clone(), vec![]).await);
+    refuse(handler.vote(peer, header_round2, vec![]).await);
+    // A second request for the same header must be evaluated again, not answered from a
+    // cached permanent error.
+    refuse(handler.vote(peer, header_round1.clone(), vec![]).await);
+
+    let stored =
+        committee.first_authority().consensus_config().node_storage().read_vote_info(&author_id)?;
+    assert!(stored.is_none(), "an inactive CVV must not record a vote");
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
+    let voted = handler.vote(peer, header_round1.clone(), vec![]).await?;
+    assert_matches!(voted, PrimaryResponse::Vote(_), "a rejoined CVV votes the same header");
+
+    consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+    let recast = handler.vote(peer, header_round1, vec![]).await?;
+    assert_matches!(
+        recast,
+        PrimaryResponse::Vote(_),
+        "a vote stored while active is recast while CvvInactive"
+    );
+
+    Ok(())
+}
+
 /// Regression test: a stale `VoteInfo` from a prior epoch left over in the `Votes` table must
 /// not block a vote on a header from the current epoch. Without the explicit
 /// `header.epoch() > vote_info.epoch()` branch in the vote handler, an older entry's `round`

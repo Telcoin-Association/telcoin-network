@@ -249,12 +249,16 @@ fn penalty_from_header_error(error: &HeaderError) -> Option<Penalty> {
         // hurt"). Penalizing either would punish an honest peer for a local condition, and
         // contradicts the sibling PrimaryNetworkError::Storage and *::Timeout arms that
         // already map to None.
+        //
+        // `NotActiveCvv` is this node's own mode. The peer asked a validator that is catching
+        // up; that is not the peer's fault (#1517).
         HeaderError::PendingCertificateOneshot
         | HeaderError::Storage(_)
         | HeaderError::UnknownExecutionResult(_)
         | HeaderError::TNSend(_)
         | HeaderError::InvalidEpoch { .. }
         | HeaderError::NotCommitteeMember
+        | HeaderError::NotActiveCvv
         | HeaderError::ClosedWatchChannel => None,
     }
 }
