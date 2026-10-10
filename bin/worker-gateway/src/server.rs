@@ -43,7 +43,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    proxy::proxy,
+    proxy::{proxy, QueryHeader},
     ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
 };
@@ -69,6 +69,10 @@ pub(crate) struct AppState {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers. It is not readiness-gated.
     pub(crate) query_upstream: Option<Url>,
+    /// Header sent on every request to the query upstream and never to a
+    /// worker (`--redirect-queries-header`), or `None`. Its `Debug` prints
+    /// `<redacted>`, so this state can be debug-printed without leaking it.
+    pub(crate) query_header: Option<QueryHeader>,
 }
 
 /// Inbound connection limits enforced by the accept loop and router (derived
@@ -338,6 +342,7 @@ fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Res
 mod tests {
     use super::*;
     use crate::{
+        cli::Cli,
         config::UpstreamWorker,
         proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
@@ -346,10 +351,14 @@ mod tests {
         http::{header, HeaderMap},
         routing::post,
     };
+    use clap::Parser as _;
     use reqwest::redirect::Policy;
     use std::{
         num::NonZeroU32,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex,
+        },
     };
     use tn_types::Notifier;
     use tokio::{
@@ -378,6 +387,7 @@ mod tests {
             readiness: Arc::new(GatewayReadiness::new(upstreams)),
             http: client,
             query_upstream: None,
+            query_header: None,
         }
     }
 
@@ -895,6 +905,8 @@ mod tests {
         /// Requests carrying the client's identity (`X-Forwarded-For`,
         /// `X-Forwarded-Proto`) and the gateway's user agent.
         identified: Arc<AtomicUsize>,
+        /// Every [`API_KEY_HEADER`] value received, in order.
+        api_keys: Arc<Mutex<Vec<String>>>,
     }
 
     impl Seen {
@@ -912,6 +924,10 @@ mod tests {
 
         fn identified(&self) -> usize {
             self.identified.load(Ordering::SeqCst)
+        }
+
+        fn api_keys(&self) -> Vec<String> {
+            self.api_keys.lock().expect("api keys lock").clone()
         }
     }
 
@@ -941,6 +957,11 @@ mod tests {
                     {
                         counters.identified.fetch_add(1, Ordering::SeqCst);
                     }
+                    counters.api_keys.lock().expect("api keys lock").extend(
+                        headers.get_all(API_KEY_HEADER).iter().map(|value| {
+                            value.to_str().unwrap_or("<not visible ascii>").to_string()
+                        }),
+                    );
                     name
                 }
             }),
@@ -967,6 +988,7 @@ mod tests {
             http: client,
             query_upstream: query
                 .map(|addr| Url::parse(&format!("http://{addr}/")).expect("query url")),
+            query_header: None,
         }
     }
 
@@ -1251,5 +1273,150 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// The header name the query-header tests configure.
+    const API_KEY_HEADER: &str = "x-api-key";
+
+    /// The secret value the query-header tests configure.
+    const API_KEY: &str = "s3cr3t-k3y-1609";
+
+    /// The `--redirect-queries-header` line the query-header tests configure.
+    fn api_key_line() -> String {
+        format!("X-Api-Key: {API_KEY}")
+    }
+
+    /// `redirect_state` with the test API key as the query header.
+    fn keyed_redirect_state(worker: SocketAddr, query: SocketAddr) -> AppState {
+        let query_header = QueryHeader::parse(&api_key_line()).expect("valid header");
+        AppState { query_header: Some(query_header), ..redirect_state(worker, Some(query)) }
+    }
+
+    #[tokio::test]
+    async fn header_reaches_the_query_mock_and_never_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = keyed_redirect_state(worker, query);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let submission = call("eth_sendRawTransaction", 1);
+        let sync = call("eth_sendRawTransactionSync", 2);
+        let read = call("eth_getLogs", 3);
+        let bodies = [
+            (call("eth_call", 4), "query"),
+            (submission.clone(), "worker"),
+            (sync.clone(), "worker"),
+            (format!("[{submission},{sync}]"), "worker"),
+            (format!("[{submission},{read}]"), "query"),
+            ("not json".to_string(), "query"),
+        ];
+        for (body, expected) in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, *expected), "{body}");
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (3, 3));
+        // every query hop carries the header exactly once, with its value,
+        // and no worker hop carries it at all
+        assert_eq!(query_seen.api_keys(), vec![API_KEY.to_string(); 3]);
+        assert_eq!(worker_seen.api_keys(), Vec::<String>::new());
+        // the markers are unchanged by the header
+        assert_eq!((query_seen.redirect_marker(), query_seen.hop_marker()), (3, 0));
+        assert_eq!((worker_seen.hop_marker(), worker_seen.redirect_marker()), (3, 0));
+    }
+
+    /// A `MakeWriter` that appends every formatted log line to a shared
+    /// buffer.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
+
+    impl CapturedLogs {
+        fn contents(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+        }
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("log buffer lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Captures every log line, at every level, from resolving the settings
+    /// through a forward that succeeds and one that fails, with the state and
+    /// settings debug-printed into the log as well. The runtime is
+    /// current-thread, so the spawned servers log through the same
+    /// thread-local subscriber.
+    #[tokio::test]
+    async fn header_value_never_appears_in_logs() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+
+        // startup: resolve both header forms; the public plain-http redirect
+        // also takes the plaintext warning path
+        let header = format!("--redirect-queries-header={}", api_key_line());
+        let worker_flag = format!("--upstream-rpc-url=http://{worker}/");
+        for redirect in [format!("http://{query}/"), "http://203.0.113.5:8545/".to_string()] {
+            let settings = Cli::parse_from([
+                "worker-gateway",
+                worker_flag.as_str(),
+                "--upstream-readiness-url=http://127.0.0.1:1/health/workers",
+                format!("--redirect-queries={redirect}").as_str(),
+                header.as_str(),
+            ])
+            .into_settings()
+            .expect("settings resolve");
+            assert!(settings.query_header.is_some());
+            info!(target: "gateway", ?settings, "resolved settings");
+        }
+
+        // a forward to each route, then a query whose upstream is down
+        let state = keyed_redirect_state(worker, query);
+        info!(target: "gateway", ?state, "gateway state");
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        let (_, text) = post_rpc(gateway, None, call("eth_call", 1)).await;
+        assert_eq!(text, "query");
+        let (_, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 2)).await;
+        assert_eq!(text, "worker");
+        // nothing listens on port 1
+        let down = keyed_redirect_state(worker, "127.0.0.1:1".parse().expect("addr"));
+        down.readiness.set_ready(0, true);
+        let (down, _down) = spawn(test_router(down)).await;
+        let (status, _) = post_rpc(down, None, call("eth_call", 3)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        let captured = logs.contents();
+        // the capture saw the gateway's own lines, and the header was in play
+        for line in
+            ["plain http", "resolved settings", "gateway state", "forwarding to upstream failed"]
+        {
+            assert!(captured.contains(line), "missing {line:?} in: {captured}");
+        }
+        assert!(captured.contains("<redacted>"), "the header should print redacted: {captured}");
+        assert_eq!(query_seen.api_keys(), vec![API_KEY.to_string()]);
+        assert_eq!(worker_seen.api_keys(), Vec::<String>::new());
+        assert!(!captured.contains(API_KEY), "the header value leaked into the logs: {captured}");
     }
 }

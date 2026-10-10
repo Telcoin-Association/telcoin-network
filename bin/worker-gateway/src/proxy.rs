@@ -14,7 +14,9 @@
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`classify`]),
 //! which is not readiness-gated, never falls back to the worker, and gets the
-//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, plus the
+//! `--redirect-queries-header` header when one is configured (see
+//! [`QueryHeader`]); a worker never receives that header.
 
 use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
 
@@ -27,7 +29,7 @@ use axum::{
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
 };
-use reqwest::{redirect::Policy, Client};
+use reqwest::{redirect::Policy, Client, RequestBuilder};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserializer,
@@ -162,9 +164,7 @@ pub(crate) async fn proxy(
         },
     };
 
-    match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
-        .await
-    {
+    match forward(&state, route, method, &headers, body.clone(), upstream_url.clone(), peer).await {
         Ok(response) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
@@ -225,12 +225,13 @@ fn reject_body(rejection: &BytesRejection) -> Response {
 /// into an axum response, preserving the status, body, and content type.
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
-/// [`REDIRECT_HEADER`] toward the query upstream, never both.
+/// [`REDIRECT_HEADER`] toward the query upstream, never both; the configured
+/// [`QueryHeader`] goes to the query upstream only (see [`stamp_route`]).
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
-    client: &Client,
+    state: &AppState,
     route: Route,
     method: Method,
     headers: &HeaderMap,
@@ -244,15 +245,10 @@ async fn forward(
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-    let marker = match route {
-        Route::Worker => HOP_HEADER,
-        Route::Query => REDIRECT_HEADER,
-    };
 
-    let upstream = client
-        .request(method, upstream_url)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(marker, HeaderValue::from_static("1"))
+    let upstream =
+        state.http.request(method, upstream_url).header(header::CONTENT_TYPE, content_type);
+    let upstream = stamp_route(upstream, route, state.query_header.as_ref())
         .header(X_FORWARDED_FOR, forwarded_for(headers, peer))
         .header(X_FORWARDED_PROTO, HeaderValue::from_static("http"))
         .body(body)
@@ -278,6 +274,28 @@ async fn forward(
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
     Ok(response)
+}
+
+/// Stamp the marker for `route` on a request bound upstream and, toward the
+/// query upstream only, the configured [`QueryHeader`]: a worker never
+/// receives it.
+fn stamp_route(
+    request: RequestBuilder,
+    route: Route,
+    query_header: Option<&QueryHeader>,
+) -> RequestBuilder {
+    match route {
+        Route::Worker => request.header(HOP_HEADER, HeaderValue::from_static("1")),
+        Route::Query => {
+            let request = request.header(REDIRECT_HEADER, HeaderValue::from_static("1"));
+            match query_header {
+                Some(query_header) => {
+                    request.header(query_header.name.clone(), query_header.value.clone())
+                }
+                None => request,
+            }
+        }
+    }
 }
 
 /// Build the client that forwards requests on both routes.
@@ -343,6 +361,60 @@ impl fmt::Display for UpstreamOrigin<'_> {
             write!(f, ":{port}")?;
         }
         Ok(())
+    }
+}
+
+/// A header sent on every request to the query upstream and never to a worker
+/// (`--redirect-queries-header`), such as a public RPC's API key.
+///
+/// Every redirected read leaves from the gateway's address, so a public RPC
+/// that meters by address would charge all of this gateway's clients to one
+/// quota; a key lets it meter the gateway instead. The value is marked
+/// sensitive and `Debug` prints only `<redacted>`, so neither [`AppState`] nor
+/// the resolved settings can leak it through a debug print.
+#[derive(Clone)]
+pub(crate) struct QueryHeader {
+    /// The header name.
+    name: HeaderName,
+    /// The header value, marked sensitive.
+    value: HeaderValue,
+}
+
+impl QueryHeader {
+    /// Parse one `Name: value` line, trimming whitespace around the line, the
+    /// name and the value.
+    ///
+    /// Errors name the problem but never echo any part of the line, which can
+    /// hold a credential even when it is malformed.
+    pub(crate) fn parse(line: &str) -> eyre::Result<Self> {
+        let (name, value) = line
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| eyre::eyre!("expected one `Name: value` line, found no `:`"))?;
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| eyre::eyre!("the header name is not a valid HTTP header name"))?;
+        let value = value.trim();
+        eyre::ensure!(!value.is_empty(), "the header value is empty");
+        let mut value = HeaderValue::from_str(value).map_err(|_| {
+            eyre::eyre!(
+                "the header value is not a valid HTTP header value (one line, no control \
+                 characters)"
+            )
+        })?;
+        value.set_sensitive(true);
+        Ok(Self { name, value })
+    }
+
+    /// The header's name and value, for tests.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&HeaderName, &HeaderValue) {
+        (&self.name, &self.value)
+    }
+}
+
+impl fmt::Debug for QueryHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
     }
 }
 

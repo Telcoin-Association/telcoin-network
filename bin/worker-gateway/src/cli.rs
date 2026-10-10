@@ -1,6 +1,7 @@
 //! Command-line interface and resolved runtime settings.
 
 use std::{
+    fs,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
@@ -8,12 +9,13 @@ use std::{
 };
 
 use clap::Parser;
+use eyre::WrapErr as _;
 use tracing::warn;
 use url::Url;
 
 use crate::{
     config::{GatewayConfig, UpstreamWorker},
-    proxy::UpstreamOrigin,
+    proxy::{QueryHeader, UpstreamOrigin},
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
@@ -58,6 +60,25 @@ pub(crate) struct Cli {
     /// gateway itself or at a worker's RPC host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
     pub(crate) redirect_queries: Option<Url>,
+
+    /// Header sent on every request to the `--redirect-queries` endpoint and
+    /// never to a worker, written as one `Name: value` line: for example a
+    /// public RPC's API key, so it can meter this gateway by key rather than by
+    /// the one address all redirected reads share. Every client's redirected
+    /// call carries it, so use a key scoped to public reads, and quote the
+    /// whole line on a command line. Requires `--redirect-queries`; set this or
+    /// `--redirect-queries-header-file`, not both. The value is never logged.
+    /// Default: none.
+    #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES_HEADER", hide_env_values = true)]
+    pub(crate) redirect_queries_header: Option<String>,
+
+    /// Path to a file holding the `--redirect-queries-header` line, which keeps
+    /// the secret out of the process arguments and environment (a mounted
+    /// secret, for example). Whitespace around the line, a trailing newline
+    /// included, is trimmed. Requires `--redirect-queries`; set this or
+    /// `--redirect-queries-header`, not both. Default: none.
+    #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES_HEADER_FILE")]
+    pub(crate) redirect_queries_header_file: Option<PathBuf>,
 
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
@@ -236,6 +257,9 @@ pub(crate) struct Settings {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers.
     pub(crate) query_upstream: Option<Url>,
+    /// Header sent to the query upstream only (`--redirect-queries-header` or
+    /// `--redirect-queries-header-file`), or `None`. Its `Debug` is redacted.
+    pub(crate) query_header: Option<QueryHeader>,
     /// Readiness poll interval.
     pub(crate) readiness_poll_interval: Duration,
     /// Readiness poll timeout.
@@ -282,6 +306,7 @@ impl Cli {
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        let query_header = self.resolve_query_header()?;
         let query_upstream = self
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
@@ -316,6 +341,7 @@ impl Cli {
             listen_addr: self.listen_addr,
             upstreams,
             query_upstream,
+            query_header,
             readiness_poll_interval: self.readiness_poll_interval,
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
@@ -361,6 +387,36 @@ impl Cli {
                 }])
             }
         }
+    }
+
+    /// Resolve `--redirect-queries-header` or `--redirect-queries-header-file`
+    /// into the header sent to the query upstream.
+    ///
+    /// Setting both, or either without `--redirect-queries`, is a startup
+    /// error. No error carries the header line, which holds a credential even
+    /// when it is malformed.
+    fn resolve_query_header(&self) -> eyre::Result<Option<QueryHeader>> {
+        let (flag, line) = match (&self.redirect_queries_header, &self.redirect_queries_header_file)
+        {
+            (None, None) => return Ok(None),
+            (Some(_), Some(_)) => eyre::bail!(
+                "--redirect-queries-header and --redirect-queries-header-file are both set; use \
+                 one"
+            ),
+            (Some(line), None) => ("--redirect-queries-header", Ok(line.clone())),
+            (None, Some(path)) => (
+                "--redirect-queries-header-file",
+                fs::read_to_string(path).wrap_err_with(|| {
+                    format!("failed to read --redirect-queries-header-file `{}`", path.display())
+                }),
+            ),
+        };
+        eyre::ensure!(
+            self.redirect_queries.is_some(),
+            "{flag} is set without --redirect-queries; the header is only ever sent to the query \
+             upstream"
+        );
+        QueryHeader::parse(&line?).map(Some).wrap_err_with(|| format!("invalid {flag}"))
     }
 }
 
@@ -520,6 +576,7 @@ fn url_host_ip(url: &Url) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn cli_with(config: Option<&str>, rpc: Option<&str>, readiness: Option<&str>) -> Cli {
         let mut argv = vec!["worker-gateway".to_string()];
@@ -826,6 +883,110 @@ mod tests {
             ("http://[fd00::7]:8545/", false),
         ] {
             assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
+        }
+        Ok(())
+    }
+
+    /// A redirect the query-header tests can attach a header to.
+    const REDIRECT: &str = "--redirect-queries=https://rpc.example.com/";
+
+    /// The secret every query-header test hides in its header line.
+    const SECRET: &str = "s3cr3t";
+
+    /// A temporary file holding `contents`, and the
+    /// `--redirect-queries-header-file` flag naming it.
+    fn header_file(contents: &str) -> eyre::Result<(tempfile::NamedTempFile, String)> {
+        let mut file = tempfile::NamedTempFile::new()?;
+        file.write_all(contents.as_bytes())?;
+        let flag = format!("--redirect-queries-header-file={}", file.path().display());
+        Ok((file, flag))
+    }
+
+    #[test]
+    fn header_file_is_read_and_trimmed() -> eyre::Result<()> {
+        let (_file, flag) = header_file(&format!("  X-Api-Key:  {SECRET}-k3y \r\n\n"))?;
+        let settings = cli_with_flags(&[REDIRECT, flag.as_str()]).into_settings()?;
+        let header = settings.query_header.ok_or_else(|| eyre::eyre!("header not resolved"))?;
+        let (name, value) = header.parts();
+        assert_eq!(name.as_str(), "x-api-key");
+        assert_eq!(value.to_str()?, "s3cr3t-k3y");
+        assert!(value.is_sensitive(), "the value must be marked sensitive");
+
+        // the flag form is trimmed the same way
+        let settings =
+            cli_with_flags(&[REDIRECT, "--redirect-queries-header= X-Api-Key: s3cr3t-k3y "])
+                .into_settings()?;
+        let header = settings.query_header.ok_or_else(|| eyre::eyre!("header not resolved"))?;
+        assert_eq!(header.parts().1.to_str()?, "s3cr3t-k3y");
+        assert!(!format!("{header:?}").contains(SECRET), "debug output must be redacted");
+        Ok(())
+    }
+
+    #[test]
+    fn header_without_a_redirect_is_rejected_at_startup() -> eyre::Result<()> {
+        let line = format!("X-Api-Key: {SECRET}");
+        let (_file, file_flag) = header_file(&line)?;
+        let flag = format!("--redirect-queries-header={line}");
+        for flag in [flag.as_str(), file_flag.as_str()] {
+            let message = match cli_with_flags(&[flag]).into_settings() {
+                Ok(_) => panic!("{flag} without --redirect-queries must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("without --redirect-queries"), "{message}");
+            assert!(!message.contains(SECRET), "the value leaked into: {message}");
+
+            // the same flag with a redirect is accepted
+            let settings = cli_with_flags(&[REDIRECT, flag]).into_settings()?;
+            assert!(settings.query_header.is_some(), "{flag}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn both_header_forms_is_an_error() -> eyre::Result<()> {
+        let line = format!("X-Api-Key: {SECRET}");
+        let (_file, file_flag) = header_file(&line)?;
+        let flag = format!("--redirect-queries-header={line}");
+        let message =
+            match cli_with_flags(&[REDIRECT, flag.as_str(), file_flag.as_str()]).into_settings() {
+                Ok(_) => panic!("both header forms together must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+        assert!(message.contains("both set"), "{message}");
+        assert!(!message.contains(SECRET), "the value leaked into: {message}");
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_header_error_omits_the_value() -> eyre::Result<()> {
+        for line in [
+            // no `:` at all
+            "s3cr3t".to_string(),
+            // a name that is not a header token
+            format!("Bearer {SECRET}: value"),
+            // an empty name
+            format!(": {SECRET}"),
+            // an empty value
+            format!("X-{SECRET}:"),
+            // control characters in the value
+            format!("X-Api-Key: {SECRET}\u{7f}"),
+            format!("X-Api-Key: {SECRET}\0"),
+            // two lines
+            format!("X-Api-Key: {SECRET}\nX-Other: {SECRET}"),
+        ] {
+            let (_file, file_flag) = header_file(&line)?;
+            let flag = format!("--redirect-queries-header={line}");
+            for (flag, name) in [
+                (flag.as_str(), "invalid --redirect-queries-header"),
+                (file_flag.as_str(), "invalid --redirect-queries-header-file"),
+            ] {
+                let message = match cli_with_flags(&[REDIRECT, flag]).into_settings() {
+                    Ok(_) => panic!("{line:?} must be rejected"),
+                    Err(err) => format!("{err:?}"),
+                };
+                assert!(message.contains(name), "{message}");
+                assert!(!message.contains(SECRET), "the value of {line:?} leaked into: {message}");
+            }
         }
         Ok(())
     }

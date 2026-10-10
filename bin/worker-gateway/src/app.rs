@@ -25,6 +25,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         listen_addr,
         upstreams,
         query_upstream,
+        query_header,
         readiness_poll_interval,
         readiness_poll_timeout,
         upstream_connect_timeout,
@@ -48,6 +49,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         redirect_queries = %query_upstream
             .as_ref()
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
+        redirect_queries_header = query_header.is_some(),
         "starting worker gateway"
     );
 
@@ -119,7 +121,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
+    let state = AppState {
+        readiness: Arc::clone(&readiness),
+        http: proxy_client,
+        query_upstream,
+        query_header,
+    };
 
     spawner.spawn_critical_task(
         "readiness-poller",
