@@ -26,6 +26,7 @@ use axum::{
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -38,7 +39,7 @@ use url::Url;
 
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
-    server::AppState,
+    server::{AccessSampled, AppState},
     telemetry,
 };
 
@@ -89,15 +90,25 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// De-facto standard header carrying the client-facing scheme to the upstream.
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
+/// The access log's `route` for a request the gateway answered itself,
+/// without forwarding it to an upstream.
+pub(crate) const REJECTED_ROUTE: &str = "rejected";
+
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
+///
+/// When the access log samples the request (`sampled`), the proxy puts the
+/// request's [`AccessRecord`] in the sampled slot before it answers or
+/// forwards, unless the body could not be read; a request the log skips is not
+/// classified for it at all.
 ///
 /// `body` is the final extractor (it consumes the request body), so it must
 /// stay last in the parameter list.
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    sampled: Option<Extension<AccessSampled>>,
     method: Method,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -111,6 +122,20 @@ pub(crate) async fn proxy(
         Err(rejection) => return reject_body(&rejection),
     };
 
+    // only a sampled request is classified for the access log, so the log
+    // costs nothing on the requests it skips. the record goes into the slot
+    // before the proxy answers or forwards, so the line keeps the class and
+    // route when the forward is cut short (a request timeout, a cancellation).
+    let record = |route: &'static str| {
+        if let Some(Extension(AccessSampled(slot))) = &sampled {
+            slot.get_or_init(|| AccessRecord {
+                class: access_class(body.as_ref()),
+                route,
+                bytes_in: u64::try_from(body.len()).unwrap_or(u64::MAX),
+            });
+        }
+    };
+
     // A request that already carries the hop marker has passed through a
     // gateway before: some upstream URL points back at a gateway, and
     // forwarding again would loop until fds run out.
@@ -120,6 +145,7 @@ pub(crate) async fn proxy(
             "proxy loop detected (inbound request already carries the gateway hop marker); \
              check that upstream URLs point at workers, not gateways"
         );
+        record(REJECTED_ROUTE);
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -134,6 +160,7 @@ pub(crate) async fn proxy(
             "redirect loop detected (inbound request already carries the query-redirect marker); \
              check that --redirect-queries does not lead to a gateway that redirects"
         );
+        record(REJECTED_ROUTE);
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -143,6 +170,7 @@ pub(crate) async fn proxy(
     // the paths that reject, so nothing here re-parses the body.
     if let Some((err, id)) = screen_raw_transaction(body.as_ref()) {
         warn!(target: "gateway::proxy", ?err, "rejecting eth_sendRawTransaction before forwarding");
+        record(REJECTED_ROUTE);
         return error_response_with_id(&err, id);
     }
 
@@ -157,11 +185,13 @@ pub(crate) async fn proxy(
             Some(rpc_url) => (Route::Worker, rpc_url),
             None => {
                 warn!(target: "gateway::proxy", "no upstream worker ready; rejecting request");
+                record(REJECTED_ROUTE);
                 return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
             }
         },
     };
 
+    record(route.label());
     match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
         .await
     {
@@ -203,6 +233,21 @@ fn is_query(body: &[u8]) -> bool {
         telemetry::record_mixed_batch();
     }
     calls.route() == Route::Query
+}
+
+/// The access log's method class for a request body: `batch` for a JSON
+/// array, whatever it holds; `submission` for a single call to one of the
+/// [`SUBMISSION_METHODS`]; `query` for anything else, a body that is not
+/// JSON-RPC included. Like [`classify`], which it defers to for a single call,
+/// it parses nothing unless the body names the raw-transaction method.
+fn access_class(body: &[u8]) -> &'static str {
+    if body.trim_ascii_start().starts_with(b"[") {
+        "batch"
+    } else if classify(body) == Calls::Submissions {
+        "submission"
+    } else {
+        "query"
+    }
 }
 
 /// Answer a body-buffering failure: a length-limit trip is a client error worth
@@ -364,6 +409,26 @@ impl fmt::Display for ErrorChain<'_> {
         }
         Ok(())
     }
+}
+
+/// What became of a request the access log samples, put by [`proxy`] into the
+/// request's [`AccessSampled`] slot before it answers or forwards, for the log
+/// to read (see [`crate::server::AccessLog`]).
+///
+/// It holds two fixed labels and a length, never text copied from the
+/// request, so the line built from it cannot carry a URL, header value, body,
+/// params or method name.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccessRecord {
+    /// Method class: `submission`, `query` or `batch` (see [`access_class`]).
+    pub(crate) class: &'static str,
+    /// Where the request went: `worker` or `query` once a forward was
+    /// started, whatever its result (a request timeout or a cancellation
+    /// included), or [`REJECTED_ROUTE`] when the gateway answered it without
+    /// forwarding.
+    pub(crate) route: &'static str,
+    /// Length of the buffered request body, in bytes.
+    pub(crate) bytes_in: u64,
 }
 
 /// Which upstream a request goes to.

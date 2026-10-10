@@ -221,6 +221,16 @@ pub(crate) struct Cli {
     #[arg(long = "metrics", env = "WORKER_GATEWAY_METRICS_ADDR")]
     pub(crate) metrics_addr: Option<SocketAddr>,
 
+    /// Fraction of proxied requests written to the access log (tracing target
+    /// `gateway::access`), from `0` to `1`: `1` logs every request, rate-limit
+    /// `429`s included, `0.01` one in a hundred, and the default `0` disables
+    /// the log. A line carries the client's network prefix, the method class,
+    /// the route, the status, the latency and the request size, never a URL,
+    /// body, params or header value. A value outside `0..=1` is a startup
+    /// error.
+    #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_SAMPLE", default_value_t = 0.0)]
+    pub(crate) access_log_sample: f64,
+
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
@@ -268,6 +278,9 @@ pub(crate) struct Settings {
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
     /// metrics are disabled.
     pub(crate) metrics_addr: Option<SocketAddr>,
+    /// Fraction of proxied requests the access log samples, in `0..=1`; `0`
+    /// disables the log.
+    pub(crate) access_log_sample: f64,
 }
 
 impl Cli {
@@ -312,6 +325,13 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        // `contains` is false for NaN too, so every value that is not a
+        // fraction fails here
+        eyre::ensure!(
+            (0.0..=1.0).contains(&self.access_log_sample),
+            "invalid --access-log-sample {}: use a fraction from 0 to 1",
+            self.access_log_sample
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -336,6 +356,7 @@ impl Cli {
             ),
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
+            access_log_sample: self.access_log_sample,
         })
     }
 
@@ -724,6 +745,23 @@ mod tests {
         assert!(v4.is_err(), "a /33 IPv4 prefix must fail startup, not be clamped");
         let v6 = cli_with_flags(&["--rate-limit-per-ip-v6-prefix=129"]).into_settings();
         assert!(v6.is_err(), "a /129 IPv6 prefix must fail startup, not be clamped");
+    }
+
+    #[test]
+    fn rate_out_of_range_is_rejected_at_startup() -> eyre::Result<()> {
+        for rate in ["-0.1", "1.01", "2", "NaN", "inf"] {
+            let result = cli_with_flags(&[&format!("--access-log-sample={rate}")]).into_settings();
+            assert!(result.is_err(), "--access-log-sample={rate} must fail startup");
+        }
+        // the access log is off unless asked for, and both ends of the range
+        // are accepted
+        assert!(cli_with_flags(&[]).into_settings()?.access_log_sample.abs() < f64::EPSILON);
+        for (flag, rate) in [("0", 0.0), ("0.25", 0.25), ("1", 1.0)] {
+            let settings =
+                cli_with_flags(&[&format!("--access-log-sample={flag}")]).into_settings()?;
+            assert!((settings.access_log_sample - rate).abs() < f64::EPSILON, "{flag}");
+        }
+        Ok(())
     }
 
     #[test]

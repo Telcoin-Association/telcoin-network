@@ -114,6 +114,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
+| `--access-log-sample` | `WORKER_GATEWAY_ACCESS_LOG_SAMPLE` | `0` | Fraction of proxied requests written to the access log, from `0` to `1` (`0` disables); see [Access log](#access-log). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
@@ -354,6 +355,31 @@ from these series, so they reflect real client load only. The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
+
+### Access log
+
+Pass `--access-log-sample <rate>` (or `WORKER_GATEWAY_ACCESS_LOG_SAMPLE`) to write one `info` line per sampled proxied request under the tracing target `gateway::access`.
+The rate is a fraction from `0` to `1`: `1` logs every request, `0.01` one in a hundred, and the default `0` turns the log off.
+A value outside that range, or one that is not a number, stops the gateway at startup.
+
+Sampling is deterministic and uses no random source.
+The gateway counts proxied requests and logs the `n`th one when `floor(n * rate)` is greater than `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n` requests are logged, evenly spread: at `0.5` every second request, at `0.25` every fourth.
+The `/health` and `/ready` probes are neither counted nor logged.
+The log sits outside the rate limiter, so a request shed with a `429` is logged like any other.
+
+| Field | Meaning |
+| --- | --- |
+| `client` | The peer address masked to the per-IP rate limiter's prefix (`--rate-limit-per-ip-v4-prefix`, `--rate-limit-per-ip-v6-prefix`), so a line names a client the way the limiter meters it. At the default IPv4 `/32` this is the full address. |
+| `class` | `submission` for a single `eth_sendRawTransaction` or `eth_sendRawTransactionSync` call, `batch` for any JSON-RPC batch whatever it holds, `query` for any other request body, and `unknown` when the gateway answered before reading the body. It does not depend on `--redirect-queries`. |
+| `route` | `worker` or `query` for a request forwarded to that upstream, whatever the forward's result, a timeout included; `rejected` for a request the gateway answered itself (rate limit, oversized body, a request timeout before the forward started, loop marker, transaction screen, no ready worker). |
+| `status` | The HTTP status returned to the client, or `499` when the connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
+| `latency_ms` | Whole milliseconds from the request reaching the gateway until the response head is ready, or until the connection closed for a `499`; a streamed response body may still be in flight. |
+| `bytes_in` | The request body's length in bytes, or, when the gateway answered before reading the body, the `Content-Length` the client declared: unverified, so a client can inflate it, and `0` for a chunked body that declares none. |
+
+A line never carries the request URL, a header value, the body, the params, or a method name beyond its class.
+With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
+The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, with no ceiling of its own, so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
+Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
 
 ## Operator guidance
 

@@ -261,7 +261,7 @@ impl PrefixPolicy {
     /// them as IPv6 would collapse *all* IPv4 clients onto one bucket; they are
     /// unmapped first and keyed by the IPv4 prefix, exactly as an IPv4-only
     /// listener would key them.
-    fn key(&self, ip: IpAddr) -> IpAddr {
+    pub(crate) fn key(&self, ip: IpAddr) -> IpAddr {
         match ip {
             IpAddr::V4(addr) => IpAddr::V4(mask_v4(addr, self.v4)),
             IpAddr::V6(addr) => addr.to_ipv4_mapped().map_or_else(
