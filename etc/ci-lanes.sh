@@ -96,6 +96,11 @@ lane_test_default() {
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
+    # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
+    # -p), but the workspace build below unifies features across every member, so a
+    # feature the gateway needs and does not enable on its own dependencies still
+    # compiles there. Build it alone so that gap fails here, not in the image build.
+    run cargo build --locked -p tn-worker-gateway --bin worker-gateway
     run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 
