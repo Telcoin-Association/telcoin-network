@@ -283,19 +283,26 @@ async fn forward(
 
 /// Start a client for the upstream hop with the settings every upstream client
 /// shares: rustls, trusting the platform's native root store plus every
-/// `--upstream-ca-cert` certificate, and the upstream connect timeout.
+/// `--upstream-ca-cert` certificate, the `--upstream-client-cert` identity when
+/// one is configured, and the upstream connect timeout.
 ///
 /// The forwarding client ([`proxy_client`]) and the readiness poller's client
 /// both start here, so an `https` worker URL and its readiness URL are verified
-/// the same way. The forwarding client also serves the `--redirect-queries`
-/// route, so the extra CA certificates are trusted there too. An upstream whose
+/// the same way and see the same client certificate. The forwarding client also
+/// serves the `--redirect-queries` route, so the extra CA certificates are
+/// trusted there too, and the client certificate goes to that endpoint if it
+/// asks for one (rustls sends it only on request). An upstream whose
 /// certificate chains to none of these roots fails the handshake: a forward to
 /// it fails and a poll marks it not ready, so a wrong CA fails closed.
 pub(crate) fn client_builder(settings: &Settings) -> ClientBuilder {
-    settings.upstream_ca_certs.iter().cloned().fold(
+    let builder = settings.upstream_ca_certs.iter().cloned().fold(
         Client::builder().use_rustls_tls().connect_timeout(settings.upstream_connect_timeout),
         ClientBuilder::add_root_certificate,
-    )
+    );
+    match &settings.upstream_identity {
+        Some(identity) => builder.identity(identity.clone()),
+        None => builder,
+    }
 }
 
 /// Finish `builder` (see [`client_builder`]) into the client that forwards

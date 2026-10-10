@@ -8,7 +8,7 @@ use std::{
 };
 
 use clap::Parser;
-use reqwest::Certificate;
+use reqwest::{Certificate, Identity};
 use tracing::warn;
 use url::Url;
 
@@ -106,6 +106,20 @@ pub(crate) struct Cli {
     /// default) trusts the native root store only.
     #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CA_CERT")]
     pub(crate) upstream_ca_cert: Option<PathBuf>,
+
+    /// PEM file holding the client certificate, followed by any intermediates,
+    /// that the gateway presents to an `https` upstream asking for one (mutual
+    /// TLS). Requires `--upstream-client-key`; read once at startup. Applies to
+    /// the worker RPC and readiness URLs and to a `--redirect-queries` endpoint
+    /// that asks for a client certificate. Unset (the default) presents none.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CLIENT_CERT")]
+    pub(crate) upstream_client_cert: Option<PathBuf>,
+
+    /// PEM file holding the private key (PKCS#8, PKCS#1 or SEC1, unencrypted)
+    /// for `--upstream-client-cert`. Requires `--upstream-client-cert`; read
+    /// once at startup. Unset (the default) presents no client certificate.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CLIENT_KEY")]
+    pub(crate) upstream_client_key: Option<PathBuf>,
 
     /// How long a new connection may take to send its complete request headers
     /// before it is disconnected (slow-loris guard).
@@ -256,6 +270,9 @@ pub(crate) struct Settings {
     /// Extra trust anchors for `https` upstreams (`--upstream-ca-cert`), added
     /// to the native root store; empty when the flag is unset.
     pub(crate) upstream_ca_certs: Vec<Certificate>,
+    /// Client certificate and key presented to an `https` upstream that asks
+    /// for one (`--upstream-client-cert`, `--upstream-client-key`), or `None`.
+    pub(crate) upstream_identity: Option<Identity>,
     /// Inbound header read deadline (slow-loris guard).
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
@@ -300,6 +317,10 @@ impl Cli {
             .transpose()?;
         let upstream_ca_certs =
             self.upstream_ca_cert.as_deref().map(load_ca_certs).transpose()?.unwrap_or_default();
+        let upstream_identity = load_identity(
+            self.upstream_client_cert.as_deref(),
+            self.upstream_client_key.as_deref(),
+        )?;
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
@@ -335,6 +356,7 @@ impl Cli {
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
             upstream_ca_certs,
+            upstream_identity,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
@@ -453,6 +475,43 @@ fn load_ca_certs(path: &Path) -> eyre::Result<Vec<Certificate>> {
         path.display()
     );
     Ok(certs)
+}
+
+/// Read the `--upstream-client-cert` and `--upstream-client-key` PEM files into
+/// the identity presented to an upstream that asks for a client certificate.
+///
+/// Both flags or neither: one without the other is a startup error rather than
+/// a gateway that silently presents nothing. Each file is read once, at
+/// startup; messages name the files by path only, never their content. A key
+/// that does not match the certificate, or a certificate rustls cannot parse,
+/// is reported here against both paths (see [`rustls_accepts`]).
+fn load_identity(cert: Option<&Path>, key: Option<&Path>) -> eyre::Result<Option<Identity>> {
+    let (cert, key) = match (cert, key) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => (cert, key),
+        (Some(_), None) => eyre::bail!("--upstream-client-cert requires --upstream-client-key"),
+        (None, Some(_)) => eyre::bail!("--upstream-client-key requires --upstream-client-cert"),
+    };
+    // `Identity::from_pem` takes the key and the certificate chain in one buffer
+    let mut pem = read_pem_file("--upstream-client-key", key)?;
+    pem.push(b'\n');
+    pem.extend(read_pem_file("--upstream-client-cert", cert)?);
+    let identity = Identity::from_pem(&pem).map_err(|_| {
+        eyre::eyre!(
+            "--upstream-client-cert `{}` and --upstream-client-key `{}` do not hold a PEM \
+             certificate and an unencrypted PEM private key",
+            cert.display(),
+            key.display()
+        )
+    })?;
+    eyre::ensure!(
+        rustls_accepts(|builder| builder.identity(identity.clone())),
+        "--upstream-client-cert `{}` and --upstream-client-key `{}` do not hold a certificate \
+         and the private key that matches it",
+        cert.display(),
+        key.display()
+    );
+    Ok(Some(identity))
 }
 
 /// Read the PEM file that `flag` names, rejecting an unreadable or empty file.
@@ -773,6 +832,88 @@ mod tests {
             assert!(message.contains("--upstream-ca-cert"), "flag missing from: {message}");
             assert!(message.contains(&path.display().to_string()), "path missing from: {message}");
             assert!(!message.contains("s3cr3t"), "file content leaked into: {message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cert_without_key_is_rejected_at_startup() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["gateway.test".to_string()])?;
+        let cert_path = dir.path().join("client.pem");
+        std::fs::write(&cert_path, cert.pem())?;
+        let key_path = dir.path().join("client-key.pem");
+        std::fs::write(&key_path, key_pair.serialize_pem())?;
+        let cert_flag = format!("--upstream-client-cert={}", cert_path.display());
+        let key_flag = format!("--upstream-client-key={}", key_path.display());
+
+        for (flags, missing) in [
+            ([cert_flag.as_str()], "--upstream-client-key"),
+            ([key_flag.as_str()], "--upstream-client-cert"),
+        ] {
+            let message = match cli_with_flags(&flags).into_settings() {
+                Ok(_) => panic!("{flags:?} alone must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(missing), "`{missing}` missing from: {message}");
+        }
+
+        let settings = cli_with_flags(&[cert_flag.as_str(), key_flag.as_str()]).into_settings()?;
+        assert!(settings.upstream_identity.is_some(), "both files make an identity");
+        assert!(cli_with_flags(&[]).into_settings()?.upstream_identity.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn client_identity_errors_name_the_paths_only() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["gateway.test".to_string()])?;
+        let cert_path = dir.path().join("client.pem");
+        std::fs::write(&cert_path, cert.pem())?;
+        // a key file holding no key: the pair cannot make an identity
+        let key_path = dir.path().join("not-a-key.pem");
+        std::fs::write(&key_path, "s3cr3t text without a pem block\n")?;
+        let missing = dir.path().join("missing-key.pem");
+        // a key that parses but belongs to another certificate, which only
+        // rustls rejects
+        let other_key_path = dir.path().join("other-key.pem");
+        let other = rcgen::generate_simple_self_signed(vec!["other.test".to_string()])?;
+        std::fs::write(&other_key_path, other.key_pair.serialize_pem())?;
+        // valid base64 ("s3cr3t not a certificate") in a certificate block
+        // next to a real key, which only rustls rejects
+        let not_x509_path = dir.path().join("not-x509-client.pem");
+        std::fs::write(
+            &not_x509_path,
+            "-----BEGIN CERTIFICATE-----\nczNjcjN0IG5vdCBhIGNlcnRpZmljYXRl\n-----END CERTIFICATE-----\n",
+        )?;
+        let own_key_path = dir.path().join("client-key.pem");
+        std::fs::write(&own_key_path, key_pair.serialize_pem())?;
+        // (certificate file, key file, whether the error must name the
+        // certificate file too)
+        for (cert, key, names_cert) in [
+            (&cert_path, &key_path, true),
+            (&cert_path, &missing, false),
+            (&cert_path, &other_key_path, true),
+            (&not_x509_path, &own_key_path, true),
+        ] {
+            let message = match cli_with_flags(&[
+                format!("--upstream-client-cert={}", cert.display()).as_str(),
+                format!("--upstream-client-key={}", key.display()).as_str(),
+            ])
+            .into_settings()
+            {
+                Ok(_) => panic!("{} / {} must be rejected", cert.display(), key.display()),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(&key.display().to_string()), "path missing from: {message}");
+            if names_cert {
+                let cert = cert.display().to_string();
+                assert!(message.contains(&cert), "path missing from: {message}");
+            }
+            assert!(!message.contains("s3cr3t"), "file content leaked into: {message}");
+            assert!(!message.contains("BEGIN"), "pem content leaked into: {message}");
         }
         Ok(())
     }

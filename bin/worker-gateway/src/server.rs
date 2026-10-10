@@ -1630,4 +1630,47 @@ mod tests {
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         assert_eq!(rpc_hits.load(Ordering::SeqCst), 1);
     }
+
+    #[tokio::test]
+    async fn client_certificate_is_presented() {
+        let server_ca = TestCa::new("worker test ca");
+        let client_ca = TestCa::new("gateway client test ca");
+        let config = tls_server_config(&server_ca, Some(&client_ca));
+        let ca_file = server_ca.pem_file();
+        let ca_flag = format!("--upstream-ca-cert={}", ca_file.path().display());
+
+        // without a client certificate the mocks refuse the handshake
+        let refused = tls_worker_mocks(Arc::clone(&config)).await;
+        let settings = worker_settings(
+            "https",
+            refused.rpc,
+            refused.readiness,
+            std::slice::from_ref(&ca_flag),
+        );
+        let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+        wait_for_count(&refused.readiness_handshakes, 2).await;
+        assert_eq!(ready_status(gateway).await, StatusCode::SERVICE_UNAVAILABLE);
+
+        // with the certificate and key, the same configuration accepts it
+        let (cert, key) = client_ca.leaf(ExtendedKeyUsagePurpose::ClientAuth);
+        let cert_file = pem_file(&cert.pem());
+        let key_file = pem_file(&key.serialize_pem());
+        let accepted = tls_worker_mocks(config).await;
+        let settings = worker_settings(
+            "https",
+            accepted.rpc,
+            accepted.readiness,
+            &[
+                ca_flag,
+                format!("--upstream-client-cert={}", cert_file.path().display()),
+                format!("--upstream-client-key={}", key_file.path().display()),
+            ],
+        );
+        let (gateway, _shutdown, _poller) = spawn_polled_gateway(&settings).await;
+        wait_until_ready(gateway).await;
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(accepted.rpc_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(refused.rpc_hits.load(Ordering::SeqCst), 0);
+    }
 }

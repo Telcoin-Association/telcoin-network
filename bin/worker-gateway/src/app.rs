@@ -15,6 +15,13 @@ use crate::{
     server::{serve, AppState, ServerLimits},
 };
 
+/// Context for a failure to build an upstream client. A TLS file rustls
+/// rejects (a certificate it cannot parse, or a client key that does not match
+/// its certificate) is already reported by flag and path when the settings are
+/// resolved, so this only points at the TLS flags as a backstop.
+const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upstream-ca-cert, \
+                                 --upstream-client-cert and --upstream-client-key";
+
 /// Run the gateway until SIGTERM / ctrl-c.
 ///
 /// Spawns two critical tasks (the HTTP server and the readiness poller) under a
@@ -34,6 +41,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_connect_timeout: _,
         upstream_request_timeout,
         upstream_ca_certs: _,
+        upstream_identity: _,
         header_read_timeout,
         max_connections,
         tcp_user_timeout,
@@ -78,11 +86,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
     // probe with its own tokio timeout.
-    let proxy_client = proxy_client(proxy_client_builder, upstream_request_timeout)
-        .wrap_err("cannot build the upstream client; check --upstream-ca-cert")?;
-    let readiness_client = readiness_client_builder
-        .build()
-        .wrap_err("cannot build the readiness client; check --upstream-ca-cert")?;
+    let proxy_client =
+        proxy_client(proxy_client_builder, upstream_request_timeout).wrap_err(TLS_SETTINGS_HINT)?;
+    let readiness_client = readiness_client_builder.build().wrap_err(TLS_SETTINGS_HINT)?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
     // Let in-flight requests drain within the graceful deadline (plus a small
