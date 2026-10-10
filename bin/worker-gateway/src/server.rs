@@ -339,8 +339,10 @@ mod tests {
     use super::*;
     use crate::{
         config::UpstreamWorker,
+        dns::{lookup_fn, CachingResolver, SystemLookup},
         proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        readiness::run_poller,
     };
     use axum::{
         http::{header, HeaderMap},
@@ -949,11 +951,23 @@ mod tests {
         (addr, seen, shutdown)
     }
 
+    /// A caching resolver over the system resolver, with the default TTL and
+    /// lookup cap.
+    fn system_resolver() -> Arc<CachingResolver> {
+        Arc::new(CachingResolver::new(
+            Arc::new(SystemLookup),
+            Duration::from_secs(30),
+            NonZeroUsize::new(8).expect("nonzero"),
+        ))
+    }
+
     /// Gateway state with one worker at `worker` and, when given,
     /// `--redirect-queries` pointing at `query`, using the production proxy
     /// client. The worker starts not ready.
     fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
-        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_secs(5), system_resolver())
+                .expect("client");
         redirect_state_with_client(worker, query, client)
     }
 
@@ -1113,7 +1127,8 @@ mod tests {
         );
         let (query, _query) = spawn(slow).await;
         let client =
-            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+            proxy_client(Duration::from_secs(2), Duration::from_millis(200), system_resolver())
+                .expect("client");
         let state = redirect_state_with_client(worker, Some(query), client);
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
@@ -1251,5 +1266,196 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// reqwest connects to an IP literal without calling its resolver, so a
+    /// literal upstream never takes a lookup permit or a cache entry.
+    #[tokio::test]
+    async fn ip_literal_upstreams_never_reach_the_resolver() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lookups);
+        let lookup = lookup_fn(move |_host| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Err(std::io::Error::other("no name should be looked up")) }
+        });
+        let resolver = Arc::new(CachingResolver::new(
+            lookup,
+            Duration::from_secs(30),
+            NonZeroUsize::new(1).expect("nonzero"),
+        ));
+        let client =
+            proxy_client(Duration::from_secs(2), Duration::from_secs(5), resolver).expect("client");
+        let state = redirect_state_with_client(worker, Some(query), client);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "an IP literal is never looked up");
+    }
+
+    /// The `Threads:` count from `/proc/self/status`.
+    fn thread_count() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read /proc/self/status")
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))
+            .and_then(|count| count.trim().parse().ok())
+            .expect("Threads: line")
+    }
+
+    /// A node health endpoint reporting worker 0 ready.
+    async fn ready_node() -> (SocketAddr, Notifier) {
+        let node = Router::new().route(
+            "/health/workers",
+            get(|| async {
+                r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
+            }),
+        );
+        spawn(node).await
+    }
+
+    /// `http://{host}:{port of addr}{path}`.
+    fn named_url(host: &str, addr: SocketAddr, path: &str) -> Url {
+        Url::parse(&format!("http://{host}:{}{path}", addr.port())).expect("url")
+    }
+
+    /// The #1614 stall: the query host's name takes 10 s to resolve, and each
+    /// lookup holds a blocking thread the way `getaddrinfo` does, while 100
+    /// reads per second go to that host. Readiness polls and submissions,
+    /// which resolve the worker's name, must keep working, and the lookups
+    /// must not pile up threads. Measures the process's thread count, so it is
+    /// ignored by default; run it by hand with `--run-ignored only
+    /// --no-capture` to see the numbers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measures the process thread count; run by hand"]
+    async fn slow_query_host_resolution_does_not_stall_readiness_or_submissions() {
+        const MAX_LOOKUPS: usize = 8;
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let (node, _node) = ready_node().await;
+
+        let query_lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&query_lookups);
+        let lookup = lookup_fn(move |host| {
+            let slow = host == "query.test";
+            if slow {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            async move {
+                if slow {
+                    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(10)))
+                        .await
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+            }
+        });
+        let max_lookups = NonZeroUsize::new(MAX_LOOKUPS).expect("nonzero");
+        let proxy_resolver = Arc::new(CachingResolver::new(
+            Arc::clone(&lookup),
+            Duration::from_secs(30),
+            max_lookups,
+        ));
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5), proxy_resolver)
+            .expect("client");
+        let readiness_client = Client::builder()
+            .connect_timeout(Duration::from_secs(2))
+            .dns_resolver(Arc::new(CachingResolver::new(
+                lookup,
+                Duration::from_secs(30),
+                max_lookups,
+            )))
+            .build()
+            .expect("readiness client");
+
+        let state = AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[UpstreamWorker {
+                worker_id: 0,
+                rpc_url: named_url("worker.test", worker, "/"),
+                readiness_url: named_url("worker.test", node, "/health/workers"),
+            }])),
+            http: client,
+            query_upstream: Some(named_url("query.test", query, "/")),
+        };
+        let poller = Notifier::new();
+        tokio::spawn(run_poller(
+            Arc::clone(&state.readiness),
+            readiness_client,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            poller.subscribe(),
+        ));
+        // room for every read in flight, so the connection cap is not what
+        // stalls the probes
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(4_096).expect("nonzero"),
+            ..test_limits()
+        };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let client = Client::new();
+        let mut ready = false;
+        for _ in 0..50 {
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            if response.status() == StatusCode::OK {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "the poller should mark the worker ready");
+        let start = thread_count();
+
+        let reader = Client::new();
+        let reads = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            let mut sent = Vec::with_capacity(300);
+            for id in 0..300_u64 {
+                ticker.tick().await;
+                let read = reader.post(format!("http://{gateway}/")).body(call("eth_chainId", id));
+                sent.push(tokio::spawn(async move { read.send().await.map(|r| r.status()) }));
+            }
+            sent
+        });
+
+        let mut peak = start;
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        for id in 0..30_u64 {
+            ticker.tick().await;
+            let response = client
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_sendRawTransaction", id))
+                .send()
+                .await
+                .expect("submission");
+            assert_eq!(response.status(), StatusCode::OK, "submission {id}");
+            assert_eq!(response.text().await.expect("text"), "worker");
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            assert_eq!(response.status(), StatusCode::OK, "/ready at tick {id}");
+            peak = peak.max(thread_count());
+        }
+        let end = thread_count();
+        println!("threads: start {start}, peak {peak}, end {end}");
+
+        let bound = start + MAX_LOOKUPS + 4;
+        assert!(peak < bound && end < bound, "threads grew from {start} to {peak} (bound {bound})");
+        assert_eq!(query_lookups.load(Ordering::SeqCst), 1, "every read shares one lookup");
+        for read in reads.await.expect("reads") {
+            let status = read.await.expect("join").expect("a gateway response");
+            assert!(
+                matches!(status, StatusCode::GATEWAY_TIMEOUT | StatusCode::BAD_GATEWAY),
+                "{status}"
+            );
+        }
+        assert_eq!(query_seen.hits(), 0);
+        assert!(worker_seen.hits() >= 30);
     }
 }

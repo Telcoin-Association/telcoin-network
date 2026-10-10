@@ -98,6 +98,25 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_request_timeout: Duration,
 
+    /// How long a resolved upstream host name is cached (default `30s`). An
+    /// expired answer is still served while one background lookup refreshes it,
+    /// and while refreshes fail, for up to a day past its expiry. `0` disables
+    /// the cache: every new upstream connection looks its host up again.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_DNS_CACHE_TTL",
+        default_value = "30s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) dns_cache_ttl: Duration,
+
+    /// Most DNS lookups for upstream hosts that may run at once (default `8`).
+    /// Only one lookup per host runs at a time; a lookup beyond the cap fails at
+    /// once instead of waiting, so a request to a host with no cached answer is
+    /// answered as an unreachable upstream. Must be at least `1`.
+    #[arg(long, env = "WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS", default_value = "8")]
+    pub(crate) max_concurrent_dns_lookups: NonZeroUsize,
+
     /// How long a new connection may take to send its complete request headers
     /// before it is disconnected (slow-loris guard).
     #[arg(
@@ -244,6 +263,11 @@ pub(crate) struct Settings {
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
     pub(crate) upstream_request_timeout: Duration,
+    /// How long a resolved upstream host name is cached; zero disables the
+    /// cache.
+    pub(crate) dns_cache_ttl: Duration,
+    /// Most upstream DNS lookups that may run at once.
+    pub(crate) max_concurrent_dns_lookups: NonZeroUsize,
     /// Inbound header read deadline (slow-loris guard).
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
@@ -320,6 +344,8 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
+            dns_cache_ttl: self.dns_cache_ttl,
+            max_concurrent_dns_lookups: self.max_concurrent_dns_lookups,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
@@ -731,6 +757,30 @@ mod tests {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
         Ok(())
+    }
+
+    #[test]
+    fn dns_flags_default_and_parse() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(settings.dns_cache_ttl, Duration::from_secs(30));
+        assert_eq!(settings.max_concurrent_dns_lookups.get(), 8);
+
+        let settings = cli_with_flags(&["--dns-cache-ttl=0", "--max-concurrent-dns-lookups=2"])
+            .into_settings()?;
+        assert_eq!(settings.dns_cache_ttl, Duration::ZERO, "0 disables the cache");
+        assert_eq!(settings.max_concurrent_dns_lookups.get(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn zero_dns_lookup_cap_is_rejected() {
+        let result = Cli::try_parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+            "--max-concurrent-dns-lookups=0",
+        ]);
+        assert!(result.is_err(), "a zero cap would refuse every lookup; it must fail at startup");
     }
 
     #[test]

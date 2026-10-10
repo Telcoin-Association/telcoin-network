@@ -12,6 +12,7 @@
 mod app;
 mod cli;
 mod config;
+mod dns;
 mod error;
 mod proxy;
 mod ratelimit;

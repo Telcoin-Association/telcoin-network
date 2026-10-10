@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::{
     cli::Settings,
+    dns::{CachingResolver, SystemLookup},
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
@@ -29,6 +30,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         readiness_poll_timeout,
         upstream_connect_timeout,
         upstream_request_timeout,
+        dns_cache_ttl,
+        max_concurrent_dns_lookups,
         header_read_timeout,
         max_connections,
         tcp_user_timeout,
@@ -67,13 +70,23 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
+        ?dns_cache_ttl,
+        %max_concurrent_dns_lookups,
         "edge protections configured"
     );
 
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
-    // probe with its own tokio timeout.
-    let proxy_client = proxy_client(upstream_connect_timeout, upstream_request_timeout)?;
+    // probe with its own tokio timeout. The proxy resolves upstream names
+    // through a cache with a lookup cap (see `crate::dns`), so a slow resolver
+    // for one upstream cannot fill tokio's blocking pool.
+    let proxy_resolver = Arc::new(CachingResolver::new(
+        Arc::new(SystemLookup),
+        dns_cache_ttl,
+        max_concurrent_dns_lookups,
+    ));
+    let proxy_client =
+        proxy_client(upstream_connect_timeout, upstream_request_timeout, proxy_resolver)?;
     let readiness_client = Client::builder().connect_timeout(upstream_connect_timeout).build()?;
 
     let mut task_manager = TaskManager::new("worker-gateway");

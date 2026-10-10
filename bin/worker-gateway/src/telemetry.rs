@@ -24,6 +24,9 @@
 //! splits the load between the worker and the query upstream, and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
+//!
+//! [`record_dns_lookup`] counts the outcomes of name resolution by the upstream
+//! clients' caching resolvers, both clients in one series (see [`crate::dns`]).
 
 use std::time::Instant;
 
@@ -56,6 +59,15 @@ const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 /// Batches sent whole to the query upstream because they mixed submissions
 /// with other calls.
 const MIXED_BATCHES_TOTAL: &str = "tn_worker_gateway_mixed_batches_total";
+
+/// Name resolutions by the upstream clients' caching resolvers, by `result`:
+/// `hit` (answered from the cache, fresh or stale), `miss` (a lookup was
+/// started), `error` (a started lookup failed) or `rejected` (a lookup was
+/// needed but every lookup slot was busy). A resolve that joins a lookup
+/// already in flight for the same host is counted only by that lookup's
+/// `miss`; a stale hit whose background refresh could not start counts as
+/// both `hit` and `rejected`.
+const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 
 /// RAII guard covering one proxied request.
 ///
@@ -106,6 +118,12 @@ pub(crate) fn record_routed(route: &'static str, result: &'static str) {
 /// submissions with other calls.
 pub(crate) fn record_mixed_batch() {
     counter!(MIXED_BATCHES_TOTAL).increment(1);
+}
+
+/// Record one name resolution with its `result` (`hit`, `miss`, `error` or
+/// `rejected`).
+pub(crate) fn record_dns_lookup(result: &'static str) {
+    counter!(DNS_LOOKUPS_TOTAL, "result" => result).increment(1);
 }
 
 /// Publish a worker's current readiness as a `0`/`1` gauge.
