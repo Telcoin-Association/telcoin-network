@@ -91,7 +91,8 @@ Every flag has an environment-variable fallback.
 
 | Flag | Env | Default | Description |
 | --- | --- | --- | --- |
-| `--listen-addr` | `WORKER_GATEWAY_LISTEN_ADDR` | `0.0.0.0:8545` | Client JSON-RPC + `/health` + `/ready`. |
+| `--listen-addr` | `WORKER_GATEWAY_LISTEN_ADDR` | `0.0.0.0:8545` | Client JSON-RPC + `/health` + `/ready` + `/ready/any`. |
+| `--probe-addr` | `WORKER_GATEWAY_PROBE_ADDR` | (none) | Separate listener for `/health`, `/ready` and `/ready/any` only, outside the connection cap and rate limits; unset opens none (see [Gateway endpoints](#gateway-endpoints)). |
 | `--config` | `WORKER_GATEWAY_CONFIG` | (none) | YAML upstream list. |
 | `--upstream-rpc-url` | `WORKER_GATEWAY_UPSTREAM_RPC_URL` | (none) | Inline upstream JSON-RPC URL. |
 | `--upstream-readiness-url` | `WORKER_GATEWAY_UPSTREAM_READINESS_URL` | (none) | Inline upstream readiness URL. |
@@ -127,6 +128,7 @@ Each request additionally has a whole-request deadline of
 `--upstream-request-timeout` + `--header-read-timeout` covering the body read
 and the upstream response headers, so a request body trickled in below the
 size limit cannot hold a slot indefinitely.
+The probe listener (`--probe-addr`) has no connection cap: it applies the header read deadline, serves one request per connection and refuses a request head over 8 KiB; see [Gateway endpoints](#gateway-endpoints).
 
 Upstream response bodies are streamed through, never buffered whole, so
 response size does not translate into gateway memory. A stalled *upstream* is
@@ -209,10 +211,8 @@ or put the per-IP limit there.
 > relying on them; they can also be disabled entirely (`0`) if you rate-limit at
 > the ingress.
 
-The gateway's own `GET /health` and `GET /ready` probes are **exempt** from rate
-limiting, so an orchestrator's liveness/readiness checks keep succeeding under a
-flood (rate-limiting them would make the orchestrator kill or depool the pod at
-the worst possible moment).
+The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
+The probe listener (`--probe-addr`) has no rate limit at all.
 
 Per-IP state is bounded: idle buckets are swept periodically and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
@@ -274,17 +274,20 @@ A gateway with `--redirect-queries` set answers an inbound request carrying `X-T
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client as is, without its `Location` header, so a query upstream cannot bounce a read onto the worker.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
-`/ready` still means "this gateway can take submissions".
-The query URL gets no readiness probe and no fallback: when it fails, the client gets `502` or `504` and the call is never retried on the worker, which would put the read load on the validator just when the public RPC is struggling.
+`/ready` still means "this gateway can take submissions"; `/ready/any` reports whether it can serve any route (see [Gateway endpoints](#gateway-endpoints)).
+The query URL gets no readiness gate and no fallback: when it fails, the client gets `502` or `504` and the call is never retried on the worker, which would put the read load on the validator just when the public RPC is struggling.
+The gateway does probe it, with one `eth_chainId` call per `--readiness-poll-interval` carrying `X-TN-Gateway-Redirect: 1` and bounded by `--readiness-poll-timeout`, but only to report read availability on `/ready/any`; the result never changes routing.
+A `2xx` reply whose JSON body has a `result` member counts as up; anything else, including a reply over 64 KiB, counts as down.
 
-| Worker | Query URL | `/ready` | Submissions | Other calls |
-| --- | --- | --- | --- | --- |
-| up | up | `200` | worker | query URL |
-| down | up | `503` | `503` / `-32000` | query URL |
-| up | down | `200` | worker | `502` / `-32001` or `504` / `-32002`, no fallback |
+| Worker | Query URL | `/ready` | `/ready/any` | Submissions | Other calls |
+| --- | --- | --- | --- | --- | --- |
+| up | up | `200` | `200` | worker | query URL |
+| down | up | `503` | `200` | `503` / `-32000` | query URL |
+| up | down | `200` | `200` | worker | `502` / `-32001` or `504` / `-32002`, no fallback |
+| down | down | `503` | `503` | `503` / `-32000` | `502` / `-32001` or `504` / `-32002`, no fallback |
 
 Reads answered by the query URL come from a node that has not seen this validator's transaction pool, every one of them reaches that node from the gateway's address, and each carries the client's address in `X-Forwarded-For`; see [Split routing](#split-routing) before advertising the endpoint.
-`/ready` reports only whether submissions can be served, so a front that drops a gateway on `503` (the reference `readinessProbe`, a health-checked DNS record) also stops its reads while the worker is down; probe `/health` instead if reads must survive a worker outage.
+`/ready` reports only whether submissions can be served, so a front that drops a gateway on its `503` (a health-checked DNS record, a load balancer) also stops its reads while the worker is down; probe `/ready/any` instead, as the reference `readinessProbe` does, to keep the gateway in rotation while it can serve reads.
 
 The reverse topology, a gateway that sends submissions to a validator's worker and every other call to an observer's RPC, can be expressed with the same two settings, but it is not a supported deployment yet.
 
@@ -293,8 +296,18 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
   `503` with `{"ready": false}`.
+- `GET /ready/any`: read availability, `200` when the gateway can serve any route, else `503`.
+  It answers `200` when `/ready` would, or when `--redirect-queries` is set and the query URL answered the gateway's last probe (see [Query redirect](#query-redirect)); without `--redirect-queries` it is exactly `/ready`.
+  The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports and `queries` whether the query URL is up.
 - everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
   with `--redirect-queries`, to the query URL unless it is a submission.
+
+The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
+With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
+Each connection to it serves one request, whose head must arrive within the header read deadline and be at most 8 KiB; a larger head gets `431`.
+A flood that holds every client connection then cannot make the probes time out, as it can on the client port, where a timed-out liveness probe gets a healthy pod restarted.
+Point orchestrator probes at it, and keep it reachable from the orchestrator only, since it has no connection cap.
+`--probe-addr` must not collide with `--listen-addr`; the gateway refuses to start if it does.
 
 ## Behaviour on failure
 
@@ -325,6 +338,7 @@ spec's standard "Invalid Request" code).
 On SIGTERM (or ctrl-c) the gateway stops accepting new connections and drains
 in-flight requests, up to `--graceful-shutdown-timeout`. Requests still running
 after the deadline are force-closed.
+The probe listener stops accepting at the same moment.
 
 ## Observability
 
@@ -349,7 +363,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
-The gateway's own `/health` and `/ready` probes are not proxied and are excluded
+The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and are excluded
 from these series, so they reflect real client load only. The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
@@ -388,8 +402,8 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
 
 ### DNS and the DDoS front
 
-- Publish the gateways behind health-checked DNS or a load balancer that probes each gateway's `/ready`; with plain round-robin records a dead gateway keeps receiving its share of clients until someone edits the zone.
-  `/ready` means "can take submissions", so a gateway whose worker is down drops out even though it still serves reads; every gateway shares the worker, so probe `/health` instead if reads must survive a worker outage.
+- Publish the gateways behind health-checked DNS or a load balancer that probes each gateway's `/ready/any`; with plain round-robin records a dead gateway keeps receiving its share of clients until someone edits the zone.
+  `/ready/any` keeps a gateway published while it can serve reads; `/ready` means "can take submissions", and every gateway shares the worker, so with it every gateway drops out at once when the worker is down, reads included.
 - Lock the domain at the registrar and enable DNSSEC where the provider supports it; a hijacked name serves forged state to every client.
 - Absorb packet floods in front of the gateways.
   A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer; use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
@@ -401,6 +415,7 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
 - The node's `--healthcheck` port: reachable from the gateway hosts only.
   It is unauthenticated and serves one connection at a time, so a few idle connections from anyone else make every gateway report not ready.
 - The gateway's metrics port: inside the monitoring network only.
+- The gateway's probe port (`--probe-addr`): reachable from the orchestrator only; it has no connection cap.
 - The gateway-to-worker hop is plaintext `http`; when it leaves a network you control, run it through a tunnel.
 
 ## Deployment

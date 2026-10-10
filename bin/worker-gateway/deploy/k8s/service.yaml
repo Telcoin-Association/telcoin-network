@@ -1,5 +1,7 @@
 # ClusterIP Service fronting the worker gateway pods.
 # Exposes both the client JSON-RPC port and the (cluster-internal) metrics port.
+# The probe port (8546) is left out, which does not stop other pods from
+# reaching it on the pod IP; see the NetworkPolicy example in deploy/README.md.
 apiVersion: v1
 kind: Service
 metadata:

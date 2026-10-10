@@ -1,8 +1,12 @@
 //! The gateway's HTTP surface: the JSON-RPC proxy plus liveness / readiness.
 //!
 //! A single server serves all three on one address: any request that is not
-//! `GET /health` or `GET /ready` falls through to the proxy, so JSON-RPC
-//! (`POST /`) is forwarded while orchestration probes hit the health routes.
+//! `GET /health`, `GET /ready` or `GET /ready/any` falls through to the proxy,
+//! so JSON-RPC (`POST /`) is forwarded while orchestration probes hit the
+//! health routes.
+//! With `--probe-addr` set, a second listener serves the probes alone, outside
+//! the connection cap and the rate limits, so a flood that holds every client
+//! connection cannot make them time out.
 //!
 //! The accept loop is hand-rolled over hyper's HTTP/1 connection builder
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
@@ -58,6 +62,10 @@ pub(crate) const HEALTH_PATH: &str = "/health";
 /// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
 pub(crate) const READY_PATH: &str = "/ready";
 
+/// Read-availability probe path. Never rate limited: [`router`] adds it after
+/// the rate-limit layer.
+pub(crate) const READY_ANY_PATH: &str = "/ready/any";
+
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -107,6 +115,18 @@ struct ReadyBody {
     ready: bool,
 }
 
+/// JSON body of the gateway's `/ready/any` response.
+#[derive(Debug, Serialize)]
+struct ReadyAnyBody {
+    /// Whether the gateway can serve any route.
+    ready: bool,
+    /// Whether at least one upstream worker is ready (what `/ready` reports).
+    submissions: bool,
+    /// Whether the query upstream (`--redirect-queries`) answered its last
+    /// probe; always `false` without a redirect.
+    queries: bool,
+}
+
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
 /// `request_deadline` bounds each whole request; the bare `408` the timeout
@@ -120,7 +140,8 @@ struct ReadyBody {
 ///
 /// When `rate_limiters` is present it is installed as the outermost layer, so
 /// an over-limit request is shed with a JSON-RPC `429` before its body is
-/// buffered or forwarded.
+/// buffered or forwarded. `/ready/any` is added after every layer, so it
+/// answers from memory with none of them applied.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -139,7 +160,10 @@ pub(crate) fn router(
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
         None => router,
     };
-    router.with_state(state)
+    // a layer wraps only the routes added before it, so this probe, like
+    // `/health` and `/ready` (exempt in `crate::ratelimit`), is never rate
+    // limited
+    router.route(READY_ANY_PATH, get(ready_any)).with_state(state)
 }
 
 /// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
@@ -162,12 +186,29 @@ async fn liveness() -> impl IntoResponse {
 /// `503`.
 ///
 /// It means "this gateway can take submissions". With `--redirect-queries`
-/// set, reads keep working while it reports `503`, and a failing query
-/// upstream does not change it: that upstream is never probed.
+/// set, reads keep working while it reports `503`, and the query upstream's
+/// state does not change it; [`ready_any`] reports that.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     let ready = state.readiness.any_ready();
     let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     (status, Json(ReadyBody { ready }))
+}
+
+/// Read-availability probe: `200` when the gateway can serve any route, that
+/// is when `/ready` would, or when `--redirect-queries` is set and the query
+/// upstream answered its last probe; else `503`. Without a redirect it is
+/// exactly `/ready`.
+///
+/// Every gateway in front of a validator polls the same worker, so a front
+/// that drops gateways on `/ready` drops all of them during a worker outage,
+/// and the reads they could still serve go down too. This probe keeps them in
+/// rotation while the query upstream answers.
+async fn ready_any(State(state): State<AppState>) -> impl IntoResponse {
+    let ready = state.readiness.any_route_ready();
+    let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+    let submissions = state.readiness.any_ready();
+    let queries = state.readiness.query_ready();
+    (status, Json(ReadyAnyBody { ready, submissions, queries }))
 }
 
 /// Bind `listen_addr` and serve until `shutdown` fires, then stop accepting and
@@ -315,6 +356,87 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Build the probe-only router served on `--probe-addr`: the health, readiness
+/// and read-availability routes and nothing else (any other path is a `404`,
+/// another method on a probe path a `405`), with no rate limit, body limit or
+/// request deadline, since the handlers answer from memory.
+fn probe_router(state: AppState) -> Router {
+    Router::new()
+        .route(HEALTH_PATH, get(liveness))
+        .route(READY_PATH, get(readiness))
+        .route(READY_ANY_PATH, get(ready_any))
+        .with_state(state)
+}
+
+/// Bind `probe_addr` and serve the probe-only router until `shutdown` fires.
+pub(crate) async fn serve_probes(
+    probe_addr: SocketAddr,
+    state: AppState,
+    header_read_timeout: Duration,
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    let listener = TcpListener::bind(probe_addr).await?;
+    let local_addr = listener.local_addr()?;
+    info!(target: "gateway::server", %local_addr, "probe listener listening");
+    probe_accept_loop(listener, probe_router(state), header_read_timeout, shutdown).await
+}
+
+/// Accept probe connections until `shutdown` fires, serving each on its own
+/// task, then stop accepting and let in-flight probes finish.
+///
+/// There is deliberately no connection cap: a cap is the thing a flood
+/// exhausts, and this listener exists so the probes still answer when the
+/// client listener's cap is full. Each connection must therefore be cheap and
+/// short-lived instead: it serves one request (keep-alive off), and its
+/// request head may be at most 8 KiB (hyper's smallest buffer; a larger head
+/// gets a `431`). A probe needs neither more. The header deadline bounds every
+/// connection that never completes a request.
+async fn probe_accept_loop(
+    listener: TcpListener,
+    app: Router,
+    header_read_timeout: Duration,
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    let mut connection_builder = hyper::server::conn::http1::Builder::new();
+    connection_builder
+        .timer(TokioTimer::new())
+        .header_read_timeout(header_read_timeout)
+        .keep_alive(false)
+        .max_buf_size(8 * 1024);
+    let graceful = GracefulShutdown::new();
+
+    loop {
+        let accepted = tokio::select! {
+            () = &shutdown => break,
+            accepted = listener.accept() => accepted,
+        };
+        let Ok((stream, _)) = accepted.inspect_err(|err| {
+            warn!(target: "gateway::server", %err, "failed to accept probe connection");
+        }) else {
+            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+            continue;
+        };
+        let connection = graceful.watch(
+            connection_builder
+                .serve_connection(TokioIo::new(stream), TowerToHyperService::new(app.clone())),
+        );
+        tokio::spawn(async move {
+            if let Err(err) = connection.await {
+                debug!(target: "gateway::server", %err, "probe connection error");
+            }
+        });
+    }
+
+    // each connection serves one probe, answered from memory, so only one
+    // still sending its head (at most 8 KiB) can outlast its exchange, and
+    // the header deadline closes that one anyway
+    drop(listener);
+    if tokio::time::timeout(header_read_timeout, graceful.shutdown()).await.is_err() {
+        debug!(target: "gateway::server", "probe connections still open at shutdown");
+    }
+    Ok(())
+}
+
 /// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
 /// closes the connection when transmitted data stays unacknowledged, or
 /// buffered data stays untransmittable behind a closed receive window, longer
@@ -341,6 +463,7 @@ mod tests {
         config::UpstreamWorker,
         proxy::{proxy_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        readiness::{run_poller, QueryProbe},
     };
     use axum::{
         http::{header, HeaderMap},
@@ -397,6 +520,26 @@ mod tests {
 
     async fn spawn(app: Router) -> (SocketAddr, Notifier) {
         spawn_with_limits(app, test_limits()).await
+    }
+
+    /// Serve the probe-only router for `state` through the real probe accept
+    /// loop on a second ephemeral port, as `--probe-addr` does. The returned
+    /// `Notifier` keeps the listener alive for the test's duration.
+    async fn spawn_probes(state: AppState) -> (SocketAddr, Notifier) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let noticer = shutdown.subscribe();
+        tokio::spawn(async move {
+            let _ = probe_accept_loop(
+                listener,
+                probe_router(state),
+                test_limits().header_read_timeout,
+                noticer,
+            )
+            .await;
+        });
+        (addr, shutdown)
     }
 
     fn upstream(addr: SocketAddr) -> UpstreamWorker {
@@ -1251,5 +1394,346 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn probes_answer_while_client_connections_hold_every_permit() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        state.readiness.set_ready(0, true);
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(4).expect("nonzero"),
+            ..test_limits()
+        };
+        let (gateway_addr, _shutdown) = spawn_with_limits(test_router(state.clone()), limits).await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // four client connections that send nothing hold every permit until
+        // the 5s header deadline
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            held.push(TcpStream::connect(gateway_addr).await.expect("connect"));
+        }
+        let client = Client::builder().timeout(Duration::from_secs(1)).build().expect("client");
+
+        // the client listener's cap is full, so a probe sent there waits in
+        // the accept backlog
+        let blocked = client.get(format!("http://{gateway_addr}{HEALTH_PATH}")).send().await;
+        assert!(blocked.is_err(), "the held connections should hold every permit");
+
+        for path in [HEALTH_PATH, READY_PATH] {
+            let response = client
+                .get(format!("http://{probe_addr}{path}"))
+                .send()
+                .await
+                .unwrap_or_else(|err| panic!("{path} on the probe listener: {err}"));
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn probe_connection_serves_one_request_with_a_small_head() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // a keep-alive request still gets one response and then EOF, long
+        // before the 5s header deadline would close an idle connection
+        let mut stream = TcpStream::connect(probe_addr).await.expect("connect");
+        stream
+            .write_all(format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: probe\r\n\r\n").as_bytes())
+            .await
+            .expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the probe connection should close after one response")
+            .expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+
+        // a head well over 8 KiB (one long header value) is refused, never
+        // served
+        let mut stream = TcpStream::connect(probe_addr).await.expect("connect");
+        let padding = "a".repeat(32 * 1024);
+        let head =
+            format!("GET {HEALTH_PATH} HTTP/1.1\r\nHost: probe\r\nX-Padding: {padding}\r\n\r\n");
+        // the server may refuse the head and close before all of it is written
+        let _ = stream.write_all(head.as_bytes()).await;
+        let mut response = Vec::new();
+        // a reset after the refusal is as good as a clean close; the bytes read
+        // before it stay in `response`
+        let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the oversized head should end the connection");
+        let response = String::from_utf8_lossy(&response);
+        assert!(
+            response.is_empty() || response.starts_with("HTTP/1.1 431"),
+            "expected 431 or a closed connection, got: {response}"
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_listener_is_not_rate_limited() {
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        // one request per second per IP and in total, no burst headroom
+        let limiters = RateLimiters::new(
+            Some(RateLimit::new(nz(1), nz(1))),
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (gateway_addr, _shutdown) =
+            spawn(router(state.clone(), Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters)))
+                .await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // a client request spends the bucket; the next one is refused
+        let (first, _) = post_rpc(gateway_addr, None, call("eth_chainId", 1)).await;
+        assert_eq!(first, StatusCode::OK);
+        let (second, body) = post_rpc(gateway_addr, None, call("eth_chainId", 2)).await;
+        assert_eq!(second, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&body).0, -32006);
+
+        // the probe listener, from the same address, still answers every probe
+        // no limiter by construction; the global bucket and /ready/any would catch one being added
+        let client = Client::new();
+        for _ in 0..3 {
+            for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
+                let response =
+                    client.get(format!("http://{probe_addr}{path}")).send().await.expect("send");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_listener_serves_no_rpc() {
+        let (worker, seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        let (status, _) = post_rpc(probe_addr, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(seen.hits(), 0, "the probe listener must never reach an upstream");
+    }
+
+    /// A query upstream's answer to the poller's `eth_chainId` probe.
+    const CHAIN_ID_REPLY: &str = r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#;
+
+    /// Run the real readiness poller over `state` every 50ms, probing its query
+    /// upstream (if any) with its proxy client, as `app::run` wires it. The
+    /// returned `Notifier` keeps the poller running.
+    fn spawn_poller(state: &AppState) -> Notifier {
+        let shutdown = Notifier::new();
+        let query_probe =
+            state.query_upstream.clone().map(|url| QueryProbe { url, client: state.http.clone() });
+        tokio::spawn(run_poller(
+            Arc::clone(&state.readiness),
+            Client::new(),
+            query_probe,
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            shutdown.subscribe(),
+        ));
+        shutdown
+    }
+
+    /// GET a probe path, returning its status and JSON body.
+    async fn get_probe(addr: SocketAddr, path: &str) -> (StatusCode, serde_json::Value) {
+        let response =
+            Client::new().get(format!("http://{addr}{path}")).send().await.expect("send");
+        (response.status(), response.json().await.expect("json body"))
+    }
+
+    /// GET `path` until it answers `status`, returning that body; fails after
+    /// five seconds.
+    async fn await_probe_status(
+        addr: SocketAddr,
+        path: &str,
+        status: StatusCode,
+    ) -> serde_json::Value {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let (got, body) = get_probe(addr, path).await;
+                if got == status {
+                    break body;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("{path} never answered {status}"))
+    }
+
+    #[tokio::test]
+    async fn ready_any_is_200_when_only_the_query_upstream_is_up() {
+        // the worker mock serves no readiness route, so its poll fails
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (query, _query_seen, _query) = named_mock(CHAIN_ID_REPLY).await;
+        let state = redirect_state(worker, Some(query));
+        let _poller = spawn_poller(&state);
+        let (gateway_addr, _shutdown) = spawn(test_router(state.clone())).await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        let body = await_probe_status(probe_addr, READY_ANY_PATH, StatusCode::OK).await;
+        assert_eq!(body, serde_json::json!({"ready": true, "submissions": false, "queries": true}));
+        for addr in [gateway_addr, probe_addr] {
+            assert_eq!(get_probe(addr, READY_ANY_PATH).await.0, StatusCode::OK);
+            let (status, body) = get_probe(addr, READY_PATH).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(body, serde_json::json!({"ready": false}));
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_any_is_503_when_neither_is_up() {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        // the query upstream answers, but with an error rather than a result
+        let (query, query_seen, _query) = named_mock(
+            r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"internal error"}}"#,
+        )
+        .await;
+        let state = redirect_state(worker, Some(query));
+        let _poller = spawn_poller(&state);
+        let (gateway_addr, _shutdown) = spawn(test_router(state.clone())).await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        // the poller probes one cycle at a time, so a second probe means the
+        // first one's answer has been recorded
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while query_seen.hits() < 2 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the poller should probe the query upstream");
+
+        for addr in [gateway_addr, probe_addr] {
+            let (status, body) = get_probe(addr, READY_ANY_PATH).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(
+                body,
+                serde_json::json!({"ready": false, "submissions": false, "queries": false})
+            );
+            assert_eq!(get_probe(addr, READY_PATH).await.0, StatusCode::SERVICE_UNAVAILABLE);
+        }
+    }
+
+    #[tokio::test]
+    async fn ready_any_matches_ready_without_a_redirect() {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        let readiness = Arc::clone(&state.readiness);
+        let (gateway_addr, _shutdown) = spawn(test_router(state.clone())).await;
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        for worker_ready in [false, true, false] {
+            readiness.set_ready(0, worker_ready);
+            let expected =
+                if worker_ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
+            for addr in [gateway_addr, probe_addr] {
+                let (ready_status, ready_body) = get_probe(addr, READY_PATH).await;
+                let (any_status, any_body) = get_probe(addr, READY_ANY_PATH).await;
+                assert_eq!(ready_status, expected);
+                assert_eq!(any_status, ready_status);
+                assert_eq!(any_body["ready"], ready_body["ready"]);
+                assert_eq!(
+                    any_body,
+                    serde_json::json!({
+                        "ready": worker_ready,
+                        "submissions": worker_ready,
+                        "queries": false
+                    })
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn query_probe_sends_the_redirect_marker() {
+        // a query upstream that records the marker headers and the call of
+        // every request it receives
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&received);
+        let mock = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, body: String| {
+                let record = Arc::clone(&record);
+                async move {
+                    let header = |name: &str| {
+                        headers.get(name).and_then(|v| v.to_str().ok()).map(str::to_string)
+                    };
+                    let seen = (header("x-tn-gateway-redirect"), header("x-tn-gateway"), body);
+                    record.lock().expect("record lock").push(seen);
+                    CHAIN_ID_REPLY
+                }
+            }),
+        );
+        let (query, _query) = spawn(mock).await;
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, Some(query));
+        let _poller = spawn_poller(&state);
+        let (probe_addr, _probes) = spawn_probes(state.clone()).await;
+
+        await_probe_status(probe_addr, READY_ANY_PATH, StatusCode::OK).await;
+        let probes = received.lock().expect("record lock").clone();
+        assert!(!probes.is_empty());
+        for (redirect_marker, hop_marker, body) in &probes {
+            assert_eq!(redirect_marker.as_deref(), Some("1"));
+            assert_eq!(*hop_marker, None, "the query probe must not carry the worker hop marker");
+            let call: serde_json::Value = serde_json::from_str(body).expect("json call");
+            assert_eq!(call["method"], "eth_chainId");
+        }
+        assert_eq!(worker_seen.hits(), 0, "the query probe must never reach the worker");
+
+        // a read the proxy forwards to the same upstream carries exactly the
+        // probe's markers, so the probe travels like any query-route request
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        let (status, _) = post_rpc(gateway, None, call("eth_call", 2)).await;
+        assert_eq!(status, StatusCode::OK);
+        let reads: Vec<_> = received
+            .lock()
+            .expect("record lock")
+            .iter()
+            .filter(|(_, _, body)| {
+                let call: serde_json::Value = serde_json::from_str(body).expect("json call");
+                call["method"] == "eth_call"
+            })
+            .map(|(redirect_marker, hop_marker, _)| (redirect_marker.clone(), hop_marker.clone()))
+            .collect();
+        let [read] = reads.as_slice() else { panic!("expected one proxied read, got {reads:?}") };
+        for (redirect_marker, hop_marker, _) in &probes {
+            assert_eq!(
+                (redirect_marker, hop_marker),
+                (&read.0, &read.1),
+                "the query probe's markers must match a proxied read's"
+            );
+        }
+        assert_eq!(worker_seen.hits(), 0, "a redirected read must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn ready_any_bypasses_rate_limit() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        state.readiness.set_ready(0, true);
+        // a maximally strict global limit: if this probe were rate limited, the
+        // second hit would be a 429
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (addr, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+
+        for _ in 0..5 {
+            assert_eq!(get_probe(addr, READY_ANY_PATH).await.0, StatusCode::OK);
+        }
     }
 }
