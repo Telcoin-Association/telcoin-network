@@ -298,12 +298,14 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 
 ## Behaviour on failure
 
-Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
-connection reset) when the gateway cannot serve them. The request `id` is
-echoed when it can be recovered.
+Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare connection reset) when the gateway cannot serve them.
+The error carries the HTTP status in the table below and a JSON-RPC error object as its body (`Content-Type: application/json`); there is no option to answer gateway errors with `200`.
+A client library that treats every non-`2xx` status as a transport failure reports these as HTTP errors, so read the body whatever the status.
+The request `id` is echoed when it can be recovered from the body.
+It is `null` for a batch (see below), and always `null` on a `405`, `408`, `413`, `429` or the `400` for an unreadable body, which the gateway answers without recovering the id.
 
-The exception is a request whose head hyper, the HTTP library underneath, cannot parse.
-Hyper answers it itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
+The exceptions are a request whose head hyper, the HTTP library underneath, cannot parse (below), a connection that does not finish its request head within `--header-read-timeout` (closed without a response), and an exchange still running when the connection-lifetime grace or `--graceful-shutdown-timeout` ends (see [Connection handling](#connection-handling) and [Graceful shutdown](#graceful-shutdown)).
+Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |
@@ -317,11 +319,27 @@ Hyper answers it itself, before the request reaches the gateway's service, with 
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
+| Method other than `POST` (other than `GET` or `HEAD` on `/health` and `/ready`) | `405` | `-32600` |
+
+The `408` message says whether the request may have been delivered.
+"request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
+"request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
+An upstream's own `408` is not rewritten; the client gets it with the upstream's status and body.
+
+A `504`, and a `502`, do not mean the request was not delivered: the gateway may already have sent it when the upstream timed out or the connection failed.
+With the default timeouts a slow worker produces the `504`, not the `408`.
+Treat either like the second `408` message and look a submission up by hash before sending it again.
+
+A gateway error answering a batch (a JSON array) is one error object with `id: null`, not an array of per-call errors.
+The gateway refuses a batch only as a whole: it never splits one, and it decides a `405` or `429` before reading the body.
+That is the shape JSON-RPC 2.0 prescribes when a batch cannot be taken as a whole (invalid JSON or an empty array).
+A batch the upstream answers comes back as the upstream sent it.
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
 disambiguate by HTTP status and message, not by code alone (`-32600` is the
-spec's standard "Invalid Request" code).
+spec's standard "Invalid Request" code, used for both the unreadable-body
+`400` and the `405`).
 
 ## Graceful shutdown
 
@@ -349,7 +367,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |
 
 The gateway's own `/health` and `/ready` probes are not proxied and are excluded
