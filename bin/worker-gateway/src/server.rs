@@ -18,7 +18,7 @@ use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, State},
-    http::StatusCode,
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{from_fn_with_state, map_response},
     response::{IntoResponse, Response},
     routing::get,
@@ -37,7 +37,10 @@ use tokio::{
     net::{TcpListener, TcpStream},
     sync::Semaphore,
 };
-use tower_http::timeout::TimeoutLayer;
+use tower_http::{
+    cors::{AllowOrigin, CorsLayer},
+    timeout::TimeoutLayer,
+};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -57,6 +60,10 @@ pub(crate) const HEALTH_PATH: &str = "/health";
 
 /// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
 pub(crate) const READY_PATH: &str = "/ready";
+
+/// How long a browser may cache the gateway's answer to a CORS preflight
+/// (`Access-Control-Max-Age`).
+const CORS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -100,6 +107,17 @@ pub(crate) struct ServerLimits {
     pub(crate) max_request_bytes: usize,
 }
 
+/// Browser origins allowed to call the gateway cross-origin
+/// (`--cors-allowed-origins`, validated in [`crate::cli`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CorsOrigins {
+    /// Any origin (`*`).
+    Any,
+    /// Exactly these origins, each written as a browser sends it in `Origin`
+    /// (`scheme://host[:port]`, lowercase, no default port). Never `*`.
+    List(Vec<HeaderValue>),
+}
+
 /// JSON body of the gateway's `/ready` response.
 #[derive(Debug, Serialize)]
 struct ReadyBody {
@@ -118,14 +136,21 @@ struct ReadyBody {
 /// checked when the body is polled, which a slow-reading client can prevent;
 /// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
 ///
-/// When `rate_limiters` is present it is installed as the outermost layer, so
-/// an over-limit request is shed with a JSON-RPC `429` before its body is
+/// When `rate_limiters` is present it is installed outside every route, so an
+/// over-limit request is shed with a JSON-RPC `429` before its body is
 /// buffered or forwarded.
+///
+/// When `cors_origins` is present a CORS layer wraps everything, the rate-limit
+/// layer included: it answers every `OPTIONS` preflight itself, so a preflight
+/// is never forwarded, and it adds `Access-Control-Allow-Origin` for an allowed
+/// `Origin` to every other response, a `429` included. Without it no CORS
+/// header is ever added.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
     max_request_bytes: usize,
     rate_limiters: Option<Arc<RateLimiters>>,
+    cors_origins: Option<CorsOrigins>,
 ) -> Router {
     let router = Router::new()
         .route(HEALTH_PATH, get(liveness))
@@ -139,7 +164,31 @@ pub(crate) fn router(
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
         None => router,
     };
+    // cors goes on last so it runs before the rate limiter: a preflight costs
+    // no token, and a browser can still read a `429`.
+    let router = match cors_origins {
+        Some(origins) => router.layer(cors_layer(origins)),
+        None => router,
+    };
     router.with_state(state)
+}
+
+/// Build the CORS layer for `origins`: a JSON-RPC client only ever needs
+/// `POST` with a `Content-Type` header, and a browser may cache the preflight
+/// answer for [`CORS_MAX_AGE`]. Origins are matched exactly, byte for byte,
+/// against the request's `Origin`.
+fn cors_layer(origins: CorsOrigins) -> CorsLayer {
+    let allow_origin = match origins {
+        CorsOrigins::Any => AllowOrigin::any(),
+        // `AllowOrigin::list` panics on a `*` entry; `CorsOrigins::List` never
+        // holds one (see `cli::resolve_cors_origins`)
+        CorsOrigins::List(origins) => AllowOrigin::list(origins),
+    };
+    CorsLayer::new()
+        .allow_origin(allow_origin)
+        .allow_methods([Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+        .max_age(CORS_MAX_AGE)
 }
 
 /// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
@@ -178,6 +227,7 @@ pub(crate) async fn serve(
     state: AppState,
     limits: ServerLimits,
     rate_limiters: Option<Arc<RateLimiters>>,
+    cors_origins: Option<CorsOrigins>,
     graceful_timeout: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
@@ -185,7 +235,13 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "worker gateway listening");
 
-    let app = router(state, limits.request_deadline, limits.max_request_bytes, rate_limiters);
+    let app = router(
+        state,
+        limits.request_deadline,
+        limits.max_request_bytes,
+        rate_limiters,
+        cors_origins,
+    );
     accept_loop(listener, app, limits, graceful_timeout, shutdown).await
 }
 
@@ -344,7 +400,7 @@ mod tests {
     };
     use axum::{
         http::{header, HeaderMap},
-        routing::post,
+        routing::{any, post},
     };
     use reqwest::redirect::Policy;
     use std::{
@@ -408,7 +464,7 @@ mod tests {
     }
 
     fn test_router(state: AppState) -> Router {
-        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None)
+        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None, None)
     }
 
     fn nz(n: u32) -> NonZeroU32 {
@@ -617,7 +673,7 @@ mod tests {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         // A tiny configured body limit so a small request trips the size guard
         // through the real router path (`--max-request-bytes` is configurable).
-        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None)).await;
+        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None, None)).await;
 
         let response = Client::new()
             .post(format!("http://{addr}/"))
@@ -649,7 +705,8 @@ mod tests {
         )
         .expect("limiters");
         let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters), None))
+                .await;
 
         let client = Client::new();
         let first = client
@@ -685,7 +742,8 @@ mod tests {
         )
         .expect("limiters");
         let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters), None))
+                .await;
 
         let client = Client::new();
         for _ in 0..5 {
@@ -720,7 +778,7 @@ mod tests {
         // Short whole-request deadline; generous header timeout so only the
         // body trickle trips.
         let (addr, _shutdown) = spawn_with_limits(
-            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None),
+            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None, None),
             test_limits(),
         )
         .await;
@@ -915,14 +973,15 @@ mod tests {
         }
     }
 
-    /// A mock upstream that answers every POST with `name` as the body and
-    /// counts what it receives. The `Notifier` keeps it alive.
+    /// A mock upstream that answers every request, whatever its method, with
+    /// `name` as the body and counts what it receives. The `Notifier` keeps it
+    /// alive.
     async fn named_mock(name: &'static str) -> (SocketAddr, Seen, Notifier) {
         let seen = Seen::default();
         let counters = seen.clone();
         let mock = Router::new().route(
             "/",
-            post(move |headers: HeaderMap| {
+            any(move |headers: HeaderMap| {
                 let counters = counters.clone();
                 async move {
                     let get = |name: &str| {
@@ -1251,5 +1310,207 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A gateway with one ready worker (`named_mock("worker")`) and the given
+    /// `--cors-allowed-origins`. The `Notifier`s keep both servers alive.
+    async fn cors_gateway(origins: Option<CorsOrigins>) -> (SocketAddr, Seen, [Notifier; 2]) {
+        let (worker, seen, worker_shutdown) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let app = router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None, origins);
+        let (gateway, shutdown) = spawn(app).await;
+        (gateway, seen, [worker_shutdown, shutdown])
+    }
+
+    /// `--cors-allowed-origins` listing exactly `origins`.
+    fn cors_list(origins: &[&'static str]) -> Option<CorsOrigins> {
+        Some(CorsOrigins::List(origins.iter().copied().map(HeaderValue::from_static).collect()))
+    }
+
+    /// The browser's preflight for a JSON-RPC `POST` from `origin`.
+    async fn preflight(gateway: SocketAddr, origin: &str) -> reqwest::Response {
+        Client::new()
+            .request(Method::OPTIONS, format!("http://{gateway}/"))
+            .header(header::ORIGIN, origin)
+            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+            .header(header::ACCESS_CONTROL_REQUEST_HEADERS, "content-type")
+            .send()
+            .await
+            .expect("send")
+    }
+
+    /// A JSON-RPC `POST` from `origin`, as a browser sends it after the
+    /// preflight.
+    async fn post_from(gateway: SocketAddr, origin: &str) -> reqwest::Response {
+        Client::new()
+            .post(format!("http://{gateway}/"))
+            .header(header::ORIGIN, origin)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send")
+    }
+
+    /// The names of the `Access-Control-*` headers on `response`.
+    fn cors_headers(response: &reqwest::Response) -> Vec<String> {
+        response
+            .headers()
+            .keys()
+            .map(|name| name.as_str().to_string())
+            .filter(|name| name.starts_with("access-control-"))
+            .collect()
+    }
+
+    /// The value of `name` on `response`, or `""` when absent.
+    fn header_value(response: &reqwest::Response, name: header::HeaderName) -> &str {
+        response.headers().get(name).and_then(|value| value.to_str().ok()).unwrap_or("")
+    }
+
+    /// The flag's core promise: the gateway answers a preflight itself, with
+    /// the allow headers a browser needs, and never forwards it. The mock
+    /// counts every method, so a forwarded `OPTIONS` would show up as a hit.
+    #[tokio::test]
+    async fn preflight_is_answered_locally_with_the_flag() {
+        let origin = "https://app.example";
+        let (gateway, worker_seen, _guards) = cors_gateway(cors_list(&[origin])).await;
+
+        let response = preflight(gateway, origin).await;
+        assert!(response.status().is_success(), "preflight answered {}", response.status());
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_METHODS), "POST");
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_HEADERS), "content-type");
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_MAX_AGE), "3600");
+        assert_eq!(worker_seen.hits(), 0, "a preflight must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn allowed_origin_gets_access_control_allow_origin() {
+        let (gateway, worker_seen, _guards) =
+            cors_gateway(cors_list(&["https://one.example", "http://localhost:3000"])).await;
+
+        for origin in ["https://one.example", "http://localhost:3000"] {
+            let response = post_from(gateway, origin).await;
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+            // the allowed origin is echoed, and caches are told the answer
+            // depends on it
+            assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+            assert!(header_value(&response, header::VARY).contains("origin"), "{origin}");
+            assert_eq!(response.text().await.expect("text"), "worker", "{origin}");
+        }
+        assert_eq!(worker_seen.hits(), 2);
+    }
+
+    /// A disallowed origin is still served, as a non-browser client would be,
+    /// but its `POST` gets no CORS header and its preflight no
+    /// `Access-Control-Allow-Origin`, so a browser withholds the response from
+    /// the page. Matching is exact: scheme, host and port must all agree.
+    #[tokio::test]
+    async fn disallowed_origin_gets_no_cors_headers() {
+        let (gateway, worker_seen, _guards) =
+            cors_gateway(cors_list(&["https://app.example"])).await;
+
+        let disallowed = [
+            "https://evil.example",
+            "http://app.example",
+            "https://app.example:8443",
+            "https://app.example.evil",
+            "https://sub.app.example",
+        ];
+        for origin in disallowed {
+            let response = post_from(gateway, origin).await;
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+            assert_eq!(cors_headers(&response), Vec::<String>::new(), "{origin}");
+            assert_eq!(response.text().await.expect("text"), "worker", "{origin}");
+
+            // the preflight is still answered locally, without allowing the
+            // origin: only `Access-Control-Allow-Origin` is withheld
+            let response = preflight(gateway, origin).await;
+            let mut names = cors_headers(&response);
+            names.sort();
+            assert_eq!(
+                names,
+                [
+                    "access-control-allow-headers",
+                    "access-control-allow-methods",
+                    "access-control-max-age",
+                ],
+                "{origin}"
+            );
+        }
+        assert_eq!(worker_seen.hits(), disallowed.len(), "only the posts are forwarded");
+    }
+
+    #[tokio::test]
+    async fn wildcard_allows_any_origin() {
+        let (gateway, worker_seen, _guards) = cors_gateway(Some(CorsOrigins::Any)).await;
+
+        for origin in ["https://anything.example", "http://127.0.0.1:5173"] {
+            let response = preflight(gateway, origin).await;
+            assert!(response.status().is_success(), "{origin}");
+            assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), "*");
+
+            let response = post_from(gateway, origin).await;
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+            assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), "*");
+            assert_eq!(response.text().await.expect("text"), "worker", "{origin}");
+        }
+        assert_eq!(worker_seen.hits(), 2, "only the posts are forwarded");
+    }
+
+    /// Without the flag the gateway's responses are unchanged: no CORS header,
+    /// whatever the `Origin`. (How a bare `OPTIONS` is routed without the flag
+    /// is outside this test.)
+    #[tokio::test]
+    async fn without_the_flag_no_cors_headers_are_added() {
+        let (gateway, worker_seen, _guards) = cors_gateway(None).await;
+
+        let response = post_from(gateway, "https://app.example").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(cors_headers(&response), Vec::<String>::new());
+        assert!(response.headers().get(header::VARY).is_none());
+        assert_eq!(response.text().await.expect("text"), "worker");
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    /// The CORS layer sits outside the rate limiter: a preflight spends no
+    /// token, and a `429` still carries the CORS header a browser needs to let
+    /// the page read it.
+    #[tokio::test]
+    async fn cors_wraps_the_rate_limiter() {
+        let origin = "https://app.example";
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // one request, no refill within the test
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let app = router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            Some(limiters),
+            cors_list(&[origin]),
+        );
+        let (gateway, _shutdown) = spawn(app).await;
+
+        for _ in 0..3 {
+            let response = preflight(gateway, origin).await;
+            assert!(response.status().is_success(), "preflight answered {}", response.status());
+        }
+        let first = post_from(gateway, origin).await;
+        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(header_value(&first, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+
+        let second = post_from(gateway, origin).await;
+        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header_value(&second, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+        assert_eq!(worker_seen.hits(), 1);
     }
 }

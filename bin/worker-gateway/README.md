@@ -30,8 +30,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
   the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
   gets the upstream status, body, and `Content-Type`. All other headers are
-  dropped in both directions; in particular CORS is not terminated here, so
-  browser dApps need CORS handled at the ingress (or a later PR).
+  dropped in both directions.
+  With `--cors-allowed-origins` set the gateway adds CORS headers of its own (see [CORS](#cors)); without it, browser dApps on another origin need CORS handled at the ingress.
 - The request path and query string are not forwarded: every request goes to
   the configured upstream base URL (JSON-RPC carries its method in the body,
   so `POST /` is the whole HTTP surface).
@@ -114,9 +114,26 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
+| `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
+
+### CORS
+
+CORS is off by default: the gateway adds no CORS header, so a browser dApp served from another origin cannot read its responses unless a front handles CORS.
+Set `--cors-allowed-origins` to let browsers call the gateway directly, either to a comma-separated list of origins (`--cors-allowed-origins https://app.example.com,http://localhost:3000`) or to `*` for any origin.
+Each origin is `http` or `https`, written as `scheme://host[:port]` with no path, query, fragment or credentials, the way a browser sends it in `Origin`; host case and a default port are normalised, so `https://App.example.com:443` means `https://app.example.com`.
+An invalid entry, an empty entry, and a `*` beside other entries all fail startup, and the error names the entry's position in the list rather than its text.
+
+With the flag set, the gateway answers every `OPTIONS` preflight itself and never forwards it.
+The answer allows `POST` with a `Content-Type` header, and the browser may cache it for an hour (`Access-Control-Max-Age: 3600`); a page that sends any other request header, such as `Authorization`, fails its preflight.
+A request from an allowed origin gets `Access-Control-Allow-Origin` on its response (the origin itself, or `*` with the wildcard), gateway error responses included.
+Origins match exactly, so `https://app.example.com` does not allow `http://app.example.com`, `https://app.example.com:8443` or `https://www.app.example.com`.
+A request from any other origin is still served, like a request without `Origin`, but its response carries no `Access-Control-Allow-Origin`, so the browser withholds it from the page.
+A preflight from such an origin still lists the allowed method and header and the max age, which grant nothing without `Access-Control-Allow-Origin`.
+CORS protects users' browsers, not the gateway, and does not replace the edge protections.
+Preflights are answered ahead of the [rate limiter](#rate-limiting) and spend no token, and a `429` still carries the CORS header so the page can read it.
 
 ## Connection handling
 
@@ -293,6 +310,7 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
   `503` with `{"ready": false}`.
+- `OPTIONS`, with `--cors-allowed-origins` set: a CORS preflight, answered by the gateway and never forwarded (see [CORS](#cors)).
 - everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
   with `--redirect-queries`, to the query URL unless it is a submission.
 

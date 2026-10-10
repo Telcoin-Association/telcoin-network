@@ -12,7 +12,7 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
-    server::{serve, AppState, ServerLimits},
+    server::{serve, AppState, CorsOrigins, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -39,6 +39,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_global,
         graceful_shutdown_timeout,
         metrics_addr,
+        cors_allowed_origins,
     } = settings;
 
     info!(
@@ -48,6 +49,11 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         redirect_queries = %query_upstream
             .as_ref()
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
+        cors = match &cors_allowed_origins {
+            None => "off",
+            Some(CorsOrigins::Any) => "any origin",
+            Some(CorsOrigins::List(_)) => "listed origins",
+        },
         "starting worker gateway"
     );
 
@@ -162,6 +168,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             state,
             limits,
             rate_limiters,
+            cors_allowed_origins,
             graceful_shutdown_timeout,
             shutdown.subscribe(),
         ),
