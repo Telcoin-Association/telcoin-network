@@ -1,31 +1,44 @@
 //! JSON-RPC reverse-proxy handler.
 //!
-//! Forwards a client request's method, JSON-RPC body, and content type to the
+//! Forwards a client's `POST` (its JSON-RPC body and content type) to the
 //! first ready upstream worker and returns the upstream's status, body, and
-//! content type. Other headers are not forwarded in either direction, with
-//! three deliberate additions on the upstream hop: `X-Forwarded-For` /
-//! `X-Forwarded-Proto` (client identity for worker-side logs and the PR3 rate
-//! limits) and the `X-TN-Gateway` hop marker (loop protection; an inbound
-//! request that already carries it is rejected instead of forwarded). The
-//! upstream response body is streamed through, never buffered whole. When no
-//! upstream is ready, or the upstream cannot be reached / times out, the
-//! client receives a well-formed JSON-RPC error instead (see [`crate::error`]).
+//! content type; a request with any other method is answered locally with a
+//! `405` error envelope before its body is read. Other headers are not
+//! forwarded in either direction, with three deliberate additions on the
+//! upstream hop: `X-Forwarded-For` / `X-Forwarded-Proto` (client identity for
+//! worker-side logs and the PR3 rate limits) and the `X-TN-Gateway` hop
+//! marker (loop protection; an inbound request that already carries it is
+//! rejected instead of forwarded). The upstream response body is streamed
+//! through, never buffered whole. When no upstream is ready, or the upstream
+//! cannot be reached / times out, the client receives a well-formed JSON-RPC
+//! error instead (see [`crate::error`]).
 //!
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`classify`]),
-//! which is not readiness-gated, never falls back to the worker, and gets the
-//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! which is not readiness-gated, never falls back to the worker, gets the
+//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, and has its
+//! response content type passed through only when it is JSON.
 
-use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt,
+    net::SocketAddr,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
     extract::{
         rejection::{BytesRejection, FailedToBufferBody},
-        ConnectInfo, State,
+        ConnectInfo, FromRequestParts, State,
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method},
+    http::{header, request::Parts, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
+    Extension,
 };
 use reqwest::{redirect::Policy, Client};
 use serde::{
@@ -93,12 +106,14 @@ const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
 ///
-/// `body` is the final extractor (it consumes the request body), so it must
-/// stay last in the parameter list.
+/// Only a `POST` gets this far: [`PostOnly`] answers any other method before
+/// the body is read. `body` is the final extractor (it consumes the request
+/// body), so it must stay last in the parameter list.
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    method: Method,
+    _post: PostOnly,
+    forwarding: Option<Extension<ForwardingStarted>>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
@@ -162,9 +177,13 @@ pub(crate) async fn proxy(
         },
     };
 
-    match forward(&state.http, route, method, &headers, body.clone(), upstream_url.clone(), peer)
-        .await
-    {
+    // from here on the upstream may receive the request, so a deadline that
+    // fires later can no longer tell the client it was not delivered
+    if let Some(Extension(forwarding)) = &forwarding {
+        forwarding.mark();
+    }
+
+    match forward(&state.http, route, &headers, body.clone(), upstream_url.clone(), peer).await {
         Ok(response) => {
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
@@ -221,18 +240,31 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
-/// Forward one request to `upstream_url` and adapt the upstream response back
-/// into an axum response, preserving the status, body, and content type.
+/// Answer a request whose method is not `POST` with the `405` error envelope,
+/// without reading its body or forwarding it (JSON-RPC over HTTP is `POST`
+/// only).
+pub(crate) fn reject_non_post(method: &Method) -> Response {
+    debug!(target: "gateway::proxy", %method, "rejecting non-POST request");
+    error_response(&GatewayError::NonPostMethod, b"")
+}
+
+/// Forward one request to `upstream_url` as a `POST` and adapt the upstream
+/// response back into an axum response, preserving the status, body, and
+/// content type.
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
-/// [`REDIRECT_HEADER`] toward the query upstream, never both.
+/// [`REDIRECT_HEADER`] toward the query upstream, never both. It also decides
+/// how far the content type is trusted: a worker's passes through as is, while
+/// the query upstream's passes only when it is JSON ([`is_json`]) and is
+/// replaced by `application/json` otherwise. The query upstream is outside the
+/// operator's control and its answer is served on the validator's origin, so
+/// it must not be able to label that answer HTML or script.
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
     client: &Client,
     route: Route,
-    method: Method,
     headers: &HeaderMap,
     body: Bytes,
     upstream_url: Url,
@@ -250,7 +282,7 @@ async fn forward(
     };
 
     let upstream = client
-        .request(method, upstream_url)
+        .post(upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
         .header(X_FORWARDED_FOR, forwarded_for(headers, peer))
@@ -260,7 +292,16 @@ async fn forward(
         .await?;
 
     let status = upstream.status();
-    let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE);
+    let content_type = match route {
+        Route::Worker => upstream_content_type.cloned(),
+        Route::Query => Some(
+            upstream_content_type
+                .filter(|content_type| is_json(content_type))
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+        ),
+    };
 
     // Stream the upstream body through instead of buffering it whole: response
     // sizes are client-controlled (`eth_getLogs`, `debug_*`, large batches can
@@ -274,10 +315,32 @@ async fn forward(
     // connection-lifetime cap (see [`crate::server::accept_loop`]).
     let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
     *response.status_mut() = status;
-    if let Some(content_type) = upstream_content_type {
+    if let Some(content_type) = content_type {
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
     Ok(response)
+}
+
+/// Whether a `Content-Type` names JSON: `application/json` or an
+/// `application/*+json` subtype, in any letter case and whatever its
+/// parameters (such as `charset`). A comma-separated list is never JSON.
+fn is_json(content_type: &HeaderValue) -> bool {
+    let Ok(content_type) = content_type.to_str() else {
+        return false;
+    };
+    // a browser splits a Content-Type value on commas and takes the last valid
+    // type (Fetch "extract a MIME type"), so a list must never pass on the
+    // strength of its first element
+    if content_type.contains(',') {
+        return false;
+    }
+    let essence = content_type
+        .split_once(';')
+        .map_or(content_type, |(essence, _parameters)| essence)
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || essence.strip_prefix("application/").is_some_and(|subtype| subtype.ends_with("+json"))
 }
 
 /// Build the client that forwards requests on both routes.
@@ -324,6 +387,50 @@ fn classify_error(err: &reqwest::Error) -> GatewayError {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
+    }
+}
+
+/// Extractor that admits only `POST` requests and answers any other method
+/// through [`reject_non_post`], with `Allow: POST`.
+///
+/// It reads nothing but the request head, so ahead of the body extractor it
+/// refuses a request before any of its body is read: a client cannot make the
+/// gateway buffer a body it is going to refuse anyway.
+pub(crate) struct PostOnly;
+
+impl<S: Send + Sync> FromRequestParts<S> for PostOnly {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if parts.method == Method::POST {
+            return Ok(Self);
+        }
+        // a 405 must name the methods the resource supports (rfc 9110,
+        // section 15.5.6)
+        let mut response = reject_non_post(&parts.method);
+        response.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+        Err(response)
+    }
+}
+
+/// Whether [`proxy`] has started sending a request upstream.
+///
+/// The request-deadline middleware ([`crate::server::router`]) puts a fresh
+/// flag in every request's extensions and reads it when the deadline fires: a
+/// request that never started forwarding cannot have reached an upstream, one
+/// that did may have, and the client is told which.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForwardingStarted(Arc<AtomicBool>);
+
+impl ForwardingStarted {
+    /// Record that the request is about to be sent upstream.
+    fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether the request may have reached an upstream.
+    pub(crate) fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire)
     }
 }
 
