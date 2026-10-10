@@ -1,16 +1,15 @@
 # worker-gateway
 
-A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
+A mostly stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
 It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
 With `--redirect-queries` it sends only transaction submissions to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
 "Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
 
-Because every instance is stateless and identical, the gateway can be scaled
-horizontally: any replica can serve any request. This is PR4 of the epic
-(issue #712): it adds observability and deployment (a Prometheus `/metrics`
-endpoint, a container image, and reference Kubernetes manifests including an
-autoscaler keyed on the in-flight-request gauge) on top of the PR2 proxy core
-and the PR3 edge protections.
+Because every instance is mostly stateless and identical, the gateway can be scaled
+horizontally: any replica can serve any request. Besides the proxy and its
+edge protections, the crate ships a Prometheus `/metrics` endpoint, a container
+image, and reference Kubernetes manifests, including an autoscaler keyed on the
+in-flight-request gauge.
 
 ## Scope (v1)
 
@@ -39,7 +38,7 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 ## Readiness contract
 
 The gateway polls each upstream node's readiness endpoint
-(`GET /health/workers`, added in PR1) and expects the versioned envelope:
+(`GET /health/workers`) and expects the versioned envelope:
 
 ```json
 {
@@ -161,9 +160,15 @@ revisit instead of exhausting file descriptors.
 Two token-bucket limiters shed load before a request is buffered or forwarded:
 
 - A **per-client** limiter (`--rate-limit-per-ip`, requests/second, with
-  `--rate-limit-per-ip-burst`) caps what one source can take of that budget.
+  `--rate-limit-per-ip-burst`) caps how many requests one source gets through.
 - A **global** limiter (`--rate-limit-global` / `--rate-limit-global-burst`)
   caps aggregate throughput to roughly what the upstream workers can absorb.
+
+The global limiter is checked first and the per-client limiter second, so a
+request the per-client limiter refuses has already spent a global token: a
+source sending above its per-client rate still drains the global budget that
+every other client shares (WG-08 in the
+[production-readiness review](docs/production-readiness.md)).
 
 Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
@@ -199,10 +204,15 @@ landing in one `/64`.
 > keying raises the cost of the attack from free to the price of address space;
 > it does not eliminate it. Size `--rate-limit-global` accordingly.
 
-The client identity is the immediate TCP peer. Run the gateway **edge-facing**:
-behind an untrusted L7 proxy the peer is that proxy, so per-IP limiting would
-meter the proxy, not the real client. Terminate client identity at that proxy,
-or put the per-IP limit there.
+The client identity is the immediate TCP peer. Run the gateway **edge-facing**,
+or behind an L4 front that preserves client source addresses: the reference
+`deploy/k8s/service.yaml` is a ClusterIP Service, which is not reachable from
+outside the cluster on its own, so external clients reach a deployment built
+from it through a front (for a LoadBalancer Service, set
+`externalTrafficPolicy: Local` to keep their addresses). Behind an untrusted L7
+proxy the peer is that proxy, so per-IP limiting would meter the proxy, not the
+real client. Terminate client identity at that proxy, or put the per-IP limit
+there.
 
 > The default rates (`100`/s per IP, `3000`/s global) are conservative starting
 > points, not tuned figures. Set them to your workers' measured capacity before
@@ -298,9 +308,17 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 
 ## Behaviour on failure
 
-Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
-connection reset) when the gateway cannot serve them. The request `id` is
-echoed when it can be recovered.
+A request that reaches the gateway's handlers receives a well-formed JSON-RPC
+2.0 error when the gateway cannot serve it, and the request `id` is echoed when
+it can be recovered. The exceptions sit below the handlers: hyper answers a
+malformed request with its own bare `400` (`414` for an overlong URI) and
+oversized headers with a bare `431`, a request to `/health` or `/ready` with a
+method other than `GET` or `HEAD` gets axum's bare `405`, and a connection that
+misses the header read deadline is closed without a response. A request still
+in progress when its connection reaches `--max-connection-duration`, or when
+the `--graceful-shutdown-timeout` drain deadline passes, is also cut off
+without a response (see [Connection handling](#connection-handling) and
+[Graceful shutdown](#graceful-shutdown)).
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |
@@ -341,10 +359,10 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
-| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests currently in flight; the intended autoscaling signal. |
+| `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests between their buffered body and the upstream's response head (or the gateway's own error); requests refused by the rate limiter, body reads and streamed response bodies are not counted. The intended autoscaling signal. |
 | `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected`) | Proxied requests by terminal outcome. |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected proxied requests, broken down by reason (the conditions in the failure table above). |
-| `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency. |
+| `tn_worker_gateway_request_duration_seconds` | histogram | | Time from a proxied request's buffered body to the upstream's response head (or the gateway's own error); not end-to-end, as it leaves out the body read, the streamed response body and requests refused by the rate limiter. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id` | Per-worker readiness as last polled (`1` ready, `0` not-ready). |
 | `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `unreachable` / `timeout`) | Forward attempts by route, with their transport result. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls. |

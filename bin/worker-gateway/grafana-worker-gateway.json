@@ -248,7 +248,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram."
+      "description": "Proxied-request latency quantiles from the request duration histogram, timed from the buffered request body to the upstream's response head (or the gateway's own error). Not end-to-end: the body read, the streamed response body and rate-limited requests are left out."
     },
     {
       "id": 9,

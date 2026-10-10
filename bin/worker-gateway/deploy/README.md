@@ -148,7 +148,8 @@ spec:
       app: worker-gateway
   policyTypes: [Ingress]
   ingress:
-    # allow client RPC from anywhere in-cluster
+    # allow client RPC from any source: a rule without `from` admits every
+    # peer that can reach the pod, inside or outside the cluster
     - ports:
         - port: 8545
     # restrict metrics to the monitoring namespace only

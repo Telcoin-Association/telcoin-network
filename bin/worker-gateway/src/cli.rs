@@ -17,7 +17,7 @@ use crate::{
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
-/// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
+/// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Cli {
