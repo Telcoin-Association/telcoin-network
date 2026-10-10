@@ -28,7 +28,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 - Header forwarding is minimal. Upstream gets the request method, body, and
   `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
   identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
-  the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
+  the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the
+  `--redirect-queries-header` header when one is set). The client
   gets the upstream status, body, and `Content-Type`. All other headers are
   dropped in both directions; in particular CORS is not terminated here, so
   browser dApps need CORS handled at the ingress (or a later PR).
@@ -97,6 +98,8 @@ Every flag has an environment-variable fallback.
 | `--upstream-readiness-url` | `WORKER_GATEWAY_UPSTREAM_READINESS_URL` | (none) | Inline upstream readiness URL. |
 | `--worker-id` | `WORKER_GATEWAY_WORKER_ID` | `0` | Inline upstream worker id. |
 | `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions; see [Query redirect](#query-redirect). |
+| `--redirect-queries-header` | `WORKER_GATEWAY_REDIRECT_QUERIES_HEADER` | (none) | One `Name: value` header sent to the query URL only, never to a worker, and never logged; requires `--redirect-queries`; see [Query upstream header](#query-upstream-header). |
+| `--redirect-queries-header-file` | `WORKER_GATEWAY_REDIRECT_QUERIES_HEADER_FILE` | (none) | File holding the `--redirect-queries-header` line (trimmed), for a secret; requires `--redirect-queries`; not with `--redirect-queries-header`. |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
@@ -288,6 +291,28 @@ Reads answered by the query URL come from a node that has not seen this validato
 
 The reverse topology, a gateway that sends submissions to a validator's worker and every other call to an observer's RPC, can be expressed with the same two settings, but it is not a supported deployment yet.
 
+### Query upstream header
+
+Set `--redirect-queries-header "<Name>: <value>"` to send one header, typically the public RPC's API key, on every call to the query URL.
+It goes to the query URL only and never to a worker, and it lets the public RPC meter this gateway by key instead of by the one address that all redirected reads share.
+Every client of the gateway uses the key: each call that is not a submission, whatever its method and parameters, reaches the query URL carrying the header.
+Issue a key limited to what this endpoint should serve publicly (no archive, `debug_*` or `trace_*` access, no tier or billing it does not need), and size its quota for all of the gateway's clients together.
+For a secret, use `--redirect-queries-header-file <path>` instead: the file holds the same line (a mounted secret, for example), which keeps the value out of the process arguments and environment, and whitespace around the line, a trailing newline included, is trimmed.
+Either flag requires `--redirect-queries`, and setting both is a startup error.
+A line that is not one valid `Name: value` header also stops startup, with an error that names the problem but never the value.
+On a command line, quote the whole line: unquoted, the shell splits it at the space after the colon, and the argument parser rejects the value as a stray argument and prints it in that error, before the gateway's own checks run.
+
+The value is never logged: the startup line records only whether a header is configured, debug output of the gateway's settings and state prints `<redacted>` in its place, and `--help` hides the environment variable's value.
+Use an `https` query URL with a header; over plain `http` the header crosses the network in clear.
+
+### Chain-id check
+
+At startup a gateway with `--redirect-queries` sends `eth_chainId` to the first configured worker and to the query URL, the second call carrying the header.
+When the two chain ids differ it logs a warning with both, since reads would then describe a different chain from the one submissions reach; when they match it logs at info.
+The check runs in the background, so it never delays the listener, and `--upstream-request-timeout` bounds each call.
+When either call fails (the upstream is down, answers with an error status, or returns no hex chain id), the gateway logs the reason at info and serves anyway.
+The check runs once; a query URL that changes chains later is not detected.
+
 ## Gateway endpoints
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
@@ -383,7 +408,7 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
 - `eth_getTransactionCount(.., "pending")`, `eth_getTransactionByHash` and receipts right after a submission can lag, so clients that send several transactions in a row should track their own nonces.
 - Fee quotes come from the public node and can lag an epoch boundary.
 - A submission inside a mixed batch goes to the public RPC with the rest of the batch and enters the network there.
-- Every redirected read reaches the public RPC from the gateway's address, so its per-IP limits apply to all of the gateway's clients together; agree limits with its operator before advertising the endpoint.
+- Every redirected read reaches the public RPC from the gateway's address, so its per-IP limits apply to all of the gateway's clients together; agree limits with its operator before advertising the endpoint, or have it meter the gateway by a key sent with `--redirect-queries-header` (see [Query upstream header](#query-upstream-header)).
 - Each redirected call carries the client's address in `X-Forwarded-For`, so the public RPC's operator sees your clients' addresses.
 
 ### DNS and the DDoS front
