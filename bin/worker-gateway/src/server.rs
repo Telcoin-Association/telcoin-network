@@ -14,7 +14,7 @@
 //! body streams to it): a transport-stall deadline (`TCP_USER_TIMEOUT`) and a
 //! hard cap on total connection lifetime.
 
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{net::SocketAddr, num::NonZeroUsize, pin::pin, sync::Arc, time::Duration};
 
 use axum::{
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
@@ -27,7 +27,6 @@ use axum::{
 use futures::future::{self, Either};
 use hyper_util::{
     rt::{TokioIo, TokioTimer},
-    server::graceful::GracefulShutdown,
     service::TowerToHyperService,
 };
 use reqwest::Client;
@@ -35,7 +34,7 @@ use serde::Serialize;
 use tn_types::{Noticer, TaskError};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{watch, Semaphore},
 };
 use tracing::{debug, info, warn};
 use url::Url;
@@ -83,6 +82,8 @@ pub(crate) struct ServerLimits {
     pub(crate) header_read_timeout: Duration,
     /// Deadline for a whole request: body read plus upstream response headers.
     /// A body trickled in below the size limit must still finish inside this.
+    /// It is also the grace an exchange in flight gets to finish once its
+    /// connection reaches the lifetime cap.
     pub(crate) request_deadline: Duration,
     /// Maximum concurrently-open inbound connections; further connections wait
     /// in the OS accept backlog.
@@ -96,8 +97,10 @@ pub(crate) struct ServerLimits {
     /// included), or `None` when uncapped. Enforced by the runtime independent
     /// of connection progress, so it fires even when hyper's write path is
     /// backpressured by a slow-reading client and no future the connection
-    /// owns is being polled forward. The close is abrupt: an exchange still
-    /// in flight when a keep-alive session hits the cap is cut off mid-stream.
+    /// owns is being polled forward. At the cap the connection stops taking
+    /// new requests, and an exchange still in flight gets
+    /// [`Self::request_deadline`] more to finish before the connection is
+    /// closed.
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
@@ -220,6 +223,12 @@ pub(crate) async fn serve(
 /// written data outright, and the connection-lifetime cap is a runtime timer
 /// polled independent of connection progress, so it fires even against a
 /// client trickling one byte per interval to keep the transport alive.
+///
+/// Neither the cap nor shutdown cuts a request off mid-exchange: either one
+/// asks the connection to take no further requests and close once the
+/// exchange in flight (if any) finishes, and only drops it if that takes
+/// longer than a grace of `request_deadline` after the cap or
+/// `graceful_timeout` at shutdown.
 async fn accept_loop(
     listener: TcpListener,
     app: Router,
@@ -233,7 +242,11 @@ async fn accept_loop(
     let mut connection_builder = hyper::server::conn::http1::Builder::new();
     connection_builder.timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout);
 
-    let graceful = GracefulShutdown::new();
+    // Shutdown fan-out: every connection task holds a receiver, watches it
+    // for the drain signal, and drops it when its connection ends, so the
+    // sender's `closed()` resolves once every connection has finished.
+    let (drain, _) = watch::channel(());
+    let request_deadline = limits.request_deadline;
     let limiter =
         Arc::new(Semaphore::new(limits.max_connections.get().min(Semaphore::MAX_PERMITS)));
 
@@ -278,8 +291,7 @@ async fn accept_loop(
         // proxy's `X-Forwarded-For`).
         let service =
             TowerToHyperService::new(app.clone().layer(Extension(ConnectInfo(peer_addr))));
-        let connection =
-            graceful.watch(connection_builder.serve_connection(TokioIo::new(stream), service));
+        let connection = connection_builder.serve_connection(TokioIo::new(stream), service);
         // The lifetime cap is a runtime timer, deliberately NOT a timeout on
         // any body future: the runtime polls it regardless of whether hyper's
         // backpressured write path ever polls the connection forward again.
@@ -290,16 +302,19 @@ async fn accept_loop(
             || Either::Left(future::pending::<()>()),
             |cap| Either::Right(tokio::time::sleep(cap)),
         );
+        let mut draining = drain.subscribe();
         tokio::spawn(async move {
+            let mut connection = pin!(connection);
             // `biased` so a connection that finishes in the same poll as the
             // cap expires is reported as what it was (completion or its real
             // error), never mislabeled as cap-killed.
-            tokio::select! {
+            let grace = tokio::select! {
                 biased;
-                result = connection => {
+                result = connection.as_mut() => {
                     if let Err(err) = result {
                         debug!(target: "gateway::server", %err, "connection error");
                     }
+                    None
                 }
                 () = lifetime_cap => {
                     debug!(
@@ -307,18 +322,42 @@ async fn accept_loop(
                         %peer_addr,
                         "connection exceeded max lifetime; closing"
                     );
+                    Some(request_deadline)
+                }
+                // an error means the accept loop has returned, which it only
+                // does after shutdown, so both outcomes mean "drain"
+                _ = draining.changed() => Some(graceful_timeout),
+            };
+            // Take no further requests: hyper closes an idle connection at
+            // once and lets the exchange in flight finish first. The grace
+            // bounds that exchange, so a client that stops reading cannot
+            // hold the connection past it.
+            if let Some(grace) = grace {
+                connection.as_mut().graceful_shutdown();
+                match tokio::time::timeout(grace, connection).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => debug!(target: "gateway::server", %err, "connection error"),
+                    Err(_elapsed) => debug!(
+                        target: "gateway::server",
+                        %peer_addr,
+                        ?grace,
+                        "connection did not finish within its grace; closing"
+                    ),
                 }
             }
+            drop(draining);
             drop(permit);
         });
     }
 
-    // Stop accepting (drop the listener), then drain in-flight connections
-    // until they finish or the graceful deadline elapses.
+    // Stop accepting (drop the listener), ask every connection to finish its
+    // current exchange and close, then wait until they all have or the
+    // graceful deadline elapses.
     drop(listener);
     info!(target: "gateway::server", "shutdown signal received; draining in-flight requests");
+    drain.send_replace(());
     tokio::select! {
-        () = graceful.shutdown() => {
+        () = drain.closed() => {
             info!(target: "gateway::server", "in-flight requests drained");
         }
         () = tokio::time::sleep(graceful_timeout) => {
@@ -882,9 +921,14 @@ mod tests {
         state.readiness.set_ready(0, true);
         // The cap is generous enough that the response head always arrives
         // inside it, even on a loaded CI host where the whole 3-hop round
-        // trip shares one test runtime.
-        let limits =
-            ServerLimits { max_connection_duration: Some(Duration::from_secs(2)), ..test_limits() };
+        // trip shares one test runtime. The exchange in flight gets the
+        // limits' request deadline as its grace past the cap, kept short here
+        // so the test can wait out both.
+        let limits = ServerLimits {
+            max_connection_duration: Some(Duration::from_secs(2)),
+            request_deadline: Duration::from_millis(500),
+            ..test_limits()
+        };
         let (gateway_addr, _shutdown) = spawn_with_limits(test_router(state), limits).await;
 
         let mut stream = TcpStream::connect(gateway_addr).await.expect("connect");
@@ -897,19 +941,19 @@ mod tests {
             .expect("write");
 
         // Read one chunk (the response head plus some body), then stall past
-        // the lifetime cap without reading further.
+        // the lifetime cap and its grace without reading further.
         let mut first = [0_u8; 4096];
         let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut first))
             .await
             .expect("response head should arrive well inside the lifetime cap")
             .expect("first read");
         assert!(read > 0, "expected the response head to arrive");
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Drain what the socket still holds. The cap closed the connection
-        // mid-body, so the drain must end (EOF or reset both count) well short
-        // of the full body; pre-fix the stream resumes here and delivers all
-        // of it.
+        // Drain what the socket still holds. The grace ran out with the body
+        // still stalled, so the connection was closed mid-body and the drain
+        // must end (EOF or reset both count) well short of the full body;
+        // without the cap the stream resumes here and delivers all of it.
         let mut rest = Vec::new();
         let drained = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
             .await
@@ -920,6 +964,115 @@ mod tests {
             "expected a truncated body, got all {} bytes",
             read + rest.len(),
         );
+    }
+
+    #[tokio::test]
+    async fn lifetime_cap_lets_the_inflight_request_finish() {
+        // A worker that answers 150ms after it is asked, and counts the asks.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let limits = ServerLimits {
+            max_connection_duration: Some(Duration::from_millis(300)),
+            ..test_limits()
+        };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let body = call("eth_chainId", 1);
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        // The request starts at 250ms, inside the 300ms cap, and its answer
+        // comes at about 400ms, past it.
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        stream.write_all(request.as_bytes()).await.expect("write");
+
+        // The exchange in flight finishes, then the connection closes.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the connection should close once the exchange in flight finishes")
+            .expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+        assert!(response.contains(r#""result":"0x1""#), "expected the worker's answer: {response}");
+
+        // The next request on that connection fails: nothing answers it and
+        // it never reaches the worker.
+        let written = stream.write_all(request.as_bytes()).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("a closed connection answers at once");
+        assert!(
+            written.is_err() || read.is_err() || rest.is_empty(),
+            "a second request was answered: {}",
+            String::from_utf8_lossy(&rest)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_inflight_request() {
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+
+        // A drain deadline far past the test's bounds, so the accept loop can
+        // only return in time by seeing every connection finish.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let server = tokio::spawn(accept_loop(
+            listener,
+            test_router(state),
+            test_limits(),
+            Duration::from_secs(30),
+            shutdown.subscribe(),
+        ));
+
+        let request = tokio::spawn(
+            Client::new().post(format!("http://{addr}/")).body(call("eth_chainId", 1)).send(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify();
+
+        // The request in flight when shutdown began still gets its answer.
+        let response = request.await.expect("join").expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("text"),
+            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the drain should end as soon as the last connection closes")
+            .expect("join")
+            .expect("accept loop");
+        assert!(TcpStream::connect(addr).await.is_err(), "the listener should be closed");
     }
 
     #[tokio::test]

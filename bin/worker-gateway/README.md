@@ -104,7 +104,7 @@ Every flag has an environment-variable fallback.
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
-| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
+| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
@@ -140,9 +140,11 @@ socket, so a peer black-holed past the deadline is dropped where stock TCP
 might have recovered), and a connection-lifetime cap
 (`--max-connection-duration`) closes any connection, keep-alive sessions
 included, that outlives it, catching a client that trickles reads too slowly
-to be worth a slot but fast enough to defeat the transport guard. The cap
-closes abruptly: an exchange in flight on a long-lived keep-alive session is
-cut off at the cap, so size it well above the longest legitimate transfer.
+to be worth a slot but fast enough to defeat the transport guard. At the cap
+the connection stops taking new requests: an idle keep-alive session closes
+at once, and an exchange in flight gets the whole-request deadline above to
+finish before the connection is closed, so a response still streaming then
+is cut off; size the cap well above the longest legitimate transfer.
 It must be at least the gateway's single-request bound
 (`--header-read-timeout` + the whole-request deadline above) so the first
 request on a connection can never be cut off.
