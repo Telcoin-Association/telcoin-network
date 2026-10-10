@@ -17,6 +17,11 @@ use crate::{
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
+/// Longest `--shutdown-delay` accepted at startup. A longer delay holds a
+/// terminating gateway's listener open past any sensible termination grace
+/// period, so the orchestrator would kill it before the drain even starts.
+const MAX_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
+
 /// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -205,6 +210,20 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST", default_value_t = 0)]
     pub(crate) rate_limit_global_burst: u32,
 
+    /// How long to keep accepting and serving after SIGTERM while `/ready`
+    /// answers `503` with `"draining": true`, so fronts that probe `/ready`
+    /// (DNS health checks, external load balancers) stop routing here before
+    /// the listener closes; the in-flight drain (`--graceful-shutdown-timeout`)
+    /// starts after it. At most `60s`. `0` (the default) disables the delay:
+    /// the listener closes as soon as SIGTERM arrives.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_SHUTDOWN_DELAY",
+        default_value = "0s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) shutdown_delay: Duration,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -263,6 +282,9 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_prefix: PrefixPolicy,
     /// Gateway-wide rate limit, or `None` when disabled.
     pub(crate) rate_limit_global: Option<RateLimit>,
+    /// How long to keep serving, with `/ready` reporting draining, between
+    /// the shutdown notice and closing the listener; zero closes it at once.
+    pub(crate) shutdown_delay: Duration,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -312,6 +334,13 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        eyre::ensure!(
+            self.shutdown_delay <= MAX_SHUTDOWN_DELAY,
+            "--shutdown-delay ({}) is longer than the {} maximum; a terminating gateway would \
+             keep its listener open that long before draining",
+            humantime::format_duration(self.shutdown_delay),
+            humantime::format_duration(MAX_SHUTDOWN_DELAY),
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -334,6 +363,7 @@ impl Cli {
                 self.rate_limit_global,
                 self.rate_limit_global_burst,
             ),
+            shutdown_delay: self.shutdown_delay,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -599,6 +629,23 @@ mod tests {
         ])
         .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
+    }
+
+    #[test]
+    fn delay_over_a_minute_is_rejected_at_startup() -> eyre::Result<()> {
+        // off by default
+        assert_eq!(cli_with_flags(&[]).into_settings()?.shutdown_delay, Duration::ZERO);
+
+        // the boundary itself is accepted
+        let settings = cli_with_flags(&["--shutdown-delay=60s"]).into_settings()?;
+        assert_eq!(settings.shutdown_delay, Duration::from_secs(60));
+
+        let message = match cli_with_flags(&["--shutdown-delay=61s"]).into_settings() {
+            Ok(_) => panic!("a delay over a minute must be a startup error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("--shutdown-delay"), "the error must name the flag: {message}");
+        Ok(())
     }
 
     #[test]

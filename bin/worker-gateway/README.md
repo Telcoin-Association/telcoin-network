@@ -112,6 +112,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its bucket. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
+| `--shutdown-delay` | `WORKER_GATEWAY_SHUTDOWN_DELAY` | `0s` | How long to keep serving after SIGTERM, with `/ready` reporting draining, before the listener closes (`0` disables; at most `60s`); see [Graceful shutdown](#graceful-shutdown). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
@@ -292,7 +293,8 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
-  `503` with `{"ready": false}`.
+  `503` with `{"ready": false}`; during the shutdown delay, `503` with
+  `{"ready": false, "draining": true}`.
 - everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
   with `--redirect-queries`, to the query URL unless it is a submission.
 
@@ -322,9 +324,17 @@ spec's standard "Invalid Request" code).
 
 ## Graceful shutdown
 
-On SIGTERM (or ctrl-c) the gateway stops accepting new connections and drains
-in-flight requests, up to `--graceful-shutdown-timeout`. Requests still running
-after the deadline are force-closed.
+On SIGTERM (or ctrl-c) the gateway shuts down in two phases.
+
+1. Shutdown delay (`--shutdown-delay`, off by default): the gateway keeps accepting and serving new connections, but `/ready` answers `503` with `{"ready": false, "draining": true}`.
+   Fronts that act on `/ready` (DNS health checks, external load balancers) see the `503` and stop routing new clients here before the listener closes, provided they act within the delay.
+   In Kubernetes the Service drops a terminating pod from its ready endpoints as soon as the pod is deleted, whatever its readiness probe says; there the delay covers the time that removal takes to reach kube-proxy and load balancers, as a `preStop` sleep would.
+2. Drain: the gateway stops accepting new connections and drains in-flight requests, up to `--graceful-shutdown-timeout`.
+   Requests still running after the deadline are force-closed.
+
+With the delay at `0` the first phase is skipped: the listener closes as soon as the signal arrives, and a front that has not noticed yet sees refused connections.
+Set the delay to at least the time your fronts outside Kubernetes take to act on a failing `/ready` (health-check interval times unhealthy threshold, plus the record TTL for DNS), and keep the delay plus the drain timeout plus about 1s inside the orchestrator's termination grace period.
+The reference manifest uses 5s, 30s and 40s, which covers Kubernetes endpoint removal only (see `deploy/README.md`).
 
 ## Observability
 
