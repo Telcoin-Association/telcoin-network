@@ -293,29 +293,58 @@ How the committer keeps writers off the disk, and keeps the WAL invariants (`TnT
    the commit record that covers them; append the commit record; capture the data log's range.
 4. Unlocked: `msync` the data log (and `fsync` once if it grew).
 5. Under the lock: record the synced end and the commit markers; switch to a finished compaction,
-   or start one, when nothing is pending.
+   or start one, when nothing is pending; reap compactions a clear cancelled.
 
 A writer holds the lock only for its append and index update, never across a sync.
+
+**A new generation during an unlocked sync.** While steps 2 and 4 run, a clear (or a compaction's
+switch made by `compact_table_now`) can install a new generation. Each captured range therefore
+keeps its generation's files open (mapped) until its sync is done, and its outcome is recorded only
+while that generation is still current: the retired generation's rows are superseded (a clear is
+durable when it returns) or already durable in the new one (a switch syncs it before its rename),
+so its sync, failed or not, is moot, and the new generation's watermark and commit markers move
+only with its own syncs. (`MmapDataFile::complete_sync` also ignores a range taken from another
+file.) `test_tndb_group_clear_during_the_unlocked_sync` pauses the committer at both syncs.
 
 **The durable watermark.** A round reads its target number *before* it takes the dirty tables, and
 a writer marks its table dirty *before* it takes its number, so every write numbered at or below
 the target is in that round (or an earlier one). The watermark advances to the target, held back
 by any table still pending. A table written by an **open write transaction** is left uncommitted
 until the transaction ends (it is held back, in every later round, until then), so a transaction
-is never durable in part. A write committed early (numbered after the target, but in a table the
-round took) triggers one more round, so the watermark reaches it without waiting for a later write.
+is never durable in part in that table. A write committed early (numbered after the target, but in
+a table the round took) triggers one more round whenever that can move the watermark (a held
+table's first pending write is not what stops it), so the watermark reaches it without waiting for
+a later write. A write is numbered *before* it is published: a reader that sees it and then writes
+takes a later number, so a `persist` covering the reader's write covers the one it read.
+
+**Failures.** The first failed commit is latched: every later `persist` fails, and the watermark
+never moves again (it may not pass a failed table's writes, whatever other tables commit; a
+`persist` also re-checks the latch after reading the watermark). A write that fails because its
+table can no longer commit (its writer stopped, or a log failed) is latched too, even though it
+was never published for the committer to find and its caller may ignore the error; a caller's own
+error (a key of the wrong size, a table never opened) is only returned. A committer (or a table's
+commit) that panics latches the failure, so no `persist` waits forever.
 
 **Transactions in group mode** apply their writes at once (the transaction's own `get` sees them)
 and publish them when the transaction ends, by `commit` or by a drop (as `LayeredDatabase`'s
 dropped transactions do: kept and committed, no rollback). A bare write to a table with an open
-transaction is published at once but committed with the transaction.
+transaction is published at once but committed with the transaction. Atomicity is per table: a
+transaction spanning tables can, after a crash mid-round, be durable in one and not yet in another
+(as in sync mode, which commits its tables one by one). A transaction left open holds its tables
+back, and with them every `persist`, until it ends.
 
-**Clears** stay synchronous (a generation switch, durable on return), then are published.
+**Clears** stay synchronous (a generation switch, durable on return), then are published; a
+transaction's `clear_table` is durable at once too.
+
+**`compact_table_now`** (tooling and tests) runs the sync-mode commit on the caller's thread,
+which commits whatever its table holds, an open transaction's writes included; production
+compacts through the automatic trigger and `Database::compact`, which leave the switch to the
+committer.
 
 **Crash semantics** match a write-behind layer's: a write is readable before it is durable, and a
 crash keeps every write made before the last successful `persist` (and possibly some after it),
-always whole transactions (each table's committed state is a prefix of its writes, ending at a
-transaction boundary).
+always whole transactions in each table (each table's committed state is a prefix of its writes,
+ending at a transaction boundary).
 
 **Compaction** in group mode is started at commit rounds, and the committer also asks every table
 to compact at start and daily (what `LayeredDatabase`'s writer did for the wrapped database).
@@ -601,9 +630,17 @@ key check):
     are synced before the commit record; a write numbered during a round waits for a later round
     (gated rounds); a write committed early still reaches the watermark; concurrent writers keep
     their persisted writes; compaction; and a randomized crash model (after a crash the table is
-    exactly one of the states since the last `persist`). Mutation checks: ignoring open
-    transactions, ignoring held-back tables, reading the target after taking the dirty set, and
-    dropping the extra round each fail at least one of them.
+    exactly one of the states since the last `persist`); a clear while the committer syncs
+    outside the lock (paused before either sync: the old generation stays mapped, the new one's
+    watermarks move only with its own syncs, nothing is poisoned); after a failed commit the
+    watermark never passes the failed writes; a write failing on a stopped table latches (a
+    caller's error does not); a panicking committer, or table commit, fails `persist` rather than
+    hanging; a clear-cancelled compaction is reaped at a group commit; the watermark reaches a
+    held table's first pending write without its transaction ending. Mutation checks: ignoring open transactions, ignoring held-back tables, reading
+    the target after taking the dirty set, dropping the extra round (or its held-table clause),
+    not holding the synced generation open, applying a sync to a new generation, advancing the
+    watermark after a failure, not latching a stopped table, no panic latch, and no reap each
+    fail at least one of them.
 - **`table.rs`:**
   - byte-level table operations and scans;
   - snapshots under concurrent commits, and page reuse;

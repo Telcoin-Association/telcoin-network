@@ -408,6 +408,9 @@ struct Writer {
     /// unlocked removal-log sync and its commit record, then waits to be released.
     #[cfg(test)]
     commit_gate: Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    /// Test-only: the committer's next step for this table panics.
+    #[cfg(test)]
+    panic_next_group_commit: bool,
     /// When and how fast this table compacts.
     config: CompactionConfig,
     /// Puts in the current generation made dead (overwritten or removed): the automatic
@@ -511,6 +514,11 @@ impl Writer {
     }
 
     /// Refuse writes once a failed clear or compaction switch stopped this writer (see `failed`).
+    /// True once this writer can no longer commit: it stopped (see `failed`), or a log failed.
+    fn is_broken(&self) -> bool {
+        self.failed.is_some() || self.files.data.is_failed() || self.files.removed.is_failed()
+    }
+
     fn check_failed(&self) -> eyre::Result<()> {
         match &self.failed {
             Some(cause) => bail!(
@@ -1203,6 +1211,8 @@ impl TnTable {
             open_txns: 0,
             #[cfg(test)]
             commit_gate: None,
+            #[cfg(test)]
+            panic_next_group_commit: false,
             config,
             dead: 0,
             compaction: None,
@@ -1264,6 +1274,18 @@ impl TnTable {
         self.inner.writer.lock().fail_next_flush = true;
     }
 
+    /// Test-only: make the committer's next step for this table panic.
+    #[cfg(test)]
+    pub(crate) fn panic_next_group_commit(&self) {
+        self.inner.writer.lock().panic_next_group_commit = true;
+    }
+
+    /// Test-only: make the next clear stop the writer (its directory sync fails after the rename).
+    #[cfg(test)]
+    pub(crate) fn fail_next_clear_sync(&self) {
+        self.inner.writer.lock().fail_next_clear_sync = true;
+    }
+
     /// Test-only, for a simulated crash (a leaked handle): release the table's lock, as a crashed
     /// process would, so the table can be reopened.
     #[cfg(test)]
@@ -1308,6 +1330,7 @@ impl TnTable {
             running: writer.compaction.is_some(),
             started: writer.compactions_started,
             last_switch_tail: writer.last_switch_tail,
+            cancelled: writer.cancelled.len(),
         }
     }
 
@@ -1367,7 +1390,9 @@ impl TnTable {
         name: &'static str,
     ) -> eyre::Result<()> {
         let mut writer = self.inner.writer.lock();
-        writer.insert(key, value)?;
+        if let Err(e) = writer.insert(key, value) {
+            return Err(latch_if_broken(&writer, group, name, e));
+        }
         self.publish_pending(&mut writer, group, name);
         Ok(())
     }
@@ -1380,7 +1405,10 @@ impl TnTable {
         name: &'static str,
     ) -> eyre::Result<bool> {
         let mut writer = self.inner.writer.lock();
-        let removed = writer.remove(key)?;
+        let removed = match writer.remove(key) {
+            Ok(removed) => removed,
+            Err(e) => return Err(latch_if_broken(&writer, group, name, e)),
+        };
         if removed {
             self.publish_pending(&mut writer, group, name);
         }
@@ -1394,7 +1422,9 @@ impl TnTable {
         name: &'static str,
     ) -> eyre::Result<()> {
         let mut writer = self.inner.writer.lock();
-        writer.clear()?;
+        if let Err(e) = writer.clear() {
+            return Err(latch_if_broken(&writer, group, name, e));
+        }
         self.publish_pending(&mut writer, group, name);
         Ok(())
     }
@@ -1413,18 +1443,20 @@ impl TnTable {
         self.publish_pending(&mut writer, group, name);
     }
 
-    /// Publish every write applied so far (no commit) and hand the table to the committer with
-    /// the next sequence number, under the writer lock (so sequence order is log order).
+    /// Hand every write applied so far to the committer with the next sequence number, then
+    /// publish it (no commit), under the writer lock (so sequence order is log order).
     ///
     /// The table is marked dirty *before* the number is taken: a committer round reads its target
     /// number before it takes the dirty tables, so any write numbered at or below the target is
     /// in that round (or an earlier one), and the round never counts a write it did not commit.
+    /// And the number is taken *before* the publish: a reader that sees the write and then writes
+    /// itself takes a later number, so a `persist` covering the reader's write covers this one.
     fn publish_pending(&self, writer: &mut Writer, group: &GroupCommit, name: &'static str) {
-        self.inner.published.store(Arc::new(writer.publish()));
         group.mark_dirty(name);
         let n = group.seq.fetch_add(1, Ordering::AcqRel) + 1;
         writer.applied_seq = n;
         writer.first_pending.get_or_insert(n);
+        self.inner.published.store(Arc::new(writer.publish()));
     }
 
     /// The committer's step for this table (see `super::commit`): commit every write published so
@@ -1435,11 +1467,17 @@ impl TnTable {
     /// The ordering is [`Writer::flush`]'s: removals are durable before the commit record that
     /// makes them count. So the removal log is synced first (unlocked), any removal appended
     /// meanwhile is synced under the lock, and only then is the commit record appended.
+    ///
+    /// While a sync runs unlocked, a clear or a compaction's switch can install a new generation.
+    /// Each ticket therefore keeps its generation open (mapped) until its sync is done, and its
+    /// outcome is applied only while that generation is still current: the retired one's rows are
+    /// superseded (a clear is durable when it returns) or already durable in the new one (a switch
+    /// syncs it before the rename), so a sync of the retired generation, failed or not, is moot.
     pub(crate) fn group_commit(&self) -> eyre::Result<Option<u64>> {
         // (a) What is pending; the removal log's unsynced range, if any.
         #[cfg(test)]
         let gate;
-        let removal: Option<SyncTicket> = {
+        let removal: Option<GenTicket> = {
             // Mutated only to take the test gate.
             #[cfg_attr(not(test), allow(unused_mut))]
             let mut writer = self.inner.writer.lock();
@@ -1453,22 +1491,29 @@ impl TnTable {
             #[cfg(test)]
             {
                 gate = writer.commit_gate.take();
+                if std::mem::take(&mut writer.panic_next_group_commit) {
+                    panic!("injected group commit panic");
+                }
             }
             match writer.removals_unsynced {
-                true => Some(writer.files.removed.sync_ticket()?),
+                true => Some(GenTicket::new(&writer, writer.files.removed.sync_ticket()?)),
                 false => None,
             }
         };
         // (b) The removal log, unlocked.
-        let removal_outcome = removal.as_ref().map(SyncTicket::sync);
+        #[cfg(test)]
+        let gate = commit_gate_wait(gate, CommitPoint::BeforeRemovalSync);
+        let removal_outcome = removal.as_ref().map(|removal| removal.ticket.sync());
         #[cfg(test)]
         let gate = commit_gate_wait(gate, CommitPoint::AfterRemovalSync);
         // (c) Under the lock: finish the removal log, append the commit record, take the data
         // log's range.
         let (data, removals_synced_to, covered) = {
             let mut writer = self.inner.writer.lock();
-            if let (Some(ticket), Some(outcome)) = (&removal, &removal_outcome) {
-                writer.files.removed.complete_sync(ticket, outcome)?;
+            if let (Some(removal), Some(outcome)) = (&removal, &removal_outcome) {
+                if removal.gen == writer.gen {
+                    writer.files.removed.complete_sync(&removal.ticket, outcome)?;
+                }
             }
             if writer.open_txns > 0 {
                 return Ok(writer.first_pending);
@@ -1479,7 +1524,8 @@ impl TnTable {
             }
             let removals = writer.removals_unsynced.then(|| writer.files.removed.file_len());
             if removals.is_some() {
-                // Removals appended during the unlocked sync (rare, and few).
+                // Removals appended during the unlocked sync (rare, and few), or all of a new
+                // generation's.
                 writer.files.removed.commit()?;
             }
             if writer.uncommitted {
@@ -1498,24 +1544,47 @@ impl TnTable {
                 }
                 false => removals,
             };
-            (writer.files.data.sync_ticket()?, removals, writer.applied_seq)
+            let data = GenTicket::new(&writer, writer.files.data.sync_ticket()?);
+            (data, removals, writer.applied_seq)
         };
+        drop(removal);
         #[cfg(test)]
         commit_gate_wait(gate, CommitPoint::AfterCommitRecord);
         // (d) The data log, unlocked; writes appended meanwhile lie past the ticket.
-        let outcome = data.sync();
+        let outcome = data.ticket.sync();
         // (e) Record it; start a compaction if one is due.
         let mut writer = self.inner.writer.lock();
-        writer.files.data.complete_sync(&data, &outcome)?;
-        writer.files.data.stamp_commit_marker_at(data.end());
-        if let Some(removed_end) = removals_synced_to {
-            writer.files.removed.stamp_commit_marker_at(removed_end);
+        if data.gen == writer.gen {
+            writer.files.data.complete_sync(&data.ticket, &outcome)?;
+            writer.files.data.stamp_commit_marker_at(data.ticket.end());
+            if let Some(removed_end) = removals_synced_to {
+                writer.files.removed.stamp_commit_marker_at(removed_end);
+            }
         }
         writer.first_pending = (writer.applied_seq != covered).then_some(covered + 1);
         if writer.wants_compaction() && !writer.start_compaction(self.inner.published.load_full()) {
             writer.back_off();
         }
+        if !writer.cancelled.is_empty() {
+            writer.reap_cancelled(false);
+        }
         Ok(writer.first_pending)
+    }
+
+    /// Test-only: the data and removal logs' synced watermarks and lengths, in that order.
+    #[cfg(test)]
+    pub(crate) fn log_sync_state(&self) -> [u64; 4] {
+        let writer = self.inner.writer.lock();
+        let (data, removed) = (&writer.files.data, &writer.files.removed);
+        [data.synced_end(), data.file_len(), removed.synced_end(), removed.file_len()]
+    }
+
+    /// Test-only: the current generation's data and removal log views (which stop mapping
+    /// anything once the generation's files drop).
+    #[cfg(test)]
+    pub(crate) fn log_views(&self) -> (Arc<MapView>, Arc<MapView>) {
+        let writer = self.inner.writer.lock();
+        (writer.files.data.view(), writer.files.removed.view())
     }
 
     /// Test-only: the committer's next round on this table stops at `point`, reports it on the
@@ -1664,10 +1733,42 @@ impl TnTable {
     }
 }
 
+/// Group commit: a write to table `name` failed with `e`. If the table can no longer commit, the
+/// failure is latched (every later `persist` fails, though the caller may ignore `e`): with no
+/// write published, the committer would never visit the table to find it. A caller's own error
+/// (e.g. a key of the wrong size) leaves the table as it was and is only returned.
+fn latch_if_broken(
+    writer: &Writer,
+    group: &GroupCommit,
+    name: &'static str,
+    e: eyre::Report,
+) -> eyre::Report {
+    if writer.is_broken() {
+        group.fail(format!("table {name}: {e:#}"));
+    }
+    e
+}
+
+/// A log's [`SyncTicket`] for [`TnTable::group_commit`]'s unlocked sync, with the generation it
+/// was taken in, held open (so its mapping stays valid) until the ticket drops.
+struct GenTicket {
+    ticket: SyncTicket,
+    gen: u64,
+    _alive: Arc<GenAlive>,
+}
+
+impl GenTicket {
+    fn new(writer: &Writer, ticket: SyncTicket) -> Self {
+        Self { ticket, gen: writer.gen, _alive: Arc::clone(&writer.alive) }
+    }
+}
+
 /// Test-only: where a table's group commit stops (see [`TnTable::gate_next_group_commit`]).
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CommitPoint {
+    /// After its first locked step, before the unlocked removal-log sync.
+    BeforeRemovalSync,
     /// After the unlocked removal-log sync, before the commit record.
     AfterRemovalSync,
     /// After the commit record (and a compaction's switch), before the unlocked data-log sync.
@@ -1701,6 +1802,8 @@ pub(crate) struct CompactionState {
     pub(crate) running: bool,
     pub(crate) started: u32,
     pub(crate) last_switch_tail: u64,
+    /// Cancelled compaction threads not reaped yet.
+    pub(crate) cancelled: usize,
 }
 
 /// Log a scan or seek ended by an error. `DBIter` (and a seek's `Option`) cannot carry it, but a

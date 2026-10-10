@@ -292,7 +292,9 @@ impl TnDatabase {
     /// Compact table `T` now, whatever its garbage, and wait for it: its log is rewritten without
     /// the removed and overwritten records. Blocks the caller for the whole copy; the table stays
     /// readable and writable meanwhile. For tooling and tests: tables compact on their own (see
-    /// [`CompactionConfig`]) and on [`Database::compact`].
+    /// [`CompactionConfig`]) and on [`Database::compact`]. In [`CommitMode::Group`] it commits the
+    /// table on the caller's thread, the sync-mode way, including any open transaction's writes to
+    /// it.
     pub fn compact_table_now<T: Table>(&self) -> eyre::Result<()> {
         with_open_table::<T, _>(&self.store, |entry| entry.table.compact_now())
     }
@@ -354,6 +356,12 @@ impl TnDatabase {
         with_table(&self.store, T::NAME, |entry| entry.table.fail_next_flush());
     }
 
+    /// Test-only: make table `T`'s next clear stop its writer (after the rename).
+    #[cfg(test)]
+    fn fail_next_clear_sync_for_test<T: Table>(&self) {
+        with_table(&self.store, T::NAME, |entry| entry.table.fail_next_clear_sync());
+    }
+
     /// Test-only, for a simulated crash (a leaked handle): release every open table's lock, as a
     /// crashed process would, so the tables can be reopened.
     #[cfg(test)]
@@ -386,8 +394,8 @@ impl DbTx for TnDbTx {
 ///
 /// In [`CommitMode::Group`] the commit publishes without a sync and hands the tables to the
 /// committer, which leaves each table uncommitted while a transaction that wrote it is open (so a
-/// transaction is never durable in part). A transaction dropped without a commit ends the same way
-/// (as `LayeredDatabase`'s does): its writes are kept, published and committed.
+/// transaction is never durable in part in a table). A transaction dropped without a commit ends
+/// the same way (as `LayeredDatabase`'s does): its writes are kept, published and committed.
 #[derive(Debug)]
 pub struct TnDbTxMut {
     store: Arc<StoreType>,
@@ -1672,6 +1680,200 @@ mod test {
         let db = open_group(tmp.path());
         let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
         assert_eq!(keys, vec![0, 3, 4, 5, 6, 7, 8, 9, 20]);
+    }
+
+    /// A clear (a new generation) while the committer syncs the old generation outside the lock,
+    /// paused before its removal-log sync and again before its data-log sync. The committer keeps
+    /// the old generation's files mapped until its sync is done, never applies the old sync to the
+    /// new generation (whose synced watermarks move only with its own syncs), and the table is
+    /// not poisoned: the next persist succeeds and the new rows survive a crash.
+    #[test]
+    fn test_tndb_group_clear_during_the_unlocked_sync() {
+        use super::super::commit::GatePoint;
+        for point in [CommitPoint::BeforeRemovalSync, CommitPoint::AfterCommitRecord] {
+            let tmp = TempDir::with_prefix("tndb_group_clear_sync").expect("temp dir");
+            let db = open_group(tmp.path());
+            for i in 0..50u64 {
+                db.insert::<TestTable>(&i, &format!("old-{i}")).expect("insert");
+            }
+            block_on(db.persist::<TestTable>()).expect("persist");
+            let table = super::with_table(&db.store, "TestTable", |entry| entry.table.clone())
+                .expect("table");
+            let (old_data, old_removed) = table.log_views();
+
+            let (arrived, release) = table.gate_next_group_commit(point);
+            db.remove::<TestTable>(&0).expect("remove"); // a removal ticket for the round too
+            arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
+            db.clear_table::<TestTable>().expect("clear");
+            for i in 0..5u64 {
+                db.insert::<TestTable>(&i, &format!("new-{i}")).expect("insert");
+            }
+            db.remove::<TestTable>(&4).expect("remove");
+            // The old generation's last snapshot is gone; only the committer can keep it mapped.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+            while !(old_data.is_unmapped() || old_removed.is_unmapped())
+                && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            assert!(
+                !old_data.is_unmapped() && !old_removed.is_unmapped(),
+                "{point:?}: the committer keeps the generation it syncs mapped"
+            );
+            let before = table.log_sync_state();
+            let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
+            let (arrived2, release2) = group.gate_next_round(GatePoint::BeforeTake);
+            drop(release);
+            arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("next round");
+            if point == CommitPoint::AfterCommitRecord {
+                // The round's commit record was in the old generation: nothing of the new one
+                // was synced by it.
+                assert_eq!(table.log_sync_state(), before, "the old sync moved the new watermarks");
+            }
+            drop(release2);
+            block_on(db.persist::<TestTable>()).expect("persist: nothing poisoned");
+            crash(db);
+
+            let db = open_group(tmp.path());
+            let rows: Vec<(u64, String)> = db.iter::<TestTable>().collect();
+            let expected: Vec<(u64, String)> = (0..4u64).map(|i| (i, format!("new-{i}"))).collect();
+            assert_eq!(rows, expected, "{point:?}");
+        }
+    }
+
+    /// After a failed commit the durable watermark stays below the failed table's writes, even
+    /// while other tables keep committing, so no persist can find them covered.
+    #[test]
+    fn test_tndb_group_failed_commit_holds_the_watermark() {
+        let tmp = TempDir::with_prefix("tndb_group_hold").expect("temp dir");
+        let db = open_group(tmp.path());
+        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        block_on(db.persist::<TestTable>()).expect("persist");
+
+        db.fail_next_flush_for_test::<TestTable>();
+        db.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
+        let failed = group.seq.load(std::sync::atomic::Ordering::Acquire);
+        assert!(block_on(db.persist::<TestTable>()).is_err(), "the failed commit surfaces");
+        db.insert::<OtherTable>(&3, &"c".to_string()).expect("another table's write");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while group.durable_for_test() < failed && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(group.durable_for_test() < failed, "the watermark passed a failed write");
+    }
+
+    /// A write that fails because its table stopped is latched even with nothing pending for the
+    /// committer to find (here a clear failing after its rename, its error ignored by the
+    /// caller): the next persist fails, as after a failed commit. A caller's own error (a table
+    /// never opened) is not a failure of the database.
+    #[test]
+    fn test_tndb_group_broken_table_latches_persist() {
+        #[derive(Debug)]
+        struct NeverOpened;
+        impl tn_types::Table for NeverOpened {
+            type Key = u64;
+            type Value = String;
+
+            const NAME: &'static str = "NeverOpened";
+            const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+        }
+
+        let tmp = TempDir::with_prefix("tndb_group_broken").expect("temp dir");
+        let db = open_group(tmp.path());
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        assert!(db.insert::<NeverOpened>(&1, &"x".to_string()).is_err(), "not opened");
+        block_on(db.persist::<TestTable>()).expect("a caller's error is not latched");
+
+        db.fail_next_clear_sync_for_test::<TestTable>();
+        let _ = db.clear_table::<TestTable>(); // ignored, as some production writes are
+        assert!(block_on(db.persist::<OtherTable>()).is_err(), "the stopped table is latched");
+    }
+
+    /// A committer that panics latches the failure: persist fails instead of waiting forever.
+    #[test]
+    fn test_tndb_group_committer_panic_fails_persist() {
+        let tmp = TempDir::with_prefix("tndb_group_panic").expect("temp dir");
+        let db = open_group(tmp.path());
+        db.group.as_ref().expect("group mode").commit.panic_next_round();
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        let persisted = block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), db.persist::<TestTable>()).await
+        });
+        assert!(matches!(persisted, Ok(Err(_))), "persist fails, not hangs: {persisted:?}");
+    }
+
+    /// A compaction cancelled by a clear is reaped at a later group commit, as at a sync-mode
+    /// commit, rather than kept until the next compaction starts or the table closes.
+    #[test]
+    fn test_tndb_group_reaps_cancelled_compactions() {
+        let tmp = TempDir::with_prefix("tndb_group_reap").expect("temp dir");
+        let db = open_group(tmp.path());
+        for i in 0..200u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        block_on(db.persist::<TestTable>()).expect("persist");
+        let table =
+            super::with_table(&db.store, "TestTable", |entry| entry.table.clone()).expect("table");
+        let gate = table.start_compaction_gated(); // waits after its copy
+        db.clear_table::<TestTable>().expect("clear"); // cancels it, still running
+        assert_eq!(table.compaction_state().cancelled, 1);
+        drop(gate); // it stops at its next check
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut i = 0u64;
+        while table.compaction_state().cancelled > 0 && std::time::Instant::now() < deadline {
+            db.insert::<TestTable>(&i, &"x".to_string()).expect("insert"); // a group commit
+            block_on(db.persist::<TestTable>()).expect("persist");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            i += 1;
+        }
+        assert_eq!(table.compaction_state().cancelled, 0, "reaped at a group commit");
+    }
+
+    /// A round's watermark held back by a table with an open transaction moves on, without that
+    /// transaction ending, to every write numbered before that table's first pending one: one more
+    /// round reads a target past the writes it committed beyond its own.
+    #[test]
+    fn test_tndb_group_watermark_reaches_a_held_tables_first_write() {
+        use super::super::commit::GatePoint;
+        let tmp = TempDir::with_prefix("tndb_group_again").expect("temp dir");
+        let db = open_group(tmp.path());
+        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
+        let mut txn = db.write_txn().expect("txn");
+        txn.insert::<TestTable>(&1, &"t".to_string()).expect("txn insert"); // TestTable held
+
+        let (arrived, release) = group.gate_next_round(GatePoint::BeforeTake);
+        db.insert::<OtherTable>(&1, &"a".to_string()).expect("insert"); // starts a round
+        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round paused");
+        db.insert::<OtherTable>(&2, &"b".to_string()).expect("after the round's target");
+        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("rt");
+        let mut persist = Box::pin(db.persist::<OtherTable>()); // covers both OtherTable writes
+        let first = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(1), &mut persist).await
+        });
+        assert!(first.is_err(), "not durable yet");
+        db.insert::<TestTable>(&2, &"bare".to_string()).expect("held back by the txn");
+        drop(release);
+        let persisted = rt.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), persist).await
+        });
+        assert!(matches!(persisted, Ok(Ok(()))), "durable without the txn ending: {persisted:?}");
+        drop(txn);
+    }
+
+    /// A table's commit that panics (holding its writer lock) latches the failure: persist fails
+    /// instead of waiting forever.
+    #[test]
+    fn test_tndb_group_table_commit_panic_fails_persist() {
+        let tmp = TempDir::with_prefix("tndb_group_table_panic").expect("temp dir");
+        let db = open_group(tmp.path());
+        super::with_table(&db.store, "TestTable", |entry| entry.table.panic_next_group_commit())
+            .expect("table");
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        let persisted = block_on(async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), db.persist::<TestTable>()).await
+        });
+        assert!(matches!(persisted, Ok(Err(_))), "persist fails, not hangs: {persisted:?}");
     }
 
     /// Writers on several threads, each persisting now and then: after a crash every write made

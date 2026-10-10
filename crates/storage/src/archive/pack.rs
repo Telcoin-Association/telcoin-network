@@ -289,6 +289,18 @@ where
         self.inner.data_file.sync_ticket().map_err(CommitError::DataFileSync)
     }
 
+    /// True once the pack is failed or its data file poisoned: every later append or commit
+    /// fails.
+    pub(crate) fn is_failed(&self) -> bool {
+        self.inner.failed.is_some() || self.inner.data_file.is_poisoned()
+    }
+
+    /// Test-only: the data file's synced watermark (see [`MmapDataFile::synced_end`]).
+    #[cfg(test)]
+    pub(crate) fn synced_end(&self) -> u64 {
+        self.inner.data_file.synced_end()
+    }
+
     /// Stamp the tail commit marker at `committed`, an end a [`SyncTicket`] synced (see
     /// [`MmapDataFile::stamp_commit_marker_at`]).
     pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {

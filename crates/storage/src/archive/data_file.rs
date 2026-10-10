@@ -299,6 +299,12 @@ impl MapView {
         }
     }
 
+    /// Test-only: true once the file behind this view has dropped (it no longer maps anything).
+    #[cfg(test)]
+    pub(crate) fn is_unmapped(&self) -> bool {
+        self.base.load(Ordering::Acquire).is_null()
+    }
+
     /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         self.tail(offset)?.get(..len)
@@ -721,7 +727,7 @@ impl MmapDataFile {
     }
 
     /// True once any durability barrier or remap has failed on this handle.
-    fn is_poisoned(&self) -> bool {
+    pub(crate) fn is_poisoned(&self) -> bool {
         self.write_failed.load(Ordering::Relaxed)
     }
 
@@ -1366,6 +1372,12 @@ impl MmapDataFile {
         Ok(())
     }
 
+    /// Test-only: the end of the bytes synced so far (the synced watermark).
+    #[cfg(test)]
+    pub(crate) fn synced_end(&self) -> u64 {
+        self.flushed_end.load(Ordering::Relaxed)
+    }
+
     /// Capture a [`SyncTicket`] for the appended bytes not yet synced, `[flushed_end, end)`, and
     /// for the file's size if a growth left it unsynced. An append-mode file only.
     pub(crate) fn sync_ticket(&self) -> io::Result<SyncTicket> {
@@ -1391,12 +1403,16 @@ impl MmapDataFile {
     /// Record the outcome of `ticket`'s [`SyncTicket::sync`]: on success the synced watermark
     /// moves to the ticket's end (never past the current end, nor back), and the size counts as
     /// synced if no growth happened since the ticket; on failure the file is poisoned, as a failed
-    /// barrier poisons it, and the error is returned.
+    /// barrier poisons it, and the error is returned. A ticket taken from another file says
+    /// nothing about this one and is ignored.
     pub(crate) fn complete_sync(
         &mut self,
         ticket: &SyncTicket,
         outcome: &io::Result<()>,
     ) -> io::Result<()> {
+        if !Arc::ptr_eq(&ticket.view, &self.view) {
+            return Ok(());
+        }
         if let Err(e) = outcome {
             self.poison();
             return Err(io::Error::new(e.kind(), e.to_string()));
@@ -2919,6 +2935,27 @@ mod tests {
         assert!(df.is_poisoned());
         assert!(df.write_all(&pattern(5)).is_err(), "writes refused after the failure");
         assert!(df.sync_ticket().is_err(), "and so are tickets");
+    }
+
+    /// A ticket from another file (e.g. one its owner replaced meanwhile) is ignored: it neither
+    /// moves this file's watermark nor poisons it.
+    #[test]
+    fn sync_ticket_of_another_file_is_ignored() {
+        let tmp = TempDir::with_prefix("mmap_df_ticket_other").expect("temp dir");
+        let mut a =
+            MmapDataFile::open_with(tmp.path().join("a"), false, tiny_opts()).expect("open a");
+        let mut b =
+            MmapDataFile::open_with(tmp.path().join("b"), false, tiny_opts()).expect("open b");
+        a.write_all(&pattern(100)).expect("write a");
+        b.write_all(&pattern(50)).expect("write b");
+        let ticket = a.sync_ticket().expect("ticket");
+        let outcome = ticket.sync();
+        b.complete_sync(&ticket, &outcome).expect("ignored");
+        assert_eq!(b.synced_end(), 0, "b's watermark is its own");
+        b.complete_sync(&ticket, &Err(io::Error::other("injected"))).expect("ignored");
+        assert!(!b.is_poisoned(), "another file's failure does not poison b");
+        a.complete_sync(&ticket, &outcome).expect("complete a");
+        assert_eq!(a.synced_end(), 100);
     }
 
     /// The platform sync helpers work on a file and on a directory (this platform's branch is the

@@ -10,7 +10,7 @@
 //! before the call is committed, in every table (a whole-database, FIFO barrier), and fails from
 //! the first failed write or commit on (a latch never cleared). A table written by an open write
 //! transaction is left uncommitted until the transaction ends, so a transaction never becomes
-//! durable in part, and the barrier waits for it.
+//! durable in part in a table, and the barrier waits for it.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -61,6 +61,9 @@ pub(crate) struct GroupCommit {
     /// released (see [`Self::gate_next_round`]).
     #[cfg(test)]
     round_gate: Mutex<Option<RoundGate>>,
+    /// Test-only: the committer's next round panics.
+    #[cfg(test)]
+    panic_next_round: std::sync::atomic::AtomicBool,
 }
 
 /// Test-only: where a committer round stops (see [`GroupCommit::gate_next_round`]).
@@ -86,6 +89,8 @@ impl GroupCommit {
             wake: Condvar::new(),
             #[cfg(test)]
             round_gate: Mutex::new(None),
+            #[cfg(test)]
+            panic_next_round: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -119,6 +124,18 @@ impl GroupCommit {
         }
     }
 
+    /// Test-only: make the committer's next round panic.
+    #[cfg(test)]
+    pub(crate) fn panic_next_round(&self) {
+        self.panic_next_round.store(true, Ordering::Relaxed);
+    }
+
+    /// Test-only: the durable watermark.
+    #[cfg(test)]
+    pub(crate) fn durable_for_test(&self) -> u64 {
+        *self.durable.borrow()
+    }
+
     /// Table `name` has writes to commit. Called under the table's writer lock, before the
     /// write's sequence number is taken (see `TnTable::publish_pending`).
     pub(crate) fn mark_dirty(&self, name: &'static str) {
@@ -126,11 +143,22 @@ impl GroupCommit {
         self.wake.notify_one();
     }
 
-    /// Latch `cause` (the first failure wins) and wake every barrier waiting.
+    /// Latch `cause` (the first failure wins, and only it is logged) and wake every barrier
+    /// waiting.
     pub(crate) fn fail(&self, cause: String) {
-        tracing::error!(target: "tndb", "group commit failed: {cause}; every later persist fails");
-        self.failed.lock().get_or_insert(cause);
+        {
+            let mut failed = self.failed.lock();
+            if failed.is_some() {
+                return;
+            }
+            tracing::error!(target: "tndb", "group commit failed: {cause}; every later persist fails");
+            *failed = Some(cause);
+        }
         self.durable.send_modify(|_| {});
+    }
+
+    fn is_failed(&self) -> bool {
+        self.failed.lock().is_some()
     }
 
     fn check(&self) -> eyre::Result<()> {
@@ -148,6 +176,8 @@ impl GroupCommit {
         loop {
             self.check()?;
             if *durable.borrow_and_update() >= target {
+                // Checked again: a failure latched between the check above and this read wins.
+                self.check()?;
                 return Ok(());
             }
             if durable.changed().await.is_err() {
@@ -210,11 +240,23 @@ impl Drop for Committer {
     }
 }
 
+/// Latches a failure if the committer thread unwinds: no barrier then waits for it forever.
+struct PanicLatch<'a>(&'a GroupCommit);
+
+impl Drop for PanicLatch<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.fail("the committer thread panicked".to_string());
+        }
+    }
+}
+
 /// The committer: wait for written tables, commit each (one sync per table per round), then
 /// advance the durable watermark to the round's starting sequence number, held back by any table
 /// still pending (an open transaction, or writes published during its sync). A held-back table
 /// stays in every later round until it commits, so the watermark never passes it.
 fn run(group: &GroupCommit, store: &StoreType) {
+    let _latch = PanicLatch(group);
     let compact_all = || {
         for entry in store.load().values() {
             entry.table.compact();
@@ -250,6 +292,10 @@ fn run(group: &GroupCommit, store: &StoreType) {
         }
         #[cfg(test)]
         group.gate(GatePoint::AfterTake);
+        #[cfg(test)]
+        if group.panic_next_round.swap(false, Ordering::Relaxed) {
+            panic!("injected committer panic");
+        }
         if last_compact.elapsed() >= COMPACT_EVERY {
             compact_all();
             last_compact = Instant::now();
@@ -276,14 +322,25 @@ fn run(group: &GroupCommit, store: &StoreType) {
             }
         }
         let durable = held.values().map(|first| first - 1).fold(target, u64::min);
+        if group.is_failed() {
+            // Every later barrier fails, and the watermark never moves again: it may not pass a
+            // write whose commit failed (the failed table is no longer held back).
+            if run == Run::Finish {
+                return;
+            }
+            again = false;
+            continue;
+        }
         group.advance(durable);
         if run == Run::Finish {
             return;
         }
         // A write numbered after the target, whose table this round took and committed, has no
         // dirty mark left to start a round, yet the watermark stopped at the target. One more round
-        // reads a target covering it (and commits nothing it need not). A table held back by an
-        // open transaction is marked dirty when the transaction ends, so it needs no such round.
-        again = held.is_empty() && group.seq.load(Ordering::Acquire) > durable;
+        // reads a target covering it (and commits nothing it need not), when that can move the
+        // watermark: not when a held table's first pending write is what stops it (that table is
+        // marked dirty again when its transaction ends or its writes land).
+        again = group.seq.load(Ordering::Acquire) > durable
+            && held.values().all(|&first| durable < first - 1);
     }
 }
