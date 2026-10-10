@@ -105,13 +105,9 @@ impl JoinDraft {
                                 TestWorkerRequest::NewBatch(_)
                                 | TestWorkerRequest::PeerExchange(_) => None,
                             };
-                            futures::future::join_all(
-                                response
-                                    .map(|response| async move {
-                                        handle.send_response(response, channel).await
-                                    })
-                                    .into_iter(),
-                            )
+                            futures::future::join_all(response.map(|response| async move {
+                                handle.send_response(response, channel).await
+                            }))
                             .await;
                         }
                         NetworkEvent::Gossip(_)

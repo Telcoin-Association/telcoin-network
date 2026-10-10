@@ -1434,6 +1434,7 @@ impl PeerManager {
     /// (a member that already rotated out) or forged, and is never read. Legitimate discovery is
     /// unaffected: missing records, scheduled refresh, and endpoint recovery all resolve tracked
     /// committee members while retaining the last verified mapping on lookup failure.
+    #[cfg(test)]
     pub(crate) fn add_discovered_peer(&mut self, bls_key: BlsPublicKey, info: NetworkInfo) {
         let timestamp = crate::freshness::RecordTimestamp::admit(info.timestamp, now());
         self.add_discovered_peer_with_timestamp(bls_key, info, timestamp);

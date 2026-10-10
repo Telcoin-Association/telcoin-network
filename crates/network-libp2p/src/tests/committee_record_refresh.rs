@@ -135,6 +135,8 @@ async fn cached_record_converges(network_type: NetworkType) -> eyre::Result<()> 
         HashSet::from([authority]),
         HashSet::new(),
     );
+    // The store admits only owned keys, so the refreshed authority must own its record row.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([authority])?;
     network.process_kad_put_request(publisher, old_record.clone())?;
     assert_eq!(network.swarm.behaviour().peer_manager.get_rpc(&authority), Some(old_rpc.clone()));
     peer_manager_events(&mut network);
@@ -145,7 +147,7 @@ async fn cached_record_converges(network_type: NetworkType) -> eyre::Result<()> 
     let query_id = *network
         .kad_record_queries
         .iter()
-        .find(|(_, query)| query.request == authority)
+        .find(|(_, query)| query.query.request == authority)
         .map(|(id, _)| id)
         .ok_or_else(|| eyre!("cached member must be refreshed"))?;
 
@@ -294,7 +296,14 @@ async fn committee_record_retention_does_not_enable_third_party_replication() ->
         HashSet::from([authority]),
         HashSet::new(),
     );
-    network.retain_committee_record(record);
+    // The store admits only owned keys, so the refreshed authority must own its record row.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([authority])?;
+    // Seed the retained third-party copy the way the GetRecord handler stores it: finite expiry.
+    let expires = Some(std::time::Instant::now() + network.config.kad_record_ttl);
+    libp2p::kad::store::RecordStore::put(
+        network.swarm.behaviour_mut().kademlia.store_mut(),
+        libp2p::kad::Record { expires, ..record },
+    )?;
     let interval = network.config.kad_publication_interval;
     let mut own_refresh =
         tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
