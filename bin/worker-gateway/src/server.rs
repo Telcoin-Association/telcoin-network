@@ -8,18 +8,28 @@
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
 //! hyper's header read timeout is silently disabled and a slow-loris client
 //! could hold connections open forever. Here every connection gets a header
-//! read deadline, a whole-request deadline, `TCP_NODELAY`, a global
-//! concurrent-connection cap, and two write-path guards for the response-side
-//! slow loris (a client that stops or trickles its reads while a response
-//! body streams to it): a transport-stall deadline (`TCP_USER_TIMEOUT`) and a
-//! hard cap on total connection lifetime.
+//! read deadline, a whole-request deadline, `TCP_NODELAY`, a bounded read
+//! buffer, a global concurrent-connection cap, and two write-path guards for
+//! the response-side slow loris (a client that stops or trickles its reads
+//! while a response body streams to it): a transport-stall deadline
+//! (`TCP_USER_TIMEOUT`) and a hard cap on total connection lifetime.
+//!
+//! The router also budgets the request-body bytes held across all in-flight
+//! requests (see [`reserve_request_bytes`]), so the memory buffered bodies
+//! take is bounded by one number rather than by the connection count.
 
-use std::{net::SocketAddr, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroUsize},
+    sync::Arc,
+    time::Duration,
+};
 
 use axum::{
-    extract::{ConnectInfo, DefaultBodyLimit, State},
+    body::HttpBody as _,
+    extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::StatusCode,
-    middleware::{from_fn_with_state, map_response},
+    middleware::{from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -35,7 +45,7 @@ use serde::Serialize;
 use tn_types::{Noticer, TaskError};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::Semaphore,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, info, warn};
@@ -46,6 +56,7 @@ use crate::{
     proxy::proxy,
     ratelimit::{rate_limit, RateLimiters},
     readiness::GatewayReadiness,
+    telemetry,
 };
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
@@ -57,6 +68,18 @@ pub(crate) const HEALTH_PATH: &str = "/health";
 
 /// Readiness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
 pub(crate) const READY_PATH: &str = "/ready";
+
+/// Default budget of request-body bytes held across all in-flight requests
+/// (`--max-inflight-request-bytes`), 512 MiB.
+pub(crate) const MAX_INFLIGHT_REQUEST_BYTES: u32 = 512 * 1024 * 1024;
+
+/// Default cap on hyper's per-connection read buffer (`--http1-max-buf-size`),
+/// 64 KiB, against hyper's own default of about 408 KiB.
+pub(crate) const HTTP1_MAX_BUF_SIZE: usize = 64 * 1024;
+
+/// The smallest read buffer hyper accepts: `http1::Builder::max_buf_size`
+/// panics below it.
+pub(crate) const HTTP1_MIN_BUF_SIZE: usize = 8 * 1024;
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -98,6 +121,12 @@ pub(crate) struct ServerLimits {
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
+    /// Budget of request-body bytes held across all in-flight requests, or
+    /// `None` when unlimited (see [`reserve_request_bytes`]).
+    pub(crate) max_inflight_request_bytes: Option<NonZeroU32>,
+    /// Cap on each connection's read buffer, in bytes; it also caps the size
+    /// of a request head. Values below [`HTTP1_MIN_BUF_SIZE`] are raised to it.
+    pub(crate) http1_max_buf_size: usize,
 }
 
 /// JSON body of the gateway's `/ready` response.
@@ -105,6 +134,72 @@ pub(crate) struct ServerLimits {
 struct ReadyBody {
     /// Whether at least one upstream worker is currently ready.
     ready: bool,
+}
+
+/// The in-flight request-byte budget (`--max-inflight-request-bytes`): byte
+/// reservations taken before a request body is read and held until the
+/// request has been forwarded or rejected.
+#[derive(Debug)]
+struct RequestByteBudget {
+    /// One permit per byte, or `None` when the budget is unlimited.
+    permits: Option<Arc<Semaphore>>,
+    /// The per-request body cap (`--max-request-bytes`), reserved whole for a
+    /// body whose length is not declared up front (chunked).
+    max_request_bytes: usize,
+}
+
+impl RequestByteBudget {
+    fn new(max_inflight_request_bytes: Option<NonZeroU32>, max_request_bytes: usize) -> Self {
+        // `MAX_PERMITS` is far above `u32::MAX` on 64-bit targets; the clamp
+        // only matters where `usize` is narrower.
+        let permits = max_inflight_request_bytes.map(|budget| {
+            let budget = usize::try_from(budget.get()).unwrap_or(usize::MAX);
+            Arc::new(Semaphore::new(budget.min(Semaphore::MAX_PERMITS)))
+        });
+        Self { permits, max_request_bytes }
+    }
+
+    /// Reserve what a request body may take, before any of it is read.
+    ///
+    /// `declared_len` is hyper's decoded `Content-Length`, or `None` for a
+    /// chunked body, which reserves the whole per-request cap. A declared
+    /// length over the cap is refused as too large outright. A reservation
+    /// that does not fit in what is left of the budget is refused at once
+    /// rather than queued: a queued request would hold its connection open
+    /// while it waits. Returns `None` when the budget is unlimited.
+    fn reserve(&self, declared_len: Option<u64>) -> Result<Option<HeldRequestBytes>, GatewayError> {
+        let cap = u64::try_from(self.max_request_bytes).unwrap_or(u64::MAX);
+        let reservation = match declared_len {
+            Some(len) if len > cap => return Err(GatewayError::RequestTooLarge),
+            Some(len) => len,
+            None => cap,
+        };
+        let Some(permits) = &self.permits else { return Ok(None) };
+        // a reservation past `u32::MAX` can never fit a budget that is a `u32`
+        u32::try_from(reservation)
+            .ok()
+            .and_then(|bytes| {
+                let permit = Arc::clone(permits).try_acquire_many_owned(bytes).ok()?;
+                Some(HeldRequestBytes {
+                    _permit: permit,
+                    _gauge: telemetry::RequestBytesHeld::enter(bytes),
+                })
+            })
+            .map(Some)
+            .ok_or(GatewayError::InflightBytesExhausted)
+    }
+}
+
+/// The bytes one in-flight request holds against the budget; dropping it
+/// returns them.
+#[derive(Debug)]
+struct HeldRequestBytes {
+    /// Keeps the held-bytes gauge in step with the permits; declared first so
+    /// it is lowered before the permits are returned, and the gauge never reads
+    /// above the bytes actually held.
+    _gauge: telemetry::RequestBytesHeld,
+    /// One permit per reserved byte.
+    _permit: OwnedSemaphorePermit,
 }
 
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
@@ -118,6 +213,11 @@ struct ReadyBody {
 /// checked when the body is polled, which a slow-reading client can prevent;
 /// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
 ///
+/// `max_inflight_request_bytes` budgets the body bytes held across all
+/// in-flight requests (see [`reserve_request_bytes`]); `None` leaves the total
+/// unbounded, though a declared `Content-Length` over `max_request_bytes` is
+/// still refused before the body is read.
+///
 /// When `rate_limiters` is present it is installed as the outermost layer, so
 /// an over-limit request is shed with a JSON-RPC `429` before its body is
 /// buffered or forwarded.
@@ -125,15 +225,22 @@ pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
     max_request_bytes: usize,
+    max_inflight_request_bytes: Option<NonZeroU32>,
     rate_limiters: Option<Arc<RateLimiters>>,
 ) -> Router {
+    let byte_budget =
+        Arc::new(RequestByteBudget::new(max_inflight_request_bytes, max_request_bytes));
     let router = Router::new()
         .route(HEALTH_PATH, get(liveness))
         .route(READY_PATH, get(readiness))
         .fallback(proxy)
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
-        .layer(map_response(envelope_request_timeout));
+        .layer(map_response(envelope_request_timeout))
+        // inside the rate limit, so a rate-limited request costs no budget, and
+        // outside the body read and the request deadline, so a refused request
+        // is answered without reading its body
+        .layer(from_fn_with_state(byte_budget, reserve_request_bytes));
     // Add the rate-limit layer last so it runs first, ahead of the body read.
     let router = match rate_limiters {
         Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
@@ -150,6 +257,50 @@ async fn envelope_request_timeout(response: Response) -> Response {
     if response.status() == StatusCode::REQUEST_TIMEOUT {
         return error_response(&GatewayError::RequestTimeout, b"");
     }
+    response
+}
+
+/// Reserve a request's body bytes against the in-flight budget before the body
+/// is read, and hold them until the inner service has answered.
+///
+/// A refused request is answered from its head alone, without reading its
+/// body: a declared `Content-Length` over the per-request cap gets the "request
+/// too large" error, and a reservation the budget cannot cover gets the
+/// "in-flight bytes exhausted" error at once instead of waiting. Neither can
+/// recover the request `id`, which sits in the unread body, so it echoes as
+/// `null`. The reservation is held across the inner call, which returns once
+/// the proxy has the upstream's response head; the buffered body is dropped by
+/// then. It cannot ride in the request extensions instead: the proxy drops the
+/// request's parts before it reads the body. Probes are exempt, as they are
+/// from rate limiting.
+async fn reserve_request_bytes(
+    State(budget): State<Arc<RequestByteBudget>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == HEALTH_PATH || path == READY_PATH {
+        return next.run(request).await;
+    }
+    let held = match budget.reserve(request.body().size_hint().exact()) {
+        Ok(held) => held,
+        Err(err) => {
+            if matches!(err, GatewayError::RequestTooLarge) {
+                warn!(
+                    target: "gateway::server",
+                    "rejecting oversized request body before reading it"
+                );
+            } else {
+                debug!(
+                    target: "gateway::server",
+                    "in-flight request byte budget exhausted; refusing request"
+                );
+            }
+            return error_response(&err, b"");
+        }
+    };
+    let response = next.run(request).await;
+    drop(held);
     response
 }
 
@@ -185,7 +336,13 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "worker gateway listening");
 
-    let app = router(state, limits.request_deadline, limits.max_request_bytes, rate_limiters);
+    let app = router(
+        state,
+        limits.request_deadline,
+        limits.max_request_bytes,
+        limits.max_inflight_request_bytes,
+        rate_limiters,
+    );
     accept_loop(listener, app, limits, graceful_timeout, shutdown).await
 }
 
@@ -215,6 +372,12 @@ async fn accept_loop(
     // loop exists to close).
     let mut connection_builder = hyper::server::conn::http1::Builder::new();
     connection_builder.timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout);
+    // hyper's read buffer grows up to this cap and stays allocated while the
+    // connection lives, so a connection holding a buffered body costs the body
+    // plus this buffer; at hyper's default (about 408 KiB) a held 1 MiB body
+    // cost about 1.42 MiB. hyper panics below its minimum, which startup
+    // validation enforces; the clamp keeps that panic unreachable.
+    connection_builder.max_buf_size(limits.http1_max_buf_size.max(HTTP1_MIN_BUF_SIZE));
 
     let graceful = GracefulShutdown::new();
     let limiter =
@@ -348,8 +511,8 @@ mod tests {
     };
     use reqwest::redirect::Policy;
     use std::{
-        num::NonZeroU32,
         sync::atomic::{AtomicUsize, Ordering},
+        time::Instant,
     };
     use tn_types::Notifier;
     use tokio::{
@@ -366,6 +529,8 @@ mod tests {
             tcp_user_timeout: None,
             max_connection_duration: None,
             max_request_bytes: MAX_REQUEST_BYTES,
+            max_inflight_request_bytes: None,
+            http1_max_buf_size: HTTP1_MAX_BUF_SIZE,
         }
     }
 
@@ -408,7 +573,13 @@ mod tests {
     }
 
     fn test_router(state: AppState) -> Router {
-        router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None)
+        router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            NonZeroU32::new(MAX_INFLIGHT_REQUEST_BYTES),
+            None,
+        )
     }
 
     fn nz(n: u32) -> NonZeroU32 {
@@ -617,7 +788,7 @@ mod tests {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         // A tiny configured body limit so a small request trips the size guard
         // through the real router path (`--max-request-bytes` is configurable).
-        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None)).await;
+        let (addr, _shutdown) = spawn(router(state, Duration::from_secs(5), 8, None, None)).await;
 
         let response = Client::new()
             .post(format!("http://{addr}/"))
@@ -649,7 +820,8 @@ mod tests {
         )
         .expect("limiters");
         let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None, Some(limiters)))
+                .await;
 
         let client = Client::new();
         let first = client
@@ -685,7 +857,8 @@ mod tests {
         )
         .expect("limiters");
         let (addr, _shutdown) =
-            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(limiters))).await;
+            spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, None, Some(limiters)))
+                .await;
 
         let client = Client::new();
         for _ in 0..5 {
@@ -720,7 +893,7 @@ mod tests {
         // Short whole-request deadline; generous header timeout so only the
         // body trickle trips.
         let (addr, _shutdown) = spawn_with_limits(
-            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None),
+            router(state, Duration::from_millis(300), MAX_REQUEST_BYTES, None, None),
             test_limits(),
         )
         .await;
@@ -1251,5 +1424,406 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A mock upstream that counts each request it receives and never answers
+    /// it, so the gateway holds the forwarded request (and its byte
+    /// reservation) for as long as the client stays connected. The `Notifier`
+    /// keeps it alive.
+    async fn stalled_mock() -> (SocketAddr, Arc<AtomicUsize>, Notifier) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                future::pending::<&'static str>()
+            }),
+        );
+        let (addr, shutdown) = spawn(mock).await;
+        (addr, hits, shutdown)
+    }
+
+    /// An `eth_chainId` call padded with trailing whitespace (which JSON
+    /// allows) to exactly `len` bytes.
+    fn padded_call(id: u64, len: usize) -> String {
+        let mut body = call("eth_chainId", id);
+        body.push_str(&" ".repeat(len.saturating_sub(body.len())));
+        body
+    }
+
+    /// Wait until an upstream has seen `n` requests, so every request held
+    /// against it has taken its byte reservation.
+    async fn wait_for_hits(hits: &AtomicUsize, n: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while hits.load(Ordering::SeqCst) < n {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the held request should reach the upstream");
+    }
+
+    /// Send a complete `POST /` with a `len`-byte body (a JSON-RPC call padded
+    /// with whitespace) on a fresh connection without waiting for the answer.
+    /// Against a stalled upstream the gateway holds the request, and its byte
+    /// reservation, until the returned stream is dropped.
+    async fn send_held_request(addr: SocketAddr, len: usize) -> TcpStream {
+        let body = padded_call(1, len);
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        stream
+            .write_all(
+                format!("POST / HTTP/1.1\r\nHost: gateway\r\nContent-Length: {len}\r\n\r\n{body}")
+                    .as_bytes(),
+            )
+            .await
+            .expect("write");
+        stream
+    }
+
+    /// Send the request line and headers in `head`, then `body`, on a fresh
+    /// connection that asks to be closed after the response, and read the whole
+    /// response. Returns how long the answer took from the first byte sent,
+    /// its status and its body.
+    async fn raw_exchange(addr: SocketAddr, head: &str, body: &[u8]) -> (Duration, u16, String) {
+        let mut stream = TcpStream::connect(addr).await.expect("connect");
+        let started = Instant::now();
+        let head = format!("{head}\r\nHost: gateway\r\nConnection: close\r\n\r\n");
+        stream.write_all(&[head.as_bytes(), body].concat()).await.expect("write");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the gateway should answer and close")
+            .expect("read");
+        let elapsed = started.elapsed();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let status =
+            response.split(' ').nth(1).and_then(|status| status.parse().ok()).expect("status line");
+        let (head, body) = response.split_once("\r\n\r\n").expect("response body");
+        let chunked = head.to_ascii_lowercase().contains("transfer-encoding: chunked");
+        (elapsed, status, if chunked { dechunk(body) } else { body.to_string() })
+    }
+
+    /// Decode a chunked response body (a proxied response streams back
+    /// chunked).
+    fn dechunk(mut rest: &str) -> String {
+        let mut body = String::new();
+        while let Some((size, tail)) = rest.split_once("\r\n") {
+            let size = usize::from_str_radix(size.trim(), 16).expect("chunk size");
+            if size == 0 {
+                break;
+            }
+            body.push_str(tail.get(..size).expect("chunk data"));
+            rest = tail.get(size + 2..).expect("chunk terminator");
+        }
+        body
+    }
+
+    /// A gateway with one ready worker at `worker`, the given byte budget and
+    /// the default per-request cap.
+    async fn spawn_with_budget(worker: SocketAddr, budget: u32) -> (SocketAddr, Notifier) {
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        spawn(router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, Some(nz(budget)), None))
+            .await
+    }
+
+    /// The issue's acceptance criterion: a request that would exceed the
+    /// remaining budget gets an envelope at once instead of stalling. The
+    /// refused request is answered from its head, before its body is read or
+    /// even sent, so its `id` is unknown and echoes as `null`.
+    #[tokio::test]
+    async fn request_over_remaining_byte_budget_gets_envelope_immediately() {
+        let (worker, hits, _worker) = stalled_mock().await;
+        let (gateway, _shutdown) = spawn_with_budget(worker, 1024 * 1024).await;
+
+        // 900 KiB held against an upstream that never answers leaves 124 KiB
+        let _held = send_held_request(gateway, 900 * 1024).await;
+        wait_for_hits(&hits, 1).await;
+
+        let (elapsed, status, body) =
+            raw_exchange(gateway, "POST / HTTP/1.1\r\nContent-Length: 204800", b"").await;
+        assert_eq!(status, 503);
+        assert_eq!(error_code_and_id(&body), (-32010, serde_json::Value::Null));
+        assert!(elapsed < Duration::from_millis(100), "answered after {elapsed:?}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the refused request must not be forwarded");
+    }
+
+    #[tokio::test]
+    async fn byte_budget_is_released_after_forward() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (gateway, _shutdown) = spawn_with_budget(worker, 1024 * 1024).await;
+
+        // each request reserves 900 KiB of the 1 MiB budget, so the second
+        // only fits if the first returned its reservation once forwarded
+        for id in [1, 2] {
+            let body = padded_call(id, 900 * 1024);
+            let (status, text) = post_rpc(gateway, None, body).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "request {id}");
+        }
+        assert_eq!(worker_seen.hits(), 2);
+    }
+
+    #[tokio::test]
+    async fn chunked_body_reserves_the_request_cap() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let request = call("eth_chainId", 1);
+        let chunked_head = "POST / HTTP/1.1\r\nTransfer-Encoding: chunked";
+        let chunked_body = format!("{:x}\r\n{request}\r\n0\r\n\r\n", request.len());
+        let cap = u32::try_from(MAX_REQUEST_BYTES).expect("the cap fits a u32");
+
+        // a budget of exactly the cap admits a chunked request
+        let (gateway, _exact) = spawn_with_budget(worker, cap).await;
+        let (_, status, body) = raw_exchange(gateway, chunked_head, chunked_body.as_bytes()).await;
+        assert_eq!((status, body.as_str()), (200, "worker"));
+
+        // one byte less cannot cover the cap, so the same call sent chunked is
+        // refused from its head, while sent with its length it still fits
+        let (gateway, _short) = spawn_with_budget(worker, cap - 1).await;
+        let (_, status, body) = raw_exchange(gateway, chunked_head, b"").await;
+        assert_eq!(status, 503);
+        assert_eq!(error_code_and_id(&body).0, -32010);
+        let sized_head = format!("POST / HTTP/1.1\r\nContent-Length: {}", request.len());
+        let (_, status, body) = raw_exchange(gateway, &sized_head, request.as_bytes()).await;
+        assert_eq!((status, body.as_str()), (200, "worker"));
+        assert_eq!(worker_seen.hits(), 2);
+
+        // startup refuses a budget below the cap, so the case a deployment can
+        // reach is a budget of exactly the cap with a small request held
+        // against a stalled upstream: what is left is below the cap, so a
+        // chunked head is refused
+        let (stalled, stalled_hits, _stalled) = stalled_mock().await;
+        let (gateway, _full) = spawn_with_budget(stalled, cap).await;
+        let _held = send_held_request(gateway, 1024).await;
+        wait_for_hits(&stalled_hits, 1).await;
+        let (_, status, body) = raw_exchange(gateway, chunked_head, b"").await;
+        assert_eq!(status, 503);
+        assert_eq!(error_code_and_id(&body).0, -32010);
+        assert_eq!(stalled_hits.load(Ordering::SeqCst), 1, "the refused head is not forwarded");
+    }
+
+    #[tokio::test]
+    async fn content_length_over_the_request_cap_is_rejected_before_reading() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        // with the budget on and off: the length check does not need it
+        for budget in [NonZeroU32::new(MAX_INFLIGHT_REQUEST_BYTES), None] {
+            let state = test_state(&[upstream(worker)]);
+            state.readiness.set_ready(0, true);
+            let app = router(state, Duration::from_secs(5), MAX_REQUEST_BYTES, budget, None);
+            let (gateway, _shutdown) = spawn(app).await;
+
+            // only the head is sent, so an answer proves nothing was read
+            let head = format!("POST / HTTP/1.1\r\nContent-Length: {}", 2 * MAX_REQUEST_BYTES);
+            let (_, status, body) = raw_exchange(gateway, &head, b"").await;
+            assert_eq!(status, 413, "budget {budget:?}");
+            assert_eq!(error_code_and_id(&body).0, -32003, "budget {budget:?}");
+        }
+        assert_eq!(worker_seen.hits(), 0);
+    }
+
+    /// A body over the cap whose length is not declared is still refused
+    /// while it is read: the early length check only sees declared lengths.
+    #[tokio::test]
+    async fn oversized_chunked_body_is_rejected_while_read() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), 8, None, None)).await;
+
+        let request = call("eth_chainId", 1);
+        let chunked_body = format!("{:x}\r\n{request}\r\n0\r\n\r\n", request.len());
+        let (_, status, body) = raw_exchange(
+            gateway,
+            "POST / HTTP/1.1\r\nTransfer-Encoding: chunked",
+            chunked_body.as_bytes(),
+        )
+        .await;
+        assert_eq!(status, 413);
+        assert_eq!(error_code_and_id(&body).0, -32003);
+        assert_eq!(worker_seen.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_request_costs_no_budget() {
+        let (worker, hits, _worker) = stalled_mock().await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        // two requests of burst, refilled at one per second
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(2))),
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let budget = 64 * 1024;
+        let app = router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            Some(nz(budget)),
+            Some(limiters),
+        );
+        let (gateway, _shutdown) = spawn(app).await;
+        let budget = usize::try_from(budget).expect("usize");
+
+        // the first token: a request holding the whole budget
+        let held = send_held_request(gateway, budget).await;
+        wait_for_hits(&hits, 1).await;
+        // the second token: admitted by the rate limit, refused by the budget
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text).0, -32010);
+        // out of tokens: the rate limit answers before the budget is consulted
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(error_code_and_id(&text).0, -32006);
+
+        // drop the held request (the gateway cancels it on the disconnect) and
+        // wait for a token: a request needing the whole budget then fits, so
+        // the refused and rate-limited requests left nothing held
+        drop(held);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+        let _held = send_held_request(gateway, budget).await;
+        wait_for_hits(&hits, 2).await;
+    }
+
+    #[tokio::test]
+    async fn probes_bypass_the_byte_budget() {
+        let (worker, hits, _worker) = stalled_mock().await;
+        let budget = 64 * 1024;
+        let (gateway, _shutdown) = spawn_with_budget(worker, budget).await;
+        let _held = send_held_request(gateway, usize::try_from(budget).expect("usize")).await;
+        wait_for_hits(&hits, 1).await;
+
+        // the budget is spent
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_code_and_id(&text).0, -32010);
+
+        // the probes still answer, even carrying a body that would not fit
+        for path in [HEALTH_PATH, READY_PATH] {
+            for body in [Vec::new(), vec![b' '; 16]] {
+                let response = Client::new()
+                    .get(format!("http://{gateway}{path}"))
+                    .body(body)
+                    .send()
+                    .await
+                    .expect("send");
+                assert_eq!(response.status(), StatusCode::OK, "{path}");
+            }
+        }
+    }
+
+    /// Byte `i` of a recognizable test body: the alphabet, over and over.
+    fn pattern_byte(i: usize) -> u8 {
+        b'a' + u8::try_from(i % 26).expect("below 26")
+    }
+
+    #[tokio::test]
+    async fn large_body_still_forwards_with_a_small_read_buffer() {
+        // the upstream answers with the length it received and whether every
+        // byte is where the client put it
+        let mock = Router::new().route(
+            "/",
+            post(|body: axum::body::Bytes| async move {
+                let intact = body.iter().enumerate().all(|(i, byte)| *byte == pattern_byte(i));
+                format!("{} {intact}", body.len())
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        // hyper's minimum read buffer, 128 times smaller than the body
+        let limits = ServerLimits { http1_max_buf_size: HTTP1_MIN_BUF_SIZE, ..test_limits() };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let body: String = (0..MAX_REQUEST_BYTES).map(|i| char::from(pattern_byte(i))).collect();
+        let (status, text) = post_rpc(gateway, None, body).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "1048576 true"));
+    }
+
+    /// Peak resident memory of this process so far, in kB (`VmHWM`).
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn peak_rss_kb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("VmHWM line")
+    }
+
+    /// The issue's acceptance criterion: peak RSS stays near the budget for
+    /// many parallel maximum-size bodies held against a slow upstream.
+    /// Everything (client, gateway, upstream) shares this process, so the
+    /// client sends one shared allocation and the upstream drains each body
+    /// without keeping it. The peak is measured above the idle process and
+    /// bounded in proportion to the budget, so a body reader that holds about
+    /// twice what it reserved fails. The bound relies on the read-buffer cap
+    /// both servers run with: at hyper's default every connection keeps up to
+    /// 408 KiB. Run by hand; the printed lines go in the PR body.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[ignore = "measures peak RSS; run alone with --run-ignored ignored-only --no-capture"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peak_rss_stays_near_the_budget_with_parallel_max_bodies() {
+        const BUDGET: u32 = 64 * 1024 * 1024;
+        const PARALLEL: usize = 128;
+        let slow = Router::new().route(
+            "/",
+            post(|body: axum::body::Body| async move {
+                let mut chunks = body.into_data_stream();
+                while futures::StreamExt::next(&mut chunks).await.is_some() {}
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                "slow"
+            }),
+        );
+        let wide = ServerLimits {
+            max_connections: NonZeroUsize::new(2 * PARALLEL).expect("nonzero"),
+            request_deadline: Duration::from_secs(30),
+            ..test_limits()
+        };
+        let (worker, _worker) = spawn_with_limits(slow, wide.clone()).await;
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(30)).expect("client");
+        let state = test_state_with_client(&[upstream(worker)], client);
+        state.readiness.set_ready(0, true);
+        let app = router(state, Duration::from_secs(30), MAX_REQUEST_BYTES, Some(nz(BUDGET)), None);
+        let (gateway, _shutdown) = spawn_with_limits(app, wide).await;
+
+        let body = axum::body::Bytes::from(padded_call(1, MAX_REQUEST_BYTES));
+        let client = Client::new();
+        let before = peak_rss_kb();
+        let requests = (0..PARALLEL).map(|_| {
+            let request = client.post(format!("http://{gateway}/")).body(body.clone()).send();
+            async move { request.await.map(|response| response.status()) }
+        });
+        let outcomes = futures::future::join_all(requests).await;
+        let peak = peak_rss_kb();
+
+        let forwarded =
+            outcomes.iter().filter(|outcome| matches!(outcome, Ok(StatusCode::OK))).count();
+        let refused = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(StatusCode::SERVICE_UNAVAILABLE)))
+            .count();
+        let failed = PARALLEL - forwarded - refused;
+        // the budget with a tenth for allocator slack, a full read buffer for
+        // every connection on both servers, and a fixed allowance; collecting
+        // the chunks and then joining them costs about 1.7 times the budget
+        // and does not fit
+        let above_kb = peak.saturating_sub(before);
+        let budget_kb = u64::from(BUDGET / 1024);
+        let buffers_kb = u64::try_from(PARALLEL * 2 * HTTP1_MAX_BUF_SIZE / 1024).expect("fits");
+        let bound_kb = budget_kb * 11 / 10 + buffers_kb + 16 * 1024;
+        println!(
+            "VmHWM: {peak} kB ({before} kB before the flood) for {PARALLEL} parallel \
+             {MAX_REQUEST_BYTES}-byte bodies against a {BUDGET}-byte budget: {forwarded} \
+             forwarded, {refused} refused with -32010, {failed} other"
+        );
+        println!("{above_kb} kB above the idle process, bound {bound_kb} kB");
+        assert!((1..=64).contains(&forwarded), "{forwarded} forwarded");
+        assert!(above_kb < bound_kb, "{above_kb} kB above the idle process, bound {bound_kb} kB");
     }
 }

@@ -45,6 +45,9 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
+    /// The request did not fit in what is left of the gateway's in-flight
+    /// request-byte budget (`--max-inflight-request-bytes`).
+    pub(super) const INFLIGHT_BYTES_EXHAUSTED: i32 = -32010;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -74,6 +77,9 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     UnsupportedTransactionType,
+    /// The request's body bytes did not fit in what is left of the in-flight
+    /// request-byte budget, so it was refused before its body was read.
+    InflightBytesExhausted,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
 }
@@ -90,6 +96,7 @@ impl GatewayError {
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
+            Self::InflightBytesExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -106,6 +113,7 @@ impl GatewayError {
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
@@ -126,6 +134,9 @@ impl GatewayError {
             Self::UnsupportedTransactionType => {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
+            Self::InflightBytesExhausted => {
+                "gateway is holding too many request bytes; retry shortly"
+            }
             Self::UnreadableBody => "request body could not be read",
         }
     }
@@ -145,6 +156,7 @@ impl GatewayError {
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::InflightBytesExhausted => "inflight_bytes_exhausted",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -475,6 +487,19 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
+    }
+
+    #[test]
+    fn inflight_bytes_code_and_reason_are_stable() {
+        // the budget refusal is a retryable overload signal with its own code
+        // and metric reason, so clients and dashboards can tell it apart from
+        // a rate limit or a missing upstream
+        let err = GatewayError::InflightBytesExhausted;
+        assert_eq!(err.code(), -32010);
+        assert_eq!(err.reason(), "inflight_bytes_exhausted");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_response(&err, b"").status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -494,6 +519,7 @@ mod tests {
             GatewayError::UnsupportedTransactionType.reason(),
             "unsupported_transaction_type"
         );
+        assert_eq!(GatewayError::InflightBytesExhausted.reason(), "inflight_bytes_exhausted");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
     }
 }
