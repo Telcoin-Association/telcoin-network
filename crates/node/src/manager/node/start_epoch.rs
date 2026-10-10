@@ -806,9 +806,12 @@ where
             .collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
+            u64::from(consensus_config.committee().epoch()),
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
+            &epoch_task_spawner,
+            consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
 
@@ -977,9 +980,12 @@ where
             consensus_config.next_committee_keys().iter().copied().collect();
         Self::init_network_for_epoch(
             network_handle.inner_handle(),
+            u64::from(consensus_config.committee().epoch()),
             previous_committee_keys,
             committee_keys.clone(),
             next_committee_keys,
+            &epoch_task_spawner,
+            consensus_config.network_config().admission().refresh_interval(),
         )
         .await?;
 
@@ -1098,20 +1104,47 @@ where
 
     /// Point a network handle at a new epoch's committee membership.
     ///
-    /// Every epoch sets the previous/current/next committee slots directly from authoritative
-    /// state via `update_committees`.
+    /// Every epoch publishes its immutable authoritative committee window and renews its
+    /// admission lease on the epoch-scoped spawner. Shutdown cancels renewal; delayed commands
+    /// from an older epoch cannot overwrite a newer window. Every swarm uses the same contract.
     ///
     /// Process startup has already registered bootstrap peers, so `known_peers` is populated
     /// before the peer manager resolves these committee slots.
     async fn init_network_for_epoch<Req: TNMessage, Res: TNMessage>(
         handle: &NetworkHandle<Req, Res>,
+        epoch: u64,
         previous_committee_keys: HashSet<BlsPublicKey>,
         committee_keys: HashSet<BlsPublicKey>,
         next_committee_keys: HashSet<BlsPublicKey>,
+        epoch_task_spawner: &TaskSpawner,
+        refresh_interval: Duration,
     ) -> eyre::Result<()> {
         handle
-            .update_committees(previous_committee_keys, committee_keys, next_committee_keys)
+            .update_committees_at(
+                epoch,
+                previous_committee_keys.clone(),
+                committee_keys.clone(),
+                next_committee_keys.clone(),
+            )
             .await?;
+        let handle = handle.clone();
+        epoch_task_spawner.spawn_task("Renew admission committee snapshot", async move {
+            let interval = tokio::time::interval(refresh_interval);
+            futures::stream::unfold(interval, |mut interval| async move {
+                interval.tick().await;
+                Some(((), interval))
+            }).for_each(move |()| {
+                let handle = handle.clone();
+                let previous = previous_committee_keys.clone();
+                let current = committee_keys.clone();
+                let next = next_committee_keys.clone();
+                async move {
+                    let _ = handle.update_committees_at(epoch, previous, current, next).await
+                        .inspect_err(|error| warn!(target: "epoch-manager", ?error, epoch, "admission snapshot renewal failed"));
+                }
+            }).await;
+            Ok(())
+        });
         Ok(())
     }
 

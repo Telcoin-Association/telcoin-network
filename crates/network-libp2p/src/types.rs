@@ -1,7 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, GossipMessage, PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, GossipMessage,
+    PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -445,6 +446,22 @@ where
         /// The next epoch committee.
         next: HashSet<BlsPublicKey>,
     },
+    /// Set or renew a complete authoritative admission window at an epoch revision.
+    UpdateAdmissionCommittees {
+        /// Epoch owning the immutable committee window.
+        epoch: u64,
+        /// Previous committee.
+        previous: HashSet<BlsPublicKey>,
+        /// Current committee.
+        current: HashSet<BlsPublicKey>,
+        /// Next committee.
+        next: HashSet<BlsPublicKey>,
+    },
+    /// Observe admission inputs without conflating records, connections, and consensus readiness.
+    AdmissionStatus {
+        /// Admission observations from this handle's swarm.
+        reply: oneshot::Sender<AdmissionStatus>,
+    },
     /// Pre-dial recovery: forgive bans for a committee so it can be dialed, without mutating the
     /// committee slots.
     PrepareCommitteeDial {
@@ -764,6 +781,29 @@ where
     ) -> NetworkResult<()> {
         self.sender.send(NetworkCommand::UpdateCommittees { previous, current, next }).await?;
         Ok(())
+    }
+
+    /// Set or renew an authoritative admission window. Identical revisions renew its lease.
+    /// Older or contradictory revisions trigger fallback without replacing accepted membership.
+    pub async fn update_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next })
+            .await?;
+        Ok(())
+    }
+
+    /// Observe this swarm's policy, resolved-record quorum, and connected current peers.
+    /// Consensus readiness remains a separate node-level observation.
+    pub async fn admission_status(&self) -> NetworkResult<AdmissionStatus> {
+        let (reply, res) = oneshot::channel();
+        self.sender.send(NetworkCommand::AdmissionStatus { reply }).await?;
+        res.await.map_err(Into::into)
     }
 
     /// Forgive bans for a committee so it can be dialed, without mutating the committee slots.

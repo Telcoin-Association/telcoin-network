@@ -37,7 +37,7 @@ pub mod types;
 pub use codec::{decode_message, encode_message, TNCodec, TNMessage};
 pub use consensus::ConsensusNetwork;
 pub use metrics::AdmissionShed;
-pub use peers::{LoadPenalty, PeerExchangeMap, Penalty};
+pub use peers::{AdmissionFallback, AdmissionStatus, LoadPenalty, PeerExchangeMap, Penalty};
 pub use service_class::ServiceClass;
 pub use stream::StreamError;
 pub use sync::{

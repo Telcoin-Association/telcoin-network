@@ -746,6 +746,7 @@ where
         // rotation. Our own record is skipped: both primary and worker key their record by
         // the primary BLS key, and there is no point caching ourselves as a known peer.
         let own_key = key_config.primary_public_key();
+        behavior.peer_manager.configure_admission(network_config.admission().clone(), own_key);
         let mut restored: usize = 0;
         for (key, info) in known {
             if key == own_key {
@@ -1452,6 +1453,7 @@ where
                 send_or_log_error!(reply, peers, "PeersForExchange");
             }
             NetworkCommand::UpdateCommittees { previous, current, next } => {
+                self.swarm.behaviour_mut().peer_manager.invalidate_admission();
                 // The network mirrors three of the on-chain registry's committees: previous,
                 // current, and next. Peers in any of the three count as validators so the
                 // just-completed committee is not pruned while late gossip may still arrive and
@@ -1475,6 +1477,34 @@ where
                 self.refresh_explicit_peers();
                 self.query_missing_required_records();
                 retention?;
+            }
+            NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next } => {
+                // Mirror the `UpdateCommittees` arm for authoritative epoch updates. Only a
+                // replaced window moves retention, so an old or contradictory revision cannot
+                // prune the records of the accepted committees.
+                let window: Vec<_> =
+                    previous.iter().chain(&current).chain(&next).copied().collect();
+                let replaced = self
+                    .swarm
+                    .behaviour_mut()
+                    .peer_manager
+                    .update_committees_at(epoch, previous, current, next);
+                if replaced {
+                    let retention = self
+                        .swarm
+                        .behaviour_mut()
+                        .kademlia
+                        .store_mut()
+                        .retain_committees(window)
+                        .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
+                    self.refresh_explicit_peers();
+                    self.query_missing_required_records();
+                    retention?;
+                }
+            }
+            NetworkCommand::AdmissionStatus { reply } => {
+                let status = self.swarm.behaviour().peer_manager.admission_status();
+                send_or_log_error!(reply, status, "AdmissionStatus");
             }
             NetworkCommand::PrepareCommitteeDial { committee } => {
                 // Deadlock-breaker pre-dial: forgive bans so the committee can be dialed without
