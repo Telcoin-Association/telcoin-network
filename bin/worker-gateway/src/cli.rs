@@ -36,12 +36,12 @@ pub(crate) struct Cli {
     )]
     pub(crate) config: Option<PathBuf>,
 
-    /// Inline single upstream: the worker JSON-RPC base URL
+    /// Inline single upstream: the worker JSON-RPC base URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8545`).
     #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_RPC_URL")]
     pub(crate) upstream_rpc_url: Option<Url>,
 
-    /// Inline single upstream: the node readiness URL
+    /// Inline single upstream: the node readiness URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8551/health/workers`).
     #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_READINESS_URL")]
     pub(crate) upstream_readiness_url: Option<Url>,
