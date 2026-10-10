@@ -6,8 +6,19 @@
 # a non-root user. Build from the repository root so the whole workspace is in
 # the build context:
 #
-#   docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:latest .
-FROM rust:1.94-slim-bookworm AS builder
+#   docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
+#
+# Both base images are pinned by the digest of their multi-arch index, so a
+# rebuild starts from the same bytes on every platform until a pin is moved on
+# purpose. To move one, read the new index digest (the top-level "Digest", not a
+# per-platform manifest) with
+#
+#   docker buildx imagetools inspect rust:1.94-slim-bookworm
+#   docker buildx imagetools inspect debian:bookworm-slim
+#
+# and replace the sha256 after the tag; keep the rust tag in step with
+# RUSTUP_TOOLCHAIN below.
+FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
 ENV RUSTUP_TOOLCHAIN=1.94
 
@@ -34,16 +45,17 @@ COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
 
 # Build only the gateway binary, then move it out of the cache mount so the
-# runtime stage can COPY it.
+# runtime stage can COPY it. --locked makes the build fail instead of resolving
+# versions other than the ones in Cargo.lock.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=./target,sharing=locked \
     rm -rf /usr/local/cargo/registry/src \
-    && cargo build -p tn-worker-gateway --bin worker-gateway --release \
+    && cargo build --locked -p tn-worker-gateway --bin worker-gateway --release \
     && mv ./target/release/worker-gateway /tmp/
 
-# production image
-FROM debian:bookworm-slim
+# production image (pinned by index digest, see the top of this file)
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 # The gateway links rustls, not openssl, so no TLS library is installed.
 # ca-certificates is required for an https --redirect-queries URL: rustls reads

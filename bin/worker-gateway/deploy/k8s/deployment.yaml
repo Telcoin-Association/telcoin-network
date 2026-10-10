@@ -29,8 +29,11 @@ spec:
       terminationGracePeriodSeconds: 40
       containers:
         - name: worker-gateway
-          # Replace with your registry ref, e.g. registry.example.com/telcoin/worker-gateway:<tag>
-          image: telcoin-worker-gateway:latest
+          # Replace with your registry ref and a versioned tag, e.g.
+          # registry.example.com/telcoin/worker-gateway:<tag>, and pin it by
+          # digest (<ref>:<tag>@sha256:<digest>) so every replica runs the same
+          # build. Never deploy :latest.
+          image: telcoin-worker-gateway:<tag>
           env:
             # Client JSON-RPC + /health + /ready all listen here.
             - name: WORKER_GATEWAY_LISTEN_ADDR

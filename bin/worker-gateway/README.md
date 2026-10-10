@@ -410,7 +410,7 @@ node's `etc/Dockerfile` (rust:1.94 builder, slim debian runtime, non-root user).
 Build it from the repository root:
 
 ```
-docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:latest .
+docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
 ```
 
 Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, Service,
