@@ -108,16 +108,24 @@ impl NetworkBehaviour for PeerManager {
         Ok(vec![])
     }
 
-    // filter connections
+    /// Reserve bounded source and aggregate slots without assigning identity privileges.
     fn handle_pending_inbound_connection(
         &mut self,
-        _connection_id: ConnectionId,
+        connection_id: ConnectionId,
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<(), ConnectionDenied> {
-        self.sanitize_ip_addr(remote_addr)
+        // PeerId is unavailable here. An address cannot authorize its sender, and a collateral
+        // ban cannot discard an admitted identity's authentication opportunity. The transport's
+        // validated-address and pending-incoming budgets still apply to every handshake.
+        Self::extract_ip_from_multiaddr(remote_addr)
+            .ok_or_else(|| ConnectionDenied::new(PeerAdmissionDenied::InvalidIp))
+            .and_then(|ip| {
+                self.reserve_pending_inbound(connection_id, ip).map_err(ConnectionDenied::new)
+            })
     }
 
+    /// Apply identity penalties and then the authenticated peer's collateral-ban policy.
     fn handle_established_inbound_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -125,6 +133,7 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.release_pending_inbound(&connection_id);
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
         // the earliest point an inbound self-connection can be rejected.
@@ -136,10 +145,12 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
 
+        self.sanitize_ip_addr(&peer, remote_addr)?;
         self.reserve_source(connection_id, peer, remote_addr, "in")?;
         Ok(ConnectionHandler)
     }
 
+    /// Recheck the authenticated identity and actual outbound address against live policy.
     fn handle_established_outbound_connection(
         &mut self,
         connection_id: ConnectionId,
@@ -161,12 +172,13 @@ impl NetworkBehaviour for PeerManager {
         }
 
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
-        self.sanitize_ip_addr(addr)?;
+        self.sanitize_ip_addr(&peer, addr)?;
 
         self.reserve_source(connection_id, peer, addr, "out")?;
         Ok(ConnectionHandler)
     }
 
+    /// Reconcile peer lifecycle and release pre-authentication slots after listen failures.
     fn on_swarm_event(&mut self, event: FromSwarm<'_>) {
         self.on_source_swarm_event(&event);
         match event {
@@ -191,12 +203,14 @@ impl NetworkBehaviour for PeerManager {
                 debug!(target: "peer-manager", ?peer_id, ?error, "failed to dial peer");
                 self.on_dial_failure(peer_id, error);
             }
-            FromSwarm::ListenFailure(ListenFailure { error, .. }) => {
-                // Inbound hooks reserve no peer-manager state. Peers are registered only on
-                // ConnectionEstablished, after every behaviour has accepted. The swarm and
-                // connection_limits own pending slots and clean them up on this same event.
+            FromSwarm::ListenFailure(ListenFailure { connection_id, error, .. }) => {
+                // Release the pre-authentication slot that handle_pending_inbound_connection
+                // reserved. Peers are registered only on ConnectionEstablished, after every
+                // behaviour has accepted. The swarm and connection_limits own their pending slots
+                // and clean them up on this same event.
                 // Do not disconnect the peer or complete a concurrent outbound dial here.
                 // Counters replace per-attempt logs on this remotely driven failure path.
+                self.release_pending_inbound(&connection_id);
                 let reason = match error {
                     ListenError::Denied { cause } => cause
                         .downcast_ref::<PeerAdmissionDenied>()
@@ -268,14 +282,15 @@ impl NetworkBehaviour for PeerManager {
 }
 
 impl PeerManager {
-    /// Logic to ensure a pending connection supports ipv4 or ipv6, and that the ip address isn't
-    /// banned.
-    fn sanitize_ip_addr(&self, remote_addr: &Multiaddr) -> Result<(), ConnectionDenied> {
-        // only support ipv4 and ipv6
-        if !self.has_valid_unbanned_ips(std::slice::from_ref(remote_addr)) {
-            return Err(ConnectionDenied::new(PeerAdmissionDenied::InvalidIp));
-        }
-        Ok(())
+    /// Validate an authenticated connection's address using the live admission policy.
+    fn sanitize_ip_addr(
+        &self,
+        peer_id: &PeerId,
+        remote_addr: &Multiaddr,
+    ) -> Result<(), ConnectionDenied> {
+        self.has_valid_peer_ips(peer_id, std::slice::from_ref(remote_addr))
+            .then_some(())
+            .ok_or_else(|| ConnectionDenied::new(PeerAdmissionDenied::InvalidIp))
     }
 
     /// Handle on connection established event from the swarm.

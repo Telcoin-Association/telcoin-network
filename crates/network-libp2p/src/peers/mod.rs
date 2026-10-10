@@ -7,6 +7,7 @@ mod cache;
 mod manager;
 mod peer;
 mod penalty;
+mod pending_inbound;
 mod policy;
 mod score;
 mod status;

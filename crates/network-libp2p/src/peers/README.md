@@ -28,6 +28,35 @@ Solution:
 Admission, retention, load scoring, and protocol scoring are independent policy dimensions.
 The peer policy composes every live trust basis instead of selecting a single exemption.
 
+### Collateral address penalties
+
+An authenticated identity with `Admission::Authorized` is exempt from collateral IP bans. The
+exemption uses the same live policy snapshot as configured admission: operator trust, pinned
+bootstrap or explicit discovery peers, and the previous/current/next committee union. Advertising
+a committee address, a trusted peer's `/p2p` component, or another identity's address grants no
+trust or quota. The offending identity's reputation and protocol bans remain enforceable for
+every trust basis.
+
+Pending inbound connections have no authenticated PeerId. They receive ordinary finite slots
+before collateral filtering, so an admitted identity sharing a banned address can authenticate.
+The source ceiling is `max_priority_peers * MAX_ESTABLISHED_CONNECTIONS_PER_PEER`, clamped to
+the existing aggregate pending ceiling. This accommodates configured priority peers behind one
+NAT without allocating any identity privilege before authentication. IPv4 and IPv4-mapped IPv6
+sources share a scope; IPv6 sources share their /64. QUIC Retry validates addresses before
+acceptance by default. Disabling Retry retains all finite slot and transport memory bounds but
+removes that source-validation guarantee.
+
+Authentication and every listen failure release the connection's slot exactly once, including
+denial by another behaviour, failed upgrades, cancellation, and transport timeouts. Identity
+penalties and live collateral policy are checked in both established connection directions.
+Collateral bans use only actually observed IPs, not advertised addresses, and apply to the
+current connection or proposed dial addresses. Historical IP evidence is retained for ban
+contributions without stranding a peer that moves to an unbanned address. Committee rotation
+changes the exemption without deleting shared-address counters; ordinary unban and pruning
+remove only the departing banned identity's contributions. Persistent IP penalties use exact
+observed addresses; the /64 scope bounds pending work, without penalizing authenticated IPv6
+neighbours solely for sharing a prefix.
+
 | Peer | Configured admission | Population pruning and mesh | Load penalties | Protocol penalties |
 | --- | --- | --- | --- | --- |
 | Ordinary | Public discovery policy | Ordinary | Scored | Scored |

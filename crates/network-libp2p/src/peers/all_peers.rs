@@ -895,13 +895,11 @@ impl AllPeers {
         self.banned_peers.ip_banned(ip)
     }
 
-    /// Boolean indicating if a peer id is banned or associated with any banned ip addresses.
+    /// Whether the authenticated identity's own reputation is banned.
     /// NOTE: the peer can still be in a connected status but pending a ban, so the connection
     /// status is not used.
     pub(super) fn peer_banned(&self, peer_id: &PeerId) -> bool {
-        self.get_peer(peer_id).is_some_and(|peer| {
-            peer.reputation().banned() || peer.known_ip_addresses().any(|ip| self.ip_banned(&ip))
-        })
+        self.get_peer(peer_id).is_some_and(|peer| peer.reputation().banned())
     }
 
     /// Gives the ids of all known connected peers.
@@ -1217,7 +1215,6 @@ impl AllPeers {
             // committee slots, so we only prime the score (no trust flag is stored)
             self.peers.get_mut(&identity).into_iter().for_each(|peer| {
                 peer.reset_score_to_max();
-                self.banned_peers.remove_validator_ip(&peer_id, peer.known_ip_addresses());
             });
             action.map(|action| (peer_id, action))
         }).collect()

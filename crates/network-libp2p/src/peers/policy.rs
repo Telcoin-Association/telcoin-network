@@ -103,6 +103,14 @@ impl PeerPolicy {
         self.admission
     }
 
+    /// Whether an authenticated identity is exempt from collateral address bans.
+    ///
+    /// An address claim never supplies a trust basis. Identity bans and all resource budgets
+    /// remain enforceable, including for authorized peers.
+    pub(super) fn exempts_collateral_bans(self) -> bool {
+        self.admission == Admission::Authorized
+    }
+
     /// Whether temporary load is exempt from scoring.
     pub(super) fn exempts_load(self) -> bool {
         self.load_scoring == LoadScoring::Exempt
@@ -243,5 +251,19 @@ mod tests {
         assert_eq!(PeerPolicy::from_bases([TrustBasis::Bootstrap, TrustBasis::Operator]), trusted);
         assert!(!PeerPolicy::from_bases([]).protects_retention());
         assert!(PeerPolicy::from_bases([]).applies(Penalty::Load(LoadPenalty::Timeout)));
+    }
+
+    /// Collateral exemption follows configured admission, including bootstrap-only peers.
+    #[test]
+    fn collateral_bans_follow_admission() {
+        assert!(!PeerPolicy::default().exempts_collateral_bans());
+        [TrustBasis::Bootstrap, TrustBasis::Operator, TrustBasis::Validator].into_iter().for_each(
+            |basis| {
+                let policy = PeerPolicy::from_bases([basis]);
+                assert!(policy.exempts_collateral_bans());
+                assert!(policy.applies(Penalty::Fatal));
+            },
+        );
+        assert!(!PeerPolicy::from_bases([]).exempts_collateral_bans());
     }
 }

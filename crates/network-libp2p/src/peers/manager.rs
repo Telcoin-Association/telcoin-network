@@ -4,6 +4,7 @@ use super::{
     all_peers::AllPeers,
     cache::BannedPeerCache,
     peer::MAX_MULTIADDRS_PER_PEER,
+    pending_inbound::{PendingInbound, PendingInboundError},
     status::NewConnectionStatus,
     types::{ConnectionDirection, ConnectionType, DialRequest, PeerAction},
     PeerEvent, PeerExchangeMap, Penalty,
@@ -36,6 +37,10 @@ use tracing::{debug, error, trace, warn};
 #[cfg(test)]
 #[path = "../tests/peer_manager.rs"]
 mod peer_manager;
+
+#[cfg(test)]
+#[path = "../tests/collateral_bans.rs"]
+mod collateral_bans;
 
 #[cfg(test)]
 #[path = "../tests/listen_failure.rs"]
@@ -246,6 +251,8 @@ pub(crate) struct PeerManager {
     /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
     /// connections drop.
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Finite validated-source and aggregate slots before the remote identity is authenticated.
+    pending_inbound: PendingInbound<ConnectionId>,
     /// Per-source inbound kad `PutRecord` rate windows.
     ///
     /// Bounds the expensive BLS verify plus kad store write in `process_kad_put_request` to
@@ -342,6 +349,11 @@ impl PeerManager {
             dial_requests: Default::default(),
             temporarily_banned,
             discovery_peers: Default::default(),
+            pending_inbound: PendingInbound::new(
+                config.max_priority_peers(),
+                crate::consensus::MAX_ESTABLISHED_CONNECTIONS_PER_PEER,
+                crate::consensus::MAX_PENDING_INCOMING_CONNECTIONS,
+            ),
             put_record_windows: Default::default(),
             add_provider_windows: Default::default(),
             metrics,
@@ -639,6 +651,20 @@ impl PeerManager {
         self.peers.ip_banned(ip)
     }
 
+    /// Reserve a finite slot using only the actual transport source before authentication.
+    pub(super) fn reserve_pending_inbound(
+        &mut self,
+        id: ConnectionId,
+        ip: IpAddr,
+    ) -> Result<(), PendingInboundError> {
+        self.pending_inbound.reserve(id, ip)
+    }
+
+    /// Release a pending slot on authentication, denial, failed upgrade, timeout, or cancellation.
+    pub(super) fn release_pending_inbound(&mut self, id: &ConnectionId) {
+        self.pending_inbound.release(id);
+    }
+
     /// Returns a boolean if the peer is a known validator.
     ///
     /// Membership spans the previous, current, and next committees tracked by `AllPeers`, so peers
@@ -664,7 +690,7 @@ impl PeerManager {
         &self.local_peer_id == peer_id
     }
 
-    /// Check if the peer id is banned or associated with any banned ip addresses.
+    /// Check the identity's reputation and temporary retention bans.
     ///
     /// This is called before accepting new connections. Also checks that the peer
     /// wasn't temporarily banned due to excess peers connections.
@@ -804,7 +830,7 @@ impl PeerManager {
         peer_id: &PeerId,
         connection: ConnectionType,
     ) -> bool {
-        if self.peers.peer_banned(peer_id) {
+        if self.peer_banned(peer_id) {
             // log error if the peer is banned
             error!(target: "peer-manager", ?peer_id, "connected with banned peer");
             return false;
@@ -1637,24 +1663,29 @@ impl PeerManager {
     /// Returns `true` if the peer has valid IP addresses and NONE are banned.
     /// Returns `false` if no valid IPs found OR any IP is banned.
     pub(super) fn has_valid_unbanned_ips(&self, multiaddrs: &[Multiaddr]) -> bool {
-        let mut found_valid_ip = false;
+        let (found, allowed) = multiaddrs
+            .iter()
+            .filter_map(Self::extract_ip_from_multiaddr)
+            .fold((false, true), |(_, allowed), ip| (true, allowed && !self.is_ip_banned(&ip)));
+        found && allowed
+    }
 
-        for addr in multiaddrs {
-            if let Some(ip) = Self::extract_ip_from_multiaddr(addr) {
-                found_valid_ip = true;
-                if self.is_ip_banned(&ip) {
-                    return false; // Early return on first banned IP
-                }
-            }
+    /// Validate addresses against the admission policy of the expected or authenticated identity.
+    ///
+    /// Outbound authentication must prove the expected identity before a connection is accepted.
+    /// This exemption changes no connection or handshake quota and never forgives an identity ban.
+    pub(super) fn has_valid_peer_ips(&self, peer_id: &PeerId, multiaddrs: &[Multiaddr]) -> bool {
+        if self.peer_policy(peer_id).exempts_collateral_bans() {
+            multiaddrs.iter().any(|addr| Self::extract_ip_from_multiaddr(addr).is_some())
+        } else {
+            self.has_valid_unbanned_ips(multiaddrs)
         }
-
-        found_valid_ip
     }
 
     /// Extract IP address from a single multiaddr.
     ///
     /// Only supports IPv4 and IPv6.
-    fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
+    pub(super) fn extract_ip_from_multiaddr(addr: &Multiaddr) -> Option<IpAddr> {
         addr.iter().find_map(|protocol| match protocol {
             Protocol::Ip4(ip) => Some(IpAddr::V4(ip)),
             Protocol::Ip6(ip) => Some(IpAddr::V6(ip)),
@@ -1668,7 +1699,7 @@ impl PeerManager {
     /// - it is not this node's own identity
     /// - its address list is within [`MAX_MULTIADDRS_PER_PEER`]
     /// - it has at least one valid ip address (ipv4/ipv6)
-    /// - none of its ip addresses are banned
+    /// - its addresses satisfy the live policy's collateral-ban check
     /// - it can be dialed (not connected/dialing/banned)
     fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
         // never add our own identity to the discovery feed; a self entry (learned
@@ -1685,8 +1716,8 @@ impl PeerManager {
             // into a dial-amplification proxy against attacker-chosen targets (issue #1183).
             // The heartbeat re-checks eligibility, so an oversized entry is also purged.
             && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
-            && self.has_valid_unbanned_ips(&info.addrs)
-            && self.peers.can_dial(&info.peer_id)
+            && self.has_valid_peer_ips(&info.peer_id, &info.addrs)
+            && self.can_dial(&info.peer_id)
     }
 
     /// Process newly discovered peers for potential dial attempts.

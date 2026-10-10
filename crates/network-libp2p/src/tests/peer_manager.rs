@@ -2095,10 +2095,13 @@ async fn test_banned_peer_dial_fails_and_ip_ban() {
     // verify IP is now banned after second peer banned from ip
     assert!(peer_manager.is_ip_banned(&ip));
 
-    // assert pending dial attempt fails
+    // Preserve a bounded authentication opportunity, then reject the authenticated offender.
     let dial_attempt =
         peer_manager.handle_pending_inbound_connection(connection_id, &local, &multiaddr);
-    assert!(dial_attempt.is_err());
+    assert!(dial_attempt.is_ok());
+    assert!(peer_manager
+        .handle_established_inbound_connection(connection_id, peer_id, &local, &multiaddr)
+        .is_err());
 }
 
 // Regression: a peer whose reputation is Banned but whose ConnectionStatus
