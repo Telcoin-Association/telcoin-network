@@ -23,8 +23,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 - Static upstream configuration (no hot reload, no dynamic discovery).
 - Calls for the worker go to the first ready worker in configuration order; there is no load balancing across workers.
   With `--redirect-queries`, only `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the worker and every other call goes to the query URL (see [Query redirect](#query-redirect)).
-- TLS termination and auth/API keys are out of scope; run the gateway behind
-  your own ingress/mTLS.
+- TLS termination for clients and auth/API keys are out of scope; run the gateway behind your own ingress/mTLS.
+  The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
 - Header forwarding is minimal. Upstream gets the request method, body, and
   `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
   identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
@@ -101,6 +101,9 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
+| `--upstream-ca-cert` | `WORKER_GATEWAY_UPSTREAM_CA_CERT` | (none) | PEM file of extra CA certificates trusted for `https` upstreams, on top of the system roots; see [TLS to workers](#tls-to-workers). |
+| `--upstream-client-cert` | `WORKER_GATEWAY_UPSTREAM_CLIENT_CERT` | (none) | PEM client certificate chain presented to an `https` upstream that asks for one; requires `--upstream-client-key`. |
+| `--upstream-client-key` | `WORKER_GATEWAY_UPSTREAM_CLIENT_KEY` | (none) | Unencrypted PEM private key for `--upstream-client-cert`; requires `--upstream-client-cert`. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
@@ -117,6 +120,38 @@ Every flag has an environment-variable fallback.
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
+
+### TLS to workers
+
+Worker RPC and readiness URLs may be `http` or `https`.
+The node serves both ports as plain `http`, so an `https` URL points at a TLS terminator in front of them, such as a reverse proxy on the worker host.
+The forwarding client and the readiness poller share one TLS configuration, and the `--redirect-queries` URL uses it too.
+
+```
+worker-gateway \
+  --upstream-rpc-url https://worker-0.internal:8545 \
+  --upstream-readiness-url https://worker-0.internal:8551/health/workers \
+  --upstream-ca-cert /etc/worker-gateway/worker-ca.pem \
+  --upstream-client-cert /etc/worker-gateway/gateway.pem \
+  --upstream-client-key /etc/worker-gateway/gateway-key.pem
+```
+
+- **System roots.** An `https` upstream is verified against the system CA certificates (or the bundle that `SSL_CERT_FILE` or `SSL_CERT_DIR` names), which the image installs.
+  When an `https` URL is configured without `--upstream-ca-cert` and the system store holds no certificate, the gateway refuses to start instead of failing every call.
+- **Custom CA.** `--upstream-ca-cert` adds every certificate in a PEM bundle to the trusted roots, so a worker certificate from a private CA needs only that CA's file.
+  The system roots stay trusted alongside it.
+  The certificate must name the host in the URL: a DNS name for a host name, an IP address entry for an IP literal.
+- **Client certificate.** `--upstream-client-cert` and `--upstream-client-key`, given together, present a client certificate for mutual TLS, so the terminator can refuse anything but the gateway.
+  The key must be an unencrypted PEM key (PKCS#8, PKCS#1 or SEC1).
+  The certificate is sent only to a server that asks for one, which can include the `--redirect-queries` URL.
+- **Startup checks.** The files are read once, at startup, so restart the gateway to pick up a renewed certificate.
+  An unreadable or empty file, a CA file without a certificate, one client flag without the other, or a key that does not match its certificate stops the gateway at startup.
+  The error names the flag, and the path of a file that cannot be read or parsed, but never quotes a file's content.
+- **Fail closed.** A worker whose certificate does not chain to a trusted root or does not name the URL's host, or whose terminator refuses the client certificate, fails the handshake.
+  Its readiness poll then fails, so it is not ready: `/ready` answers `503` and submissions get `503` / `-32000`, and a forward sent before the next poll notices gets `502` / `-32001`.
+- **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback or private address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
+  A domain name other than `localhost` counts as public, because the gateway does not resolve it.
+  When the hop leaves a network you control, use `https` or a tunnel.
 
 ## Connection handling
 
@@ -259,8 +294,8 @@ With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go 
 Method names match exactly and case-sensitively.
 Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or bytes after the JSON value.
 
-The URL may be `http` or `https`; worker URLs stay `http` only.
-An `https` URL needs the system CA certificates, which the image installs.
+The URL may be `http` or `https`, as worker URLs may.
+An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
 The URL must not point at the gateway itself or at a worker's RPC host and port, and plain `http` to a host that is not a loopback or private address logs a warning at startup.
 
 A batch goes to the worker only when every element is a submission.
@@ -401,7 +436,7 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
 - The node's `--healthcheck` port: reachable from the gateway hosts only.
   It is unauthenticated and serves one connection at a time, so a few idle connections from anyone else make every gateway report not ready.
 - The gateway's metrics port: inside the monitoring network only.
-- The gateway-to-worker hop is plaintext `http`; when it leaves a network you control, run it through a tunnel.
+- When the gateway-to-worker hop leaves a network you control, use `https` worker URLs, ideally with a client certificate (see [TLS to workers](#tls-to-workers)), or run it through a tunnel; plain `http` to a public address logs a warning at startup.
 
 ## Deployment
 

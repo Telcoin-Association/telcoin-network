@@ -3,11 +3,12 @@
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::Duration,
 };
 
 use clap::Parser;
+use reqwest::{Certificate, Identity};
 use tracing::warn;
 use url::Url;
 
@@ -35,12 +36,12 @@ pub(crate) struct Cli {
     )]
     pub(crate) config: Option<PathBuf>,
 
-    /// Inline single upstream: the worker JSON-RPC base URL
+    /// Inline single upstream: the worker JSON-RPC base URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8545`).
     #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_RPC_URL")]
     pub(crate) upstream_rpc_url: Option<Url>,
 
-    /// Inline single upstream: the node readiness URL
+    /// Inline single upstream: the node readiness URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8551/health/workers`).
     #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_READINESS_URL")]
     pub(crate) upstream_readiness_url: Option<Url>,
@@ -97,6 +98,28 @@ pub(crate) struct Cli {
         value_parser = humantime::parse_duration
     )]
     pub(crate) upstream_request_timeout: Duration,
+
+    /// PEM file of extra CA certificates to trust for `https` upstreams, on
+    /// top of the platform's native root store. Every certificate in the file
+    /// is trusted; the file is read once at startup. Applies to the worker RPC
+    /// and readiness URLs and to the `--redirect-queries` endpoint. Unset (the
+    /// default) trusts the native root store only.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CA_CERT")]
+    pub(crate) upstream_ca_cert: Option<PathBuf>,
+
+    /// PEM file holding the client certificate, followed by any intermediates,
+    /// that the gateway presents to an `https` upstream asking for one (mutual
+    /// TLS). Requires `--upstream-client-key`; read once at startup. Applies to
+    /// the worker RPC and readiness URLs and to a `--redirect-queries` endpoint
+    /// that asks for a client certificate. Unset (the default) presents none.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CLIENT_CERT")]
+    pub(crate) upstream_client_cert: Option<PathBuf>,
+
+    /// PEM file holding the private key (PKCS#8, PKCS#1 or SEC1, unencrypted)
+    /// for `--upstream-client-cert`. Requires `--upstream-client-cert`; read
+    /// once at startup. Unset (the default) presents no client certificate.
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_CLIENT_KEY")]
+    pub(crate) upstream_client_key: Option<PathBuf>,
 
     /// How long a new connection may take to send its complete request headers
     /// before it is disconnected (slow-loris guard).
@@ -244,6 +267,12 @@ pub(crate) struct Settings {
     pub(crate) upstream_connect_timeout: Duration,
     /// Upstream per-request deadline.
     pub(crate) upstream_request_timeout: Duration,
+    /// Extra trust anchors for `https` upstreams (`--upstream-ca-cert`), added
+    /// to the native root store; empty when the flag is unset.
+    pub(crate) upstream_ca_certs: Vec<Certificate>,
+    /// Client certificate and key presented to an `https` upstream that asks
+    /// for one (`--upstream-client-cert`, `--upstream-client-key`), or `None`.
+    pub(crate) upstream_identity: Option<Identity>,
     /// Inbound header read deadline (slow-loris guard).
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
@@ -277,15 +306,30 @@ impl Cli {
         let upstreams = self.resolve_upstreams()?;
         eyre::ensure!(!upstreams.is_empty(), "no upstream workers configured");
         upstreams.iter().try_for_each(|upstream| {
-            ensure_http_scheme(&upstream.rpc_url)?;
-            ensure_http_scheme(&upstream.readiness_url)?;
+            ensure_http_or_https(&upstream.rpc_url)?;
+            ensure_http_or_https(&upstream.readiness_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.rpc_url)?;
             ensure_not_gateway(self.listen_addr, &upstream.readiness_url)
         })?;
+        plaintext_worker_urls(&upstreams).for_each(|(worker_id, url)| {
+            warn!(
+                target: "gateway",
+                worker_id,
+                upstream = %UpstreamOrigin(url),
+                "worker upstream uses plain http to a host that is not a loopback or private \
+                 address; submissions, reads and readiness cross the network unencrypted"
+            );
+        });
         let query_upstream = self
             .redirect_queries
             .map(|url| ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url))
             .transpose()?;
+        let upstream_ca_certs =
+            self.upstream_ca_cert.as_deref().map(load_ca_certs).transpose()?.unwrap_or_default();
+        let upstream_identity = load_identity(
+            self.upstream_client_cert.as_deref(),
+            self.upstream_client_key.as_deref(),
+        )?;
         let max_connection_duration = resolve_optional_duration(self.max_connection_duration);
         // The longest a single request stays live from the gateway's own point
         // of view: up to `header_read_timeout` reading the head before the
@@ -320,6 +364,8 @@ impl Cli {
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
             upstream_request_timeout: self.upstream_request_timeout,
+            upstream_ca_certs,
+            upstream_identity,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
@@ -396,19 +442,114 @@ fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
         })
 }
 
-/// Reject non-`http` worker URLs at startup. The hop to a worker is HTTP-only:
-/// the gateway carries a TLS backend for `--redirect-queries`, but TLS to
-/// workers (and to their readiness endpoints) is not supported, so an `https`
-/// worker URL is a configuration error reported here rather than a surprise at
-/// runtime.
-fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
+/// Reject a worker RPC or readiness URL whose scheme is neither `http` nor
+/// `https` at startup, rather than at the first forward or poll. An `https`
+/// URL is verified against the native root store plus any `--upstream-ca-cert`
+/// certificates (see [`crate::proxy::client_builder`]). The message names the
+/// URL by origin only.
+fn ensure_http_or_https(url: &Url) -> eyre::Result<()> {
     eyre::ensure!(
-        url.scheme() == "http",
-        "unsupported URL scheme `{}` in `{url}`: worker upstreams are HTTP-only; TLS is \
-         supported only for --redirect-queries",
-        url.scheme()
+        matches!(url.scheme(), "http" | "https"),
+        "unsupported URL scheme `{}` in worker upstream `{}`: use http or https",
+        url.scheme(),
+        UpstreamOrigin(url)
     );
     Ok(())
+}
+
+/// Read the `--upstream-ca-cert` PEM bundle into trust anchors.
+///
+/// The file is read once, at startup. An unreadable or empty file, one that
+/// holds no PEM certificate, or one with a certificate rustls cannot parse is
+/// a startup error rather than a client that silently trusts nothing extra.
+/// Messages name the file by path only, never its content.
+fn load_ca_certs(path: &Path) -> eyre::Result<Vec<Certificate>> {
+    let pem = read_pem_file("--upstream-ca-cert", path)?;
+    let certs = Certificate::from_pem_bundle(&pem).map_err(|_| {
+        eyre::eyre!(
+            "--upstream-ca-cert file `{}` is not a valid PEM certificate bundle",
+            path.display()
+        )
+    })?;
+    eyre::ensure!(
+        !certs.is_empty(),
+        "--upstream-ca-cert file `{}` holds no PEM certificate",
+        path.display()
+    );
+    eyre::ensure!(
+        rustls_accepts(|builder| {
+            certs.iter().cloned().fold(builder, reqwest::ClientBuilder::add_root_certificate)
+        }),
+        "--upstream-ca-cert file `{}` holds a certificate that cannot be parsed",
+        path.display()
+    );
+    Ok(certs)
+}
+
+/// Read the `--upstream-client-cert` and `--upstream-client-key` PEM files into
+/// the identity presented to an upstream that asks for a client certificate.
+///
+/// Both flags or neither: one without the other is a startup error rather than
+/// a gateway that silently presents nothing. Each file is read once, at
+/// startup; messages name the files by path only, never their content. A key
+/// that does not match the certificate, or a certificate rustls cannot parse,
+/// is reported here against both paths (see [`rustls_accepts`]).
+fn load_identity(cert: Option<&Path>, key: Option<&Path>) -> eyre::Result<Option<Identity>> {
+    let (cert, key) = match (cert, key) {
+        (None, None) => return Ok(None),
+        (Some(cert), Some(key)) => (cert, key),
+        (Some(_), None) => eyre::bail!("--upstream-client-cert requires --upstream-client-key"),
+        (None, Some(_)) => eyre::bail!("--upstream-client-key requires --upstream-client-cert"),
+    };
+    // `Identity::from_pem` takes the key and the certificate chain in one buffer
+    let mut pem = read_pem_file("--upstream-client-key", key)?;
+    pem.push(b'\n');
+    pem.extend(read_pem_file("--upstream-client-cert", cert)?);
+    let identity = Identity::from_pem(&pem).map_err(|_| {
+        eyre::eyre!(
+            "--upstream-client-cert `{}` and --upstream-client-key `{}` do not hold a PEM \
+             certificate and an unencrypted PEM private key",
+            cert.display(),
+            key.display()
+        )
+    })?;
+    eyre::ensure!(
+        rustls_accepts(|builder| builder.identity(identity.clone())),
+        "--upstream-client-cert `{}` and --upstream-client-key `{}` do not hold a certificate \
+         and the private key that matches it",
+        cert.display(),
+        key.display()
+    );
+    Ok(Some(identity))
+}
+
+/// Read the PEM file that `flag` names, rejecting an unreadable or empty file.
+/// The error names the flag and the path, never the content.
+fn read_pem_file(flag: &str, path: &Path) -> eyre::Result<Vec<u8>> {
+    let pem = std::fs::read(path)
+        .map_err(|err| eyre::eyre!("cannot read {flag} file `{}`: {err}", path.display()))?;
+    eyre::ensure!(
+        !pem.iter().all(u8::is_ascii_whitespace),
+        "{flag} file `{}` is empty",
+        path.display()
+    );
+    Ok(pem)
+}
+
+/// Whether rustls accepts the TLS material `configure` adds to a bare client.
+///
+/// In a rustls-only build reqwest decodes the PEM armour when a file is loaded,
+/// but rustls parses what is inside only when a client is built, so a bad block
+/// would otherwise fail the client build in [`crate::app`] with an error that
+/// names no file. A throwaway client built here, without the native root store,
+/// lets the caller report the file by flag and path. The rustls error is
+/// dropped, as it can quote what it failed to parse.
+fn rustls_accepts(
+    configure: impl FnOnce(reqwest::ClientBuilder) -> reqwest::ClientBuilder,
+) -> bool {
+    configure(reqwest::Client::builder().use_rustls_tls().tls_built_in_root_certs(false))
+        .build()
+        .is_ok()
 }
 
 /// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
@@ -457,6 +598,23 @@ fn ensure_query_upstream(
         );
     }
     Ok(())
+}
+
+/// The worker RPC and readiness URLs that use plain `http` to a host that is
+/// not a loopback or private address literal, each with its worker id.
+///
+/// Such a hop may cross a network the operator does not control, where an
+/// on-path attacker can drop submissions behind their computable hash and
+/// forge reads and readiness. Startup warns about each one, as
+/// [`ensure_query_upstream`] does for the redirect, rather than refusing it:
+/// the address may still be on a private network the check cannot see.
+fn plaintext_worker_urls(upstreams: &[UpstreamWorker]) -> impl Iterator<Item = (u16, &Url)> + '_ {
+    upstreams
+        .iter()
+        .flat_map(|upstream| {
+            [(upstream.worker_id, &upstream.rpc_url), (upstream.worker_id, &upstream.readiness_url)]
+        })
+        .filter(|(_, url)| plaintext_to_public_host(url))
 }
 
 /// Whether two URLs name the same host and port, whatever their schemes.
@@ -641,14 +799,162 @@ mod tests {
     }
 
     #[test]
-    fn https_upstream_is_rejected() {
-        let result = cli_with(
+    fn https_upstream_is_accepted() -> eyre::Result<()> {
+        let settings = cli_with(
             None,
-            Some("https://127.0.0.1:8545"),
-            Some("http://127.0.0.1:8551/health/workers"),
+            Some("https://10.0.0.7:8545"),
+            Some("https://10.0.0.7:8551/health/workers"),
         )
-        .into_settings();
-        assert!(result.is_err());
+        .into_settings()?;
+        assert_eq!(settings.upstreams.len(), 1);
+        assert!(settings.upstream_ca_certs.is_empty(), "no extra trust anchors by default");
+        Ok(())
+    }
+
+    #[test]
+    fn non_http_worker_schemes_are_rejected() {
+        for (rpc, readiness) in [
+            ("ws://10.0.0.7:8545", "http://10.0.0.7:8551/health/workers"),
+            ("http://10.0.0.7:8545", "ftp://10.0.0.7:8551/health/workers"),
+        ] {
+            let result = cli_with(None, Some(rpc), Some(readiness)).into_settings();
+            assert!(result.is_err(), "{rpc} / {readiness} must be rejected");
+        }
+    }
+
+    #[test]
+    fn unreadable_ca_file_error_names_the_path_only() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = dir.path().join("missing-ca.pem");
+        let empty = dir.path().join("empty-ca.pem");
+        std::fs::write(&empty, " \n")?;
+        let no_pem = dir.path().join("no-pem.pem");
+        std::fs::write(&no_pem, "s3cr3t plain text without a pem block\n")?;
+        let key_only = dir.path().join("key-only.pem");
+        std::fs::write(
+            &key_only,
+            "s3cr3t note\n-----BEGIN PRIVATE KEY-----\nczNjcjN0\n-----END PRIVATE KEY-----\n",
+        )?;
+        let garbled = dir.path().join("garbled-ca.pem");
+        std::fs::write(
+            &garbled,
+            "-----BEGIN CERTIFICATE-----\ns3cr3t!!not base64\n-----END CERTIFICATE-----\n",
+        )?;
+        // valid base64 ("s3cr3t not a certificate") in a certificate block,
+        // which only rustls rejects
+        let not_x509 = dir.path().join("not-x509-ca.pem");
+        std::fs::write(
+            &not_x509,
+            "-----BEGIN CERTIFICATE-----\nczNjcjN0IG5vdCBhIGNlcnRpZmljYXRl\n-----END CERTIFICATE-----\n",
+        )?;
+        // a directory cannot be read as a file, whoever runs the test
+        for path in [missing.as_path(), dir.path(), &empty, &no_pem, &key_only, &garbled, &not_x509]
+        {
+            let flag = format!("--upstream-ca-cert={}", path.display());
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("{} must be rejected", path.display()),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("--upstream-ca-cert"), "flag missing from: {message}");
+            assert!(message.contains(&path.display().to_string()), "path missing from: {message}");
+            assert!(!message.contains("s3cr3t"), "file content leaked into: {message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cert_without_key_is_rejected_at_startup() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["gateway.test".to_string()])?;
+        let cert_path = dir.path().join("client.pem");
+        std::fs::write(&cert_path, cert.pem())?;
+        let key_path = dir.path().join("client-key.pem");
+        std::fs::write(&key_path, key_pair.serialize_pem())?;
+        let cert_flag = format!("--upstream-client-cert={}", cert_path.display());
+        let key_flag = format!("--upstream-client-key={}", key_path.display());
+
+        for (flags, missing) in [
+            ([cert_flag.as_str()], "--upstream-client-key"),
+            ([key_flag.as_str()], "--upstream-client-cert"),
+        ] {
+            let message = match cli_with_flags(&flags).into_settings() {
+                Ok(_) => panic!("{flags:?} alone must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(missing), "`{missing}` missing from: {message}");
+        }
+
+        let settings = cli_with_flags(&[cert_flag.as_str(), key_flag.as_str()]).into_settings()?;
+        assert!(settings.upstream_identity.is_some(), "both files make an identity");
+        assert!(cli_with_flags(&[]).into_settings()?.upstream_identity.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn client_identity_errors_name_the_paths_only() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let rcgen::CertifiedKey { cert, key_pair } =
+            rcgen::generate_simple_self_signed(vec!["gateway.test".to_string()])?;
+        let cert_path = dir.path().join("client.pem");
+        std::fs::write(&cert_path, cert.pem())?;
+        // a key file holding no key: the pair cannot make an identity
+        let key_path = dir.path().join("not-a-key.pem");
+        std::fs::write(&key_path, "s3cr3t text without a pem block\n")?;
+        let missing = dir.path().join("missing-key.pem");
+        // a key that parses but belongs to another certificate, which only
+        // rustls rejects
+        let other_key_path = dir.path().join("other-key.pem");
+        let other = rcgen::generate_simple_self_signed(vec!["other.test".to_string()])?;
+        std::fs::write(&other_key_path, other.key_pair.serialize_pem())?;
+        // valid base64 ("s3cr3t not a certificate") in a certificate block
+        // next to a real key, which only rustls rejects
+        let not_x509_path = dir.path().join("not-x509-client.pem");
+        std::fs::write(
+            &not_x509_path,
+            "-----BEGIN CERTIFICATE-----\nczNjcjN0IG5vdCBhIGNlcnRpZmljYXRl\n-----END CERTIFICATE-----\n",
+        )?;
+        let own_key_path = dir.path().join("client-key.pem");
+        std::fs::write(&own_key_path, key_pair.serialize_pem())?;
+        // (certificate file, key file, whether the error must name the
+        // certificate file too)
+        for (cert, key, names_cert) in [
+            (&cert_path, &key_path, true),
+            (&cert_path, &missing, false),
+            (&cert_path, &other_key_path, true),
+            (&not_x509_path, &own_key_path, true),
+        ] {
+            let message = match cli_with_flags(&[
+                format!("--upstream-client-cert={}", cert.display()).as_str(),
+                format!("--upstream-client-key={}", key.display()).as_str(),
+            ])
+            .into_settings()
+            {
+                Ok(_) => panic!("{} / {} must be rejected", cert.display(), key.display()),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(&key.display().to_string()), "path missing from: {message}");
+            if names_cert {
+                let cert = cert.display().to_string();
+                assert!(message.contains(&cert), "path missing from: {message}");
+            }
+            assert!(!message.contains("s3cr3t"), "file content leaked into: {message}");
+            assert!(!message.contains("BEGIN"), "pem content leaked into: {message}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ca_file_certificates_are_loaded() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let bundle = dir.path().join("ca.pem");
+        let one = rcgen::generate_simple_self_signed(vec!["one.test".to_string()])?.cert.pem();
+        let two = rcgen::generate_simple_self_signed(vec!["two.test".to_string()])?.cert.pem();
+        std::fs::write(&bundle, format!("{one}{two}"))?;
+        let flag = format!("--upstream-ca-cert={}", bundle.display());
+        let settings = cli_with_flags(&[flag.as_str()]).into_settings()?;
+        assert_eq!(settings.upstream_ca_certs.len(), 2, "every certificate in the file is trusted");
+        Ok(())
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does
@@ -808,6 +1114,35 @@ mod tests {
         let result =
             cli_with_flags(&["--redirect-queries=https://rpc.example.com/#frag"]).into_settings();
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn plaintext_to_public_worker_host_warns() -> eyre::Result<()> {
+        let worker = |worker_id, rpc: &str, readiness: &str| -> eyre::Result<UpstreamWorker> {
+            Ok(UpstreamWorker {
+                worker_id,
+                rpc_url: Url::parse(rpc)?,
+                readiness_url: Url::parse(readiness)?,
+            })
+        };
+        let upstreams = [
+            worker(0, "http://10.0.0.7:8545", "http://10.0.0.7:8551/health/workers")?,
+            worker(1, "http://203.0.113.5:8545", "https://203.0.113.5:8551/health/workers")?,
+            worker(2, "https://worker.example.com/", "http://worker.example.com:8551/health")?,
+            worker(3, "https://203.0.113.9:8545", "https://203.0.113.9:8551/health/workers")?,
+            worker(4, "http://localhost:8545", "http://[::1]:8551/health/workers")?,
+        ];
+        let warned: Vec<(u16, String)> = plaintext_worker_urls(&upstreams)
+            .map(|(worker_id, url)| (worker_id, UpstreamOrigin(url).to_string()))
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                (1, "http://203.0.113.5:8545".to_string()),
+                (2, "http://worker.example.com:8551".to_string())
+            ]
+        );
+        Ok(())
     }
 
     #[test]
