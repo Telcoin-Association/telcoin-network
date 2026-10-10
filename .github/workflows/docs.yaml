@@ -42,7 +42,12 @@ concurrency:
 jobs:
   # Build main with the pinned mdBook and hand the site to the deploy job as a
   # Pages artifact.
+  # A dispatch runs this file from the ref it was started on, so the `if:` only stops
+  # an accidental dispatch from another branch (and skips the deploy job through
+  # `needs`). The real control is the github-pages environment's deployment rule,
+  # which allows only main; keep it that way.
   build:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -59,12 +64,20 @@ jobs:
         run: mdbook build docs --dest-dir "$PWD/site"
 
       # mdBook only logs a missing include and leaves the raw directive in the
-      # page, and a missing anchor includes nothing, so a broken Release notes
-      # page still builds. Fail here instead of publishing it.
+      # page, a missing anchor includes nothing, and a stray anchor line in the
+      # included text cuts the page short, so a broken Release notes page still
+      # builds. Fail here instead of publishing it: the anchor must be in
+      # CHANGELOG.md, the include directive must be gone from the page, and the
+      # page must show every CHANGELOG.md section. Commit text that quotes
+      # `{{#include` is fine, because only the exact directive is looked for.
       - name: Check the release notes include
         run: |
+          page=site/getting-started/release-notes.html
           grep -q 'ANCHOR: releases' CHANGELOG.md || { echo "::error::CHANGELOG.md lacks the releases anchor"; exit 1; }
-          if grep -q '{{#include' site/getting-started/release-notes.html; then echo "::error::CHANGELOG.md include did not resolve"; exit 1; fi
+          if grep -qF '{{#include ../../../CHANGELOG.md:releases}}' "$page"; then echo "::error::the CHANGELOG.md include did not resolve"; exit 1; fi
+          want=$(grep -c '^## \[' CHANGELOG.md || true)
+          got=$(grep -c '<h2 id="v' "$page" || true)
+          [ "$want" = "$got" ] || { echo "::error::the Release notes page shows $got of the $want CHANGELOG.md sections"; exit 1; }
 
       # Since v4 hidden files (any path component starting with `.`) stay out of the
       # artifact (v5 added `include-hidden-files: true` to keep them), so mdBook's

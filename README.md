@@ -11,7 +11,7 @@ The Telcoin Network protocol client supports Linux and MacOS operating systems. 
 
 ## Install
 
-Releases are signed git tags with a Linux x86_64 tarball and a `linux/amd64` container image published as `ghcr.io/telcoin-association/telcoin-network:<tag>`. Tags ending in `-adiri` are built with the `adiri` feature for the adiri testnet. Each release lists the tarball and the image digest in `SHA256SUMS`, and `SHA256SUMS.asc` carries a detached signature over that file from a maintainer's OpenPGP key held on a YubiKey. Follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) to download a release and check its signature and checksums before you run it.
+Releases are signed git tags with a Linux x86_64 tarball and a `linux/amd64` container image published as `ghcr.io/telcoin-association/telcoin-network:<tag>`. Tags ending in `-adiri` are built with the `adiri` feature for the adiri testnet. Each release lists the tarball and the image digest in `SHA256SUMS`, and `SHA256SUMS.asc` carries a detached signature over that file from a maintainer's OpenPGP key held on a YubiKey. Follow [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) to download a release and check its signature and checksums before you run it. The check takes the maintainer keys from `.github/maintainer-gpg-keys/` on `main`, never from the release's tag, and has you compare their fingerprints with the table in `SECURITY.md` and with the maintainers' keys on GitHub.
 
 On macOS or any other platform, build from source as shown in the Quick Start below.
 

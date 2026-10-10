@@ -371,19 +371,23 @@ The maintainer publishes with their own `gh` login, so the event fires; GitHub s
 A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode`, and is possible only once the workflow is on `main`.
 `validate` runs `validate-tag` alone and drafts nothing; run on an old, unsigned tag, it shows that the gate fails closed.
 `verify` works on a published release only, because a read-only token cannot see drafts.
-If the attestation was missing when a tag was pushed, run `make attest` and re-run the failed jobs; there is no need to re-tag.
+If the attestation was missing when a tag was pushed, run `make attest` on the tagged commit, with `ALLOW_STALE_BASE=1` if `main` has moved past it, and re-run the failed jobs; there is no need to re-tag.
 No job in `release.yaml` may be named `CI Success`: item 1 of "Repository settings this requires" says why, and a tag can be pushed on any commit, a pull request's head included.
 
 ### Scripts and keys come from `main`
 
 Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read) and `persist-credentials: false`.
+The checkout step still receives the job's token and fetches with it; `persist-credentials: false` only keeps the token out of `.git/config` for the steps after it.
 `etc/release.sh`, `.github/scripts/verify_commit_hash.sh` and the allowlist all come from that checkout.
 The reason is the one the `attest` job in `pr.yaml` gives for its `trusted/` checkout: a tag on a commit that edits a script or adds a key would otherwise be judged by its own edit.
 The local `make release-*` targets read the allowlist from `origin/main` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
+The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main`, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
 
 The job definitions are the exception.
-GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow, write token included.
-The tag ruleset below is what stops that.
+GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
+The tag ruleset below keeps anyone but the maintainers from creating, moving or deleting a `v*` tag, so an edited workflow cannot run for a release tag a maintainer did not push.
+It does not keep a `contents: write` token from anyone with write access: they can push a branch whose workflow asks for one, or create, edit, publish and delete releases with their own credentials.
+What protects a release is the maintainer signatures, which `make release-publish` and `verify-release` check against the allowlist on `main`, not the token.
 
 ### Why CI never builds
 
@@ -391,13 +395,17 @@ CI cannot run the full suite (the top of this file says why).
 What vouches for a released commit is the attested local run, e2e included, and the release binary and image are built from that commit on the maintainer's host by `make release-build`.
 A `GITHUB_TOKEN` must also never be able to publish an artifact.
 A CI build would compile every dependency, build scripts and procedural macros included, in a job holding a token that can upload release assets or push the image.
-In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs `etc/release.sh draft` and `gh` and nothing else.
-That token can create and edit a release, but it holds no artifact and cannot sign one, and an operator's check rejects anything not signed by a key in the allowlist.
+In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs only the pinned `actions/checkout`, which fetches `main` with the token and does not leave it in the checkout, and `etc/release.sh draft`, which calls `gh`.
+Its `contents: write` lets the token create, edit, publish and delete releases and their assets, and push any branch or tag that no ruleset protects, but it holds no artifact and cannot sign one.
+Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `SECURITY.md` on `main`.
+The release text is not protected: anyone with write access can edit a draft's notes, so the install page, built from `main`, is the reference.
 
 ### The post-publish check is detective only
 
 `verify-release` repeats the checks `make release-publish` runs before it publishes: the tag checks, the asset set and `SHA256SUMS`, the signatures on `SHA256SUMS` against the allowlist on `main`, the image digest against the registry, and that the binary in the image is the one in the tarball and reports the tagged commit.
 By the time it runs the release is public, so a failure is an alarm for a maintainer, not a gate.
+It runs only for a publish that was not made with a `GITHUB_TOKEN`: GitHub starts no workflow for an event a `GITHUB_TOKEN` caused, so a draft that anyone with write access publishes from a workflow on their own branch is never checked here and raises no alarm.
+After every publish, check that a `verify-release` run exists for the tag, and if none does, start one with a `verify` dispatch.
 What keeps a release from changing after it passed is the immutable-releases setting below, not this job.
 
 ### Settings the release workflow requires
@@ -407,13 +415,16 @@ None of these is visible to the workflow, and each closes a gap the workflow lea
 1. **A tag ruleset** (Settings -> Rules -> Rulesets) on the `v*` tags that lets only the maintainers create, update or delete one.
    `validate-tag` proves who signed a tag, not who pushed it, and GitHub runs the workflow definition at the tagged commit.
    Without the rule, anyone with write access could push a `v*` tag on a commit with an edited `release.yaml`, or move or delete a tag after it was validated.
+   The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
 2. **Immutable releases** (Settings -> General -> Releases).
    Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
-3. **The ghcr package `ghcr.io/telcoin-association/telcoin-network` is public, linked to this repository, and writable only by the maintainers.**
+3. **The ghcr package `ghcr.io/telcoin-association/telcoin-network` is public, linked to this repository, and writable only by the maintainers, by account and by workflow.**
    Operators, `verify-release` and `etc/release.sh` read it anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
-   The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed.
-   Write access is set on the package (Package settings -> Manage access); a package that inherits access from this repository lets every account with write access here push to it.
-   No workflow has `packages: write`.
+   The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
+   Two lists in Package settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the maintainers; under "Manage Actions access", this repository must be absent or have the Read role.
+   Otherwise anyone with write access here can push to the package, directly or from a workflow on any branch that asks for `packages: write`, and overwrite `:vX.Y.Z`, `:latest` or `:adiri`.
+   No workflow here asks for `packages: write`, but anyone with write access can add one on a branch, so that is not a control.
+   A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST`.
 4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
    `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
 

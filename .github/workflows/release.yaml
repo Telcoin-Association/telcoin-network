@@ -5,9 +5,12 @@
 # maintainer's host by `make release-build`, from a commit whose full local suite, e2e
 # included, was attested on-chain. CI cannot run that suite, and a job that compiled
 # the workspace would run every dependency's build code next to a token that can write
-# releases. The only job here with a write token runs etc/release.sh and gh, nothing
-# else, and no token in CI can sign: the signatures on the tag and on SHA256SUMS come
-# from maintainer keys that never touch a runner. The procedure:
+# releases. The only job here with a write token runs the pinned actions/checkout,
+# which receives the token for its fetch and does not leave it in the checkout, and
+# etc/release.sh, which calls gh. That token guards nothing by itself: anyone with write
+# access can get the same permission from a workflow on their own branch. No token in CI
+# can sign: the signatures on the tag and on SHA256SUMS come from maintainer keys that
+# never touch a runner, and they are what protects a release. The procedure:
 # https://docs.telcoin.network/maintainers/releasing.html
 #
 # Every job checks out main as it stands when the job starts, never the tagged tree,
@@ -17,7 +20,8 @@
 # by its own edit. This file itself is not covered by that. GitHub reads the job
 # definitions from the tagged commit (for a dispatch, from the branch it is run on), so
 # who may push a `v*` tag is decided by the tag ruleset, a repository setting
-# (.github/ACTIONS.md, "Release workflow").
+# (.github/ACTIONS.md, "Release workflow"). The ruleset limits who can create, move or
+# delete a `v*` tag and nothing else; it does not limit who can write releases.
 #
 # The post-publish check (`verify-release`) is detective only. The release is already
 # public when it runs, so a failure is an alarm for a maintainer, not a gate.
@@ -35,16 +39,19 @@ on:
     tags: ["v*"]
   # `published` also fires when a draft is published as a prerelease, which every adiri
   # and rc release is; `prereleased` does not fire for those. The maintainer publishes
-  # with their own gh login, so the event fires (one caused by a GITHUB_TOKEN would
-  # start no workflow).
+  # with their own gh login, so the event fires. A publish made with a GITHUB_TOKEN
+  # starts no workflow, so a release published from another workflow is never checked
+  # here; the maintainer guide says to confirm a verify-release run exists after every
+  # publish and to dispatch `verify` if none does.
   release:
     types: [published]
   # Runs only once this file is on the default branch. `validate` repeats the tag
   # checks and drafts nothing; run on an old, unsigned tag it fails, which shows the
   # gate fails closed. `verify` repeats the post-publish check; the token cannot see
   # draft releases, so it works on published ones only.
-  # If the attestation was missing when a tag was pushed, run `make attest` and re-run
-  # the failed jobs instead: there is no need to re-tag.
+  # If the attestation was missing when a tag was pushed, run `make attest` on the
+  # tagged commit (with ALLOW_STALE_BASE=1 if main has moved past it) and re-run the
+  # failed jobs instead: there is no need to re-tag.
   workflow_dispatch:
     inputs:
       tag:
@@ -63,10 +70,13 @@ on:
 permissions:
   contents: read
 
-# One run per tag at a time, queued rather than cancelled: a cancelled run would leave a
-# pushed tag without its draft, or a published release unchecked.
+# One run per event and tag at a time. A running run is never cancelled, but GitHub
+# keeps only the newest waiting run in a group and cancels the one already waiting
+# there. With the event in the key, a dispatch can never displace a waiting push or
+# release run; only another run of the same event and tag can, such as a third dispatch
+# for one tag. A cancelled run shows as cancelled and can be re-run.
 concurrency:
-  group: release-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  group: release-${{ github.event_name }}-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 # The steps read the tag from here and nowhere else. Every `run:` below uses
@@ -160,8 +170,10 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # The only write in this workflow. It lets the token create and edit releases; it
-    # cannot sign one, and an operator's check rejects a release without signatures.
+    # The only write in this workflow. contents: write lets the token create, edit,
+    # publish and delete releases and their assets, and push any branch or tag that no
+    # ruleset protects. It holds no artifact and cannot sign one, and the install page's
+    # check verifies SHA256SUMS.asc against the keys on main.
     permissions:
       contents: write
     steps:
@@ -177,11 +189,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: ./etc/release.sh draft "$RELEASE_TAG"
 
-  # Proves: the published release is still what the maintainer verified before
-  # publishing. It repeats the tag checks, then checks the asset set and SHA256SUMS, the
-  # maintainer signatures on SHA256SUMS against the allowlist on main, the image digest
-  # against the registry, and that the binary in the image is the one in the tarball and
-  # reports the tagged commit.
+  # Proves: the published release is still what `make release-publish` verified, which
+  # re-checks the asset set after its prompt and again after publishing. It repeats the
+  # tag checks, then checks the asset set and SHA256SUMS, the maintainer signatures on
+  # SHA256SUMS against the allowlist on main, the image digest against the registry, and
+  # that the binary in the image is the one in the tarball and reports the tagged commit.
   # Does not prove anything in advance: the release is public before this runs, so a
   # failure is an alarm, not a gate. Keeping the release from changing after this check
   # is the job of immutable releases, a repository setting.

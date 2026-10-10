@@ -11,7 +11,7 @@ The examples use `v0.17.0-adiri`.
 
 | Step | Where | Command | Result |
 | --- | --- | --- | --- |
-| 1. Release PR | xerxes | `make release-prep TAG=v0.17.0-adiri`, a PR merged alone, then `make attest` | The attested `release: v0.17.0-adiri` commit on `main` |
+| 1. Release PR | xerxes | `make release-prep TAG=v0.17.0-adiri`, a PR merged alone, then `ALLOW_STALE_BASE=1 make attest` on the release commit | The attested `release: v0.17.0-adiri` commit on `main` |
 | 2. Tag | laptop | `make release-tag TAG=v0.17.0-adiri` | A signed tag on GitHub |
 | 3. Validate and draft | CI | runs when the tag is pushed | A draft release with generated notes |
 | 4. Build | xerxes | `make release-build TAG=v0.17.0-adiri` | The image pushed as `:v0.17.0-adiri`; the tarball, `IMAGE_DIGEST` and `SHA256SUMS` on the draft |
@@ -23,14 +23,15 @@ The examples use `v0.17.0-adiri`.
 
 | Tag | Network | Build features | Image tags | GitHub release |
 | --- | --- | --- | --- | --- |
-| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` | Latest |
+| `vX.Y.Z` | mainnet | none | `:vX.Y.Z`, `:latest` | Latest, or a normal release if a higher mainnet version is already published |
 | `vX.Y.Z-rcN` | mainnet release candidate | none | `:vX.Y.Z-rcN` only | Pre-release |
 | `vX.Y.Z-adiri` | Adiri testnet | `adiri` | `:vX.Y.Z-adiri`, `:adiri` | Pre-release |
 | `vX.Y.Z-adiri-rcN` | Adiri release candidate | `adiri` | `:vX.Y.Z-adiri-rcN` only | Pre-release |
 
 `release-build` pushes the image under the tag name.
 `release-publish` moves `:latest` or `:adiri` only when the release is the highest published final version in its channel, so publishing an older patch later does not move the alias back.
-It marks a release Latest only when it is a mainnet final release with the highest published mainnet version, and publishes everything else as a pre-release.
+It marks a release Latest only when it is a mainnet final release with the highest published mainnet version.
+An older mainnet final, such as a patch to an earlier minor version, is published as a normal release that is not Latest, and every release candidate and Adiri release as a pre-release.
 `etc/release.sh` rejects any tag outside this grammar, so neither CI nor the `make` targets accept one; numbers have no leading zeros, and `N` starts at 1.
 
 The tag checks also enforce these version rules:
@@ -84,15 +85,15 @@ make release-prep TAG=v0.17.0-adiri
 `release-prep` checks that the tracked tree is clean, that `HEAD` is `origin/main`, and that the tag exists neither locally nor on GitHub.
 It sets `[workspace.package].version` to `0.17.0`, runs `cargo update --workspace`, and generates the new `CHANGELOG.md` section with git-cliff in Docker.
 The section records the `main` commit it was generated on in a `<!-- release-base: <sha> -->` line under its heading.
-It prints the section, then the commands to run next:
+It prints the section and a `Next:` list that starts with these commands:
 
 ```sh
 git switch -c release/v0.17.0-adiri
 git commit -am "release: v0.17.0-adiri"
-gh pr create --title "release: v0.17.0-adiri"
+gh pr create --title "release: v0.17.0-adiri" --body "Version 0.17.0 and the CHANGELOG section for v0.17.0-adiri."
 ```
 
-Review the section, but do not edit it; `CHANGELOG.md` sections are generated, never written by hand.
+Review the section, but do not edit it; `CHANGELOG.md` sections are generated, never written by hand, except to remove a release withdrawn before publishing (see [Before publish](#before-publish)).
 Notes for operators, such as a required resync, a configuration change or an activation epoch, go in the GitHub release in step 4.
 
 Attest the PR head with `make attest` as for any PR, then merge it through the merge queue on its own.
@@ -100,12 +101,20 @@ The tag checks require the release commit's parent to be the `release-base` comm
 If `main` moves before the PR merges, close it and repeat this step on the new `main`.
 If the release commit landed in a batch with another PR, repeat this step on the new `main`; `release-prep` replaces the section it wrote earlier, since that section is still the newest one.
 
-When the PR has merged, attest the commit that landed on `main`, which is the commit you will tag:
+When the PR has merged, attest the release commit, which is the commit you will tag:
 
 ```sh
 git switch main && git pull --ff-only
-make attest
+RELEASE_SHA="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri' origin/main)"
+git switch --detach "$RELEASE_SHA" && ALLOW_STALE_BASE=1 make attest
+git switch main
 ```
+
+`RELEASE_SHA` is the newest commit on `main` whose subject starts with `release: v0.17.0-adiri`, which is the release commit you just merged; it is the tip of `main` unless another PR has landed since.
+`make attest` normally refuses a commit that is behind `origin/main`, because a PR attested on an old base is not what the merge queue merges.
+The release commit is already on `main` and is the exact commit that gets tagged and built, so `ALLOW_STALE_BASE=1` is safe here.
+If `make attest` reports that the commit is already attested, there is nothing more to do.
+Switch back to `main` afterwards, because `release-build` and `release-publish` compare the release scripts in the checkout with `origin/main`.
 
 The new section shows up on the docs site's [Release notes](../getting-started/release-notes.md) as soon as the PR merges.
 
@@ -120,8 +129,11 @@ make release-tag TAG=v0.17.0-adiri
 If another PR has landed since the release commit, point it at the release commit instead:
 
 ```sh
-RELEASE_COMMIT="$(git log -1 --format=%H --grep='^release: v0.17.0-adiri' origin/main)" make release-tag TAG=v0.17.0-adiri
+RELEASE_COMMIT="$(git log -1 --format=%H --grep='^release: v0\.17\.0-adiri' origin/main)" make release-tag TAG=v0.17.0-adiri
 ```
+
+The pattern also matches a release candidate's commit, such as `release: v0.17.0-adiri-rc1`, and `-1` picks the newest, so it finds the candidate's commit when the final release tags the same commit.
+The release commit must already be attested, as in step 1.
 
 Before signing, it checks the Cargo version and the `CHANGELOG.md` section on that commit, and the attestation too when `cast` is installed.
 It signs with `RELEASE_GPG_KEY` if set and `git config user.signingkey` otherwise, and refuses a key whose primary key is not on the allowlist.
@@ -142,7 +154,8 @@ Its `validate-tag` job runs `etc/release.sh check-tag` with the scripts and the 
 
 The job writes the generated release notes to its summary.
 The `draft-release` job then creates a draft release with those notes.
-The later steps only accept a draft that `github-actions[bot]` created.
+`release-build` refuses a draft that `github-actions[bot]` did not create, which catches a draft made by hand.
+This is not a security check, because anyone with write access can edit a draft or create one from a workflow of their own, so the later steps re-check the tag, the assets and the signatures instead of trusting the draft.
 
 ```sh
 gh run list --workflow release.yaml --limit 3
@@ -183,7 +196,8 @@ make release-sign TAG=v0.17.0-adiri
 It checks the hashes in `SHA256SUMS`, checks that `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, and checks that your key is allowlisted and has not signed this release yet.
 It then shows the tag, the commit, the content of `SHA256SUMS` and its SHA-256, and waits for `yes`.
 Compare that SHA-256 with the value `release-build` printed in step 4 before you type `yes`, and stop if they differ.
-It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and counts the signatures.
+It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and checks that it is the file it uploaded and that it carries your signature.
+Sign one at a time: two maintainers uploading at once replace each other's file, and `release-sign` stops with an error for the one whose signature was lost.
 Expect one touch; [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing) covers the prompts and retries.
 
 ### 6. Verify and publish (xerxes)
@@ -207,16 +221,25 @@ docker logout ghcr.io
 
 It ends with a line like `verified v0.17.0-adiri commit=... signatures=1/1 image=...`.
 
-`release-publish` runs the same checks, asks for `yes`, and publishes the draft as Latest or as a pre-release, following the channel table.
+`release-publish` runs the same checks, and also checks the ghcr login when it will move the channel alias, before it asks for `yes`.
+After you type `yes`, it checks that the draft's files are still the ones it verified, by name, asset id and digest, and publishes the draft as Latest, as a normal release or as a pre-release, following the channel table.
+It checks the files once more after publishing, before it moves the alias.
 If the release is the highest published final version in its channel, it points the channel alias at the image digest and confirms that the registry agrees.
 It skips work that is already done, so it is safe to run again.
 `docker logout ghcr.io` removes the registry credential from xerxes until the next release.
 
 ### 7. CI verifies the published release
 
-Publishing starts the `verify-release` job, which runs `etc/release.sh verify` on a GitHub runner with the scripts and the allowlist from `main` and without registry credentials.
+Publishing with your own `gh` login, as `release-publish` does, starts the `verify-release` job, which runs `etc/release.sh verify` on a GitHub runner with the scripts and the allowlist from `main` and without registry credentials.
 The check is detective only: the release is already public when it runs, so a failure means following [After publish](#after-publish).
-To run it again later:
+GitHub starts no workflow for a publish made with a `GITHUB_TOKEN`, so a release that someone publishes from a workflow is never checked by this job.
+After every publish, check that a `verify-release` run exists for the tag:
+
+```sh
+gh run list --workflow release.yaml --event release --limit 3
+```
+
+If none of the runs is for `v0.17.0-adiri`, start one, and use the same command to run the check again later:
 
 ```sh
 gh workflow run release.yaml -f tag=v0.17.0-adiri -f mode=verify
@@ -235,8 +258,13 @@ Publishing a candidate never moves an image alias.
 ## When a step fails
 
 Every step prints `error:` and the reason when it stops.
-It exits with 1 when a check fails, 2 for a usage error or an unmet precondition, and 3 when GitHub, the registry or the RPC endpoint stayed unreachable after retries.
+`etc/release.sh` exits with 1 when a check fails, 2 for a usage error or an unmet precondition, and 3 when GitHub, the registry, the RPC endpoint or a `git` or `docker` network call failed; `make` shows the code as `Error N`.
+GitHub API calls, `git fetch`, registry lookups and the attestation check are retried before a step gives up with 3.
+A request that GitHub refuses, with an HTTP 4xx other than 429, is not retried and exits with 1 or 2, and so does a tag push that `origin` rejects.
+`git push`, `docker push`, `docker pull`, the submodule fetch and the alias move are tried once.
 After an exit code of 3, run the same command again.
+If `release-build` had already pushed the image, the second run stops because `:<TAG>` is in the registry; rebuild with `RELEASE_REBUILD=1` as the table below says.
+If `release-sign` had already uploaded the signature, the second run stops because your key has already signed, and nothing more is needed.
 
 | Step | Symptom | Fix |
 | --- | --- | --- |
@@ -244,9 +272,9 @@ After an exit code of 3, run the same command again.
 | 1 | `release-prep` finds the version's section lower down in `CHANGELOG.md` | That version was already released; choose the next one. |
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
 | 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing subkey (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
-| 3 | The commit is not attested | Run `make attest` on that commit on xerxes, then `gh run rerun <run-id>`. |
+| 2, 3 | The commit is not attested | On xerxes, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
 | 3 | The tag is wrong and has to go | If CI created no draft and nothing was built, delete it with `git push --delete origin <TAG>` and `git tag -d <TAG>`, then tag again. Otherwise follow [Before publish](#before-publish). |
-| 4 | `run make docker-login` | Run `make docker-login` on xerxes. |
+| 4, 6 | `run make docker-login` | Run `make docker-login` on xerxes. |
 | 4 | `package is not public` | Do the [one-time setup](#one-time-setup). |
 | 4 | The image `:<TAG>` is already in the registry | An earlier build pushed it. Rebuild with `RELEASE_REBUILD=1 make release-build TAG=<TAG>`; the new image has a different digest, because builds are not reproducible. |
 | 4 | The release scripts differ from `origin/main` | Run `git switch main && git pull --ff-only`, then the build again. |
@@ -254,6 +282,7 @@ After an exit code of 3, run the same command again.
 | 5 | PIN or touch errors | See [PIN and touch during signing](yubikey-setup.md#pin-and-touch-during-signing). |
 | 5 | Your key has already signed this release | Nothing to do. With a threshold above 1, another maintainer signs next. |
 | 6 | `release-verify` fails | Do not publish; the message names the failed check. To rebuild under the same tag, delete the draft with `gh release delete <TAG> --yes`, recreate it with `gh run rerun <run-id>` on the tag's CI run, run step 4 with `RELEASE_REBUILD=1`, then step 5. |
+| 6 | `release-publish` stops because the release's files changed after they were verified | Someone changed the draft while `release-publish` ran. If the release is still a draft, find out what changed before you run `release-publish` again; if it is public, follow [After publish](#after-publish). |
 | 6 | `release-publish` stops at the alias step | Run it again; it skips the steps already done. |
 | 7 | CI verification fails after publishing | Follow [After publish](#after-publish). |
 | any | Unsure where things stand | Check `gh release view <TAG>`, `gh run list --workflow release.yaml` and the files in `target/release-artifacts/<TAG>/`. |
@@ -262,20 +291,23 @@ After an exit code of 3, run the same command again.
 
 ### Before publish
 
-Until the release is published, only the tag and the `:<TAG>` image are public.
+Until the release is published, the public parts are the tag, the `:<TAG>` image, and the release commit on `main`, whose `CHANGELOG.md` section is already on the docs site's [Release notes](../getting-started/release-notes.md) page.
 Delete the draft, the image version and the tag, running the `gh` commands on xerxes, where the package scopes belong:
 
 ```sh
 gh release delete v0.17.0-adiri --yes
-gh auth refresh -h github.com -s read:packages,delete:packages
-ID=$(gh api --paginate /orgs/Telcoin-Association/packages/container/telcoin-network/versions \
+ID=$(GH_TOKEN="$PACKAGES_PAT" gh api --paginate /orgs/Telcoin-Association/packages/container/telcoin-network/versions \
   --jq '.[] | select(.metadata.container.tags | any(. == "v0.17.0-adiri")) | .id')
-gh api -X DELETE "/orgs/Telcoin-Association/packages/container/telcoin-network/versions/$ID"
+GH_TOKEN="$PACKAGES_PAT" gh api -X DELETE "/orgs/Telcoin-Association/packages/container/telcoin-network/versions/$ID"
 git push --delete origin v0.17.0-adiri
 git tag -d v0.17.0-adiri
 ```
 
+The packages API accepts only a classic personal access token with the `read:packages` and `delete:packages` scopes, so put one in `PACKAGES_PAT` for those two calls and revoke it afterwards; the package's Versions page on GitHub can delete the version instead.
+
 Run `git tag -d` on every machine that has the tag.
+Then open a PR that deletes the release's section from `CHANGELOG.md`, from its `## [v0.17.0-adiri]` heading up to the next `## [` heading, and attest and merge it like any other PR.
+This is the only hand edit `CHANGELOG.md` takes; with the tag deleted, the next release's section lists the same commits again.
 Then cut the next release candidate or patch version; reuse a tag name only if CI never created a draft for it and no image was pushed.
 
 ### After publish
@@ -288,12 +320,15 @@ Instead:
 3. If the channel alias points at it, move the alias back to the previous good release from xerxes, after `make docker-login`:
 
    ```sh
-   PREV=vX.Y.Z-adiri   # the previous good release
-   make release-verify TAG="$PREV"
-   docker buildx imagetools create --tag ghcr.io/telcoin-association/telcoin-network:adiri \
-     "$(curl -fsSL "https://github.com/Telcoin-Association/telcoin-network/releases/download/$PREV/IMAGE_DIGEST")"
+   PREV=vX.Y.Z-adiri
+   make release-verify TAG="$PREV" &&
+   REF=$(curl -fsSL "https://github.com/Telcoin-Association/telcoin-network/releases/download/$PREV/IMAGE_DIGEST") &&
+   docker buildx imagetools create --prefer-index=false --tag ghcr.io/telcoin-association/telcoin-network:adiri "$REF" &&
+   docker buildx imagetools inspect ghcr.io/telcoin-association/telcoin-network:adiri --format '{{println .Manifest.Digest}}'
    ```
 
+   Set `PREV` to the previous good release.
+   `--prefer-index=false` copies the image manifest as it is, as `release-publish` does, so the last command prints the digest after the `@` in `$REF`.
    For a mainnet release, the alias is `:latest`.
 4. Ship a fixed patch release through all seven steps; publishing it moves the alias forward again.
 5. Tell operators the affected version and the version to roll back to, following the [release and network update process](../getting-started/validator-operations.md#release-and-network-update-process).
@@ -317,7 +352,7 @@ With a threshold above 1, each signer runs `make release-sign` on their own lapt
 The allowlist and `SECURITY.md` change like this:
 
 - for an extended expiry, a new signing subkey or a revoked subkey, update `<handle>.asc` in place, and update the serial and date in the `SECURITY.md` row when the YubiKey changes;
-- for a revoked primary key, delete `<handle>.asc` and mark the `SECURITY.md` row `revoked YYYY-MM-DD`;
+- for a revoked primary key, delete `<handle>.asc`, mark the `SECURITY.md` row `revoked YYYY-MM-DD`, and remove the key from GitHub as [Primary key compromised](yubikey-setup.md#primary-key-compromised) describes;
 - never add a placeholder file for a new maintainer; the file is added when the key exists.
 
 `release-verify` does not count a signature from an expired or revoked key, and it reads the keys from `main`.

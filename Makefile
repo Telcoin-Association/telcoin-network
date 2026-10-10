@@ -79,8 +79,7 @@ help:
 	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
 	@echo ;
 	@echo "make docker-login" ;
-	@echo "    :::> Log docker in to ghcr.io with the gh CLI token." ;
-	@echo "    :::> One-time: gh auth refresh -h github.com -s write:packages" ;
+	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
 	@echo ;
 	@echo "make docker-adiri" ;
 	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
@@ -382,10 +381,10 @@ fmt:
 clippy:
 	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
 
-# log docker in to ghcr.io with the gh CLI token
-# one-time: gh auth refresh -h github.com -s write:packages
+# log docker in to ghcr.io as your GitHub user; docker prompts for the password:
+# paste a classic PAT with write:packages only, never the gh token
 docker-login:
-	gh auth token | docker login ghcr.io --username "$$(gh api user --jq .login)" --password-stdin ;
+	docker login ghcr.io --username "$$(gh api user --jq .login)" ;
 
 # build and push an ad-hoc adiri image for amd64 and arm64 as dev-adiri-$(TAG)
 # CARGO_FEATURES=adiri compiles in the epoch-gated testnet fork logic. The authoritative

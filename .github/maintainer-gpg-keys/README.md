@@ -11,7 +11,8 @@ Signatures are matched on the primary key fingerprint, and a primary fingerprint
 ## Readers
 
 - `.github/workflows/release.yaml` and `make release-*` (through `etc/release.sh`) always read this directory from `main`, never from the tagged tree, so a release cannot vouch for its own signer.
-- Operators import these keys to verify `SHA256SUMS.asc`, then compare the fingerprints with the table in `SECURITY.md` on `main`.
+- Operators read this directory from `main` too, as [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) shows, verify `SHA256SUMS.asc` against it, and compare the fingerprints with the table in `SECURITY.md` on `main`.
+- Every reader uses the current file, so a signature by a subkey that has since expired or been revoked stops verifying, older releases included.
 
 ## Threshold
 
@@ -27,6 +28,9 @@ A release needs signatures from at least `MIN_SIGNATURES` distinct maintainers (
 ## Rules
 
 - When a signing subkey is added or replaced, or an expiry date changes, re-export the key and update the file in place.
+- When a signing subkey is revoked, re-export with `--export-filter 'drop-subkey=revoked -t'` added to the command under Format, and check with `gpg --show-keys` that the revoked subkey is gone.
+  Plain `gpgv` still reports a good signature for a revoked subkey; the operator check and `etc/release.sh` reject it, but other tools may not.
+- Extend a signing subkey before it expires, even one you no longer use, or the releases it signed stop verifying.
 - When a key is revoked, delete its file and mark its row in the `SECURITY.md` table as revoked.
 - Never add a placeholder for a new maintainer; add the file only once the real key exists.
 

@@ -12,7 +12,7 @@ Operators install a release with [Installing a release](../getting-started/insta
 Only keys in `.github/maintainer-gpg-keys/` on `main` can sign a release, one file per maintainer, named after their GitHub handle.
 The same key signs the git tag and `SHA256SUMS.asc`, the detached signature over the checksums of the tarball and of the image digest.
 One signature is required (`MIN_SIGNATURES` in `etc/release.sh`).
-CI and the release scripts read the allowlist from `main`, never from the tagged tree, so a tag cannot bring its own key.
+CI, the release scripts and the operator check in [Installing a release](../getting-started/installing-a-release.md) read the allowlist from `main`, never from the tagged tree, so a tag cannot bring its own key.
 
 Signing happens on a maintainer's macOS laptop, where the signing subkey lives on a YubiKey.
 Building happens on xerxes, a Linux x86_64 host that holds the registry credential and never sees the YubiKey.

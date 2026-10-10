@@ -78,6 +78,7 @@ Keep this terminal open until the end of [Export the public key and close the RA
 HANDLE=your-github-login
 RAMDISK=$(hdiutil attach -nomount ram://204800 | tr -d '[:space:]')
 diskutil erasevolume HFS+ tn-gpg "$RAMDISK"
+gpgconf --kill scdaemon
 export GNUPGHOME=/Volumes/tn-gpg/gnupg
 mkdir -m 700 "$GNUPGHOME"
 cp ~/.gnupg/gpg-agent.conf "$GNUPGHOME/"
@@ -90,6 +91,7 @@ echo "signing subkey $SUBKEY_FPR"
 ```
 
 The RAM disk holds 100 MB and is gone after a detach or a reboot.
+The `gpgconf --kill scdaemon` line runs before `GNUPGHOME` changes, so it stops the `scdaemon` of your normal keyring, which still holds the YubiKey after you set the PINs; only one `scdaemon` can use the card at a time.
 The primary key can only certify other keys, never expires, and stays offline; the signing subkey expires in two years.
 Use your GitHub-verified email address in the user ID.
 Give the primary key a strong passphrase and store it in your password manager.
@@ -246,30 +248,23 @@ gpg --verify t.asc t
 - If you miss the touch window the signature fails; run the command again.
 - `gpg --card-status` shows the tries left in `PIN retry counter`; each PIN allows 3.
 - If the PIN is blocked, unblock it with the Admin PIN: `gpg --card-edit`, then `admin`, `passwd` and `2`.
-- If the Admin PIN is blocked too, run `ykman openpgp reset`, [set the PINs](#set-the-pins) again, and put the signing subkey back on the card from a backup with [Work with the backup](#work-with-the-backup) and [Move the signing subkey to the card](#move-the-signing-subkey-to-the-card).
+- If the Admin PIN is blocked too, run `ykman openpgp reset`, [set the PINs](#set-the-pins) again, and put the signing subkey back on the card from a backup: open it with [Work with the backup](#work-with-the-backup), move that card's subkey as in [Move the signing subkey to the card](#move-the-signing-subkey-to-the-card), selecting it with `key N` in the order `gpg --edit-key` lists the subkeys, and close the RAM disk without writing the key back.
 
 ## Registry access on xerxes
 
-`make release-build` and `make release-publish` push to `ghcr.io/telcoin-association/telcoin-network`, which needs a GitHub token with the `write:packages` scope on xerxes.
-On xerxes, add the scope to the `gh` login and log Docker in with it:
+`make release-build` and `make release-publish` push to `ghcr.io/telcoin-association/telcoin-network`, which needs a classic personal access token with only the `write:packages` scope.
+Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-xerxes` with a 90-day expiry.
+That link selects `write:packages` alone; ticking the scope by hand on the token page also selects `repo`, which this token must not have.
+Then, on xerxes:
 
 ```sh
-gh auth refresh -h github.com -s write:packages
 make docker-login
 ```
 
-`make docker-login` pipes `gh auth token` into `docker login ghcr.io`.
-If the registry refuses that token, use a classic personal access token instead.
-Create one at `https://github.com/settings/tokens/new?scopes=write:packages&description=tn-release-xerxes` with a 90-day expiry, then on xerxes:
-
-```sh
-read -rs GHCR_PAT
-printf '%s' "$GHCR_PAT" | docker login ghcr.io --username "$(gh api user --jq .login)" --password-stdin
-unset GHCR_PAT
-```
-
+`make docker-login` runs `docker login ghcr.io` with your GitHub login as the user name, and Docker prompts for the password: paste the token there.
+Keep `write:packages` off every `gh` login, on xerxes and on the laptop, so the only credential that can push images is the one Docker holds.
 Unless xerxes has a Docker credential helper, `docker login` stores the token in `~/.docker/config.json`, so log out after each release, as step 6 of [Releasing](releasing.md#6-verify-and-publish-xerxes) does.
-The YubiKey never goes to xerxes, and the packages token never goes on the laptop: keep `write:packages` off the laptop's `gh` login.
+The YubiKey never goes to xerxes, and the packages token never goes on the laptop.
 
 ## Work with the backup
 
@@ -282,6 +277,7 @@ FPR=$(gpg --show-keys --with-colons ~/"$HANDLE".asc | awk -F: '/^fpr:/ {print $1
 USB=/Volumes/BACKUP1
 RAMDISK=$(hdiutil attach -nomount ram://204800 | tr -d '[:space:]')
 diskutil erasevolume HFS+ tn-gpg "$RAMDISK"
+gpgconf --kill scdaemon
 export GNUPGHOME=/Volumes/tn-gpg/gnupg
 mkdir -m 700 "$GNUPGHOME"
 cp ~/.gnupg/gpg-agent.conf "$GNUPGHOME/"
@@ -289,12 +285,29 @@ hdiutil attach "$USB/tn-gpg-backup.dmg"
 gpg --import "/Volumes/tn-gpg-backup/$FPR-secret.asc"
 ```
 
-When you are done, write the changed key back to both backups if it changed, then close everything the same way as after creating the key:
+After changing the key, and before any `keytocard`, write it to a file in the RAM disk and check it:
 
 ```sh
-gpg --armor --export-secret-keys "$FPR" > "/Volumes/tn-gpg-backup/$FPR-secret.asc"
+gpg --armor --export-secret-keys "$FPR" > /Volumes/tn-gpg/secret.asc
+gpg --list-packets /Volumes/tn-gpg/secret.asc | grep -c -E 'gnu-(dummy|divert-to-card)'
+```
+
+The count must be `0`.
+Any other number means a key in the RAM disk keyring is only a pointer to a card, so stop and leave the backups as they are.
+Then copy the key to the open backup:
+
+```sh
+cp /Volumes/tn-gpg/secret.asc "/Volumes/tn-gpg-backup/$FPR-secret.asc"
 gpg --armor --export "$FPR" > "/Volumes/tn-gpg-backup/$FPR-public.asc"
 hdiutil detach /Volumes/tn-gpg-backup
+```
+
+Attach the second drive's disk image with `hdiutil attach /Volumes/BACKUP2/tn-gpg-backup.dmg` and run the same three commands again.
+Never write the key back after `keytocard`: the RAM disk keyring then holds only a pointer to the card for that subkey, and the backups would lose its secret.
+
+When you are done, close everything the same way as after creating the key:
+
+```sh
 gpg --armor --export --export-options export-minimal "$FPR" > ~/"$HANDLE".asc
 gpgconf --kill all
 unset GNUPGHOME
@@ -302,7 +315,7 @@ hdiutil detach /Volumes/tn-gpg
 gpg --import ~/"$HANDLE".asc
 ```
 
-Attach the second drive's disk image and repeat the first two `gpg` commands there before the final detach.
+If a backup is still attached, detach it with `hdiutil detach /Volumes/tn-gpg-backup` first.
 
 GitHub does not update a key in place, so after any change, replace it there too: find its ID with `gh gpg-key list`, remove it with `gh gpg-key delete <key-id>`, and add `~/$HANDLE.asc` again with `gh gpg-key add`.
 
@@ -311,9 +324,18 @@ GitHub does not update a key in place, so after any change, replace it there too
 Give the spare its own signing subkey, so losing one card only costs that card's subkey:
 
 1. [Set the PINs](#set-the-pins) on the spare, and open a backup with [Work with the backup](#work-with-the-backup).
-2. Add a subkey with `gpg --quick-add-key "$FPR" ed25519 sign 2y`, then write it to both backups before moving it.
-3. With the spare plugged in, run `gpg --edit-key "$FPR"`, then `key 2`, `keytocard`, `(1) Signature key` and `save`, and set the spare's touch policy with `ykman openpgp keys set-touch sig on`.
-4. Close the RAM disk as described above, and replace the key on GitHub.
+2. Add a subkey with `gpg --quick-add-key "$FPR" ed25519 sign 2y`, then write the key to both backups as in [Work with the backup](#work-with-the-backup).
+3. With the spare plugged in, find the new subkey's number.
+   A new subkey goes last, so its number is the count of subkeys; `gpg --edit-key` counts revoked and expired subkeys too, and so does this command:
+
+   ```sh
+   N=$(gpg --list-keys --with-colons "$FPR" | awk -F: '/^sub:/ {n++} END {print n}')
+   echo "key $N"
+   ```
+
+   Run `gpg --edit-key "$FPR"` and the `key` command that printed, check that the subkey created today is now marked `ssb*`, then run `keytocard`, choose `(1) Signature key`, and `save`.
+   Then run `gpgconf --kill scdaemon` and `gpgconf --homedir ~/.gnupg --kill scdaemon`, so that no `scdaemon` holds the spare, and set its touch policy with `ykman openpgp keys set-touch sig on`.
+4. Close the RAM disk as in [Work with the backup](#work-with-the-backup) without writing the key back again, because the keyring now holds only a pointer to the spare for the new subkey, and replace the key on GitHub.
 5. Open a PR that updates `.github/maintainer-gpg-keys/<handle>.asc` in place and adds the spare's serial to your `SECURITY.md` row.
 6. Store the spare offline.
 
@@ -324,11 +346,12 @@ To sign with the spare, plug it in, run `gpg --card-status`, and point `user.sig
 ### Extend the expiry
 
 Set a reminder well before the subkey expires.
-`make release-verify` does not count a signature from an expired key, including the signatures on older releases, so a lapsed key also breaks the later verification of everything it signed.
+Once a signing subkey expires, its signatures stop counting, on older releases too: `make release-verify`, CI and the check on [Installing a release](../getting-started/installing-a-release.md) read the keys from `main` and reject them.
+Those releases verify again once the subkey is extended and `<handle>.asc` on `main` is re-exported; until then, or if it is never extended, they cannot be verified.
 
 1. Open a backup with [Work with the backup](#work-with-the-backup).
-2. Run `gpg --quick-set-expire "$FPR" 2y <subkey fingerprint>`, listing every signing subkey you still use.
-3. Close the RAM disk, writing the key back to both backups, and replace the key on GitHub.
+2. Run `gpg --quick-set-expire "$FPR" 2y <subkey fingerprint>`, listing every signing subkey that signed a release and is not revoked, even one you no longer use.
+3. Write the key to both backups as in [Work with the backup](#work-with-the-backup), close the RAM disk, and replace the key on GitHub.
 4. Open a PR that updates `.github/maintainer-gpg-keys/<handle>.asc` in place.
 
 The YubiKey itself does not change.
@@ -339,9 +362,10 @@ If the primary key is safe, revoke only the lost card's subkey:
 
 1. Open a backup with [Work with the backup](#work-with-the-backup).
 2. Run `gpg --edit-key "$FPR"`, select the lost card's subkey with `key N`, then `revkey` and `save`.
-3. Switch to the spare by pointing `user.signingkey` at its subkey, or give a replacement YubiKey a new subkey as in [Spare YubiKey](#spare-yubikey).
-4. Close the RAM disk, writing the key back to both backups, and replace the key on GitHub.
-5. Open a PR that updates `.github/maintainer-gpg-keys/<handle>.asc` in place, and the serial and date in your `SECURITY.md` row.
+3. Write the key to both backups as in [Work with the backup](#work-with-the-backup).
+4. Switch to the spare by pointing `user.signingkey` at its subkey, or set up a replacement YubiKey with steps 2 and 3 of [Spare YubiKey](#spare-yubikey).
+5. Close the RAM disk as in [Work with the backup](#work-with-the-backup) without writing the key back again, and replace the key on GitHub.
+6. Open a PR that updates `.github/maintainer-gpg-keys/<handle>.asc` in place, exported without the revoked subkey as its [README](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/maintainer-gpg-keys/README.md#rules) describes, and the serial and date in your `SECURITY.md` row.
 
 ### Primary key compromised
 
@@ -359,8 +383,8 @@ Create a new key with this page, and replace your allowlist file and `SECURITY.m
 
 | Symptom | Fix |
 | --- | --- |
-| `gpg --card-status` finds no card, or reports a card error | Run `gpgconf --kill scdaemon` and plug the YubiKey in again. If that does not help, add `disable-ccid` and `pcsc-shared` on separate lines to `~/.gnupg/scdaemon.conf` and kill `scdaemon` again. |
-| `ykman` cannot connect to the YubiKey | Run `gpgconf --kill scdaemon`, then retry. |
+| `gpg --card-status` finds no card, or reports a card error | Run `gpgconf --kill scdaemon` and plug the YubiKey in again; while `GNUPGHOME` points at the RAM disk, also run `gpgconf --homedir ~/.gnupg --kill scdaemon`, because only one `scdaemon` can hold the card. If that does not help, add `disable-ccid` and `pcsc-shared` on separate lines to `~/.gnupg/scdaemon.conf`, and to `$GNUPGHOME/scdaemon.conf` while it points at the RAM disk, then kill `scdaemon` again. |
+| `ykman` cannot connect to the YubiKey | Run `gpgconf --kill scdaemon`, and while `GNUPGHOME` points at the RAM disk also `gpgconf --homedir ~/.gnupg --kill scdaemon`, then retry. |
 | `keytocard` rejects the ed25519 subkey | The firmware is older than 5.2.3; create the subkey with `rsa4096` instead of `ed25519`. |
 | git prints `gpg failed to sign the data` | Run `echo test \| gpg --clearsign --local-user "${SUBKEY_FPR}!"` to see GnuPG's own error. |
 | GitHub shows a tag as Unverified | The user ID's email is not verified on your GitHub account, or the key was uploaded before its signing subkey existed; fix the email, or replace the key on GitHub. |
