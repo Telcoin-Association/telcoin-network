@@ -29,6 +29,59 @@ use super::database::StoreType;
 /// How often the committer asks every table to compact (see `Database::compact`).
 const COMPACT_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Test-only: what the committers did (every database's, process-wide), for the benches.
+#[cfg(test)]
+pub(crate) mod stats {
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::Duration,
+    };
+
+    pub(crate) static ROUNDS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static ROUND_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DATA_SYNCS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static DATA_SYNC_NS: AtomicU64 = AtomicU64::new(0);
+    /// The committer's writer-lock acquisitions (waits) and its locked steps (holds).
+    pub(crate) static LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_HOLDS: AtomicU64 = AtomicU64::new(0);
+    pub(crate) static LOCK_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+
+    /// Count one event of `count` taking `took` (added to `ns`).
+    pub(crate) fn add(count: &AtomicU64, ns: &AtomicU64, took: Duration) {
+        count.fetch_add(1, Ordering::Relaxed);
+        ns.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Committer rounds and the syncs they ran, since the last take.
+    #[derive(Clone, Copy, Debug, Default)]
+    pub(crate) struct GroupStats {
+        pub(crate) rounds: u64,
+        pub(crate) round_ns: u64,
+        pub(crate) data_syncs: u64,
+        pub(crate) data_sync_ns: u64,
+        pub(crate) lock_waits: u64,
+        pub(crate) lock_wait_ns: u64,
+        pub(crate) lock_holds: u64,
+        pub(crate) lock_hold_ns: u64,
+    }
+
+    /// The counts since the last take, resetting them.
+    pub(crate) fn take() -> GroupStats {
+        let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
+        GroupStats {
+            rounds: take(&ROUNDS),
+            round_ns: take(&ROUND_NS),
+            data_syncs: take(&DATA_SYNCS),
+            data_sync_ns: take(&DATA_SYNC_NS),
+            lock_waits: take(&LOCK_WAITS),
+            lock_wait_ns: take(&LOCK_WAIT_NS),
+            lock_holds: take(&LOCK_HOLDS),
+            lock_hold_ns: take(&LOCK_HOLD_NS),
+        }
+    }
+}
+
 /// Whether the committer keeps running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Run {
@@ -300,6 +353,8 @@ fn run(group: &GroupCommit, store: &StoreType) {
             compact_all();
             last_compact = Instant::now();
         }
+        #[cfg(test)]
+        let round_started = Instant::now();
         let tables = store.load();
         let mut todo = names;
         todo.extend(held.keys().copied());
@@ -321,6 +376,8 @@ fn run(group: &GroupCommit, store: &StoreType) {
                 }
             }
         }
+        #[cfg(test)]
+        stats::add(&stats::ROUNDS, &stats::ROUND_NS, round_started.elapsed());
         let durable = held.values().map(|first| first - 1).fold(target, u64::min);
         if group.is_failed() {
             // Every later barrier fails, and the watermark never moves again: it may not pass a

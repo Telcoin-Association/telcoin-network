@@ -10,7 +10,7 @@ on this crate's own storage primitives instead of MDBX or redb:
 - read through published, immutable **snapshots** with **no lock**: readers never block writers,
   and writers never block readers.
 
-On top of that it adds crash recovery (rebuild the index by replaying the logs to the last commit),
+On top of that it adds crash recovery (rebuild the index by replaying the log to the last commit),
 physical clears (a cleared table's data leaves the disk), background compaction (overwritten and
 removed records leave the disk too), and two key modes (store the key, or derive it from the
 value).
@@ -93,8 +93,7 @@ TnDatabase (database.rs)                    typed layer: encode keys/values, rou
   ▼
 TnTable (table.rs)                          one table; a cheap Clone handle over Arc<Inner>
   ├─ Mutex<Writer>                          the single writer: current generation's files
-  │    ├─ data log      Pack<Vec<u8>>       puts + commit records (the WAL, source of truth)
-  │    ├─ removal log   Pack<Vec<u8>>       removed keys
+  │    ├─ data log      Pack<Vec<u8>>       puts, removals + commit records (the WAL, source of truth)
   │    ├─ BtreeIndex                         key → data-log position (copy-on-write, derived)
   │    ├─ spare thread                       the next generation, prepared in the background
   │    └─ compaction thread                  the live rows, rewritten into the next generation
@@ -123,7 +122,6 @@ TnTable (table.rs)                          one table; a cheap Clone handle over
     meta                                key mode + encoded key size (16 bytes, CRC'd)
     gen-<N>/                            the current generation (exactly one after a clean open)
       data                              data log (Pack, uncompressed) ── + clean-close seal
-      removed                           removal log (Pack, uncompressed) ── + clean-close seal
       btx/index.btx                     B+tree index (derived; created at the first insert)
     spare-<N+1>-<pid>-<id>/             the next generation, prepared in the background
     compact-<N+1>-<pid>-<id>/           a compaction's new generation, being built
@@ -147,30 +145,31 @@ A corrupt `meta` fails the open. A table with generation data but no `meta` also
 ### Data log records
 
 Every record sits in the pack's frame `[u32 len LE | payload | u32 crc32 LE]` (the CRC covers
-`len ‖ payload`) after the pack's 28-byte header. The payload carries no type tag; what it holds is
-fixed per table by its key mode:
+`len ‖ payload`) after the pack's 28-byte header. A payload starts with a tag byte:
 
 | payload | meaning |
 |---|---|
-| `key ‖ value` | a put in a **keyed** table (`key` is exactly the table's key size) |
-| `value` | a put in a **derived-key** table (a derived table never stores an empty value) |
-| *empty* | a **commit record**: every put before it (since the previous commit) is committed |
+| `1 ‖ key ‖ value` | a put in a **keyed** table (`key` is exactly the table's key size) |
+| `1 ‖ value` | a put in a **derived-key** table (a derived table never stores an empty value) |
+| `2 ‖ key` | a **removal** (both modes): every earlier put of `key` is gone |
+| *empty* | a **commit record**: every put and removal before it (since the previous commit) is committed |
 
-Overwrites append a new put; the index points at the newest. Reads find the value at
-`payload[key_size..]` (keyed) or `payload` (derived).
+Any other tag, or a removal that is not exactly one key long, is a malformed record (recovery fails
+closed). Overwrites append a new put; the index points at the newest. Reads find the value at
+`payload[1 + key_size..]` (keyed) or `payload[1..]` (derived). A removal is logged only when the key
+was present (a miss costs nothing).
 
-### Removal log records
-
-`key ‖ data_len (u64 LE)`, where `data_len` is the data log's length when the key was removed: every
-put of that key **below** `data_len` is gone. A removal is logged only when the key was present (a
-miss costs nothing). The removal log is read only by recovery and by compaction's catch-up.
+Puts and removals share the one log, so a commit syncs one file, and recovery needs no ordering
+between logs: the records are CRC-framed and replay stops at the first bad frame, so a commit
+record counts only when every record before it read back intact. (Format version 1, a pre-release
+layout, kept removals in a second log that had to be synced before the commit record; `meta`
+version 2 marks the one-log format, and a version-1 table is refused.)
 
 ### Files and options
 
 | file | mapping | initial size | notes |
 |---|---|---|---|
 | `data` | 1 GiB reserved range (never moves while open) | 1 MiB, geometric growth | lock-free readers read it in place |
-| `removed` | default | 64 KiB | never read on the hot path |
 | `btx/index.btx` | 1 GiB reserved range | 2 pages | see the btree_index README |
 
 ---
@@ -238,14 +237,13 @@ durable a write the caller saw fail.
 A commit (`TnTable::flush`, run by `commit` and by every autocommit op) is skipped when the table
 has nothing uncommitted; otherwise:
 
-1. If the transaction removed keys, `msync` the **removal log**. Removals must be durable before
-   the commit record that makes them count.
-2. Append the **commit record** (an empty record) to the data log.
-3. `msync` the **data log** (plus a one-time `fsync` after a growth, so the new size is durable).
-4. Stamp both logs' **commit markers** (best-effort, unsynced; a floor recovery uses, below), and
+1. Append the **commit record** (an empty record) to the data log.
+2. `msync` the **data log** (plus a one-time `fsync` after a growth, so the new size is durable):
+   one sync, however many puts and removals the commit covers.
+3. Stamp the log's **commit marker** (best-effort, unsynced; a floor recovery uses, below), and
    record the covered log length in the index header (in memory).
-5. If a compaction's thread has finished, switch to its generation (see [Compaction](#compaction)).
-6. Publish a new snapshot to readers, then start the automatic compaction if it is due.
+4. If a compaction's thread has finished, switch to its generation (see [Compaction](#compaction)).
+5. Publish a new snapshot to readers, then start the automatic compaction if it is due.
 
 The B+tree index is **not** synced on commit; it is derived, synced at a clean close, and rebuilt
 after a crash.
@@ -259,11 +257,10 @@ for 10–20 ms, and tndb's commits don't issue one either. So on macOS tndb (lik
 mode with `write_map`) is not a full power-loss barrier, and its numbers there understate the
 production (Linux) sync cost.
 
-**A clean close** commits anything uncommitted through the ordinary commit (so the removal log is
-synced before the commit record), for example a dropped transaction's writes. A close that cannot
-commit leaves the index marked stale, so the next open rebuilds and drops the uncommitted records.
-Otherwise the close records the final log length in the index header, syncs the index, and seals
-all three files, and the next open needs no rebuild.
+**A clean close** commits anything uncommitted through the ordinary commit, for example a dropped
+transaction's writes. A close that cannot commit leaves the index marked stale, so the next open
+rebuilds and drops the uncommitted records. Otherwise the close records the final log length in the
+index header, syncs the index, and seals both files, and the next open needs no rebuild.
 
 ---
 
@@ -286,25 +283,25 @@ all three files, and the next open needs no rebuild.
 
 How the committer keeps writers off the disk, and keeps the WAL invariants (`TnTable::group_commit`):
 
-1. Under the table's lock: capture the removal log's unsynced range (if it has removals).
-2. Unlocked: `msync` it (`MmapDataFile::sync_ticket`; the sync runs through the mapping's shared
-   view, so writers keep appending past it).
-3. Under the lock: sync any removal logged meanwhile (rare, small), so removals are durable before
-   the commit record that covers them; append the commit record; capture the data log's range.
-4. Unlocked: `msync` the data log (and `fsync` once if it grew).
-5. Under the lock: record the synced end and the commit markers; switch to a finished compaction,
-   or start one, when nothing is pending; reap compactions a clear cancelled.
+1. Under the table's lock: append the commit record (the puts and removals it covers all sit before
+   it in the one log); switch to a finished compaction; capture the log's unsynced range.
+2. Unlocked: `msync` it, and `fsync` once if it grew (`MmapDataFile::sync_ticket`; the sync runs
+   through the mapping's shared view, so writers keep appending past it).
+3. Under the lock: record the synced end and the commit marker; start a compaction if one is due;
+   reap compactions a clear cancelled.
+
+Each table costs the committer one sync and two lock acquisitions per round.
 
 A writer holds the lock only for its append and index update, never across a sync.
 
-**A new generation during an unlocked sync.** While steps 2 and 4 run, a clear (or a compaction's
-switch made by `compact_table_now`) can install a new generation. Each captured range therefore
-keeps its generation's files open (mapped) until its sync is done, and its outcome is recorded only
-while that generation is still current: the retired generation's rows are superseded (a clear is
+**A new generation during an unlocked sync.** While step 2 runs, a clear (or a compaction's switch
+made by `compact_table_now`) can install a new generation. The captured range therefore keeps its
+generation's files open (mapped) until its sync is done, and its outcome is recorded only while
+that generation is still current: the retired generation's rows are superseded (a clear is
 durable when it returns) or already durable in the new one (a switch syncs it before its rename),
-so its sync, failed or not, is moot, and the new generation's watermark and commit markers move
+so its sync, failed or not, is moot, and the new generation's watermark and commit marker move
 only with its own syncs. (`MmapDataFile::complete_sync` also ignores a range taken from another
-file.) `test_tndb_group_clear_during_the_unlocked_sync` pauses the committer at both syncs.
+file.) `test_tndb_group_clear_during_the_unlocked_sync` pauses the committer at its sync.
 
 **The durable watermark.** A round reads its target number *before* it takes the dirty tables, and
 a writer marks its table dirty *before* it takes its number, so every write numbered at or below
@@ -365,36 +362,33 @@ about one sync, with no copy of the data.
 
 Any of:
 
-- the data log, removal log or index was not closed cleanly (`opened_unclean()`, no clean-close
-  seal);
+- the data log or index was not closed cleanly (`opened_unclean()`, no clean-close seal);
 - the index fails to open or has a bad header or geometry (an `IO` error is surfaced instead);
 - the index's recorded `data_file_length` differs from the data log's length (the index lags);
 - the data log has records but there is no index.
 
 ### What the rebuild does (`Writer::recover`, `replay`)
 
-1. **Validate and replay in memory, changing nothing.** Both logs are read through cloned file
-   handles (`PackIter::next_raw`, CRC-checked payloads; never through the shared mapping).
-   - **Data log:** each put becomes *pending*; at each commit record the pending puts become live
-     (`key → position`, newest wins). The key comes from the record (keyed) or `key_fn(value)`
-     (derived).
-   - **Removal log:** a removal `(key, data_len)` is committed only if `data_len` is at or below the
-     **start of the last commit record**. A committed removal drops the key if its live position is
-     below `data_len`. A put of the same key after the removal survives.
-   - Puts after the last commit record, and uncommitted removals, are an **uncommitted
-     transaction**: they are discarded. Log pages can reach disk through OS writeback before their
-     commit, so without commit records a crash could apply half a transaction.
+1. **Validate and replay in memory, changing nothing.** The data log is read through a cloned file
+   handle (`PackIter::next_raw`, CRC-checked payloads; never through the shared mapping).
+   - Each put and each removal becomes *pending*; at each commit record the pending records apply
+     in log order: a put makes its key live (`key → position`, newest wins), a removal drops it (a
+     put of the same key after the removal survives). A put's key comes from the record (keyed) or
+     `key_fn(value)` (derived); a removal carries its key.
+   - Records after the last commit record are an **uncommitted transaction**: they are discarded.
+     Log pages can reach disk through OS writeback before their commit, so without commit records
+     a crash could apply half a transaction.
 2. **Fail closed.** Any of these makes the open fail, with nothing changed:
    - a tear (bad frame) in a log that was **sealed** by a clean close: a sealed log must replay
      whole (it may end in uncommitted records, from a close that could not commit; those are
      dropped);
    - in an **unclean** log, a stop *below* the log's commit marker: that is damage to committed
      data, not a crash tail;
-   - a malformed record (shorter than the key; a removal of the wrong size), a removal log out of
-     order, or a key function failure.
-3. **Only then** cut each unclean log back to its last committed record (`rewind_to`), rebuild the
+   - a malformed record (an unknown tag; a put shorter than its key; a removal that is not one key
+     long; a key of the wrong size), or a key function failure.
+3. **Only then** cut an unclean log back to its last committed record (`rewind_to`), rebuild the
    index with `rebuild_from` (sorted, so a sequential build), record the covered length, sync the
-   index, and `mark_consistent()` all three files, so the next clean close seals them.
+   index, and `mark_consistent()` both files, so the next clean close seals them.
 
 A failed recovery changes no log byte, so retrying reaches the same verdict. The replay holds the
 live `key → position` map in memory: about (key size + 8 + map overhead) per live row, e.g. around
@@ -453,7 +447,7 @@ into a closed table's directory.
 
 ## Compaction
 
-Overwrites and removes leave dead records in the data log (and removal records in the removal log)
+Overwrites and removes leave dead records in the data log (the old puts, and the removal records)
 until the table is cleared. Compaction rewrites a table's live rows into its next generation in the
 background and switches to it; the old generation, dead records and all, is then deleted.
 
@@ -479,11 +473,11 @@ turns the automatic trigger off.
    snapshot is released once copied, so it pins no index pages during the catch-up; the old
    generation's keepalive is held for the whole run.
 2. **Catch-up** (same thread, no lock). Commits keep landing in the old generation. At each publish
-   the writer tells the thread how far the old logs are committed, and the thread replays both
-   logs' committed tails through their lock-free views, merging puts and removals by position as
-   recovery does. Removals go to the new removal log against the new data log's length, so the new
-   generation replays on its own. Rounds repeat until one has at most 1 MiB to replay (at most 8).
-3. **Sync** the new logs (removal log first) and the directory. That bulk sync can take a while for
+   the writer tells the thread how far the old log is committed, and the thread replays its
+   committed tail through its lock-free view, in log order: a put is copied (byte for byte, and
+   indexed), a removal drops the key and is logged in the new data log, so the new generation
+   replays on its own. Rounds repeat until one has at most 1 MiB to replay (at most 8).
+3. **Sync** the new log and the directory. That bulk sync can take a while for
    a large table, so one more catch-up round then replays what was committed during it, followed
    by a (small) sync of that.
 4. **Switch** (the writer, at the first commit after the thread finishes, between that commit and
@@ -593,8 +587,6 @@ Crate-internal building blocks (`table.rs`, `table/compact.rs`, `layout.rs`): `T
   with one size `fsync` per growth (about 7 for a 100 MB table). Preallocating the spare to the
   previous size was tried and rejected: the spare and the current generation would both hold that
   reservation (up to 2 × 128 MiB per table).
-- **Removal cost.** A commit that includes removals syncs two files (the removal log, then the data
-  log).
 - **Production wiring.** `open_db` still builds the MDBX composite; moving the node to tndb (and
   choosing which tables are derived-key) is separate work.
 
@@ -614,7 +606,9 @@ key check):
   - key mode fixed at creation, and idempotent opens;
   - the debug key check (`#[should_panic]`);
   - clear deletes the old generation while a pre-clear scan keeps reading it;
-  - torn data-log and removal-log tails cut back to the last commit;
+  - torn log tails (puts, and a run of removals) cut back to the last commit; a generation holds
+    one log (no removal log through writes, removes and a clear); a meta of another format version
+    is refused with its own error (`layout.rs`);
   - fail-closed corruption, in a sealed log and below the commit marker;
   - randomized crash recovery against a model (puts, removes, clears, commits, crashes, clean
     closes);
@@ -626,8 +620,8 @@ key check):
   - group commit: the shared suite; a write is readable at once and durable after `persist`
     (through a crash); `persist` covers every table; a failed commit latches every later
     `persist`; an open transaction holds its table back (a crash keeps none of it); a dropped
-    transaction is published and committed; removals logged during the committer's unlocked sync
-    are synced before the commit record; a write numbered during a round waits for a later round
+    transaction is published and committed; removals and puts made during the committer's
+    unlocked sync are committed whole by the next round; a write numbered during a round waits for a later round
     (gated rounds); a write committed early still reaches the watermark; concurrent writers keep
     their persisted writes; compaction; and a randomized crash model (after a crash the table is
     exactly one of the states since the last `persist`); a clear while the committer syncs
@@ -648,11 +642,13 @@ key check):
     open and nothing is deleted;
   - a clear failing after its rename stops the writer, and a reopen sees the clear;
   - a put or remove whose index step fails leaves no log record (checked through a crash rebuild);
+  - one commit's puts and removals replay in log order; an unknown tag, or a removal that is not
+    one key long, fails the rebuild closed and changes nothing;
   - a clear activates the prepared spare (with its index ready once the key size is known);
   - a leftover spare is removed on open;
   - compaction keeps exactly the live rows, with commits landing during its copy, during its
     catch-up, after its last round and uncommitted at the switch (a test gate pauses the thread);
-    both logs shrink; the result survives a crash and a clean reopen;
+    the log shrinks; the result survives a crash and a clean reopen;
   - a snapshot taken before the switch keeps reading the old generation;
   - a crash before the switch leaves the table as it was, and the open deletes the compaction;
   - a clear cancels a running compaction; a derived-key table compacts;

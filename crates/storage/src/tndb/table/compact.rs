@@ -4,13 +4,13 @@
 //! thread ([`run`]):
 //! 1. it copies the rows of a published (committed) snapshot, in key order — removed and
 //!    overwritten records are never reached, so they are not copied;
-//! 2. it catches up on what was committed since, in rounds, by replaying the old logs' committed
-//!    tails ([`replay_delta`]), until a round has little left;
+//! 2. it catches up on what was committed since, in rounds, by replaying the old log's committed
+//!    tail ([`replay_delta`]), until a round has little left;
 //! 3. it makes the new generation durable (a bulk sync, then one more round for what was committed
 //!    during it and a small sync), and hands it back.
 //!
-//! It reads the old generation the way a reader does — a published snapshot and the logs' mapped
-//! views — so it takes no lock, and the writer feeds it each publish's committed log lengths
+//! It reads the old generation the way a reader does — a published snapshot and the log's mapped
+//! view — so it takes no lock, and the writer feeds it each publish's committed log length
 //! ([`Compaction::publish`]). The copy is paced ([`CompactionConfig::bytes_per_sec`]) so it leaves
 //! the disk to commits; the catch-up is not (it must keep up with the writer to finish).
 //!
@@ -37,9 +37,11 @@ use std::{
 use eyre::bail;
 use parking_lot::Mutex;
 
+use eyre::WrapErr as _;
+
 use super::{
-    open_logs, sync_dir, BtreeIndex, GenAlive, GenFiles, KeyFn, KeyMode, Log, MapView, Pack,
-    Published, ScanKind, TableMeta, COMMIT,
+    data_record, open_log, sync_dir, BtreeIndex, DataRecord, GenAlive, GenFiles, KeyFn, Log,
+    MapView, Pack, Published, ScanKind, TableMeta, COMMIT, REMOVE,
 };
 use crate::archive::error::fetch::FetchError;
 
@@ -87,11 +89,10 @@ pub(super) const DISK_HEADROOM: u64 = 128 << 20;
 pub(super) const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
 pub(super) const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
-/// Where a generation's committed records end, in its data and removal logs.
+/// Where a generation's committed records end in its data log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Committed {
     pub(super) data: u64,
-    pub(super) removed: u64,
 }
 
 /// Reads a log's records by position: the writer's own log, or a lock-free view of it.
@@ -161,8 +162,8 @@ impl Builder {
             started: Instant::now(),
         };
         // Opened once the builder exists, so a failure still deletes the directory.
-        let (data, removed) = open_logs(&builder.dir)?;
-        builder.files = Some(GenFiles { data, removed, idx: None });
+        let data = open_log(&builder.dir)?;
+        builder.files = Some(GenFiles { data, idx: None });
         Ok(builder)
     }
 
@@ -195,16 +196,16 @@ impl Builder {
         Ok(())
     }
 
-    /// Remove `key`, logging the removal (against the new data log's length) so the new
-    /// generation's own replay stays correct. An absent key logs nothing.
+    /// Remove `key`, logging the removal in the new data log so the new generation's own replay
+    /// stays correct. An absent key logs nothing.
     fn remove(&mut self, key: &[u8]) -> eyre::Result<()> {
         let files = self.files();
         let Some(idx) = files.idx.as_mut() else { return Ok(()) };
         if idx.remove(key)? {
-            let data_len = files.data.file_len().to_le_bytes();
-            files.removed.append_raw_parts(&[key, &data_len])?;
+            files.data.append_raw_parts(&[REMOVE, key])?;
             self.dead += 1;
             self.uncommitted = true;
+            self.written += key.len() as u64 + 9;
         }
         Ok(())
     }
@@ -218,14 +219,12 @@ impl Builder {
         Ok(())
     }
 
-    /// Make everything written durable: the removal log, then the data log (whose commit records
-    /// make the removals count), then the directory's entries. The index records the log length
-    /// it matches (it is synced only by a clean close, as any generation's is).
+    /// Make everything written durable: the data log, then the directory's entries. The index
+    /// records the log length it matches (it is synced only by a clean close, as any generation's
+    /// is).
     pub(super) fn sync(&mut self) -> eyre::Result<()> {
         let files = self.files();
-        files.removed.commit()?;
         files.data.commit()?;
-        files.removed.stamp_commit_marker();
         files.data.stamp_commit_marker();
         let data_len = files.data.file_len();
         if let Some(idx) = files.idx.as_mut() {
@@ -287,7 +286,6 @@ impl Drop for Builder {
     fn drop(&mut self) {
         if let Some(mut files) = self.files.take() {
             files.data.set_remove_on_drop();
-            files.removed.set_remove_on_drop();
             if let Some(idx) = files.idx.as_mut() {
                 idx.set_remove_on_drop();
             }
@@ -298,60 +296,28 @@ impl Drop for Builder {
     }
 }
 
-/// The key of the data record `payload`: stored before the value, or derived from it.
-fn key_of(payload: &[u8], meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Result<Vec<u8>> {
-    let ksize = meta.ksize as usize;
-    let key = match meta.mode {
-        KeyMode::Keyed if payload.len() >= ksize => payload[..ksize].to_vec(),
-        KeyMode::Keyed => bail!("tndb: a data record is shorter than its key"),
-        KeyMode::Derived => key_fn.ok_or_else(|| eyre::eyre!("tndb: no key function"))?(payload)?,
-    };
-    if key.len() != ksize {
-        bail!("tndb: a {}-byte key in a table of {ksize}-byte keys", key.len());
-    }
-    Ok(key)
-}
-
-/// Replay committed records of the old generation into `out`: the data log's records in `data`
-/// and the removal log's in `removed`. Puts and removals merge as in recovery: a removal made when
-/// the data log was `d` bytes long comes after every put below `d` and before every put at or past
-/// it. Commit records are skipped (the caller writes its own).
-pub(super) fn replay_delta<D: Records + ?Sized, R: Records + ?Sized>(
+/// Replay the old generation's data records in `data` into `out`, in log order: a put is put
+/// (its payload copied as is), a removal removed, and a commit record skipped (the caller writes
+/// its own).
+pub(super) fn replay_delta<D: Records + ?Sized>(
     out: &mut Builder,
     data_log: &D,
     data: Range<u64>,
-    removed_log: &R,
-    removed: Range<u64>,
 ) -> eyre::Result<()> {
-    let ksize = out.meta.ksize as usize;
-    let mut removals = Vec::new();
-    let mut pos = removed.start;
-    while pos < removed.end {
-        let payload = removed_log.record(pos)?;
-        if payload.len() != ksize + 8 {
-            bail!("tndb: a removal record at {pos} is malformed");
-        }
-        let data_len = u64::from_le_bytes(payload[ksize..].try_into().expect("8 bytes"));
-        removals.push((payload[..ksize].to_vec(), data_len));
-        pos += payload.len() as u64 + 8;
-    }
-    let mut removals = removals.into_iter().peekable();
     let mut pos = data.start;
     while pos < data.end {
         let payload = data_log.record(pos)?;
-        let next = pos + payload.len() as u64 + 8;
-        if !payload.is_empty() {
-            while let Some((key, _)) = removals.next_if(|&(_, data_len)| data_len <= pos) {
-                out.remove(&key)?;
+        match data_record(payload, out.meta, out.key_fn.as_ref())
+            .wrap_err_with(|| format!("tndb: the data record at {pos}"))?
+        {
+            DataRecord::Commit => {}
+            DataRecord::Put(key) => {
+                out.put(&key, payload)?;
+                out.pace()?;
             }
-            let key = key_of(payload, out.meta, out.key_fn.as_ref())?;
-            out.put(&key, payload)?;
-            out.pace()?;
+            DataRecord::Remove(key) => out.remove(&key)?,
         }
-        pos = next;
-    }
-    for (key, _) in removals {
-        out.remove(&key)?;
+        pos += payload.len() as u64 + 8;
     }
     Ok(())
 }
@@ -371,11 +337,10 @@ pub(super) struct Job {
     /// The committed state to copy; dropped once copied, so its index pages are not pinned for
     /// the catch-up.
     pub(super) snapshot: Arc<Published>,
-    /// The old generation's keepalive: its files (and so both views) stay open for the whole run,
-    /// even if the table is cleared.
+    /// The old generation's keepalive: its files (and so the log's view) stay open for the whole
+    /// run, even if the table is cleared.
     pub(super) alive: Arc<GenAlive>,
     pub(super) data_view: Arc<MapView>,
-    pub(super) removed_view: Arc<MapView>,
     pub(super) meta: TableMeta,
     pub(super) key_fn: Option<KeyFn>,
     pub(super) rate: u64,
@@ -396,10 +361,8 @@ pub(super) struct Compaction {
     /// The generation being compacted.
     pub(super) gen: u64,
     cancel: Arc<AtomicBool>,
-    /// The old generation's committed log ends, as of the last publish (read by the catch-up).
+    /// The old generation's committed log end, as of the last publish (read by the catch-up).
     progress: Arc<Mutex<Committed>>,
-    /// The old removal log's lock-free view, whose published length the writer advances.
-    removed_view: Arc<MapView>,
     handle: JoinHandle<eyre::Result<Compacted>>,
 }
 
@@ -408,20 +371,17 @@ impl Compaction {
     pub(super) fn start(gen: u64, job: Job) -> Option<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let progress = Arc::new(Mutex::new(job.snapshot.committed));
-        let removed_view = Arc::clone(&job.removed_view);
-        removed_view.publish_len(job.snapshot.committed.removed);
         let (thread_cancel, thread_progress) = (Arc::clone(&cancel), Arc::clone(&progress));
         let handle = std::thread::Builder::new()
             .name("tndb-compact".to_string())
             .spawn(move || run(job, &thread_progress, &thread_cancel))
             .map_err(|e| tracing::warn!(target: "tndb", "spawn a compaction thread: {e}"))
             .ok()?;
-        Some(Self { gen, cancel, progress, removed_view, handle })
+        Some(Self { gen, cancel, progress, handle })
     }
 
-    /// Tell the catch-up how far the old generation's logs are committed (at each publish).
+    /// Tell the catch-up how far the old generation's log is committed (at each publish).
     pub(super) fn publish(&self, committed: Committed) {
-        self.removed_view.publish_len(committed.removed);
         *self.progress.lock() = committed;
     }
 
@@ -470,15 +430,13 @@ pub(super) fn is_corruption(e: &eyre::Report) -> bool {
 fn catch_up_round(
     out: &mut Builder,
     data_view: &MapView,
-    removed_view: &MapView,
     progress: &Mutex<Committed>,
     done: &mut Committed,
 ) -> eyre::Result<u64> {
     let now = *progress.lock();
-    let behind = (now.data - done.data) + (now.removed - done.removed);
+    let behind = now.data - done.data;
     if behind > 0 {
-        let (data, removed) = (done.data..now.data, done.removed..now.removed);
-        replay_delta(out, data_view, data, removed_view, removed)?;
+        replay_delta(out, data_view, done.data..now.data)?;
         out.commit_record()?;
         *done = now;
     }
@@ -510,7 +468,6 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
         snapshot,
         alive,
         data_view,
-        removed_view,
         meta,
         key_fn,
         rate,
@@ -525,7 +482,7 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
     if fail_at_start {
         bail!("tndb: injected compaction failure");
     }
-    // Keeps the old generation's files open (and so both views valid) until the thread ends.
+    // Keeps the old generation's files open (and so its log's view valid) until the thread ends.
     let _alive = alive;
     let mut out = Builder::new(dir, meta, key_fn, Arc::clone(cancel), rate)?;
 
@@ -550,7 +507,7 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
     out.rate = 0;
     for _ in 0..MAX_CATCHUP_ROUNDS {
         out.check_cancel()?;
-        let behind = catch_up_round(&mut out, &data_view, &removed_view, progress, &mut done)?;
+        let behind = catch_up_round(&mut out, &data_view, progress, &mut done)?;
         #[cfg(test)]
         checkpoint(2, &gate, &arrived);
         if behind <= CATCHUP_BYTES {
@@ -565,7 +522,7 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
     #[cfg(test)]
     checkpoint(3, &gate, &arrived);
     out.check_cancel()?;
-    if catch_up_round(&mut out, &data_view, &removed_view, progress, &mut done)? > 0 {
+    if catch_up_round(&mut out, &data_view, progress, &mut done)? > 0 {
         out.sync()?;
     }
     Ok(Compacted { builder: out.unpaced(), done })

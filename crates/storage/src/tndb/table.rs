@@ -21,21 +21,24 @@
 //!
 //! ## Logs and recovery
 //!
-//! The data log is the table's write-ahead log (see [`super::layout`] for the files):
-//! - a put appends `[key | value]`, or just `[value]` in a derived-key table, whose key function
-//!   recomputes the key from the value;
-//! - a remove appends `[key | data log length]` to the separate removal log: every put of that key
-//!   below that length is gone;
-//! - a flush appends an empty record to the data log, the commit point, after syncing the removal
-//!   log, and then syncs the data log.
+//! The data log is the table's write-ahead log (see [`super::layout`] for the files). Each record
+//! starts with a tag byte:
+//! - a put appends `[PUT | key | value]`, or `[PUT | value]` in a derived-key table, whose key
+//!   function recomputes the key from the value;
+//! - a remove appends `[REMOVE | key]`: every earlier put of that key is gone;
+//! - a flush appends an empty record, the commit point, and then syncs the log.
+//!
+//! Puts and removals share the log, so one sync commits both, and a commit record counts only if
+//! every record before it reads back intact (records are CRC-framed): a crash cannot keep a commit
+//! and lose a removal it covers.
 //!
 //! The index is derived: it is synced only by a clean close. Opening a table whose files were not
 //! closed cleanly (or whose index is unreadable, or behind its log) rebuilds the index by replaying
-//! the logs up to the last commit point, so a crash keeps every committed write and no part of an
-//! uncommitted one (see [`recover`]). Recovery fails closed: it changes nothing until both logs
-//! have been read and checked, a tear in a sealed log or below a log's commit marker is an error,
-//! and a failed recovery leaves the logs as they were. Each write is all or nothing: a put or
-//! remove whose index step fails takes its log record back out.
+//! the log up to the last commit point, so a crash keeps every committed write and no part of an
+//! uncommitted one (see [`recover`]). Recovery fails closed: it changes nothing until the log has
+//! been read and checked, a tear in a sealed log or below its commit marker is an error, and a
+//! failed recovery leaves the log as it was. Each write is all or nothing: a put or remove whose
+//! index step fails takes its log record back out.
 //!
 //! One writer per table: an open holds the table's `LOCK` (`flock`) for the writer's life, so a
 //! second open of the same table (this process or another) fails. A clear that fails after the
@@ -98,11 +101,16 @@ const PACK_VERSION: u16 = 1;
 /// virtual only, sized so a table's log never outgrows it in practice.
 const TNDB_MAP_RESERVE: u64 = crate::archive::btree_index::index::BTX_MAP_RESERVE;
 
-/// First size of a removal log: removals are few, and the log is only read on a rebuild.
-const REMOVED_INITIAL_SIZE: u64 = 64 << 10;
-
-/// The data log's commit record: an empty payload (no put record is empty).
+/// The data log's commit record: an empty payload (every other record starts with its tag).
 const COMMIT: &[u8] = &[];
+
+/// A put record's tag: `PUT ‖ key ‖ value`, or `PUT ‖ value` in a derived-key table.
+const TAG_PUT: u8 = 1;
+const PUT: &[u8] = &[TAG_PUT];
+
+/// A removal record's tag: `REMOVE ‖ key`, which removes every earlier put of `key`.
+const TAG_REMOVE: u8 = 2;
+const REMOVE: &[u8] = &[TAG_REMOVE];
 
 /// Derives a derived-key table's encoded key from an encoded value.
 pub(crate) type KeyFn = Arc<dyn Fn(&[u8]) -> eyre::Result<Vec<u8>> + Send + Sync>;
@@ -134,22 +142,21 @@ impl ScanKind {
     }
 }
 
-/// The value bytes of a data record: past the key in a keyed table (`value_offset` = key size),
-/// the whole record in a derived-key one (0).
+/// The value bytes of a put record: past its tag and key in a keyed table (`value_offset` = 1 +
+/// key size), past its tag in a derived-key one (1).
 fn record_value(record: &[u8], value_offset: usize) -> Result<&[u8], FetchError> {
     record
         .get(value_offset..)
         .ok_or_else(|| FetchError::CorruptIndex("a data record is shorter than its key".into()))
 }
 
-/// A byte log: the data log or the removal log.
+/// A byte log: a generation's data log.
 type Log = Pack<Vec<u8>>;
 
 /// One generation's open files.
 #[derive(Debug)]
 struct GenFiles {
     data: Log,
-    removed: Log,
     idx: Option<BtreeIndex>,
 }
 
@@ -192,45 +199,27 @@ fn remove_in_background(dir: PathBuf) {
     }
 }
 
-/// Open (creating if absent) a generation's data and removal logs.
-fn open_logs(dir: &Path) -> eyre::Result<(Log, Log)> {
-    // The data log keeps one reserved mapping for its whole open life (it never moves on growth),
-    // as the B-tree index does, so lock-free readers can read it.
-    let data_opts = MmapFileOptions { reserve: TNDB_MAP_RESERVE, ..Default::default() };
-    let data = Pack::open_with(
-        dir.join("data"),
-        0,
-        false,
-        PackCompression::None,
-        PACK_VERSION,
-        data_opts,
-    )?;
-    let removed_opts = MmapFileOptions { initial_size: REMOVED_INITIAL_SIZE, ..Default::default() };
-    let removed = Pack::open_with(
-        dir.join("removed"),
-        0,
-        false,
-        PackCompression::None,
-        PACK_VERSION,
-        removed_opts,
-    )?;
-    Ok((data, removed))
+/// Open (creating if absent) a generation's data log.
+fn open_log(dir: &Path) -> eyre::Result<Log> {
+    // The log keeps one reserved mapping for its whole open life (it never moves on growth), as
+    // the B-tree index does, so lock-free readers can read it.
+    let opts = MmapFileOptions { reserve: TNDB_MAP_RESERVE, ..Default::default() };
+    Ok(Pack::open_with(dir.join("data"), 0, false, PackCompression::None, PACK_VERSION, opts)?)
 }
 
-/// Create generation `n` of `table`: its directory and empty logs, durable before it is used (the
-/// log headers, the generation's entries, and the generation itself).
-fn create_gen(table: &Path, n: u64) -> eyre::Result<(Log, Log)> {
+/// Create generation `n` of `table`: its directory and empty log, durable before it is used (the
+/// log header, the generation's entries, and the generation itself).
+fn create_gen(table: &Path, n: u64) -> eyre::Result<Log> {
     let dir = gen_dir(table, n);
     fs::create_dir(&dir).wrap_err_with(|| format!("tndb: create {}", dir.display()))?;
-    let (data, removed) = open_logs(&dir)?;
+    let data = open_log(&dir)?;
     data.commit()?;
-    removed.commit()?;
     sync_dir(&dir)?;
     sync_dir(table)?;
-    Ok((data, removed))
+    Ok(data)
 }
 
-/// Prepare a spare generation in `dir` (run on a background thread): an empty generation's logs,
+/// Prepare a spare generation in `dir` (run on a background thread): an empty generation's log,
 /// and its index when the key size is known, created and synced. A spare directory is never
 /// mistaken for a generation (only `gen-<N>` directories are). First deletes `cleared`, the
 /// directory of the generation the last clear replaced, if any.
@@ -243,125 +232,113 @@ fn prepare_spare(dir: &Path, ksize: u16, cleared: Option<&Path>) -> eyre::Result
         }
     }
     fs::create_dir(dir).wrap_err_with(|| format!("tndb: create {}", dir.display()))?;
-    let (data, removed) = open_logs(dir)?;
+    let data = open_log(dir)?;
     data.commit()?;
-    removed.commit()?;
     let idx = match ksize {
         0 => None,
         ksize => Some(BtreeIndex::open_btx_file(dir.join("btx"), data.header(), ksize, false)?),
     };
     sync_dir(dir)?;
-    Ok(GenFiles { data, removed, idx })
+    Ok(GenFiles { data, idx })
 }
 
-/// What replaying a generation's logs found: the live rows and where each log's committed records
-/// end.
+/// What replaying a generation's log found: the live rows and where its committed records end.
 struct Replay {
     rows: BTreeMap<Vec<u8>, u64>,
     /// Committed puts, live or not.
     puts: u64,
     data_end: u64,
-    removed_end: u64,
 }
 
-/// One data record, read during a replay.
+/// A data record, parsed (see [`data_record`]).
 enum DataRecord {
     Commit,
+    /// A put, with its key.
     Put(Vec<u8>),
+    /// A removal of every earlier put of this key.
+    Remove(Vec<u8>),
 }
 
-/// Replay a generation's logs (read through cloned file handles; nothing is changed): the rows
-/// the committed records leave, and the end of each log's committed records. Every check happens
-/// here, before recovery changes anything:
-/// - a put becomes live only at the commit record after it, and a removal applies only when it was
-///   made before the last commit (its data length is at most that commit record's position), so a
-///   crash keeps no part of an uncommitted flush;
-/// - a sealed (cleanly closed) log must read whole (no tear); any log may end in uncommitted
-///   records (a close that could not commit), which are dropped; an unclean log may also end in a
-///   tear, but not below its commit marker (that is damage to committed data, not a crash tail);
-/// - a malformed record, or a key function failure, is an error.
-fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Result<Replay> {
+/// Parse a data record's payload: a commit record (empty), or a put or a removal by its tag. A
+/// put's key is read from the record (keyed) or derived from its value by `key_fn` (derived); a
+/// removal's is the rest of the record. Every key must be the table's key size; an unknown tag or
+/// a malformed record is an error.
+fn data_record(
+    payload: &[u8],
+    meta: TableMeta,
+    key_fn: Option<&KeyFn>,
+) -> eyre::Result<DataRecord> {
     let ksize = meta.ksize as usize;
-    let header = DATA_HEADER_BYTES as u64;
+    let Some((&tag, body)) = payload.split_first() else { return Ok(DataRecord::Commit) };
+    let key = match tag {
+        TAG_PUT => match meta.mode {
+            KeyMode::Keyed if body.len() >= ksize => body[..ksize].to_vec(),
+            KeyMode::Keyed => bail!("tndb: a put record is shorter than its key"),
+            KeyMode::Derived => key_fn.ok_or_else(|| eyre::eyre!("tndb: no key function"))?(body)
+                .wrap_err("tndb: derive a put record's key")?,
+        },
+        TAG_REMOVE => body.to_vec(),
+        other => bail!("tndb: a data record has an unknown tag {other}"),
+    };
+    if ksize == 0 || key.len() != ksize {
+        bail!("tndb: a {}-byte key in a table of {ksize}-byte keys", key.len());
+    }
+    Ok(match tag {
+        TAG_PUT => DataRecord::Put(key),
+        _ => DataRecord::Remove(key),
+    })
+}
 
-    // The data log: puts, made live by the commit record after them.
+/// Replay a generation's log (read through a cloned file handle; nothing is changed): the rows its
+/// committed records leave, and where those records end. Every check happens here, before
+/// recovery changes anything:
+/// - puts and removals take effect, in log order, only at the commit record after them, so a crash
+///   keeps no part of an uncommitted flush;
+/// - a sealed (cleanly closed) log must read whole (no tear); it may end in uncommitted records (a
+///   close that could not commit), which are dropped; an unclean log may also end in a tear, but
+///   not below its commit marker (that is damage to committed data, not a crash tail);
+/// - a malformed record (see [`data_record`]), or a key function failure, is an error.
+fn replay(files: &GenFiles, meta: TableMeta, key_fn: Option<&KeyFn>) -> eyre::Result<Replay> {
     let mut rows = BTreeMap::new();
     let mut puts = 0;
-    let mut pending: Vec<(Vec<u8>, u64)> = Vec::new();
-    let mut last_commit = None;
-    let mut data_end = header;
+    // Since the last commit record, in log order: a put's key and position, or a removal's key.
+    let mut pending: Vec<(Vec<u8>, Option<u64>)> = Vec::new();
+    let mut data_end = DATA_HEADER_BYTES as u64;
     let mut torn = false;
     let mut iter = files.data.raw_iter()?;
     loop {
         let start = iter.logical_position();
-        let record = match iter.next_raw() {
+        let payload = match iter.next_raw() {
             None => break,
             Some(Err(_)) => {
                 torn = true;
                 break;
             }
-            Some(Ok([])) => DataRecord::Commit,
-            Some(Ok(payload)) => DataRecord::Put(match meta.mode {
-                KeyMode::Keyed if ksize > 0 && payload.len() >= ksize => payload[..ksize].to_vec(),
-                KeyMode::Keyed => bail!("tndb: a data record at {start} is shorter than its key"),
-                KeyMode::Derived => {
-                    let key_fn = key_fn.ok_or_else(|| eyre::eyre!("tndb: no key function"))?;
-                    let key = key_fn(payload).wrap_err_with(|| {
-                        format!("tndb: derive the key of the record at {start}")
-                    })?;
-                    if key.len() != ksize {
-                        bail!("tndb: the derived key at {start} is not {ksize} bytes");
-                    }
-                    key
-                }
-            }),
+            Some(Ok(payload)) => payload,
         };
-        match record {
-            DataRecord::Put(key) => pending.push((key, start)),
+        match data_record(payload, meta, key_fn)
+            .wrap_err_with(|| format!("tndb: the data record at {start}"))?
+        {
+            DataRecord::Put(key) => pending.push((key, Some(start))),
+            DataRecord::Remove(key) => pending.push((key, None)),
             DataRecord::Commit => {
-                puts += pending.len() as u64;
-                rows.extend(pending.drain(..));
-                last_commit = Some(start);
+                for (key, put) in pending.drain(..) {
+                    match put {
+                        Some(pos) => {
+                            puts += 1;
+                            rows.insert(key, pos);
+                        }
+                        None => {
+                            rows.remove(&key);
+                        }
+                    }
+                }
                 data_end = iter.logical_position();
             }
         }
     }
     check_log_end("data", &files.data, torn, data_end)?;
-
-    // The removal log: committed removals, in order (their data lengths never decrease).
-    let mut removed_end = header;
-    let mut torn = false;
-    let mut uncommitted = false;
-    let mut iter = files.removed.raw_iter()?;
-    loop {
-        let start = iter.logical_position();
-        let (key, data_len) = match iter.next_raw() {
-            None => break,
-            Some(Err(_)) => {
-                torn = true;
-                break;
-            }
-            Some(Ok(payload)) if payload.len() == ksize + 8 && ksize > 0 => {
-                let data_len = u64::from_le_bytes(payload[ksize..].try_into().expect("8 bytes"));
-                (payload[..ksize].to_vec(), data_len)
-            }
-            Some(Ok(_)) => bail!("tndb: a removal record at {start} is malformed"),
-        };
-        if last_commit.is_some_and(|commit| data_len <= commit) {
-            if uncommitted {
-                bail!("tndb: the removal log is out of order at {start}");
-            }
-            if rows.get(&key).is_some_and(|&pos| pos < data_len) {
-                rows.remove(&key);
-            }
-            removed_end = iter.logical_position();
-        } else {
-            uncommitted = true;
-        }
-    }
-    check_log_end("removal", &files.removed, torn, removed_end)?;
-
-    Ok(Replay { rows, puts, data_end, removed_end })
+    Ok(Replay { rows, puts, data_end })
 }
 
 /// Fail closed on a log whose replay hit a bad frame (`torn`) when that cannot be a crash tail:
@@ -395,8 +372,6 @@ struct Writer {
     spare: Option<(PathBuf, std::thread::JoinHandle<eyre::Result<GenFiles>>)>,
     /// Records appended since the last commit record.
     uncommitted: bool,
-    /// Removal records appended since the removal log was last synced.
-    removals_unsynced: bool,
     /// Group-commit mode (see `super::commit`): the sequence number of the last write published
     /// here, the first one not yet durable (if any), and the open write transactions that wrote
     /// this table (the committer leaves the table alone while any is open, so a transaction never
@@ -404,10 +379,10 @@ struct Writer {
     applied_seq: u64,
     first_pending: Option<u64>,
     open_txns: u32,
-    /// Test-only: the committer's next round on this table reports reaching the point between its
-    /// unlocked removal-log sync and its commit record, then waits to be released.
+    /// Test-only: the committer's next round on this table reports reaching its unlocked sync,
+    /// then waits to be released (see [`TnTable::gate_next_group_commit`]).
     #[cfg(test)]
-    commit_gate: Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    commit_gate: Option<CommitGate>,
     /// Test-only: the committer's next step for this table panics.
     #[cfg(test)]
     panic_next_group_commit: bool,
@@ -477,11 +452,11 @@ impl std::fmt::Debug for Writer {
 }
 
 impl Writer {
-    /// Bytes before a data record's value: its key in a keyed table, nothing in a derived one.
+    /// Bytes before a put record's value: its tag, and its key in a keyed table.
     fn value_offset(&self) -> usize {
         match self.meta.mode {
-            KeyMode::Keyed => self.meta.ksize as usize,
-            KeyMode::Derived => 0,
+            KeyMode::Keyed => 1 + self.meta.ksize as usize,
+            KeyMode::Derived => 1,
         }
     }
 
@@ -516,7 +491,7 @@ impl Writer {
     /// Refuse writes once a failed clear or compaction switch stopped this writer (see `failed`).
     /// True once this writer can no longer commit: it stopped (see `failed`), or a log failed.
     fn is_broken(&self) -> bool {
-        self.failed.is_some() || self.files.data.is_failed() || self.files.removed.is_failed()
+        self.failed.is_some() || self.files.data.is_failed()
     }
 
     fn check_failed(&self) -> eyre::Result<()> {
@@ -534,7 +509,7 @@ impl Writer {
         self.check_failed()?;
         self.check_ksize(key)?;
         let pos = match &self.key_fn {
-            None => self.files.data.append_raw_parts(&[key, value])?,
+            None => self.files.data.append_raw_parts(&[PUT, key, value])?,
             Some(key_fn) => {
                 if value.is_empty() {
                     bail!("tndb: a derived-key table cannot store an empty value");
@@ -544,7 +519,7 @@ impl Writer {
                     Some(key),
                     "tndb: a derived-key table's key must be the key derived from its value"
                 );
-                self.files.data.append_raw(value)?
+                self.files.data.append_raw_parts(&[PUT, value])?
             }
         };
         // All or nothing: a failed index step takes its record back out of the log, or a later
@@ -585,22 +560,19 @@ impl Writer {
     fn remove(&mut self, key: &[u8]) -> eyre::Result<bool> {
         self.check_failed()?;
         let Some(idx) = self.files.idx.as_mut() else { return Ok(false) };
-        let record = self.files.removed.file_len();
-        let data_len = self.files.data.file_len().to_le_bytes();
-        self.files.removed.append_raw_parts(&[key, &data_len])?;
+        let record = self.files.data.append_raw_parts(&[REMOVE, key])?;
         match idx.remove(key) {
             Ok(true) => {
-                self.removals_unsynced = true;
                 self.uncommitted = true;
                 self.dead += 1;
                 Ok(true)
             }
             Ok(false) => {
-                self.files.removed.rewind_to(record);
+                self.files.data.rewind_to(record);
                 Ok(false)
             }
             Err(e) => {
-                self.files.removed.rewind_to(record);
+                self.files.data.rewind_to(record);
                 Err(e.into())
             }
         }
@@ -670,7 +642,7 @@ impl Writer {
                 files
             }
             None => match create_gen(&self.table_dir, next) {
-                Ok((data, removed)) => GenFiles { data, removed, idx: None },
+                Ok(data) => GenFiles { data, idx: None },
                 // A partly created generation the next open would pick stops this writer too.
                 Err(e) if next_dir.exists() => {
                     return Err(self.stop(format!("create the new generation: {e}")));
@@ -696,9 +668,7 @@ impl Writer {
         self.data_view = self.files.data.view();
         self.gen = next;
         self.uncommitted = false;
-        self.removals_unsynced = false;
         old.data.set_remove_on_drop();
-        old.removed.set_remove_on_drop();
         if let Some(idx) = old.idx.as_mut() {
             idx.set_remove_on_drop();
         }
@@ -718,8 +688,8 @@ impl Writer {
         report
     }
 
-    /// Commit: sync the removal log (if it changed), append the commit record, and sync the data
-    /// log. A flush with nothing to commit does nothing.
+    /// Commit: append the commit record and sync the data log. A flush with nothing to commit does
+    /// nothing.
     fn flush(&mut self) -> eyre::Result<()> {
         self.check_failed()?;
         if !self.uncommitted {
@@ -729,20 +699,11 @@ impl Writer {
         if std::mem::take(&mut self.fail_next_flush) {
             eyre::bail!("injected commit failure");
         }
-        // The removals are durable before the commit record that makes them count.
-        let removals = self.removals_unsynced;
-        if removals {
-            self.files.removed.commit()?;
-        }
         self.files.data.append_raw(COMMIT)?;
         self.files.data.commit()?;
-        // The commit markers (best-effort floors for recovery) move only once the commit is
-        // durable, so neither ever claims an uncommitted record.
+        // The commit marker (a best-effort floor for recovery) moves only once the commit is
+        // durable, so it never claims an uncommitted record.
         self.files.data.stamp_commit_marker();
-        if removals {
-            self.files.removed.stamp_commit_marker();
-        }
-        self.removals_unsynced = false;
         self.uncommitted = false;
         let data_len = self.files.data.file_len();
         if let Some(idx) = self.files.idx.as_mut() {
@@ -755,8 +716,7 @@ impl Writer {
     /// the data log's current extent.
     fn publish(&mut self) -> Published {
         let index = self.files.idx.as_mut().map(BtreeIndex::publish);
-        let committed =
-            Committed { data: self.files.data.file_len(), removed: self.files.removed.file_len() };
+        let committed = Committed { data: self.files.data.file_len() };
         self.data_view.publish_len(committed.data);
         if let Some(compaction) = &self.compaction {
             compaction.publish(committed);
@@ -832,7 +792,6 @@ impl Writer {
             dir: compact_dir(&self.table_dir, self.gen + 1),
             alive: Arc::clone(&snapshot.alive),
             data_view: Arc::clone(&snapshot.data_view),
-            removed_view: self.files.removed.view(),
             snapshot,
             meta: self.meta,
             key_fn: self.key_fn.clone(),
@@ -870,9 +829,7 @@ impl Writer {
             .and_then(|compacted| {
                 #[cfg(test)]
                 {
-                    let (data, removed) = (&self.files.data, &self.files.removed);
-                    self.last_switch_tail = (data.file_len() - compacted.done.data)
-                        + (removed.file_len() - compacted.done.removed);
+                    self.last_switch_tail = self.files.data.file_len() - compacted.done.data;
                 }
                 self.catch_up(compacted)
             })
@@ -912,9 +869,8 @@ impl Writer {
     /// it. The new generation must have exactly the table's rows.
     fn catch_up(&self, compacted: Compacted) -> eyre::Result<compact::Builder> {
         let Compacted { mut builder, done } = compacted;
-        let (data, removed) = (&self.files.data, &self.files.removed);
-        let pending = (done.data..data.file_len(), done.removed..removed.file_len());
-        replay_delta(&mut builder, data, pending.0, removed, pending.1)?;
+        let data = &self.files.data;
+        replay_delta(&mut builder, data, done.data..data.file_len())?;
         builder.commit_record()?;
         builder.sync()?;
         let live = self.files.idx.as_ref().map_or(0, BtreeIndex::len);
@@ -961,9 +917,6 @@ impl Writer {
         if replay.data_end < self.files.data.file_len() {
             self.files.data.rewind_to(replay.data_end);
         }
-        if replay.removed_end < self.files.removed.file_len() {
-            self.files.removed.rewind_to(replay.removed_end);
-        }
         if replay.rows.is_empty() && self.files.idx.is_none() {
             let _ = fs::remove_dir_all(self.gen_dir.join("btx"));
         } else {
@@ -981,7 +934,6 @@ impl Writer {
             idx.mark_consistent();
         }
         self.files.data.mark_consistent();
-        self.files.removed.mark_consistent();
         #[cfg(test)]
         {
             self.rebuilt = true;
@@ -999,15 +951,13 @@ impl Drop for Writer {
         // closes), then discard it: the next open prepares its own.
         if let Some((dir, mut spare)) = self.take_spare() {
             spare.data.set_remove_on_drop();
-            spare.removed.set_remove_on_drop();
             if let Some(idx) = spare.idx.as_mut() {
                 idx.set_remove_on_drop();
             }
             drop(spare);
             let _ = fs::remove_dir_all(dir);
         }
-        // Commit what is uncommitted the ordinary way (the removal log synced before the commit
-        // record that makes its removals count).
+        // Commit what is uncommitted the ordinary way.
         let committed = self.flush().is_ok();
         // Keep a compaction that has finished (switch to it); stop one still running. Wait for
         // every compaction thread, so none writes in the table directory after it closes.
@@ -1101,18 +1051,17 @@ pub(crate) struct TnTable {
 /// The current generation of the table at `dir`, opened: the newest generation (an error if it
 /// does not open), with every older one deleted (more than one exists only after a crash during a
 /// clear); a new table gets generation 0.
-fn open_current_gen(dir: &Path) -> eyre::Result<(u64, Log, Log)> {
+fn open_current_gen(dir: &Path) -> eyre::Result<(u64, Log)> {
     let gens = list_gens(dir)?;
     let Some(&newest) = gens.last() else {
-        let (data, removed) = create_gen(dir, 0)?;
-        return Ok((0, data, removed));
+        return Ok((0, create_gen(dir, 0)?));
     };
     // The newest generation is current. One that does not open is an error, never a reason to
     // delete it or to fall back to an older one: a clear renames a complete generation into place,
     // and a partly created one opens as empty (a missing log is created, a zeroed one reset), so a
     // failure here is damage or an environment error, and older data must not come back.
     let current = newest;
-    let logs = open_logs(&gen_dir(dir, current))
+    let data = open_log(&gen_dir(dir, current))
         .wrap_err_with(|| format!("tndb: open generation {current} of {}", dir.display()))?;
     // An older generation is never opened again (the newest is current), so one that cannot be
     // deleted now (logged) is only garbage for a later open to remove.
@@ -1121,7 +1070,7 @@ fn open_current_gen(dir: &Path) -> eyre::Result<(u64, Log, Log)> {
             tracing::warn!(target: "tndb", "remove old generation {old} of {}: {e}", dir.display());
         }
     }
-    Ok((current, logs.0, logs.1))
+    Ok((current, data))
 }
 
 impl TnTable {
@@ -1159,7 +1108,7 @@ impl TnTable {
             }
         };
         remove_spares(&dir)?;
-        let (gen, data, removed) = open_current_gen(&dir)?;
+        let (gen, data) = open_current_gen(&dir)?;
         let gen_path = gen_dir(&dir, gen);
 
         // The index, if the generation has one: a header or geometry the open rejects marks it for
@@ -1183,7 +1132,6 @@ impl TnTable {
         let has_records = data.file_len() > DATA_HEADER_BYTES as u64;
         let must_rebuild = index_broken
             || data.opened_unclean()
-            || removed.opened_unclean()
             || match &idx {
                 Some(idx) => idx.opened_unclean() || idx.data_file_length() != data.file_len(),
                 None => has_records,
@@ -1200,12 +1148,11 @@ impl TnTable {
             key_fn,
             gen,
             gen_dir: gen_path,
-            files: GenFiles { data, removed, idx },
+            files: GenFiles { data, idx },
             data_view,
             alive: Arc::default(),
             spare: None,
             uncommitted: false,
-            removals_unsynced: false,
             applied_seq: 0,
             first_pending: None,
             open_txns: 0,
@@ -1325,7 +1272,6 @@ impl TnTable {
         CompactionState {
             gen: writer.gen,
             data_len: writer.files.data.file_len(),
-            removed_len: writer.files.removed.file_len(),
             dead: writer.dead,
             running: writer.compaction.is_some(),
             started: writer.compactions_started,
@@ -1459,28 +1405,41 @@ impl TnTable {
         self.inner.published.store(Arc::new(writer.publish()));
     }
 
+    /// The writer lock, for the committer's steps; test builds count the wait and the hold (see
+    /// `super::commit::stats`).
+    fn committer_lock(&self) -> CommitterLock<'_> {
+        #[cfg(test)]
+        let started = Instant::now();
+        let writer = self.inner.writer.lock();
+        #[cfg(test)]
+        {
+            use super::commit::stats;
+            stats::add(&stats::LOCK_WAITS, &stats::LOCK_WAIT_NS, started.elapsed());
+        }
+        CommitterLock {
+            writer,
+            #[cfg(test)]
+            held_from: Instant::now(),
+        }
+    }
+
     /// The committer's step for this table (see `super::commit`): commit every write published so
     /// far, syncing outside the writer lock so writers never wait on the disk. Returns the first
     /// sequence number still not durable here, if any: a table with an open write transaction is
     /// left as it is, and writes published during the sync wait for the next round.
     ///
-    /// The ordering is [`Writer::flush`]'s: removals are durable before the commit record that
-    /// makes them count. So the removal log is synced first (unlocked), any removal appended
-    /// meanwhile is synced under the lock, and only then is the commit record appended.
-    ///
-    /// While a sync runs unlocked, a clear or a compaction's switch can install a new generation.
-    /// Each ticket therefore keeps its generation open (mapped) until its sync is done, and its
+    /// While the sync runs unlocked, a clear or a compaction's switch can install a new generation.
+    /// The ticket therefore keeps its generation open (mapped) until its sync is done, and its
     /// outcome is applied only while that generation is still current: the retired one's rows are
     /// superseded (a clear is durable when it returns) or already durable in the new one (a switch
     /// syncs it before the rename), so a sync of the retired generation, failed or not, is moot.
     pub(crate) fn group_commit(&self) -> eyre::Result<Option<u64>> {
-        // (a) What is pending; the removal log's unsynced range, if any.
+        // Under the lock: append the commit record (removals and puts alike sit before it in the
+        // one log) and take the log's unsynced range.
         #[cfg(test)]
         let gate;
-        let removal: Option<GenTicket> = {
-            // Mutated only to take the test gate.
-            #[cfg_attr(not(test), allow(unused_mut))]
-            let mut writer = self.inner.writer.lock();
+        let (data, covered) = {
+            let mut writer = self.committer_lock();
             if writer.open_txns > 0 {
                 return Ok(writer.first_pending);
             }
@@ -1494,72 +1453,39 @@ impl TnTable {
                 if std::mem::take(&mut writer.panic_next_group_commit) {
                     panic!("injected group commit panic");
                 }
-            }
-            match writer.removals_unsynced {
-                true => Some(GenTicket::new(&writer, writer.files.removed.sync_ticket()?)),
-                false => None,
-            }
-        };
-        // (b) The removal log, unlocked.
-        #[cfg(test)]
-        let gate = commit_gate_wait(gate, CommitPoint::BeforeRemovalSync);
-        let removal_outcome = removal.as_ref().map(|removal| removal.ticket.sync());
-        #[cfg(test)]
-        let gate = commit_gate_wait(gate, CommitPoint::AfterRemovalSync);
-        // (c) Under the lock: finish the removal log, append the commit record, take the data
-        // log's range.
-        let (data, removals_synced_to, covered) = {
-            let mut writer = self.inner.writer.lock();
-            if let (Some(removal), Some(outcome)) = (&removal, &removal_outcome) {
-                if removal.gen == writer.gen {
-                    writer.files.removed.complete_sync(&removal.ticket, outcome)?;
+                if std::mem::take(&mut writer.fail_next_flush) {
+                    bail!("injected commit failure");
                 }
-            }
-            if writer.open_txns > 0 {
-                return Ok(writer.first_pending);
-            }
-            #[cfg(test)]
-            if std::mem::take(&mut writer.fail_next_flush) {
-                bail!("injected commit failure");
-            }
-            let removals = writer.removals_unsynced.then(|| writer.files.removed.file_len());
-            if removals.is_some() {
-                // Removals appended during the unlocked sync (rare, and few), or all of a new
-                // generation's.
-                writer.files.removed.commit()?;
             }
             if writer.uncommitted {
                 writer.files.data.append_raw(COMMIT)?;
             }
             writer.uncommitted = false;
-            writer.removals_unsynced = false;
             // Nothing is uncommitted and no transaction is open: the moment a finished compaction
             // can switch in (its catch-up replays through the commit record just appended and
             // syncs the new generation before renaming it into place). Waiting for a round that
             // ends idle instead would never come while writes keep arriving.
-            let removals = match writer.switch_if_compacted()? {
-                true => {
-                    self.inner.published.store(Arc::new(writer.publish()));
-                    None // the removal log just synced belongs to the retired generation
-                }
-                false => removals,
-            };
-            let data = GenTicket::new(&writer, writer.files.data.sync_ticket()?);
-            (data, removals, writer.applied_seq)
+            if writer.switch_if_compacted()? {
+                self.inner.published.store(Arc::new(writer.publish()));
+            }
+            (GenTicket::new(&writer, writer.files.data.sync_ticket()?), writer.applied_seq)
         };
-        drop(removal);
         #[cfg(test)]
-        commit_gate_wait(gate, CommitPoint::AfterCommitRecord);
-        // (d) The data log, unlocked; writes appended meanwhile lie past the ticket.
+        commit_gate_wait(gate);
+        // Unlocked: sync the log; writes appended meanwhile lie past the ticket.
+        #[cfg(test)]
+        let sync_started = Instant::now();
         let outcome = data.ticket.sync();
-        // (e) Record it; start a compaction if one is due.
-        let mut writer = self.inner.writer.lock();
+        #[cfg(test)]
+        {
+            use super::commit::stats;
+            stats::add(&stats::DATA_SYNCS, &stats::DATA_SYNC_NS, sync_started.elapsed());
+        }
+        // Under the lock: record it; start a compaction if one is due.
+        let mut writer = self.committer_lock();
         if data.gen == writer.gen {
             writer.files.data.complete_sync(&data.ticket, &outcome)?;
             writer.files.data.stamp_commit_marker_at(data.ticket.end());
-            if let Some(removed_end) = removals_synced_to {
-                writer.files.removed.stamp_commit_marker_at(removed_end);
-            }
         }
         writer.first_pending = (writer.applied_seq != covered).then_some(covered + 1);
         if writer.wants_compaction() && !writer.start_compaction(self.inner.published.load_full()) {
@@ -1571,32 +1497,30 @@ impl TnTable {
         Ok(writer.first_pending)
     }
 
-    /// Test-only: the data and removal logs' synced watermarks and lengths, in that order.
+    /// Test-only: the data log's synced watermark and length.
     #[cfg(test)]
-    pub(crate) fn log_sync_state(&self) -> [u64; 4] {
+    pub(crate) fn log_sync_state(&self) -> [u64; 2] {
         let writer = self.inner.writer.lock();
-        let (data, removed) = (&writer.files.data, &writer.files.removed);
-        [data.synced_end(), data.file_len(), removed.synced_end(), removed.file_len()]
+        [writer.files.data.synced_end(), writer.files.data.file_len()]
     }
 
-    /// Test-only: the current generation's data and removal log views (which stop mapping
-    /// anything once the generation's files drop).
+    /// Test-only: the current generation's data log view (which stops mapping anything once the
+    /// generation's files drop).
     #[cfg(test)]
-    pub(crate) fn log_views(&self) -> (Arc<MapView>, Arc<MapView>) {
-        let writer = self.inner.writer.lock();
-        (writer.files.data.view(), writer.files.removed.view())
+    pub(crate) fn log_view(&self) -> Arc<MapView> {
+        self.inner.writer.lock().files.data.view()
     }
 
-    /// Test-only: the committer's next round on this table stops at `point`, reports it on the
-    /// first channel, and waits for a message (or the sender's drop) on the second.
+    /// Test-only: the committer's next round on this table stops before its unlocked sync (after
+    /// its commit record, and a compaction's switch), reports it on the first channel, and waits
+    /// for a message (or the sender's drop) on the second.
     #[cfg(test)]
     pub(crate) fn gate_next_group_commit(
         &self,
-        point: CommitPoint,
     ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
         let (arrived, arrivals) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
-        self.inner.writer.lock().commit_gate = Some((point, arrived, released));
+        self.inner.writer.lock().commit_gate = Some((arrived, released));
         (arrivals, release)
     }
 
@@ -1749,6 +1673,35 @@ fn latch_if_broken(
     e
 }
 
+/// The writer lock held by a committer step (see [`TnTable::committer_lock`]).
+struct CommitterLock<'a> {
+    writer: parking_lot::MutexGuard<'a, Writer>,
+    #[cfg(test)]
+    held_from: Instant,
+}
+
+impl std::ops::Deref for CommitterLock<'_> {
+    type Target = Writer;
+
+    fn deref(&self) -> &Writer {
+        &self.writer
+    }
+}
+
+impl std::ops::DerefMut for CommitterLock<'_> {
+    fn deref_mut(&mut self) -> &mut Writer {
+        &mut self.writer
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommitterLock<'_> {
+    fn drop(&mut self) {
+        use super::commit::stats;
+        stats::add(&stats::LOCK_HOLDS, &stats::LOCK_HOLD_NS, self.held_from.elapsed());
+    }
+}
+
 /// A log's [`SyncTicket`] for [`TnTable::group_commit`]'s unlocked sync, with the generation it
 /// was taken in, held open (so its mapping stays valid) until the ticket drops.
 struct GenTicket {
@@ -1763,31 +1716,17 @@ impl GenTicket {
     }
 }
 
-/// Test-only: where a table's group commit stops (see [`TnTable::gate_next_group_commit`]).
+/// Test-only: a table's group-commit gate (see [`TnTable::gate_next_group_commit`]): where to
+/// report arriving, and where to wait for the release.
 #[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CommitPoint {
-    /// After its first locked step, before the unlocked removal-log sync.
-    BeforeRemovalSync,
-    /// After the unlocked removal-log sync, before the commit record.
-    AfterRemovalSync,
-    /// After the commit record (and a compaction's switch), before the unlocked data-log sync.
-    AfterCommitRecord,
-}
+type CommitGate = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
 
-/// Test-only: wait at `gate` if it is set for `point`; otherwise hand it on.
+/// Test-only: report arriving at `gate`, if set, and wait for its release.
 #[cfg(test)]
-fn commit_gate_wait(
-    gate: Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
-    point: CommitPoint,
-) -> Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
-    match gate {
-        Some((at, arrived, release)) if at == point => {
-            let _ = arrived.send(());
-            let _ = release.recv_timeout(Duration::from_secs(30));
-            None
-        }
-        other => other,
+fn commit_gate_wait(gate: Option<CommitGate>) {
+    if let Some((arrived, release)) = gate {
+        let _ = arrived.send(());
+        let _ = release.recv_timeout(Duration::from_secs(30));
     }
 }
 
@@ -1797,7 +1736,6 @@ fn commit_gate_wait(
 pub(crate) struct CompactionState {
     pub(crate) gen: u64,
     pub(crate) data_len: u64,
-    pub(crate) removed_len: u64,
     pub(crate) dead: u64,
     pub(crate) running: bool,
     pub(crate) started: u32,
@@ -2352,6 +2290,61 @@ mod test {
         assert!(table.contains(&k_other).expect("contains"));
     }
 
+    /// One commit's puts and removals take effect in log order on a rebuild: a key put, removed
+    /// and put again keeps its last value; a key put and then removed is gone; a removal of a key
+    /// committed earlier holds.
+    #[test]
+    fn test_tntable_replay_applies_records_in_log_order() {
+        let tmp = TempDir::with_prefix("tntable_replay_order").expect("temp dir");
+        let dir = tmp.path().join("t");
+        let table = TnTable::open(dir.clone(), None).expect("open");
+        let (k1, k2, k3) = (kv(1).0, kv(2).0, kv(3).0);
+        table.insert(&k3, b"old").expect("insert");
+        table.flush().expect("flush");
+        table.insert(&k1, b"a").expect("insert");
+        table.remove(&k1).expect("remove");
+        table.insert(&k1, b"b").expect("insert");
+        table.insert(&k2, b"x").expect("insert");
+        table.remove(&k2).expect("remove");
+        table.remove(&k3).expect("remove");
+        table.flush().expect("flush");
+        crash(table);
+
+        let table = TnTable::open(dir, None).expect("reopen");
+        assert!(table.rebuilt_on_open());
+        assert_eq!(table.get_with(&k1, |v| v.to_vec()).expect("get"), Some(b"b".to_vec()));
+        assert!(!table.contains(&k2).expect("contains"), "put, then removed");
+        assert!(!table.contains(&k3).expect("contains"), "removed after an earlier commit");
+    }
+
+    /// A committed data record with an unknown tag, or a removal that is not one key long, fails
+    /// a rebuild closed: the open is an error and the log is left as it was.
+    #[test]
+    fn test_tntable_malformed_record_fails_closed() {
+        let cases =
+            [("unknown tag", vec![9_u8, 1, 2, 3]), ("3-byte key", vec![TAG_REMOVE, 1, 2, 3])];
+        for (expected, record) in cases {
+            let tmp = TempDir::with_prefix("tntable_malformed").expect("temp dir");
+            let dir = tmp.path().join("t");
+            let table = TnTable::open(dir.clone(), None).expect("open");
+            table.insert(&kv(1).0, &kv(1).1).expect("insert");
+            table.flush().expect("flush");
+            {
+                let mut writer = table.inner.writer.lock();
+                writer.files.data.append_raw(&record).expect("append");
+                writer.files.data.append_raw(COMMIT).expect("commit record");
+                writer.files.data.commit().expect("sync");
+            }
+            crash(table);
+
+            let data = dir.join("gen-0").join("data");
+            let len = fs::metadata(&data).expect("data log").len();
+            let err = TnTable::open(dir.clone(), None).expect_err(expected);
+            assert!(format!("{err:#}").contains(expected), "{expected}: {err:#}");
+            assert_eq!(fs::metadata(&data).expect("data log").len(), len, "nothing changed");
+        }
+    }
+
     // ---- compaction ----
 
     type Model = BTreeMap<Vec<u8>, Vec<u8>>;
@@ -2466,7 +2459,6 @@ mod test {
         assert_eq!(after.gen, before.gen + 1, "switched to the next generation");
         assert!(!after.running);
         assert!(after.data_len < before.data_len * 2 / 3, "{after:?} vs {before:?}");
-        assert!(after.removed_len < before.removed_len / 4, "{after:?} vs {before:?}");
         assert_matches(&table, &model);
         wait_for_only_gen(&dir, after.gen);
         assert_eq!(compact_dirs(&dir), 0);

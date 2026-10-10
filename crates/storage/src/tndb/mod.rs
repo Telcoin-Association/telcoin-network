@@ -7,5 +7,7 @@ pub mod database;
 mod layout;
 mod table;
 
+#[cfg(test)]
+pub(crate) use commit::stats as group_stats;
 pub use database::{CommitMode, TnDatabase, TnDbOptions};
 pub use table::CompactionConfig;

@@ -3,9 +3,8 @@
 //! ```text
 //! <table>/LOCK             held (flock) by the table's one open writer
 //! <table>/meta             the key mode (keyed | derived) and the encoded key size
-//! <table>/gen-<N>/data     the value log: keyed records [key | value], derived records [value],
-//!                          and an empty record at each commit
-//! <table>/gen-<N>/removed  the removal log: [key | data log length at the removal]
+//! <table>/gen-<N>/data     the log: puts [PUT | key | value] (derived: [PUT | value]),
+//!                          removals [REMOVE | key], and an empty record at each commit
 //! <table>/gen-<N>/btx/     the B-tree index over the current generation (rebuildable)
 //! <table>/spare-<N+1>-<id>/ the next generation, prepared empty in the background
 //! <table>/compact-<N+1>-<id>/ a compaction's new generation, being built in the background
@@ -62,7 +61,9 @@ pub(crate) struct TableMeta {
 const META_FILE: &str = "meta";
 const META_TMP: &str = "meta.tmp";
 const META_MAGIC: &[u8; 8] = b"TNDBMETA";
-const META_VERSION: u8 = 1;
+/// The on-disk format: 2 (one tagged data log per generation). Version 1, a pre-release layout
+/// with a separate removal log, is not read (no table of it was ever in production).
+const META_VERSION: u8 = 2;
 /// magic (8) | version (1) | mode (1) | ksize (2, LE) | crc32 of the preceding 12 bytes (4, LE).
 const META_LEN: usize = 16;
 
@@ -84,10 +85,16 @@ impl TableMeta {
     fn from_bytes(bytes: &[u8]) -> eyre::Result<Self> {
         if bytes.len() != META_LEN
             || &bytes[..8] != META_MAGIC
-            || bytes[8] != META_VERSION
             || crc32(&bytes[..12]).to_le_bytes() != bytes[12..16]
         {
             bail!("tndb: table meta file is corrupt");
+        }
+        if bytes[8] != META_VERSION {
+            bail!(
+                "tndb: the table's on-disk format is version {}, this build reads version \
+                 {META_VERSION} (version 1 was a pre-release layout; delete the table)",
+                bytes[8]
+            );
         }
         let mode = match bytes[9] {
             0 => KeyMode::Keyed,
@@ -229,6 +236,21 @@ mod test {
     use tempfile::TempDir;
 
     use super::*;
+
+    /// A meta of another format version (1 is the pre-release layout with a separate removal log)
+    /// is refused with its own error, not read as corrupt.
+    #[test]
+    fn test_tndb_meta_other_version_refused() {
+        let meta = TableMeta { mode: KeyMode::Keyed, ksize: 8 };
+        let mut bytes = meta.to_bytes();
+        assert_eq!(TableMeta::from_bytes(&bytes).expect("current version"), meta);
+        bytes[8] = 1;
+        let crc = crc32(&bytes[..12]);
+        bytes[12..].copy_from_slice(&crc.to_le_bytes());
+        let err = TableMeta::from_bytes(&bytes).expect_err("version 1");
+        assert!(format!("{err}").contains("version 1"), "{err}");
+        assert!(!format!("{err}").contains("corrupt"), "{err}");
+    }
 
     #[test]
     fn test_tndb_meta_roundtrip_and_corruption() {

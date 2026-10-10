@@ -95,7 +95,7 @@ use crate::{
 use crate::{
     layered_db::LayeredDatabase,
     mem_db::MemDatabase,
-    tndb::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
+    tndb::{group_stats, CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
     ROUNDS_TO_KEEP,
 };
 
@@ -104,6 +104,39 @@ use crate::{
 fn open_tndb_group(dir: &Path, compaction: CompactionConfig) -> TnDatabase {
     TnDatabase::open_with(dir, TnDbOptions { compaction, commit: CommitMode::Group })
         .expect("open tndb")
+}
+
+/// Run the `TnDb-group` column at `dir`, then print what its committer did: rounds, and the
+/// syncs per round (data log and removal log) with their average time (see `tndb::group_stats`).
+fn group_column<W: Workload>(
+    rt: &Runtime,
+    w: &mut W,
+    dir: &Path,
+    compaction: CompactionConfig,
+) -> Column {
+    let _ = group_stats::take();
+    let col = column(rt, w, "TnDb-group".to_string(), open_tndb_group(dir, compaction), Some(dir));
+    let s = group_stats::take();
+    let rounds = s.rounds.max(1) as f64;
+    let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
+    let round_ns = s.round_ns.max(1) as f64;
+    println!(
+        "  TnDb-group committer: {} rounds (avg {:.0} us); per round {:.2} syncs (avg {:.0} us); \
+         of round time: syncs {:.0}%, lock waits {:.0}% ({:.1}/round, avg {:.1} us), locked steps \
+         {:.0}% ({:.1}/round, avg {:.1} us)",
+        s.rounds,
+        avg_us(s.round_ns, s.rounds),
+        s.data_syncs as f64 / rounds,
+        avg_us(s.data_sync_ns, s.data_syncs),
+        100.0 * s.data_sync_ns as f64 / round_ns,
+        100.0 * s.lock_wait_ns as f64 / round_ns,
+        s.lock_waits as f64 / rounds,
+        avg_us(s.lock_wait_ns, s.lock_waits),
+        100.0 * s.lock_hold_ns as f64 / round_ns,
+        s.lock_holds as f64 / rounds,
+        avg_us(s.lock_hold_ns, s.lock_holds),
+    );
+    col
 }
 
 /// Define a bench table with a production key shape.
@@ -478,9 +511,7 @@ fn run_backends<W: Workload>(
     let dir = base.join("tndb");
     let db = TnDatabase::open(&dir).expect("open tndb");
     cols.push(column(rt, w, "TnDb".to_string(), db, Some(&dir)));
-    let dir = base.join("tndb_group");
-    let db = open_tndb_group(&dir, CompactionConfig::default());
-    cols.push(column(rt, w, "TnDb-group".to_string(), db, Some(&dir)));
+    cols.push(group_column(rt, w, &base.join("tndb_group"), CompactionConfig::default()));
     let dir = base.join("tndb_layered");
     let db = LayeredDatabase::open(TnDatabase::open(&dir).expect("open tndb"), full_memory);
     cols.push(column(rt, w, format!("{layered}<TnDb>"), db, Some(&dir)));
@@ -1210,9 +1241,7 @@ fn workload_compaction() {
         let (db, dir) = tndb(name, config);
         cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
     }
-    let dir = tmp.path().join("TnDb-group");
-    let db = open_tndb_group(&dir, on);
-    cols.push(column(&rt, &mut w, "TnDb-group".to_string(), db, Some(&dir)));
+    cols.push(group_column(&rt, &mut w, &tmp.path().join("TnDb-group"), on));
     for (name, config) in [("Layered-cache<TnDb-nocompact>", off), ("Layered-cache<TnDb>", on)] {
         let (db, dir) = tndb(name, config);
         let db = LayeredDatabase::open(db, false);
@@ -1241,4 +1270,94 @@ fn workload_compaction() {
          steps are not durable until the final persist; step max includes a compaction's switch",
         &cols,
     );
+}
+
+/// How this machine's file system overlaps the `msync`s of different files (what a committer
+/// round syncing several tables at once could gain): `k` files, each with ~100 B appended per
+/// iteration, synced one after another, then on `k` threads at once; p50 per iteration of 300.
+///
+/// On-demand probe (kept out of the default suite). Run with:
+/// `cargo test --release -p tn-storage msync_concurrency_probe -- --ignored --nocapture`.
+#[test]
+#[ignore = "on-demand file-system probe; run with --ignored --nocapture"]
+fn msync_concurrency_probe() {
+    use crate::archive::{
+        data_file::MmapFileOptions,
+        pack::{Pack, PackCompression},
+    };
+
+    const ITERATIONS: usize = 300;
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let record = vec![0x5a_u8; 100];
+    println!("files  serial p50 us  parallel p50 us  (one msync of ~100 B per file)");
+    for k in [1usize, 2, 4, 8] {
+        let mut packs: Vec<Pack<Vec<u8>>> = (0..k)
+            .map(|i| {
+                let path = tmp.path().join(format!("probe-{k}-{i}"));
+                Pack::open_with(
+                    path,
+                    0,
+                    false,
+                    PackCompression::None,
+                    1,
+                    MmapFileOptions::default(),
+                )
+                .expect("open")
+            })
+            .collect();
+        for pack in &mut packs {
+            pack.append_raw(&record).expect("append");
+            pack.commit().expect("first sync (and size)");
+        }
+        let mut serial = Vec::with_capacity(ITERATIONS);
+        let mut parallel = Vec::with_capacity(ITERATIONS);
+        for _ in 0..ITERATIONS {
+            for (times, at_once) in [(&mut serial, false), (&mut parallel, true)] {
+                let tickets: Vec<_> = packs
+                    .iter_mut()
+                    .map(|pack| {
+                        pack.append_raw(&record).expect("append");
+                        pack.sync_ticket().expect("ticket")
+                    })
+                    .collect();
+                let outcomes: Vec<_> = if at_once {
+                    // Timed from the threads' common release to the last one's end, so the
+                    // threads' start-up is not counted.
+                    let release = std::sync::Barrier::new(k);
+                    let timed: Vec<_> = std::thread::scope(|s| {
+                        let handles: Vec<_> = tickets
+                            .iter()
+                            .map(|ticket| {
+                                let release = &release;
+                                s.spawn(move || {
+                                    release.wait();
+                                    let start = Instant::now();
+                                    let outcome = ticket.sync();
+                                    (start, Instant::now(), outcome)
+                                })
+                            })
+                            .collect();
+                        handles.into_iter().map(|h| h.join().expect("sync thread")).collect()
+                    });
+                    let first = timed.iter().map(|(start, ..)| *start).min().expect("k > 0");
+                    let last = timed.iter().map(|(_, end, _)| *end).max().expect("k > 0");
+                    times.push(last - first);
+                    timed.into_iter().map(|(.., outcome)| outcome).collect()
+                } else {
+                    let start = Instant::now();
+                    let outcomes = tickets.iter().map(|ticket| ticket.sync()).collect();
+                    times.push(start.elapsed());
+                    outcomes
+                };
+                for ((pack, ticket), outcome) in packs.iter_mut().zip(&tickets).zip(&outcomes) {
+                    pack.complete_sync(ticket, outcome).expect("synced");
+                }
+            }
+        }
+        println!(
+            "{k:>5}  {:>13}  {:>15}",
+            quantile(&mut serial, 0.5).as_micros(),
+            quantile(&mut parallel, 0.5).as_micros()
+        );
+    }
 }

@@ -15,11 +15,10 @@
 //! Each table is keyed (its log stores every row's key, the default: [`Database::open_table`]) or
 //! derived-key (its log stores only values, and a key function recomputes the keys on a rebuild:
 //! [`TnDatabase::open_table_with_key`]), fixed when the table is created. A table not closed
-//! cleanly rebuilds its index from its logs on open, keeping every committed write; clearing a
-//! table deletes its data from disk (see `table.rs`). Transactions commit per table: a write
-//! transaction over several tables commits each in turn, so a crash can keep one table's part and
-//! not another's. Not yet covered: compacting the logs (garbage from overwrites and removals), and
-//! durability-barrier tuning.
+//! cleanly rebuilds its index from its log on open, keeping every committed write; clearing a
+//! table deletes its data from disk, and compaction drops overwritten and removed records (see
+//! `table.rs`). Transactions commit per table: a write transaction over several tables commits
+//! each in turn, so a crash can keep one table's part and not another's.
 
 use std::{
     cell::RefCell,
@@ -149,9 +148,8 @@ fn insert<T: Table>(
     })
 }
 
-/// Remove a key: the table logs the removal (in its removal log) and drops the key from its index.
-/// The removed row's bytes stay in the data log until the table is cleared (compaction is a later
-/// step).
+/// Remove a key: the table logs the removal (a record in its data log) and drops the key from its
+/// index. The removed row's bytes stay in the log until a clear or a compaction.
 fn remove<T: Table>(
     store: &StoreType,
     key: &T::Key,
@@ -597,7 +595,7 @@ mod test {
     use tn_types::{Database as _, DbTx as _, DbTxMut as _};
 
     use super::TnDatabase;
-    use crate::{test::*, tndb::table::CommitPoint};
+    use crate::test::*;
 
     /// Open a fresh tndb in a temp dir with the shared `TestTable` opened.  The `TempDir` is
     /// returned so the caller keeps it alive for the duration of the test.
@@ -1046,11 +1044,12 @@ mod test {
         assert!(db.rebuilt_on_open::<DerivedTable>());
         assert_matches::<DerivedTable>(&db, &model, 50);
 
-        // The log holds values only: an 8-byte key per put would make it longer.
+        // The log holds values only (after each record's tag byte): an 8-byte key per put would
+        // make it longer.
         let data = gen_path(tmp.path(), "DerivedTable", 0).join("data");
         let ends = record_ends(&data);
         let first_put = ends[0] - crate::archive::pack::DATA_HEADER_BYTES as u64;
-        assert_eq!(first_put, 4 + "0:a".len() as u64 + 1 + 4, "frame of [value] only");
+        assert_eq!(first_put, 4 + 1 + "0:a".len() as u64 + 1 + 4, "frame of [PUT | value] only");
     }
 
     /// A table's key mode is fixed when it is created; re-opening an open table keeps it.
@@ -1167,7 +1166,8 @@ mod test {
         assert_matches::<TestTable>(&db, &model, 100);
     }
 
-    /// A torn removal log keeps the committed removals and drops the uncommitted ones.
+    /// A tear inside a run of removal records keeps the committed removals and drops the
+    /// uncommitted ones: removals sit in the data log, committed by the commit record after them.
     #[test]
     fn test_tndb_torn_removal_tail() {
         let tmp = TempDir::with_prefix("tndb_torn_removed").expect("temp dir");
@@ -1189,14 +1189,44 @@ mod test {
             crash_txn(txn);
             crash(db);
         }
-        let removed = gen_path(tmp.path(), "TestTable", 0).join("removed");
-        let ends = record_ends(&removed);
-        assert_eq!(ends.len(), 7, "4 committed and 3 uncommitted removals");
-        truncate(&removed, ends[5] + 3); // tear the last removal
+        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
+        let ends = record_ends(&data);
+        // 20 puts and 4 removals, each with its commit record, then 3 uncommitted removals.
+        assert_eq!(ends.len(), 2 * 24 + 3);
+        truncate(&data, ends[ends.len() - 2] + 3); // tear the last removal
 
         let db = TnDatabase::open(tmp.path()).expect("reopen");
         db.open_table::<TestTable>().expect("reopen table");
         assert_matches::<TestTable>(&db, &model, 25);
+    }
+
+    /// A generation holds one log: removals are records in it, so no removal log is ever created
+    /// (a commit with removals syncs one file), through writes, removes and a clear.
+    #[test]
+    fn test_tndb_generation_has_one_log() {
+        fn names(dir: &std::path::Path, found: &mut Vec<String>) {
+            for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
+                found.push(entry.file_name().to_string_lossy().into_owned());
+                if entry.file_type().expect("file type").is_dir() {
+                    names(&entry.path(), found);
+                }
+            }
+        }
+        let tmp = TempDir::with_prefix("tndb_one_log").expect("temp dir");
+        let db = TnDatabase::open(tmp.path()).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        for i in 0..5u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.remove::<TestTable>(&1).expect("remove");
+        db.clear_table::<TestTable>().expect("clear");
+        db.insert::<TestTable>(&9, &"v9".to_string()).expect("insert");
+        db.remove::<TestTable>(&9).expect("remove");
+        drop(db);
+        let mut found = Vec::new();
+        names(&tmp.path().join("TestTable"), &mut found);
+        assert!(found.iter().any(|name| name == "data"), "{found:?}");
+        assert!(!found.iter().any(|name| name == "removed"), "{found:?}");
     }
 
     /// A cleanly closed log must replay whole: corruption inside it fails the open, changes no
@@ -1651,9 +1681,9 @@ mod test {
         assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
     }
 
-    /// Removals logged while the committer syncs the removal log outside the lock are synced
-    /// before the commit record that covers them: a transaction mixing removes and puts there is
-    /// durable whole.
+    /// Removals and puts made while the committer syncs outside the lock (a bare removal, and a
+    /// transaction mixing both) land past the range it syncs and are committed whole by the next
+    /// round: after a persist and a crash every one is there.
     #[test]
     fn test_tndb_group_removals_during_the_unlocked_sync() {
         let tmp = TempDir::with_prefix("tndb_group_removals").expect("temp dir");
@@ -1663,12 +1693,12 @@ mod test {
         }
         block_on(db.persist::<TestTable>()).expect("persist");
 
-        let (arrived, release) = super::with_table(&db.store, "TestTable", |entry| {
-            entry.table.gate_next_group_commit(CommitPoint::AfterRemovalSync)
-        })
-        .expect("table");
-        db.remove::<TestTable>(&1).expect("remove"); // the committer syncs this removal, then waits
+        let (arrived, release) =
+            super::with_table(&db.store, "TestTable", |entry| entry.table.gate_next_group_commit())
+                .expect("table");
+        db.remove::<TestTable>(&1).expect("remove"); // starts a round, which pauses at its sync
         arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
+        db.remove::<TestTable>(&3).expect("remove during the sync");
         let mut txn = db.write_txn().expect("txn");
         txn.remove::<TestTable>(&2).expect("txn remove");
         txn.insert::<TestTable>(&20, &"v20".to_string()).expect("txn insert");
@@ -1679,66 +1709,54 @@ mod test {
 
         let db = open_group(tmp.path());
         let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec![0, 3, 4, 5, 6, 7, 8, 9, 20]);
+        assert_eq!(keys, vec![0, 4, 5, 6, 7, 8, 9, 20]);
     }
 
-    /// A clear (a new generation) while the committer syncs the old generation outside the lock,
-    /// paused before its removal-log sync and again before its data-log sync. The committer keeps
-    /// the old generation's files mapped until its sync is done, never applies the old sync to the
-    /// new generation (whose synced watermarks move only with its own syncs), and the table is
-    /// not poisoned: the next persist succeeds and the new rows survive a crash.
+    /// A clear (a new generation) while the committer syncs the old generation outside the lock:
+    /// the committer keeps the old generation's files mapped until its sync is done, never applies
+    /// the old sync to the new generation (whose synced watermark moves only with its own syncs),
+    /// and the table is not poisoned: the next persist succeeds and the new rows survive a crash.
     #[test]
     fn test_tndb_group_clear_during_the_unlocked_sync() {
         use super::super::commit::GatePoint;
-        for point in [CommitPoint::BeforeRemovalSync, CommitPoint::AfterCommitRecord] {
-            let tmp = TempDir::with_prefix("tndb_group_clear_sync").expect("temp dir");
-            let db = open_group(tmp.path());
-            for i in 0..50u64 {
-                db.insert::<TestTable>(&i, &format!("old-{i}")).expect("insert");
-            }
-            block_on(db.persist::<TestTable>()).expect("persist");
-            let table = super::with_table(&db.store, "TestTable", |entry| entry.table.clone())
-                .expect("table");
-            let (old_data, old_removed) = table.log_views();
-
-            let (arrived, release) = table.gate_next_group_commit(point);
-            db.remove::<TestTable>(&0).expect("remove"); // a removal ticket for the round too
-            arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
-            db.clear_table::<TestTable>().expect("clear");
-            for i in 0..5u64 {
-                db.insert::<TestTable>(&i, &format!("new-{i}")).expect("insert");
-            }
-            db.remove::<TestTable>(&4).expect("remove");
-            // The old generation's last snapshot is gone; only the committer can keep it mapped.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-            while !(old_data.is_unmapped() || old_removed.is_unmapped())
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            }
-            assert!(
-                !old_data.is_unmapped() && !old_removed.is_unmapped(),
-                "{point:?}: the committer keeps the generation it syncs mapped"
-            );
-            let before = table.log_sync_state();
-            let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-            let (arrived2, release2) = group.gate_next_round(GatePoint::BeforeTake);
-            drop(release);
-            arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("next round");
-            if point == CommitPoint::AfterCommitRecord {
-                // The round's commit record was in the old generation: nothing of the new one
-                // was synced by it.
-                assert_eq!(table.log_sync_state(), before, "the old sync moved the new watermarks");
-            }
-            drop(release2);
-            block_on(db.persist::<TestTable>()).expect("persist: nothing poisoned");
-            crash(db);
-
-            let db = open_group(tmp.path());
-            let rows: Vec<(u64, String)> = db.iter::<TestTable>().collect();
-            let expected: Vec<(u64, String)> = (0..4u64).map(|i| (i, format!("new-{i}"))).collect();
-            assert_eq!(rows, expected, "{point:?}");
+        let tmp = TempDir::with_prefix("tndb_group_clear_sync").expect("temp dir");
+        let db = open_group(tmp.path());
+        for i in 0..50u64 {
+            db.insert::<TestTable>(&i, &format!("old-{i}")).expect("insert");
         }
+        block_on(db.persist::<TestTable>()).expect("persist");
+        let table =
+            super::with_table(&db.store, "TestTable", |entry| entry.table.clone()).expect("table");
+        let old_data = table.log_view();
+
+        let (arrived, release) = table.gate_next_group_commit();
+        db.remove::<TestTable>(&0).expect("remove"); // starts a round, which pauses at its sync
+        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
+        db.clear_table::<TestTable>().expect("clear");
+        for i in 0..5u64 {
+            db.insert::<TestTable>(&i, &format!("new-{i}")).expect("insert");
+        }
+        db.remove::<TestTable>(&4).expect("remove");
+        // The old generation's last snapshot is gone; only the committer can keep it mapped.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        while !old_data.is_unmapped() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(!old_data.is_unmapped(), "the committer keeps the generation it syncs mapped");
+        let before = table.log_sync_state();
+        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
+        let (arrived2, release2) = group.gate_next_round(GatePoint::BeforeTake);
+        drop(release);
+        arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("next round");
+        assert_eq!(table.log_sync_state(), before, "the old sync moved the new watermark");
+        drop(release2);
+        block_on(db.persist::<TestTable>()).expect("persist: nothing poisoned");
+        crash(db);
+
+        let db = open_group(tmp.path());
+        let rows: Vec<(u64, String)> = db.iter::<TestTable>().collect();
+        let expected: Vec<(u64, String)> = (0..4u64).map(|i| (i, format!("new-{i}"))).collect();
+        assert_eq!(rows, expected);
     }
 
     /// After a failed commit the durable watermark stays below the failed table's writes, even
@@ -2053,7 +2071,7 @@ mod test {
         drop(table.start_compaction_gated()); // runs to completion
         table.wait_compaction_thread();
 
-        let (arrived, release) = table.gate_next_group_commit(CommitPoint::AfterCommitRecord);
+        let (arrived, release) = table.gate_next_group_commit();
         db.insert::<TestTable>(&1_000, &"a".to_string()).expect("insert"); // starts a round
         arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round at its commit");
         db.insert::<TestTable>(&1_001, &"b".to_string()).expect("a write during the sync");
