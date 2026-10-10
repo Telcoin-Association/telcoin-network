@@ -102,6 +102,19 @@ pub const GIGABYTE: usize = MEGABYTE * 1024;
 /// Number of bytes in one terabyte, for expressing MDBX geometry sizes.
 pub const TERABYTE: usize = GIGABYTE * 1024;
 
+// The production geometry of the node's composite DB (`open_db`): each environment's size limit
+// and the step it grows by. Test builds open smaller environments.
+/// Production size limit of the epoch environment.
+pub const PROD_EPOCH_MAX: usize = 512 * MEGABYTE;
+/// Production size limit of the kad environment.
+pub const PROD_KAD_MAX: usize = 64 * MEGABYTE;
+/// Production size limit of the cache environment.
+pub const PROD_CACHE_MAX: usize = GIGABYTE;
+/// Production growth step of the epoch and kad environments.
+pub const PROD_GROWTH: usize = 8 * MEGABYTE;
+/// Production growth step of the cache environment.
+pub const PROD_CACHE_GROWTH: usize = 64 * MEGABYTE;
+
 /// Returns the default page size that can be used in this OS.
 fn default_page_size() -> usize {
     let os_page_size = page_size::get();

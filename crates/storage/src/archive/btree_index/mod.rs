@@ -1,0 +1,19 @@
+//! On-disk, paged B+tree "sortable index": a durable `key → u64` index over pack files supporting
+//! sorted point lookup plus range/prefix/forward/reverse iteration.  It complements the hash-based
+//! [`digest_index`](crate::archive::digest_index), which offers point lookups only.
+//!
+//! Keys are fixed `ksize`-byte byte strings (the key length is chosen at creation and stored in
+//! the header) compared lexicographically; values are `u64` byte
+//! offsets into a pack file.  The tree is a copy-on-write B+tree (a published page is never
+//! modified, so published snapshots are read with no lock), stored in fixed 4 KiB pages (each
+//! protected by a trailing CRC32) in a single `index.btx` file.  Leaves are not linked; scans walk
+//! down from the root.  See [`index::BtreeIndex`].
+
+pub(crate) mod header;
+pub(crate) mod page;
+
+pub mod index;
+pub mod iter;
+
+pub use index::{BtreeIndex, PageCrcReport};
+pub use iter::BtreeIter;

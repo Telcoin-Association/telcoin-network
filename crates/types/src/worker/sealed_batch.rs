@@ -4,12 +4,12 @@
 //! have reached quorum.
 
 use crate::{
-    crypto, encode, Address, BlockHash, BlsPublicKey, Epoch, ExecHeader, RpcInfo, TimestampSec,
-    MIN_PROTOCOL_BASE_FEE,
+    crypto, encode, Address, BlockHash, BlsPublicKey, ByteSlice, ByteVec, Epoch, ExecHeader,
+    RpcInfo, TimestampSec, MIN_PROTOCOL_BASE_FEE,
 };
 use serde::{
     de::{self, SeqAccess, Visitor},
-    Deserialize, Deserializer, Serialize,
+    Deserialize, Deserializer, Serialize, Serializer,
 };
 use std::fmt::{self, Debug};
 use thiserror::Error;
@@ -69,9 +69,13 @@ pub struct Batch {
     /// Decoded through [`deserialize_transactions`], which rejects a zero-byte (empty) transaction
     /// and bounds the transaction count at [`MAX_TXS_PER_BATCH`] before allocating — an untrusted
     /// peer must not be able to make a tiny compressed record decode into a huge `Vec<Vec<u8>>`
-    /// (see the epoch-pack import path). Encoding is unchanged, so the digest/wire format are
-    /// stable.
-    #[serde(deserialize_with = "deserialize_transactions")]
+    /// (see the epoch-pack import path). Each transaction is encoded and decoded as one byte
+    /// string ([`serialize_transactions`]), which is byte-identical in `bcs` to a sequence of
+    /// `u8`, so the digest/wire format are stable.
+    #[serde(
+        serialize_with = "serialize_transactions",
+        deserialize_with = "deserialize_transactions"
+    )]
     pub transactions: Vec<Vec<u8>>,
     /// The epoch that this batch belongs to.
     pub epoch: Epoch,
@@ -231,6 +235,16 @@ pub const fn max_batch_size(_epoch: Epoch) -> usize {
 /// entry costs `size_of::<Vec<u8>>()` (24 bytes on 64-bit) beyond its data.
 pub const MAX_TXS_PER_BATCH: usize = max_batch_size(0);
 
+/// Serialize a batch's transaction list as a sequence of byte strings: each transaction is one
+/// length prefix and one copy (`serialize_bytes`) instead of a call per byte. In `bcs` this is
+/// byte-identical to the derived encoding of `Vec<Vec<u8>>`, so batch digests do not change.
+fn serialize_transactions<S: Serializer>(
+    txs: &[Vec<u8>],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(txs.iter().map(|tx| ByteSlice(tx)))
+}
+
 /// Deserialize a batch's transaction list, rejecting inputs an honest producer never creates and an
 /// attacker uses to blow up memory during decode:
 /// - a **zero-byte (empty) transaction** is invalid (a real transaction is a non-empty RLP/EIP-2718
@@ -238,8 +252,9 @@ pub const MAX_TXS_PER_BATCH: usize = max_batch_size(0);
 /// - the transaction count is bounded at [`MAX_TXS_PER_BATCH`], checked against the declared length
 ///   **before** allocating so a crafted huge count cannot force a large up-front allocation.
 ///
-/// Honest batches decode unchanged; only serialization (unchanged) feeds the digest, so this does
-/// not affect any batch hash.
+/// Each transaction is read as one byte string (see [`crate::byte_vec`]) rather than byte by byte.
+/// Honest batches decode unchanged; only serialization (unchanged bytes) feeds the digest, so this
+/// does not affect any batch hash.
 fn deserialize_transactions<'de, D>(deserializer: D) -> Result<Vec<Vec<u8>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -268,7 +283,7 @@ where
             }
             // Cautious initial capacity: never trust the declared length for the allocation size.
             let mut txs: Vec<Vec<u8>> = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
-            while let Some(tx) = seq.next_element::<Vec<u8>>()? {
+            while let Some(ByteVec(tx)) = seq.next_element::<ByteVec>()? {
                 if tx.is_empty() {
                     return Err(de::Error::custom("zero-byte transaction is invalid"));
                 }
@@ -310,7 +325,57 @@ fn min_batch_size_bounds_every_epoch() {
 #[cfg(test)]
 mod transaction_bounds_tests {
     use super::{max_batch_size, Batch, MAX_TXS_PER_BATCH};
-    use crate::{encode, try_decode, ExecHeader};
+    use crate::{decode, encode, try_decode, Address, Epoch, ExecHeader, WorkerId};
+    use serde::{Deserialize, Serialize};
+
+    /// `Batch` as it was derived before its transactions were encoded as byte strings (each
+    /// transaction element by element). The oracle the byte-string encoding must match exactly:
+    /// batch digests hash these bytes.
+    #[derive(Serialize, Deserialize)]
+    struct ElementwiseBatch {
+        transactions: Vec<Vec<u8>>,
+        epoch: Epoch,
+        beneficiary: Address,
+        base_fee_per_gas: u64,
+        worker_id: WorkerId,
+    }
+
+    /// Encoding each transaction as one byte string leaves a batch's bytes (and so its digest)
+    /// exactly as the element-by-element derive wrote them, including at the ULEB128 length
+    /// boundaries, and each encoding decodes the other's bytes.
+    #[test]
+    fn transactions_encode_identically_as_byte_strings() {
+        let shapes: [&[usize]; 5] = [&[], &[1], &[127, 128], &[16_383, 16_384], &[200; 500]];
+        for shape in shapes {
+            let transactions: Vec<Vec<u8>> = shape
+                .iter()
+                .enumerate()
+                .map(|(i, &len)| (0..len).map(|b| (b + i) as u8).collect())
+                .collect();
+            let batch = Batch {
+                transactions: transactions.clone(),
+                epoch: 7,
+                beneficiary: Address::repeat_byte(3),
+                base_fee_per_gas: 42,
+                worker_id: 1,
+                received_at: None,
+            };
+            let oracle = ElementwiseBatch {
+                transactions,
+                epoch: 7,
+                beneficiary: Address::repeat_byte(3),
+                base_fee_per_gas: 42,
+                worker_id: 1,
+            };
+            let bytes = encode(&batch);
+            assert_eq!(bytes, encode(&oracle), "{shape:?}: bytes must not change");
+            let decoded: Batch = decode(&encode(&oracle));
+            assert_eq!(decoded, batch, "{shape:?}: the old bytes decode to the same batch");
+            assert_eq!(decoded.digest(), batch.digest(), "{shape:?}: digest unchanged");
+            let back: ElementwiseBatch = decode(&bytes);
+            assert_eq!(encode(&back), bytes, "{shape:?}: the old decoder reads the new bytes");
+        }
+    }
 
     /// The count cap can never reject a legitimate batch in any epoch: a valid transaction is
     /// non-empty (>= 1 byte) and a batch's transaction bytes are capped at that epoch's
@@ -492,4 +557,51 @@ pub enum BatchValidationError {
     /// Error, wrong epoch.
     #[error("Invalid epoch, expected epoch {expected} got epoch {found}")]
     InvalidEpoch { expected: Epoch, found: Epoch },
+}
+
+/// On-demand timing of a realistic batch's codec work: encode, digest (a hash of the encoding) and
+/// decode of 1,000 transactions of 200 bytes.
+/// `cargo test --release -p tn-types batch_codec_bench -- --ignored --nocapture`
+#[cfg(test)]
+mod codec_bench {
+    use super::Batch;
+    use crate::{decode, encode, Address};
+    use std::{hint::black_box, time::Instant};
+
+    #[test]
+    #[ignore = "on-demand batch codec benchmark; run with --release --ignored --nocapture"]
+    fn batch_codec_bench() {
+        let transactions: Vec<Vec<u8>> =
+            (0..1_000).map(|i| (0..200).map(|b| (b + i) as u8).collect()).collect();
+        let batch = Batch {
+            transactions,
+            epoch: 7,
+            beneficiary: Address::repeat_byte(3),
+            base_fee_per_gas: 42,
+            worker_id: 1,
+            received_at: None,
+        };
+        let bytes = encode(&batch);
+        let rounds = 2_000_u32;
+        let time = |label: &str, op: &mut dyn FnMut()| {
+            let start = Instant::now();
+            for _ in 0..rounds {
+                op();
+            }
+            println!(
+                "{label:<8} {:>9.1} us/batch",
+                start.elapsed().as_secs_f64() * 1e6 / rounds as f64
+            );
+        };
+        println!("batch: 1000 txs x 200 B = {} encoded bytes", bytes.len());
+        time("encode", &mut || {
+            black_box(encode(black_box(&batch)));
+        });
+        time("digest", &mut || {
+            black_box(black_box(&batch).digest());
+        });
+        time("decode", &mut || {
+            black_box(decode::<Batch>(black_box(&bytes)));
+        });
+    }
 }

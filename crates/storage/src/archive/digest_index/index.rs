@@ -48,9 +48,10 @@ use crate::archive::{
     fxhasher::FxHasher,
     index::Index,
     pack::{DataHeader, DATA_HEADER_BYTES},
+    page_set::PageSet,
 };
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::BTreeSet,
     fs,
     hash::{BuildHasher, BuildHasherDefault, Hasher},
     io::{self, Read, Seek, SeekFrom, Write},
@@ -284,7 +285,7 @@ pub struct HdxIndex<
     /// read/write/sync paths consult it to tell the two apart; it is empty on open (so
     /// read-only handles trust no `Dirty` bucket) and cleared each sync (`crc_dirty_buckets`
     /// stamps exactly this set).
-    unsynced_buckets: HashSet<u64>,
+    unsynced_buckets: PageSet,
     _index_dir: PathBuf,
     /// Test-only: when set, the next bucket split fails mid-way (after both buckets are zeroed) to
     /// exercise the rollback in [`Self::split_one_bucket`].
@@ -358,10 +359,12 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         }
 
         // The digest index does point lookups over fixed-offset hash buckets — random
-        // access with no benefit from readahead — so hint `MADV_RANDOM`.
+        // access with no benefit from readahead — so hint `MADV_RANDOM`. It is derived from the
+        // data log (rebuilt after any unclean open), so its size waits for the seal.
         let opts = MmapFileOptions {
             write_mode: WriteMode::Random,
             access: MmapAccess::Random,
+            derived: true,
             ..Default::default()
         };
         let mut hdx_file = MmapDataFile::open_with(dir.join("index.hdx"), read_only, opts)?;
@@ -495,7 +498,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             synced: true,
             remove_on_drop: false,
             bloom,
-            unsynced_buckets: HashSet::new(),
+            unsynced_buckets: PageSet::default(),
             _index_dir: dir.to_owned(),
             #[cfg(test)]
             fail_next_split: false,
@@ -519,7 +522,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     /// True if this handle wrote `bucket` since the last sync (so a `Dirty` trailer on it is
     /// expected).
     fn is_unsynced(&self, bucket: u64) -> bool {
-        self.unsynced_buckets.contains(&bucket)
+        self.unsynced_buckets.contains(bucket)
     }
 
     /// Number of keys hashed in this index.
@@ -974,9 +977,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
             // mark (a later split re-creates and re-marks it, and sync must not
             // try to CRC a bucket past the count).
             if !split_was_unsynced {
-                self.unsynced_buckets.remove(&split_bucket);
+                self.unsynced_buckets.remove(split_bucket);
             }
-            self.unsynced_buckets.remove(&(old_buckets as u64));
+            self.unsynced_buckets.remove(old_buckets as u64);
             return Err(e);
         }
         Ok(())
@@ -1182,9 +1185,9 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
         // an at-rest zeroed bucket as `Valid`, laundering the corruption; restricting to
         // the tracked set keeps that bucket `Dirty` so a later lookup / `bucket_crc_scan`
         // still flags it. Also makes sync O(written), not O(buckets). The set is consumed
-        // here (cleared for the next cycle).
-        let unsynced = std::mem::take(&mut self.unsynced_buckets);
-        for bucket in unsynced {
+        // here (cleared for the next cycle), in ascending bucket order.
+        let mut unsynced = std::mem::take(&mut self.unsynced_buckets);
+        for bucket in unsynced.drain() {
             let pos = self.bucket_pos(bucket);
             if let Some(buffer) = self.hdx_file.slice_mut(pos, Self::BUCKET_SIZE) {
                 if crc_is_zero(buffer) {
@@ -1194,6 +1197,8 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
                 }
             }
         }
+        // Put the drained (empty) set back so the next cycle reuses its allocation.
+        self.unsynced_buckets = unsynced;
     }
 
     /// Scan every main bucket and classify its CRC trailer (see [`BucketCrcReport`]). Read-only

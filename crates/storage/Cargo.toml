@@ -16,8 +16,10 @@ tracing.workspace = true
 tn-types = { workspace = true }
 eyre = { workspace = true }
 ouroboros = { workspace = true }
-parking_lot = { workspace = true }
+parking_lot = { workspace = true, features = ["arc_lock"] }
+arc-swap = { workspace = true }
 dashmap = { workspace = true }
+foldhash = { workspace = true }
 # Counts layered-DB write failures per storage environment.
 metrics = { workspace = true }
 # For the persist async implemetation. `rt` is needed for `spawn_blocking` (offloading the blocking

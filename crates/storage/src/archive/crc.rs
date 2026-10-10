@@ -1,5 +1,6 @@
-//! Wrapper function to add and check crc32s on byte buffers.  THe CRC codes are always the last
-//! four bytes in little endian format.
+//! CRC-32 helpers: the shared [`crc32`] / [`crc32_update`] (with an aarch64 PMULL fast path), and
+//! functions that add and check a CRC-32 trailer on byte buffers. The trailer is always the last
+//! four bytes, little endian.
 
 /// A CRC of exactly zero is indistinguishable from the all-zero "dirty" sentinel [`zero_crc`]
 /// writes, so buffers whose validity is classified by [`crc_state`] (the digest index's main
@@ -8,11 +9,128 @@
 /// not 0.
 const NONZERO_CRC_SENTINEL: u32 = 0xFFFF_FFFF;
 
-/// Compute the crc32 of `payload`.
-fn compute_crc32(payload: &[u8]) -> u32 {
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(payload);
-    crc32_hasher.finalize()
+/// The CRC-32 (IEEE, the value `crc32fast` and zlib compute) of `data`.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
+    crc32_update(0, data)
+}
+
+/// Continue the finished CRC-32 `crc` (0 to start) over `data`: the same value as
+/// `crc32fast::Hasher::new_with_initial(crc)` updated with `data`, so `crc32_update(crc32(a), b)`
+/// is the CRC-32 of `a` followed by `b`.
+///
+/// On aarch64 with PMULL, inputs of at least `pmull::MIN_LEN` bytes take a carry-less-multiply
+/// folding path (a port of `crc32fast`'s x86 pclmulqdq one): `crc32fast` itself uses a single
+/// serial `crc32` instruction chain there, several times slower on large buffers. Everything else
+/// (small inputs, other targets) is `crc32fast`.
+pub(crate) fn crc32_update(crc: u32, data: &[u8]) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    if data.len() >= pmull::MIN_LEN && std::arch::is_aarch64_feature_detected!("aes") {
+        // SAFETY: the `aes` feature (which carries PMULL) was detected at runtime just above.
+        return unsafe { pmull::update(crc, data) };
+    }
+    let mut hasher = crc32fast::Hasher::new_with_initial(crc);
+    hasher.update(data);
+    hasher.finalize()
+}
+
+/// CRC-32 by carry-less-multiply folding on aarch64 (PMULL): a port of `crc32fast`'s x86
+/// `specialized::pclmulqdq::calculate` (same constants, same steps), so it computes the same value.
+/// Each `_mm_clmulepi64_si128` there becomes a `vmull_p64` here: selector `0x00` multiplies the
+/// low 64-bit halves, `0x11` the high halves, and `0x10` the first operand's low half by the second
+/// operand's high half.
+#[cfg(target_arch = "aarch64")]
+mod pmull {
+    use std::arch::aarch64::{
+        uint64x2_t, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vld1q_u8, vmull_high_p64,
+        vmull_p64, vreinterpretq_p64_u64, vreinterpretq_u64_p128, vreinterpretq_u64_u8,
+        vsetq_lane_u64,
+    };
+
+    /// Below this the folding setup does not pay; `crc32fast` (as on x86) handles it.
+    pub(super) const MIN_LEN: usize = 128;
+
+    const K1: u64 = 0x1_5444_2bd4;
+    const K2: u64 = 0x1_c6e4_1596;
+    const K3: u64 = 0x1_7519_97d0;
+    const K4: u64 = 0x0_ccaa_009e;
+    const K5: u64 = 0x1_63cd_6124;
+    const P_X: u64 = 0x1_DB71_0641;
+    const U_PRIME: u64 = 0x1_F701_1641;
+
+    /// Continue the finished CRC `crc` over `data` (at least [`MIN_LEN`] bytes).
+    ///
+    /// # Safety
+    /// The CPU must support the `aes` feature (PMULL); NEON is baseline on aarch64.
+    #[target_feature(enable = "neon,aes")]
+    pub(super) unsafe fn update(crc: u32, mut data: &[u8]) -> u32 {
+        debug_assert!(data.len() >= MIN_LEN);
+
+        // Fold by 4: four 128-bit accumulators over 64-byte blocks.
+        let mut x3 = get(&mut data);
+        let mut x2 = get(&mut data);
+        let mut x1 = get(&mut data);
+        let mut x0 = get(&mut data);
+        // The incoming CRC enters as the (inverted) first 32 bits of the message.
+        x3 = veorq_u64(x3, vsetq_lane_u64::<0>(u64::from(!crc), vdupq_n_u64(0)));
+        let k1k2 = vld1q_u64([K1, K2].as_ptr());
+        while data.len() >= 64 {
+            x3 = reduce128(x3, get(&mut data), k1k2);
+            x2 = reduce128(x2, get(&mut data), k1k2);
+            x1 = reduce128(x1, get(&mut data), k1k2);
+            x0 = reduce128(x0, get(&mut data), k1k2);
+        }
+        let k3k4 = vld1q_u64([K3, K4].as_ptr());
+        let mut x = reduce128(x3, x2, k3k4);
+        x = reduce128(x, x1, k3k4);
+        x = reduce128(x, x0, k3k4);
+        // Fold by 1 over the remaining 16-byte blocks.
+        while data.len() >= 16 {
+            x = reduce128(x, get(&mut data), k3k4);
+        }
+
+        // 128 -> 64 bits, then Barrett to 32, on the 128-bit value as a `u128`.
+        let x = u128::from(vgetq_lane_u64::<0>(x)) | (u128::from(vgetq_lane_u64::<1>(x)) << 64);
+        let x = clmul(x as u64, K4) ^ (x >> 64);
+        let x = clmul(x as u64 & 0xFFFF_FFFF, K5) ^ (x >> 32);
+        let t1 = clmul(x as u64 & 0xFFFF_FFFF, U_PRIME);
+        let t2 = clmul(t1 as u64 & 0xFFFF_FFFF, P_X);
+        let c = ((x ^ t2) >> 32) as u32;
+
+        if data.is_empty() {
+            !c
+        } else {
+            let mut hasher = crc32fast::Hasher::new_with_initial(!c);
+            hasher.update(data);
+            hasher.finalize()
+        }
+    }
+
+    /// `b ^ a.lo * k.lo ^ a.hi * k.hi` (carry-less).
+    #[inline]
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn reduce128(a: uint64x2_t, b: uint64x2_t, k: uint64x2_t) -> uint64x2_t {
+        let lo = vmull_p64(vgetq_lane_u64::<0>(a), vgetq_lane_u64::<0>(k));
+        let hi = vmull_high_p64(vreinterpretq_p64_u64(a), vreinterpretq_p64_u64(k));
+        veorq_u64(b, veorq_u64(vreinterpretq_u64_p128(lo), vreinterpretq_u64_p128(hi)))
+    }
+
+    /// Carry-less 64 x 64 -> 128-bit multiply.
+    #[inline]
+    #[target_feature(enable = "neon,aes")]
+    unsafe fn clmul(a: u64, b: u64) -> u128 {
+        vmull_p64(a, b)
+    }
+
+    /// Load the next 16 bytes (unaligned) and advance `data` past them.
+    #[inline]
+    #[target_feature(enable = "neon")]
+    unsafe fn get(data: &mut &[u8]) -> uint64x2_t {
+        let (block, rest) = data.split_at(16);
+        // SAFETY: `block` is exactly 16 readable bytes; `vld1q_u8` has no alignment requirement.
+        let v = unsafe { vreinterpretq_u64_u8(vld1q_u8(block.as_ptr())) };
+        *data = rest;
+        v
+    }
 }
 
 /// Map a computed CRC to a never-zero value so a stamped trailer can never collide with the
@@ -32,9 +150,7 @@ pub(crate) fn check_crc(buffer: &[u8]) -> bool {
     if len < 5 {
         return false;
     }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let calc_crc32 = crc32_hasher.finalize();
+    let calc_crc32 = crc32(&buffer[..(len - 4)]);
     let mut buf32 = [0_u8; 4];
     buf32.copy_from_slice(&buffer[(len - 4)..]);
     let read_crc32 = u32::from_le_bytes(buf32);
@@ -53,10 +169,8 @@ pub(crate) fn add_crc32(buffer: &mut [u8]) {
     if len < 5 {
         return;
     }
-    let mut crc32_hasher = crc32fast::Hasher::new();
-    crc32_hasher.update(&buffer[..(len - 4)]);
-    let crc32 = crc32_hasher.finalize();
-    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
+    let crc = crc32(&buffer[..(len - 4)]);
+    buffer[len - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Like [`add_crc32`], but never stamps an all-zero trailer: a computed CRC of 0 is written as
@@ -77,8 +191,8 @@ pub(crate) fn add_crc32_nonzero(buffer: &mut [u8]) {
     if len < 5 {
         return;
     }
-    let crc32 = map_nonzero(compute_crc32(&buffer[..(len - 4)]));
-    buffer[len - 4..].copy_from_slice(&crc32.to_le_bytes());
+    let crc = map_nonzero(crc32(&buffer[..(len - 4)]));
+    buffer[len - 4..].copy_from_slice(&crc.to_le_bytes());
 }
 
 /// Overwrite the trailing 4-byte CRC of `buffer` with zeros, marking it as "dirty" — written but
@@ -130,7 +244,7 @@ fn check_crc_nonzero(buffer: &[u8]) -> bool {
     if len < 5 {
         return false;
     }
-    let calc = map_nonzero(compute_crc32(&buffer[..(len - 4)]));
+    let calc = map_nonzero(crc32(&buffer[..(len - 4)]));
     let mut buf32 = [0_u8; 4];
     buf32.copy_from_slice(&buffer[(len - 4)..]);
     calc == u32::from_le_bytes(buf32)
@@ -144,8 +258,8 @@ fn check_crc_nonzero(buffer: &[u8]) -> bool {
 /// so the dirty (all-zero) and valid states are disjoint — the recompute uses the same never-zero
 /// mapping ([`check_crc_nonzero`]) so a genuine CRC of 0 reads `Valid`, not `Dirty` or `Corrupt`.
 ///
-/// Note this recomputes the CRC for non-dirty buffers, so it is for verification/recovery, not the
-/// hot path; use [`crc_is_zero`] when you only need the cheap dirty check.
+/// Note this recomputes the CRC for non-dirty buffers (the digest index pays it on every lookup of
+/// a stamped bucket); use [`crc_is_zero`] when you only need the cheap dirty check.
 pub(crate) fn crc_state(buffer: &[u8]) -> CrcState {
     let len = buffer.len();
     if len < 5 {
@@ -163,6 +277,61 @@ pub(crate) fn crc_state(buffer: &[u8]) -> CrcState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Deterministic pseudo-random bytes.
+    fn noise(len: usize, seed: u64) -> Vec<u8> {
+        let mut x = seed | 1;
+        (0..len)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x as u8
+            })
+            .collect()
+    }
+
+    /// `crc32` / `crc32_update` compute exactly `crc32fast`'s CRC-32 for every length up to 2 KiB
+    /// at every start offset 0..16 (unaligned loads), and for large buffers. On aarch64 with
+    /// PMULL this exercises the folding path (from `pmull::MIN_LEN` bytes); elsewhere the
+    /// dispatch is `crc32fast` itself, so the comparison is trivial there.
+    #[test]
+    fn crc32_matches_crc32fast() {
+        let buf = noise(2_048 + 16, 1);
+        for offset in 0..16 {
+            for len in 0..=2_048 {
+                let data = &buf[offset..offset + len];
+                assert_eq!(crc32(data), crc32fast::hash(data), "offset {offset}, len {len}");
+            }
+        }
+        for (len, seed) in [(4_096, 2), ((64 << 10) + 13, 3), ((1 << 20) + 7, 4)] {
+            let data = noise(len, seed);
+            assert_eq!(crc32(&data), crc32fast::hash(&data), "len {len}");
+        }
+    }
+
+    /// Continuing from any CRC matches `crc32fast::Hasher::new_with_initial`, and chaining updates
+    /// across any split point equals the one-shot CRC.
+    #[test]
+    fn crc32_update_continues_like_crc32fast() {
+        let data = noise(1_500, 5);
+        for (i, init) in [0_u32, 1, 0xFFFF_FFFF, 0xDEAD_BEEF, 0x1234_5678].into_iter().enumerate() {
+            for len in [0, 1, 15, 16, 127, 128, 129, 200, 1_024, 1_500] {
+                let mut hasher = crc32fast::Hasher::new_with_initial(init);
+                hasher.update(&data[..len]);
+                assert_eq!(
+                    crc32_update(init, &data[..len]),
+                    hasher.finalize(),
+                    "init {i}, len {len}"
+                );
+            }
+        }
+        let whole = crc32(&data);
+        for split in 0..=data.len() {
+            let (a, b) = data.split_at(split);
+            assert_eq!(crc32_update(crc32(a), b), whole, "split {split}");
+        }
+    }
 
     #[test]
     fn test_crc_round_trip() {

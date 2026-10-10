@@ -8,6 +8,8 @@
 //! non keys.  BCS encoding however does not meet the sorting requirements for DB keys so we have
 //! both encodings.  This can be experimented with by changing these functions.
 
+use std::io::{Read, Write};
+
 pub use bcs::Error as BcsError;
 use bincode::Options;
 
@@ -21,7 +23,87 @@ where
 {
     seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
 }
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
+
+/// Serde helpers that encode a byte vector as one byte string (`serialize_bytes`) instead of as a
+/// sequence of `u8`. Use as `#[serde(with = "tn_types::byte_vec")]` on a `Vec<u8>` field.
+///
+/// serde has no byte specialization: a plain `Vec<u8>` serializes element by element, and `bcs`
+/// writes (and reads back) each element with its own call, so a large byte vector costs a call per
+/// byte. A byte string is one length prefix and one copy. The two are byte-identical in `bcs`
+/// (`ULEB128(len)` then the raw bytes, with the same length limit on decode), so switching a field
+/// to this leaves its encoding, and any digest over it, unchanged. Not for fixed `[u8; N]` arrays,
+/// which `bcs` writes without a length prefix.
+pub mod byte_vec {
+    use serde::{de, Deserializer, Serializer};
+    use std::fmt;
+
+    /// Serialize `bytes` as one byte string.
+    pub fn serialize<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(bytes)
+    }
+
+    /// Deserialize a byte vector written by [`serialize`], or as a sequence of `u8` by a format
+    /// that presents bytes that way.
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<u8>, D::Error> {
+        deserializer.deserialize_byte_buf(ByteVecVisitor)
+    }
+
+    struct ByteVecVisitor;
+
+    impl<'de> de::Visitor<'de> for ByteVecVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("a byte vector")
+        }
+
+        fn visit_bytes<E: de::Error>(self, v: &[u8]) -> Result<Vec<u8>, E> {
+            Ok(v.to_vec())
+        }
+
+        fn visit_byte_buf<E: de::Error>(self, v: Vec<u8>) -> Result<Vec<u8>, E> {
+            Ok(v)
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, mut seq: A) -> Result<Vec<u8>, A::Error> {
+            // Never trust a declared length for the allocation size.
+            let mut bytes = Vec::with_capacity(seq.size_hint().unwrap_or(0).min(4096));
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+/// A byte vector that serializes as one byte string (see [`byte_vec`]), for byte vectors held in a
+/// collection, where a field attribute cannot reach.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ByteVec(pub Vec<u8>);
+
+impl Serialize for ByteVec {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        byte_vec::serialize(&self.0, serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ByteVec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        byte_vec::deserialize(deserializer).map(Self)
+    }
+}
+
+/// A borrowed byte slice that serializes as one byte string (see [`byte_vec`]), for serializing
+/// byte vectors held in a collection without copying them into [`ByteVec`]s.
+#[derive(Clone, Copy, Debug)]
+pub struct ByteSlice<'a>(pub &'a [u8]);
+
+impl Serialize for ByteSlice<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        byte_vec::serialize(self.0, serializer)
+    }
+}
 
 /// Decode bytes to a type for a DB key.
 ///
@@ -59,6 +141,19 @@ pub fn encode_key<T: Serialize>(obj: &T) -> Vec<u8> {
         .expect("Can not serialize!")
 }
 
+/// Encode a DB key into a provided buffer (appending), with the same binary-sortable encoding as
+/// [`encode_key`] — use it to reuse one buffer across keys instead of allocating a `Vec` per key.
+pub fn encode_key_into<W, T>(write: &mut W, key: &T) -> bincode::Result<()>
+where
+    W: ?Sized + Write,
+    T: ?Sized + Serialize,
+{
+    bincode::DefaultOptions::new()
+        .with_big_endian()
+        .with_fixint_encoding()
+        .serialize_into(&mut *write, key)
+}
+
 /// Decode bytes to a type.
 ///
 /// This version will panic on failure, use with data that should be valid.
@@ -72,6 +167,13 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> T {
 /// This version will be optimized without regard to binary sort order.
 pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> bcs::Result<T> {
     bcs::from_bytes(bytes)
+}
+
+/// Decode a Read instance to a type.
+///
+/// This version will be optimized without regard to binary sort order.
+pub fn try_decode_from_read<T: DeserializeOwned, R: Read>(read: R) -> bcs::Result<T> {
+    bcs::from_reader(read)
 }
 
 /// Encode an object to a byte vector.
@@ -98,4 +200,59 @@ where
     T: ?Sized + Serialize,
 {
     bcs::serialize_into(write, value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Assert `encode_key_into` writes exactly `encode_key`'s bytes, appended after existing ones.
+    fn assert_key_into_matches<T: Serialize>(key: &T) {
+        let mut buf = vec![0xAA, 0xBB];
+        encode_key_into(&mut buf, key).expect("encode key");
+        assert_eq!(&buf[..2], &[0xAA, 0xBB], "existing bytes are kept");
+        assert_eq!(&buf[2..], &encode_key(key)[..]);
+    }
+
+    /// A byte string (`byte_vec` on a field, `ByteVec`, `ByteSlice`) encodes exactly like a plain
+    /// `Vec<u8>` in bcs, and each decodes the other's bytes, across the ULEB128 length-prefix
+    /// boundaries: switching a stored byte vector to a byte string changes no stored bytes, CRC or
+    /// digest.
+    #[test]
+    fn byte_strings_encode_like_vec_u8() {
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct Plain {
+            tag: u8,
+            bytes: Vec<u8>,
+        }
+        #[derive(Debug, PartialEq, Serialize, Deserialize)]
+        struct WithHelper {
+            tag: u8,
+            #[serde(with = "byte_vec")]
+            bytes: Vec<u8>,
+        }
+        for len in [0_usize, 1, 127, 128, 16_383, 16_384, 100_000] {
+            let v: Vec<u8> = (0..len).map(|i| (i * 7) as u8).collect();
+            let plain = encode(&v);
+            assert_eq!(encode(&ByteVec(v.clone())), plain, "ByteVec, len {len}");
+            assert_eq!(encode(&ByteSlice(&v)), plain, "ByteSlice, len {len}");
+            assert_eq!(decode::<ByteVec>(&plain), ByteVec(v.clone()), "len {len}");
+            assert_eq!(decode::<Vec<u8>>(&encode(&ByteVec(v.clone()))), v, "len {len}");
+
+            let old = Plain { tag: 9, bytes: v.clone() };
+            let new = WithHelper { tag: 9, bytes: v.clone() };
+            assert_eq!(encode(&new), encode(&old), "field helper, len {len}");
+            assert_eq!(decode::<WithHelper>(&encode(&old)), new, "len {len}");
+            assert_eq!(decode::<Plain>(&encode(&new)), old, "len {len}");
+        }
+    }
+
+    #[test]
+    fn key_into_buffer_matches_encode_key() {
+        assert_key_into_matches(&42_u64);
+        assert_key_into_matches(&(7_u32, u64::MAX));
+        assert_key_into_matches(&[0x5A_u8; 32]);
+        assert_key_into_matches(&crate::B256::repeat_byte(0x11));
+        assert_key_into_matches(&"a key".to_string());
+    }
 }

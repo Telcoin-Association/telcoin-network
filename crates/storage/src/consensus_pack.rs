@@ -3817,7 +3817,7 @@ impl Inner {
             .data
             .read_bytes(output_start, output_end)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
-        Ok(bytes)
+        Ok(bytes.to_vec())
     }
 
     /// Return the byte offset in the data file just past the end of the consensus output for
@@ -3990,6 +3990,7 @@ pub(crate) fn fetch_error_is_absent(err: &FetchError) -> bool {
         | FetchError::IO(_)
         | FetchError::CrcFailed
         | FetchError::CorruptIndex(_)
+        | FetchError::KeySize { .. }
         | FetchError::RequestedSizeTooLarge(_, _)
         | FetchError::RequestedDecompressSizeTooLarge(_) => false,
     }
@@ -9859,7 +9860,7 @@ pub(crate) mod test {
         std::fs::create_dir_all(&base_dir).expect("create epoch dir");
         let data_path = base_dir.join(Inner::DATA_NAME);
         {
-            let mut raw: Pack<PackRecord> =
+            let raw: Pack<PackRecord> =
                 Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("raw pack");
             raw.commit().expect("commit header");
@@ -9931,7 +9932,7 @@ pub(crate) mod test {
         std::fs::create_dir_all(&base_dir).expect("create epoch dir");
         let data_path = base_dir.join(Inner::DATA_NAME);
         {
-            let mut raw: Pack<PackRecord> =
+            let raw: Pack<PackRecord> =
                 Pack::open(&data_path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("raw pack");
             raw.commit().expect("commit header");
@@ -10201,7 +10202,7 @@ pub(crate) mod test {
 
     /// Reads the epoch meta at the head of the data file at `data_path`.
     fn read_epoch_meta(data_path: &Path, epoch: Epoch) -> EpochMeta {
-        let mut pack: Pack<PackRecord> =
+        let pack: Pack<PackRecord> =
             Pack::open(data_path, epoch as u64, true, PackCompression::ZStd, PACK_VERSION)
                 .expect("open data file read-only");
         pack.fetch(DATA_HEADER_BYTES as u64)
@@ -11250,7 +11251,7 @@ pub(crate) mod test {
         };
         let record = PackRecord::Consensus(Box::new(consensus.clone()));
 
-        // `encode` is exactly the serialization `write_value` runs before framing and
+        // `encode` is exactly the serialization a pack append streams into framing and
         // compression, so a byte round trip here is a byte round trip of the stored record.
         let bytes = encode(&record);
         let decoded: PackRecord = decode(&bytes);
