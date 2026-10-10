@@ -55,6 +55,10 @@ Delivery is best-effort on a background task, so batch production is never block
 > If no committee validator has advertised a JSON-RPC endpoint, an observer cannot forward at all.
 > The batch is refused rather than dropped, and its transactions stay pending in the pool for a later attempt.
 
+An observer started with `--forward-txs` takes its RPC submissions off this path.
+It relays each `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call synchronously to an operator-configured validator endpoint and never inserts the transaction into its own pool, so the node-record forwarder never sees it.
+See [Public RPC nodes](../getting-started/public-rpc-nodes.md).
+
 ## Swarms and epoch interfaces
 
 A node runs one libp2p swarm for its primary and one more for each configured worker.
@@ -120,5 +124,6 @@ The remaining protocol families sit at `/0.0.1`; only request-response has been 
 | Swarm construction and QUIC transport | `crates/network-libp2p/src/consensus.rs` (`ConsensusNetwork::new`) |
 | Process-lifetime swarms | `crates/node/src/manager/node.rs` (`spawn_node_networks`) |
 | Observer transaction forwarding | `crates/consensus/worker/src/worker.rs` (`Worker::disburse_txns`) |
+| RPC submission forwarding (`--forward-txs`) | `crates/tn-reth/src/rpc_tx_forward.rs` (`EthSubmitForwarded`), `crates/tn-reth/src/rpc_tx_forward/client.rs` (`TxForwarder`) |
 
 Update this page when those files change.

@@ -45,7 +45,10 @@ use reth::{
 use reth_cli_util::parse_ether_value;
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
 
-use crate::cli::SELECTABLE_MODULE_NAMES;
+use crate::{
+    cli::SELECTABLE_MODULE_NAMES,
+    rpc_tx_forward::{parse_forward_targets, ForwardTargets},
+};
 
 /// The default IPC endpoint
 #[cfg(windows)]
@@ -235,6 +238,30 @@ pub struct RpcServerArgs {
     #[arg(long = "rpc.pending-block", default_value = "none", value_name = "KIND")]
     pub rpc_pending_block: PendingBlockKind,
 
+    /// Forward eth_sendRawTransaction(Sync) to these validator RPC targets instead of the local
+    /// pool.
+    ///
+    /// Ordered failover list: the next target is tried only on a transport failure (unreachable,
+    /// timeout, a non-2xx status other than 413, an oversized or malformed reply), never on a
+    /// JSON-RPC error reply. Accepts a URL, ip:port, a bare IPv6 address, [IPv6]:port, or
+    /// host[:port]; no scheme means http://, and no port means 8545 (a URL keeps its scheme's
+    /// default port). Reads and every other method are served locally. Targets are never shown
+    /// to clients.
+    #[arg(
+        long = "forward-txs",
+        value_name = "TARGET[,TARGET...]",
+        env = "TN_FORWARD_TXS",
+        hide_env_values = true,
+        value_parser = parse_forward_targets
+    )]
+    pub forward_txs: Option<ForwardTargets>,
+
+    /// Before forwarding, decode the transaction, recover its signer, and check the TN type
+    /// allowlist and chain id; reject locally with reth's errors. Off: bytes are forwarded
+    /// untouched.
+    #[arg(long = "sanitize-txs", requires = "forward_txs", default_value_t = false)]
+    pub sanitize_txs: bool,
+
     /// State cache configuration.
     #[command(flatten)]
     pub rpc_state_cache: RpcStateCacheArgs,
@@ -270,12 +297,17 @@ impl Default for RpcServerArgs {
             rpc_max_simulate_blocks: constants::DEFAULT_MAX_SIMULATE_BLOCKS,
             rpc_eth_proof_window: constants::DEFAULT_ETH_PROOF_WINDOW,
             rpc_pending_block: PendingBlockKind::None,
+            forward_txs: None,
+            sanitize_txs: false,
             rpc_state_cache: RpcStateCacheArgs::default(),
             rpc_proof_permits: constants::DEFAULT_PROOF_PERMITS,
         }
     }
 }
 
+/// `forward_txs` and `sanitize_txs` are TN-only and have no reth counterpart: they travel
+/// through `TxForwardConfig`, which `RethConfig::new` takes out of the args before this
+/// conversion.
 impl From<RpcServerArgs> for reth::args::RpcServerArgs {
     fn from(v: RpcServerArgs) -> Self {
         reth::args::RpcServerArgs {
@@ -398,5 +430,69 @@ mod tests {
         let config = reth::args::RpcServerArgs::from(full.rpc).eth_config();
         assert_eq!(config.pending_block_kind, PendingBlockKind::Full);
         Ok(())
+    }
+
+    /// Forwarding is off unless asked for: a bare parse and the manual `Default` agree on no
+    /// targets and no sanitizing, and an explicit list parses into the ordered targets.
+    #[test]
+    fn cli_forward_txs_defaults_disabled_and_matches_default_impl() -> eyre::Result<()> {
+        let parsed = RethCommand::try_parse_from(["tn-reth"])?;
+        assert_eq!(parsed.rpc.forward_txs, None);
+        assert!(!parsed.rpc.sanitize_txs);
+        assert_eq!(parsed.rpc.forward_txs, RpcServerArgs::default().forward_txs);
+        assert_eq!(parsed.rpc.sanitize_txs, RpcServerArgs::default().sanitize_txs);
+
+        let parsed = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1:8545,https://validator.example.com",
+            "--sanitize-txs",
+        ])?;
+        let expected = parse_forward_targets("10.0.0.1:8545,https://validator.example.com")?;
+        assert_eq!(parsed.rpc.forward_txs, Some(expected));
+        assert!(parsed.rpc.sanitize_txs);
+        Ok(())
+    }
+
+    /// `--sanitize-txs` only means something on a forwarding node, so it needs `--forward-txs`.
+    #[test]
+    fn cli_sanitize_txs_requires_forward_txs() {
+        let err = RethCommand::try_parse_from(["tn-reth", "--sanitize-txs"])
+            .expect_err("--sanitize-txs without --forward-txs is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    /// The list is one value: a second `--forward-txs` is an error rather than a silent
+    /// replacement or append, and a bad entry fails the parse instead of being skipped.
+    #[test]
+    fn cli_forward_txs_rejects_repeated_flag() {
+        let err = RethCommand::try_parse_from([
+            "tn-reth",
+            "--forward-txs",
+            "10.0.0.1",
+            "--forward-txs",
+            "10.0.0.2",
+        ])
+        .expect_err("a repeated --forward-txs is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let err = RethCommand::try_parse_from(["tn-reth", "--forward-txs", "10.0.0.1,10.0.0.1"])
+            .expect_err("duplicate targets are refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// `TN_FORWARD_TXS` supplies the list, which keeps the private targets out of the process
+    /// command line, and `--help` never prints its value. Checked on the clap definition rather
+    /// than by setting the variable, which would leak into parses running on other threads.
+    #[test]
+    fn cli_forward_txs_reads_env_var() {
+        use clap::CommandFactory as _;
+        let command = RethCommand::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "forward_txs")
+            .expect("--forward-txs is registered");
+        assert_eq!(arg.get_env(), Some(std::ffi::OsStr::new("TN_FORWARD_TXS")));
+        assert!(arg.is_hide_env_values_set(), "--help must not print the target list");
     }
 }

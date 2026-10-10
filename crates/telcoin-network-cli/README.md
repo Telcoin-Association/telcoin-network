@@ -349,6 +349,7 @@ Default data directory by platform:
 | `TN_EXTERNAL_WORKER_ADDRS` | keytool generate | External multiaddrs for worker P2P (comma-separated)       |
 | `TN_TRACING_URL`           | node             | OpenTelemetry collector endpoint                           |
 | `HEALTHCHECK_TCP_PORT`     | node             | TCP health check port                                      |
+| `TN_FORWARD_TXS`           | node             | Target list for `--forward-txs`, kept off the command line |
 | `RUST_LOG`                 | all              | Standard Rust log filter directive (e.g. `info,evm=debug`) |
 
 ## Data directory layout
@@ -405,6 +406,8 @@ Enable the HTTP and WebSocket RPC servers with `--http` and `--ws`. By default, 
 | `--rpc.max-logs-per-response`            | `20000`               | Max logs in one `eth_getLogs` or filter response (0 = no limit) |
 | `--rpc.gascap`                           | `50000000`            | Max gas for `eth_call` and the call-tracing methods             |
 | `--rpc.txfeecap`                         | `0` (no cap)          | Max transaction fee via RPC (0 = no cap)                        |
+| `--forward-txs`                          | none                  | Forward `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to an ordered failover list of validator RPC targets instead of the local pool. Env: `TN_FORWARD_TXS`. See [Public RPC nodes](../../docs/src/getting-started/public-rpc-nodes.md) |
+| `--sanitize-txs`                         | `false`               | Decode each transaction, recover its signer, and check the transaction type and chain id before forwarding (requires `--forward-txs`). See [Public RPC nodes](../../docs/src/getting-started/public-rpc-nodes.md#sanitizing-submissions) |
 
 ### available RPC namespaces
 

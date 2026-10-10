@@ -497,6 +497,19 @@ pub(crate) fn start_observer(
     test: &str,
     run: u32,
 ) -> Child {
+    start_observer_with_args(instance, bin, base_dir, rpc_port, test, run, &[])
+}
+
+/// Start an observer node process with additional CLI arguments (e.g. `--forward-txs`).
+pub(crate) fn start_observer_with_args(
+    instance: usize,
+    bin: &'static TestBinary,
+    base_dir: &Path,
+    rpc_port: u16,
+    test: &str,
+    run: u32,
+    extra_args: &[&str],
+) -> Child {
     let data_dir = base_dir.join("observer");
     let ws_port = get_available_tcp_port("127.0.0.1").expect("ws port");
     // IPC: use temp-dir-based path to avoid cross-test conflicts
@@ -517,6 +530,8 @@ pub(crate) fn start_observer(
         .arg(ipc_path.to_string_lossy().as_ref())
         .arg("--node-name")
         .arg(format!("{test}-node{instance}"));
+
+    command.args(extra_args);
 
     setup_log_dir(&mut command, instance, test, run);
 

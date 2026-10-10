@@ -4,6 +4,8 @@ Submits a pre-signed transaction to the network. This is the only way to send a 
 
 A node that is not part of the current committee accepts the transaction into its local pool and then forwards it to a committee validator's advertised RPC endpoint on your behalf. Forwarding is best-effort and routes by sender address, so all of one account's transactions converge on the same validator and nonce ordering is preserved. Submitting to any Telcoin Network node therefore works the same way.
 
+An operator can also run a public RPC node that relays this method to a fixed validator and returns that validator's answer exactly as given: the transaction hash, or the validator's error object with its code, message and data unchanged. Such a node does not report the transaction through [eth\_getTransactionByHash](eth_gettransactionbyhash.md) or the `pending` nonce from [eth\_getTransactionCount](eth_gettransactioncount.md) until it is mined. See [Public RPC nodes](../../getting-started/public-rpc-nodes.md) for how these nodes forward and which errors they return.
+
 Telcoin Network nodes additionally guard this method with a transaction fee cap (`--rpc.txfeecap`, in TEL; `0` disables the cap and is the default). When an operator sets a cap, the transaction's maximum possible fee - `maxFeePerGas * gasLimit`, plus the blob fee bound for EIP-4844 transactions - must not exceed it. An over-cap transaction is rejected before it reaches the pool with a JSON-RPC error (code `-32000`) of the form:
 
 ```
