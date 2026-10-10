@@ -76,6 +76,9 @@ port so the gateway is a drop-in edge for clients; on a single host that means
 the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
+The gateway ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`: forwarded calls and readiness polls connect to the configured URLs directly.
+Neither follows an HTTP redirect: a readiness poll that gets a `3xx` counts as not ready, so only a `2xx` answer from the configured readiness URL can mark its worker ready.
+
 YAML (`--config gateway.yaml`):
 
 ```yaml

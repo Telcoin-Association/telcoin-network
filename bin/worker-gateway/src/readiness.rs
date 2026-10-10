@@ -204,7 +204,15 @@ async fn poll_one(client: &Client, url: &Url, worker_id: u16, poll_timeout: Dura
 
 /// Fetch and parse one upstream's readiness payload.
 async fn fetch_readiness(client: &Client, url: &Url, worker_id: u16) -> eyre::Result<bool> {
-    let bytes = client.get(url.clone()).send().await?.error_for_status()?.bytes().await?;
+    let response = client.get(url.clone()).send().await?.error_for_status()?;
+    // redirects are not followed and `error_for_status` passes a `3xx`, so a
+    // body counts only when the endpoint itself answered `2xx`
+    eyre::ensure!(
+        response.status().is_success(),
+        "readiness endpoint answered {} instead of 2xx",
+        response.status()
+    );
+    let bytes = response.bytes().await?;
     parse_ready(bytes.as_ref(), worker_id).ok_or_else(|| eyre::eyre!("malformed readiness payload"))
 }
 

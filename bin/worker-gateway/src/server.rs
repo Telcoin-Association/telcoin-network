@@ -339,8 +339,9 @@ mod tests {
     use super::*;
     use crate::{
         config::UpstreamWorker,
-        proxy::{proxy_client, MAX_REQUEST_BYTES},
+        proxy::{client_builder, proxy_client, readiness_client, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
+        readiness::run_poller,
     };
     use axum::{
         http::{header, HeaderMap},
@@ -953,7 +954,8 @@ mod tests {
     /// `--redirect-queries` pointing at `query`, using the production proxy
     /// client. The worker starts not ready.
     fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
-        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        let client = proxy_client(client_builder(Duration::from_secs(2)), Duration::from_secs(5))
+            .expect("client");
         redirect_state_with_client(worker, query, client)
     }
 
@@ -1113,7 +1115,8 @@ mod tests {
         );
         let (query, _query) = spawn(slow).await;
         let client =
-            proxy_client(Duration::from_secs(2), Duration::from_millis(200)).expect("client");
+            proxy_client(client_builder(Duration::from_secs(2)), Duration::from_millis(200))
+                .expect("client");
         let state = redirect_state_with_client(worker, Some(query), client);
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
@@ -1251,5 +1254,164 @@ mod tests {
             assert_eq!(response.text().await.expect("text"), "moved");
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// Worker `worker_id` with its RPC and readiness endpoints on `addr`.
+    fn upstream_at(worker_id: u16, addr: SocketAddr) -> UpstreamWorker {
+        UpstreamWorker { worker_id, ..upstream(addr) }
+    }
+
+    /// A mock node whose `GET /health/workers` reports workers 0 and 1 both
+    /// accepting transactions. Returns the number of polls it has answered;
+    /// the `Notifier` keeps it alive.
+    async fn ready_node() -> (SocketAddr, Arc<AtomicUsize>, Notifier) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&polls);
+        let node = Router::new().route(
+            "/health/workers",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true},{"worker_id":1,"accepting_transactions":true}]}"#
+                }
+            }),
+        );
+        let (addr, shutdown) = spawn(node).await;
+        (addr, polls, shutdown)
+    }
+
+    /// Run the readiness poller over `readiness` with `client`, polling every
+    /// 50 ms. The `Notifier` stops it.
+    fn spawn_poller(readiness: Arc<GatewayReadiness>, client: Client) -> Notifier {
+        let shutdown = Notifier::new();
+        let noticer = shutdown.subscribe();
+        tokio::spawn(async move {
+            let _ = run_poller(
+                readiness,
+                client,
+                Duration::from_millis(50),
+                Duration::from_secs(2),
+                noticer,
+            )
+            .await;
+        });
+        shutdown
+    }
+
+    /// Wait up to five seconds for `done` to hold, and report whether it did.
+    async fn wait_until(done: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// The readiness client follows no redirect. Worker 0's readiness endpoint
+    /// answers `302` toward a node that reports it ready, with a body that
+    /// reports it ready too; the poll must leave worker 0 not ready, and that
+    /// node must never be polled. Worker 1 is polled directly at an identical
+    /// node, so the client and the poller are shown to work in the same run.
+    #[tokio::test]
+    async fn readiness_client_does_not_follow_redirects() {
+        let (target, target_polls, _target) = ready_node().await;
+        let (control, _control_polls, _control) = ready_node().await;
+        let location = format!("http://{target}/health/workers");
+        let bounces = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&bounces);
+        let bouncer = Router::new().route(
+            "/health/workers",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let location = location.clone();
+                async move {
+                    let ready = r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#;
+                    (StatusCode::FOUND, [(header::LOCATION, location)], ready)
+                }
+            }),
+        );
+        let (bouncer, _bouncer) = spawn(bouncer).await;
+
+        let redirected = upstream_at(0, bouncer);
+        let direct = upstream_at(1, control);
+        let readiness = Arc::new(GatewayReadiness::new(&[redirected.clone(), direct.clone()]));
+        let client = readiness_client(client_builder(Duration::from_secs(2))).expect("client");
+        let _poller = spawn_poller(Arc::clone(&readiness), client);
+
+        // worker 0 is polled before worker 1 in every cycle, so a second
+        // bounce means the whole first cycle has been recorded
+        assert!(
+            wait_until(|| bounces.load(Ordering::SeqCst) >= 2).await,
+            "the poller never reached the redirecting endpoint twice"
+        );
+        assert_eq!(
+            readiness.first_ready_rpc_url(),
+            Some(direct.rpc_url),
+            "worker 1 must be ready and worker 0 not, at {}",
+            redirected.rpc_url
+        );
+        assert_eq!(target_polls.load(Ordering::SeqCst), 0, "the redirect target was polled");
+    }
+
+    /// Both upstream clients ignore proxy variables. Every proxy variable
+    /// points at a port nothing listens on, with no `NO_PROXY` exemption, yet
+    /// a poll through the production readiness client still marks the worker
+    /// ready and a call through the production proxy client still reaches it.
+    ///
+    /// The variables set here are process-wide, so the body runs only under
+    /// nextest's process-per-test model, where they reach no other test; any
+    /// other runner skips it.
+    #[tokio::test]
+    async fn clients_ignore_proxy_environment() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!(
+                "skipped: clients_ignore_proxy_environment needs nextest's process-per-test model"
+            );
+            return;
+        }
+        for name in
+            ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        {
+            std::env::set_var(name, "http://127.0.0.1:9");
+        }
+        // `REQUEST_METHOD` makes reqwest skip `HTTP_PROXY` (a CGI guard), so it
+        // goes too, along with any loopback exemption the environment carries
+        for name in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            std::env::remove_var(name);
+        }
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (node, node_polls, _node) = ready_node().await;
+        let readiness = Arc::new(GatewayReadiness::new(&[UpstreamWorker {
+            readiness_url: upstream(node).readiness_url,
+            ..upstream(worker)
+        }]));
+        let client = readiness_client(client_builder(Duration::from_secs(2))).expect("client");
+        let _poller = spawn_poller(Arc::clone(&readiness), client);
+        assert!(
+            wait_until(|| readiness.any_ready()).await,
+            "the readiness poll must reach the node directly"
+        );
+        assert!(node_polls.load(Ordering::SeqCst) >= 1);
+
+        let client = proxy_client(client_builder(Duration::from_secs(2)), Duration::from_secs(5))
+            .expect("client");
+        let state = AppState { readiness, http: client, query_upstream: None };
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // the test's own client must not use the proxy either
+        let client = Client::builder().no_proxy().build().expect("client");
+        let response = client
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("text"), "worker");
+        assert_eq!(worker_seen.hits(), 1);
     }
 }
