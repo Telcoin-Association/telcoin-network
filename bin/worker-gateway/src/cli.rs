@@ -400,13 +400,23 @@ fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
 /// the gateway carries a TLS backend for `--redirect-queries`, but TLS to
 /// workers (and to their readiness endpoints) is not supported, so an `https`
 /// worker URL is a configuration error reported here rather than a surprise at
-/// runtime.
+/// runtime. The message names the URL by origin only, since a worker URL can
+/// carry a credential in its userinfo, path or query.
+///
+/// A scheme the URL standard does not define is named not at all: a value
+/// written without one, such as `key:secret@host:port`, parses with part of
+/// the credential as its scheme (and so as its origin).
 fn ensure_http_scheme(url: &Url) -> eyre::Result<()> {
     eyre::ensure!(
+        url.is_special(),
+        "a worker upstream URL has no http:// scheme; write it as http://host:port[/path]"
+    );
+    eyre::ensure!(
         url.scheme() == "http",
-        "unsupported URL scheme `{}` in `{url}`: worker upstreams are HTTP-only; TLS is \
+        "unsupported URL scheme `{}` in `{}`: worker upstreams are HTTP-only; TLS is \
          supported only for --redirect-queries",
-        url.scheme()
+        url.scheme(),
+        UpstreamOrigin(url)
     );
     Ok(())
 }
@@ -649,6 +659,46 @@ mod tests {
         )
         .into_settings();
         assert!(result.is_err());
+    }
+
+    /// Startup errors about a worker URL name it by origin only: a scheme error
+    /// and a self-pointing error, for both the RPC and the readiness URL. A
+    /// value written without a scheme parses with part of its credential as
+    /// the scheme, so its error names neither the scheme nor the origin.
+    #[test]
+    fn startup_errors_name_origins_only() {
+        let ready = "http://10.0.0.7:8551/health/workers";
+        let userinfo = ["user", "pw@", "/path"].as_slice();
+        let schemeless = ["apikey", "s3cr3t"].as_slice();
+        for (rpc, readiness, secrets, origin) in [
+            ("ftp://user:pw@host/path", ready, userinfo, Some("`ftp://host:21`")),
+            ("http://10.0.0.7:8544", "ftp://user:pw@host/path", userinfo, Some("`ftp://host:21`")),
+            (
+                "http://user:pw@127.0.0.1:8545/path",
+                ready,
+                userinfo,
+                Some("`http://127.0.0.1:8545`"),
+            ),
+            (
+                "http://10.0.0.7:8544",
+                "http://user:pw@127.0.0.1:8545/path",
+                userinfo,
+                Some("`http://127.0.0.1:8545`"),
+            ),
+            ("apikey:s3cr3t@10.0.0.7:8545", ready, schemeless, None),
+            ("http://10.0.0.7:8544", "apikey:s3cr3t@10.0.0.7:8545", schemeless, None),
+        ] {
+            let message = match cli_with(None, Some(rpc), Some(readiness)).into_settings() {
+                Ok(_) => panic!("{rpc} / {readiness} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            for secret in secrets {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+            if let Some(origin) = origin {
+                assert!(message.contains(origin), "the origin is missing from: {message}");
+            }
+        }
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does

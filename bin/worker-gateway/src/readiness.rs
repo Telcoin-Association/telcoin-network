@@ -24,14 +24,14 @@ use std::{
 };
 
 use futures::StreamExt as _;
-use reqwest::Client;
+use reqwest::{Client, Response};
 use serde::Deserialize;
 use tn_types::{Noticer, TaskError};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::debug;
 use url::Url;
 
-use crate::config::UpstreamWorker;
+use crate::{config::UpstreamWorker, proxy::UpstreamOrigin};
 
 /// Readiness envelope version the gateway targets. Newer versions still parse,
 /// because unknown fields are ignored (see [`NodeReadiness`]); this is only used
@@ -187,24 +187,46 @@ pub(crate) async fn run_poller(
 }
 
 /// Poll a single upstream, returning `false` (not-ready) on any failure.
+///
+/// The logs name the upstream by origin only, since a readiness URL can carry
+/// a credential in its userinfo, path or query.
 async fn poll_one(client: &Client, url: &Url, worker_id: u16, poll_timeout: Duration) -> bool {
     timeout(poll_timeout, fetch_readiness(client, url, worker_id))
         .await
-        .inspect_err(|_| debug!(target: "gateway::readiness", %url, "readiness poll timed out"))
+        .inspect_err(|_| {
+            debug!(
+                target: "gateway::readiness",
+                upstream = %UpstreamOrigin(url),
+                "readiness poll timed out"
+            )
+        })
         .ok()
         .and_then(|result| {
             result
-                .inspect_err(
-                    |err| debug!(target: "gateway::readiness", %url, %err, "readiness poll failed"),
-                )
+                .inspect_err(|err| {
+                    debug!(
+                        target: "gateway::readiness",
+                        upstream = %UpstreamOrigin(url),
+                        %err,
+                        "readiness poll failed"
+                    )
+                })
                 .ok()
         })
         .unwrap_or(false)
 }
 
 /// Fetch and parse one upstream's readiness payload.
+///
+/// A `reqwest` error's `Display` appends the full request URL, so every
+/// transport or status error has the URL removed before it is returned.
 async fn fetch_readiness(client: &Client, url: &Url, worker_id: u16) -> eyre::Result<bool> {
-    let response = client.get(url.clone()).send().await?.error_for_status()?;
+    let response = client
+        .get(url.clone())
+        .send()
+        .await
+        .and_then(Response::error_for_status)
+        .map_err(reqwest::Error::without_url)?;
     // redirects are not followed and `error_for_status` passes a `3xx`, so a
     // body counts only when the endpoint itself answered `2xx`
     eyre::ensure!(
@@ -212,7 +234,7 @@ async fn fetch_readiness(client: &Client, url: &Url, worker_id: u16) -> eyre::Re
         "readiness endpoint answered {} instead of 2xx",
         response.status()
     );
-    let bytes = response.bytes().await?;
+    let bytes = response.bytes().await.map_err(reqwest::Error::without_url)?;
     parse_ready(bytes.as_ref(), worker_id).ok_or_else(|| eyre::eyre!("malformed readiness payload"))
 }
 
@@ -242,6 +264,9 @@ fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{http::StatusCode, Router};
+    use std::sync::Mutex;
+    use tokio::net::TcpListener;
 
     #[test]
     fn parses_ready_worker() {
@@ -321,5 +346,70 @@ mod tests {
             readiness.first_ready_rpc_url(),
             Some(Url::parse("http://127.0.0.1:8545").expect("url"))
         );
+    }
+
+    /// Collects everything a fmt subscriber writes, so a test can read the log
+    /// lines back.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A readiness URL for `addr` whose userinfo, path and query carry secrets.
+    fn secret_url(addr: std::net::SocketAddr) -> Url {
+        Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url")
+    }
+
+    /// The readiness poll logs name the upstream by origin only. A URL whose
+    /// userinfo, path and query carry secrets is polled while nothing listens,
+    /// while its node answers `500` (reqwest's status error also carries the
+    /// URL), and while its node never answers; no secret may reach the debug
+    /// output, and each line still names the upstream's origin.
+    #[tokio::test]
+    async fn readiness_logs_hide_the_url() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=debug")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let failing = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let failing_addr = failing.local_addr().expect("addr");
+        let app = Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR });
+        tokio::spawn(async move { axum::serve(failing, app).await });
+        // bound but never accepted: the connect completes and no answer comes
+        let silent = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let silent_addr = silent.local_addr().expect("addr");
+        // nothing listens on port 1
+        let refused_addr = "127.0.0.1:1".parse().expect("addr");
+
+        let client = Client::new();
+        let poll_timeout = Duration::from_millis(300);
+        for addr in [refused_addr, failing_addr, silent_addr] {
+            assert!(!poll_one(&client, &secret_url(addr), 0, poll_timeout).await, "{addr}");
+        }
+
+        let logs = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("utf-8 logs");
+        assert_eq!(logs.matches("readiness poll failed").count(), 2, "{logs}");
+        assert_eq!(logs.matches("readiness poll timed out").count(), 1, "{logs}");
+        for addr in [refused_addr, failing_addr, silent_addr] {
+            assert!(logs.contains(&format!("upstream=http://{addr}")), "{addr} missing: {logs}");
+        }
+        for secret in ["user", "s3cr3t", "k3y", "t0k3n"] {
+            assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+        }
     }
 }
