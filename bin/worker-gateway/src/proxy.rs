@@ -14,7 +14,10 @@
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`classify`]),
 //! which is not readiness-gated, never falls back to the worker, and gets the
-//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`. Without
+//! `--redirect-queries`, a call whose method starts with a
+//! `--denied-method-prefixes` entry is refused before forwarding (see
+//! [`calls_denied_method`]).
 
 use std::{borrow::Cow, fmt, net::SocketAddr, time::Duration};
 
@@ -146,6 +149,18 @@ pub(crate) async fn proxy(
         return error_response_with_id(&err, id);
     }
 
+    // without a redirect every call would reach the worker, so the namespaces
+    // a validator should not serve publicly are refused here; with one, the
+    // query upstream decides what it serves and routing is unchanged
+    if state.query_upstream.is_none()
+        && calls_denied_method(body.as_ref(), &state.denied_method_prefixes)
+    {
+        // the method is the client's choice, not an operator fault, so this
+        // stays at debug; the rejection metric counts it by reason
+        debug!(target: "gateway::proxy", "refusing a denied method before forwarding");
+        return error_response(&GatewayError::MethodNotAllowed, body.as_ref());
+    }
+
     // with a redirect configured, every call but a submission goes to the
     // query upstream, with no readiness gate and no fallback to the worker: a
     // fallback would put the read load on the validator exactly when the
@@ -203,6 +218,41 @@ fn is_query(body: &[u8]) -> bool {
         telemetry::record_mixed_batch();
     }
     calls.route() == Route::Query
+}
+
+/// Whether `body` calls a method whose name starts with one of `prefixes`,
+/// alone or anywhere in a batch.
+///
+/// One scan of the bytes, built like [`classify`]: each call's `method` is read
+/// through [`CallMethodVisitor`] and every other member is skipped in place.
+/// Matching is case-sensitive and anchored at the first character, as jsonrpsee
+/// matches method names, so under `tn_` neither `TN_x` nor `xtn_` is denied; a
+/// name spelled with unicode escapes is unescaped first, as the worker's server
+/// does. The scan starts after leading ASCII whitespace, form feed included,
+/// which the worker's server skips and serde_json does not. A body that does not
+/// then start with `{` or `[` is forwarded unread, since the worker's server
+/// refuses it before decoding any call, and so is a call whose `method` is not a
+/// string. A body that does start with one but that the scan cannot read is
+/// refused: the worker's server decodes each batch element on its own and runs
+/// the calls around one it cannot decode (an out-of-range number, an unpaired
+/// surrogate escape), so a scan error is no proof that nothing runs.
+fn calls_denied_method(body: &[u8], prefixes: &[String]) -> bool {
+    // an empty list allows everything, without a parse
+    if prefixes.is_empty() {
+        return false;
+    }
+    // the worker's server skips leading ASCII whitespace (form feed included,
+    // which serde_json rejects) and refuses, unread, a body that does not then
+    // start with `{` or `[`, so only those bodies can run a call
+    let body = body.trim_ascii_start();
+    if !matches!(body.first(), Some(b'{' | b'[')) {
+        return false;
+    }
+    // past that point a scan error refuses the body: the worker's server
+    // decodes each batch element on its own and runs the calls around one it
+    // cannot decode, so an unreadable body is no proof that nothing runs
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
+    deserializer.deserialize_any(DeniedMethods { prefixes }).unwrap_or(true)
 }
 
 /// Answer a body-buffering failure: a length-limit trip is a client error worth
@@ -560,6 +610,112 @@ fn read_method<'de, A: MapAccess<'de>>(mut members: A) -> Result<Option<String>,
         }
     }
     Ok(method)
+}
+
+/// Visitor behind [`calls_denied_method`]: whether a single call, or any call in
+/// a batch, names a denied method.
+struct DeniedMethods<'a> {
+    /// The `--denied-method-prefixes` entries.
+    prefixes: &'a [String],
+}
+
+impl DeniedMethods<'_> {
+    /// Whether `method` starts with one of the prefixes.
+    fn denies(&self, method: Option<&str>) -> bool {
+        method.is_some_and(|method| {
+            self.prefixes.iter().any(|prefix| method.starts_with(prefix.as_str()))
+        })
+    }
+}
+
+impl<'de> Visitor<'de> for DeniedMethods<'_> {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC request object or batch")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
+        let CallMethod(method) = CallMethodVisitor.visit_map(members)?;
+        Ok(self.denies(method.as_deref()))
+    }
+
+    /// Reads every element even after a denied one, so the verdict comes from
+    /// the calls themselves: stopping early leaves the batch unread, and
+    /// serde_json then fails the whole parse.
+    fn visit_seq<A: SeqAccess<'de>>(self, mut calls: A) -> Result<Self::Value, A::Error> {
+        let mut denied = false;
+        while let Some(BatchElement(method)) = calls.next_element()? {
+            denied |= self.denies(method.as_deref());
+        }
+        Ok(denied)
+    }
+}
+
+/// One batch element reduced to its `method`: an object is read through
+/// [`CallMethodVisitor`], and any other element is skipped in place.
+///
+/// [`CallMethod`] fails on an element that is not an object, which ends the
+/// scan. That suits [`classify`], where an unreadable batch goes to the query
+/// upstream, but not the method policy: the worker's server answers such an
+/// element as an invalid request and still runs the calls around it, so the
+/// scan skips the element and reads on to them.
+///
+/// Skipping a string or number element still decodes it, so an element that
+/// serde_json can skip but not decode (an unpaired surrogate escape, a number
+/// outside the f64 range) ends the scan with an error; [`calls_denied_method`]
+/// then refuses the body, because the worker would answer only that element as
+/// invalid and still run the rest.
+struct BatchElement(Option<String>);
+
+impl<'de> serde::Deserialize<'de> for BatchElement {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BatchElementVisitor)
+    }
+}
+
+/// Visitor behind [`BatchElement`].
+struct BatchElementVisitor;
+
+impl<'de> Visitor<'de> for BatchElementVisitor {
+    type Value = BatchElement;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("any JSON value")
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
+        CallMethodVisitor.visit_map(members).map(|CallMethod(method)| BatchElement(method))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(BatchElement(None))
+    }
+
+    fn visit_str<E: de::Error>(self, _: &str) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
+
+    fn visit_bool<E: de::Error>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
+
+    fn visit_i64<E: de::Error>(self, _: i64) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
+
+    fn visit_u64<E: de::Error>(self, _: u64) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
+
+    fn visit_f64<E: de::Error>(self, _: f64) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(BatchElement(None))
+    }
 }
 
 /// Shallow pre-flight for `eth_sendRawTransaction`.
@@ -1357,6 +1513,76 @@ mod tests {
         assert_eq!(classify(last_read.as_bytes()), Calls::Queries);
         let batch = format!("[{last_read},{}]", call("eth_sendRawTransaction"));
         assert_eq!(classify(batch.as_bytes()), Calls::MixedBatch);
+    }
+
+    /// The shipped `--denied-method-prefixes` default, as the CLI resolves it.
+    fn default_denied() -> Vec<String> {
+        crate::cli::DEFAULT_DENIED_METHOD_PREFIXES.split(',').map(String::from).collect()
+    }
+
+    #[test]
+    fn prefix_match_is_case_sensitive_and_anchored() {
+        let prefixes = default_denied();
+        for method in ["tn_getStuff", "debug_traceTransaction", "trace_block", "admin_peers", "tn_"]
+        {
+            assert!(calls_denied_method(call(method).as_bytes(), &prefixes), "{method}");
+        }
+        for method in [
+            "TN_x",
+            "Tn_getStuff",
+            "DEBUG_traceTransaction",
+            "xtn_",
+            "eth_tn_x",
+            " tn_x",
+            "tn",
+            "eth_call",
+            "net_version",
+        ] {
+            assert!(!calls_denied_method(call(method).as_bytes(), &prefixes), "{method:?}");
+        }
+    }
+
+    /// The worker's server unescapes method names and runs every call object in
+    /// a batch around the elements it cannot read, so the scan has to as well.
+    #[test]
+    fn denied_call_is_found_behind_escapes_and_junk_elements() {
+        let prefixes = default_denied();
+        let denied = call("tn_getStuff");
+        let deep = format!("{}{}", "[".repeat(512), "]".repeat(512));
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
+            format!("[1,{denied}]"),
+            format!(r#"["tn_x",null,true,1.5,{{"method":7}},{denied}]"#),
+            format!("[{deep},{denied}]"),
+            format!(r#"[{{"params":{deep},"method":"eth_call"}},{denied}]"#),
+            format!("[{denied},{}]", call("eth_call")),
+            // the worker's server skips a leading form feed; serde_json does not
+            format!("\x0C{denied}"),
+            format!(" \x0C\n[{denied}]"),
+            // an element the worker answers as an invalid request does not
+            // hide the calls around it, wherever it sits
+            format!(r#"["\ud800",{denied}]"#),
+            format!(r#"[{denied},{{"\ud800":1}}]"#),
+            format!(r#"[{{"method":"\ud800"}},{denied}]"#),
+            format!("[{denied},1e999]"),
+            format!(r#"[{{"method":-1e400}},{denied}]"#),
+            format!("[{denied},{}]", "9".repeat(400)),
+        ] {
+            assert!(calls_denied_method(body.as_bytes(), &prefixes), "{body}");
+        }
+        // nothing the worker could run as a denied call is refused
+        for body in [
+            "not json, tn_getStuff".to_string(),
+            r#"{"method":["tn_x"],"id":1}"#.to_string(),
+            r#""tn_x""#.to_string(),
+            "[]".to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_call","params":["tn_x"],"id":1}"#.to_string(),
+            format!("[{deep}]"),
+            format!("[{},{}]", call("eth_call"), call("eth_blockNumber")),
+        ] {
+            assert!(!calls_denied_method(body.as_bytes(), &prefixes), "{body}");
+        }
+        assert!(!calls_denied_method(denied.as_bytes(), &[]), "an empty list denies nothing");
     }
 
     /// `use_rustls_tls` exists only when a rustls feature is enabled on

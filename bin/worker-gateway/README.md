@@ -1,7 +1,7 @@
 # worker-gateway
 
 A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
-It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
+It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*`) unchanged to a ready upstream worker, refuses the namespaces the [method policy](#method-policy) denies (`tn_*`, `debug_*`, `trace_*` and `admin_*` by default), gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
 With `--redirect-queries` it sends only transaction submissions to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
 "Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
 
@@ -97,6 +97,7 @@ Every flag has an environment-variable fallback.
 | `--upstream-readiness-url` | `WORKER_GATEWAY_UPSTREAM_READINESS_URL` | (none) | Inline upstream readiness URL. |
 | `--worker-id` | `WORKER_GATEWAY_WORKER_ID` | `0` | Inline upstream worker id. |
 | `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions; see [Query redirect](#query-redirect). |
+| `--denied-method-prefixes` | `WORKER_GATEWAY_DENIED_METHOD_PREFIXES` | `tn_,debug_,trace_,admin_` | Comma-separated method-name prefixes refused when `--redirect-queries` is unset (empty allows every method); see [Method policy](#method-policy). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
@@ -248,9 +249,28 @@ edge, the two cases the worker would also reject — an undecodable payload and 
 EIP-4844 blob transaction (the network does not accept blobs) — saving a wasted
 upstream round-trip. The decode uses the same pooled wire format the worker's
 RPC accepts and never recovers the signer, so it cannot reject a transaction the
-worker would accept. Batches (JSON arrays) and every other method are forwarded
-unchanged and validated upstream: by the worker, or, with `--redirect-queries`,
-by the query URL for everything that is not a submission.
+worker would accept. Batches (JSON arrays) and every other method the
+[method policy](#method-policy) allows are forwarded unchanged and validated
+upstream: by the worker, or, with `--redirect-queries`, by the query URL for
+everything that is not a submission.
+
+### Method policy
+
+Without `--redirect-queries` every call goes to the worker, so the gateway refuses the namespaces a validator should not serve to the public before forwarding.
+A call whose `method` starts with an entry of `--denied-method-prefixes` (default `tn_,debug_,trace_,admin_`) gets `403` / `-32011` "method not allowed through this gateway" with its request `id`, and never reaches the worker.
+The node says a validator should not expose the `tn` namespace publicly; `debug_`, `trace_` and `admin_` cover what an operator may have enabled on the worker for its own use.
+A batch that holds a refused call is refused whole, with one error object whose `id` is `null`, and no part of it is forwarded.
+
+Matching is case-sensitive and anchored at the start of the name, as the worker matches method names: under `tn_`, neither `TN_info` nor `eth_tn_x` is refused, and the worker answers both as unknown methods.
+The gateway reads method names the way the worker's server does: leading whitespace, form feed included, is skipped, a name spelled with unicode escapes is unescaped before the match, and a batch element that is not an object does not hide the calls around it.
+A body that does not start with `{` or `[` once leading whitespace is skipped, or whose `method` is not a string, is forwarded, and the worker rejects it on its own.
+A body that starts with `{` or `[` but that the gateway cannot read, such as a batch with an element holding an out-of-range number or an unpaired surrogate escape, is refused like a denied call, because the worker would still run the calls around the element it cannot read.
+Reading the names costs one scan of each request body.
+
+Entries are separated by commas and surrounding whitespace is ignored.
+An empty value (`--denied-method-prefixes=` or an empty `WORKER_GATEWAY_DENIED_METHOD_PREFIXES`) allows every method.
+With `--redirect-queries` set the list is not applied: routing is unchanged, and the query URL decides what it serves.
+Refused calls are counted in `tn_worker_gateway_rejections_total` with reason `method_not_allowed`.
 
 ## Query redirect
 
@@ -293,8 +313,9 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
   `503` with `{"ready": false}`.
-- everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
-  with `--redirect-queries`, to the query URL unless it is a submission.
+- everything else (i.e. `POST /`): forwarded to a ready upstream worker unless
+  the [method policy](#method-policy) refuses it, or, with `--redirect-queries`,
+  to the query URL unless it is a submission.
 
 ## Behaviour on failure
 
@@ -313,6 +334,7 @@ echoed when it can be recovered.
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob) | `400` | `-32008` |
+| Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
 | Request body unreadable (client aborted) | `400` | `-32600` |
 
 The gateway's own codes sit in the JSON-RPC server-error range
@@ -362,7 +384,8 @@ The [production-readiness review](docs/production-readiness.md#operator-guidance
 ### Validators: always redirect queries
 
 Set `--redirect-queries` on every gateway in front of a validator.
-Without it, every read reaches the worker, including the `tn_*` calls the node says a validator should not serve publicly, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+Without it, reads reach the worker, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+The [method policy](#method-policy) refuses the `tn_*` calls the node says a validator should not serve publicly, but every other read still lands on the validator.
 Point it at an `https` public RPC for the same chain.
 
 ### Sizing for N gateways

@@ -45,6 +45,9 @@ mod code {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
+    /// The request calls a method the gateway refuses to forward
+    /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
+    pub(super) const METHOD_NOT_ALLOWED: i32 = -32011;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -74,6 +77,9 @@ pub(crate) enum GatewayError {
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
     /// network does not accept (an EIP-4844 blob transaction).
     UnsupportedTransactionType,
+    /// The request calls a method whose name starts with a denied prefix
+    /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
+    MethodNotAllowed,
     /// The request body could not be read (e.g. the client aborted mid-body).
     UnreadableBody,
 }
@@ -90,6 +96,7 @@ impl GatewayError {
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
+            Self::MethodNotAllowed => StatusCode::FORBIDDEN,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -106,6 +113,7 @@ impl GatewayError {
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::MethodNotAllowed => code::METHOD_NOT_ALLOWED,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
@@ -126,6 +134,7 @@ impl GatewayError {
             Self::UnsupportedTransactionType => {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
+            Self::MethodNotAllowed => "method not allowed through this gateway",
             Self::UnreadableBody => "request body could not be read",
         }
     }
@@ -145,6 +154,7 @@ impl GatewayError {
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::MethodNotAllowed => "method_not_allowed",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -475,6 +485,7 @@ mod tests {
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
         assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::MethodNotAllowed.code(), -32011);
     }
 
     #[test]
@@ -494,6 +505,29 @@ mod tests {
             GatewayError::UnsupportedTransactionType.reason(),
             "unsupported_transaction_type"
         );
+        assert_eq!(GatewayError::MethodNotAllowed.reason(), "method_not_allowed");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_code_and_reason_are_stable() {
+        // code, status, message and reason are the client and metrics contract
+        // for a refused method; pin all four, end to end through the renderer
+        let err = GatewayError::MethodNotAllowed;
+        assert_eq!(err.code(), -32011);
+        assert_eq!(err.reason(), "method_not_allowed");
+
+        let response = error_response(&err, br#"{"jsonrpc":"2.0","method":"tn_x","id":"q-1"}"#);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body,
+            json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32011, "message": "method not allowed through this gateway" },
+                "id": "q-1",
+            })
+        );
     }
 }

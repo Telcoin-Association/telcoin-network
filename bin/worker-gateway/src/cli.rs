@@ -17,6 +17,11 @@ use crate::{
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
 };
 
+/// The `--denied-method-prefixes` default: the `tn` namespace, which the node
+/// says a validator should not serve publicly, and the `debug`, `trace` and
+/// `admin` namespaces, which an operator may enable on the worker for itself.
+pub(crate) const DEFAULT_DENIED_METHOD_PREFIXES: &str = "tn_,debug_,trace_,admin_";
+
 /// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -58,6 +63,22 @@ pub(crate) struct Cli {
     /// gateway itself or at a worker's RPC host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
     pub(crate) redirect_queries: Option<Url>,
+
+    /// Comma-separated method-name prefixes the gateway refuses when
+    /// `--redirect-queries` is unset (default `tn_,debug_,trace_,admin_`). A
+    /// call whose `method` starts with one of them, matched case-sensitively
+    /// from the first character, gets a JSON-RPC "method not allowed" error
+    /// and never reaches the worker; a batch holding one is refused whole.
+    /// Whitespace around an entry is ignored, and an empty value allows every
+    /// method. With `--redirect-queries` set the list is not applied: the query
+    /// upstream decides what it serves.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_DENIED_METHOD_PREFIXES",
+        value_delimiter = ',',
+        default_value = DEFAULT_DENIED_METHOD_PREFIXES
+    )]
+    pub(crate) denied_method_prefixes: Vec<String>,
 
     /// How often to poll each upstream's readiness endpoint.
     #[arg(
@@ -236,6 +257,9 @@ pub(crate) struct Settings {
     /// Endpoint serving every non-submission call (`--redirect-queries`), or
     /// `None` when every call goes to the workers.
     pub(crate) query_upstream: Option<Url>,
+    /// Method-name prefixes refused when `query_upstream` is `None`; empty
+    /// allows every method.
+    pub(crate) denied_method_prefixes: Vec<String>,
     /// Readiness poll interval.
     pub(crate) readiness_poll_interval: Duration,
     /// Readiness poll timeout.
@@ -316,6 +340,7 @@ impl Cli {
             listen_addr: self.listen_addr,
             upstreams,
             query_upstream,
+            denied_method_prefixes: resolve_denied_method_prefixes(self.denied_method_prefixes),
             readiness_poll_interval: self.readiness_poll_interval,
             readiness_poll_timeout: self.readiness_poll_timeout,
             upstream_connect_timeout: self.upstream_connect_timeout,
@@ -362,6 +387,17 @@ impl Cli {
             }
         }
     }
+}
+
+/// Trim each `--denied-method-prefixes` entry and drop the empty ones, so an
+/// empty value allows every method rather than denying all of them (every name
+/// starts with the empty prefix) and `tn_, debug_` still denies `debug_`.
+fn resolve_denied_method_prefixes(prefixes: Vec<String>) -> Vec<String> {
+    prefixes
+        .into_iter()
+        .map(|prefix| prefix.trim().to_owned())
+        .filter(|prefix| !prefix.is_empty())
+        .collect()
 }
 
 /// Turn a duration flag into `Some(duration)`, or `None` when zero (the
@@ -736,6 +772,20 @@ mod tests {
     #[test]
     fn no_query_redirect_by_default() -> eyre::Result<()> {
         assert_eq!(cli_with_flags(&[]).into_settings()?.query_upstream, None);
+        Ok(())
+    }
+
+    #[test]
+    fn denied_method_prefixes_default_trim_and_empty() -> eyre::Result<()> {
+        let default = cli_with_flags(&[]).into_settings()?.denied_method_prefixes;
+        assert_eq!(default, ["tn_", "debug_", "trace_", "admin_"]);
+        let trimmed = cli_with_flags(&["--denied-method-prefixes=tn_, debug_ ,,"])
+            .into_settings()?
+            .denied_method_prefixes;
+        assert_eq!(trimmed, ["tn_", "debug_"]);
+        let empty =
+            cli_with_flags(&["--denied-method-prefixes="]).into_settings()?.denied_method_prefixes;
+        assert!(empty.is_empty(), "an empty value must allow everything: {empty:?}");
         Ok(())
     }
 
