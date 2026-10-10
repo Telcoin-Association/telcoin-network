@@ -7,7 +7,7 @@ license.workspace = true
 homepage.workspace = true
 repository.workspace = true
 authors.workspace = true
-description = "Stateless reverse proxy in front of Telcoin Network worker JSON-RPC."
+description = "Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC."
 
 [[bin]]
 name = "worker-gateway"
@@ -28,7 +28,7 @@ tokio = { workspace = true, features = [
     "io-util",
 ] }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std"] }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt", "ansi", "std", "json"] }
 
 # http server + client
 axum = { workspace = true, features = ["json", "tokio", "http1"] }
@@ -46,11 +46,11 @@ metrics = { workspace = true }
 # config + serde
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 url = { workspace = true }
 humantime = { workspace = true }
 
 # telcoin
-tn-config = { workspace = true }
 tn-metrics = { workspace = true }
 tn-types = { workspace = true }
 

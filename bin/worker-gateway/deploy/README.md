@@ -19,9 +19,12 @@ A Grafana dashboard for the metrics these expose lives at
 
 ## Placeholders to replace
 
-- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:latest` is a local
-  build tag. Point it at your registry, e.g.
-  `registry.example.com/telcoin/worker-gateway:<tag>`.
+- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:<tag>` is a
+  placeholder for a local build tag. Point it at your registry with a versioned
+  tag, e.g. `registry.example.com/telcoin/worker-gateway:<tag>`, and pin it by
+  digest (`...:<tag>@sha256:<digest>`) so every replica runs the same build;
+  `docker buildx imagetools inspect <ref>:<tag>` prints the digest after a push.
+  Do not deploy `:latest`.
 - **Upstream worker endpoints** (`deployment.yaml`):
   `WORKER_GATEWAY_UPSTREAM_RPC_URL` and `WORKER_GATEWAY_UPSTREAM_READINESS_URL`
   are placeholders pointing at an in-cluster worker Service DNS name. Replace
@@ -145,7 +148,8 @@ spec:
       app: worker-gateway
   policyTypes: [Ingress]
   ingress:
-    # allow client RPC from anywhere in-cluster
+    # allow client RPC from any source: a rule without `from` admits every
+    # peer that can reach the pod, inside or outside the cluster
     - ports:
         - port: 8545
     # restrict metrics to the monitoring namespace only

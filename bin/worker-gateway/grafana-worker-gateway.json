@@ -25,7 +25,7 @@
       "title": "Request rate by outcome",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -37,7 +37,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total[5m]))",
           "refId": "A",
@@ -60,7 +60,7 @@
       "title": "In-flight requests (autoscaling signal)",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -72,7 +72,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "tn_worker_gateway_inflight_requests",
           "refId": "A",
@@ -107,7 +107,7 @@
       "title": "Rejections by reason",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -119,7 +119,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total[5m]))",
           "refId": "A",
@@ -148,7 +148,7 @@
       "title": "Reject ratio",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -160,7 +160,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
           "refId": "A",
@@ -203,7 +203,7 @@
       "title": "Request duration p50/p90/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -215,7 +215,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "A",
@@ -224,7 +224,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "B",
@@ -233,7 +233,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "C",
@@ -248,7 +248,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram."
+      "description": "Proxied-request latency quantiles from the request duration histogram, timed from the buffered request body to the upstream's response head (or the gateway's own error). Not end-to-end: the body read, the streamed response body and rate-limited requests are left out."
     },
     {
       "id": 9,
@@ -268,7 +268,7 @@
       "title": "Upstream readiness",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -280,7 +280,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "tn_worker_gateway_upstream_ready",
           "refId": "A",
@@ -316,7 +316,7 @@
       "title": "CPU",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -328,7 +328,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "rate(reth_process_cpu_seconds_total[5m])",
           "refId": "A",
@@ -351,7 +351,7 @@
       "title": "Resident memory",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -363,7 +363,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "reth_process_resident_memory_bytes",
           "refId": "A",
@@ -388,7 +388,22 @@
     "worker-gateway"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false
+      }
+    ]
   },
   "time": {
     "from": "now-1h",
