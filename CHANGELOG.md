@@ -1,0 +1,1612 @@
+# Changelog
+
+Generated from commit messages by git-cliff when a release is cut (`make release-prep`); sections are never edited by hand.
+
+<!-- ANCHOR: releases -->
+## [v0.16.0-adiri] - 2026-10-08
+### Features
+- **rpc**: Make tn selectable and document every namespace ([#1593](https://github.com/Telcoin-Association/telcoin-network/pull/1593))
+- **network**: Probe every eligible sync peer and prefer the last one that served ([#1574](https://github.com/Telcoin-Association/telcoin-network/pull/1574))
+- **network**: Add validated handshake start accounting ([#1447](https://github.com/Telcoin-Association/telcoin-network/pull/1447))
+### Bug fixes
+- **state-sync**: Re-queue given-up epoch packs without waiting and queue each epoch at most once ([#1577](https://github.com/Telcoin-Association/telcoin-network/pull/1577))
+- **storage**: Prune committed batches from the batch cache and count write failures ([#1524](https://github.com/Telcoin-Association/telcoin-network/pull/1524))
+- **storage**: Log restart stalls and test crash recovery across a reopen ([#1521](https://github.com/Telcoin-Association/telcoin-network/pull/1521))
+- **network**: Use is_none_or in the record TTL refresh check
+- **primary**: Keep vote collection when the same header is re-sent ([#1579](https://github.com/Telcoin-Association/telcoin-network/pull/1579))
+- **primary**: Backpressure consensus_output with a bounded que channel ([#1575](https://github.com/Telcoin-Association/telcoin-network/pull/1575))
+- **storage**: Treat an out-of-range final header as an incomplete epoch ([#1576](https://github.com/Telcoin-Association/telcoin-network/pull/1576))
+- **network**: Retrieve current peer records on reconnect ([#1499](https://github.com/Telcoin-Association/telcoin-network/pull/1499))
+- **node**: Expose recoverable readiness for every network swarm ([#1492](https://github.com/Telcoin-Association/telcoin-network/pull/1492))
+- Observer catch-up on adiri (backpressured sync_output, local replay, fresh-node anchor) ([#1561](https://github.com/Telcoin-Association/telcoin-network/pull/1561))
+- **tn-reth**: Use epoch fees for tip simulations ([#1458](https://github.com/Telcoin-Association/telcoin-network/pull/1458))
+- **node**: Report epoch-aware readiness for all workers ([#1426](https://github.com/Telcoin-Association/telcoin-network/pull/1426))
+- **node**: Use a read lock when starting batch builders ([#1429](https://github.com/Telcoin-Association/telcoin-network/pull/1429))
+- **node**: Stop inactive committee members from sealing unreportable batches ([#1523](https://github.com/Telcoin-Association/telcoin-network/pull/1523))
+- **worker**: Record batch metrics only after the primary accepts the report ([#1520](https://github.com/Telcoin-Association/telcoin-network/pull/1520))
+- **node**: Tolerate peerless worker lanes at epoch startup ([#1424](https://github.com/Telcoin-Association/telcoin-network/pull/1424))
+- **node**: Recover orphaned batches across worker-count changes ([#1423](https://github.com/Telcoin-Association/telcoin-network/pull/1423))
+- **node**: Deactivate removed worker RPC servers ([#1422](https://github.com/Telcoin-Association/telcoin-network/pull/1422))
+- **batch-builder**: Evict transactions exceeding batch limits ([#1412](https://github.com/Telcoin-Association/telcoin-network/pull/1412))
+- **tn-reth**: Reject RPC state below restored snapshots ([#1457](https://github.com/Telcoin-Association/telcoin-network/pull/1457))
+- **node**: Bind worker 0 RPC before startup synchronization ([#1419](https://github.com/Telcoin-Association/telcoin-network/pull/1419))
+- **keytool**: Configure RPC endpoints for all workers ([#1428](https://github.com/Telcoin-Association/telcoin-network/pull/1428))
+- **types**: Declare test utility dependency features ([#1413](https://github.com/Telcoin-Association/telcoin-network/pull/1413))
+### Performance
+- **network**: Profile QUIC key exchange and retain provider defaults ([#1451](https://github.com/Telcoin-Association/telcoin-network/pull/1451))
+### Refactoring
+- **node**: Build RPC node info per worker ([#1430](https://github.com/Telcoin-Association/telcoin-network/pull/1430))
+- **cli**: Remove deprecated observer flag ([#1417](https://github.com/Telcoin-Association/telcoin-network/pull/1417))
+### Documentation
+- **network**: Record early identity refusal decision ([#1450](https://github.com/Telcoin-Association/telcoin-network/pull/1450))
+- Define carried transport patch maintenance ([#1446](https://github.com/Telcoin-Association/telcoin-network/pull/1446))
+- **tn-reth**: Explain epoch base fee update ordering ([#1425](https://github.com/Telcoin-Association/telcoin-network/pull/1425))
+- Evidence-based hardware requirements for validators and observers ([#1441](https://github.com/Telcoin-Association/telcoin-network/pull/1441))
+### Tests
+- **node**: Shorten cold-genesis peer readiness waits ([#1491](https://github.com/Telcoin-Association/telcoin-network/pull/1491))
+- **e2e**: Drop the removed --observer flag from the second-worker observer test ([#1525](https://github.com/Telcoin-Association/telcoin-network/pull/1525))
+- Cover multi-worker isolation and execution ([#1421](https://github.com/Telcoin-Association/telcoin-network/pull/1421))
+- Make fork fixtures reproducible ([#1414](https://github.com/Telcoin-Association/telcoin-network/pull/1414))
+### Build, CI and chores
+- Re-pin the QUIC handshake profile and make pin drift block merges ([#1582](https://github.com/Telcoin-Association/telcoin-network/pull/1582))
+- Qualify carried QUIC patch maintenance ([#1462](https://github.com/Telcoin-Association/telcoin-network/pull/1462))
+- Harden the attestation gate, pin actions by SHA, move rust-cache to v2.9.2 ([#1461](https://github.com/Telcoin-Association/telcoin-network/pull/1461))
+- Restore warmed Rust caches and skip nested submodules ([#1445](https://github.com/Telcoin-Association/telcoin-network/pull/1445))
+### Batched merges
+- Staging/mavenrain 2026 10 07 ([#1621](https://github.com/Telcoin-Association/telcoin-network/pull/1621))
+  - fix(node): expose recoverable readiness for every network swarm ([#1492](https://github.com/Telcoin-Association/telcoin-network/pull/1492))
+  - fix(network-libp2p): account for inbound listen failures ([#1494](https://github.com/Telcoin-Association/telcoin-network/pull/1494))
+  - fix(network): scope peer scoring to network instances ([#1498](https://github.com/Telcoin-Association/telcoin-network/pull/1498))
+  - test(node): cover multi-worker shrink and CVV startup ([#1427](https://github.com/Telcoin-Association/telcoin-network/pull/1427))
+  - ci: complete QUIC Retry and release qualification coverage ([#1449](https://github.com/Telcoin-Association/telcoin-network/pull/1449))
+  - fix(network): retrieve current peer records on reconnect ([#1499](https://github.com/Telcoin-Association/telcoin-network/pull/1499))
+- Staging/mavenrain 2026 10 06 ([#1592](https://github.com/Telcoin-Association/telcoin-network/pull/1592))
+  - fix(network-libp2p): account for inbound listen failures ([#1494](https://github.com/Telcoin-Association/telcoin-network/pull/1494))
+  - fix(network): scope peer scoring to network instances ([#1498](https://github.com/Telcoin-Association/telcoin-network/pull/1498))
+  - test(node): cover multi-worker shrink and CVV startup ([#1427](https://github.com/Telcoin-Association/telcoin-network/pull/1427))
+  - ci: complete QUIC Retry and release qualification coverage ([#1449](https://github.com/Telcoin-Association/telcoin-network/pull/1449))
+  - fix(network): release empty connection-limit peer entries ([#1496](https://github.com/Telcoin-Association/telcoin-network/pull/1496))
+  - feat(network): separate listen and advertised endpoints ([#1500](https://github.com/Telcoin-Association/telcoin-network/pull/1500))
+### Merged from private forks
+- Merge commit from fork
+  - fix(types): reject committees with fewer than two authorities on decode
+  - test(storage): reject single-authority committee meta on stream import
+  - fix(node): report the committee file decode error at startup
+- Merge commit from fork
+  - Reopening an epoch pack compared the whole on-disk epoch meta with the chain-derived one, committee included.
+- Merge commit from fork
+  - fix(network-libp2p): bound pending inbound connections per swarm
+  - fix(network-libp2p): make pending inbound cap a memory-only bound
+- Merge commit from fork
+  - test(network): add QUIC ingress qualification tooling
+  - test(network): address QUIC qualification review feedback
+- Merge commit from fork
+  - test(network-libp2p): measure QUIC accept-lock contention (GHSA-5pxp)
+  - test(network-libp2p): address contention harness review
+- Merge commit from fork
+  - Carry a small patch on libp2p-quic 0.14.0 so that the listener answers
+- Merge commit from fork
+  - The swarm stream spends no tokio coop budget. Since tokio 1.44 the
+### Other
+- Operator docs backlog ([#1573](https://github.com/Telcoin-Association/telcoin-network/pull/1573))
+- Implements an mmap backend for pack files and benches against direct IO. ([#1269](https://github.com/Telcoin-Association/telcoin-network/pull/1269))
+- Harden subsecond block times ([#1533](https://github.com/Telcoin-Association/telcoin-network/pull/1533))
+- Updated test harness for certifier tests ([#662](https://github.com/Telcoin-Association/telcoin-network/pull/662))
+- Sub-second consensus timestamps with a seconds-granularity EVM ([#1453](https://github.com/Telcoin-Association/telcoin-network/pull/1453))
+- Keep cold-genesis validators alive without peers ([#1418](https://github.com/Telcoin-Association/telcoin-network/pull/1418))
+- Node record discovery ([#1416](https://github.com/Telcoin-Association/telcoin-network/pull/1416))
+
+## [v0.15.0-adiri] - 2026-09-23
+### Features
+- **node**: Start all committee workers each epoch ([#1390](https://github.com/Telcoin-Association/telcoin-network/pull/1390))
+- **network**: Configure bootstrap peers via YAML and CLI ([#1364](https://github.com/Telcoin-Association/telcoin-network/pull/1364))
+- **node,config,network-libp2p**: Per-worker network swarms (#555, PR 2) ([#1315](https://github.com/Telcoin-Association/telcoin-network/pull/1315))
+- **engine**: Flag cross-producer transaction re-packing during execution ([#1259](https://github.com/Telcoin-Association/telcoin-network/pull/1259)) ([#1268](https://github.com/Telcoin-Association/telcoin-network/pull/1268))
+- **tn-reth**: Draw epoch-close committees region-aware behind a fork gate ([#1279](https://github.com/Telcoin-Association/telcoin-network/pull/1279)) ([#1294](https://github.com/Telcoin-Association/telcoin-network/pull/1294))
+- **consensus,config,network-types**: Per-worker LocalNetwork seam (#556, PR 3) ([#1267](https://github.com/Telcoin-Association/telcoin-network/pull/1267))
+- **config,types**: Multi-worker configuration foundation (#554, PR 1) ([#1219](https://github.com/Telcoin-Association/telcoin-network/pull/1219))
+### Bug fixes
+- **txpool**: Move canonical update preparation off async threads ([#1386](https://github.com/Telcoin-Association/telcoin-network/pull/1386))
+- **network-libp2p**: Derive KadStore::node_key from raw BLS key bytes ([#1331](https://github.com/Telcoin-Association/telcoin-network/pull/1331)) ([#1368](https://github.com/Telcoin-Association/telcoin-network/pull/1368))
+- **tn-reth**: Retry forwards after missing inclusion ([#1372](https://github.com/Telcoin-Association/telcoin-network/pull/1372))
+- **node**: Validate primary key and correct worker listener identity ([#1392](https://github.com/Telcoin-Association/telcoin-network/pull/1392))
+- **node**: Sync epoch records before the first epoch ([#1387](https://github.com/Telcoin-Association/telcoin-network/pull/1387))
+- **node**: Derive node role from committee membership ([#1385](https://github.com/Telcoin-Association/telcoin-network/pull/1385))
+- **network**: Refresh published node records ([#1371](https://github.com/Telcoin-Association/telcoin-network/pull/1371))
+- **tn-reth**: Propagate RPC transaction pool batch size ([#1370](https://github.com/Telcoin-Association/telcoin-network/pull/1370))
+- **tn-reth**: Honor transaction pool limits and lifetime ([#1345](https://github.com/Telcoin-Association/telcoin-network/pull/1345))
+- **network-libp2p**: Late-joining nodes never learn committee JSON-RPC endpoints ([#1389](https://github.com/Telcoin-Association/telcoin-network/pull/1389))
+- **txpool**: Offload batch builds and canonical updates ([#1344](https://github.com/Telcoin-Association/telcoin-network/pull/1344))
+- **network**: Wait for established peers during epoch startup ([#1361](https://github.com/Telcoin-Association/telcoin-network/pull/1361))
+- **node**: Start epoch pack workers before filling request queue ([#1363](https://github.com/Telcoin-Association/telcoin-network/pull/1363))
+- **node**: Add opt-in epoch export retention ([#1346](https://github.com/Telcoin-Association/telcoin-network/pull/1346)) ([#1347](https://github.com/Telcoin-Association/telcoin-network/pull/1347))
+- **node**: Seed startup mode from epoch records ([#1362](https://github.com/Telcoin-Association/telcoin-network/pull/1362))
+- **batch-builder**: Defer transactions already packed by a peer batch ([#1329](https://github.com/Telcoin-Association/telcoin-network/pull/1329)) ([#1330](https://github.com/Telcoin-Association/telcoin-network/pull/1330))
+- **network**: Split kad PutRecord shed threshold from the penalty threshold ([#1289](https://github.com/Telcoin-Association/telcoin-network/pull/1289)) ([#1299](https://github.com/Telcoin-Association/telcoin-network/pull/1299))
+- **node**: Validate per-worker network keys and addresses ([#1343](https://github.com/Telcoin-Association/telcoin-network/pull/1343))
+- **node**: Keep bootstrap servers out of epoch committees ([#1359](https://github.com/Telcoin-Association/telcoin-network/pull/1359))
+- **network**: Sweep expired per-source rate windows at heartbeat ([#1290](https://github.com/Telcoin-Association/telcoin-network/pull/1290)) ([#1300](https://github.com/Telcoin-Association/telcoin-network/pull/1300))
+- **node**: Tolerate governance worker-count changes at epoch entry ([#1342](https://github.com/Telcoin-Association/telcoin-network/pull/1342))
+- **tn-reth**: Re-arm the residual dirty-sender reload between canonical notifications ([#1316](https://github.com/Telcoin-Association/telcoin-network/pull/1316))
+- **batch-builder**: Skip empty batch proposals ([#1341](https://github.com/Telcoin-Association/telcoin-network/pull/1341))
+- **tn-reth**: Price blsVerify on the raw calldata length before the decode ([#1332](https://github.com/Telcoin-Association/telcoin-network/pull/1332)) ([#1333](https://github.com/Telcoin-Association/telcoin-network/pull/1333))
+- **metrics**: Count inbound sync stream shedding by reason ([#1307](https://github.com/Telcoin-Association/telcoin-network/pull/1307)) ([#1317](https://github.com/Telcoin-Association/telcoin-network/pull/1317))
+- **tn-reth**: Floor snapshot-scaffold heights out of the canonical execution check ([#1325](https://github.com/Telcoin-Association/telcoin-network/pull/1325))
+- **node**: Stop the restore-time RecentBlocks scan at the real-header floor ([#1324](https://github.com/Telcoin-Association/telcoin-network/pull/1324))
+- **prevrandao**: Bring the seed fork up to its siblings' rollout scaffolding ([#1319](https://github.com/Telcoin-Association/telcoin-network/pull/1319))
+- **primary**: Bound the shed-task fan-out for denied inbound sync streams ([#1308](https://github.com/Telcoin-Association/telcoin-network/pull/1308)) ([#1318](https://github.com/Telcoin-Association/telcoin-network/pull/1318))
+- **tn-reth**: Quote and fill RPC fee fields from the epoch base fee (#1305, #1313) ([#1312](https://github.com/Telcoin-Association/telcoin-network/pull/1312))
+- **tn-reth**: Derive per-worker RPC/IPC endpoints in start_rpc ([#1287](https://github.com/Telcoin-Association/telcoin-network/pull/1287)) ([#1298](https://github.com/Telcoin-Association/telcoin-network/pull/1298))
+- **tn-reth**: Reject value-bearing calls to the BLS precompile ([#1286](https://github.com/Telcoin-Association/telcoin-network/pull/1286)) ([#1297](https://github.com/Telcoin-Association/telcoin-network/pull/1297))
+- **primary**: Key intra-round commit order on the leader digest behind a fork gate ([#1260](https://github.com/Telcoin-Association/telcoin-network/pull/1260)) ([#1270](https://github.com/Telcoin-Association/telcoin-network/pull/1270))
+- Resolve eth_feeHistory base fee per query instead of pinning a container clone ([#1295](https://github.com/Telcoin-Association/telcoin-network/pull/1295))
+- **tn-reth**: Shuffle the forward fallback dial order per forward ([#1277](https://github.com/Telcoin-Association/telcoin-network/pull/1277)) ([#1291](https://github.com/Telcoin-Association/telcoin-network/pull/1291))
+- **tn-reth**: Splice tmp-chain deployed code into genesis to keep EIP712 immutables ([#1278](https://github.com/Telcoin-Association/telcoin-network/pull/1278)) ([#1288](https://github.com/Telcoin-Association/telcoin-network/pull/1288))
+- **tn-reth**: Cap forwarder RPC response reads and clamp remote reasons ([#1275](https://github.com/Telcoin-Association/telcoin-network/pull/1275)) ([#1280](https://github.com/Telcoin-Association/telcoin-network/pull/1280))
+- **tn-reth**: Label the skipped-invalid-transaction metric by error kind ([#1284](https://github.com/Telcoin-Association/telcoin-network/pull/1284)) ([#1296](https://github.com/Telcoin-Association/telcoin-network/pull/1296))
+- **tn-reth**: Pass the base fee container in the IPC transport test ([#1326](https://github.com/Telcoin-Association/telcoin-network/pull/1326))
+- Source worker pool base fee from the per-worker container ([#1273](https://github.com/Telcoin-Association/telcoin-network/pull/1273))
+- **engine**: Drop the cumulative trie overlay from built blocks ([#1266](https://github.com/Telcoin-Association/telcoin-network/pull/1266)) ([#1276](https://github.com/Telcoin-Association/telcoin-network/pull/1276))
+- **engine**: Credit batch priority fees to the producer beneficiary ([#1222](https://github.com/Telcoin-Association/telcoin-network/pull/1222)) ([#1224](https://github.com/Telcoin-Association/telcoin-network/pull/1224))
+- **worker**: Bound the shed-task fan-out for denied inbound sync streams ([#1254](https://github.com/Telcoin-Association/telcoin-network/pull/1254)) ([#1265](https://github.com/Telcoin-Association/telcoin-network/pull/1265))
+- **batch-builder**: Size batches by encoded bytes, not InMemorySize ([#1255](https://github.com/Telcoin-Association/telcoin-network/pull/1255))
+- **network**: Bound discovery inserts at max_discovery_peers ([#1252](https://github.com/Telcoin-Association/telcoin-network/pull/1252)) ([#1261](https://github.com/Telcoin-Association/telcoin-network/pull/1261))
+- **network**: Bound peer-exchange discovery sampling to the missing target ([#1253](https://github.com/Telcoin-Association/telcoin-network/pull/1253)) ([#1258](https://github.com/Telcoin-Association/telcoin-network/pull/1258))
+- **engine**: Derive PREVRANDAO from the epoch seed chain behind a fork gate ([#1247](https://github.com/Telcoin-Association/telcoin-network/pull/1247)) ([#1249](https://github.com/Telcoin-Association/telcoin-network/pull/1249))
+- **primary**: Bound the unreadable-frame sync bail close with a timeout ([#1250](https://github.com/Telcoin-Association/telcoin-network/pull/1250)) ([#1257](https://github.com/Telcoin-Association/telcoin-network/pull/1257))
+- **network**: Cap a peer's observed connection IP set ([#1251](https://github.com/Telcoin-Association/telcoin-network/pull/1251)) ([#1256](https://github.com/Telcoin-Association/telcoin-network/pull/1256))
+- **tn-reth**: Run reth's storage consistency check at startup ([#1238](https://github.com/Telcoin-Association/telcoin-network/pull/1238)) ([#1246](https://github.com/Telcoin-Association/telcoin-network/pull/1246))
+- **tn-reth**: Detect canon-state broadcast lag in pool maintenance and resync drifted senders ([#1243](https://github.com/Telcoin-Association/telcoin-network/pull/1243))
+- **storage**: Fail open_append on an unreadable first pack record ([#1226](https://github.com/Telcoin-Association/telcoin-network/pull/1226))
+- **tn-reth**: Default the RPC pending block kind to none ([#1231](https://github.com/Telcoin-Association/telcoin-network/pull/1231)) ([#1237](https://github.com/Telcoin-Association/telcoin-network/pull/1237))
+- **tn-reth**: Pass the base-fee argument in the eth_syncing rpc test ([#1283](https://github.com/Telcoin-Association/telcoin-network/pull/1283)) ([#1285](https://github.com/Telcoin-Association/telcoin-network/pull/1285))
+- **engine**: Log skipped duplicate transactions at debug with the tx hash ([#1263](https://github.com/Telcoin-Association/telcoin-network/pull/1263)) ([#1274](https://github.com/Telcoin-Association/telcoin-network/pull/1274))
+- **cli**: Reject --instance 0 at parse time ([#1233](https://github.com/Telcoin-Association/telcoin-network/pull/1233)) ([#1234](https://github.com/Telcoin-Association/telcoin-network/pull/1234))
+- **tn-reth**: Answer eth_syncing from consensus catch-up state ([#1231](https://github.com/Telcoin-Association/telcoin-network/pull/1231)) ([#1232](https://github.com/Telcoin-Association/telcoin-network/pull/1232))
+- **network**: Cap a kad provider record's address list ([#1221](https://github.com/Telcoin-Association/telcoin-network/pull/1221))
+- **tn-reth**: Serve eth_feeHistory's next-block base fee from the epoch schedule ([#1231](https://github.com/Telcoin-Association/telcoin-network/pull/1231)) ([#1235](https://github.com/Telcoin-Association/telcoin-network/pull/1235))
+- **tn-reth**: Gate blsVerify on the O(1) gas floor before decoding calldata ([#1215](https://github.com/Telcoin-Association/telcoin-network/pull/1215))
+- **tn-reth**: Refuse DELEGATECALL/CALLCODE frames in the TEL precompile dispatcher ([#1214](https://github.com/Telcoin-Association/telcoin-network/pull/1214))
+- **network**: Gate kad provider capacity check on new keys only ([#1202](https://github.com/Telcoin-Association/telcoin-network/pull/1202))
+- **snapshot**: Enforce the BLOCKHASH lookback floor on restore windows and packs ([#1181](https://github.com/Telcoin-Association/telcoin-network/pull/1181))
+- Enforce --rpc.txfeecap on RPC transaction submission ([#1176](https://github.com/Telcoin-Association/telcoin-network/pull/1176))
+- **tn-reth**: Hold a forwarded tx rejection until a second validator confirms it ([#1175](https://github.com/Telcoin-Association/telcoin-network/pull/1175))
+- **tn-reth**: Enforce payability in the TEL precompile dispatcher ([#1201](https://github.com/Telcoin-Association/telcoin-network/pull/1201))
+- **tn-reth**: Pin the blob gas price in evm_env to match block execution ([#1208](https://github.com/Telcoin-Association/telcoin-network/pull/1208))
+- **batch-builder**: Carry real sender balance in optimistic pool update ([#1170](https://github.com/Telcoin-Association/telcoin-network/pull/1170))
+- **worker**: Close the observer transaction loss residuals behind forward admission ([#1153](https://github.com/Telcoin-Association/telcoin-network/pull/1153))
+- **tn-reth**: Use saturating_sub for unused_gas in calculate_gas_penalty ([#1184](https://github.com/Telcoin-Association/telcoin-network/pull/1184))
+- **network-libp2p**: Cap per-entry multiaddrs on discovery ingest ([#1194](https://github.com/Telcoin-Association/telcoin-network/pull/1194))
+### Performance
+- **engine**: Compact cumulative trie overlays geometrically ([#1382](https://github.com/Telcoin-Association/telcoin-network/pull/1382))
+- **batch-builder**: Reuse pending count for build gate ([#1391](https://github.com/Telcoin-Association/telcoin-network/pull/1391))
+- **batch-builder**: Read sender balances through one state provider ([#1303](https://github.com/Telcoin-Association/telcoin-network/pull/1303)) ([#1306](https://github.com/Telcoin-Association/telcoin-network/pull/1306))
+### Refactoring
+- **node**: Hoist network bring-up before the epoch loop ([#1360](https://github.com/Telcoin-Association/telcoin-network/pull/1360))
+- Remove validator regions and the region-shuffle fork gate ([#1328](https://github.com/Telcoin-Association/telcoin-network/pull/1328))
+- **worker**: Extract shed_sync_stream generic over the stream ([#1314](https://github.com/Telcoin-Association/telcoin-network/pull/1314)) ([#1322](https://github.com/Telcoin-Association/telcoin-network/pull/1322))
+### Documentation
+- **evm**: Document and surface the gas over-reservation penalty ([#1186](https://github.com/Telcoin-Association/telcoin-network/pull/1186))
+### Tests
+- **e2e**: Align eject_restart with intended ejection semantics ([#1271](https://github.com/Telcoin-Association/telcoin-network/pull/1271))
+- **e2e**: Deflake future-committee seating budget accounting ([#1204](https://github.com/Telcoin-Association/telcoin-network/pull/1204))
+### Build, CI and chores
+- Build(deps): bump quinn-proto from 0.11.14 to 0.11.18 ([#1393](https://github.com/Telcoin-Association/telcoin-network/pull/1393))
+- **deps**: Bump libp2p-quic from 0.13.0 to 0.13.1 ([#1394](https://github.com/Telcoin-Association/telcoin-network/pull/1394))
+- Run the PR checks on merge_group so main can use a merge queue ([#1293](https://github.com/Telcoin-Association/telcoin-network/pull/1293))
+### Merged from private forks
+- Merge commit from fork
+  - No commit description; see [b872ee815](https://github.com/Telcoin-Association/telcoin-network/commit/b872ee815d0f0a817aa2cfbde611488667d29380)
+- Merge commit from fork
+  - fix(network): decouple KAD identity confirmation from storage
+  - fix(network): confirm peers before Kademlia store writes
+- Merge commit from fork
+  - fix(network): rate-limit inbound kad AddProvider and throttle provider eviction scan
+  - fix(network): preserve KAD rate limits across reconnects
+- Merge commit from fork
+  - fix(types): redact the private key in BlsKeypair's Debug output
+  - test(types,config): strengthen the Debug-redaction regression tests
+- Merge commit from fork
+  - fix(config): zeroize transient BLS key material in the wrap/unwrap path
+  - fix(config): close the remaining key-material cleanup gaps from review
+- Merge commit from fork
+  - fix(types): bound roaring bitmap container count at deserialization
+  - refactor(types,primary): share one roaring header parser across crates
+  - fix(tn-reth): pass the base-fee container in the IPC transport test
+- Merge commit from fork
+  - fix(reth): drop debug and trace from what `--http.api all` enables
+  - fix(reth): apply review findings to the RPC module allowlist
+- Merge commit from fork
+  - fix(gateway): read the raw-transaction screen's fields without a full parse
+  - fix(gateway): skip the id during screening; recover it only on rejection
+- Merge commit from fork
+  - fix(config): create BLS key files and node-keys dir owner-only
+  - fix(config): close the review gaps in the owner-only key permissions
+- Merge commit from fork
+  - A `NodeRecord` signature currently covers only the advertised `NetworkInfo`
+- Merge commit from fork
+  - Every inbound kad `PutRecord` ran a BLS signature verify and, for a newer
+- Merge commit from fork
+  - `read_sync_batches` bounds each response frame with `BATCH_STREAM_TIMEOUT`
+### Other
+- Arm adiri forks ([#1442](https://github.com/Telcoin-Association/telcoin-network/pull/1442))
+- Migrate adiri's Safe stack to the canonical v1.4.1 suite at a fork boundary ([#1410](https://github.com/Telcoin-Association/telcoin-network/pull/1410))
+- Update to libp2p v0.57.0 ([#1408](https://github.com/Telcoin-Association/telcoin-network/pull/1408))
+- Update network docs ([#1369](https://github.com/Telcoin-Association/telcoin-network/pull/1369))
+- Update docs, tests, and tools for prevrandao adiri fork ([#1311](https://github.com/Telcoin-Association/telcoin-network/pull/1311))
+- Refactor the epoch vote certifier code. ([#1309](https://github.com/Telcoin-Association/telcoin-network/pull/1309))
+- TEL precompile follow-ups: event mirror, harness fidelity, rejection gas ([#1240](https://github.com/Telcoin-Association/telcoin-network/pull/1240))
+- Refactor the epoch vote certification code. ([#1230](https://github.com/Telcoin-Association/telcoin-network/pull/1230))
+- Surface ConsensusRegistry logs from epoch-boundary system calls ([#1220](https://github.com/Telcoin-Association/telcoin-network/pull/1220))
+- Tn docs ([#1241](https://github.com/Telcoin-Association/telcoin-network/pull/1241))
+- Tighten epoch vote gossip to only allow votes for expected EpochRecords. ([#1217](https://github.com/Telcoin-Association/telcoin-network/pull/1217))
+- Added some comparative benchmarks for cache DB backends. ([#1142](https://github.com/Telcoin-Association/telcoin-network/pull/1142))
+- Don't verify the parent hash for consensus block 1- no need and its subject to change. ([#1207](https://github.com/Telcoin-Association/telcoin-network/pull/1207))
+
+## [v0.14.0-adiri] - 2026-08-19
+### Bug fixes
+- **storage**: Enforce STORAGE_CHUNK_SLOTS on read and write paths ([#1192](https://github.com/Telcoin-Association/telcoin-network/pull/1192))
+- **tn-reth**: Rotate the observer forward fallback dial order ([#1180](https://github.com/Telcoin-Association/telcoin-network/pull/1180))
+- **tn-reth**: Seed reth's process-global RPC defaults and disable IPC for temp chains ([#1172](https://github.com/Telcoin-Association/telcoin-network/pull/1172))
+- **tn-reth**: Try the next validator on node-local -32000 refusals ([#1171](https://github.com/Telcoin-Association/telcoin-network/pull/1171))
+- **node**: Re-vote stored-but-uncertified epoch record on startup ([#1203](https://github.com/Telcoin-Association/telcoin-network/pull/1203))
+- **tn-reth**: Reject blob and set-code txns at pool admission ([#1159](https://github.com/Telcoin-Association/telcoin-network/pull/1159)) ([#1169](https://github.com/Telcoin-Association/telcoin-network/pull/1169))
+- **storage**: Sync the write-behind remove in test_remove before the read-back ([#1200](https://github.com/Telcoin-Association/telcoin-network/pull/1200))
+- **storage**: Latch the first background write failure, not the last ([#1150](https://github.com/Telcoin-Association/telcoin-network/pull/1150))
+- **metrics**: Count transaction forwarding drops by reason ([#1146](https://github.com/Telcoin-Association/telcoin-network/pull/1146))
+### Tests
+- **storage**: Add TN_TEST_MDBX_SYNC runtime override and scheduled Durable e2e lane ([#1152](https://github.com/Telcoin-Association/telcoin-network/pull/1152))
+- **e2e**: Cut eject restart test runtime by about 36% ([#1151](https://github.com/Telcoin-Association/telcoin-network/pull/1151))
+### Build, CI and chores
+- **submodule**: Bump tn-contracts to 0fb6b01 and regenerate mainnet chain-configs ([#1206](https://github.com/Telcoin-Association/telcoin-network/pull/1206))
+### Other
+- Arm consensus registry fork 407 ([#1157](https://github.com/Telcoin-Association/telcoin-network/pull/1157))
+- Add a test to codify and confirm that network events are not lost between epochs. ([#1216](https://github.com/Telcoin-Association/telcoin-network/pull/1216))
+- Close a race in the basefee restart e2e test. ([#1209](https://github.com/Telcoin-Association/telcoin-network/pull/1209))
+- Do not require certification for an epoch record when starting a new epoch. ([#1196](https://github.com/Telcoin-Association/telcoin-network/pull/1196))
+
+## [v0.13.0-adiri] - 2026-08-12
+### Features
+- **types**: Set SEED_SIGNATURE_FORK_EPOCH to 380 for adiri ([#1118](https://github.com/Telcoin-Association/telcoin-network/pull/1118))
+- **worker**: Surface a stalled batch fetch with a rate-limited warning ([#1035](https://github.com/Telcoin-Association/telcoin-network/pull/1035))
+- **worker-gateway**: Observability and deployment ([#712](https://github.com/Telcoin-Association/telcoin-network/pull/712)) ([#972](https://github.com/Telcoin-Association/telcoin-network/pull/972))
+- **network**: Delete frozen legacy request-response variants, bump req-res to /0.0.2 (739) ([#970](https://github.com/Telcoin-Association/telcoin-network/pull/970))
+- **network**: Freeze and delete the legacy /tn-stream bulk path (739, step 9c) ([#939](https://github.com/Telcoin-Association/telcoin-network/pull/939))
+- **worker-gateway**: Edge protections (rate/size limits, tx screening) ([#712](https://github.com/Telcoin-Association/telcoin-network/pull/712)) ([#908](https://github.com/Telcoin-Association/telcoin-network/pull/908))
+- **network**: Cut the primary partial epoch-pack path over to the typed sync protocol with legacy fallback (739) ([#884](https://github.com/Telcoin-Association/telcoin-network/pull/884))
+- **tn-reth**: Expand RethEnv read API for ExEx consumers ([#850](https://github.com/Telcoin-Association/telcoin-network/pull/850))
+- **network**: Move the goodbye exchange to a dedicated peer-exchange protocol (739, step 8) ([#825](https://github.com/Telcoin-Association/telcoin-network/pull/825))
+- **node**: Sync GasAccumulator worker count from on-chain `WorkerConfigs` ([#846](https://github.com/Telcoin-Association/telcoin-network/pull/846))
+- **node**: Activate per-worker base fees from WorkerConfigs ([#844](https://github.com/Telcoin-Association/telcoin-network/pull/844))
+- **node**: Restore base fee per worker on catchup ([#842](https://github.com/Telcoin-Association/telcoin-network/pull/842))
+- **node**: Seed base fee from chain on sync/restart instead of recomputing ([#840](https://github.com/Telcoin-Association/telcoin-network/pull/840))
+- **node**: Wire EIP-1559 base-fee adjustment with an inert u64::MAX target ([#796](https://github.com/Telcoin-Association/telcoin-network/pull/796))
+- **batch-validator**: Take a u64 base-fee snapshot ([#794](https://github.com/Telcoin-Association/telcoin-network/pull/794))
+- **network**: Cut the primary MissingCertificates path fully over to the typed sync protocol (739, step 7) ([#811](https://github.com/Telcoin-Association/telcoin-network/pull/811))
+- Feat(network): drop the legacy full-pack sync fallback (739) ([#810](https://github.com/Telcoin-Association/telcoin-network/pull/810))
+- **node**: Source worker pool base fee from the gas accumulator ([#792](https://github.com/Telcoin-Association/telcoin-network/pull/792))
+- Feat(node): per-worker readiness endpoint at GET /health/workers ([#712](https://github.com/Telcoin-Association/telcoin-network/pull/712)) ([#798](https://github.com/Telcoin-Association/telcoin-network/pull/798))
+- **network**: Cut the primary epoch-pack path over to the typed sync protocol with legacy fallback (739, step 6) ([#797](https://github.com/Telcoin-Association/telcoin-network/pull/797))
+- Feat(network): cut the worker batch path over to the typed sync protocol with legacy fallback (739, step 5) ([#781](https://github.com/Telcoin-Association/telcoin-network/pull/781))
+- **network**: Typed sync-frame layer registered alongside /tn-stream (739, step 4) ([#768](https://github.com/Telcoin-Association/telcoin-network/pull/768))
+### Bug fixes
+- **tn-reth**: Use TN's DEFAULT_IPC_ENDPOINT in RpcServerArgs::default() ([#1164](https://github.com/Telcoin-Association/telcoin-network/pull/1164))
+- **tn-reth**: Apply node_config.rpc.eth_config() when building the EthApi ([#1161](https://github.com/Telcoin-Association/telcoin-network/pull/1161))
+- **worker**: Keep observer txs pooled when a batch forward is refused ([#1144](https://github.com/Telcoin-Association/telcoin-network/pull/1144))
+- **storage**: Report a queued save failure from CertificatePack flush replies ([#1138](https://github.com/Telcoin-Association/telcoin-network/pull/1138)) ([#1143](https://github.com/Telcoin-Association/telcoin-network/pull/1143))
+- **types**: Add one-shot ShutdownNotifier so a subscribe after notify resolves ([#1141](https://github.com/Telcoin-Association/telcoin-network/pull/1141))
+- **network-libp2p**: Issue at most one in-flight kad query per missing authority ([#1140](https://github.com/Telcoin-Association/telcoin-network/pull/1140))
+- **tn-reth**: Enforce the restored-state floor in read_only_state_db ([#1137](https://github.com/Telcoin-Association/telcoin-network/pull/1137))
+- **tn-reth**: Enforce the archive-mode assumption behind pinned registry reads ([#1060](https://github.com/Telcoin-Association/telcoin-network/pull/1060))
+- **storage**: Surface consensus-store read failures instead of collapsing them to "not found" ([#1083](https://github.com/Telcoin-Association/telcoin-network/pull/1083))
+- **config**: Refuse an unset basefee_address at the production entry points ([#1115](https://github.com/Telcoin-Association/telcoin-network/pull/1115))
+- **tn-reth**: Refuse pinned reads below the restored-state floor ([#1105](https://github.com/Telcoin-Association/telcoin-network/pull/1105)) ([#1131](https://github.com/Telcoin-Association/telcoin-network/pull/1131))
+- **tn-reth**: Refuse non-public dial targets in observer transaction forwarding ([#1114](https://github.com/Telcoin-Association/telcoin-network/pull/1114))
+- **cli**: Verify the epoch-record certificate chain before the state import ([#1085](https://github.com/Telcoin-Association/telcoin-network/pull/1085))
+- **node**: Restrict stale temp-export sweep to epoch-{N}.tmp directories ([#1099](https://github.com/Telcoin-Association/telcoin-network/pull/1099))
+- **tn-reth**: Bound state-pack export memory with streamed storage chunks ([#1112](https://github.com/Telcoin-Association/telcoin-network/pull/1112))
+- **worker-gateway**: Key per-IP rate limit buckets on a network prefix ([#956](https://github.com/Telcoin-Association/telcoin-network/pull/956)) ([#1096](https://github.com/Telcoin-Association/telcoin-network/pull/1096))
+- **consensus**: Round-bound canonical epoch-close seed chain ([#1032](https://github.com/Telcoin-Association/telcoin-network/pull/1032)) ([#1062](https://github.com/Telcoin-Association/telcoin-network/pull/1062))
+- **engine**: Roll back the in-memory advance and classify provider faults when the output persist fails ([#1110](https://github.com/Telcoin-Association/telcoin-network/pull/1110))
+- **types**: Clamp current_base_fee before alloy's unchecked fee-increase add ([#1108](https://github.com/Telcoin-Association/telcoin-network/pull/1108)) ([#1111](https://github.com/Telcoin-Association/telcoin-network/pull/1111))
+- **tn-reth**: Reject state-mutating TEL precompile selectors under STATICCALL ([#1107](https://github.com/Telcoin-Association/telcoin-network/pull/1107))
+- **storage**: Report a queued write failure from EpochRecordDb::persist ([#1065](https://github.com/Telcoin-Association/telcoin-network/pull/1065)) ([#1094](https://github.com/Telcoin-Association/telcoin-network/pull/1094))
+- **epoch**: Classify and retry provider faults on epoch-record and epoch-entry committee reads ([#1025](https://github.com/Telcoin-Association/telcoin-network/pull/1025))
+- **worker-gateway**: Bound response-body streaming against slow-reading clients ([#1055](https://github.com/Telcoin-Association/telcoin-network/pull/1055))
+- **tn-rpc**: Run the proofOfPossessionMessage BLS decompress off the shared runtime ([#1058](https://github.com/Telcoin-Association/telcoin-network/pull/1058))
+- **consensus**: Fail-stop on epoch-DB commit error to prevent self-equivocation ([#975](https://github.com/Telcoin-Association/telcoin-network/pull/975)) ([#979](https://github.com/Telcoin-Association/telcoin-network/pull/979))
+- **node**: Import PrimaryNode in close_epoch ([#1071](https://github.com/Telcoin-Association/telcoin-network/pull/1071))
+- **network-libp2p**: Cap concurrent established connections per peer ([#1010](https://github.com/Telcoin-Association/telcoin-network/pull/1010)) ([#1029](https://github.com/Telcoin-Association/telcoin-network/pull/1029))
+- **epoch**: Drop the debug_assert shadowing the close-time identity guard ([#1026](https://github.com/Telcoin-Association/telcoin-network/pull/1026))
+- **engine**: Hard-error on undecodable BLS keys in the pinned committee read ([#1022](https://github.com/Telcoin-Association/telcoin-network/pull/1022))
+- **epoch**: Write and persist the epoch record on replay-and-close and leftover-drain paths ([#1021](https://github.com/Telcoin-Association/telcoin-network/pull/1021))
+- **network-libp2p**: Saturate KadStore counter decrements to prevent underflow wedge ([#1005](https://github.com/Telcoin-Association/telcoin-network/pull/1005)) ([#1013](https://github.com/Telcoin-Association/telcoin-network/pull/1013))
+- **network-libp2p**: Bound the temporarily-banned peer cache with a size cap ([#1023](https://github.com/Telcoin-Association/telcoin-network/pull/1023))
+- **config**: Validate ScoreConfig at startup to prevent a late clamp panic ([#1014](https://github.com/Telcoin-Association/telcoin-network/pull/1014))
+- **network-libp2p**: Gate inbound Kademlia AddProvider on peer ban status\nCloses #1001. ([#1011](https://github.com/Telcoin-Association/telcoin-network/pull/1011))
+- **network-kad**: Tolerate undecodable kad provider rows ([#999](https://github.com/Telcoin-Association/telcoin-network/pull/999)) ([#1004](https://github.com/Telcoin-Association/telcoin-network/pull/1004))
+- **network-libp2p**: Carry worse reputation across anonymous-inbound merge ([#998](https://github.com/Telcoin-Association/telcoin-network/pull/998)) ([#1002](https://github.com/Telcoin-Association/telcoin-network/pull/1002))
+- **consensus/executor**: Fail-stop the graceful-shutdown drain on a batch-fetch Err ([#1000](https://github.com/Telcoin-Association/telcoin-network/pull/1000))
+- **engine**: Roll back in-memory canonical advance on mid-output block failure ([#995](https://github.com/Telcoin-Association/telcoin-network/pull/995))
+- **config**: Reject consensus params below their operational floors ([#994](https://github.com/Telcoin-Association/telcoin-network/pull/994))
+- **execution**: Commit the finalized/safe markers atomically with the blocks ([#987](https://github.com/Telcoin-Association/telcoin-network/pull/987))
+- **consensus**: Close the two anti-equivocation guards #940 left non-durable ([#963](https://github.com/Telcoin-Association/telcoin-network/pull/963)) ([#964](https://github.com/Telcoin-Association/telcoin-network/pull/964))
+- **epoch**: Anchor recovered epoch records to the locally-trusted committee ([#937](https://github.com/Telcoin-Association/telcoin-network/pull/937))
+- Restrict consensus-output and epoch-vote gossip to committee publishers ([#912](https://github.com/Telcoin-Association/telcoin-network/pull/912)) ([#927](https://github.com/Telcoin-Association/telcoin-network/pull/927))
+- Floor the parent-round GC key in insert_pending to avoid a round-0 underflow ([#953](https://github.com/Telcoin-Association/telcoin-network/pull/953))
+- **consensus**: Make anti-equivocation records durable before externalizing ([#940](https://github.com/Telcoin-Association/telcoin-network/pull/940))
+- **worker**: Back off batch fetch retries with no connected worker peers ([#865](https://github.com/Telcoin-Association/telcoin-network/pull/865)) ([#944](https://github.com/Telcoin-Association/telcoin-network/pull/944))
+- **node**: Keep the healthcheck accept loop alive across transient accept errors ([#945](https://github.com/Telcoin-Association/telcoin-network/pull/945))
+- **worker**: Validate gossip-prefetched batches before caching ([#933](https://github.com/Telcoin-Association/telcoin-network/pull/933)) ([#938](https://github.com/Telcoin-Association/telcoin-network/pull/938))
+- **state-sync**: Request missing range from peers on observer catch-up stall ([#882](https://github.com/Telcoin-Association/telcoin-network/pull/882))
+- **consensus/network**: Gate gossip cheap-first and set explicit per-topic publisher policy ([#898](https://github.com/Telcoin-Association/telcoin-network/pull/898)) ([#929](https://github.com/Telcoin-Association/telcoin-network/pull/929))
+- **consensus**: Make the consensus-output batch-count bound symmetric across writer and reader ([#902](https://github.com/Telcoin-Association/telcoin-network/pull/902))
+- Charge signed gossip content faults to the author, not the relayer ([#889](https://github.com/Telcoin-Association/telcoin-network/pull/889))
+- Enforce the gossip size bound as a protocol constant on both paths ([#872](https://github.com/Telcoin-Association/telcoin-network/pull/872)) ([#892](https://github.com/Telcoin-Association/telcoin-network/pull/892))
+- Reject round-0 headers on the vote path to avoid header.round() - 1 underflow ([#888](https://github.com/Telcoin-Association/telcoin-network/pull/888))
+- **network-libp2p**: Bound published_to_peers with an LRU ([#856](https://github.com/Telcoin-Association/telcoin-network/pull/856))
+- **engine**: Bound the consensus-output execution backlog ([#880](https://github.com/Telcoin-Association/telcoin-network/pull/880))
+- **primary**: Cap sync_output and ExEx broadcast channels ([#878](https://github.com/Telcoin-Association/telcoin-network/pull/878))
+- **network-libp2p**: Prune zero-count banned_peers_by_ip keys ([#829](https://github.com/Telcoin-Association/telcoin-network/pull/829)) ([#860](https://github.com/Telcoin-Association/telcoin-network/pull/860))
+- **network-libp2p**: Bound known_peers against unbounded peer injection ([#827](https://github.com/Telcoin-Association/telcoin-network/pull/827)) ([#857](https://github.com/Telcoin-Association/telcoin-network/pull/857))
+- **network**: Attribute gossip faults to the accountable peer across the reject, worker, and primary paths ([#819](https://github.com/Telcoin-Association/telcoin-network/pull/819)) ([#824](https://github.com/Telcoin-Association/telcoin-network/pull/824))
+- **primary**: Out-of-bounds peer index when logging invalid fetched certs ([#826](https://github.com/Telcoin-Association/telcoin-network/pull/826))
+- Stop remove_validator_ip from over-decrementing banned total ([#809](https://github.com/Telcoin-Association/telcoin-network/pull/809)) ([#818](https://github.com/Telcoin-Association/telcoin-network/pull/818))
+- Return error instead of panicking on non-validator vote path ([#815](https://github.com/Telcoin-Association/telcoin-network/pull/815))
+- Fix(primary): report peer penalties for failed vote requests ([#802](https://github.com/Telcoin-Association/telcoin-network/pull/802)) ([#814](https://github.com/Telcoin-Association/telcoin-network/pull/814))
+- Fix(worker): do not ban gossip relayer for author-content faults ([#812](https://github.com/Telcoin-Association/telcoin-network/pull/812))
+- Evict oldest bans/disconnects on overflow, not newest ([#799](https://github.com/Telcoin-Association/telcoin-network/pull/799)) ([#807](https://github.com/Telcoin-Association/telcoin-network/pull/807))
+- Fix broken worker network test - merge order issue ([#816](https://github.com/Telcoin-Association/telcoin-network/pull/816))
+- Fix(network): surface the real DialError to the dialer instead of a hardcoded timeout ([#745](https://github.com/Telcoin-Association/telcoin-network/pull/745)) ([#786](https://github.com/Telcoin-Association/telcoin-network/pull/786))
+- **network**: Deliver accepted gossip when relayer BLS unresolved ([#785](https://github.com/Telcoin-Association/telcoin-network/pull/785))
+- Fix(primary): clear a pre-existing never_loop lint and a broken doc link ([#784](https://github.com/Telcoin-Association/telcoin-network/pull/784))
+- **network**: Do not penalize UnsupportedProtocols; guard against self-dial/self-penalty ([#777](https://github.com/Telcoin-Association/telcoin-network/pull/777)) ([#780](https://github.com/Telcoin-Association/telcoin-network/pull/780))
+- **worker**: Retry transient RPC errors instead of treating them as  rejections ([#747](https://github.com/Telcoin-Association/telcoin-network/pull/747)) ([#778](https://github.com/Telcoin-Association/telcoin-network/pull/778))
+- **network**: Recover partial peers from GetClosestPeers query timeouts ([#744](https://github.com/Telcoin-Association/telcoin-network/pull/744)) ([#758](https://github.com/Telcoin-Association/telcoin-network/pull/758))
+- **network-libp2p**: Make operator-set peer-scoring thresholds take effect ([#760](https://github.com/Telcoin-Association/telcoin-network/pull/760))
+- Fix(network): handle unresolved peer identity in gossip and response paths ([#743](https://github.com/Telcoin-Association/telcoin-network/pull/743)) ([#754](https://github.com/Telcoin-Association/telcoin-network/pull/754))
+### Performance
+- **storage**: Bound per-boundary state-export work ([#1078](https://github.com/Telcoin-Association/telcoin-network/pull/1078)) ([#1087](https://github.com/Telcoin-Association/telcoin-network/pull/1087))
+- **primary**: Resolve remaining #822 review findings (missing-certs sync) ([#886](https://github.com/Telcoin-Association/telcoin-network/pull/886))
+### Refactoring
+- **engine**: Split the epoch boundary into three system calls ([#1012](https://github.com/Telcoin-Association/telcoin-network/pull/1012))
+- **storage**: Converge persist and persist_durable into one durable barrier ([#962](https://github.com/Telcoin-Association/telcoin-network/pull/962)) ([#977](https://github.com/Telcoin-Association/telcoin-network/pull/977))
+- **network-libp2p**: Box Gossip payload, drop large_enum_variant allow ([#881](https://github.com/Telcoin-Association/telcoin-network/pull/881)) ([#974](https://github.com/Telcoin-Association/telcoin-network/pull/974))
+- Push non-validator txns to committee via RPC instead of gossip ([#820](https://github.com/Telcoin-Association/telcoin-network/pull/820))
+- **cli**: Extract BLS passphrase handling into telcoin-network-cli ([#848](https://github.com/Telcoin-Association/telcoin-network/pull/848))
+- Replace hand-rolled Future impls with async fns ([#808](https://github.com/Telcoin-Association/telcoin-network/pull/808))
+- **network**: Harden the /tn-stream behaviour (739, step 3) ([#750](https://github.com/Telcoin-Association/telcoin-network/pull/750))
+- **network**: Own ResponseChannel and outbound-failure types (739) ([#749](https://github.com/Telcoin-Association/telcoin-network/pull/749))
+### Documentation
+- **consensus**: Evaluate reputation schedule reset and byzantine impact ([#942](https://github.com/Telcoin-Association/telcoin-network/pull/942)) ([#983](https://github.com/Telcoin-Association/telcoin-network/pull/983))
+- Correct stale epoch, base-fee and hash references; drop dead topic constants ([#1064](https://github.com/Telcoin-Association/telcoin-network/pull/1064))
+- **engine**: Explain why reward accounting is advanced before finalization ([#1033](https://github.com/Telcoin-Association/telcoin-network/pull/1033))
+### Tests
+- **e2e**: Cut state export fee test runtime by about 36% ([#1126](https://github.com/Telcoin-Association/telcoin-network/pull/1126))
+- **e2e**: End the post-transfer idle wait in the eject tests ([#1117](https://github.com/Telcoin-Association/telcoin-network/pull/1117))
+- **e2e**: Speed up basefee boundary-kill test by ~30% ([#1119](https://github.com/Telcoin-Association/telcoin-network/pull/1119)) ([#1120](https://github.com/Telcoin-Association/telcoin-network/pull/1120))
+- **e2e**: Run the eject mid-epoch test on 6 second epochs ([#1124](https://github.com/Telcoin-Association/telcoin-network/pull/1124))
+- **storage**: Run shared-batch consensus_pack tests across the adiri dup-batch cutoff ([#1130](https://github.com/Telcoin-Association/telcoin-network/pull/1130))
+- Pin the zero-word entry fee of the adiri pre-fork epoch close ([#1129](https://github.com/Telcoin-Association/telcoin-network/pull/1129))
+- **engine**: Pin the UnknownAuthority fail-stop for the empty epoch-closing beneficiary lookup ([#1037](https://github.com/Telcoin-Association/telcoin-network/pull/1037))
+- **storage**: Open test-build MDBX envs in SafeNoSync to drop hot-path fsync ([#917](https://github.com/Telcoin-Association/telcoin-network/pull/917)) ([#982](https://github.com/Telcoin-Association/telcoin-network/pull/982))
+- **metrics**: Pin the sync-distance gauge trio and certificates_formed_total by name ([#1039](https://github.com/Telcoin-Association/telcoin-network/pull/1039))
+- **e2e**: Collapse the redundant warm-up epoch in the mid-epoch-restart eject test ([#1009](https://github.com/Telcoin-Association/telcoin-network/pull/1009))
+- **e2e**: Speed up the three heaviest ignored tests ([#978](https://github.com/Telcoin-Association/telcoin-network/pull/978)) ([#990](https://github.com/Telcoin-Association/telcoin-network/pull/990))
+- Build the e2e node binary under an opt-level-2 profile ([#916](https://github.com/Telcoin-Association/telcoin-network/pull/916)) ([#980](https://github.com/Telcoin-Association/telcoin-network/pull/980))
+- **storage**: Open the epoch data file, not the directory, in test_consensus_pack ([#965](https://github.com/Telcoin-Association/telcoin-network/pull/965))
+- Lower e2e round cadence and expose max_batch_delay genesis flag ([#946](https://github.com/Telcoin-Association/telcoin-network/pull/946))
+- Test(e2e): floor the epoch-boundary cert deadline above the new-validator quorum window ([#936](https://github.com/Telcoin-Association/telcoin-network/pull/936))
+- **node**: Heal the finalized marker before mid-run accumulator catchup ([#947](https://github.com/Telcoin-Association/telcoin-network/pull/947))
+- Test(e2e): cut base-fee e2e runtime via a decoupled epoch-duration cut ([#907](https://github.com/Telcoin-Association/telcoin-network/pull/907)) ([#920](https://github.com/Telcoin-Association/telcoin-network/pull/920))
+- Replace fixed real-time sleeps with condition polling (shared wait_until) ([#923](https://github.com/Telcoin-Association/telcoin-network/pull/923))
+- Reuse the prebuilt e2e node binary on every path, not only make ([#926](https://github.com/Telcoin-Association/telcoin-network/pull/926)) ([#928](https://github.com/Telcoin-Association/telcoin-network/pull/928))
+- Cut targeted suite runtime by memoizing fixtures and sharing crypto contexts ([#899](https://github.com/Telcoin-Association/telcoin-network/pull/899))
+- Fix faucet e2e ABI + precompile drift via generated bindings ([#863](https://github.com/Telcoin-Association/telcoin-network/pull/863)) ([#885](https://github.com/Telcoin-Association/telcoin-network/pull/885))
+- **e2e**: Cut runtime of the four ignored e2e tests ([#897](https://github.com/Telcoin-Association/telcoin-network/pull/897)) ([#900](https://github.com/Telcoin-Association/telcoin-network/pull/900))
+- Reserve test ports from per-nextest-slot windows ([#830](https://github.com/Telcoin-Association/telcoin-network/pull/830)) ([#861](https://github.com/Telcoin-Association/telcoin-network/pull/861))
+- Remove wall-clock timing assumptions from test_fetch_cancellation_on_success ([#864](https://github.com/Telcoin-Association/telcoin-network/pull/864))
+- Use an injectable clock for BannedPeerCache expiry tests ([#862](https://github.com/Telcoin-Association/telcoin-network/pull/862))
+- **network-libp2p**: Replace fixed real-time sleeps in network_tests  with condition polling ([#859](https://github.com/Telcoin-Association/telcoin-network/pull/859))
+- Drive test_all_possible_error_outcomes off the rebuild ordering instead of sleep(1s) ([#855](https://github.com/Telcoin-Association/telcoin-network/pull/855))
+- Add persistence barrier before iterating in db_simp_bench ([#831](https://github.com/Telcoin-Association/telcoin-network/pull/831)) ([#854](https://github.com/Telcoin-Association/telcoin-network/pull/854))
+### Build, CI and chores
+- **e2e**: Derive the e2e --target-dir from CARGO_TARGET_DIR instead of hardcoding it ([#1127](https://github.com/Telcoin-Association/telcoin-network/pull/1127))
+- **deps**: Gate rocksdb out of the default build (closes #941) ([#948](https://github.com/Telcoin-Association/telcoin-network/pull/948))
+- Build/dev profile compile speedups ([#913](https://github.com/Telcoin-Association/telcoin-network/pull/913))
+- Forward `adiri` feature to `tn-types/adiri` in storage, engine, executor ([#858](https://github.com/Telcoin-Association/telcoin-network/pull/858))
+- Chore(ci): raise e2e slow-timeout period from 120s to 720s ([#761](https://github.com/Telcoin-Association/telcoin-network/pull/761))
+### Merged from private forks
+- Merge commit from fork
+  - fix(tn-reth): bound observer forward tasks by count and lifetime
+  - fix(tn-reth): count forward outcomes individually, address review nits
+- Merge commit from fork
+  - The `PrimaryRequest::EpochRecord` request-response arm spawned one detached
+- Merge commit from fork
+  - test_epoch_vote_non_committee_rejected_before_verify: a non-committee vote for
+  - test_epoch_vote_unknown_epoch_dropped_before_verify: an unknown-epoch garbage
+  - test_epoch_vote_valid_committee_member_forwarded: a validly signed committee
+- Merge commit from fork
+  - The `MAX_CONSENSUS_CERTS` cap added for GHSA-2r5c-c4h7-gp5h bounds the memory of
+- Merge commit from fork
+  - A non-committee observer could inflate a node's per-peer multiaddr set
+- Merge commit from fork
+  - fix(network): count only observed connection IPs toward the per-IP ban
+  - test(network): make GHSA-6qcj regression tests deterministic and add observed-IP positive control
+- Merge commit from fork
+  - A worker processes each batch-digest gossip in its own spawned task and, on a
+- Merge commit from fork
+  - read_and_validate_batches_with_timeout wraps every per-batch read in
+- Merge commit from fork
+  - Kademlia runs with StoreInserts::FilterBoth, so libp2p never stores an inbound
+- Merge commit from fork
+  - The per-peer batch-stream cap (MAX_PENDING_REQUESTS_PER_PEER) summed a peer's
+- Merge commit from fork
+  - remove test-utils cfg and replace with hard test-labelled const
+  - add test-utils feat on cli for e2e tests to use insecure pbkdf2 rounds
+  - use new approach for tests - update docs
+- Merge commit from fork
+  - fix(primary): bound skip-round cardinality in get_bounds (remote OOM)
+  - fix(primary): bound skip_rounds entry count by committee size
+- Merge commit from fork
+  - `read_and_validate_batches_with_timeout` (the legacy batch-sync reader) read the
+- Merge commit from fork
+  - Two inbound-stream handlers in the worker network held the global batch-stream
+- Merge commit from fork
+  - MissingCertificatesRequest::get_bounds deserialized each peer-supplied
+- Merge commit from fork
+  - `consensus_certs` tallies the committee signatures gossiped for each consensus
+### Other
+- Set signature seed fork boundary to adiri epoch 383 ([#1163](https://github.com/Telcoin-Association/telcoin-network/pull/1163))
+- Regenerate mainnet genesis with post-fork registry runtime ([#1097](https://github.com/Telcoin-Association/telcoin-network/pull/1097))
+- Enforce a batch transaction-type allowlist symmetrically across gateway, builder, and validator ([#1104](https://github.com/Telcoin-Association/telcoin-network/pull/1104))
+- End the epoch-record waits with a lookup at the deadline ([#1098](https://github.com/Telcoin-Association/telcoin-network/pull/1098))
+- Propagate non-NotFound remove_file failures in write_bounded_pack ([#1088](https://github.com/Telcoin-Association/telcoin-network/pull/1088))
+- Docs and tests for the engine/epoch code, plus two bugs the effort surfaced ([#1109](https://github.com/Telcoin-Association/telcoin-network/pull/1109))
+- Instrument the gas the epoch-boundary system calls spend ([#1061](https://github.com/Telcoin-Association/telcoin-network/pull/1061))
+- Read entered-epoch base fees from chain instead of re-deriving them ([#1103](https://github.com/Telcoin-Association/telcoin-network/pull/1103))
+- Refuse a faucet-compiled binary on canonical Telcoin mainnet ([#1095](https://github.com/Telcoin-Association/telcoin-network/pull/1095))
+- Tn 942 prng pin ([#1093](https://github.com/Telcoin-Association/telcoin-network/pull/1093))
+- Canonical-DB fallback for wait_for_execution ring miss ([#1036](https://github.com/Telcoin-Association/telcoin-network/pull/1036)) ([#1038](https://github.com/Telcoin-Association/telcoin-network/pull/1038))
+- Write next-epoch worker base fees to WorkerConfigs at epoch close ([#1101](https://github.com/Telcoin-Association/telcoin-network/pull/1101))
+- Tn-reth epoch-boundary hardening sweep ([#1072](https://github.com/Telcoin-Association/telcoin-network/pull/1072))
+- Offload state-export fs work to tokio's blocking pool ([#1081](https://github.com/Telcoin-Association/telcoin-network/pull/1081))
+- Saturate reward_beneficiary fee credits to match reimburse_caller ([#1047](https://github.com/Telcoin-Association/telcoin-network/pull/1047))
+- Gate worker batch-digest gossip subscription on node mode ([#1057](https://github.com/Telcoin-Association/telcoin-network/pull/1057))
+- Recover the JSON-RPC id without building a Value ([#1054](https://github.com/Telcoin-Association/telcoin-network/pull/1054))
+- Meter blsVerify by message length and cap it ([#1051](https://github.com/Telcoin-Association/telcoin-network/pull/1051))
+- Harden always-active assert/expect panics on the commit hot path and startup recovery (defense-in-depth) ([#1049](https://github.com/Telcoin-Association/telcoin-network/pull/1049))
+- Check parent-hash linkage across the snapshot header window ([#1077](https://github.com/Telcoin-Association/telcoin-network/pull/1077))
+- Fuse ReplayStream on the first replay error ([#1059](https://github.com/Telcoin-Association/telcoin-network/pull/1059))
+- Epoch read docs and consolidation ([#1024](https://github.com/Telcoin-Association/telcoin-network/pull/1024))
+- Add CLI option to import an exported exec block/state. ([#985](https://github.com/Telcoin-Association/telcoin-network/pull/985))
+- Tn reth reorg ([#1069](https://github.com/Telcoin-Association/telcoin-network/pull/1069))
+- Add a cli option and hook up the code to export exec state at the end of every epoch when enabled. ([#973](https://github.com/Telcoin-Association/telcoin-network/pull/973))
+- Count transactions dropped during block building ([#1056](https://github.com/Telcoin-Association/telcoin-network/pull/1056))
+- Seed reth's txpool defaults so an explicit --txpool.max-account-slots 16 is honored ([#1053](https://github.com/Telcoin-Association/telcoin-network/pull/1053))
+- Make TNExecution's never-driven validators fail loudly.  Closes #1048. ([#1052](https://github.com/Telcoin-Association/telcoin-network/pull/1052))
+- Reject undersized committee before building concludeEpoch calldata ([#1045](https://github.com/Telcoin-Association/telcoin-network/pull/1045))
+- Preserve FinishedHeight reporting on the replay_and_subscribe path ([#988](https://github.com/Telcoin-Association/telcoin-network/pull/988))
+- Add reth code to export to or import from new exec state pack. ([#969](https://github.com/Telcoin-Association/telcoin-network/pull/969))
+- Add a pack file to store execution state at a specific block (the state tree). ([#967](https://github.com/Telcoin-Association/telcoin-network/pull/967))
+- Makefile devnet build ([#966](https://github.com/Telcoin-Association/telcoin-network/pull/966))
+- Bound stream-merge starvation with a round-robin schedule ([#992](https://github.com/Telcoin-Association/telcoin-network/pull/992)) ([#997](https://github.com/Telcoin-Association/telcoin-network/pull/997))
+- Guard ExEx manager against empty canonical chains ([#991](https://github.com/Telcoin-Association/telcoin-network/pull/991)) ([#996](https://github.com/Telcoin-Association/telcoin-network/pull/996))
+- Fast-fail unsatisfiable certificate fetch ([#866](https://github.com/Telcoin-Association/telcoin-network/pull/866)) ([#971](https://github.com/Telcoin-Association/telcoin-network/pull/971))
+- Pin epoch-entry reads to the previous epoch's closing block ([#952](https://github.com/Telcoin-Association/telcoin-network/pull/952))
+- Finish the wait_until migration for eject/epoch e2e helpers ([#951](https://github.com/Telcoin-Association/telcoin-network/pull/951))
+- Use new pack format to avoid issues with a malicious peer. ([#932](https://github.com/Telcoin-Association/telcoin-network/pull/932))
+- Backpressure when engine channel full instead of dropping output ([#925](https://github.com/Telcoin-Association/telcoin-network/pull/925))
+- Tolerate mid-epoch validator ejection in epoch records ([#922](https://github.com/Telcoin-Association/telcoin-network/pull/922))
+- Add the pack bytes number to gossiped consensus results. ([#817](https://github.com/Telcoin-Association/telcoin-network/pull/817))
+- Harden known peers restore ([#906](https://github.com/Telcoin-Association/telcoin-network/pull/906))
+- Save consensus in pack files with the header then the batches instead of batches then the header. ([#893](https://github.com/Telcoin-Association/telcoin-network/pull/893))
+- Retrieve validator RPCs instead of all known-peer RPCs ([#904](https://github.com/Telcoin-Association/telcoin-network/pull/904))
+- Storage memory management ([#876](https://github.com/Telcoin-Association/telcoin-network/pull/876))
+- Cut the primary consensus-output path fully over to the typed sync protocol (739) ([#895](https://github.com/Telcoin-Association/telcoin-network/pull/895))
+- Limit reth MDBX sizes for temp-chain tests ([#911](https://github.com/Telcoin-Association/telcoin-network/pull/911))
+- Fork consensus registry bls precompile ([#868](https://github.com/Telcoin-Association/telcoin-network/pull/868))
+- (feat) CLI keytool set rpc ([#837](https://github.com/Telcoin-Association/telcoin-network/pull/837))
+- Catchup finalized watermark inconsistency on restart ([#891](https://github.com/Telcoin-Association/telcoin-network/pull/891))
+- Feat/basefee 08 e2e ([#852](https://github.com/Telcoin-Association/telcoin-network/pull/852))
+- # feat(worker-gateway): stateless reverse proxy crate skeleton + proxy core ([#712](https://github.com/Telcoin-Association/telcoin-network/pull/712)) ([#823](https://github.com/Telcoin-Association/telcoin-network/pull/823))
+- Use the pack consensus output bytes for sync. ([#813](https://github.com/Telcoin-Association/telcoin-network/pull/813))
+- Generic BLS verify precompile (reusable beyond proof-of-possession) ([#759](https://github.com/Telcoin-Association/telcoin-network/pull/759))
+- Bump tn-contracts submodule (#107 -> #123): per-network deployments + genesis.rs repoint ([#752](https://github.com/Telcoin-Association/telcoin-network/pull/752))
+- Synchronize() errored on every call that had to fetch a batch from a peer. ([#806](https://github.com/Telcoin-Association/telcoin-network/pull/806))
+- This uses partial pack downloads to speed up intra-epoch syncing. ([#790](https://github.com/Telcoin-Association/telcoin-network/pull/790))
+- Hardening patches for consensus chain. ([#787](https://github.com/Telcoin-Association/telcoin-network/pull/787))
+- Route genesis PoP through the BLS precompile and adopt the integration ConsensusRegistry ABI ([#732](https://github.com/Telcoin-Association/telcoin-network/pull/732))
+- Add `keytool generate pop` for execution-address rotation ([#775](https://github.com/Telcoin-Association/telcoin-network/pull/775))
+- Exex2 ([#770](https://github.com/Telcoin-Association/telcoin-network/pull/770))
+- Allow partial pack file streaming. ([#783](https://github.com/Telcoin-Association/telcoin-network/pull/783))
+- Native BLS proof-of-possession precompile at 0x...b151 ([#731](https://github.com/Telcoin-Association/telcoin-network/pull/731))
+- Make sure to only count a consensus sig once per validator. ([#779](https://github.com/Telcoin-Association/telcoin-network/pull/779))
+- Incorporate the chain id into every libp2p protocol string and gossip topic ([#772](https://github.com/Telcoin-Association/telcoin-network/pull/772))
+- Add server side calls to retrieve consensus bytes for an entire ConsensusOutput. ([#773](https://github.com/Telcoin-Association/telcoin-network/pull/773))
+- Results of scan of consensus chain code. ([#771](https://github.com/Telcoin-Association/telcoin-network/pull/771))
+- Db debug tool command ([#734](https://github.com/Telcoin-Association/telcoin-network/pull/734))
+- Feature - Enable DB Stats Usage ([#751](https://github.com/Telcoin-Association/telcoin-network/pull/751))
+- A litte more time before adiri fork. ([#766](https://github.com/Telcoin-Association/telcoin-network/pull/766))
+- Result of iterating on core pack file code with Claude. ([#762](https://github.com/Telcoin-Association/telcoin-network/pull/762))
+- Serialize epoch pack install against epoch transition ([#764](https://github.com/Telcoin-Association/telcoin-network/pull/764))
+- Metrics ([#733](https://github.com/Telcoin-Association/telcoin-network/pull/733))
+- Breakdown epoch manager ([#737](https://github.com/Telcoin-Association/telcoin-network/pull/737))
+- Reduce the default hash index size (buckets). ([#757](https://github.com/Telcoin-Association/telcoin-network/pull/757))
+- Make sure we can not save consensus to the wrong epoch pack file. ([#756](https://github.com/Telcoin-Association/telcoin-network/pull/756))
+- Use saturating sub when collecting epoch records and going back one. ([#755](https://github.com/Telcoin-Association/telcoin-network/pull/755))
+- Bound codec decode buffers to delivered bytes ([#742](https://github.com/Telcoin-Association/telcoin-network/pull/742))
+- Re-key bls_by_peer_id on network-key rotation ([#740](https://github.com/Telcoin-Association/telcoin-network/pull/740))
+- Fix two critical/high issues found with a scan. ([#748](https://github.com/Telcoin-Association/telcoin-network/pull/748))
+- Separate operator trust from committee (validator) trust on Peer (715) ([#720](https://github.com/Telcoin-Association/telcoin-network/pull/720))
+- Peer rpc info ([#730](https://github.com/Telcoin-Association/telcoin-network/pull/730))
+- Index so we can access all the bytes (batches plus consensus header) for consensus output in a pack file. ([#741](https://github.com/Telcoin-Association/telcoin-network/pull/741))
+- Epoch Info RPC  ([#736](https://github.com/Telcoin-Association/telcoin-network/pull/736))
+- Use specific types for specific digests. ([#724](https://github.com/Telcoin-Association/telcoin-network/pull/724))
+- Track previous/current/next committees in the network layer ([#707](https://github.com/Telcoin-Association/telcoin-network/pull/707))
+- Add maintainers to github actions ([#727](https://github.com/Telcoin-Association/telcoin-network/pull/727))
+
+## [v0.10.0-adiri] - 2026-06-09
+### Features
+- Stream worker batches ([#571](https://github.com/Telcoin-Association/telcoin-network/pull/571))
+- CLI for Staking Info ([#546](https://github.com/Telcoin-Association/telcoin-network/pull/546))
+- Observer diagnostics, sync-aware healthcheck and e2e tests ([#542](https://github.com/Telcoin-Association/telcoin-network/pull/542))
+- **engine**: Skip EVM execution for empty non-epoch-closing output ([#535](https://github.com/Telcoin-Association/telcoin-network/pull/535))
+- **consensus**: Make channel send no-op when no receiver subscribed ([#534](https://github.com/Telcoin-Association/telcoin-network/pull/534))
+- **tn-reth**: Parallelize transaction recovery with rayon ([#533](https://github.com/Telcoin-Association/telcoin-network/pull/533))
+### Bug fixes
+- Fix banned peer logic to reduce log flapping ([#688](https://github.com/Telcoin-Association/telcoin-network/pull/688))
+- Correct transposed UDP port values in .env.example ([#670](https://github.com/Telcoin-Association/telcoin-network/pull/670))
+- Fix sporadic docker build failures - removes stale .cargo-ok files from the registry cache before running cargo build ([#617](https://github.com/Telcoin-Association/telcoin-network/pull/617))
+- **types**: Handle broadcast channel lag instead of silently dropping observers ([#541](https://github.com/Telcoin-Association/telcoin-network/pull/541))
+- **ci**: Align cache-deps env vars with pr workflow ([#537](https://github.com/Telcoin-Association/telcoin-network/pull/537))
+- **batch-builder**: Reset interval after non-fatal error to prevent spurious re-proposals ([#538](https://github.com/Telcoin-Association/telcoin-network/pull/538))
+- Fix JSON serialization for tn_latestHeader RPC ([#375](https://github.com/Telcoin-Association/telcoin-network/pull/375)) ([#519](https://github.com/Telcoin-Association/telcoin-network/pull/519))
+### Refactoring
+- **committee**: Enforce equal voting power across authorities ([#560](https://github.com/Telcoin-Association/telcoin-network/pull/560))
+- Catchup Accumulator ([#544](https://github.com/Telcoin-Association/telcoin-network/pull/544))
+- **consensus**: Replace watch send() with send_replace() and remove stored receivers ([#529](https://github.com/Telcoin-Association/telcoin-network/pull/529)) ([#536](https://github.com/Telcoin-Association/telcoin-network/pull/536))
+- Remove monitored_future, monitored_scope, and related code ([#518](https://github.com/Telcoin-Association/telcoin-network/pull/518))
+### Tests
+- Extend test coverage ([#522](https://github.com/Telcoin-Association/telcoin-network/pull/522))
+### Build, CI and chores
+- Upgrade reth v1.11.3 ([#578](https://github.com/Telcoin-Association/telcoin-network/pull/578))
+- **submodule**: Use HTTPS URL for tn-contracts ([#550](https://github.com/Telcoin-Association/telcoin-network/pull/550))
+### Other
+- Separate protocols for primary and worker (by id) ([#726](https://github.com/Telcoin-Association/telcoin-network/pull/726))
+- Preemptive refactors for future sync. ([#723](https://github.com/Telcoin-Association/telcoin-network/pull/723))
+- Key AllPeers by domain identity instead of libp2p PeerId. ([#716](https://github.com/Telcoin-Association/telcoin-network/pull/716))
+- Pass RethEnv to rpc for expanding rpc calls - replace redundant chainspec field ([#721](https://github.com/Telcoin-Association/telcoin-network/pull/721))
+- Security and performance fixes for sync. ([#718](https://github.com/Telcoin-Association/telcoin-network/pull/718))
+- This should address the missing pack files (never retrieved) found in testnet observer testing. ([#711](https://github.com/Telcoin-Association/telcoin-network/pull/711))
+- Make consensus headers cheap to clone. ([#705](https://github.com/Telcoin-Association/telcoin-network/pull/705))
+- Remove unused UpdateAuthorizedPublishers network command ([#704](https://github.com/Telcoin-Association/telcoin-network/pull/704))
+- Handle duplicate batch digests in a committed sub-DAG ([#701](https://github.com/Telcoin-Association/telcoin-network/pull/701))
+- Fixes some observer issues. ([#699](https://github.com/Telcoin-Association/telcoin-network/pull/699))
+- Add rpc tn_info. ([#695](https://github.com/Telcoin-Association/telcoin-network/pull/695))
+- Add ConsensusChainReader/Writer facet traits ([#698](https://github.com/Telcoin-Association/telcoin-network/pull/698))
+- Fix open_redb test helper for 3-arg CompositeDatabase::open. ([#697](https://github.com/Telcoin-Association/telcoin-network/pull/697))
+- Fsync parent directory after file create and rename in archive ([#696](https://github.com/Telcoin-Association/telcoin-network/pull/696))
+- Fix observer sync issue. ([#692](https://github.com/Telcoin-Association/telcoin-network/pull/692))
+- Reduce penalties to prevent ban cascades on WAN ([#690](https://github.com/Telcoin-Association/telcoin-network/pull/690))
+- Improve sync. ([#684](https://github.com/Telcoin-Association/telcoin-network/pull/684))
+- Use serde default to deserialize missing fields on network config ([#686](https://github.com/Telcoin-Association/telcoin-network/pull/686))
+- Always have bootstraps and dont crash on a network event error. ([#681](https://github.com/Telcoin-Association/telcoin-network/pull/681))
+- Remove an needed channel and task. ([#678](https://github.com/Telcoin-Association/telcoin-network/pull/678))
+- Kad improvements ([#683](https://github.com/Telcoin-Association/telcoin-network/pull/683))
+- Regression tests for observer epoch-0 sync + stale prior-epoch vote ([#676](https://github.com/Telcoin-Association/telcoin-network/pull/676))
+- Fix observers getting stuck on epoch 0. ([#674](https://github.com/Telcoin-Association/telcoin-network/pull/674))
+- Update adiri testnet chain config ([#672](https://github.com/Telcoin-Association/telcoin-network/pull/672))
+- Centralize rust version - update gh action to fix ci for public PRs ([#665](https://github.com/Telcoin-Association/telcoin-network/pull/665))
+- Final tn-contracts updates for adiri testnet ([#671](https://github.com/Telcoin-Association/telcoin-network/pull/671))
+- Store validator certs in a pack file for diagnostics. ([#668](https://github.com/Telcoin-Association/telcoin-network/pull/668))
+- Worker configs patch ([#669](https://github.com/Telcoin-Association/telcoin-network/pull/669))
+- Remove erc20 interface from TEL precompile ([#667](https://github.com/Telcoin-Association/telcoin-network/pull/667))
+- Add zstd compression to pack file records. ([#661](https://github.com/Telcoin-Association/telcoin-network/pull/661))
+- Validator bls key map ([#663](https://github.com/Telcoin-Association/telcoin-network/pull/663))
+- Worker configs ([#656](https://github.com/Telcoin-Association/telcoin-network/pull/656))
+- Fix a couple of edge cases from testing. ([#659](https://github.com/Telcoin-Association/telcoin-network/pull/659))
+- Use a dedicated table for published certs. ([#652](https://github.com/Telcoin-Association/telcoin-network/pull/652))
+- Fix download of epoch pack 0. ([#655](https://github.com/Telcoin-Association/telcoin-network/pull/655))
+- Validator region ([#653](https://github.com/Telcoin-Association/telcoin-network/pull/653))
+- Update worker network handle at epoch boundary ([#650](https://github.com/Telcoin-Association/telcoin-network/pull/650))
+- AI suggested race fix. ([#648](https://github.com/Telcoin-Association/telcoin-network/pull/648))
+- Fix race uncovered by restart failure. ([#645](https://github.com/Telcoin-Association/telcoin-network/pull/645))
+- Only store headers not entire certs in subdags. ([#641](https://github.com/Telcoin-Association/telcoin-network/pull/641))
+- Delay remaval from our batches cache until we are sure. ([#643](https://github.com/Telcoin-Association/telcoin-network/pull/643))
+- Tighten some of consensus chain data. ([#639](https://github.com/Telcoin-Association/telcoin-network/pull/639))
+- Fix task manager so handle task errors. ([#635](https://github.com/Telcoin-Association/telcoin-network/pull/635))
+- Clean up batch handling and possible race conditions. ([#632](https://github.com/Telcoin-Association/telcoin-network/pull/632))
+- Stream pack files for historic epoch data sync. ([#630](https://github.com/Telcoin-Association/telcoin-network/pull/630))
+- Validator node documentation ([#628](https://github.com/Telcoin-Association/telcoin-network/pull/628))
+- Cleaned up issues with batch caching. ([#625](https://github.com/Telcoin-Association/telcoin-network/pull/625))
+- Patch logic for advancing round with 0 delay for odd rounds - this only happens for even rounds when the node expects to be the leader ([#626](https://github.com/Telcoin-Association/telcoin-network/pull/626))
+- Worker network race condition ([#613](https://github.com/Telcoin-Association/telcoin-network/pull/613))
+- Remove spurious touches from system calls ([#608](https://github.com/Telcoin-Association/telcoin-network/pull/608))
+- Forward transactions based on address ([#604](https://github.com/Telcoin-Association/telcoin-network/pull/604))
+- Fix some restart issues. ([#607](https://github.com/Telcoin-Association/telcoin-network/pull/607))
+- Punish peers for bad consensus requests. ([#603](https://github.com/Telcoin-Association/telcoin-network/pull/603))
+- Update consensus round check ([#602](https://github.com/Telcoin-Association/telcoin-network/pull/602))
+- Epoch votes patch ([#588](https://github.com/Telcoin-Association/telcoin-network/pull/588))
+- Race condition on subscriber shutdown ([#599](https://github.com/Telcoin-Association/telcoin-network/pull/599))
+- Batch builder throughput ([#596](https://github.com/Telcoin-Association/telcoin-network/pull/596))
+- Patch for a restart test failure. ([#597](https://github.com/Telcoin-Association/telcoin-network/pull/597))
+- Fix race in vote equivocation code. ([#594](https://github.com/Telcoin-Association/telcoin-network/pull/594))
+- Return an error when fetching a batch and DB write fails- cause cleaner node shutdown. ([#592](https://github.com/Telcoin-Association/telcoin-network/pull/592))
+- Update adiri genesis v0.7.0-adiri ([#595](https://github.com/Telcoin-Association/telcoin-network/pull/595))
+- Update tn contracts ([#585](https://github.com/Telcoin-Association/telcoin-network/pull/585))
+- Return false when validating with no keys, add some tests. ([#590](https://github.com/Telcoin-Association/telcoin-network/pull/590))
+- Native TEL ERC20 precompile ([#581](https://github.com/Telcoin-Association/telcoin-network/pull/581))
+- Async epoch streams ([#583](https://github.com/Telcoin-Association/telcoin-network/pull/583))
+- Refactor manager. ([#582](https://github.com/Telcoin-Association/telcoin-network/pull/582))
+- Use pack files for epoch records. ([#579](https://github.com/Telcoin-Association/telcoin-network/pull/579))
+- Couple of restart test fixes. ([#575](https://github.com/Telcoin-Association/telcoin-network/pull/575))
+- PR feedback. ([#574](https://github.com/Telcoin-Association/telcoin-network/pull/574))
+- Add support for bulk storage of consensus data by epoch. ([#510](https://github.com/Telcoin-Association/telcoin-network/pull/510))
+- Stream behavior ([#570](https://github.com/Telcoin-Association/telcoin-network/pull/570))
+- Make codec functions pub ([#569](https://github.com/Telcoin-Association/telcoin-network/pull/569))
+- RethEnv inner arc ([#549](https://github.com/Telcoin-Association/telcoin-network/pull/549))
+- Remove old metrics ([#524](https://github.com/Telcoin-Association/telcoin-network/pull/524))
+- Update tests for GH runner ([#527](https://github.com/Telcoin-Association/telcoin-network/pull/527))
+- Update GitHub actions ([#525](https://github.com/Telcoin-Association/telcoin-network/pull/525))
+- Add helper methods to ConsensusBus ([#516](https://github.com/Telcoin-Association/telcoin-network/pull/516))
+- Fix a race that effected nodes catching up. ([#514](https://github.com/Telcoin-Association/telcoin-network/pull/514))
+
+## [v0.6.0-adiri] - 2026-01-12
+### Other
+- Update genesis with latest adiri deployment ([#512](https://github.com/Telcoin-Association/telcoin-network/pull/512))
+- Update tn-contracts submodule ([#511](https://github.com/Telcoin-Association/telcoin-network/pull/511))
+- Add quadratic scaling for gas limit penalty ([#498](https://github.com/Telcoin-Association/telcoin-network/pull/498))
+- Remove some gc round complexity. ([#507](https://github.com/Telcoin-Association/telcoin-network/pull/507))
+- Fixes for epoch tests. ([#509](https://github.com/Telcoin-Association/telcoin-network/pull/509))
+- WIP, need to NOT save all data in memory now that we have ever growing consesnsus chain data. ([#501](https://github.com/Telcoin-Association/telcoin-network/pull/501))
+- Fix some bugs in observer syncing and following. ([#499](https://github.com/Telcoin-Association/telcoin-network/pull/499))
+- Initial open telemetry hook up. ([#487](https://github.com/Telcoin-Association/telcoin-network/pull/487))
+- Task manager cert fetcher ([#493](https://github.com/Telcoin-Association/telcoin-network/pull/493))
+- Update faucet address ([#492](https://github.com/Telcoin-Association/telcoin-network/pull/492))
+- Log debug params on rpc calls ([#497](https://github.com/Telcoin-Association/telcoin-network/pull/497))
+- Remove unused `total_fees` var during batch execution ([#495](https://github.com/Telcoin-Association/telcoin-network/pull/495))
+- Read next committee size from state ([#496](https://github.com/Telcoin-Association/telcoin-network/pull/496))
+- Correct inverted logic to filter prev unknown ips for banned ips ([#494](https://github.com/Telcoin-Association/telcoin-network/pull/494))
+- Engine execution address empty output ([#491](https://github.com/Telcoin-Association/telcoin-network/pull/491))
+
+## [v0.5.0-adiri] - 2025-11-17
+### Bug fixes
+- Fix docker compose for local devnet ([#488](https://github.com/Telcoin-Association/telcoin-network/pull/488))
+- Fix tests - reinstating rand for committee to test determinism
+- Fix more tests - remove warnings for other crates outside tn-reth
+- Fix tests
+- Fix clippy nightly
+### Refactoring
+- Refactor genesis to use rethenv
+- Refactor tests after sporadic failure - remove printlns ([#258](https://github.com/Telcoin-Association/telcoin-network/pull/258))
+### Tests
+- Test-utils feature for pbkdf2 encryption rounds to prevent excessive time constraints during testing ([#369](https://github.com/Telcoin-Association/telcoin-network/pull/369))
+### Reverts
+- Revert "Allow the basefee address to be set on genesis."
+### Other
+- Document running an adiri observer, fix small bug. ([#489](https://github.com/Telcoin-Association/telcoin-network/pull/489))
+- Update tn-contracts submodule ([#486](https://github.com/Telcoin-Association/telcoin-network/pull/486))
+- Healthcheck ([#485](https://github.com/Telcoin-Association/telcoin-network/pull/485))
+- Upgrade rust v1.91 ([#483](https://github.com/Telcoin-Association/telcoin-network/pull/483))
+- Tweaks to initial peer connections. ([#481](https://github.com/Telcoin-Association/telcoin-network/pull/481))
+- Tech debt ([#482](https://github.com/Telcoin-Association/telcoin-network/pull/482))
+- Support for Cloud Deployments ([#371](https://github.com/Telcoin-Association/telcoin-network/pull/371))
+- Remove parent hash and timestamp from batches and add epoch. ([#480](https://github.com/Telcoin-Association/telcoin-network/pull/480))
+- More stable restarts. ([#479](https://github.com/Telcoin-Association/telcoin-network/pull/479))
+- Use the parent timestamp for batch gas and size calls. ([#478](https://github.com/Telcoin-Association/telcoin-network/pull/478))
+- Finish up issue 297 ([#477](https://github.com/Telcoin-Association/telcoin-network/pull/477))
+- Fix worker network event loop. ([#476](https://github.com/Telcoin-Association/telcoin-network/pull/476))
+- Cantina 651: Cancel Vote Requests ([#475](https://github.com/Telcoin-Association/telcoin-network/pull/475))
+- Reject votes for rounds too far in future. ([#471](https://github.com/Telcoin-Association/telcoin-network/pull/471))
+- Cache local batches until they reach consensus. ([#474](https://github.com/Telcoin-Association/telcoin-network/pull/474))
+- Remove Validators PendingExit ([#473](https://github.com/Telcoin-Association/telcoin-network/pull/473))
+- Upgrade reth v1.8.2 ([#469](https://github.com/Telcoin-Association/telcoin-network/pull/469))
+- Cantina 244 ([#466](https://github.com/Telcoin-Association/telcoin-network/pull/466))
+- Update libp2p with official upstream ([#467](https://github.com/Telcoin-Association/telcoin-network/pull/467))
+- Re-working the leader schedule and swap tables. ([#464](https://github.com/Telcoin-Association/telcoin-network/pull/464))
+- Track kad queries ([#465](https://github.com/Telcoin-Association/telcoin-network/pull/465))
+- If the network chooses an epoch record other than yours use it. ([#463](https://github.com/Telcoin-Association/telcoin-network/pull/463))
+- Validate publisher peer id matches node record's network key ([#462](https://github.com/Telcoin-Association/telcoin-network/pull/462))
+- Update subscribe for dependabot #14 ([#461](https://github.com/Telcoin-Association/telcoin-network/pull/461))
+- Node record external addr ([#454](https://github.com/Telcoin-Association/telcoin-network/pull/454))
+- Fix cert store delete. ([#460](https://github.com/Telcoin-Association/telcoin-network/pull/460))
+- Dont count duplicate kad records against our put limit. ([#459](https://github.com/Telcoin-Association/telcoin-network/pull/459))
+- Dont allow a bogus vote to derail the certifier. ([#456](https://github.com/Telcoin-Association/telcoin-network/pull/456))
+- Failing to already have or to fetch batches is a fatal error. ([#458](https://github.com/Telcoin-Association/telcoin-network/pull/458))
+- Break CommitteeFixture and related structs out of tn-test-utils. ([#455](https://github.com/Telcoin-Association/telcoin-network/pull/455))
+- Use a saturating sub call for a gas calc. ([#453](https://github.com/Telcoin-Association/telcoin-network/pull/453))
+- Cantina 1045: Finish trustless sync. ([#378](https://github.com/Telcoin-Association/telcoin-network/pull/378))
+- Cantina-244 Precursor: Kad uses Peer Manager ([#383](https://github.com/Telcoin-Association/telcoin-network/pull/383))
+- Cantina 3.1.15 (745): Ensure Reported Batch Req/Res from Committee Only ([#382](https://github.com/Telcoin-Association/telcoin-network/pull/382))
+- Cantina 3.1.4 (165): Quorum Waiter Calculations ([#380](https://github.com/Telcoin-Association/telcoin-network/pull/380))
+- Use procs instead of multiple tokio runtimes for a test that sometimes failed. ([#381](https://github.com/Telcoin-Association/telcoin-network/pull/381))
+- Fix a regression in test speed, don't call test_genesis() in loops. ([#379](https://github.com/Telcoin-Association/telcoin-network/pull/379))
+- Cantina 3.1.17 - Block Beneficiary ([#377](https://github.com/Telcoin-Association/telcoin-network/pull/377))
+- Cantina 1045: Add Epoch records and certs to allow trustless syncing. ([#359](https://github.com/Telcoin-Association/telcoin-network/pull/359))
+- Use message size constraints for MissingCertificatesRequest and Missing Batches Request ([#374](https://github.com/Telcoin-Association/telcoin-network/pull/374))
+- Cantina 699: Move KAD into the main consensus DB. ([#373](https://github.com/Telcoin-Association/telcoin-network/pull/373))
+- Initial migration to an application life timed consensus bus. ([#370](https://github.com/Telcoin-Association/telcoin-network/pull/370))
+- Include Issuance contract as explicit precompile ([#364](https://github.com/Telcoin-Association/telcoin-network/pull/364))
+- Outbound Request Channels Race Condition ([#372](https://github.com/Telcoin-Association/telcoin-network/pull/372))
+- **a**: Calculate Batch::size ([#367](https://github.com/Telcoin-Association/telcoin-network/pull/367))
+- Closing Epoch Batch Index ([#366](https://github.com/Telcoin-Association/telcoin-network/pull/366))
+- Catchup Accumulator Rewards ([#365](https://github.com/Telcoin-Association/telcoin-network/pull/365))
+- Catchup accumulator `blockHeight` ([#363](https://github.com/Telcoin-Association/telcoin-network/pull/363))
+- Return error when gas limits overflow during batch validation ([#362](https://github.com/Telcoin-Association/telcoin-network/pull/362))
+- Sanitize requested max items before allocating memory for vec ([#361](https://github.com/Telcoin-Association/telcoin-network/pull/361))
+- Cantina 74 + 845 ([#360](https://github.com/Telcoin-Association/telcoin-network/pull/360))
+- Cantina-364, Do not allow base_fee_per_gas on Batches to be None. ([#355](https://github.com/Telcoin-Association/telcoin-network/pull/355))
+- Update iteration count for PBKDF2 encryption ([#358](https://github.com/Telcoin-Association/telcoin-network/pull/358))
+- Support bls precompiles ([#354](https://github.com/Telcoin-Association/telcoin-network/pull/354))
+- Cantina-340, make committee formation less brittle. ([#356](https://github.com/Telcoin-Association/telcoin-network/pull/356))
+- Remove abort on panics for release/dev cargo profiles ([#357](https://github.com/Telcoin-Association/telcoin-network/pull/357))
+- Update docs ([#352](https://github.com/Telcoin-Association/telcoin-network/pull/352))
+- Compose updates ([#350](https://github.com/Telcoin-Association/telcoin-network/pull/350))
+- Update testnet configs ([#351](https://github.com/Telcoin-Association/telcoin-network/pull/351))
+- Tweak epoch code to hopefully avoid some races. ([#348](https://github.com/Telcoin-Association/telcoin-network/pull/348))
+- Config readme ([#335](https://github.com/Telcoin-Association/telcoin-network/pull/335))
+- Batch builder readme ([#332](https://github.com/Telcoin-Association/telcoin-network/pull/332))
+- Fix local testnet script.
+- Epoch Boundary E2E Test ([#344](https://github.com/Telcoin-Association/telcoin-network/pull/344))
+- Add base-fee recipient
+- Make fmt
+- Make clippy
+- Use typed clap CLI API
+- Make clippy
+- Set base fee recipient and consensus registry owner to governance safe precompile by default
+- Update submodule commit
+- Add base fee recipient to test assertions
+- Add governance safe genesis precompile with TEL balance for gas
+- Added chain config readme.
+- Replace rpc lib and tweaks to restart tests.
+- Readme addition
+- Add the ability to add accounts at genesis from a yaml file.
+- PR feedback.
+- Connect block rewards to epoch closing system call.
+- Use multi addrs now instead of host/port settings for p2p.
+- Fix compile, broken non-conflicting merge.
+- Use correct specific network key for node records ([#340](https://github.com/Telcoin-Association/telcoin-network/pull/340))
+- Close epochs unit test ([#336](https://github.com/Telcoin-Association/telcoin-network/pull/336))
+- Network Configuration ([#337](https://github.com/Telcoin-Association/telcoin-network/pull/337))
+- Rework p2p network configs.
+- Shadow RPC cli options from Reth to only provide a subset.
+- Refactor CLI chain/genesis and remove old adiri for a new one.
+- Add a check to restart tests for basefee ditribution.
+- Batch validator readme ([#333](https://github.com/Telcoin-Association/telcoin-network/pull/333))
+- Move batch-builder and batch-validator out of execution dir ([#331](https://github.com/Telcoin-Association/telcoin-network/pull/331))
+- Sort validator array before close epoch - shuffle test passing ([#330](https://github.com/Telcoin-Association/telcoin-network/pull/330))
+- Put the basefee address in a global to work around Reth lib issues.
+- PR feedback- better accumulator sync.
+- PR (previous) feedback.
+- Update comment.
+- Update the base fee on sync.
+- Sync the gas accumulator on a restart.
+- Update tn contracts ([#327](https://github.com/Telcoin-Association/telcoin-network/pull/327))
+- Allow the basefee address to be set on genesis.
+- Upgrade reth ([#319](https://github.com/Telcoin-Association/telcoin-network/pull/319))
+- Fmt
+- Clippy
+- Cleanup reth and fix faucet test
+- Remove packages
+- Upgrade reth v1.4.8 - use rev key for libp2p - make test passing
+- Update secp256k1 to latest and remove rand_08
+- Compilation checkpoint - all methods impl
+- Commit to transfer to laptop due to power outage
+- Cleanup payload builder to reduce duplicate code
+- Tn-engine it tests passing
+- Combine payload builder branches
+- Process fully executed blocks to storage after consensus output execution
+- Update tests - fix workspace conflicts with rand - working through tn-reth tests
+- Compilation checkpoint
+- Major refactor - upgrade again to 1.4.7
+- Tn block execution ctx
+- Upgrade reth
+- Implement infrastructure for setting base fees per worker per epoch.
+- Rename ValidatorInfo and validator.yaml to reflect they are for a node not just a validator.
+- Allow the basefee address to be set on genesis.
+- PR feedback.
+- Blind faucet fixes.
+- Blind faucet fixes.
+- Blind faucet fixes.
+- Fixed faucet?
+- Allow chain id to be set from command line during chain commisioning.
+- Feedback and faucet fixes.
+- Got tests worxking again with new genesis ceremony.
+- Fix local testnet by cleaning up genesis.
+- Removed commented code.
+- Epoch Transition ([#315](https://github.com/Telcoin-Association/telcoin-network/pull/315))
+- Add a tn RPC namespace with a couple of functions, cleanup some human readable serde.
+- PR feedback.
+- Fixed a task restart on epoch rollover.
+- Epoch Dirs ([#313](https://github.com/Telcoin-Association/telcoin-network/pull/313))
+- Simplify the peer count.
+- Fill out some the RPC endoint data (issue 189).
+- Include non-critical tasks for task manager ([#312](https://github.com/Telcoin-Association/telcoin-network/pull/312))
+- Feedback, better empty task management.
+- Fix soem races in task namager.
+- Remove Rocks as a consensus DB backend option.
+- Disable Reth metrics, just our own metrics now.
+- Spawn all tasks through `TaskManager`s ([#311](https://github.com/Telcoin-Association/telcoin-network/pull/311))
+- Add a persistant kademlia store.
+- Keep engine alive across epochs ([#310](https://github.com/Telcoin-Association/telcoin-network/pull/310))
+- Remove unused code in consensus executor ([#307](https://github.com/Telcoin-Association/telcoin-network/pull/307))
+- Node records for peers ([#293](https://github.com/Telcoin-Association/telcoin-network/pull/293))
+- Remove Circular Deps for`test-utils` ([#305](https://github.com/Telcoin-Association/telcoin-network/pull/305))
+- Update tn-contracts submodule to v1.0
+- Make fmt
+- Unused import
+- Roll with the precision loss
+- Extraneous debug line
+- Make fmt
+- Make clippy
+- Add second clap parser fn with divisor to preserve decimal precision
+- Use clap default_value rather than default_value_t
+- Improve clap parser, use parse_ether in tn-reth tests
+- Make fmt
+- Make clippy
+- Replace cumbersome match with linear usage of ? operator, make fmt
+- Make a clap_u232_parser wrapper available within tn-reth
+- Clean up u232 usage with modular clap parser
+- Improve json str value fetch name
+- Extraneous println
+- Unwrap or default causing bug
+- Make clippy
+- Make fmt
+- Make clippy
+- Make clippy
+- Update faucet tests with consolidated json fn
+- Update tn-contracts to v1.0, genesis using singletons, consolidate json functions into one
+- Update Registry interface, use singleton for tests
+- Switch blake2 digest for blake3.
+- Add back rpc to some tests.
+- Remove unused worker cache trasnactions address.
+- PR Feedback, Be explicit about reth arg defaults.
+- Remove reth args that are confusing or broken.
+- Fix pbserver test.
+- Read committee from on-chain state ([#292](https://github.com/Telcoin-Association/telcoin-network/pull/292))
+- Spawn worker tasks with task spawner ([#291](https://github.com/Telcoin-Association/telcoin-network/pull/291))
+- Dont restrict the tnx pub/sub.
+- PR feedback.
+- Update tokio and reqwest ([#290](https://github.com/Telcoin-Association/telcoin-network/pull/290))
+- Separate Task Managers for Epoch/Node Related Tasks ([#277](https://github.com/Telcoin-Association/telcoin-network/pull/277))
+- Can customize where base fees go now.
+- Observer tests and config.
+- Remove outdated note.
+- Bring over any pre-allocated accounts during genesis.
+- Put TXNs on a seperate topic and remove restrictions.
+- Cleanups.
+- Initial code to publish tnxs if not a CVV.
+- PR feedback.
+- Initial addition of kademlia to netwrok for peer discovery.
+- Fix float precision loss
+- Make clippy && fmt
+- Bring tn-contracts InterchainTEL & json changes through protocol
+- Rename RWTEL -> InterchainTEL
+- Make clippy, fmt
+- Fix floating point precision issues, update tn-contracts commit with better deployments.json structure
+- Epoch Manager ([#273](https://github.com/Telcoin-Association/telcoin-network/pull/273))
+- Fix a mistake that got checked into Makefile.
+- If you dont want a passphrase have to be explicit.
+- Tn-contracts update
+- Contracts from merge.
+- Couple simple tests for keyconfig.
+- PR feedback, and minor refactor to highlight wrap/unwrap code.
+- Fix restart tests.
+- Dont be so agressive when missing the passphrase env var.
+- Add CLAP option to specify where the key passphrase comes from and include stdin.
+- Read the passphrase from the env and then remove it as the first thing in main.
+- Added passphrase entry at startup support.
+- Initial BLS keywrapping (encrypting).
+- Add genesis CLI arg to optionally pass genesis config file
+- Add genesis CLI arg to optionally pass genesis config file
+- Include interchain token service in genesis as precompiles
+- Include genesis in local testnet script
+- Copy genesis json to validator dirs
+- Make clippy
+- Make fmt
+- Only spawn block on runtime if one doesn't already exist - ie normal CLI operations
+- Only spawn runtime if outside of tests
+- Spawn tokio runtime for create-committee to execute pre-genesis
+- Tokio async error due to reth execution env
+- Refactor deployments json fetching, still cargo manifest error
+- Set registry owner in local-testnet script and update submodule to master
+- Fix mismatched help_heading and extraneous comment
+- Make fmt
+- Make clippy
+- Make fmt
+- ITS precompiles in genesis, tests passing
+- Submodule update ([#264](https://github.com/Telcoin-Association/telcoin-network/pull/264))
+- Retry test fixes.
+- Add precompile yaml deserialization test, update tn-contracts commit
+- Consume all precompile genesis accounts within create_committee:execute()
+- Remove commented out code
+- Update faucet tests
+- Genesis it test passing
+- Resolve bytecode/deployted_bytecode difference
+- Bump
+- Update submodule - initialization still failing
+- Update sol to use latest config
+- Construct genesis from committee
+- WIP
+- Upgrade rust to 1.86
+- Update to 1.86
+- Flag Epoch Boundary in Consensus ([#262](https://github.com/Telcoin-Association/telcoin-network/pull/262))
+- PR feedback, more restart tweaks.
+- Conclude Epoch System Call ([#259](https://github.com/Telcoin-Association/telcoin-network/pull/259))
+- Try to improve restart test reliablilty.
+- Allow a node to not be validator (no authiority).
+- PR feedback.
+- Some dir cleanup/docs via code.
+- Fix faucet test 3?
+- Fix faucet test 2?
+- Fix faucet test?
+- PR feedback.
+- Cleanups.
+- Clippy
+- Fmt
+- P2P Network: Peer Manager ([#247](https://github.com/Telcoin-Association/telcoin-network/pull/247))
+- Support Custom Network Config ([#249](https://github.com/Telcoin-Association/telcoin-network/pull/249))
+- Initial refactor to contain Reth in its own crate.
+- Final small cleanups to committee refactor.
+- PR feedback, remove an extra collect.
+- Clippy.
+- PR feedback, stake -> voting power.
+- Removed old todo and fmt.
+- V0.3.2 adiri patch ([#246](https://github.com/Telcoin-Association/telcoin-network/pull/246))
+- Dont need auth id to peer id mappings anymore.
+- Fixed tests, removed Copy from AuthorityIdentifier to reduce size, clippies.
+- Fixed a clippy.
+- Refactor authority id to be a peer id.
+- Rename Stake to VotingPower
+- Add interiour mutablility to Committee so we can update for a new epoch with the current cloning approach.
+- Bump some versions.
+- Tweak SignatureVerificationState.
+- Finish removing fast crypto.
+- Replace fastcrypto BLS keys by using the BLST crate directly.
+- PR Feedback, save a seed for network keys in a file to allow easy changing.
+- Save and load the primary BLS key in base 58 format.
+- Misc refactors and moved network keys to new native libp2p.
+- PR feedback, dont check gossip source because it is already checked at lower level.
+- Publish and use batch gossip.
+- Fix some new clippies from latest nightly.
+- Streamline batch requesting.
+- Tweak batch request algorithm.
+- Fixed a format issue.
+- PR Feedback.
+- Output logs for restart tests.
+- Fetch batch returns an error now.
+- Batch fetching agnostic to peers now.
+- Issue 221, make BatchProvider Worker.
+- Reworked batch fetching to work with NVV and observer nodes.
+- Use triats instead of wrappers for DB functions.
+- Extra comment
+- For non-cvvs we wait to see a signed cert before finalizing a block.
+- Better syncing with network gossip.
+
+## [v0.3.1-adiri] - 2025-02-26
+### Other
+- Configurables for Deployments ([#228](https://github.com/Telcoin-Association/telcoin-network/pull/228))
+- Publish consensus headers headers and start using it.
+
+## [v0.3.0-adiri] - 2025-02-24
+### Bug fixes
+- Fix typo ([#219](https://github.com/Telcoin-Association/telcoin-network/pull/219))
+### Tests
+- Tests passing
+### Reverts
+- Revert previous.
+- Revert unnecessary genesis hash change
+### Other
+- Update dockerfile to fix open-ssl error - rm jemalloc - fix bin versioning ([#226](https://github.com/Telcoin-Association/telcoin-network/pull/226))
+- Agnostic txs worker batch ([#225](https://github.com/Telcoin-Association/telcoin-network/pull/225))
+- Verify incoming certs when downloading consensus headers.
+- Added number back to primary header, start to validate consensus header certs on catch up.
+- Drop the exec block number from the sub dag.
+- Add extra 32-byte field to consensus header/output ([#223](https://github.com/Telcoin-Association/telcoin-network/pull/223))
+- Move database traits to a new module in `tn_types`. ([#218](https://github.com/Telcoin-Association/telcoin-network/pull/218))
+- Engine cleanup ([#217](https://github.com/Telcoin-Association/telcoin-network/pull/217))
+- PR feedback from last tqwo PRs.
+- Fixed a test.
+- Clippy, removed a couple of expects.
+- Clippy
+- Refactors around the new networking.
+- Fix faucet test?
+- Remove some leftover sleeps.
+- PR feedback.
+- Fix restarts, add back some tests.
+- Refactor the worker network to libp2p- still WIP.
+- Rebuild `Synchronizer` ([#208](https://github.com/Telcoin-Association/telcoin-network/pull/208))
+- Missed some anemo code generation.
+- Fixed voting req/res.
+- Remove unused anemo code for Primary.
+- Cleanep some tests but restarts are getting odd wrong responses...
+- Cleanups.
+- Initial port pf primary to libp2p- still WIP.
+- Deal with some todo!
+- PR feedback- use the existing PrimaryNetwork.
+- Certificates aggregator to reduce synchronizer logic ([#206](https://github.com/Telcoin-Association/telcoin-network/pull/206))
+- Separate consensus round watch channels into separate commit round updates and gc round updates ([#205](https://github.com/Telcoin-Association/telcoin-network/pull/205))
+- Initial framework for hooking up the new libp2p core into consensus.
+- Remove comments from state-sync/Cargo.toml
+- Libp2p impl ([#183](https://github.com/Telcoin-Association/telcoin-network/pull/183))
+- Got new state sync tasks working.
+- Missed a last header set.
+- Added state-sync crate and refactored subscriber more to use it.
+- Return the full max consensus header not just some numbers.
+- Refactor subscriber to support future error handling and libp2p migration.
+- PR feedback
+- Tweaks to allow a start with a fresh DB.
+- Fix doc test.
+- Upgrade reth: v1.1.5 ([#188](https://github.com/Telcoin-Association/telcoin-network/pull/188))
+- Run some tests that require credentials during attestation.
+- Fixed a swallowed error.
+- Fixed a synchronizer panic.
+- Clean up restarts, panic really panics now- issues.
+- Move to a full node restart on mode change.
+- PR feedback
+- TN contrats hash fix.
+- PR feedback.
+- Removed leftover comment.
+- Refactor proposer from raw future to async loop.
+- WIP, initial attempt to toggle back to an active cvv.
+- Update security.md with new guidelines ([#182](https://github.com/Telcoin-Association/telcoin-network/pull/182))
+- Contributor guidelines ([#175](https://github.com/Telcoin-Association/telcoin-network/pull/175))
+- Readme bug fix and misc additions
+- Fix readme visibility override for GH and add blurb for supported OS platforms
+- Document submodule update instructions
+- Ignore some faucet tests so cargo test works for non-maintainers.
+- Docker Compose for local testnet ([#177](https://github.com/Telcoin-Association/telcoin-network/pull/177))
+- Contracts
+- Update the local test script for public use.
+- Primary network address overwrite + cleanup unwraps ([#173](https://github.com/Telcoin-Association/telcoin-network/pull/173))
+- Remove old print statements - switch to tracing::debug in some casees ([#171](https://github.com/Telcoin-Association/telcoin-network/pull/171))
+- Rename worker blocks ([#170](https://github.com/Telcoin-Association/telcoin-network/pull/170))
+- Better support for claiming ports on host ([#169](https://github.com/Telcoin-Association/telcoin-network/pull/169))
+- Updates for licenses and attributions ([#168](https://github.com/Telcoin-Association/telcoin-network/pull/168))
+- PR feedback
+- Fix a mode check.
+- Round tweaks.
+- Consensus Network: libp2p ([#147](https://github.com/Telcoin-Association/telcoin-network/pull/147))
+- This should clean up restarts a lot.
+- Use epoch and round to create the new block nonce.
+- PR feedback
+- Check consensus output to make sure we are building on our chain not a fork.
+- PR feedback, prime round watches early.
+- Check the block we are building on for consensus headers.
+- Fmt.
+- Refactor synchronizer.
+- Initial certifier refactor.
+- Fix to restart tests?
+- PR feedback.
+- Cover a NVV restart edge case that was causing restart delayed random errors.
+- PR feedback.
+- Remove an Option.
+- PR feedback.
+- Fmt.
+- Determine node mode (CVV/NVV) on start and manage tasks with the mode.
+- `NetworkResult` type ([#141](https://github.com/Telcoin-Association/telcoin-network/pull/141))
+- Gossip network: Validate Messages ([#139](https://github.com/Telcoin-Association/telcoin-network/pull/139))
+- WIP
+- Better task manager.
+- Much more solid, still cleaning.
+- WIP, new task manager compiles, kinda works (but not completely).
+- Decouple engine from primay and worker at top level.
+- Add initial task manager.
+- Libp2p Gossip Network ([#134](https://github.com/Telcoin-Association/telcoin-network/pull/134))
+- WIP, cleaner but still needs libp2p and better task management to be good.
+- WIP, but improving.
+- Embedd genesis contract files so the binary can start.
+- Sealed Worker Block ([#132](https://github.com/Telcoin-Association/telcoin-network/pull/132))
+- WIP, tweaks.
+- WIP, hacked up mess but moving to CVV/NVV split.
+- WIP, improvements to sync.
+- WIP, initial weak consensus sync.
+- Mv Network / Network-Types ([#129](https://github.com/Telcoin-Association/telcoin-network/pull/129))
+- TN RPC Namespace ([#128](https://github.com/Telcoin-Association/telcoin-network/pull/128))
+- WIP, started sync of consensus chain.
+- Modify intent scope ([#127](https://github.com/Telcoin-Association/telcoin-network/pull/127))
+- Engine to primary network interface ([#125](https://github.com/Telcoin-Association/telcoin-network/pull/125))
+- Primary/Worker WAN ([#126](https://github.com/Telcoin-Association/telcoin-network/pull/126))
+- PR feedback.
+- PR feedback, refactored how the consensus chain is built.
+- Reorg Dirs ([#123](https://github.com/Telcoin-Association/telcoin-network/pull/123))
+- Store the committed sub dag directly in the consesus header.
+- Fmt.
+- WIP, cleanups and fix some tests needed.
+- Remove comments.
+- Max worker block size and gas are functions now
+- Remove WorkerBlock::header()
+- Resolve extraneous path
+- Make fmt
+- Use new tn-contracts artifact dir, update pinned submodule commit
+- Add & document foundry build command for gitmodule flow
+- Add ConsensusRegistry to genesis
+- Make fmt
+- Remove leftover deprecation comment
+- Fix a path?
+- Update pinned tn-contracts commit
+- Fix path discrepancies
+- Undocify more titles
+- Anonymize ellided lifetime and undocify titles
+- Fmt again
+- Remove deprecated contract artifacts
+- Make fmt
+- Clippy move errors
+- Faucet json var name
+- Import missing solc struct
+- Import missing alloy macro
+- Make clippy
+- Make clippy
+- Make fmt
+- Remove deprecated contract artifacts
+- Specify json/yaml fmt for config load/store
+- New NetworkGenesis method - storing genesis as yaml - need to support json in store path
+- Update README with tn-contracts submodule info
+- Read yaml and json files for contract info: ready for merge with main
+- WIP merge from main
+- Add submodule commands and use CARGO_MANIFEST_DIR for submodule access
+- WIP merge from main
+- Misc oversights
+- Make fmt
+- Make clippy
+- Make clippy
+- Make clippy
+- Make clippy
+- Make clippy
+- Make clippy
+- Make clippy
+- Make fmt
+- Update genesis hash to reflect registry storage
+- Add tn-contracts submodule, test assertions for registry genesis
+- Improve code structure
+- Write ConsensusRegistry storage at genesis, use new ValidatorFlags struct and schema to generate them
+- WIP insert validator pubkeys, overwriting foundry flags
+- Flesh out construct_registry_genesis_accounts to read from Foundry utility output, WIP conditionally overwriting BTreeMap with info known at genesis time
+- Scaffolding for setting consensus registry storage at genesis using Foundry util
+- Test for adding ConsensusRegistry to genesis; update create_eip1559() to accept gas limit
+- Fix revert caused by duplicate BLS, ed25519, ecdsa keys
+- Move genesis test & utils to telcoin-network binary
+- Bug with alloy-sol abi encoding of arrays containing Solidity structs
+- Move ConsensusRegistry genesis test into narwhal-test-utils
+- Delete unused contract ABIs and add ConsensusRegistry runtimecode
+- WIP test for ConsensusRegistry deployment at genesis
+- Fmt.
+- Remove ommers and worker block provides a Header not SealedHeader.
+- PR feedback, us a function for max block gas.
+- Remove unneeded validations from worker blocks.
+- Fix a couple of tests.
+- Remove sealed header from worker block.
+- Moving to consolidated channels. ([#111](https://github.com/Telcoin-Association/telcoin-network/pull/111))
+- Oops.
+- Docs, add another channel.
+- PR feedback.
+- Finish move of tn-types.
+- Fix tests (including a deadlock bug).
+- Expand consensus_bus, some tests hanging...
+- WIP, moving to consilidated channels.
+- PR feedback, adjust key names.
+- Streamline the request_signature function.
+- PR feedback.
+- Keep the primary private key private.
+- More config.
+- More config.
+- More config.
+- Clippies, some comments.
+- Fix to cert order test.
+- Updates for latest adiri deployment ([#95](https://github.com/Telcoin-Association/telcoin-network/pull/95))
+- Refactor/block builder ([#102](https://github.com/Telcoin-Association/telcoin-network/pull/102))
+- Oops.
+- Test tweaks- getting ports better.
+- Siill WIP, tests a lot better.
+- WIP, compiles but failing tests.
+- WIP, bin compiles not tests.
+- Restart Tests  ([#104](https://github.com/Telcoin-Association/telcoin-network/pull/104))
+- Attest_block -> verify_block
+- PR feedback.
+- Error comment/cleanup.
+- Channel to seal blocks.
+- WIP, tests compile and pass now.
+- WIP, refactor block sealing/quorum.
+- Added a test to the new Notifier.
+- Refactor quorum waiter, tweaks and docs.
+- Remove dead code.
+- Primary Aggregators ([#93](https://github.com/Telcoin-Association/telcoin-network/pull/93))
+- Refactor block_provider with new shutdown notifier.
+- Mutex the IT tests.
+- Make fmt
+- Update sealed header values for genesis in tests
+- Add faucet (StablecoinManager proxy) to genesis funding list
+- PR feedback.
+- Update CI GitAttestationRegistry contract address
+- Use thread not task to persist consensus output.
+- Comment, typo.
+- Catch a few more places that a restart proc chould get lest behind.
+
+## [v0.2.0-adiri] - 2024-09-20
+### Bug fixes
+- Fix docker warning and add TAG to makefile for convenience ([#55](https://github.com/Telcoin-Association/telcoin-network/pull/55))
+### Reverts
+- Revert unnecessary change suggested by clippy nightly bug
+### Other
+- Remove sol parser patch in main cargo toml ([#92](https://github.com/Telcoin-Association/telcoin-network/pull/92))
+- Organize worker network handles ([#91](https://github.com/Telcoin-Association/telcoin-network/pull/91))
+- Refactor certifier.
+- Primary Proposer ([#82](https://github.com/Telcoin-Association/telcoin-network/pull/82))
+- Typo
+- Added a comment.
+- Persist consensus.
+- Organize Primary Handlers ([#86](https://github.com/Telcoin-Association/telcoin-network/pull/86))
+- Consensus Tracing ([#85](https://github.com/Telcoin-Association/telcoin-network/pull/85))
+- Fix bench that slipped through.
+- Make fmt
+- Replace bcs with tn-types::encode
+- Remove bcs
+- Diff in nightly vs lts fmt: cargo +nightly fmt -- --check
+- More clippy fixes for warning: field assignment outside of initializer for an instance created with Default::default()
+- Make clippy: unresolved bcs crate and field assignment outside of initialize warning
+- Make clippy
+- Delete tel-only test, make fmt
+- Remove unused test helpers
+- Completed faucet tel&xyz test: fixed indefinite hanging and ensure faucet stablecoin functionality
+- WIP stablecoin test
+- Resolve e2e test indefinite hang bug by setting state at genesis
+- Paired down storage deps.
+- Remove cert store cache (DB layer handles this now).
+- Fix test with cert store GC.
+- Added GC to the Database layer.
+- Clean up some noisy logs during testing.
+- PR feedback.
+- PR feedback.
+- PR feedback.
+- Add metrics to memdb.
+- Removed some commented code.
+- Fix encoding for DB keys.
+- Switch to bcs (bincode can not handle some encodings).
+- Remove deps from typed-store, use serde impl in types.
+- This arc needs to drop at a count of 1.
+- Fix mdbx metric names.
+- Add metrics to mdbx db backend.
+- Removed an unused dep.
+- Removed an unused dep.
+- Missed a versioned type...
+- Add compaction to the DB trait and use in the layered DB background thread (for redb).
+- Fix a consensus DB save issue (caused restart issues). ([#70](https://github.com/Telcoin-Association/telcoin-network/pull/70))
+- Replace Batch with Block in consensus.
+- Fix faucet test.
+- Track pending worker blocks ([#60](https://github.com/Telcoin-Association/telcoin-network/pull/60))
+- Fix sol! macro cargo conflict  ([#73](https://github.com/Telcoin-Association/telcoin-network/pull/73))
+- Fix issues/make the restart test more robust. ([#68](https://github.com/Telcoin-Association/telcoin-network/pull/68))
+- Make fmt && make clippy
+- Make clippy
+- Delete irrelevant engine test
+- Make fmt
+- Review nits + clippy
+- It test passing!
+- Make fmt
+- Make clippy
+- Make clippy
+- Make clippy
+- Make clippy
+- Successful faucet deployment and storage fetch - indefinite pending grantRole(faucet_role, kms_address) call
+- TESTING UTILITIES
+- Storage fetching fails
+- Construct raw transactions for utility function to fetch contract storage
+- Add a method to fetch the http rpc local address, WIP faucet it test
+- Update stablecoin integration test
+- Make fmt
+- Doc paragraphs too long
+- Add debug crate to faucet.rs
+- Pre-merge main
+- Doc comments too long
+- Make fmt
+- Make fmt
+- Resolve make clippy
+- Make fmt
+- Update faucet contract address: tests passing
+- Add faucet role to kms address, track nonces manually, pending faucet service address update
+- Optimizations
+- Package management: minimize dep imports
+- Tel transfer test passing: resolve issue of differing testnet google KMS key signer for tests by granting faucet role
+- Resolve upgrade bug, finalize test
+- Prettify jsons, not sure why they didn't automatically on save
+- Resolve Alloy::NonceFiller bug with manual mgmt, add admin transfer for create2 since it was set in constructor
+- Resolve issues with onchain transactions- WIP: nonce issue
+- Add arachnid create2 factory deployment via raw single-use tx, extract ugly raw tx bytecode to new artifacts module
+- Cleanup deploy functions with optional Wallet param, add helper function for fetching default signer, fix deployer genesis funding bug
+- Use TransactionFactory defaults to deploy faucet-related contracts, resolve k256<>Secp256k1 overlapping types
+- Implement deploy functions to match onchain environment
+- WIP alloy contract deployment functions
+- Use upgraded faucet contract's new native token functionality
+- Remove versioning from consesus types Votes.
+- Remove versioning from consesus types Certificate.
+- Remove versioning from consesus types Header.
+- Removed some refs to batches and removed some worker dead code.
+- Rename batch.rs -> worker_block.rs.
+- Remove consensus metadata and fix some clippies.
+- Step 1, Batch to WorkerBlock.
+- Update some comments.
+- Fix an issue with consensus DB not always saving.
+- Added an mdbx backend, test reorgs, basic dumb DB bench. ([#67](https://github.com/Telcoin-Association/telcoin-network/pull/67))
+- Clippy Fixes ([#64](https://github.com/Telcoin-Association/telcoin-network/pull/64))
+- More robust restart test.
+- Added an mdbx backend, test reorgs, basic dumb DB bench.
+- PR feedback, remove a commented line.
+- Fix rocks compile.
+- Added a layed (mem on persistant) DB.
+- Add ReDb metrics.
+- Back out the mem db open- something weird with a feature combo (?).
+- Add a in-memory DB back, not using it yet.
+- Removed some cruft.
+- PR feedback, remove Database type constraints from structs.
+- Update CI to reduce timing ([#53](https://github.com/Telcoin-Association/telcoin-network/pull/53))
+- Remove chain id string parsing issue in test-and-attest.sh
+- Fix lifetime issue by passing PathBuf to NodeStorage::reopen() directly rather than reference
+- To manage faucet drip amounts directly onchain, use newly deployed StablecoinManager proxy with bundled faucet functions
+- Add basic CI. ([#35](https://github.com/Telcoin-Association/telcoin-network/pull/35))
+- Use parking lot for the redb wrapper (typed-store).
+- Replace DatabaseType with generics except where reqired at DB creation.
+- Fmt.
+
+## [v0.1.1-adiri] - 2024-08-15
+### Other
+- Clippy fixes
+- Clean up for faucet PR and fix TRANSFER_AMOUNT parsing in faucet test file
+- Remove unused faucet_address code & comments
+- Configure faucet infra to use contract addresses from RPC context
+- PR feedback.
+- Rename the redb database file.
+- Clippies.
+- Ealier PR feedback, clean up the redb/rocksdb feature flag interaction.
+- Port RocksDB to new interface and simplify.
+- Remove the old DB traits, rocks is currently broken.
+- Interim, new and old DB traits.
+- Added some unit tests for redb.
+- Back out broken CI, make rocksdb a feature flag.
+- Initial redb, rocks commented out for now with CI on (WIP).
+- Move rocks metrics into rocks package.
+- Rename a couple things to make more sense with DB agnostic.
+- Add commit back to consensus db.
+- YOLO errors for the Map trait to remove rocks dep.
+- Replace TestDB with MemDB, it sorts keys and is a lot simplier.
+- WIP, initial DB trait port, all tests not passing (TestDB has some issues).
+- Test improvements (more reliable).
+- Use random RPC ports, can start in faucet mode when not configured.
+- Add a restart integration test, does not play nice with other tests yet.
+
+## [v0.1.0-adiri] - 2024-07-27
+### Features
+- TN Engine ([#11](https://github.com/Telcoin-Association/telcoin-network/pull/11))
+- Payload Attributes for Consensus Output ([#10](https://github.com/Telcoin-Association/telcoin-network/pull/10))
+- Broadcast ConsensusOutput ([#14](https://github.com/Telcoin-Association/telcoin-network/pull/14))
+- Dockerize ([#35](https://github.com/Telcoin-Association/telcoin-network/pull/35))
+### Bug fixes
+- Fix batch validator unit tests - need better testing in follow up PR
+- Fix certificate fetcher test - added notes for future understanding
+- Fix bullshark test_determinism - seed authority accounts from rng - seed tx factory from rng
+- Fixing compilation errors - extend error types to support payload building
+- Fix basefee - working through prevrandao since it must be consistent between batch/block execution
+- Fix vote accepted for missing parents primary unit test - still getting metrics error AlreadyReg in typed store - these tests consistently failing
+### Documentation
+- Batch Design ([#9](https://github.com/Telcoin-Association/telcoin-network/pull/9))
+- Docs
+### Tests
+- Test to make sure max_round shuts down engine - convenience method for retrieving block executor from execution engine
+- Test duplicate transactions ignored
+- Test method for versioned metadata to set sealed header - test batch execution method updating and sealing header from dummy transactions
+- Executing Consensus Output (failing) ([#7](https://github.com/Telcoin-Association/telcoin-network/pull/7))
+### Build, CI and chores
+- Build header - update payload attributes - still need to handle withdrawals
+- Upgrade reth beta.9 ([#12](https://github.com/Telcoin-Association/telcoin-network/pull/12))
+- Upgrate reth beta-7 ([#8](https://github.com/Telcoin-Association/telcoin-network/pull/8))
+### Other
+- Update dockerfile to rust:1.79 ([#32](https://github.com/Telcoin-Association/telcoin-network/pull/32))
+- Robust batch validation error ([#31](https://github.com/Telcoin-Association/telcoin-network/pull/31))
+- Updates for adiri deployment ([#30](https://github.com/Telcoin-Association/telcoin-network/pull/30))
+- Update last round of consensus ([#29](https://github.com/Telcoin-Association/telcoin-network/pull/29))
+- Make sure to read finalized_block_num from the DB not an in memory watch on startup.
+- Add finalized state to unit tests ([#27](https://github.com/Telcoin-Association/telcoin-network/pull/27))
+- Remove file that was got re-added.
+- Fix a temp that sudenly became an issue.
+- Re-remove some unused deps (from merge).
+- Update docs with decisions for repurposing block data
+- Remove redundant hashing of batch digests in consensus output
+- Clarify batch/block
+- Cleanup engine inner
+- Remove reth-stages-api
+- Cleanup engine and fmt
+- Clippy fix
+- Make fmt
+- Cleanup payload builder
+- Cleanup engine lib and unit tests
+- Realization that finalized block number is only updated after entire output executed, so impossible to have inconsistent finalized block number
+- Working through recovering last executed output
+- Cleanup
+- Remove execution executor - new engine only
+- Rename evm to evm_executor for clarity
+- Update to use evm config
+- Store evm config on execution node
+- Add evm config generic to execution node
+- Update genesis to start with min base fee
+- Empty payload unit test
+- Cleanup main test
+- Resolve some warnings from clippy fix
+- Clippy
+- Fmt
+- Cleanup
+- Assert all block fields - test passing for two rounds built off genesis
+- Update tests - add methods to consensus output
+- Several assertions - test passing
+- Initial test passing - batches executing
+- Breakup seeded genesis for batches into smaller function call - update test
+- Optional parameters for executing test batch
+- Working through tests - new certificate test method
+- Cleanup - fix tests
+- Check for max_round and terminate early - measures sub dag index, not block height
+- Async optimization to prevent blocking task from hogging runtime
+- Add Tasks generic to spawn blocking
+- Cleanup logic
+- Update loop logic for engine's poll fn
+- Move debug impl above tests
+- Impl debug for engine - nonexhaustive
+- Mix hash for empty output - not easy to manipulate
+- Initial attempt at mix hash - possible for node operators to manipulate
+- Decision on mix hash - update docs
+- Clippy
+- Update tests
+- Cleanup
+- Fmt
+- Compilation checkpoint - using sealed header
+- Consolidate approach for empty payload builder - time to fix mix hash
+- Use sealed header instead of block num hash - pass in used values to reduce memory usage
+- Rethink parent block as sealed header or look up using provider
+- Need to consider removing batch block from payload attributes - but where does mix hash come from?
+- Initial attempt at building empty payload - need to consolidate logic for DRY code
+- Quick thought on storing pool for workers after batch-builder for accessing during tests
+- Thoughts on empty payload execution - consider db read to pull canonical sealed header based on parent_block arg to reduce confusion - currently some values come from sealed header and parent, but all could come from sealed header
+- Ensure correct data in payload_builder - new test for empty payload - currently failing because loop skips
+- Add assertion and update comments
+- Set finalized block, safe block, and update chain info after successfully extending canonical tip and committing to db
+- Initial unit test - passing, but bad batch data
+- Compilation checkpoint - started unit test in engine lib
+- Thinking through channel shutdown - 'last_output loop is wrong - need a better approach
+- Update ommers in sealed block
+- Fmt
+- Last executed output recovering
+- Sanity check before trying provider generic
+- Update loop results
+- Return sealed block with senders for blockchain tree
+- Return result in future
+- Update note for checking the last executed output - use blockchain tree to prevent redundant rewrite
+- Payload builder to engine
+- Impl future for executor engine - need to migrate payload methods
+- Error and handle mods - working through new() and what fields to keep
+- Add bt to executor, but decided to build execution engine from scratch
+- Blockchain tree should be good to go for extending the canonical tip - layout some pseudocode
+- Batch digests on consensus output
+- Pass batch digests as part of consensus output
+- Bump
+- Call execute consensus output in build and execute 2 - need to think through how to pass multiple blocks to engine
+- Compilation checkpoint - use block numhash for parent block - consolidating used variables
+- Start creating build and execute v2
+- Formatting
+- Updates to payload builder
+- New section for EIPs - mostly todos
+- Inefficient approach to multiple loops for batch digests, headers, and sealed blocks with sender to get unstuck
+- Set extra data to batch digest - notes for tomorrow
+- Update dependencies to use reth v1.0.0
+- Cleanup execution
+- Additional note on prevrandao
+- More progress - need to investigate how to properly set base fee from batch to canonical block execution env
+- Get withdrawals from batch. update notes with todos
+- Make fmt
+- Update PayloadBuilderAttributes trait methods
+- Take ownership instead of references
+- Ommers and ommers root - update docs with more considerations
+- Update docs
+- Cleanup
+- Cleanup
+- Update docs for values used in final execution
+- Bump
+- New loop through batch transactions
+- Use sealed block from batch instead of batch for execution layer
+- Working through recovering batch transactions with signers
+- Recover transaction signed
+- Working through payload builder - stopping point - broken
+- Impl PayloadBuilderAttributes methods
+- Working through payload builder attributes
+- Update hasher for consensus output
+- Start for build args
+- Execution block data updated in docs
+- Add payload builder impl for executor
+- Back to reth release.
+- Adjust local start params, back to dev and discovery off to avoid spamming eth main nodes. ([#26](https://github.com/Telcoin-Association/telcoin-network/pull/26))
+- Local start back to info logs.
+- Use a local reth and update to current main (for next release).
+- PR feedback.
+- Change the metric used in test_connectivity because rtt can be 0 sometimes.
+- More cleanups, start consensus metrics if asked.
+- PR feedback.
+- Put primary metrics in its own crate, cleanups.
+- Extend the new prometheus patterns.
+- Leader Schedule Test Failing ([#3](https://github.com/Telcoin-Association/telcoin-network/pull/3))
+- Change prometheus setup so tests should pass.  Pattern needs extending.
+- Nightly Clippy ([#20](https://github.com/Telcoin-Association/telcoin-network/pull/20))
+- Fix a path in a test.
+- PR feedback, fix the faucet test.
+- Clear nightly clippies.
+- PR feedback.
+- Store Genesis instead of ChainSpec in Config.
+- Another missed code path.
+- Missed a ChainSpec somehow and we do need gcloud for faucet testing.
+- Manual Serde implementation because ChainSpec does not play with Serde anymore...
+- Update to reth 1.0.0, fix stable clippies, need to fix ChainSpec serde...
+- PR feedback.
+- PR feedback.
+- Stabilize Formatting ([#16](https://github.com/Telcoin-Association/telcoin-network/pull/16))
+- Auto clippy fixes.
+- Remove the config crate since all the things moved to types.
+- Allow a well funded test account to be added when initializing a new network (for dev testing).
+- Comments for makefile
+- Missing quote
+- Update makefile
+- Remove unused deps
+- Use reth-provider in tn-types, remove as optional dependency
+- Remove unused deps
+- Reth-provider added to tn-types, remove optional
+- Remove txs and update make test
+- Rename test_fetch_certificates_v2_handler to just _handler using v1 certificate
+- Cleanup debug statements
+- Restore leader schedule test - separate PR
+- Add idea
+- Qos idea - special worker
+- Primary header threshold still measured in MS, but consensus working in Sec
+- Upgrade to reth beta ([#76](https://github.com/Telcoin-Association/telcoin-network/pull/76))
+- Bridging idea ([#75](https://github.com/Telcoin-Association/telcoin-network/pull/75))
+- BatchValidator idea: add valid txs to own pool ([#74](https://github.com/Telcoin-Association/telcoin-network/pull/74))
+- Swap order of params passed to faucet contract's drip method ([#70](https://github.com/Telcoin-Association/telcoin-network/pull/70))
+- Use google artifacts registry ([#69](https://github.com/Telcoin-Association/telcoin-network/pull/69))
+- Faucet/stablecoin support ([#68](https://github.com/Telcoin-Association/telcoin-network/pull/68))
+- Docker Compose - Faucet ([#67](https://github.com/Telcoin-Association/telcoin-network/pull/67))
+- Add +1 to system time if it equals the parent ([#66](https://github.com/Telcoin-Association/telcoin-network/pull/66))
+- Upgrade/rust 1.76 ([#65](https://github.com/Telcoin-Association/telcoin-network/pull/65))
+- Upgrade rocksdb v0.22 - fix reference error - faucet it test passing ([#64](https://github.com/Telcoin-Association/telcoin-network/pull/64))
+- Feature/sync node after restart ([#62](https://github.com/Telcoin-Association/telcoin-network/pull/62))
+- Update Execution Unit Tests ([#61](https://github.com/Telcoin-Association/telcoin-network/pull/61))
+- Faucet option in cli ([#57](https://github.com/Telcoin-Association/telcoin-network/pull/57))
+- Refactor/yukon to adiri ([#59](https://github.com/Telcoin-Association/telcoin-network/pull/59))
+- Run validators in docker compose ([#58](https://github.com/Telcoin-Association/telcoin-network/pull/58))
+- Testing tool - Generate Local Network ([#56](https://github.com/Telcoin-Association/telcoin-network/pull/56))
+- Patch/batches failing validation ([#55](https://github.com/Telcoin-Association/telcoin-network/pull/55))
+- Deployment tweaks ([#54](https://github.com/Telcoin-Association/telcoin-network/pull/54))
+- Node Command ([#53](https://github.com/Telcoin-Association/telcoin-network/pull/53))
+- Create committee ([#52](https://github.com/Telcoin-Association/telcoin-network/pull/52))
+- Validate Genesis ([#51](https://github.com/Telcoin-Association/telcoin-network/pull/51))
+- Genesis/ceremony ([#50](https://github.com/Telcoin-Association/telcoin-network/pull/50))
+- Feature/cli validator file ([#48](https://github.com/Telcoin-Association/telcoin-network/pull/48))
+- Generate Authority Keys ([#47](https://github.com/Telcoin-Association/telcoin-network/pull/47))
+- Engine Node + Cluster Test Util Updates ([#46](https://github.com/Telcoin-Association/telcoin-network/pull/46))
+- Batch Validation ([#45](https://github.com/Telcoin-Association/telcoin-network/pull/45))
+- Update to reth v0.1.0 alpha.13 ([#44](https://github.com/Telcoin-Association/telcoin-network/pull/44))
+- Integration Test for Executor ([#43](https://github.com/Telcoin-Association/telcoin-network/pull/43))
+- Execute Consensus Output ([#42](https://github.com/Telcoin-Association/telcoin-network/pull/42))
+- Batch Maker - EL -> CL ([#41](https://github.com/Telcoin-Association/telcoin-network/pull/41))
+- Refresh consensus ([#40](https://github.com/Telcoin-Association/telcoin-network/pull/40))
+- Optimized Dependencies and Non-root User ([#34](https://github.com/Telcoin-Association/telcoin-network/pull/34))
+- TxPool Sealed Pool Patch ([#38](https://github.com/Telcoin-Association/telcoin-network/pull/38))
+- Spawn task for building header in primary proposer ([#36](https://github.com/Telcoin-Association/telcoin-network/pull/36))
+- Append Consensus Output to Canonical Chain ([#30](https://github.com/Telcoin-Association/telcoin-network/pull/30))
+- Block Building Job ([#29](https://github.com/Telcoin-Association/telcoin-network/pull/29))
+- Move timestampMs to use sec ([#28](https://github.com/Telcoin-Association/telcoin-network/pull/28))
+- Add validation docs for header. ensure timestamp is in secs. general cleanup ([#27](https://github.com/Telcoin-Association/telcoin-network/pull/27))
+- Validate Peer Batch ([#22](https://github.com/Telcoin-Association/telcoin-network/pull/22))
+- Primary to Engine impl ([#21](https://github.com/Telcoin-Association/telcoin-network/pull/21))
+- Refactor/worker to engine network client ([#19](https://github.com/Telcoin-Association/telcoin-network/pull/19))
+- Tn-network-types ([#18](https://github.com/Telcoin-Association/telcoin-network/pull/18))
+- Feature/propose blocks ([#13](https://github.com/Telcoin-Association/telcoin-network/pull/13))
+- Worker Proposes Batches ([#11](https://github.com/Telcoin-Association/telcoin-network/pull/11))
+- Feature/genesis ([#4](https://github.com/Telcoin-Association/telcoin-network/pull/4))
+- Heavy reorganization and documentation ([#3](https://github.com/Telcoin-Association/telcoin-network/pull/3))
+- Add all crates as workspace members ([#2](https://github.com/Telcoin-Association/telcoin-network/pull/2))
+- Migrate Current Progress into New Repo ([#1](https://github.com/Telcoin-Association/telcoin-network/pull/1))
+- Init

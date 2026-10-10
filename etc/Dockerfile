@@ -8,8 +8,9 @@ ENV CARGO_PROFILE_RELEASE_STRIP=true
 
 WORKDIR /usr/src/telcoin-network
 
-# Cargo features for the node build. Empty by default; docker-adiri passes adiri,
-# docker-devnet passes faucet.
+# Cargo features for the node build. Empty by default. Ad-hoc images: `make docker-adiri`
+# passes adiri, `make docker-devnet` passes faucet. Releases: `etc/release.sh build` passes
+# the tag's channel features (adiri for -adiri tags, none for mainnet).
 ARG CARGO_FEATURES=
 
 # Commit hash for the version string, injected as a vergen override (see
@@ -38,11 +39,19 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=./target,sharing=locked \
     rm -rf /usr/local/cargo/registry/src \
-    && cargo build -p telcoin-network --bin telcoin-network --release ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
+    && cargo build -p telcoin-network --bin telcoin-network --release --locked ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image
 FROM debian:bookworm-slim
+
+# OCI image annotations — these link the ghcr.io package page back to the
+# repo and let `docker inspect` self-report version + revision. `etc/release.sh build`
+# adds version and revision labels per tag; the defaults make ad-hoc builds inspectable.
+LABEL org.opencontainers.image.source="https://github.com/Telcoin-Association/telcoin-network" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.title="telcoin-network" \
+      org.opencontainers.image.description="Telcoin Network node — DAG-based BFT consensus + EVM execution"
 
 # ca-certificates for outbound rustls TLS (faucet / OTLP exporters). No libssl3 / libapr1:
 # unused by the binary. bash + coreutils ship in the base and are required by

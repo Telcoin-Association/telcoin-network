@@ -234,7 +234,7 @@ Two positions made this worth doing:
   the `main`-scope cache entry that every PR and queue run restores.
 - `actions/deploy-pages` runs with `pages: write` and `id-token: write`.
 
-Foundry, whose `cast` decides `verify-on-chain`, is not installed by an action at all: the `attest` job in `pr.yaml` downloads the release archive itself and pins it by digest, as "What a pin does not cover" below describes.
+Foundry, whose `cast` decides `verify-on-chain` and the attestation check on a release tag, is not installed by an action at all: the `attest` job in `pr.yaml` and two jobs in `release.yaml` download the release archive themselves and pin it by digest, as "What a pin does not cover" below describes.
 
 The pinned actions and the runtime each one uses (each pin's SHA, and the release it stands for in the `# vX.Y.Z` comment beside it, are in the workflows, and only there):
 
@@ -250,6 +250,7 @@ The pinned actions and the runtime each one uses (each pin's SHA, and the releas
 
 `Swatinem/rust-cache` is left out of the table: its pin moves on its own terms, and "Caches" above covers it.
 The runtime column matters because GitHub removed Node 20 from the hosted runners on 2026-09-23 and now forces any node20 action onto Node 24, which it was not written for.
+`release.yaml` uses no action but `actions/checkout`, which is already in the table.
 
 ### How a pin moves
 
@@ -268,7 +269,8 @@ Whoever reviews such a pull request:
   approval, and its head needs `make attest` like any other. Its own workflow runs get a
   read-only token and no secrets; the new code first runs with more than that after it
   lands, in `cache-deps.yaml` (the `main` cache the lanes restore), `durable-e2e.yaml`
-  (its own `main` cache entry, nightly) and `docs.yaml` (the Pages deployment).
+  (its own `main` cache entry, nightly), `docs.yaml` (the Pages deployment) and
+  `release.yaml` (`draft-release`, which can write releases, at the next tag).
 
 A new `uses:` takes the same form, SHA plus `# vX.Y.Z` on the same line; Dependabot rewrites the comment only when it is on the line it updates.
 
@@ -291,13 +293,14 @@ A pin fixes the action's own code, not what that code downloads when it runs.
 That is why Foundry is not installed by an action: `foundry-rs/foundry-toolchain` downloaded and ran `foundryup`, itself unpinned, which unpacked the release and ran every binary in it before any later step could check one.
 A digest check placed after the install gated the registry call and nothing that ran before it.
 The `Install Foundry` step in the `attest` job in `pr.yaml` does the download itself instead.
+The same step, byte for byte, runs in the `validate-tag` and `verify-release` jobs in `release.yaml`, where `etc/release.sh` calls `verify_commit_hash.sh` on the tagged commit.
 Two `env:` values on that step are the pin: `FOUNDRY_VERSION`, a Foundry release tag, and `FOUNDRY_SHA256`, the SHA-256 digest of that release's `foundry_<version>_linux_amd64.tar.gz`.
 The step downloads the archive with `curl` into `$RUNNER_TEMP` and checks it against `FOUNDRY_SHA256` with `sha256sum --check --strict` before it extracts anything; a mismatch fails the job.
 Only then does it extract `cast` and `forge` into a directory under `$RUNNER_TEMP`, write that directory to `$GITHUB_PATH` so the steps after it find both on `PATH`, and print `cast --version`, the first time anything from the archive runs.
 So nothing from upstream runs or is unpacked before the digest check: there is no `foundryup` and no action code between the download and the check.
 A release asset replaced under the same tag, or the tag re-pointed, therefore fails this step instead of deciding `verify-on-chain`.
 The digest is that of the `linux_amd64` archive, because `ubuntu-latest` is x64; a runner of another architecture needs another archive and a new digest.
-`forge` comes out of the same verified archive although nothing in `pr.yaml` runs it today, so that a step that needs it later inherits this pin instead of installing a Foundry of its own.
+`forge` comes out of the same verified archive although nothing in `pr.yaml` or `release.yaml` runs it today, so that a step that needs it later inherits this pin instead of installing a Foundry of its own.
 Dependabot has no part in this pin: there is no action for it to bump, so the release and the digest stay where they are until someone moves them, together and by hand:
 
 1. Download the new release's `linux_amd64` archive, check it against the release's own
@@ -322,12 +325,15 @@ Dependabot has no part in this pin: there is no action for it to bump, so the re
    The `gh api` command prints `sha256:<hex>`, and that hex must be the digest the last
    command prints. `gh attestation verify` must exit 0; it prints nothing when its output
    is not a terminal. The archive is hashed, never unpacked or run.
-2. In `pr.yaml`, set `FOUNDRY_VERSION` to the release and `FOUNDRY_SHA256` to that digest,
-   in the same pull request.
+2. In `pr.yaml` and in both `Install Foundry` steps in `release.yaml`, set `FOUNDRY_VERSION` to the release and `FOUNDRY_SHA256` to that digest, in the same pull request.
+   The three `run:` blocks and their `env:` values stay byte-identical, so a `diff` of them shows a missed copy; only the last paragraph of the comment differs in `release.yaml`, where the job definition comes from the tagged commit rather than a pull request.
 3. That pull request's own `verify-on-chain` run tests the new pin end to end: the step
    downloads the archive, checks it against the new digest, and the registry call runs
    with the `cast` from it. If the runner gets anything other than the archive that was
    hashed, the step fails there, before anything lands.
+
+That pull request does not run the two copies in `release.yaml`, and a re-run of a tag's workflow runs them as they were at the tagged commit, so a broken pin there would hold up the next release.
+After the pull request lands, dispatch the release workflow (*Release* -> *Run workflow*, `mode: validate`) on any existing tag: the step must pass, even where the tag checks after it fail.
 
 The `.sha256` asset and the digest GitHub reports come from the same place as the archive, so they are only as trustworthy as the release itself.
 They catch a corrupted download, and a file that differs from what the release published.
@@ -337,10 +343,90 @@ What the pin adds is that the archive checked when the pin was set is the archiv
 The provenance check is part of moving the pin and not of the `attest` job: it needs GitHub's attestation API and a token on every run, and a timeout there would fail `verify-on-chain`, while the digest already holds each run to the archive that passed it.
 
 Both values are part of the `attest` job definition, which comes from the PR's merge commit, so they guard against a change upstream, not against a PR that edits them; "Who can put a PR in the queue" above says what stops such a PR.
+The copies in `release.yaml` come from the tagged commit, and "Release workflow" below says what stops a tag on a commit that edits them.
 What is still not pinned: the runner image (`ubuntu-latest`), and with it everything preinstalled on it, including the `curl`, `tar` and `sha256sum` the step runs, which it has to trust because they fetch, check and unpack the archive.
-The local `make attest` run uses whatever `cast` the maintainer has installed, which this pin does not reach.
+The local `make attest` and `make release-*` runs use whatever `cast` the maintainer has installed, which this pin does not reach.
 
 One thing a pin does newly fix: `taiki-e/install-action` resolves a tool requested without a version (`tool: cargo-nextest`) from the manifest in the pinned commit, with a checksum, so the cargo-nextest version stays the same until the pin moves.
+
+## Release workflow
+
+`.github/workflows/release.yaml` checks a release tag, opens a draft GitHub release for it, and checks the release again once a maintainer has published it.
+It builds, signs and publishes nothing: a maintainer does those on their own machines with the `make release-*` targets, which run `etc/release.sh`.
+The procedure is in the [maintainer guide](https://docs.telcoin.network/maintainers/releasing.html), and the checks an operator runs on a release are in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html).
+The release signatures and the on-chain attestation answer different questions: the attestation says a maintainer ran the full suite on a commit, and the signatures say which files the maintainers vouch for as that commit's release.
+
+| Job | Event | Runs | Token | Timeout |
+|---|---|---|---|---|
+| `validate-tag` | a pushed `v*` tag; a dispatch with `mode: validate` | `Install Foundry`, `etc/release.sh check-tag`, then `etc/release.sh notes` into the step summary | `contents: read` | 15 min |
+| `draft-release` | a pushed `v*` tag, once `validate-tag` has passed | `etc/release.sh draft` | `contents: write` | 5 min |
+| `verify-release` | a published release (`release: published`); a dispatch with `mode: verify` | `Install Foundry`, `etc/release.sh verify` | `contents: read` | 20 min |
+
+`validate-tag` checks that the tag is an annotated tag signed by a key in the allowlist (`.github/maintainer-gpg-keys/` on `main`), that it points at a commit on `main` whose Cargo version and `CHANGELOG.md` section match it, and that the commit was attested on-chain, which is what `cast` is installed for.
+The tag filter is broader than the tag grammar on purpose: a malformed `v` tag fails visibly there instead of being ignored, and `etc/release.sh` decides what a release tag is.
+`draft-release` creates the draft with the same notes, or refreshes the notes of a draft it created before; the draft carries no assets until the maintainer's `make release-build` uploads them.
+`published` is the event type that fires when a draft is published as a prerelease, which every adiri and rc release is; `prereleased` does not fire for those.
+The maintainer publishes with their own `gh` login, so the event fires; GitHub starts no workflow for an event that a `GITHUB_TOKEN` caused.
+
+A dispatch (*Release* -> *Run workflow*) takes a `tag` and a `mode`, and is possible only once the workflow is on `main`.
+`validate` runs `validate-tag` alone and drafts nothing; run on an old, unsigned tag, it shows that the gate fails closed.
+`verify` works on a published release only, because a read-only token cannot see drafts.
+If the attestation was missing when a tag was pushed, run `make attest` on the tagged commit, with `ALLOW_STALE_BASE=1` if `main` has moved past it, and re-run the failed jobs; there is no need to re-tag.
+No job in `release.yaml` may be named `CI Success`: item 1 of "Repository settings this requires" says why, and a tag can be pushed on any commit, a pull request's head included.
+
+### Scripts and keys come from `main`
+
+Every job checks out `refs/heads/main`, never the tagged tree, with `fetch-depth: 0` (every tag, and the `refs/remotes/origin/main` that the ancestry and version checks read) and `persist-credentials: false`.
+The checkout step still receives the job's token and fetches with it; `persist-credentials: false` only keeps the token out of `.git/config` for the steps after it.
+`etc/release.sh`, `.github/scripts/verify_commit_hash.sh` and the allowlist all come from that checkout.
+The reason is the one the `attest` job in `pr.yaml` gives for its `trusted/` checkout: a tag on a commit that edits a script or adds a key would otherwise be judged by its own edit.
+The local `make release-*` targets read the allowlist from `origin/main` as well, and `make release-build` and `make release-publish` refuse to run when `etc/release.sh` or `verify_commit_hash.sh` differs from it.
+The operator check in [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html) also builds its keyring from a checkout of `main`, and fetches the tag into it by its full name, `refs/tags/<TAG>`, because `git clone --branch <TAG>` prefers a branch of the same name.
+
+The job definitions are the exception.
+GitHub reads `release.yaml` itself from the tagged commit (for a dispatch, from the branch it runs on), so a tag on a commit that edits the workflow runs the edited workflow under that tag's name.
+The tag ruleset below keeps anyone but the maintainers from creating, moving or deleting a `v*` tag, so an edited workflow cannot run for a release tag a maintainer did not push.
+It does not keep a `contents: write` token from anyone with write access: they can push a branch whose workflow asks for one, or create, edit, publish and delete releases with their own credentials.
+What protects a release is the maintainer signatures, which `make release-publish` and `verify-release` check against the allowlist on `main`, not the token.
+
+### Why CI never builds
+
+CI cannot run the full suite (the top of this file says why).
+What vouches for a released commit is the attested local run, e2e included, and the release binary and image are built from that commit on the maintainer's host by `make release-build`.
+A `GITHUB_TOKEN` must also never be able to publish an artifact.
+A CI build would compile every dependency, build scripts and procedural macros included, in a job holding a token that can upload release assets or push the image.
+In `release.yaml` no job has `packages: write`, and the one job with any write, `draft-release`, runs only the pinned `actions/checkout`, which fetches `main` with the token and does not leave it in the checkout, and `etc/release.sh draft`, which calls `gh`.
+Its `contents: write` lets the token create, edit, publish and delete releases and their assets, and push any branch or tag that no ruleset protects, but it holds no artifact and cannot sign one.
+Anyone with write access can get the same permission from a workflow on their own branch, so what protects an operator is the check in Installing a release: the signature over `SHA256SUMS` against the allowlist on `main`, and the fingerprint comparison with `SECURITY.md` on `main`.
+The release text is not protected: anyone with write access can edit a draft's notes, so the install page, built from `main`, is the reference.
+
+### The post-publish check is detective only
+
+`verify-release` repeats the checks `make release-publish` runs before it publishes: the tag checks, the asset set and `SHA256SUMS`, the signatures on `SHA256SUMS` against the allowlist on `main`, the image digest against the registry, and that the binary in the image is the one in the tarball and reports the tagged commit.
+By the time it runs the release is public, so a failure is an alarm for a maintainer, not a gate.
+It runs only for a publish that was not made with a `GITHUB_TOKEN`: GitHub starts no workflow for an event a `GITHUB_TOKEN` caused, so a draft that anyone with write access publishes from a workflow on their own branch is never checked here and raises no alarm.
+After every publish, check that a `verify-release` run exists for the tag, and if none does, start one with a `verify` dispatch.
+What keeps a release from changing after it passed is the immutable-releases setting below, not this job.
+
+### Settings the release workflow requires
+
+None of these is visible to the workflow, and each closes a gap the workflow leaves open.
+
+1. **A tag ruleset** (Settings -> Rules -> Rulesets) on the `v*` tags that lets only the maintainers create, update or delete one.
+   `validate-tag` proves who signed a tag, not who pushed it, and GitHub runs the workflow definition at the tagged commit.
+   Without the rule, anyone with write access could push a `v*` tag on a commit with an edited `release.yaml`, or move or delete a tag after it was validated.
+   The rule limits who can create, move or delete a `v*` tag and nothing else; it does not limit who can create, edit, publish or delete releases, which write access alone allows.
+2. **Immutable releases** (Settings -> General -> Releases).
+   Once a release is published its assets and its tag cannot change, so the files `verify-release` checked are the files operators download.
+3. **The ghcr package `ghcr.io/telcoin-association/telcoin-network` is public, linked to this repository, and writable only by the maintainers, by account and by workflow.**
+   Operators, `verify-release` and `etc/release.sh` read it anonymously, and the script stops with "package is not public" on a 401 or 403 from the registry.
+   The `org.opencontainers.image.source` label in `etc/Dockerfile` links the package to the repository when an image is pushed, and GitHub gives the workflows of a linked repository access to the package.
+   Two lists in Package settings decide who can push: under "Manage access", remove the access inherited from this repository and give write only to the maintainers; under "Manage Actions access", this repository must be absent or have the Read role.
+   Otherwise anyone with write access here can push to the package, directly or from a workflow on any branch that asks for `packages: write`, and overwrite `:vX.Y.Z`, `:latest` or `:adiri`.
+   No workflow here asks for `packages: write`, but anyone with write access can add one on a branch, so that is not a control.
+   A digest cannot be overwritten, which is why operators and `verify-release` pull by the digest in `IMAGE_DIGEST`.
+4. **The repository's default workflow permission can stay read-only** (Settings -> Actions -> General -> Workflow permissions).
+   `draft-release` asks for `contents: write` in its own `permissions:` block, which GitHub grants regardless of that default; without it `gh release create` fails with a 403.
 
 ## Environment
 Attesting devs must have "MAINTAINER" role to update contract state.

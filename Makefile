@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -9,8 +9,18 @@ NIGHTLY:=$(shell cat $(ROOT_DIR)/rust-nightly)
 
 .DEFAULT: help
 
-# Default tag is latest if not specified
-TAG ?= latest
+# Image repository for every image this Makefile builds or pushes.
+GHCR_IMAGE := ghcr.io/telcoin-association/telcoin-network
+
+# Ad-hoc images are always $(GHCR_IMAGE):dev-<flavor>-$(TAG), so TAG defaults to the
+# 12-character commit. Release tags and the latest/adiri aliases are written only by
+# release-build and release-publish. The release-* targets take TAG as a release tag
+# (vX.Y.Z[-adiri][-rcN]); see docs/src/maintainers/releasing.md.
+TAG ?= $(shell git rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+
+# Linter images for release-lint, pinned by digest.
+ACTIONLINT_IMAGE := rhysd/actionlint:1.7.12@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667
+SHELLCHECK_IMAGE := koalaman/shellcheck-alpine:v0.11.0@sha256:9955be09ea7f0dbf7ae942ac1f2094355bb30d96fffba0ec09f5432207544002
 
 # git commit embedded in the image version string (vergen override; avoids needing .git in
 # the build context). Falls back to `unknown` outside a git checkout.
@@ -69,13 +79,16 @@ help:
 	@echo "    :::> cargo clippy for all features with fix enabled (nightly toolchain pinned in rust-nightly)." ;
 	@echo ;
 	@echo "make docker-login" ;
-	@echo "    :::> Setup docker registry using gcloud artifacts." ;
+	@echo "    :::> Log docker in to ghcr.io as your GitHub user; at docker's password prompt, paste a classic PAT with write:packages only." ;
 	@echo ;
 	@echo "make docker-adiri" ;
-	@echo "    :::> Build telcoin-network binary and push to gcloud artifact registry with latest image tag." ;
+	@echo "    :::> Build a multi-arch adiri image and push it to ghcr.io as dev-adiri-<TAG> (TAG defaults to the short commit)." ;
+	@echo ;
+	@echo "make docker-devnet" ;
+	@echo "    :::> Build a multi-arch devnet (faucet) image and push it to ghcr.io as dev-devnet-<TAG>." ;
 	@echo ;
 	@echo "make docker-push" ;
-	@echo "    :::> Push adiri:latest image to gcloud artifact registry." ;
+	@echo "    :::> Push the local dev-adiri-<TAG> image to ghcr.io." ;
 	@echo ;
 	@echo "make docker-builder" ;
 	@echo "    :::> Create docker builder for building telcoin-network binary container images." ;
@@ -100,6 +113,27 @@ help:
 	@echo ;
 	@echo "make book-serve" ;
 	@echo "    :::> Serve the docs book at localhost:3000 with live reload." ;
+	@echo ;
+	@echo "make release-prep TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Prepare the release PR: set the workspace version, refresh Cargo.lock, add the CHANGELOG section." ;
+	@echo ;
+	@echo "make release-tag TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Create and push the GPG-signed release tag on the origin/main tip." ;
+	@echo ;
+	@echo "make release-build TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Build the linux/amd64 image and tarball, push the image and upload the assets to the draft release." ;
+	@echo ;
+	@echo "make release-sign TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Add this maintainer's GPG signature over SHA256SUMS to the draft release." ;
+	@echo ;
+	@echo "make release-verify TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Verify the tag, assets, signatures and image digest of a release." ;
+	@echo ;
+	@echo "make release-publish TAG=vX.Y.Z[-adiri][-rcN]" ;
+	@echo "    :::> Verify, then publish the draft release and move the latest or adiri image alias." ;
+	@echo ;
+	@echo "make release-lint" ;
+	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -347,26 +381,26 @@ fmt:
 clippy:
 	cargo +$(NIGHTLY) clippy --workspace --all-features --fix ;
 
-# login to gcloud artifact registry for managing docker images
+# log docker in to ghcr.io as your GitHub user; docker prompts for the password:
+# paste a classic PAT with write:packages only, never the gh token
 docker-login:
-	gcloud auth application-default login ;
-	gcloud auth configure-docker us-docker.pkg.dev ;
+	docker login ghcr.io --username "$$(gh api user --jq .login)" ;
 
-# build and push latest adiri image for amd64 and arm64
+# build and push an ad-hoc adiri image for amd64 and arm64 as dev-adiri-$(TAG)
 # CARGO_FEATURES=adiri compiles in the epoch-gated testnet fork logic. The authoritative
 # list is crates/types/src/forks.rs; a running node logs its compiled schedule at startup
 # (target "cli", "fork schedule (adiri)").
 docker-adiri:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=adiri --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t $(GHCR_IMAGE):dev-adiri-$(TAG) . --push ;
 
-# build and push latest devnet image for amd64 and arm64
+# build and push an ad-hoc devnet image for amd64 and arm64 as dev-devnet-$(TAG)
 # CARGO_FEATURES=faucet compiles in the faucet support only
 docker-devnet:
-	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) . --push ;
+	docker buildx build -f ./etc/Dockerfile --build-arg CARGO_FEATURES=faucet --build-arg GIT_SHA=$(GIT_SHA) --platform linux/amd64,linux/arm64 --no-cache -t $(GHCR_IMAGE):dev-devnet-$(TAG) . --push ;
 
-# push local adiri:latest to the gcloud artifact registry
+# push the local ad-hoc adiri image to ghcr.io
 docker-push:
-	docker push us-docker.pkg.dev/telcoin-network/tn-public/adiri:$(TAG) ;
+	docker push $(GHCR_IMAGE):dev-adiri-$(TAG) ;
 
 # docker buildx used for multiple processor image building
 docker-builder:
@@ -431,3 +465,14 @@ book:
 # serve the docs book at localhost:3000 with live reload
 book-serve:
 	mdbook serve docs --open ;
+
+# release pipeline: every step runs etc/release.sh, which parses and checks TAG.
+# Runbook: docs/src/maintainers/releasing.md.
+release-prep release-tag release-build release-sign release-verify release-publish:
+	@test "$(origin TAG)" != file || { echo "usage: make $@ TAG=vX.Y.Z[-adiri][-rcN]"; exit 2; }
+	./etc/release.sh $(patsubst release-%,%,$@) "$(TAG)"
+
+# lint the release workflows and scripts with pinned actionlint and shellcheck images
+release-lint:
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color .github/workflows/release.yaml .github/workflows/docs.yaml
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh .github/scripts/verify_commit_hash.sh

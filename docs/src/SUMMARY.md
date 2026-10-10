@@ -19,6 +19,8 @@
   * [Request-response](network/request-response.md)
   * [Sync streams](network/sync-streams.md)
 * [Getting Started](getting-started/README.md)
+  * [Installing a Release](getting-started/installing-a-release.md)
+  * [Release Notes](getting-started/release-notes.md)
   * [Bootstrap Peers](getting-started/bootstrap-peers.md)
   * [Validator Production Operations](getting-started/validator-operations.md)
   * [Reading Blockchain Data](getting-started/reading-blockchain-data/README.md)
@@ -156,6 +158,9 @@
 * [EVM Compatibility](evm-compatibility.md)
 * [Epoch Boundaries](epoch-boundaries.md)
 * [Canonical Updates](canonical-updates.md)
+* [Maintainers](maintainers/README.md)
+  * [Releasing](maintainers/releasing.md)
+  * [YubiKey Signing Setup](maintainers/yubikey-setup.md)
 
 # FAQs
 

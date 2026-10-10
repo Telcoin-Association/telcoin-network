@@ -578,7 +578,7 @@ The benchmark measured β_reth, β_pack, PC_hot and cache bytes per transaction,
 | Epoch length | 20 minutes, so the mixed phase crosses about two epoch boundaries |
 | Fleets | e2-custom-4-8192 (4 vCPU, 8 GB), run r20260923-0708; c3-highcpu-8 (8 vCPU, 16 GB), run r20260923-0515 |
 | Disk | 100 GB pd-ssd boot disk per node |
-| Node image | `us-docker.pkg.dev/telcoin-network/tn-public/adiri:v0.1.0-devnet` |
+| Node image | Internal `v0.1.0-devnet` build from `etc/Dockerfile`, not a published release |
 | Load generator | tn-transaction-generator, image `blast-v2-3644adc` |
 | Report | [Benchmark report](https://claude.ai/artifact/6qpBKmd3eKNaRBuxUtPPCR); committed copy `bench/reports/2026-09-bench-10v.html` in tn-transaction-generator |
 
