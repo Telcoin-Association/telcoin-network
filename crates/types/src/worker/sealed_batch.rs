@@ -414,6 +414,20 @@ pub trait TxnForwarder: Send + Sync + Debug {
     ) -> bool;
 }
 
+/// Requests a fresh verified committee record without blocking transaction forwarding.
+pub trait CommitteeRecordRefresher: Clone + Send + Sync + 'static {
+    /// Coalesce a lookup for `authority`; implementations must bound queued work.
+    fn refresh_record(&self, authority: BlsPublicKey);
+}
+
+/// Disables record refresh for forwarders used without a network, such as transport tests.
+#[derive(Clone, Debug, Default)]
+pub struct NoopCommitteeRecordRefresher;
+
+impl CommitteeRecordRefresher for NoopCommitteeRecordRefresher {
+    fn refresh_record(&self, _authority: BlsPublicKey) {}
+}
+
 /// A [`TxnForwarder`] that admits nothing.
 ///
 /// Committee voting validators never forward (they include transactions directly), so they can

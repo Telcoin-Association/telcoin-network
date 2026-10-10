@@ -125,7 +125,7 @@ pub fn create_validator_info(
 }
 
 /// Generate all validator worker records through the same CLI arguments operators use.
-fn create_validator_info_with_workers(
+pub fn create_validator_info_with_workers(
     dir: &Path,
     address: &str,
     passphrase: Option<String>,

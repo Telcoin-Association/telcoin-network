@@ -34,6 +34,8 @@ pub struct NetworkConfig {
     process_budget: Option<NetworkProcessBudget>,
     /// The configuration for managing peers.
     peer_config: PeerConfig,
+    /// Connection admission policy shared by the primary and every worker swarm.
+    admission: AdmissionConfig,
     /// Optional process-wide accounting of established connections by observed source.
     /// No production limits are assumed when this configuration is absent.
     source_admission: Option<SourceAdmissionConfig>,
@@ -158,11 +160,15 @@ impl fmt::Display for CommitteePeerError {
 impl std::error::Error for CommitteePeerError {}
 
 impl NetworkConfig {
+    /// Return this node's connection admission configuration.
+    pub fn admission(&self) -> &AdmissionConfig {
+        &self.admission
+    }
+
     /// Return explicit deployment limits for source admission, when configured.
     pub fn source_admission(&self) -> Option<&SourceAdmissionConfig> {
         self.source_admission.as_ref()
     }
-
     /// Return the local launch inventory. Membership remains derived from chain state.
     pub fn committee_peers(&self) -> &BTreeMap<BlsPublicKey, BootstrapServer> {
         &self.committee_peers
@@ -259,7 +265,6 @@ impl NetworkConfig {
                 )))
         })
     }
-
     /// Validate the process budget against the primary plus every configured worker swarm.
     pub fn validate_process_budget(&self, swarm_count: usize) -> Result<(), NetworkBudgetError> {
         self.process_budget
@@ -402,6 +407,69 @@ impl NetworkConfig {
     }
 }
 
+/// Connection admission rollout mode. Authentication and resource limits apply in every mode.
+#[derive(Serialize, Deserialize, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionMode {
+    /// Preserve unrestricted discovery and the existing identity and ban checks.
+    #[default]
+    Open,
+    /// Permit discovery while operators observe and repair the admission inputs.
+    Grace,
+    /// Admit only committee, trusted, and bootstrap identities when inputs are complete.
+    Closed,
+}
+
+/// Settings for renewable, epoch-versioned connection admission snapshots.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[serde(default)]
+pub struct AdmissionConfig {
+    /// Requested rollout mode; an unsafe snapshot always falls back to Open or Grace.
+    mode: AdmissionMode,
+    /// Maximum seconds since the epoch owner last renewed the authoritative snapshot.
+    snapshot_max_age_secs: u64,
+    /// Minimum Grace interval for each accepted epoch, independent of the renewal lease.
+    transition_grace_secs: u64,
+}
+
+impl Default for AdmissionConfig {
+    fn default() -> Self {
+        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300, transition_grace_secs: 30 }
+    }
+}
+
+impl AdmissionConfig {
+    /// Construct a policy with an explicit renewal lease. A zero lease prevents Closed.
+    pub fn new(mode: AdmissionMode, snapshot_max_age: Duration) -> Self {
+        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs(), ..Self::default() }
+    }
+
+    /// Set the minimum transition interval. Zero still requires valid, resolved policy inputs.
+    pub fn with_transition_grace(mut self, interval: Duration) -> Self {
+        self.transition_grace_secs = interval.as_secs();
+        self
+    }
+
+    /// Return the minimum Grace interval measured from acceptance of a new epoch snapshot.
+    pub fn transition_grace(&self) -> Duration {
+        Duration::from_secs(self.transition_grace_secs)
+    }
+
+    /// Return the requested rollout mode.
+    pub fn mode(&self) -> AdmissionMode {
+        self.mode
+    }
+
+    /// Return the snapshot lease, measured with the swarm's monotonic clock.
+    pub fn snapshot_max_age(&self) -> Duration {
+        Duration::from_secs(self.snapshot_max_age_secs)
+    }
+
+    /// Renew at one third of the lease, with a minimum interval of one second.
+    pub fn refresh_interval(&self) -> Duration {
+        Duration::from_secs((self.snapshot_max_age_secs / 3).max(1))
+    }
+}
+
 /// A legacy peer-wait budget retained for configuration serialization compatibility.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy)]
 #[serde(transparent)]
@@ -457,11 +525,11 @@ pub struct LibP2pConfig {
     pub px_disconnect_timeout: Duration,
     /// The k-bucket size for kademlia.
     pub k_bucket_size: NonZeroUsize,
-    /// The TTL applied to kademlia records — both the libp2p record TTL and the
+    /// The TTL applied to kademlia records, both the libp2p record TTL and the
     /// local store's `expires` timestamp. Drives eviction of records that are
     /// never refreshed. Also used for provider record TTL.
     pub kad_record_ttl: Duration,
-    /// How often this node republishes its own kademlia records.
+    /// How often the dedicated network timer re-signs and publishes this node's own record.
     ///
     /// Must be nonzero to give republication a positive cadence. Must also be <
     /// `kad_record_ttl`, otherwise records expire before they are refreshed.
@@ -493,13 +561,11 @@ pub struct LibP2pConfig {
 }
 
 impl LibP2pConfig {
-    /// Reject kad cadences that would panic the network task or break record persistence.
+    /// Validate the signed publication cadence and legacy replication configuration.
     ///
-    /// A zero `kad_replication_interval` makes libp2p's `PutRecordJob` re-arm with a deadline
-    /// equal to the current time, triggering its unconditional assertion on the first swarm
-    /// poll. Publication and replication must also occur before records expire. Validate at
-    /// startup beside [`ScoreConfig::validate`] so an invalid cadence produces a field-named
-    /// configuration error before either critical network task starts.
+    /// Own publication must occur before records expire. Preserve the legacy replication
+    /// constraints while retaining that serialized setting. Validate at startup beside
+    /// [`ScoreConfig::validate`] to report field-named errors before network tasks start.
     pub fn validate(&self) -> eyre::Result<()> {
         eyre::ensure!(
             !self.kad_replication_interval.is_zero(),

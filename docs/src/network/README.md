@@ -8,3 +8,5 @@ It is written for RPC providers, dapp and indexer operators, bridge partners, an
 [Peers](peers.md) covers peer reputation scoring, connection limits, and bans.
 [Request-Response](request-response.md) covers the consensus RPC and peer-exchange protocols and their wire format, and [Sync Streams](sync-streams.md) covers the bulk-transfer stream behavior used for catch-up.
 [Network Architecture](../architecture/network.md) has the node-role overview that frames all of them.
+[Validator Joins](validator-joins.md) qualifies cold admission through open hubs and documents
+the publication, provider ACL, and consensus readiness requirements.

@@ -23,6 +23,9 @@ use tokio::{sync::mpsc, time::timeout};
 /// Test topic for gossip.
 const TEST_TOPIC: &str = "test-topic";
 
+#[path = "committee_record_refresh.rs"]
+mod committee_record_refresh;
+
 /// A permitted advertised endpoint for record fixtures that never bind or dial it.
 fn record_endpoint() -> Multiaddr {
     Multiaddr::empty()

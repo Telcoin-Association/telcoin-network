@@ -62,6 +62,9 @@ impl NetworkBehaviour for PeerManager {
         addresses: &[Multiaddr], // kad may dial by PeerId only
         _effective_role: Endpoint,
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
+        // Check before the in-flight shortcut and Kademlia registration. Unknown identities
+        // cannot start a Closed dial; every established connection is checked again.
+        self.check_admission(maybe_peer.as_ref())?;
         // kademlia can initiate dial attempts
         //
         // ensure PeerId isn't banned if known and register dial attempt
@@ -125,6 +128,7 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
+        self.check_admission(Some(&peer))?;
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
         // the earliest point an inbound self-connection can be rejected.
@@ -149,6 +153,7 @@ impl NetworkBehaviour for PeerManager {
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?addr, "outbound connection established");
+        self.check_admission(Some(&peer))?;
         // drop a self-connection without scoring it (backstop for the pending
         // guard in case a self-dial still reaches the established stage).
         if self.is_local_peer(&peer) {
@@ -316,7 +321,10 @@ impl PeerManager {
         };
 
         // check connection limits
-        if self.peer_limit_reached(endpoint) && !self.peer_is_important(&peer_id) {
+        if self.peer_limit_reached(endpoint)
+            && !self.peer_is_important(&peer_id)
+            && !self.admission_is_privileged(&peer_id)
+        {
             debug!(target: "peer-manager", ?peer_id, "peer limit reached - disconnecting with PX");
             // gracefully disconnect and indicate excess peers
             self.disconnect_peer(peer_id, true);

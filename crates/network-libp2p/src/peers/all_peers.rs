@@ -1140,6 +1140,16 @@ impl AllPeers {
         &self.current_committee
     }
 
+    /// Distinct members of every tracked committee, including in-flight epoch boundaries.
+    pub(super) fn committee_members(&self) -> HashSet<BlsPublicKey> {
+        self.previous_committee
+            .iter()
+            .chain(&self.current_committee)
+            .chain(&self.next_committee)
+            .copied()
+            .collect()
+    }
+
     /// Whether `bls_key` sits in any tracked committee slot (previous, current, or next).
     ///
     /// Committee membership is set every epoch from authoritative consensus state, so this is the

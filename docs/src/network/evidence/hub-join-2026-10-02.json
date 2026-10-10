@@ -1,0 +1,741 @@
+{
+  "environment": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e\n 10cc12b7db43e2fbab67dc6a87fa5e159716bdc0 tn-contracts (heads/master)\nLinux runnervm8df0l 6.17.0-1022-azure #22-Ubuntu SMP Mon Jul 27 17:24:03 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux\nrustc 1.94.1 (e408947bf 2026-03-25)\nbinary: rustc\ncommit-hash: e408947bfd200af42db322daf0fadfe7e26d3bd1\ncommit-date: 2026-03-25\nhost: x86_64-unknown-linux-gnu\nrelease: 1.94.1\nLLVM version: 21.1.8\n",
+  "swarm_samples": {
+    "Worker(1)/delayed=false": [
+      {
+        "publication": 59,
+        "resolution": 555,
+        "connection": 3,
+        "activation": 1005
+      },
+      {
+        "publication": 62,
+        "resolution": 526,
+        "connection": 5,
+        "activation": 1009
+      },
+      {
+        "publication": 58,
+        "resolution": 540,
+        "connection": 3,
+        "activation": 1002
+      },
+      {
+        "publication": 63,
+        "resolution": 531,
+        "connection": 5,
+        "activation": 1011
+      },
+      {
+        "publication": 62,
+        "resolution": 537,
+        "connection": 0,
+        "activation": 1000
+      }
+    ],
+    "Primary/delayed=false": [
+      {
+        "publication": 61,
+        "resolution": 549,
+        "connection": 4,
+        "activation": 1008
+      },
+      {
+        "publication": 58,
+        "resolution": 523,
+        "connection": 4,
+        "activation": 1003
+      },
+      {
+        "publication": 67,
+        "resolution": 523,
+        "connection": 6,
+        "activation": 1007
+      },
+      {
+        "publication": 65,
+        "resolution": 547,
+        "connection": 5,
+        "activation": 1004
+      },
+      {
+        "publication": 62,
+        "resolution": 540,
+        "connection": 0,
+        "activation": 1000
+      }
+    ],
+    "Worker(0)/delayed=false": [
+      {
+        "publication": 55,
+        "resolution": 536,
+        "connection": 0,
+        "activation": 1005
+      },
+      {
+        "publication": 55,
+        "resolution": 529,
+        "connection": 5,
+        "activation": 1005
+      },
+      {
+        "publication": 53,
+        "resolution": 530,
+        "connection": 4,
+        "activation": 1000
+      },
+      {
+        "publication": 55,
+        "resolution": 542,
+        "connection": 0,
+        "activation": 1010
+      },
+      {
+        "publication": 55,
+        "resolution": 538,
+        "connection": 1,
+        "activation": 1003
+      }
+    ],
+    "Primary/delayed=true": [
+      {
+        "publication": 10061,
+        "resolution": 537,
+        "connection": 2,
+        "activation": 1008
+      },
+      {
+        "publication": 10060,
+        "resolution": 533,
+        "connection": 3,
+        "activation": 1005
+      },
+      {
+        "publication": 10058,
+        "resolution": 544,
+        "connection": 2,
+        "activation": 1010
+      },
+      {
+        "publication": 10058,
+        "resolution": 532,
+        "connection": 4,
+        "activation": 1003
+      },
+      {
+        "publication": 10060,
+        "resolution": 538,
+        "connection": 2,
+        "activation": 1003
+      }
+    ],
+    "Worker(1)/delayed=true": [
+      {
+        "publication": 10059,
+        "resolution": 529,
+        "connection": 4,
+        "activation": 1003
+      },
+      {
+        "publication": 10058,
+        "resolution": 542,
+        "connection": 0,
+        "activation": 1010
+      },
+      {
+        "publication": 10059,
+        "resolution": 526,
+        "connection": 3,
+        "activation": 1001
+      },
+      {
+        "publication": 10057,
+        "resolution": 543,
+        "connection": 5,
+        "activation": 1006
+      },
+      {
+        "publication": 10056,
+        "resolution": 529,
+        "connection": 3,
+        "activation": 1004
+      }
+    ],
+    "Worker(0)/delayed=true": [
+      {
+        "publication": 10058,
+        "resolution": 530,
+        "connection": 4,
+        "activation": 1005
+      },
+      {
+        "publication": 10056,
+        "resolution": 531,
+        "connection": 3,
+        "activation": 1002
+      },
+      {
+        "publication": 10057,
+        "resolution": 527,
+        "connection": 3,
+        "activation": 1003
+      },
+      {
+        "publication": 10057,
+        "resolution": 530,
+        "connection": 3,
+        "activation": 1006
+      },
+      {
+        "publication": 10058,
+        "resolution": 543,
+        "connection": 3,
+        "activation": 1005
+      }
+    ]
+  },
+  "swarm_distributions": {
+    "Worker(1)/delayed=false": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 62,
+        "p95_ms": 63,
+        "max_ms": 63
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 537,
+        "p95_ms": 555,
+        "max_ms": 555
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 3,
+        "p95_ms": 5,
+        "max_ms": 5
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1005,
+        "p95_ms": 1011,
+        "max_ms": 1011
+      }
+    },
+    "Primary/delayed=false": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 62,
+        "p95_ms": 67,
+        "max_ms": 67
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 540,
+        "p95_ms": 549,
+        "max_ms": 549
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 4,
+        "p95_ms": 6,
+        "max_ms": 6
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1004,
+        "p95_ms": 1008,
+        "max_ms": 1008
+      }
+    },
+    "Worker(0)/delayed=false": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 55,
+        "p95_ms": 55,
+        "max_ms": 55
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 536,
+        "p95_ms": 542,
+        "max_ms": 542
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 1,
+        "p95_ms": 5,
+        "max_ms": 5
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1005,
+        "p95_ms": 1010,
+        "max_ms": 1010
+      }
+    },
+    "Primary/delayed=true": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 10060,
+        "p95_ms": 10061,
+        "max_ms": 10061
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 537,
+        "p95_ms": 544,
+        "max_ms": 544
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 2,
+        "p95_ms": 4,
+        "max_ms": 4
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1005,
+        "p95_ms": 1010,
+        "max_ms": 1010
+      }
+    },
+    "Worker(1)/delayed=true": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 10058,
+        "p95_ms": 10059,
+        "max_ms": 10059
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 529,
+        "p95_ms": 543,
+        "max_ms": 543
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 3,
+        "p95_ms": 5,
+        "max_ms": 5
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1004,
+        "p95_ms": 1010,
+        "max_ms": 1010
+      }
+    },
+    "Worker(0)/delayed=true": {
+      "publication": {
+        "samples": 5,
+        "p50_ms": 10057,
+        "p95_ms": 10058,
+        "max_ms": 10058
+      },
+      "resolution": {
+        "samples": 5,
+        "p50_ms": 530,
+        "p95_ms": 543,
+        "max_ms": 543
+      },
+      "connection": {
+        "samples": 5,
+        "p50_ms": 3,
+        "p95_ms": 4,
+        "max_ms": 4
+      },
+      "activation": {
+        "samples": 5,
+        "p50_ms": 1005,
+        "p95_ms": 1006,
+        "max_ms": 1006
+      }
+    }
+  },
+  "governance_samples": [
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "healthy",
+        "hub_unavailable_seconds": 0,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 5012,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 16529,
+      "publication_to_resolution_ms": 10086,
+      "resolution_to_connection_ms": 1148,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "unavailable",
+        "hub_unavailable_seconds": 15,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 5018,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 22313,
+      "publication_to_resolution_ms": 10104,
+      "resolution_to_connection_ms": 1113,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "healthy",
+        "hub_unavailable_seconds": 0,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 5988,
+      "consensus_leader_epoch": 5,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 47839,
+      "publication_to_resolution_ms": 9062,
+      "resolution_to_connection_ms": 1153,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "unavailable",
+        "hub_unavailable_seconds": 15,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 4959,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 22413,
+      "publication_to_resolution_ms": 9999,
+      "resolution_to_connection_ms": 1199,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "healthy",
+        "hub_unavailable_seconds": 0,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 3989,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 17507,
+      "publication_to_resolution_ms": 10056,
+      "resolution_to_connection_ms": 1191,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "unavailable",
+        "hub_unavailable_seconds": 15,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 5010,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 21872,
+      "publication_to_resolution_ms": 10113,
+      "resolution_to_connection_ms": 1084,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "healthy",
+        "hub_unavailable_seconds": 0,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 3988,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 18051,
+      "publication_to_resolution_ms": 10061,
+      "resolution_to_connection_ms": 1156,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "unavailable",
+        "hub_unavailable_seconds": 15,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 4996,
+      "consensus_leader_epoch": 4,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 36824,
+      "publication_to_resolution_ms": 10091,
+      "resolution_to_connection_ms": 1129,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "healthy",
+        "hub_unavailable_seconds": 0,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 5007,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 16548,
+      "publication_to_resolution_ms": 10118,
+      "resolution_to_connection_ms": 1113,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    },
+    {
+      "conditions": {
+        "epoch_duration_seconds": 15,
+        "hub_condition": "unavailable",
+        "hub_unavailable_seconds": 15,
+        "peer_heartbeat_seconds": 1,
+        "provider_acl": "joining process UDP restricted to open hub until authenticated resolution",
+        "snapshot_lease_seconds": 300,
+        "transition_grace_seconds": 1,
+        "transport": "loopback QUIC",
+        "worker_fees": [
+          7,
+          7
+        ]
+      },
+      "connection_to_consensus_readiness_ms": 4016,
+      "consensus_leader_epoch": 3,
+      "hub_loss_preserved_consensus": true,
+      "publication_ms": 23052,
+      "publication_to_resolution_ms": 10054,
+      "resolution_to_connection_ms": 2173,
+      "revision": "b00eb690fdc1438d6580826ceb7c7d5f64995e4e",
+      "topology": {
+        "existing_validators": 4,
+        "joining_validators": 1,
+        "open_hubs": 1,
+        "swarms": [
+          "primary",
+          "worker-0",
+          "worker-1"
+        ]
+      }
+    }
+  ],
+  "governance_distributions": {
+    "healthy": {
+      "publication_ms": {
+        "samples": 5,
+        "p50_ms": 17507,
+        "p95_ms": 47839,
+        "max_ms": 47839
+      },
+      "publication_to_resolution_ms": {
+        "samples": 5,
+        "p50_ms": 10061,
+        "p95_ms": 10118,
+        "max_ms": 10118
+      },
+      "resolution_to_connection_ms": {
+        "samples": 5,
+        "p50_ms": 1153,
+        "p95_ms": 1191,
+        "max_ms": 1191
+      },
+      "connection_to_consensus_readiness_ms": {
+        "samples": 5,
+        "p50_ms": 5007,
+        "p95_ms": 5988,
+        "max_ms": 5988
+      }
+    },
+    "unavailable": {
+      "publication_ms": {
+        "samples": 5,
+        "p50_ms": 22413,
+        "p95_ms": 36824,
+        "max_ms": 36824
+      },
+      "publication_to_resolution_ms": {
+        "samples": 5,
+        "p50_ms": 10091,
+        "p95_ms": 10113,
+        "max_ms": 10113
+      },
+      "resolution_to_connection_ms": {
+        "samples": 5,
+        "p50_ms": 1129,
+        "p95_ms": 2173,
+        "max_ms": 2173
+      },
+      "connection_to_consensus_readiness_ms": {
+        "samples": 5,
+        "p50_ms": 4996,
+        "p95_ms": 5018,
+        "max_ms": 5018
+      }
+    }
+  }
+}

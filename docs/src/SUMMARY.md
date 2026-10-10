@@ -14,6 +14,7 @@
   * [Early Identity Refusal](network/early-identity-refusal.md)
   * [Gossip](network/gossip.md)
   * [Discovery](network/discovery.md)
+  * [Validator Joins](network/validator-joins.md)
   * [Peers](network/peers.md)
   * [Established Source Admission](network/source-admission.md)
   * [Local Committee Inventory](network/committee-seeding.md)
