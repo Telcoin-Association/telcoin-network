@@ -1,6 +1,7 @@
 //! Command-line interface and resolved runtime settings.
 
 use std::{
+    collections::BTreeSet,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::PathBuf,
@@ -274,8 +275,18 @@ impl Cli {
     /// Resolve the CLI into [`Settings`], loading the YAML upstream list or
     /// building a single inline upstream from the `--upstream-*` flags.
     pub(crate) fn into_settings(self) -> eyre::Result<Settings> {
+        [
+            ("--readiness-poll-interval", self.readiness_poll_interval),
+            ("--readiness-poll-timeout", self.readiness_poll_timeout),
+            ("--upstream-connect-timeout", self.upstream_connect_timeout),
+            ("--upstream-request-timeout", self.upstream_request_timeout),
+            ("--header-read-timeout", self.header_read_timeout),
+        ]
+        .into_iter()
+        .try_for_each(|(flag, value)| ensure_non_zero(flag, value))?;
         let upstreams = self.resolve_upstreams()?;
         eyre::ensure!(!upstreams.is_empty(), "no upstream workers configured");
+        ensure_unique_worker_ids(&upstreams)?;
         upstreams.iter().try_for_each(|upstream| {
             ensure_http_scheme(&upstream.rpc_url)?;
             ensure_http_scheme(&upstream.readiness_url)?;
@@ -361,6 +372,29 @@ impl Cli {
                 }])
             }
         }
+    }
+}
+
+/// Reject a zero value for a duration flag that has no disabled sentinel. A
+/// zero readiness poll interval panics the poller (`tokio::time::interval`),
+/// and a zero timeout or deadline fails every poll, forward or request it
+/// bounds, so either is a configuration error reported at startup.
+fn ensure_non_zero(flag: &str, value: Duration) -> eyre::Result<()> {
+    eyre::ensure!(!value.is_zero(), "{flag} must be greater than zero");
+    Ok(())
+}
+
+/// Reject an upstream list that names one worker id twice. Readiness
+/// transitions, their log lines and the `tn_worker_gateway_upstream_ready`
+/// gauge are keyed by worker id, so two entries with one id would be reported
+/// as a single worker whose state flips with whichever entry was polled last.
+fn ensure_unique_worker_ids(upstreams: &[UpstreamWorker]) -> eyre::Result<()> {
+    let mut seen = BTreeSet::new();
+    match upstreams.iter().map(|upstream| upstream.worker_id).find(|id| !seen.insert(*id)) {
+        Some(id) => eyre::bail!(
+            "worker id {id} appears more than once in the upstream list; list each worker once"
+        ),
+        None => Ok(()),
     }
 }
 
@@ -495,11 +529,16 @@ fn plaintext_to_public_host(url: &Url) -> bool {
 /// worker's default RPC port, so a single-host setup left on defaults hits
 /// this. The runtime hop-header guard (see [`crate::proxy`]) catches the
 /// loops this startup check cannot see, e.g. a VIP that fronts the gateways.
+///
+/// An IPv4-mapped IPv6 address (`[::ffff:127.0.0.1]`) is compared as the IPv4
+/// address it names, on either side, since a dual-stack socket reaches the
+/// same listener through both spellings.
 fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
     let same_port = url.port_or_known_default() == Some(listen_addr.port());
-    let listen_ip = listen_addr.ip();
+    let listen_ip = listen_addr.ip().to_canonical();
     let hits_gateway = url_host_ip(url)
         .map(|ip| {
+            let ip = ip.to_canonical();
             let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
             ip == listen_ip
                 || (same_family && ip.is_unspecified())
@@ -530,6 +569,7 @@ fn url_host_ip(url: &Url) -> Option<IpAddr> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write as _;
 
     fn cli_with(config: Option<&str>, rpc: Option<&str>, readiness: Option<&str>) -> Cli {
         let mut argv = vec!["worker-gateway".to_string()];
@@ -699,6 +739,98 @@ mod tests {
                 assert!(message.contains(origin), "the origin is missing from: {message}");
             }
         }
+    }
+
+    #[test]
+    fn zero_poll_interval_is_rejected() {
+        let message = match cli_with_flags(&["--readiness-poll-interval=0s"]).into_settings() {
+            Ok(_) => panic!("a zero poll interval must fail startup, not panic the poller"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("--readiness-poll-interval"), "{message}");
+    }
+
+    #[test]
+    fn zero_timeouts_are_rejected() -> eyre::Result<()> {
+        for flag in [
+            "--readiness-poll-timeout",
+            "--upstream-connect-timeout",
+            "--upstream-request-timeout",
+            "--header-read-timeout",
+        ] {
+            let zero = format!("{flag}=0s");
+            let message = match cli_with_flags(&[zero.as_str()]).into_settings() {
+                Ok(_) => panic!("{zero} must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(flag), "{message}");
+            // the smallest non-zero value is still accepted
+            let tiny = format!("{flag}=1ms");
+            cli_with_flags(&[tiny.as_str()]).into_settings()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_worker_ids_are_rejected() -> eyre::Result<()> {
+        let config = |second_id: u16| -> eyre::Result<tempfile::NamedTempFile> {
+            let mut file = tempfile::NamedTempFile::new()?;
+            write!(
+                file,
+                r#"upstreams:
+  - worker_id: 0
+    rpc_url: "http://10.0.0.7:8545"
+    readiness_url: "http://10.0.0.7:8551/health/workers"
+  - worker_id: {second_id}
+    rpc_url: "http://10.0.0.8:8545"
+    readiness_url: "http://10.0.0.8:8551/health/workers"
+"#
+            )?;
+            Ok(file)
+        };
+        let duplicate = config(0)?;
+        let path = duplicate.path().display().to_string();
+        let message = match cli_with(Some(&path), None, None).into_settings() {
+            Ok(_) => panic!("two upstreams with worker id 0 must be rejected"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("worker id 0"), "{message}");
+
+        let distinct = config(1)?;
+        let path = distinct.path().display().to_string();
+        assert_eq!(cli_with(Some(&path), None, None).into_settings()?.upstreams.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_ipv6_self_url_is_rejected() -> eyre::Result<()> {
+        let ready = "http://10.0.0.7:8551/health/workers";
+        for (listen, rpc, readiness) in [
+            ("127.0.0.1:8545", "http://[::ffff:127.0.0.1]:8545/", ready),
+            ("127.0.0.1:8545", "http://10.0.0.7:8544", "http://[::ffff:127.0.0.1]:8545/health"),
+            ("0.0.0.0:8545", "http://[::ffff:127.0.0.1]:8545/", ready),
+            ("0.0.0.0:8545", "http://[::ffff:0.0.0.0]:8545/", ready),
+        ] {
+            let result = Cli::parse_from([
+                "worker-gateway".to_string(),
+                format!("--listen-addr={listen}"),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={readiness}"),
+            ])
+            .into_settings();
+            assert!(result.is_err(), "{rpc} / {readiness} is the gateway on {listen}");
+        }
+        // a mapped address of another host, or on another port, is accepted
+        for rpc in ["http://[::ffff:10.0.0.7]:8545/", "http://[::ffff:127.0.0.1]:8544/"] {
+            Cli::parse_from([
+                "worker-gateway".to_string(),
+                "--listen-addr=127.0.0.1:8545".to_string(),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={ready}"),
+            ])
+            .into_settings()?;
+        }
+        Ok(())
     }
 
     /// An inline-upstream CLI on another host (so the self-pointing guard does
