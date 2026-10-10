@@ -59,7 +59,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{atomic::Ordering, Arc},
     time::{Duration, Instant},
 };
 
@@ -73,9 +73,12 @@ use compact::{
     DISK_HEADROOM, REQUESTED_MIN_BYTES,
 };
 
-use super::layout::{
-    available_bytes, compact_dir, gen_dir, list_gens, lock_table, remove_spares, spare_dir,
-    sync_dir, KeyMode, TableMeta,
+use super::{
+    commit::GroupCommit,
+    layout::{
+        available_bytes, compact_dir, gen_dir, list_gens, lock_table, remove_meta_tmp,
+        remove_spares, spare_dir, sync_dir, KeyMode, TableMeta,
+    },
 };
 use crate::archive::{
     btree_index::{
@@ -83,7 +86,7 @@ use crate::archive::{
         iter::{BtreeCursor, PageSource},
         BtreeIndex,
     },
-    data_file::{MapView, MmapFileOptions},
+    data_file::{MapView, MmapFileOptions, SyncTicket},
     error::{fetch::FetchError, load_header::LoadHeaderError},
     pack::{Pack, PackCompression, DATA_HEADER_BYTES},
 };
@@ -394,6 +397,17 @@ struct Writer {
     uncommitted: bool,
     /// Removal records appended since the removal log was last synced.
     removals_unsynced: bool,
+    /// Group-commit mode (see `super::commit`): the sequence number of the last write published
+    /// here, the first one not yet durable (if any), and the open write transactions that wrote
+    /// this table (the committer leaves the table alone while any is open, so a transaction never
+    /// becomes durable in part).
+    applied_seq: u64,
+    first_pending: Option<u64>,
+    open_txns: u32,
+    /// Test-only: the committer's next round on this table reports reaching the point between its
+    /// unlocked removal-log sync and its commit record, then waits to be released.
+    #[cfg(test)]
+    commit_gate: Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     /// When and how fast this table compacts.
     config: CompactionConfig,
     /// Puts in the current generation made dead (overwritten or removed): the automatic
@@ -1120,6 +1134,7 @@ impl TnTable {
     ) -> eyre::Result<Self> {
         fs::create_dir_all(&dir)?;
         let lock = lock_table(&dir)?;
+        remove_meta_tmp(&dir);
         let mode = if key_fn.is_some() { KeyMode::Derived } else { KeyMode::Keyed };
         let meta = match TableMeta::read(&dir)? {
             Some(meta) if meta.mode == mode => meta,
@@ -1183,6 +1198,11 @@ impl TnTable {
             spare: None,
             uncommitted: false,
             removals_unsynced: false,
+            applied_seq: 0,
+            first_pending: None,
+            open_txns: 0,
+            #[cfg(test)]
+            commit_gate: None,
             config,
             dead: 0,
             compaction: None,
@@ -1336,6 +1356,181 @@ impl TnTable {
         self.inner.writer.lock().clear()
     }
 
+    /// Group commit (see `super::commit`): insert `key → value` and publish it at once, without a
+    /// commit, numbering it from `seq` for the committer. Visible to readers on return; durable at
+    /// the committer's next round.
+    pub(crate) fn insert_published(
+        &self,
+        key: &[u8],
+        value: &[u8],
+        group: &GroupCommit,
+        name: &'static str,
+    ) -> eyre::Result<()> {
+        let mut writer = self.inner.writer.lock();
+        writer.insert(key, value)?;
+        self.publish_pending(&mut writer, group, name);
+        Ok(())
+    }
+
+    /// Group commit: [`Self::remove`], published at once (see [`Self::insert_published`]).
+    pub(crate) fn remove_published(
+        &self,
+        key: &[u8],
+        group: &GroupCommit,
+        name: &'static str,
+    ) -> eyre::Result<bool> {
+        let mut writer = self.inner.writer.lock();
+        let removed = writer.remove(key)?;
+        if removed {
+            self.publish_pending(&mut writer, group, name);
+        }
+        Ok(removed)
+    }
+
+    /// Group commit: [`Self::clear`] (itself durable on return), published at once.
+    pub(crate) fn clear_published(
+        &self,
+        group: &GroupCommit,
+        name: &'static str,
+    ) -> eyre::Result<()> {
+        let mut writer = self.inner.writer.lock();
+        writer.clear()?;
+        self.publish_pending(&mut writer, group, name);
+        Ok(())
+    }
+
+    /// Group commit: a write transaction is about to write this table for the first time. Until
+    /// it ends ([`Self::txn_end`]) the committer leaves the table uncommitted.
+    pub(crate) fn txn_begin(&self) {
+        self.inner.writer.lock().open_txns += 1;
+    }
+
+    /// Group commit: a write transaction that wrote this table ended (committed or dropped):
+    /// publish its writes and hand them to the committer.
+    pub(crate) fn txn_end(&self, group: &GroupCommit, name: &'static str) {
+        let mut writer = self.inner.writer.lock();
+        writer.open_txns = writer.open_txns.saturating_sub(1);
+        self.publish_pending(&mut writer, group, name);
+    }
+
+    /// Publish every write applied so far (no commit) and hand the table to the committer with
+    /// the next sequence number, under the writer lock (so sequence order is log order).
+    ///
+    /// The table is marked dirty *before* the number is taken: a committer round reads its target
+    /// number before it takes the dirty tables, so any write numbered at or below the target is
+    /// in that round (or an earlier one), and the round never counts a write it did not commit.
+    fn publish_pending(&self, writer: &mut Writer, group: &GroupCommit, name: &'static str) {
+        self.inner.published.store(Arc::new(writer.publish()));
+        group.mark_dirty(name);
+        let n = group.seq.fetch_add(1, Ordering::AcqRel) + 1;
+        writer.applied_seq = n;
+        writer.first_pending.get_or_insert(n);
+    }
+
+    /// The committer's step for this table (see `super::commit`): commit every write published so
+    /// far, syncing outside the writer lock so writers never wait on the disk. Returns the first
+    /// sequence number still not durable here, if any: a table with an open write transaction is
+    /// left as it is, and writes published during the sync wait for the next round.
+    ///
+    /// The ordering is [`Writer::flush`]'s: removals are durable before the commit record that
+    /// makes them count. So the removal log is synced first (unlocked), any removal appended
+    /// meanwhile is synced under the lock, and only then is the commit record appended.
+    pub(crate) fn group_commit(&self) -> eyre::Result<Option<u64>> {
+        // (a) What is pending; the removal log's unsynced range, if any.
+        #[cfg(test)]
+        let gate;
+        let removal: Option<SyncTicket> = {
+            // Mutated only to take the test gate.
+            #[cfg_attr(not(test), allow(unused_mut))]
+            let mut writer = self.inner.writer.lock();
+            if writer.open_txns > 0 {
+                return Ok(writer.first_pending);
+            }
+            if writer.first_pending.is_none() && !writer.uncommitted {
+                return Ok(None);
+            }
+            writer.check_failed()?;
+            #[cfg(test)]
+            {
+                gate = writer.commit_gate.take();
+            }
+            match writer.removals_unsynced {
+                true => Some(writer.files.removed.sync_ticket()?),
+                false => None,
+            }
+        };
+        // (b) The removal log, unlocked.
+        let removal_outcome = removal.as_ref().map(SyncTicket::sync);
+        #[cfg(test)]
+        let gate = commit_gate_wait(gate, CommitPoint::AfterRemovalSync);
+        // (c) Under the lock: finish the removal log, append the commit record, take the data
+        // log's range.
+        let (data, removals_synced_to, covered) = {
+            let mut writer = self.inner.writer.lock();
+            if let (Some(ticket), Some(outcome)) = (&removal, &removal_outcome) {
+                writer.files.removed.complete_sync(ticket, outcome)?;
+            }
+            if writer.open_txns > 0 {
+                return Ok(writer.first_pending);
+            }
+            #[cfg(test)]
+            if std::mem::take(&mut writer.fail_next_flush) {
+                bail!("injected commit failure");
+            }
+            let removals = writer.removals_unsynced.then(|| writer.files.removed.file_len());
+            if removals.is_some() {
+                // Removals appended during the unlocked sync (rare, and few).
+                writer.files.removed.commit()?;
+            }
+            if writer.uncommitted {
+                writer.files.data.append_raw(COMMIT)?;
+            }
+            writer.uncommitted = false;
+            writer.removals_unsynced = false;
+            // Nothing is uncommitted and no transaction is open: the moment a finished compaction
+            // can switch in (its catch-up replays through the commit record just appended and
+            // syncs the new generation before renaming it into place). Waiting for a round that
+            // ends idle instead would never come while writes keep arriving.
+            let removals = match writer.switch_if_compacted()? {
+                true => {
+                    self.inner.published.store(Arc::new(writer.publish()));
+                    None // the removal log just synced belongs to the retired generation
+                }
+                false => removals,
+            };
+            (writer.files.data.sync_ticket()?, removals, writer.applied_seq)
+        };
+        #[cfg(test)]
+        commit_gate_wait(gate, CommitPoint::AfterCommitRecord);
+        // (d) The data log, unlocked; writes appended meanwhile lie past the ticket.
+        let outcome = data.sync();
+        // (e) Record it; start a compaction if one is due.
+        let mut writer = self.inner.writer.lock();
+        writer.files.data.complete_sync(&data, &outcome)?;
+        writer.files.data.stamp_commit_marker_at(data.end());
+        if let Some(removed_end) = removals_synced_to {
+            writer.files.removed.stamp_commit_marker_at(removed_end);
+        }
+        writer.first_pending = (writer.applied_seq != covered).then_some(covered + 1);
+        if writer.wants_compaction() && !writer.start_compaction(self.inner.published.load_full()) {
+            writer.back_off();
+        }
+        Ok(writer.first_pending)
+    }
+
+    /// Test-only: the committer's next round on this table stops at `point`, reports it on the
+    /// first channel, and waits for a message (or the sender's drop) on the second.
+    #[cfg(test)]
+    pub(crate) fn gate_next_group_commit(
+        &self,
+        point: CommitPoint,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrivals) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        self.inner.writer.lock().commit_gate = Some((point, arrived, released));
+        (arrivals, release)
+    }
+
     /// Commit (see [`Writer::flush`]), then publish every write so far: install a new snapshot for
     /// readers. Readers are never blocked by it (they take no lock); writers wait for it.
     pub(crate) fn flush(&self) -> eyre::Result<()> {
@@ -1466,6 +1661,32 @@ impl TnTable {
                 None
             }
         }
+    }
+}
+
+/// Test-only: where a table's group commit stops (see [`TnTable::gate_next_group_commit`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CommitPoint {
+    /// After the unlocked removal-log sync, before the commit record.
+    AfterRemovalSync,
+    /// After the commit record (and a compaction's switch), before the unlocked data-log sync.
+    AfterCommitRecord,
+}
+
+/// Test-only: wait at `gate` if it is set for `point`; otherwise hand it on.
+#[cfg(test)]
+fn commit_gate_wait(
+    gate: Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    point: CommitPoint,
+) -> Option<(CommitPoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)> {
+    match gate {
+        Some((at, arrived, release)) if at == point => {
+            let _ = arrived.send(());
+            let _ = release.recv_timeout(Duration::from_secs(30));
+            None
+        }
+        other => other,
     }
 }
 
@@ -2351,6 +2572,40 @@ mod test {
             "{:?}",
             started.elapsed()
         );
+        assert_matches(&table, &model);
+    }
+
+    /// Only the copy is paced: the catch-up replays what was committed during it at full speed (a
+    /// catch-up paced below the writer's rate would never finish). The ~2 MiB committed here
+    /// during the copy would take minutes to replay at 16 KiB/s.
+    #[test]
+    fn test_tntable_compaction_catch_up_is_not_paced() {
+        let tmp = TempDir::with_prefix("tntable_compact_catch_up").expect("temp dir");
+        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 16 << 10 };
+        let table = Arc::new(TnTable::open_with(tmp.path().join("t"), None, config).expect("open"));
+        let mut model = Model::new();
+        let tag = "x".repeat(1_000);
+        for i in 0..10 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        let (gate, arrivals) = table.start_compaction_observed();
+        assert_eq!(arrivals.recv_timeout(Duration::from_secs(30)), Ok(1), "the copy is done");
+        for i in 10..2_100 {
+            put(&table, &mut model, i, &tag);
+        }
+        table.flush().expect("flush");
+        drop(gate);
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let finishing = Arc::clone(&table);
+        std::thread::spawn(move || {
+            let _ = done.send(finishing.finish_compaction());
+        });
+        let switched =
+            finished.recv_timeout(Duration::from_secs(10)).expect("the catch-up was paced");
+        switched.expect("switch");
+        assert_eq!(table.compaction_state().gen, 1);
         assert_matches(&table, &model);
     }
 

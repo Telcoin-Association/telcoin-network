@@ -125,7 +125,9 @@ pub trait CertificateStore {
     fn is_empty_certs(&self) -> bool;
 }
 
-/// Save a cert using an open txn.
+/// Save a cert using an open txn. Its subscribers are notified by the caller, once the txn has
+/// ended, so a notified reader finds the certificate in the store (a backend may make a txn's
+/// writes readable only when it ends).
 fn save_cert<TX: DbTxMut>(
     txn: &mut TX,
     digest: HeaderDigest,
@@ -140,8 +142,6 @@ fn save_cert<TX: DbTxMut>(
     // write the certificates id by their origins
     let key = (certificate.origin().clone(), certificate.round());
     txn.insert::<CertificateDigestByOrigin>(&key, &digest)?;
-
-    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
 
     Ok(())
 }
@@ -181,6 +181,7 @@ impl<DB: Database> CertificateStore for DB {
         save_cert(&mut txn, id, &certificate)?;
 
         txn.commit()?;
+        NOTIFY_SUBSCRIBERS.notify(&id, &certificate);
         gc_rounds(self, round)?;
         Ok(())
     }
@@ -194,16 +195,27 @@ impl<DB: Database> CertificateStore for DB {
     ) -> StoreResult<()> {
         let mut txn = self.write_txn()?;
         let mut round = 0;
+        let mut saved = Vec::new();
         for certificate in certificates {
             let digest = certificate.digest();
             round = max(round, certificate.round());
             if let Err(e) = save_cert(&mut txn, digest, certificate) {
                 tracing::error!("Failed to write certificate for {digest} due to error {e}.");
+                // The txn ends with the certificates saved so far (no rollback), notified as
+                // before.
+                drop(txn);
+                for (digest, certificate) in saved {
+                    NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+                }
                 return Err(e);
             }
+            saved.push((digest, certificate));
         }
 
         txn.commit()?;
+        for (digest, certificate) in saved {
+            NOTIFY_SUBSCRIBERS.notify(&digest, certificate);
+        }
         gc_rounds(self, round)?;
         Ok(())
     }

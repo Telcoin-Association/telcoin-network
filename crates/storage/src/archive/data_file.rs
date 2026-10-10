@@ -271,6 +271,34 @@ impl MapView {
         self.published.store(len, Ordering::Release);
     }
 
+    /// `msync(MS_SYNC)` the mapped bytes `[start, end)` (the start rounded down to a page), from
+    /// any thread. Used by [`SyncTicket::sync`] while the owner keeps appending past `end`.
+    fn msync(&self, start: u64, end: u64) -> io::Result<()> {
+        if start >= end {
+            return Ok(());
+        }
+        // Length first, then base (see `set_mapping`): either the current mapping, or a retired
+        // one still mapped, covers `[0, mapped)`.
+        let mapped = self.mapped.load(Ordering::Acquire);
+        let base = self.base.load(Ordering::Acquire);
+        if base.is_null() || end > mapped {
+            return Err(io::Error::other("sync range is not mapped"));
+        }
+        let aligned = start - start % page_size();
+        // SAFETY: `[base, base + mapped)` is a live mapping (a mapping replaced while the view is
+        // shared is retired, not unmapped, until the file drops, and the ticket holding this view
+        // is used while its file is open), and `[aligned, end)` lies within it. `msync` reads no
+        // Rust memory.
+        let rc = unsafe {
+            libc::msync(base.add(aligned as usize).cast(), (end - aligned) as usize, libc::MS_SYNC)
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(io::Error::last_os_error())
+        }
+    }
+
     /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
         self.tail(offset)?.get(..len)
@@ -290,6 +318,48 @@ impl MapView {
         // file drops), and `[offset, end)` lies within it and within the published bytes, which
         // the owner never modifies while readers can see them.
         Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len as usize) })
+    }
+}
+
+/// The OS page size (cached).
+fn page_size() -> u64 {
+    static PAGE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    // SAFETY: `sysconf` reads a system constant.
+    *PAGE
+        .get_or_init(|| u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096))
+}
+
+/// A durability barrier taken in three steps, so its slow part runs without exclusive access to
+/// the file (outside its owner's lock) while appends continue past it:
+/// [`MmapDataFile::sync_ticket`] captures the unsynced append range `[start, end)` and whether
+/// the file's size needs an fsync; [`Self::sync`] flushes them, from any thread; and
+/// [`MmapDataFile::complete_sync`] records the outcome (advancing the synced watermark, or
+/// poisoning the file on a failure, as a barrier does).
+#[derive(Debug)]
+pub(crate) struct SyncTicket {
+    start: u64,
+    end: u64,
+    /// The file's growth count when the ticket was taken (see [`MmapDataFile::complete_sync`]).
+    growths: u64,
+    view: Arc<MapView>,
+    /// A duplicate of the file's descriptor, when a growth left its size unsynced.
+    file: Option<File>,
+}
+
+impl SyncTicket {
+    /// The end of the range this ticket syncs.
+    pub(crate) fn end(&self) -> u64 {
+        self.end
+    }
+
+    /// `msync` the range, then `fsync` the file if its size needs it (see
+    /// [`MmapDataFile::sync_size_if_grown`]).
+    pub(crate) fn sync(&self) -> io::Result<()> {
+        self.view.msync(self.start, self.end)?;
+        if let Some(file) = &self.file {
+            fsync_file(file)?;
+        }
+        Ok(())
     }
 }
 
@@ -457,6 +527,9 @@ pub struct MmapDataFile {
     /// Mappings replaced while [`Self::view`] was shared: kept mapped until this file drops so a
     /// reader still holding an old base stays valid.
     retired: Vec<Backing>,
+    /// Growths so far (see [`Self::complete_sync`]: a size fsync only covers the growths before
+    /// its ticket).
+    growths: u64,
     /// Test-only: how many deferred size fsyncs barriers have run.
     #[cfg(test)]
     size_syncs: std::sync::atomic::AtomicUsize,
@@ -590,6 +663,7 @@ impl MmapDataFile {
             committed_marker,
             write_failed: AtomicBool::new(false),
             size_unsynced: AtomicBool::new(false),
+            growths: 0,
             reserved,
             view: Arc::new(MapView::new()),
             retired: Vec::new(),
@@ -697,7 +771,19 @@ impl MmapDataFile {
     /// is simply skipped this time — the next stamp, after the next append grows capacity,
     /// records it).
     pub fn stamp_commit_marker(&mut self) {
-        if self.read_only || self.end == 0 || self.is_poisoned() {
+        self.stamp_commit_marker_at(self.end);
+    }
+
+    /// [`Self::stamp_commit_marker`] for a committed end below the current one: the end a
+    /// [`SyncTicket`] synced while appends continued past it. Ignored past the synced watermark,
+    /// so it never claims bytes not yet durable.
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
+        if self.read_only
+            || committed == 0
+            || committed > self.end
+            || committed > self.flushed_end.load(Ordering::Relaxed)
+            || self.is_poisoned()
+        {
             return;
         }
         // Need `end + COMMIT_MARKER_LEN <= capacity` so the marker sits in the padding past the
@@ -709,7 +795,7 @@ impl MmapDataFile {
             return; // no headroom this persist; skip (fail-safe — falls back to the WAL probe)
         }
         if let Backing::Rw(map) = &mut self.backing {
-            let marker = commit_marker(self.end);
+            let marker = commit_marker(committed);
             let pos = marker_pos as usize;
             map_range_mut(map, pos, COMMIT_MARKER_LEN as usize).copy_from_slice(&marker);
         }
@@ -1002,6 +1088,7 @@ impl MmapDataFile {
             self.remap(new_cap)?;
         }
         self.size_unsynced.store(true, Ordering::Relaxed);
+        self.growths += 1;
         Ok(())
     }
 
@@ -1275,6 +1362,58 @@ impl MmapDataFile {
             self.sync_size_if_grown()?;
         } else {
             map.flush_async_range(start as usize, len).inspect_err(|_| self.poison())?;
+        }
+        Ok(())
+    }
+
+    /// Capture a [`SyncTicket`] for the appended bytes not yet synced, `[flushed_end, end)`, and
+    /// for the file's size if a growth left it unsynced. An append-mode file only.
+    pub(crate) fn sync_ticket(&self) -> io::Result<SyncTicket> {
+        if self.read_only || !matches!(self.opts.write_mode, WriteMode::Append) {
+            return Err(io::Error::other("a sync ticket needs a writable append-mode file"));
+        }
+        if self.is_poisoned() {
+            return Err(io::Error::other(
+                "data file poisoned by an earlier write/sync failure; refusing to sync",
+            ));
+        }
+        let start = self.flushed_end.load(Ordering::Relaxed).min(self.end);
+        let size = self.size_unsynced.load(Ordering::Relaxed) && !self.opts.derived;
+        Ok(SyncTicket {
+            start,
+            end: self.end,
+            growths: self.growths,
+            view: Arc::clone(&self.view),
+            file: if size { Some(self.file.try_clone()?) } else { None },
+        })
+    }
+
+    /// Record the outcome of `ticket`'s [`SyncTicket::sync`]: on success the synced watermark
+    /// moves to the ticket's end (never past the current end, nor back), and the size counts as
+    /// synced if no growth happened since the ticket; on failure the file is poisoned, as a failed
+    /// barrier poisons it, and the error is returned.
+    pub(crate) fn complete_sync(
+        &mut self,
+        ticket: &SyncTicket,
+        outcome: &io::Result<()>,
+    ) -> io::Result<()> {
+        if let Err(e) = outcome {
+            self.poison();
+            return Err(io::Error::new(e.kind(), e.to_string()));
+        }
+        if self.is_poisoned() {
+            return Err(io::Error::other(
+                "data file poisoned by an earlier write/sync failure; refusing to sync",
+            ));
+        }
+        let synced = ticket.end.min(self.end);
+        if synced > self.flushed_end.load(Ordering::Relaxed) {
+            self.flushed_end.store(synced, Ordering::Relaxed);
+        }
+        if ticket.file.is_some() && ticket.growths == self.growths {
+            self.size_unsynced.store(false, Ordering::Relaxed);
+            #[cfg(test)]
+            self.size_syncs.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -2715,6 +2854,71 @@ mod tests {
         // The physical file is at least the logical length (padding may make it larger until
         // close).
         assert!(std::fs::metadata(&path).expect("meta").len() >= 300);
+    }
+
+    /// A sync ticket flushes only what was appended before it was taken, from outside the file's
+    /// `&mut` (appends continue past it, and the mapping is replaced by a growth meanwhile), then
+    /// records the watermark; the next barrier syncs only the rest.
+    #[test]
+    fn sync_ticket_syncs_its_range_while_appends_continue() {
+        let tmp = TempDir::with_prefix("mmap_df_ticket").expect("temp dir");
+        let path = tmp.path().join("data");
+        let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        df.write_all(&pattern(100)).expect("write");
+        let ticket = df.sync_ticket().expect("ticket");
+        assert_eq!(ticket.end(), 100);
+        // Appends (and a growth that replaces the classic mapping) after the ticket.
+        df.write_all(&pattern(300)).expect("write more");
+        let outcome = ticket.sync();
+        df.complete_sync(&ticket, &outcome).expect("complete");
+        assert_eq!(df.flushed_end.load(Ordering::Relaxed), 100, "only the ticket's range");
+        df.sync_all().expect("barrier");
+        assert_eq!(df.flushed_end.load(Ordering::Relaxed), 400);
+        drop(df);
+        let mut df = MmapDataFile::open_with(&path, true, tiny_opts()).expect("reopen");
+        let mut buf = vec![0u8; 400];
+        df.read_exact(&mut buf).expect("read");
+        assert_eq!(&buf[..100], &pattern(100)[..]);
+        assert_eq!(&buf[100..], &pattern(300)[..]);
+    }
+
+    /// A ticket's size fsync covers only the growths before it: one after the ticket stays owed
+    /// to the next barrier.
+    #[test]
+    fn sync_ticket_size_fsync_covers_only_earlier_growths() {
+        let tmp = TempDir::with_prefix("mmap_df_ticket_growth").expect("temp dir");
+        let mut df =
+            MmapDataFile::open_with(tmp.path().join("data"), false, tiny_opts()).expect("open");
+        let size_syncs = |df: &MmapDataFile| df.size_syncs.load(Ordering::Relaxed);
+        df.write_all(&pattern(200)).expect("write"); // grows
+        let ticket = df.sync_ticket().expect("ticket");
+        df.write_all(&pattern(300)).expect("write"); // grows again after the ticket
+        let outcome = ticket.sync();
+        df.complete_sync(&ticket, &outcome).expect("complete");
+        assert_eq!(size_syncs(&df), 0, "a growth after the ticket keeps the size owed");
+        df.sync_all().expect("barrier");
+        assert_eq!(size_syncs(&df), 1, "the next barrier fsyncs it");
+
+        let ticket = df.sync_ticket().expect("ticket");
+        df.write_all(&pattern(10)).expect("small write, no growth");
+        let outcome = ticket.sync();
+        df.complete_sync(&ticket, &outcome).expect("complete");
+        assert_eq!(size_syncs(&df), 1, "nothing owed, nothing synced");
+    }
+
+    /// A failed ticket sync poisons the file, as a failed barrier does.
+    #[test]
+    fn sync_ticket_failure_poisons() {
+        let tmp = TempDir::with_prefix("mmap_df_ticket_fail").expect("temp dir");
+        let mut df =
+            MmapDataFile::open_with(tmp.path().join("data"), false, tiny_opts()).expect("open");
+        df.write_all(&pattern(50)).expect("write");
+        let ticket = df.sync_ticket().expect("ticket");
+        let failed = Err(io::Error::other("injected"));
+        assert!(df.complete_sync(&ticket, &failed).is_err());
+        assert!(df.is_poisoned());
+        assert!(df.write_all(&pattern(5)).is_err(), "writes refused after the failure");
+        assert!(df.sync_ticket().is_err(), "and so are tickets");
     }
 
     /// The platform sync helpers work on a file and on a directory (this platform's branch is the

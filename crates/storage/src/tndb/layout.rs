@@ -202,10 +202,14 @@ pub(crate) fn remove_spares(table: &Path) -> eyre::Result<()> {
     Ok(())
 }
 
-/// The generation numbers present in `table`, ascending. Removes a leftover `meta.tmp` (a meta
-/// write interrupted before its rename).
-pub(crate) fn list_gens(table: &Path) -> eyre::Result<Vec<u64>> {
+/// Remove a leftover `meta.tmp` (a meta write interrupted before its rename). Only for an open,
+/// under the table's lock: a live writer may be between writing the temporary file and renaming it.
+pub(crate) fn remove_meta_tmp(table: &Path) {
     let _ = fs::remove_file(table.join(META_TMP));
+}
+
+/// The generation numbers present in `table`, ascending.
+pub(crate) fn list_gens(table: &Path) -> eyre::Result<Vec<u64>> {
     let mut gens = Vec::new();
     for entry in fs::read_dir(table)? {
         let entry = entry?;
@@ -250,6 +254,8 @@ mod test {
         fs::create_dir(tmp.path().join("gen-x")).expect("mkdir");
         fs::write(tmp.path().join(META_TMP), b"partial").expect("tmp");
         assert_eq!(list_gens(tmp.path()).expect("list"), vec![0, 2, 10]);
-        assert!(!tmp.path().join(META_TMP).exists(), "a leftover meta.tmp is removed");
+        assert!(tmp.path().join(META_TMP).exists(), "listing changes nothing");
+        remove_meta_tmp(tmp.path());
+        assert!(!tmp.path().join(META_TMP).exists(), "a leftover meta.tmp is removed at open");
     }
 }

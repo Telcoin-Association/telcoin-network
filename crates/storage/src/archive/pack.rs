@@ -16,7 +16,7 @@ use crate::archive::{
 
 use super::{
     crc::{add_crc32, crc32},
-    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions},
+    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions, SyncTicket},
 };
 use std::{
     fmt::Debug,
@@ -280,6 +280,28 @@ where
     /// uses it as an index-free way to detect at-rest corruption of the last committed record.
     pub fn committed_end(&self) -> Option<u64> {
         self.inner.data_file.committed_end()
+    }
+
+    /// A [`SyncTicket`] for the appended bytes not yet synced (see [`MmapDataFile::sync_ticket`]):
+    /// [`Self::commit`] split so the slow sync can run outside the owner's lock.
+    pub(crate) fn sync_ticket(&self) -> Result<SyncTicket, CommitError> {
+        self.inner.failed_cause().map_err(CommitError::Failed)?;
+        self.inner.data_file.sync_ticket().map_err(CommitError::DataFileSync)
+    }
+
+    /// Stamp the tail commit marker at `committed`, an end a [`SyncTicket`] synced (see
+    /// [`MmapDataFile::stamp_commit_marker_at`]).
+    pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
+        self.inner.data_file.stamp_commit_marker_at(committed);
+    }
+
+    /// Record a [`SyncTicket`]'s outcome (see [`MmapDataFile::complete_sync`]).
+    pub(crate) fn complete_sync(
+        &mut self,
+        ticket: &SyncTicket,
+        outcome: &std::io::Result<()>,
+    ) -> Result<(), CommitError> {
+        self.inner.data_file.complete_sync(ticket, outcome).map_err(CommitError::DataFileSync)
     }
 
     /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync

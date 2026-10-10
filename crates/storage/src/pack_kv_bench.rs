@@ -343,6 +343,54 @@ impl SortedKvStore for TnKv {
     }
 }
 
+// ---- tndb in group-commit mode: writes return at once, `persist` is the durability barrier ----
+
+struct TnGroupKv {
+    db: TnDatabase,
+    rt: tokio::runtime::Runtime,
+}
+
+impl TnGroupKv {
+    fn open(dir: &Path) -> Self {
+        let options = crate::tndb::TnDbOptions {
+            commit: crate::tndb::CommitMode::Group,
+            ..Default::default()
+        };
+        let db = TnDatabase::open_with(dir, options).expect("open tndb");
+        db.open_table::<KvTable>().expect("open table");
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        Self { db, rt }
+    }
+
+    /// The durability barrier.
+    fn persist(&self) {
+        self.rt.block_on(self.db.persist::<KvTable>()).expect("persist");
+    }
+}
+
+impl KvStore for TnGroupKv {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
+        let mut txn = self.db.write_txn().expect("write_txn");
+        for (k, v) in items {
+            txn.insert::<KvTable>(k, v).expect("insert");
+        }
+        txn.commit().expect("commit");
+        self.persist();
+    }
+
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
+        for (k, v) in items {
+            self.db.insert::<KvTable>(k, v).expect("insert");
+            self.persist();
+        }
+    }
+
+    fn read_rand(&mut self, keys: &[B256]) -> usize {
+        let txn = self.db.read_txn().expect("read_txn");
+        keys.iter().filter(|k| txn.get::<KvTable>(k).expect("get").is_some()).count()
+    }
+}
+
 // ---- in-memory KV: the `MemDatabase` baseline (sorted `BTreeMap`, no disk) ----
 
 struct MemKv {
@@ -616,6 +664,8 @@ fn pack_vs_mdbx_bench() {
     cols.push(("pack-btree", column(PackBtreeKv::open)));
     println!("  running tndb ...");
     cols.push(("tndb", column(TnKv::open)));
+    println!("  running tndb-group ...");
+    cols.push(("tndb-group", column(TnGroupKv::open)));
     println!("  running mem ...");
     cols.push(("mem", column(MemKv::open)));
 

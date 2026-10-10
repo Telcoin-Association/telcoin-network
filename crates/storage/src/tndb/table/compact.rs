@@ -12,7 +12,7 @@
 //! It reads the old generation the way a reader does — a published snapshot and the logs' mapped
 //! views — so it takes no lock, and the writer feeds it each publish's committed log lengths
 //! ([`Compaction::publish`]). The copy is paced ([`CompactionConfig::bytes_per_sec`]) so it leaves
-//! the disk to commits.
+//! the disk to commits; the catch-up is not (it must keep up with the writer to finish).
 //!
 //! The writer switches to the new generation at its first commit after the thread finishes: it
 //! replays the last small tail under its lock, renames the directory into place (the switch), and
@@ -50,7 +50,8 @@ pub struct CompactionConfig {
     /// half of its puts are dead (overwritten or removed); `None` compacts only on request
     /// ([`tn_types::Database::compact`]).
     pub auto_min_bytes: Option<u64>,
-    /// The pace of a compaction's copy, in bytes per second (0: unpaced).
+    /// The pace of a compaction's copy, in bytes per second (0: unpaced). The catch-up after it
+    /// is never paced.
     pub bytes_per_sec: u64,
 }
 
@@ -543,7 +544,10 @@ fn run(job: Job, progress: &Mutex<Committed>, cancel: &Arc<AtomicBool>) -> eyre:
     #[cfg(test)]
     checkpoint(1, &gate, &arrived);
 
-    // 2. What was committed since, in rounds, until a round has little left to replay.
+    // 2. What was committed since, in rounds, until a round has little left to replay. Unpaced: a
+    // round replays what the writer committed during the last, so it adds no more I/O than the
+    // writer's own, and paced below the writer's rate it would fall further behind every round.
+    out.rate = 0;
     for _ in 0..MAX_CATCHUP_ROUNDS {
         out.check_cancel()?;
         let behind = catch_up_round(&mut out, &data_view, &removed_view, progress, &mut done)?;

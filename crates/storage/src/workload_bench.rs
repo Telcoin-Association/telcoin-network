@@ -95,9 +95,16 @@ use crate::{
 use crate::{
     layered_db::LayeredDatabase,
     mem_db::MemDatabase,
-    tndb::{CompactionConfig, TnDatabase},
+    tndb::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
     ROUNDS_TO_KEEP,
 };
+
+/// Open tndb at `dir` in group-commit mode (writes return at once; `persist` waits for the
+/// committer), compacting as `compaction` says.
+fn open_tndb_group(dir: &Path, compaction: CompactionConfig) -> TnDatabase {
+    TnDatabase::open_with(dir, TnDbOptions { compaction, commit: CommitMode::Group })
+        .expect("open tndb")
+}
 
 /// Define a bench table with a production key shape.
 macro_rules! bench_table {
@@ -471,6 +478,9 @@ fn run_backends<W: Workload>(
     let dir = base.join("tndb");
     let db = TnDatabase::open(&dir).expect("open tndb");
     cols.push(column(rt, w, "TnDb".to_string(), db, Some(&dir)));
+    let dir = base.join("tndb_group");
+    let db = open_tndb_group(&dir, CompactionConfig::default());
+    cols.push(column(rt, w, "TnDb-group".to_string(), db, Some(&dir)));
     let dir = base.join("tndb_layered");
     let db = LayeredDatabase::open(TnDatabase::open(&dir).expect("open tndb"), full_memory);
     cols.push(column(rt, w, format!("{layered}<TnDb>"), db, Some(&dir)));
@@ -509,8 +519,8 @@ fn open_epoch_tables<DB: Database>(db: &DB) {
 
 /// What a round's concurrent task measured.
 enum Durable {
-    /// A vote: write to `persist` ack.
-    Vote(Duration),
+    /// A vote: the write call alone (the caller's wait), and write to `persist` ack.
+    Vote { call: Duration, durable: Duration },
     /// Our header or certificate: write to `persist` ack.
     Own(Duration),
     /// Untimed (the payload writer).
@@ -572,8 +582,9 @@ impl ConsensusRounds {
                 }
                 let start = Instant::now();
                 db.insert::<Votes>(&origin(author), &values.vote).expect("insert vote");
+                let call = start.elapsed();
                 db.persist::<Votes>().await.expect("persist vote");
-                Durable::Vote(start.elapsed())
+                Durable::Vote { call, durable: start.elapsed() }
             });
         }
 
@@ -667,7 +678,7 @@ impl Workload for ConsensusRounds {
             cert: filler(cert_size(n), 2),
             vote: filler(VOTE_SIZE, 3),
         });
-        let (mut votes, mut own) = (Vec::new(), Vec::new());
+        let (mut votes, mut own, mut calls) = (Vec::new(), Vec::new(), Vec::new());
         let mut cert_phase = Duration::ZERO;
 
         let warmup = CONSENSUS_WARMUP_ROUNDS;
@@ -679,7 +690,10 @@ impl Workload for ConsensusRounds {
         for r in warmup + 1..=warmup + self.rounds {
             for measured in rt.block_on(self.concurrent_tasks(&db, r, &values)) {
                 match measured {
-                    Durable::Vote(d) => votes.push(d),
+                    Durable::Vote { call, durable } => {
+                        calls.push(call);
+                        votes.push(durable);
+                    }
                     Durable::Own(d) => own.push(d),
                     Durable::None => {}
                 }
@@ -694,7 +708,10 @@ impl Workload for ConsensusRounds {
         let kept = db.iter::<Certs>().count();
         assert_eq!(kept, (ROUNDS_TO_KEEP as usize + 1) * n, "gc keeps the recent rounds");
 
-        // Epoch end: clear the epoch tables (bare clears, as production does), durably.
+        // Epoch end: clear the epoch tables (bare clears, as production does), durably. Earlier
+        // writes are made durable first, so the timing is the clear's alone (a write-behind or
+        // group-commit backend would otherwise also drain the last round's commits here).
+        rt.block_on(db.persist::<Payload>()).expect("persist before the clear");
         let clear_start = Instant::now();
         db.clear_table::<Certs>().expect("clear");
         db.clear_table::<CertsByRound>().expect("clear");
@@ -711,6 +728,8 @@ impl Workload for ConsensusRounds {
         vec![
             Cell::ms("ms / round", elapsed / rounds),
             Cell::ms("  cert phase ms / round", cert_phase / rounds),
+            Cell::us("vote write call p50 us", quantile(&mut calls, 0.50)),
+            Cell::us("vote write call p99 us", quantile(&mut calls, 0.99)),
             Cell::us("vote durable p50 us", quantile(&mut votes, 0.50)),
             Cell::us("vote durable p99 us", quantile(&mut votes, 0.99)),
             Cell::us("own header/cert durable p50 us", quantile(&mut own, 0.50)),
@@ -1052,6 +1071,17 @@ fn workload_startup_reload() {
             std::mem::forget(db);
         }),
     ));
+    // Group commit: the raw column only (no layer goes over it).
+    let [group, _] = reload(
+        "TnDb-group",
+        &tmp.path().join("tndb_group"),
+        |dir| open_tndb_group(dir, CompactionConfig::default()),
+        Some(|db: TnDatabase| {
+            db.release_locks_for_crash();
+            std::mem::forget(db);
+        }),
+    );
+    cols.push(group);
     #[cfg(feature = "reth-libmdbx")]
     cols.extend(reload(
         "MDBX-prod",
@@ -1180,6 +1210,9 @@ fn workload_compaction() {
         let (db, dir) = tndb(name, config);
         cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
     }
+    let dir = tmp.path().join("TnDb-group");
+    let db = open_tndb_group(&dir, on);
+    cols.push(column(&rt, &mut w, "TnDb-group".to_string(), db, Some(&dir)));
     for (name, config) in [("Layered-cache<TnDb-nocompact>", off), ("Layered-cache<TnDb>", on)] {
         let (db, dir) = tndb(name, config);
         let db = LayeredDatabase::open(db, false);
