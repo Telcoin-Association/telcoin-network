@@ -91,6 +91,13 @@ const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
 /// De-facto standard header carrying the client-facing scheme to the upstream.
 const X_FORWARDED_PROTO: HeaderName = HeaderName::from_static("x-forwarded-proto");
 
+/// The JSON-RPC call [`fetch_chain_id`] sends.
+const CHAIN_ID_CALL: &str = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
+
+/// The largest `eth_chainId` answer [`fetch_chain_id`] reads; a real one is
+/// under a hundred bytes.
+const MAX_CHAIN_ID_ANSWER_BYTES: usize = 64 * 1024;
+
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
@@ -298,6 +305,60 @@ fn stamp_route(
     }
 }
 
+/// Ask an upstream for its chain id with one `eth_chainId` call, stamped for
+/// `route` like a forwarded call (see [`stamp_route`]): the query upstream gets
+/// the configured `query_header` and a worker never does.
+///
+/// Send it through the proxy client so `--upstream-request-timeout` bounds the
+/// whole exchange, answer included; the answer is read up to
+/// [`MAX_CHAIN_ID_ANSWER_BYTES`]. The error is a reason that is safe to log: it
+/// never carries the URL, the answer or the header.
+pub(crate) async fn fetch_chain_id(
+    client: &Client,
+    route: Route,
+    url: &Url,
+    query_header: Option<&QueryHeader>,
+) -> Result<u64, String> {
+    // reqwest's `Display` appends the request url, which can carry a credential
+    let transport = |err: reqwest::Error| ErrorChain(&err.without_url()).to_string();
+    let request = client
+        .post(url.clone())
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(CHAIN_ID_CALL);
+    let mut response = stamp_route(request, route, query_header).send().await.map_err(transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("answered HTTP {status}"));
+    }
+    let mut answer = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if answer.len().saturating_add(chunk.len()) > MAX_CHAIN_ID_ANSWER_BYTES {
+            return Err(format!("the answer exceeds {MAX_CHAIN_ID_ANSWER_BYTES} bytes"));
+        }
+        answer.extend_from_slice(&chunk);
+    }
+    parse_chain_id(&answer)
+        .ok_or_else(|| String::from("the answer is not a JSON-RPC result holding a hex chain id"))
+}
+
+/// The chain id in an `eth_chainId` answer: a `result` holding a `0x`-prefixed
+/// hex quantity that fits a `u64`.
+fn parse_chain_id(answer: &[u8]) -> Option<u64> {
+    /// The one member of the answer that matters.
+    #[derive(serde::Deserialize)]
+    struct ChainIdAnswer {
+        /// The chain id as a hex quantity.
+        result: String,
+    }
+    let answer: ChainIdAnswer = serde_json::from_slice(answer).ok()?;
+    let hex = answer.result.strip_prefix("0x")?;
+    // `from_str_radix` also takes a leading `+`, which a quantity never has
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
 /// Build the client that forwards requests on both routes.
 ///
 /// Redirects are never followed. reqwest follows up to ten by default and
@@ -440,7 +501,7 @@ impl fmt::Display for ErrorChain<'_> {
 
 /// Which upstream a request goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Route {
+pub(crate) enum Route {
     /// The first ready worker: every call without `--redirect-queries`, and
     /// only submissions with it.
     Worker,
@@ -1442,5 +1503,23 @@ mod tests {
         assert!(bare.is_ok(), "{bare:?}");
         let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1));
         assert!(proxy.is_ok(), "{proxy:?}");
+    }
+
+    #[test]
+    fn chain_id_answers_parse_only_as_hex_quantities() {
+        for (answer, expected) in [
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#, Some(2017)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#, Some(1)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0xffffffffffffffff"}"#, Some(u64::MAX)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x10000000000000000"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x+1"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"7e1"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":2017}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#, None),
+            ("not json", None),
+        ] {
+            assert_eq!(parse_chain_id(answer.as_bytes()), expected, "{answer}");
+        }
     }
 }

@@ -342,6 +342,7 @@ fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Res
 mod tests {
     use super::*;
     use crate::{
+        app::{check_chain_ids, log_chain_id_check, ChainIdCheck},
         cli::Cli,
         config::UpstreamWorker,
         proxy::{proxy_client, MAX_REQUEST_BYTES},
@@ -1356,10 +1357,10 @@ mod tests {
     }
 
     /// Captures every log line, at every level, from resolving the settings
-    /// through a forward that succeeds and one that fails, with the state and
-    /// settings debug-printed into the log as well. The runtime is
-    /// current-thread, so the spawned servers log through the same
-    /// thread-local subscriber.
+    /// and running the startup chain-id check through a forward that succeeds
+    /// and one that fails, with the state and settings debug-printed into the
+    /// log as well. The runtime is current-thread, so the spawned servers log
+    /// through the same thread-local subscriber.
     #[tokio::test]
     async fn header_value_never_appears_in_logs() {
         let logs = CapturedLogs::default();
@@ -1391,6 +1392,17 @@ mod tests {
             info!(target: "gateway", ?settings, "resolved settings");
         }
 
+        // startup's chain-id check, against the mocks (whose answers hold no
+        // chain id) and against a query upstream that is down
+        let header = QueryHeader::parse(&api_key_line()).expect("valid header");
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client");
+        let worker_url = Url::parse(&format!("http://{worker}/")).expect("worker url");
+        for query_url in [format!("http://{query}/"), "http://127.0.0.1:1/".to_string()] {
+            let query_url = Url::parse(&query_url).expect("query url");
+            let check = check_chain_ids(&client, &worker_url, &query_url, Some(&header)).await;
+            log_chain_id_check(&check, &worker_url, &query_url);
+        }
+
         // a forward to each route, then a query whose upstream is down
         let state = keyed_redirect_state(worker, query);
         info!(target: "gateway", ?state, "gateway state");
@@ -1409,14 +1421,56 @@ mod tests {
 
         let captured = logs.contents();
         // the capture saw the gateway's own lines, and the header was in play
-        for line in
-            ["plain http", "resolved settings", "gateway state", "forwarding to upstream failed"]
-        {
+        for line in [
+            "plain http",
+            "resolved settings",
+            "could not compare the chain ids",
+            "gateway state",
+            "forwarding to upstream failed",
+        ] {
             assert!(captured.contains(line), "missing {line:?} in: {captured}");
         }
         assert!(captured.contains("<redacted>"), "the header should print redacted: {captured}");
-        assert_eq!(query_seen.api_keys(), vec![API_KEY.to_string()]);
+        // one chain-id call and one forwarded read reached the query mock
+        assert_eq!(query_seen.api_keys(), vec![API_KEY.to_string(); 2]);
         assert_eq!(worker_seen.api_keys(), Vec::<String>::new());
         assert!(!captured.contains(API_KEY), "the header value leaked into the logs: {captured}");
+    }
+
+    /// A mismatch is a warning carrying both chain ids; a match, and a check
+    /// that could not compare, are logged at info.
+    #[test]
+    fn chain_id_mismatch_is_logged_as_a_warning_with_both_ids() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let worker = Url::parse("http://127.0.0.1:8545/").expect("worker url");
+        let query = Url::parse("https://rpc.example/").expect("query url");
+
+        log_chain_id_check(&ChainIdCheck::Mismatch { worker: 2017, query: 1 }, &worker, &query);
+        log_chain_id_check(&ChainIdCheck::Match(2017), &worker, &query);
+        let unchecked =
+            ChainIdCheck::Unchecked { worker: None, query: Some("connection refused".to_string()) };
+        log_chain_id_check(&unchecked, &worker, &query);
+
+        let captured = logs.contents();
+        let lines: Vec<&str> = captured.lines().collect();
+        assert_eq!(lines.len(), 3, "{captured}");
+        assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+        assert!(
+            lines[0].contains("worker_chain_id=2017") && lines[0].contains("query_chain_id=1"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains(" INFO ") && lines[1].contains(" chain_id=2017"), "{}", lines[1]);
+        assert!(
+            lines[2].contains(" INFO ") && lines[2].contains("could not compare the chain ids"),
+            "{}",
+            lines[2]
+        );
     }
 }
