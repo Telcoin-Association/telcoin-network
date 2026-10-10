@@ -169,6 +169,12 @@ Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
 
+The per-client bucket is checked first, and only a request it admits takes a
+global token, so a source over its own limit cannot drain the shared budget the
+other clients depend on. If the global bucket then refuses the request, its
+per-client token is refunded, so a global refusal costs the client nothing
+either.
+
 #### Prefix keying
 
 The per-client bucket is keyed on the client's **network prefix**, not its bare
@@ -214,9 +220,22 @@ limiting, so an orchestrator's liveness/readiness checks keep succeeding under a
 flood (rate-limiting them would make the orchestrator kill or depool the pod at
 the worst possible moment).
 
-Per-IP state is bounded: idle buckets are swept periodically and the number of
+Per-IP state is bounded: idle buckets are swept every minute and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
-limit.
+limit. Once the table is full (100,000 entries), a newly seen client gets no
+bucket of its own: every client the table cannot track shares one overflow
+bucket with the per-client rate and burst, so together they get one client's
+budget however many prefixes they spread over. One IPv6 `/48` (65,536 `/64`s)
+still fits in the table with a bucket per `/64`; the overflow bucket meters only
+the prefixes beyond the cap. A client keeps its own bucket only while it is
+busy: the sweep drops every bucket that has refilled, and a client that returns
+while the table is full shares the overflow bucket too.
+
+> **Residual limitation.** A source holding more than 100,000 prefixes (two
+> `/48`s, or one `/47`) can refill the table after each sweep and then keep the
+> overflow bucket empty, so clients without an entry get `429` until the next
+> sweep while the global bucket looks healthy. If that matters for your
+> deployment, limit new source prefixes at the ingress.
 
 ### Request size
 

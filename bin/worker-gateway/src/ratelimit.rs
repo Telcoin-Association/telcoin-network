@@ -138,6 +138,34 @@ impl Bucket {
         }
     }
 
+    /// Spend a token as [`Bucket::try_admit`] does, then ask `next` whether the
+    /// request may proceed. `next` runs only when this bucket admits, and a refusal
+    /// from it refunds the token, so a request is charged here only when both
+    /// admit it.
+    fn try_admit_then(
+        &mut self,
+        now: Instant,
+        rate: f64,
+        capacity: f64,
+        next: impl FnOnce() -> bool,
+    ) -> bool {
+        if !self.try_admit(now, rate, capacity) {
+            return false;
+        }
+        let admitted = next();
+        if !admitted {
+            self.refund(capacity);
+        }
+        admitted
+    }
+
+    /// Give back one token, capped at `capacity`. Used when a later check refuses
+    /// a request this bucket already admitted, so that refusal costs this bucket
+    /// nothing.
+    fn refund(&mut self, capacity: f64) {
+        self.tokens = (self.tokens + 1.0).min(capacity);
+    }
+
     /// Whether the bucket has refilled to capacity by `now`. An idle bucket
     /// carries no state a freshly-created one would not, so the GC sweep can
     /// drop it.
@@ -313,57 +341,83 @@ fn mask_v6(addr: Ipv6Addr, prefix: PrefixLen) -> Ipv6Addr {
 struct PerIpLimiter {
     /// The rate and burst every per-client bucket is built with.
     limit: RateLimit,
-    /// Ceiling on tracked buckets; beyond it new clients are admitted untracked.
+    /// Ceiling on tracked buckets; a first-seen client beyond it spends from
+    /// `overflow` instead of getting a bucket of its own.
     max_entries: usize,
     /// Live buckets, keyed on the prefix-masked client address.
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    /// One bucket, built with `limit`, shared by every client the full table
+    /// cannot track, so untracked clients together get one client's budget.
+    overflow: Mutex<Bucket>,
     /// How a client address is masked down to its bucket key.
     prefix: PrefixPolicy,
 }
 
 impl PerIpLimiter {
-    /// Admit or reject a request from `ip`, creating the bucket for its network
-    /// prefix on first sight.
-    fn admit(&self, now: Instant, ip: IpAddr) -> bool {
-        let rate = self.limit.tokens_per_sec();
-        let capacity = self.limit.capacity();
+    /// Admit or reject a request from `ip`. A first-seen network prefix gets a
+    /// bucket of its own only when the table has room and the request is
+    /// admitted; with the table full it spends from the shared overflow bucket
+    /// (see `admit_new_ip`). `global` is asked only once the per-client bucket
+    /// has admitted the request, and a refusal from it refunds that token.
+    ///
+    /// The map lock is held until `global` has answered, so the refund lands on
+    /// the bucket this request charged even if a sweep runs concurrently. Lock
+    /// order is always this map, then the overflow bucket, then the global
+    /// bucket; [`RateLimiters::gc`] takes only this map.
+    fn admit(&self, now: Instant, ip: IpAddr, global: impl FnOnce() -> bool) -> bool {
         // Every address in one allocation collapses onto this key, so a rotating
         // client keeps spending the same budget.
         let key = self.prefix.key(ip);
         let mut buckets = lock(&self.buckets);
-        // Bind the existing-bucket outcome first so its borrow of `buckets` ends
-        // before the new-IP path takes `&mut buckets`.
-        let existing = buckets.get_mut(&key).map(|bucket| bucket.try_admit(now, rate, capacity));
-        existing.unwrap_or_else(|| {
-            admit_new_ip(&mut buckets, self.max_entries, now, key, rate, capacity)
-        })
+        match buckets.get_mut(&key) {
+            Some(bucket) => bucket.try_admit_then(
+                now,
+                self.limit.tokens_per_sec(),
+                self.limit.capacity(),
+                global,
+            ),
+            None => self.admit_new_ip(&mut buckets, now, key, global),
+        }
     }
-}
 
-/// Admit a first-seen `ip` (already masked to its network prefix by the
-/// caller), tracking it unless the table is at capacity.
-///
-/// A new IP with the table already full is admitted *untracked* rather than
-/// evicting a live bucket or rejecting a fresh client: the global limit still
-/// bounds aggregate load, and the GC sweep keeps the table from staying full.
-/// Bounded memory is chosen over perfect per-IP fairness under a very wide
-/// source-IP spread.
-fn admit_new_ip(
-    buckets: &mut HashMap<IpAddr, Bucket>,
-    max_entries: usize,
-    now: Instant,
-    ip: IpAddr,
-    rate: f64,
-    capacity: f64,
-) -> bool {
-    if buckets.len() < max_entries {
-        let mut bucket = Bucket::full(now, capacity);
-        let admitted = bucket.try_admit(now, rate, capacity);
-        buckets.insert(ip, bucket);
-        admitted
-    } else {
-        // Table full: admit untracked (bounded memory over per-IP fairness).
-        true
+    /// Admit a first-seen `ip` (already masked to its network prefix by the
+    /// caller), tracking it unless the table is at capacity.
+    ///
+    /// The fresh bucket is inserted only when `global` admits the request too: a
+    /// refused first request leaves no entry, exactly as if its refunded (full)
+    /// bucket had been swept, so a flood the global limit refuses cannot fill the
+    /// table.
+    ///
+    /// A new IP with the table already full is not tracked and spends from the
+    /// shared overflow bucket instead, rather than evicting a live bucket or
+    /// going unmetered: every client the table cannot track shares that one
+    /// bucket, so together they get one client's budget however many prefixes
+    /// they spread over. A `/48` holds 65,536 `/64`s, so one still fits with a
+    /// bucket per `/64` and the overflow meters only the prefixes beyond the cap.
+    /// Bounded memory is still chosen over perfect per-IP fairness: an honest
+    /// client first seen while the table is full shares that budget until the
+    /// GC sweep frees a slot.
+    fn admit_new_ip(
+        &self,
+        buckets: &mut HashMap<IpAddr, Bucket>,
+        now: Instant,
+        ip: IpAddr,
+        global: impl FnOnce() -> bool,
+    ) -> bool {
+        let rate = self.limit.tokens_per_sec();
+        let capacity = self.limit.capacity();
+        if buckets.len() < self.max_entries {
+            let mut bucket = Bucket::full(now, capacity);
+            let admitted = bucket.try_admit_then(now, rate, capacity, global);
+            if admitted {
+                buckets.insert(ip, bucket);
+            }
+            admitted
+        } else {
+            // Table full: share the overflow bucket (bounded memory over per-IP
+            // fairness).
+            lock(&self.overflow).try_admit_then(now, rate, capacity, global)
+        }
     }
 }
 
@@ -410,6 +464,7 @@ impl<C: Clock> RateLimiters<C> {
             limit,
             max_entries: max_per_ip_entries.max(1),
             buckets: Mutex::new(HashMap::new()),
+            overflow: Mutex::new(Bucket::full(now, limit.capacity())),
             prefix,
         });
         Some(Self { clock, global, per_ip })
@@ -418,21 +473,28 @@ impl<C: Clock> RateLimiters<C> {
     /// Admit or reject a request from `peer`. A `None` peer skips the per-IP
     /// bucket; the global bucket still applies.
     ///
-    /// The global bucket is evaluated first and short-circuits (`&&`), so a
-    /// request rejected by the global limit does not spend a per-IP token. This
-    /// keeps the aggregate cap authoritative and can only reduce, never inflate,
-    /// admitted load.
+    /// The per-IP bucket is evaluated first and the global bucket only for a
+    /// request it admits, so a request the per-IP limit refuses spends no global
+    /// token: one source over its own limit cannot drain the shared budget every
+    /// other client depends on. A request the global limit then refuses has its
+    /// per-IP token refunded, so a global refusal spends no per-IP token either.
+    /// Each bucket is charged only for requests both admit.
     pub(crate) fn check(&self, peer: Option<IpAddr>) -> Result<(), GatewayError> {
         let now = self.clock.now();
-        let global_ok = self.global.as_ref().is_none_or(|global| {
-            lock(&global.bucket).try_admit(
-                now,
-                global.limit.tokens_per_sec(),
-                global.limit.capacity(),
-            )
-        });
-        let allowed = global_ok
-            && self.per_ip.as_ref().zip(peer).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip));
+        let admit_global = || {
+            self.global.as_ref().is_none_or(|global| {
+                lock(&global.bucket).try_admit(
+                    now,
+                    global.limit.tokens_per_sec(),
+                    global.limit.capacity(),
+                )
+            })
+        };
+        let allowed = self
+            .per_ip
+            .as_ref()
+            .zip(peer)
+            .map_or_else(admit_global, |(per_ip, ip)| per_ip.admit(now, ip, admit_global));
         allowed.then_some(()).ok_or(GatewayError::RateLimited)
     }
 
@@ -620,6 +682,62 @@ mod tests {
     }
 
     #[test]
+    fn per_ip_rejection_does_not_spend_global_token() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 1)), Some(limit(1, 3)), 16);
+        // A spends its one per-IP token; its next two requests are refused by its
+        // own bucket and must leave the shared global burst of 3 untouched.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(matches!(limiters.check(Some(ip(1))), Err(GatewayError::RateLimited)));
+        assert!(matches!(limiters.check(Some(ip(1))), Err(GatewayError::RateLimited)));
+        // Only A's admitted request took a global token, so two remain for others.
+        assert!(
+            limiters.check(Some(ip(2))).is_ok(),
+            "A's refused requests drained the global bucket"
+        );
+        assert!(limiters.check(Some(ip(3))).is_ok());
+        assert!(matches!(limiters.check(Some(ip(4))), Err(GatewayError::RateLimited)));
+    }
+
+    #[test]
+    fn global_rejection_does_not_spend_per_ip_token() {
+        let clock = ManualClock::new();
+        // The global bucket refills ten times faster than the per-IP one, so the
+        // 100 ms advance below restores a global token but only 0.1 of a per-IP
+        // token: A's last request can only pass on a refunded per-IP token.
+        let limiters = limiters(clock.clone(), Some(limit(1, 2)), Some(limit(10, 1)), 16);
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        // A's per-IP bucket admits, the empty global bucket refuses.
+        assert!(matches!(limiters.check(Some(ip(1))), Err(GatewayError::RateLimited)));
+        clock.advance(Duration::from_millis(100));
+        assert!(limiters.check(Some(ip(1))).is_ok(), "the global refusal spent A's per-IP token");
+    }
+
+    #[test]
+    fn global_rejection_leaves_no_entry_for_a_new_client() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 1)), Some(limit(1, 1)), 16);
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+        // B's first request passes its fresh per-IP bucket but the global bucket is
+        // empty; the refused request must not leave a table entry behind.
+        assert!(matches!(limiters.check(Some(ip(2))), Err(GatewayError::RateLimited)));
+        assert_eq!(limiters.per_ip_len(), 1, "a globally refused new client must not be tracked");
+    }
+
+    #[test]
+    fn refund_never_exceeds_capacity() {
+        let now = ManualClock::new().now();
+        let (rate, capacity) = (1.0, 2.0);
+        let mut bucket = Bucket::full(now, capacity);
+        bucket.refund(capacity);
+        assert!(bucket.tokens <= capacity, "a refund lifted a full bucket past its capacity");
+        // Still exactly `capacity` tokens: two admissions, then a refusal (the
+        // clock does not move, so nothing refills).
+        assert!(bucket.try_admit(now, rate, capacity));
+        assert!(bucket.try_admit(now, rate, capacity));
+        assert!(!bucket.try_admit(now, rate, capacity));
+    }
+
+    #[test]
     fn gc_reclaims_idle_buckets() {
         let clock = ManualClock::new();
         let limiters = limiters(clock.clone(), Some(limit(10, 2)), None, 16);
@@ -649,8 +767,66 @@ mod tests {
         // The first IP is tracked and exhausted.
         assert!(limiters.check(Some(ip(1))).is_ok());
         assert!(limiters.check(Some(ip(1))).is_err());
-        // The table is full (cap 1): a new IP is admitted untracked, not rejected.
+        // The table is full (cap 1): a new IP is admitted untracked, spending from
+        // the shared overflow bucket instead of getting an entry of its own.
         assert!(limiters.check(Some(ip(2))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+    }
+
+    #[test]
+    fn full_table_shares_one_bucket_for_untracked_clients() {
+        let limiters = limiters(ManualClock::new(), Some(limit(1, 2)), None, 2);
+        // Two tracked clients fill the table.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(2))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 2);
+        // A third and a fourth client cannot get entries, so they share one
+        // overflow bucket: one client's burst of 2 between them, then 429.
+        assert!(limiters.check(Some(ip(3))).is_ok());
+        assert!(limiters.check(Some(ip(4))).is_ok());
+        assert!(matches!(limiters.check(Some(ip(3))), Err(GatewayError::RateLimited)));
+        assert!(matches!(limiters.check(Some(ip(4))), Err(GatewayError::RateLimited)));
+        assert_eq!(limiters.per_ip_len(), 2, "untracked clients must not add entries");
+        // A tracked client keeps its own bucket, which still holds a token.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+    }
+
+    #[test]
+    fn gc_frees_entries_so_new_clients_get_their_own_bucket() {
+        let clock = ManualClock::new();
+        let limiters = limiters(clock.clone(), Some(limit(1, 1)), None, 1);
+        // ip(1) fills the one-entry table; ip(2) spends the overflow token, so
+        // ip(3) is refused.
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(2))).is_ok());
+        assert!(matches!(limiters.check(Some(ip(3))), Err(GatewayError::RateLimited)));
+        // ip(1)'s bucket refills and goes idle, and the sweep reclaims it.
+        clock.advance(Duration::from_secs(1));
+        limiters.gc();
+        assert_eq!(limiters.per_ip_len(), 0);
+        // The freed slot tracks the next new client.
+        assert!(limiters.check(Some(ip(3))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1, "a freed slot must track the new client");
+        // ip(3) spent its own bucket, not the overflow one, which still has the
+        // token it refilled for the next untracked client.
+        assert!(limiters.check(Some(ip(4))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+    }
+
+    #[test]
+    fn global_rejection_refunds_the_overflow_bucket() {
+        let clock = ManualClock::new();
+        // As in `global_rejection_does_not_spend_per_ip_token`, the global bucket
+        // refills ten times faster than the per-client one; the one-entry table
+        // sends every client after ip(1) to the overflow bucket.
+        let limiters = limiters(clock.clone(), Some(limit(1, 1)), Some(limit(10, 1)), 1);
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        // The overflow bucket admits ip(2), the empty global bucket refuses it.
+        assert!(matches!(limiters.check(Some(ip(2))), Err(GatewayError::RateLimited)));
+        clock.advance(Duration::from_millis(100));
+        // A global token is back but the overflow bucket regained only 0.1, so
+        // ip(3) passes only on the token refunded after ip(2)'s refusal.
+        assert!(limiters.check(Some(ip(3))).is_ok(), "the global refusal spent the overflow token");
         assert_eq!(limiters.per_ip_len(), 1);
     }
 
