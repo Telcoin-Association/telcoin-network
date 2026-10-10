@@ -9,6 +9,7 @@ operators repair or observe inputs. Neither mode grants admission privileges to 
 admission:
   mode: Grace
   snapshot_max_age_secs: 300
+  transition_grace_secs: 30
 ```
 
 Closed permits the union of previous, current, and next committee identities, explicitly trusted
@@ -49,6 +50,43 @@ These are the concrete launch semantics implemented by this change, for maintain
 | Different window at the same revision | Open | Original accepted window renewed, or a newer complete window |
 | One PeerId claimed by different authorized BLS identities, or a configured identity conflicting with a learned mapping | Open | Repair configuration or obtain consistent signature-checked records |
 | Incomplete committee identity union or insufficient authenticated current records | Grace | Resolve records through existing validation and discovery paths |
+
+## Automatic transition Grace
+
+When Closed is requested, every newly accepted epoch snapshot enters Grace for at least
+`transition_grace_secs` (30 seconds by default). The interval starts when that swarm accepts the
+snapshot, using its monotonic clock, even if all records already resolve. Identical renewals
+refresh only the policy lease. They cannot postpone closure by restarting the interval. A newer
+epoch atomically replaces the entire window and starts its own interval. An older or contradictory
+update preserves the accepted window and timer while taking the documented Open fallback.
+Consistent authoritative renewal repairs that fault without restarting the accepted epoch's timer.
+
+Elapsed time is a minimum wait, never a close authorization. With unavailable hubs or delayed
+records, Grace continues indefinitely while the authoritative lease is renewed. Closure requires
+the current snapshot's authenticated-record quorum and every identity in the complete boundary
+window to resolve, as described above. This retains the conservative launch contract: a quorum
+alone does not deny unresolved boundary identities. Connections, consensus readiness, operator
+stubs, and records from superseded windows cannot replace these inputs. Once records arrive
+through the existing signature/protocol checks, the next admission decision may close if the
+minimum wait has elapsed and the snapshot is valid. The heartbeat then revokes ordinary live peers.
+
+Unknown authenticated Grace peers remain ordinary discovery peers. Grace does not make them
+important, operator trusted, pinned in the gossip mesh, or exempt from finite service budgets.
+They continue through the same transport, ban, signature, protocol, and work-rate checks. No
+attacker is required for the connectivity failure this interval prevents, and an attacker cannot
+extend it with an identical committee renewal or acquire privileges by connecting during Grace.
+
+The timer is not persisted. Restart requires a fresh authoritative snapshot and a full new
+interval, even with a restored record cache. An unversioned compatibility update also discards the
+timer; recovery through a consistent versioned window begins a new interval. Explicit Open and
+Grace configurations keep their requested rollout behavior. A zero minimum interval permits
+immediate closure only when every existing validity and resolution condition holds.
+
+`AdmissionStatus` exposes the accepted epoch, remaining minimum interval, effective mode,
+fallback reason, and independent resolved/required/connected current counts. Metrics publish
+`tn_network_admission_transition_remaining_seconds`; fallback value 5 denotes an active minimum
+interval with otherwise valid inputs. Unresolved or invalid inputs take precedence over that
+reason so operators can see why waiting alone will not close the policy.
 
 The default lease is 300 seconds. Each epoch-scoped task renews at one third of the configured
 lease, with a minimum interval of one second. Epoch shutdown cancels renewal. The swarm checks

@@ -429,18 +429,31 @@ pub struct AdmissionConfig {
     mode: AdmissionMode,
     /// Maximum seconds since the epoch owner last renewed the authoritative snapshot.
     snapshot_max_age_secs: u64,
+    /// Minimum Grace interval for each accepted epoch, independent of the renewal lease.
+    transition_grace_secs: u64,
 }
 
 impl Default for AdmissionConfig {
     fn default() -> Self {
-        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300 }
+        Self { mode: AdmissionMode::Open, snapshot_max_age_secs: 300, transition_grace_secs: 30 }
     }
 }
 
 impl AdmissionConfig {
     /// Construct a policy with an explicit renewal lease. A zero lease prevents Closed.
     pub fn new(mode: AdmissionMode, snapshot_max_age: Duration) -> Self {
-        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs() }
+        Self { mode, snapshot_max_age_secs: snapshot_max_age.as_secs(), ..Self::default() }
+    }
+
+    /// Set the minimum transition interval. Zero still requires valid, resolved policy inputs.
+    pub fn with_transition_grace(mut self, interval: Duration) -> Self {
+        self.transition_grace_secs = interval.as_secs();
+        self
+    }
+
+    /// Return the minimum Grace interval measured from acceptance of a new epoch snapshot.
+    pub fn transition_grace(&self) -> Duration {
+        Duration::from_secs(self.transition_grace_secs)
     }
 
     /// Return the requested rollout mode.
