@@ -46,7 +46,7 @@
 #
 # Dry run, for rehearsals (RELEASE_DRY_RUN=1). The variables below are refused without it.
 # A dry run never calls gh or git push and pushes images only to RELEASE_IMAGE.
-#   RELEASE_IMAGE                  image repository on localhost: or 127.0.0.1:
+#   RELEASE_IMAGE                  image repository on localhost:PORT/ or 127.0.0.1:PORT/
 #   RELEASE_ALLOWLIST_DIR          directory of *.asc used instead of main's allowlist
 #   RELEASE_MAIN_REF               ref used instead of refs/remotes/origin/main; no fetch
 #   RELEASE_ATTESTATION=skip       skip the on-chain attestation check
@@ -74,6 +74,8 @@ TAG_RE='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-adiri)?(-rc[1-9][0-
 DIGEST_RE='^sha256:[0-9a-f]{64}$'
 HANDLE_FILE_RE='^[A-Za-z0-9-]+\.asc$'
 REPO_RE='^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$'
+LOCAL_HOST_RE='^(localhost|127\.0\.0\.1):[0-9]+$'
+LOCAL_PATH_RE='^[a-z0-9._/-]+$'
 BOT_LOGIN='github-actions[bot]'
 ATTEST_SCRIPT=.github/scripts/verify_commit_hash.sh
 ANCHOR='<!-- ANCHOR: releases -->'
@@ -103,6 +105,7 @@ REL_DRAFT=
 REL_PRERELEASE=
 REL_AUTHOR=
 REL_ASSETS=
+REL_ASSET_IDS=   # release_state: "name<TAB>asset id<TAB>digest" per asset, sorted
 FETCHED=0        # fetch_tag ran
 BUILD_WT=        # build: detached worktree of the tag, removed on exit
 CONTAINERS=      # containers from docker create, removed on exit
@@ -181,9 +184,33 @@ abspath() {
     esac
 }
 
+# Physical path (symlinks, "." and ".." resolved) of the absolute directory path $1, which may
+# not exist yet: its deepest existing ancestor is resolved and the rest appended, and that
+# rest may not contain "." or "..".
+physical_dir() {
+    local head=$1 rest='' leaf
+    while [ "$head" != / ] && [ "${head%/}" != "$head" ]; do head=${head%/}; done
+    while [ ! -d "$head" ]; do
+        leaf=${head##*/}
+        case "$leaf" in '' | . | ..) die 2 "cannot resolve the directory $1" ;; esac
+        rest="/$leaf$rest"
+        head=${head%/*}
+        if [ -z "$head" ]; then head=/; fi
+    done
+    head=$(cd "$head" && pwd -P) || die 2 "cannot resolve the directory $1"
+    printf '%s%s\n' "${head%/}" "$rest"
+}
+
+# A dry-run image repository: localhost:PORT or 127.0.0.1:PORT, then a lowercase repository
+# path with no tag, digest or "..". Anything looser (such as "localhost:5000@host/x") could
+# send registry_digest's requests to another host.
 is_local_image() {
-    case "$IMAGE" in localhost:* | 127.0.0.1:*) return 0 ;; esac
-    return 1
+    local host=${IMAGE%%/*} path=${IMAGE#*/}
+    [[ "$host" =~ $LOCAL_HOST_RE ]] || return 1
+    [ "$path" != "$IMAGE" ] || return 1
+    [[ "$path" =~ $LOCAL_PATH_RE ]] || return 1
+    case "$path" in *..*) return 1 ;; esac
+    return 0
 }
 
 require_local_image_in_dry_run() {
@@ -195,6 +222,15 @@ require_local_image_in_dry_run() {
 require_main_ref() {
     git rev-parse --verify --quiet "$MAIN_REF^{commit}" >/dev/null ||
         die 2 "$MAIN_REF does not exist; fetch main first"
+}
+
+# build pushes to ghcr.io and publish moves an alias there, so docker needs its credential.
+# A dry run uses a local registry without one.
+require_registry_login() {
+    local cfg
+    if [ "$DRY_RUN" = 1 ]; then return 0; fi
+    cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
+    grep -q '"ghcr.io"' "$cfg" 2>/dev/null || die 2 "docker is not logged in to ghcr.io: run make docker-login"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -376,7 +412,7 @@ count_sigs() {
     local file=$1 sig=$2 status results bad kind detail
     if [ ! -f "$file" ] || [ ! -f "$sig" ]; then die 2 "count_sigs: $file or $sig does not exist"; fi
     status=$(gpg --homedir "$ALLOW_GNUPGHOME" --batch --status-fd 1 --verify "$sig" "$file" 2>/dev/null || true)
-    results=$(printf '%s\n' "$status" | sig_blocks)
+    results=$(printf '%s\n' "$status" | sig_blocks) || die 1 "cannot judge the signatures in ${sig##*/}"
     bad=$(printf '%s\n' "$results" | awk -F'\t' '$1 == "bad" { printf "%s ", $2 }')
     [ -z "$bad" ] || die 1 "BADSIG in ${sig##*/} from key ${bad% }: ${file##*/} does not match its signature"
     while IFS=$'\t' read -r kind detail; do
@@ -483,10 +519,22 @@ registry_digest() {
 # ---------------------------------------------------------------------------------------------
 # Tag, version and CHANGELOG checks
 
-# Retried because a fetch is the first network call on every host.
+# A missing origin is a precondition, not an outage, so it is not retried.
+require_origin() {
+    git remote get-url origin >/dev/null 2>&1 || die 2 "this checkout has no git remote named origin"
+}
+
+# Retried because a fetch is the first network call on every host. git fetch exits 1 when it
+# refuses a ref update (here only the unforced tag: it moved on origin), 128 on other errors.
 git_fetch() {
-    local attempt=1
-    until git fetch --quiet --no-tags origin "$@"; do
+    local attempt=1 rc
+    require_origin
+    while :; do
+        git fetch --quiet --no-tags origin "$@" && rc=0 || rc=$?
+        case "$rc" in
+            0) return 0 ;;
+            1) die 1 "git fetch refused to update a local ref from origin ($*); did the tag move on origin?" ;;
+        esac
         [ "$attempt" -lt 3 ] || die 3 "git fetch from origin failed after 3 attempts"
         attempt=$((attempt + 1))
         sleep 5
@@ -496,6 +544,7 @@ git_fetch() {
 # Object id of refs/tags/$1 on origin, or nothing.
 ls_remote_tag() {
     local out attempt=1
+    require_origin
     until out=$(git ls-remote origin "refs/tags/$1"); do
         [ "$attempt" -lt 3 ] || die 3 "git ls-remote origin failed after 3 attempts"
         attempt=$((attempt + 1))
@@ -564,37 +613,29 @@ tagger_time() {
 }
 
 # Names of the refs/tags/v* tags that count for the version rules. Without a cutoff, every
-# tag; with one (epoch seconds), only annotated tags whose tagger date is strictly earlier.
+# tag; with a cutoff (epoch seconds) and commit $2, only annotated tags whose tagger date is
+# strictly earlier and whose commit is $2 or one of its ancestors. Returns git's status:
+# bash 3.2 runs $(...) without -e, so the caller checks it.
 tags_before() {
+    local name
     if [ -z "$1" ]; then
         git tag -l 'v*'
-        return 0
+    else
+        git for-each-ref --format='%(refname:strip=2) %(taggerdate:raw)' 'refs/tags/v*' |
+            awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }' |
+            while IFS= read -r name; do
+                if git merge-base --is-ancestor "refs/tags/$name^{commit}" "$2" 2>/dev/null; then
+                    printf '%s\n' "$name"
+                fi
+            done
     fi
-    git for-each-ref --format='%(refname:strip=2) %(taggerdate:raw)' 'refs/tags/v*' |
-        awk -v c="$1" '$2 != "" && $2 + 0 < c + 0 { print $1 }'
 }
 
-# check-tag step (5): the Cargo version is X.Y.Z, the extradata string fits 32 bytes, and the
-# release is monotonic in its channel, with no release candidate after its final.
-check_version_at() {
-    local commit=$1 cargo_version extradata cutoff='' earlier others highest
-    cargo_version=$(git show "$commit:Cargo.toml" 2>/dev/null | workspace_version) ||
-        die 1 "cannot read Cargo.toml at $commit"
-    [ -n "$cargo_version" ] || die 1 "no [workspace.package] version in Cargo.toml at $commit"
-    [ "$cargo_version" = "$VERSION" ] ||
-        die 1 "Cargo.toml at $commit has version $cargo_version; $TAG needs $VERSION (run make release-prep)"
-    extradata="telcoin-network/v$VERSION/linux"
-    [ "${#extradata}" -le 32 ] || die 1 "'$extradata' is longer than the 32-byte extradata limit"
-
-    # Before TAG exists (`tag` is about to create it) the rules compare with every existing tag.
-    # Once it exists they compare only with tags signed before it, both dates coming from
-    # signed tag objects: an older release must stay verifiable after newer ones exist. The
-    # tag ruleset and the maintainer signatures are what protect the tag object itself.
-    if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
-        cutoff=$(tagger_time "$TAG")
-        [ -n "$cutoff" ] || die 1 "tag $TAG has no tagger date"
-    fi
-    earlier=$(tags_before "$cutoff")
+# The release is monotonic in its channel, with no release candidate after its final, among
+# the tags that tags_before CUTOFF COMMIT names.
+check_version_order() {
+    local earlier others highest
+    earlier=$(tags_before "$1" "$2") || die 2 "cannot list the v* tags"
     if [ -n "$RC" ]; then
         case $'\n'"$earlier"$'\n' in
             *$'\n'"$BASE"$'\n'*) die 1 "$BASE already exists; no release candidate may follow its final release" ;;
@@ -605,6 +646,30 @@ check_version_at() {
     highest=$(printf '%s\n%s\n' "$others" "$VERSION" | version_max)
     [ "$highest" = "$VERSION" ] ||
         die 1 "$TAG is not newer than the $CHANNEL release v$highest; $CHANNEL versions only go up"
+}
+
+# check-tag step (5): the Cargo version is X.Y.Z, the extradata string fits 32 bytes, and the
+# release is monotonic in its channel, with no release candidate after its final.
+check_version_at() {
+    local commit=$1 cargo_version extradata cutoff=''
+    cargo_version=$(git show "$commit:Cargo.toml" 2>/dev/null | workspace_version) ||
+        die 1 "cannot read Cargo.toml at $commit"
+    [ -n "$cargo_version" ] || die 1 "no [workspace.package] version in Cargo.toml at $commit"
+    [ "$cargo_version" = "$VERSION" ] ||
+        die 1 "Cargo.toml at $commit has version $cargo_version; $TAG needs $VERSION (run make release-prep)"
+    extradata="telcoin-network/v$VERSION/linux"
+    [ "${#extradata}" -le 32 ] || die 1 "'$extradata' is longer than the 32-byte extradata limit"
+
+    # Before TAG exists (`tag` is about to create it) the rules compare with every existing tag.
+    # Once it exists they compare only with annotated tags dated before it on COMMIT or its
+    # ancestors, so an older release stays verifiable after newer ones exist. Only TAG's date
+    # is signed; the other tags are not verified (the tags before this process are unsigned),
+    # so the v* tag ruleset keeps bogus tags out, and a wrong tag has to be deleted.
+    if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+        cutoff=$(tagger_time "$TAG")
+        [ -n "$cutoff" ] || die 1 "tag $TAG has no tagger date"
+    fi
+    check_version_order "$cutoff" "$commit"
 }
 
 # Applies the CHANGELOG rules of check-tag step (6) to file $1: exactly one "## [BASE] - date"
@@ -669,7 +734,7 @@ check_attestation() {
     case "$rc" in
         0) ;;
         2) die 3 "the attestation registry did not answer for $commit" ;;
-        *) die 1 "$commit is not attested on chain (run make attest on it)" ;;
+        *) die 1 "$commit is not attested on chain; on xerxes run: git switch --detach $commit && ALLOW_STALE_BASE=1 make attest" ;;
     esac
 }
 
@@ -699,9 +764,10 @@ check_scripts_from_main() {
     require_main_ref
     for file in etc/release.sh "$ATTEST_SCRIPT"; do
         if [ "$file" = etc/release.sh ]; then
-            mine=$(git hash-object -- "$SELF")
+            mine=$(git hash-object -- "$SELF") || die 2 "cannot read $SELF"
         else
-            mine=$(git hash-object -- "$file")
+            mine=$(git hash-object -- "$file") ||
+                die 2 "$file is missing from this checkout; update it or set RELEASE_ALLOW_LOCAL_SCRIPTS=1"
         fi
         theirs=$(git rev-parse --verify --quiet "$MAIN_REF:$file") || theirs=missing
         [ "$mine" = "$theirs" ] ||
@@ -712,12 +778,20 @@ check_scripts_from_main() {
 # ---------------------------------------------------------------------------------------------
 # The GitHub release, or RELEASE_DIR in a dry run
 
-# After a failed gh call: missing auth is a precondition (2); anything else is retried, three
-# attempts in all, then exit 3.
+# After a failed gh call: missing auth is a precondition (2). An HTTP 4xx answer other than a
+# rate limit is final: 422 is a refused change (1), the rest a precondition such as the token's
+# permissions or the repository name (2). Only transport errors, 5xx and rate limits are
+# retried, three attempts in all, then exit 3.
 gh_failed() {
     local rc=$1 attempt=$2 what=$3
     cat "$WORK/gh.err" >&2
     if [ "$rc" = 4 ]; then die 2 "$what: gh is not authenticated (gh auth login, or GH_TOKEN in CI)"; fi
+    if ! grep -q -i -e 'HTTP 429' -e 'rate limit' "$WORK/gh.err"; then
+        if grep -q 'HTTP 422' "$WORK/gh.err"; then die 1 "$what: GitHub refused the request (HTTP 422)"; fi
+        if grep -q 'HTTP 4[0-9][0-9]' "$WORK/gh.err"; then
+            die 2 "$what: GitHub refused the request; check the token's permissions and RELEASE_REPO"
+        fi
+    fi
     [ "$attempt" -lt 3 ] || die 3 "$what failed after 3 attempts"
     sleep 5
 }
@@ -737,24 +811,30 @@ gh_run() {
     done
 }
 
-# Sets REL_EXISTS, REL_DRAFT, REL_PRERELEASE, REL_AUTHOR and REL_ASSETS (one name per line).
-# A dry run's RELEASE_DIR is always a draft created by the bot.
+# Sets REL_EXISTS, REL_DRAFT, REL_PRERELEASE, REL_AUTHOR, REL_ASSETS (one name per line) and
+# REL_ASSET_IDS. GitHub gives a replaced asset a new id and digest. A dry run's RELEASE_DIR is
+# always a draft created by the bot, and its files' hashes stand in for the ids and digests.
 release_state() {
-    local out rc attempt=1 file
-    REL_EXISTS=0 REL_DRAFT='' REL_PRERELEASE='' REL_AUTHOR='' REL_ASSETS=''
+    local out rc attempt=1 file hex
+    REL_EXISTS=0 REL_DRAFT='' REL_PRERELEASE='' REL_AUTHOR='' REL_ASSETS='' REL_ASSET_IDS=''
     if [ "$DRY_RUN" = 1 ]; then
         [ -n "${RELEASE_DIR:-}" ] || die 2 "dry run: set RELEASE_DIR to the directory that stands in for the release"
         [ -d "$RELEASE_DIR" ] || return 0
         REL_EXISTS=1 REL_DRAFT=true REL_PRERELEASE=$PRERELEASE REL_AUTHOR=$BOT_LOGIN
         for file in "$RELEASE_DIR"/*; do
-            if [ -f "$file" ]; then REL_ASSETS="$REL_ASSETS${file##*/}"$'\n'; fi
+            [ -f "$file" ] || continue
+            hex=$(sha256_hex "$file")
+            REL_ASSETS="$REL_ASSETS${file##*/}"$'\n'
+            REL_ASSET_IDS="$REL_ASSET_IDS${file##*/}"$'\t-\tsha256:'"$hex"$'\n'
         done
+        REL_ASSET_IDS=$(printf '%s' "$REL_ASSET_IDS" | LC_ALL=C sort)
         return 0
     fi
     need gh
     while :; do
         out=$(gh release view "$TAG" --repo "$REPO" --json isDraft,isPrerelease,author,assets \
-            --jq '.isDraft, .isPrerelease, .author.login, .assets[].name' 2>"$WORK/gh.err") && rc=0 || rc=$?
+            --jq '.isDraft, .isPrerelease, .author.login, (.assets[] | [.name, .id, (.digest // "")] | @tsv)' \
+            2>"$WORK/gh.err") && rc=0 || rc=$?
         if [ "$rc" = 0 ]; then break; fi
         if grep -q 'release not found' "$WORK/gh.err"; then return 0; fi
         gh_failed "$rc" "$attempt" "gh release view $TAG"
@@ -764,7 +844,8 @@ release_state() {
     REL_DRAFT=$(printf '%s\n' "$out" | sed -n 1p)
     REL_PRERELEASE=$(printf '%s\n' "$out" | sed -n 2p)
     REL_AUTHOR=$(printf '%s\n' "$out" | sed -n 3p)
-    REL_ASSETS=$(printf '%s\n' "$out" | sed 1,3d)
+    REL_ASSET_IDS=$(printf '%s\n' "$out" | sed 1,3d | LC_ALL=C sort)
+    REL_ASSETS=$(printf '%s\n' "$REL_ASSET_IDS" | cut -f1)
 }
 
 has_asset() {
@@ -789,6 +870,33 @@ check_asset_set() {
         case "$allowed" in *$'\n'"$asset"$'\n'*) ;; *) die 1 "release $TAG has an unexpected asset: $asset" ;; esac
     done <<EOF
 $REL_ASSETS
+EOF
+}
+
+# check_assets_unchanged WHAT: the release still holds exactly the assets, by name, id and
+# digest, that release_state listed for the last verification. WHAT ends the error message.
+check_assets_unchanged() {
+    local verified=$REL_ASSET_IDS
+    release_state
+    [ "$REL_EXISTS" = 1 ] || die 1 "release $TAG is gone; $1"
+    [ "$REL_ASSET_IDS" = "$verified" ] || die 1 "the assets of $TAG changed after they were verified; $1"
+    if [ "$REL_DRAFT" = false ] && [ "$REL_PRERELEASE" != "$PRERELEASE" ]; then
+        die 1 "release $TAG is published with prerelease=$REL_PRERELEASE; expected $PRERELEASE"
+    fi
+}
+
+# check_fetched_digests DIR: every listed asset, as downloaded into DIR, has the sha256 GitHub
+# reports for it, so the files checked are the assets listed (nothing swapped in between).
+check_fetched_digests() {
+    local dir=$1 name id digest hex
+    while IFS=$'\t' read -r name id digest; do
+        [ -n "$name" ] || continue
+        hex=$(sha256_hex "$dir/$name")
+        if [ -n "$digest" ] && [ "$digest" != "sha256:$hex" ]; then
+            die 1 "$name on release $TAG (asset $id) changed between listing and download"
+        fi
+    done <<EOF
+$REL_ASSET_IDS
 EOF
 }
 
@@ -843,6 +951,21 @@ release_set_notes() {
         return 0
     fi
     gh_run release edit "$TAG" --repo "$REPO" --notes-file "$1" >&2
+}
+
+# Empties the local artifact dir $1. In a dry run the stand-in release must be neither that
+# dir nor inside it; both are compared as physical paths at the moment of deletion, since
+# init_env's check could be outdated by a symlink created since.
+clear_release_dir() {
+    local rd=$1 here stand_in
+    if [ "$DRY_RUN" = 1 ] && [ -n "${RELEASE_DIR:-}" ]; then
+        here=$(physical_dir "$rd") || exit
+        stand_in=$(physical_dir "$RELEASE_DIR") || exit
+        case "$stand_in/" in
+            "$here/"*) die 2 "RELEASE_DIR=$RELEASE_DIR lies inside $rd, which this step empties; move it outside $ARTIFACT_ROOT" ;;
+        esac
+    fi
+    rm -rf "$rd"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -904,11 +1027,20 @@ check_tarball() {
     [ -x "$dest/$dir/telcoin-network" ] || die 1 "$dir/telcoin-network in $TARBALL is not executable"
 }
 
-# Copies /usr/local/bin/telcoin out of image $1 to $2.
+# Copies /usr/local/bin/telcoin out of image $1 to $2, after checking that the image runs that
+# file: no ENTRYPOINT, CMD ["telcoin","node"] as in etc/Dockerfile, and no telcoin in
+# /usr/local/sbin, the one PATH entry ahead of /usr/local/bin.
 image_binary() {
-    local ref=$1 dest=$2 ctr
+    local ref=$1 dest=$2 ctr cfg
+    cfg=$(docker image inspect --format '{{json .Config.Entrypoint}} {{json .Config.Cmd}}' "$ref") ||
+        die 1 "docker image inspect $ref failed"
+    [ "$cfg" = 'null ["telcoin","node"]' ] ||
+        die 1 "$ref has ENTRYPOINT and CMD $cfg; expected no ENTRYPOINT and CMD [\"telcoin\",\"node\"]"
     ctr=$(docker create --platform linux/amd64 "$ref") || die 1 "docker create $ref failed"
     CONTAINERS="$CONTAINERS$ctr"$'\n'
+    if docker cp "$ctr:/usr/local/sbin/telcoin" - >/dev/null 2>&1; then
+        die 1 "$ref has a second telcoin in /usr/local/sbin, which PATH finds first"
+    fi
     docker cp "$ctr:/usr/local/bin/telcoin" "$dest" >/dev/null || die 1 "cannot copy /usr/local/bin/telcoin out of $ref"
     docker rm "$ctr" >/dev/null 2>&1 || true
 }
@@ -917,9 +1049,11 @@ image_binary() {
 # (crates/telcoin-network-cli/src/version.rs).
 check_version_output() {
     local ref=$1 out version sha features flist has_adiri=no
-    out=$(docker run --rm --network none --platform linux/amd64 "$ref" telcoin --version) ||
-        die 1 "$ref: telcoin --version failed"
-    # clap prints the program name before the first line: "telcoin-network-cli Version: X.Y.Z".
+    # --entrypoint: run the very file image_binary copied, not whatever ENTRYPOINT or PATH picks.
+    out=$(docker run --rm --network none --platform linux/amd64 \
+        --entrypoint /usr/local/bin/telcoin "$ref" --version) ||
+        die 1 "$ref: /usr/local/bin/telcoin --version failed"
+    # clap starts the first line with the program name: "telcoin-network-cli Version: X.Y.Z".
     version=$(printf '%s\n' "$out" | sed -n 's/^\([^ ]* \)\{0,1\}Version: //p')
     sha=$(printf '%s\n' "$out" | sed -n 's/^Commit SHA: //p')
     features=$(printf '%s\n' "$out" | sed -n 's/^Build Features: //p')
@@ -1003,25 +1137,34 @@ render_notes() {
         Alias "$alias_cell"
     printf '\n'
 
-    # The verification block is the canonical one from the install page, with TAG filled in.
+    # The verification block is the canonical one (the install page's Path A), with TAG and REPO
+    # filled in. The heredocs are quoted, so $TAG, $2 and $NF reach the reader as written; only
+    # the @NAME@ placeholders are substituted.
     sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" <<'EOF'
 ## Verify
 
-Check the signed checksums before you run anything:
+Check the signed checksums before you extract or run anything. These commands take the maintainer keys from `main`, never from the tag, fetch the tag by its full name, download the release files, check the signature over `SHA256SUMS`, and check the hashes:
 
 ```sh
-TAG=@TAG@   # the release you are installing
+TAG=@TAG@
 REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
-git clone --quiet --depth 1 --branch "$TAG" "https://github.com/$REPO.git" tn-release
-for k in tn-release/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg
-gpg --show-keys --with-fingerprint tn-release/.github/maintainer-gpg-keys/*.asc
-curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz"
-gpgv --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS
-sha256sum --check SHA256SUMS
+git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
+awk '$2 == "BADSIG" { bad = 1 } $2 ~ /^(GOODSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+sha256sum --check SHA256SUMS &&
+echo "Signature and hashes verified"
 ```
 
-Maintainer release keys allowlisted on `main`:
+If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not extract or run anything from this release, and report it.
+
+Then check the key fingerprints: every primary key fingerprint `gpg --show-keys` printed, including the one after `signed by primary key`, must appear in the maintainer release keys table in `tn-main/SECURITY.md` (the same `main` checkout, also [on GitHub](https://github.com/@REPO@/blob/main/SECURITY.md#maintainer-release-keys)) with a Status that is not `revoked`, and in `https://github.com/<handle>.gpg`, where `<handle>` is the key file's name without `.asc`. Stop on any mismatch.
+
+Maintainer release keys on `main` when these notes were written:
 
 | Maintainer | Primary key fingerprint |
 |---|---|
@@ -1031,13 +1174,62 @@ EOF
     done <<EOF
 $ALLOW_LIST
 EOF
-    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@COMMIT@|$COMMIT|g" <<'EOF'
+    sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" -e "s|@VERSION@|$VERSION|g" -e "s|@IMAGE@|$IMAGE|g" <<'EOF'
 
-Compare the fingerprints `gpg --show-keys` printed with this table, with the [maintainer release keys in SECURITY.md](https://github.com/@REPO@/blob/main/SECURITY.md#maintainer-release-keys) and with `https://github.com/<handle>.gpg`; both are independent of the tag.
+Tarball, only after the last line was `Signature and hashes verified` and the fingerprints matched:
 
-Tarball: `tar -xzf telcoin-network-@TAG@-x86_64-unknown-linux-gnu.tar.gz`, then `./telcoin-network --version` inside `telcoin-network-@TAG@-x86_64-unknown-linux-gnu` prints `Version: @VERSION@` and `Commit SHA: @COMMIT@`.
+```sh
+tar -xzf "telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
+cd "telcoin-network-$TAG-x86_64-unknown-linux-gnu" &&
+./telcoin-network --version &&
+git -C ../tn-main rev-parse "refs/tags/$TAG^{commit}"
+```
 
-Docker: `docker pull "$(cat IMAGE_DIGEST)"` (this needs only `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`; check them with `sha256sum --check --ignore-missing SHA256SUMS`).
+The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed, and `Build Features:` must contain `adiri` for an `-adiri` tag and not for any other.
+
+Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`. These commands are the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
+
+```sh
+TAG=@TAG@
+REPO=@REPO@
+BASE="https://github.com/$REPO/releases/download/$TAG"
+git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
+git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
+gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
+curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
+gpgv --status-fd 1 --keyring ./tn-release-keys.gpg SHA256SUMS.asc SHA256SUMS |
+awk '$2 == "BADSIG" { bad = 1 } $2 ~ /^(GOODSIG|EXPKEYSIG|REVKEYSIG|BADSIG|ERRSIG)$/ { s = $2; print $2 } $2 == "VALIDSIG" && s == "GOODSIG" { print "signed by primary key " $NF; n++ } END { exit (n && !bad) ? 0 : 1 }' &&
+sha256sum --check --ignore-missing SHA256SUMS &&
+echo "Signature and hashes verified"
+```
+
+Only after its last line was `Signature and hashes verified` and the fingerprints matched, check the image. This refuses an `IMAGE_DIGEST` that does not name the release repository by digest:
+
+```sh
+IMAGE_REF=$(cat IMAGE_DIGEST)
+case "$IMAGE_REF" in
+  @IMAGE@@sha256:*) docker pull "$IMAGE_REF" && docker run --rm --network none --entrypoint /usr/local/bin/telcoin "$IMAGE_REF" --version ;;
+  *) echo "IMAGE_DIGEST does not name a telcoin-network image by digest: $IMAGE_REF" >&2 ;;
+esac
+```
+
+Its `--version` output must show the same three lines as the tarball's, with the commit that `git -C tn-main rev-parse "refs/tags/$TAG^{commit}"` prints.
+
+When a check fails, do not extract, install or run anything from this release:
+
+- The last line is not `Signature and hashes verified`: a step failed, and the lines above it say which.
+- `BADSIG`: `SHA256SUMS` changed after it was signed. Report it.
+- `ERRSIG`: the signing key is not in the allowlist on `main`, or `TAG` is wrong. Check `TAG`; if it is right, report it.
+- `EXPKEYSIG` or `REVKEYSIG`: the signing subkey has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
+- `sha256sum` prints `FAILED` or `no file was verified`: a file differs from its signed hash, or none of the files is present. Check `TAG` and download once more; if it still fails, report it.
+- A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
+- `IMAGE_DIGEST does not name a telcoin-network image by digest`. Report it.
+- `Commit SHA` is not the tag's commit, or `Build Features` does not match the tag. Report it.
+- `exec format error`, or Docker warns that the image platform does not match the host: the release is Linux x86_64 only. Use an x86_64 host, or build from source.
+- `docker pull` fails with `denied` or `unauthorized`: the image is not publicly readable. Tell the maintainers.
+
+Report a failed check through the [security policy](https://github.com/@REPO@/blob/main/SECURITY.md).
 
 - [Installing a release](https://docs.telcoin.network/getting-started/installing-a-release.html)
 - [Release notes](https://docs.telcoin.network/getting-started/release-notes.html)
@@ -1063,22 +1255,32 @@ set_workspace_version() {
     mv "$tmp" Cargo.toml
 }
 
-# Writes the unreleased commits as the "## [BASE]" section to $1, with the pinned git-cliff
-# image. A worktree's .git points into the common dir and a shared clone borrows objects
-# through alternates, so each of those is mounted read-only at its own path.
+# Writes the commits since the previous final release as the "## [BASE]" section to $1, with
+# the pinned git-cliff image. The range starts at the nearest final tag of either channel
+# reachable from HEAD (the whole history when there is none), not at --unreleased, which
+# would start after an ignored rc tag and drop the rc's changes from the final's section.
+# A worktree's .git points into the common dir and a shared clone borrows objects through
+# alternates, so each of those is mounted read-only at its own path.
 cliff_section() {
-    local out=$1 top common alt
+    local out=$1 top common alt prev
     top=$(pwd)
     common=$(git rev-parse --path-format=absolute --git-common-dir) || die 2 "git rev-parse --git-common-dir failed"
+    prev=$(git describe --tags --abbrev=0 --match 'v*' --exclude '*-rc[0-9]*' HEAD 2>/dev/null) || prev=
     set -- -v "$top:$top:ro" -v "$common:$common:ro"
     if [ -f "$common/objects/info/alternates" ]; then
         while IFS= read -r alt; do
             case "$alt" in /*) set -- "$@" -v "$alt:$alt:ro" ;; esac
         done <"$common/objects/info/alternates"
     fi
-    docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp "$@" -w "$top" \
-        "$GIT_CLIFF_IMAGE" --config cliff.toml --unreleased --tag "$BASE" --strip all \
-        >"$out" || die 1 "git-cliff failed"
+    set -- "$@" -w "$top" "$GIT_CLIFF_IMAGE" --config cliff.toml --tag "$BASE" --strip all
+    if [ -n "$prev" ]; then
+        info "CHANGELOG section for $BASE: commits since $prev"
+        set -- "$@" "$prev..HEAD"
+    else
+        info "CHANGELOG section for $BASE: no earlier final release tag, so the whole history"
+    fi
+    docker run --rm --network none -u "$(id -u):$(id -g)" -e HOME=/tmp "$@" >"$out" ||
+        die 1 "git-cliff failed"
 }
 
 # Splices section file $1 into CHANGELOG.md right after the anchor line, replacing a top
@@ -1119,6 +1321,28 @@ cmd_notes() {
     render_notes "$digest"
 }
 
+# gh release create is not idempotent, and it can fail after GitHub created the draft. Look
+# again before each retry, so a retry cannot leave two drafts for TAG.
+create_draft() {
+    local notes=$1 attempt=1 rc
+    need gh
+    set -- release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG" --notes-file "$notes"
+    if [ "$PRERELEASE" = true ]; then set -- "$@" --prerelease; fi
+    while :; do
+        gh "$@" >&2 2>"$WORK/gh.err" && rc=0 || rc=$?
+        if [ "$rc" = 0 ]; then return 0; fi
+        gh_failed "$rc" "$attempt" "gh release create $TAG"
+        attempt=$((attempt + 1))
+        release_state
+        if [ "$REL_EXISTS" = 1 ]; then
+            [ "$REL_DRAFT" = true ] || die 1 "release $TAG is already published"
+            [ "$REL_AUTHOR" = "$BOT_LOGIN" ] || die 1 "the draft for $TAG was created by $REL_AUTHOR, not $BOT_LOGIN"
+            info "the draft for $TAG exists after the failed call; not creating it again"
+            return 0
+        fi
+    done
+}
+
 # CI only: create the draft, or refresh the body of a draft the bot created earlier.
 cmd_draft() {
     local notes=$WORK/notes.md digest='' line
@@ -1145,10 +1369,8 @@ cmd_draft() {
     fi
     if [ "$REL_EXISTS" = 1 ]; then
         gh_run release edit "$TAG" --repo "$REPO" --notes-file "$notes" >&2
-    elif [ "$PRERELEASE" = true ]; then
-        gh_run release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG" --notes-file "$notes" --prerelease >&2
     else
-        gh_run release create "$TAG" --repo "$REPO" --draft --verify-tag --title "$TAG" --notes-file "$notes" >&2
+        create_draft "$notes"
     fi
     info "draft release $TAG is ready"
 }
@@ -1156,7 +1378,7 @@ cmd_draft() {
 # xerxes: on a clean checkout of main's tip, bump the version and splice the CHANGELOG
 # section. The marker records main's tip so check-tag can prove nothing landed in between.
 cmd_prep() {
-    local main_sha remote anchors changed name
+    local main_sha remote anchors changed name tag_re
     need docker cargo
     [ -z "$(git status --porcelain --untracked-files=no)" ] || die 2 "tracked files have local changes; prep needs a clean checkout of main"
     if [ "$DRY_RUN" != 1 ]; then git_fetch +refs/heads/main:refs/remotes/origin/main; fi
@@ -1167,6 +1389,14 @@ cmd_prep() {
     if [ "$DRY_RUN" != 1 ]; then
         remote=$(ls_remote_tag "$TAG")
         [ -z "$remote" ] || die 1 "tag $TAG already exists on origin"
+    fi
+    # The version rules of tag and check-tag, before anything is written: a release candidate
+    # after its final would replace the released section at the top of CHANGELOG.md. prep
+    # fetches no tags, so the final is also looked up on origin.
+    check_version_order '' "$main_sha"
+    if [ -n "$RC" ] && [ "$DRY_RUN" != 1 ]; then
+        remote=$(ls_remote_tag "$BASE")
+        [ -z "$remote" ] || die 1 "$BASE already exists on origin; no release candidate may follow its final release"
     fi
     [ -f cliff.toml ] || die 2 "cliff.toml is missing"
     [ -f CHANGELOG.md ] || die 2 "CHANGELOG.md is missing"
@@ -1197,6 +1427,9 @@ cmd_prep() {
 $changed
 EOF
 
+    # The squash commit's subject is "release: TAG (#PR)"; dots escaped, so v1.2.3 cannot
+    # match v1x2x3, and " (#" keeps v1.2.3 from matching v1.2.3-rc1.
+    tag_re=$(printf '%s\n' "$TAG" | sed 's/\./\\./g')
     cat "$WORK/section.md"
     cat <<EOF
 
@@ -1204,14 +1437,20 @@ Next:
   git switch -c release/$TAG
   git commit -am "release: $TAG"
   gh pr create --title "release: $TAG" --body "Version $VERSION and the CHANGELOG section for $BASE."
-  Merge it through the queue alone (no batching), then run \`make attest\` on the merged commit.
+  Attest the PR head with make attest, then merge it through the queue alone (no batching).
+  The queue lands a new squash commit that the PR's attestation does not cover; attest it here:
+    git switch main && git pull --ff-only
+    RELEASE_SHA="\$(git log -1 --format=%H --grep='^release: $tag_re (#' origin/main)"
+    git switch --detach "\$RELEASE_SHA" && ALLOW_STALE_BASE=1 make attest
+    git switch main
   Then, on the signing laptop: make release-tag TAG=$TAG
+  (with RELEASE_COMMIT=<RELEASE_SHA> if main has moved past the release commit)
 EOF
 }
 
 # laptop: sign the tag on main's tip (or RELEASE_COMMIT) and push it.
 cmd_tag() {
-    local target remote
+    local target remote rc
     need gpg
     if [ "$DRY_RUN" != 1 ]; then git_fetch +refs/heads/main:refs/remotes/origin/main; fi
     require_main_ref
@@ -1251,14 +1490,22 @@ cmd_tag() {
         CREATED_TAG=
         return 0
     fi
-    git push origin "refs/tags/$TAG" || die 3 "git push origin refs/tags/$TAG failed"
+    git push origin "refs/tags/$TAG" 2>"$WORK/push.err" && rc=0 || rc=$?
+    cat "$WORK/push.err" >&2
+    if [ "$rc" != 0 ]; then
+        # A ruleset (GH013), a protected ref or an existing tag is a refusal, not an outage.
+        if grep -q -i -e 'rejected\]' -e GH013 -e protected "$WORK/push.err"; then
+            die 1 "origin refused $TAG (tag ruleset, protected ref, or the tag exists there); see the git output above"
+        fi
+        die 3 "git push origin refs/tags/$TAG failed"
+    fi
     CREATED_TAG=
     info "pushed $TAG; CI now validates it and creates the draft release"
 }
 
 # xerxes: build image and tarball from the tag, push the image, attach the artifacts.
 cmd_build() {
-    local driver cfg existing rd stage dir mtime want got repo_digests sums_hex
+    local driver existing rd stage dir mtime want got repo_digests sums_hex
     if [ "$(uname -s)" != Linux ] || [ "$(uname -m)" != x86_64 ]; then
         die 2 "build runs on Linux x86_64 (this host is $(uname -s) $(uname -m))"
     fi
@@ -1268,10 +1515,7 @@ cmd_build() {
         die 2 "docker buildx builder '$RELEASE_BUILDER' does not exist"
     [ "$driver" = docker ] ||
         die 2 "buildx builder '$RELEASE_BUILDER' uses the '$driver' driver; release builds need the docker driver"
-    if [ "$DRY_RUN" != 1 ]; then
-        cfg="${DOCKER_CONFIG:-$HOME/.docker}/config.json"
-        grep -q '"ghcr.io"' "$cfg" 2>/dev/null || die 2 "docker is not logged in to ghcr.io: run make docker-login"
-    fi
+    require_registry_login
     fetch_tag
     check_scripts_from_main
     check_tag always
@@ -1309,7 +1553,7 @@ cmd_build() {
 
     # One build: the tarball carries the very bytes that are in the image.
     rd="$(pwd)/$(release_dir "$TAG")"
-    rm -rf "$rd"
+    clear_release_dir "$rd"
     mkdir -p "$rd"
     dir="telcoin-network-$TAG-$TRIPLE"
     stage=$WORK/stage
@@ -1347,7 +1591,7 @@ cmd_build() {
 
 # laptop: append this maintainer's detached signature over SHA256SUMS to SHA256SUMS.asc.
 cmd_sign() {
-    local rd before after recount n_before n_after sums_hex
+    local rd before after recount n_before n_after n_back sums_hex up_hex back_hex
     need gpg curl
     check_tag if-cast
     release_state
@@ -1355,7 +1599,7 @@ cmd_sign() {
     [ "$REL_DRAFT" = true ] || die 1 "release $TAG is already published; signatures go on the draft"
     check_asset_set IMAGE_DIGEST SHA256SUMS "$TARBALL" -- SHA256SUMS.asc
     rd="$(pwd)/$(release_dir "$TAG")"
-    rm -rf "$rd"
+    clear_release_dir "$rd"
     if has_asset SHA256SUMS.asc; then
         release_fetch "$rd" IMAGE_DIGEST SHA256SUMS "$TARBALL" SHA256SUMS.asc
     else
@@ -1396,10 +1640,21 @@ cmd_sign() {
     mv "$WORK/combined.asc" "$rd/SHA256SUMS.asc"
     release_upload "$rd/SHA256SUMS.asc"
 
-    # Read it back from the release, so what operators download is what was counted.
+    # Read it back from the release, so what operators download is what was counted. A
+    # maintainer signing at the same moment replaces the whole file (assets have no
+    # compare-and-swap), so it must be byte for byte the file just uploaded.
     release_fetch "$WORK/readback" SHA256SUMS SHA256SUMS.asc
-    recount=$(count_sigs "$WORK/readback/SHA256SUMS" "$WORK/readback/SHA256SUMS.asc" | count_lines)
-    [ "$recount" = "$n_after" ] || die 1 "the uploaded SHA256SUMS.asc counts $recount signatures, expected $n_after"
+    up_hex=$(sha256_hex "$rd/SHA256SUMS.asc")
+    back_hex=$(sha256_hex "$WORK/readback/SHA256SUMS.asc")
+    [ "$back_hex" = "$up_hex" ] ||
+        die 1 "SHA256SUMS.asc on the release is not the file just uploaded (did another maintainer sign at the same time?); run make release-sign again"
+    recount=$(count_sigs "$WORK/readback/SHA256SUMS" "$WORK/readback/SHA256SUMS.asc")
+    case $'\n'"$recount"$'\n' in
+        *$'\n'"$SIGN_HANDLE"$'\n'*) ;;
+        *) die 1 "the uploaded SHA256SUMS.asc carries no signature by @$SIGN_HANDLE" ;;
+    esac
+    n_back=$(printf '%s\n' "$recount" | count_lines)
+    [ "$n_back" = "$n_after" ] || die 1 "the uploaded SHA256SUMS.asc counts $n_back signatures, expected $n_after"
     printf 'signed %s as @%s: %s/%s signatures\n' "$TAG" "$SIGN_HANDLE" "$n_after" "$THRESHOLD"
 }
 
@@ -1426,6 +1681,7 @@ cmd_verify() {
     else
         release_fetch "$dir" IMAGE_DIGEST SHA256SUMS "$TARBALL"
     fi
+    check_fetched_digests "$dir"
     check_sums "$dir"
     if [ -f "$dir/SHA256SUMS.asc" ]; then
         handles=$(count_sigs "$dir/SHA256SUMS" "$dir/SHA256SUMS.asc")
@@ -1446,12 +1702,13 @@ cmd_verify() {
 }
 
 # Versions of the published final releases in TAG's channel, TAG excluded. A dry run has no
-# GitHub to ask and treats TAG as the only release.
+# GitHub to ask and treats TAG as the only release. Its output is captured, and bash 3.2 runs
+# $(...) without -e, so `|| exit` passes on the status of a die inside gh_run.
 published_versions() {
     local tags
     if [ "$DRY_RUN" = 1 ]; then return 0; fi
     tags=$(gh_run release list --repo "$REPO" --limit 1000 --json tagName,isDraft \
-        --jq '.[] | select(.isDraft | not) | .tagName')
+        --jq '.[] | select(.isDraft | not) | .tagName') || exit
     channel_finals "$tags"
 }
 
@@ -1463,12 +1720,14 @@ cmd_publish() {
     fetch_tag
     check_scripts_from_main
     cmd_verify 0
-    published=$(published_versions)
+    published=$(published_versions) || exit
     highest=$(printf '%s\n%s\n' "$published" "$VERSION" | version_max)
     if [ -z "$RC" ] && [ "$highest" = "$VERSION" ]; then
         move_alias=1
         if [ "$CHANNEL" = mainnet ]; then latest=--latest; fi
     fi
+    # Checked before anything is made public: the alias move needs the registry credential.
+    if [ "$move_alias" = 1 ]; then require_registry_login; fi
 
     info "tag      $TAG (commit $COMMIT)"
     info "image    $IMAGE@$D"
@@ -1483,6 +1742,9 @@ cmd_publish() {
         info "alias    none moves (release candidate, or not the newest $CHANNEL release)"
     fi
     confirm "Publish $TAG?"
+    # Anyone with write access can change a draft's assets while the prompt waits, and
+    # publishing takes whatever the draft holds at that moment.
+    check_assets_unchanged "run make release-publish again to verify them"
 
     if [ "$REL_DRAFT" = true ]; then
         if [ "$DRY_RUN" = 1 ]; then
@@ -1491,6 +1753,8 @@ cmd_publish() {
             gh_run release edit "$TAG" --repo "$REPO" --draft=false "--prerelease=$PRERELEASE" "$latest" >&2
         fi
     fi
+    # Catches a change between the check above and the edit, before the alias points at D.
+    check_assets_unchanged "the release is public: follow After publish in the maintainer guide"
     if [ "$move_alias" = 1 ]; then
         current=$(registry_digest "$ALIAS")
         if [ "$current" = "$D" ]; then
@@ -1498,7 +1762,7 @@ cmd_publish() {
         else
             # --prefer-index=false copies the manifest as is, so the alias keeps digest D.
             docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$ALIAS" "$IMAGE@$D" >&2 ||
-                die 3 "cannot move $IMAGE:$ALIAS"
+                die 3 "cannot move $IMAGE:$ALIAS (if docker reported unauthorized or denied, run make docker-login and publish again)"
             current=$(registry_digest "$ALIAS")
             [ "$current" = "$D" ] || die 1 "$IMAGE:$ALIAS points at ${current:-nothing}, expected $D"
         fi
@@ -1536,7 +1800,7 @@ reject_unless_dry() {
 
 # Reads and checks the environment once; see the header for each variable.
 init_env() {
-    local path
+    local artifacts
     case "${RELEASE_DRY_RUN:-}" in
         '' | 0) DRY_RUN=0 ;;
         1) DRY_RUN=1 ;;
@@ -1564,10 +1828,8 @@ init_env() {
 
     if [ -n "${RELEASE_IMAGE:-}" ]; then
         IMAGE=$RELEASE_IMAGE
-        is_local_image || die 2 "RELEASE_IMAGE must start with localhost: or 127.0.0.1:"
-        path=${IMAGE#*/}
-        case "$IMAGE" in */*) ;; *) die 2 "RELEASE_IMAGE needs a repository path, e.g. 127.0.0.1:5000/tn" ;; esac
-        case "$path" in '' | *:* | *@*) die 2 "RELEASE_IMAGE must not carry a tag or digest" ;; esac
+        is_local_image ||
+            die 2 "RELEASE_IMAGE must be localhost:PORT/ or 127.0.0.1:PORT/ and a lowercase repository path without a tag or digest, e.g. 127.0.0.1:5000/tn"
     else
         IMAGE=ghcr.io/$(lower "$REPO")
     fi
@@ -1577,10 +1839,12 @@ init_env() {
         die 2 "RELEASE_ATTESTATION accepts only 'skip'"
     fi
     if [ -n "${RELEASE_DIR:-}" ]; then
-        RELEASE_DIR=$(abspath "$RELEASE_DIR")
-        # build and sign empty the local artifact dir, which must not delete the stand-in release.
+        # build and sign empty the local artifact dir, which must not delete the stand-in
+        # release, however either path is spelled (./, .., symlinks).
+        RELEASE_DIR=$(physical_dir "$(abspath "$RELEASE_DIR")") || exit
+        artifacts=$(physical_dir "$(pwd)/$ARTIFACT_ROOT") || exit
         case "$RELEASE_DIR/" in
-            "$(pwd)/$ARTIFACT_ROOT/"*) die 2 "RELEASE_DIR must lie outside $ARTIFACT_ROOT" ;;
+            "$artifacts/"*) die 2 "RELEASE_DIR must lie outside $ARTIFACT_ROOT" ;;
         esac
     fi
     if [ -n "${RELEASE_ALLOWLIST_DIR:-}" ]; then RELEASE_ALLOWLIST_DIR=$(abspath "$RELEASE_ALLOWLIST_DIR"); fi
