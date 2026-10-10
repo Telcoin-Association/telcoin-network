@@ -38,6 +38,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_connection_duration,
         max_request_bytes,
         max_inflight_request_bytes,
+        http1_max_buf_size,
         rate_limit_per_ip,
         rate_limit_prefix,
         rate_limit_global,
@@ -70,6 +71,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
         max_inflight_request_bytes = max_inflight_request_bytes.map_or(0, NonZeroU32::get),
+        http1_max_buf_size,
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
@@ -163,6 +165,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_connection_duration,
         max_request_bytes,
         max_inflight_request_bytes,
+        http1_max_buf_size,
     };
 
     // Sweep idle per-IP buckets while the gateway runs (only when a limiter is

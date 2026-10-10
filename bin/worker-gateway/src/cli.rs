@@ -174,6 +174,20 @@ pub(crate) struct Cli {
     )]
     pub(crate) max_inflight_request_bytes: u32,
 
+    /// Cap on each inbound connection's read buffer, in bytes (default 64 KiB,
+    /// minimum 8192, which hyper enforces). The buffer grows up to this size
+    /// and stays allocated while the connection is open, so a connection
+    /// holding a request body costs the body plus this much. A request's head
+    /// (request line and headers) must fit in it, or the request is answered
+    /// `431`; it also bounds how much of a streamed response is queued per
+    /// connection.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE",
+        default_value_t = crate::server::HTTP1_MAX_BUF_SIZE
+    )]
+    pub(crate) http1_max_buf_size: usize,
+
     /// Sustained per-client-IP request rate, in requests per second (`0`
     /// disables per-IP rate limiting). The client IP is the immediate TCP peer;
     /// run the gateway directly edge-facing, not behind an untrusted proxy that
@@ -274,6 +288,8 @@ pub(crate) struct Settings {
     /// Budget of request-body bytes held across all in-flight requests, or
     /// `None` when unlimited.
     pub(crate) max_inflight_request_bytes: Option<NonZeroU32>,
+    /// Cap on each inbound connection's read buffer, in bytes.
+    pub(crate) http1_max_buf_size: usize,
     /// Per-client-IP rate limit, or `None` when disabled.
     pub(crate) rate_limit_per_ip: Option<RateLimit>,
     /// Network prefix each client address is masked to before it keys a
@@ -332,6 +348,13 @@ impl Cli {
         )?;
         let max_inflight_request_bytes =
             resolve_inflight_byte_budget(self.max_inflight_request_bytes, self.max_request_bytes)?;
+        // hyper panics on a smaller read buffer, so refuse it at startup
+        eyre::ensure!(
+            self.http1_max_buf_size >= crate::server::HTTP1_MIN_BUF_SIZE,
+            "--http1-max-buf-size ({}) is below hyper's minimum of {} bytes",
+            self.http1_max_buf_size,
+            crate::server::HTTP1_MIN_BUF_SIZE,
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -346,6 +369,7 @@ impl Cli {
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
             max_inflight_request_bytes,
+            http1_max_buf_size: self.http1_max_buf_size,
             rate_limit_per_ip: resolve_rate_limit(
                 self.rate_limit_per_ip,
                 self.rate_limit_per_ip_burst,
@@ -798,6 +822,18 @@ mod tests {
             "--max-inflight-request-bytes=4294967296",
         ]);
         assert!(past_u32.is_err(), "a budget past u32::MAX must fail startup");
+    }
+
+    #[test]
+    fn max_buf_size_below_hypers_minimum_is_rejected_at_startup() -> eyre::Result<()> {
+        // hyper's `max_buf_size` panics below 8 KiB; the gateway must refuse
+        // the value at startup rather than panic on the first connection
+        let below = cli_with_flags(&["--http1-max-buf-size=8191"]).into_settings();
+        assert!(below.is_err(), "a read buffer below 8192 bytes must fail startup");
+        let minimum = cli_with_flags(&["--http1-max-buf-size=8192"]).into_settings()?;
+        assert_eq!(minimum.http1_max_buf_size, 8_192);
+        assert_eq!(cli_with_flags(&[]).into_settings()?.http1_max_buf_size, 65_536);
+        Ok(())
     }
 
     #[test]

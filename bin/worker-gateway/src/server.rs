@@ -8,11 +8,11 @@
 //! rather than `axum::serve`: `axum::serve` never installs a hyper timer, so
 //! hyper's header read timeout is silently disabled and a slow-loris client
 //! could hold connections open forever. Here every connection gets a header
-//! read deadline, a whole-request deadline, `TCP_NODELAY`, a global
-//! concurrent-connection cap, and two write-path guards for the response-side
-//! slow loris (a client that stops or trickles its reads while a response
-//! body streams to it): a transport-stall deadline (`TCP_USER_TIMEOUT`) and a
-//! hard cap on total connection lifetime.
+//! read deadline, a whole-request deadline, `TCP_NODELAY`, a bounded read
+//! buffer, a global concurrent-connection cap, and two write-path guards for
+//! the response-side slow loris (a client that stops or trickles its reads
+//! while a response body streams to it): a transport-stall deadline
+//! (`TCP_USER_TIMEOUT`) and a hard cap on total connection lifetime.
 //!
 //! The router also budgets the request-body bytes held across all in-flight
 //! requests (see [`reserve_request_bytes`]), so the memory buffered bodies
@@ -73,6 +73,14 @@ pub(crate) const READY_PATH: &str = "/ready";
 /// (`--max-inflight-request-bytes`), 512 MiB.
 pub(crate) const MAX_INFLIGHT_REQUEST_BYTES: u32 = 512 * 1024 * 1024;
 
+/// Default cap on hyper's per-connection read buffer (`--http1-max-buf-size`),
+/// 64 KiB, against hyper's own default of about 408 KiB.
+pub(crate) const HTTP1_MAX_BUF_SIZE: usize = 64 * 1024;
+
+/// The smallest read buffer hyper accepts: `http1::Builder::max_buf_size`
+/// panics below it.
+pub(crate) const HTTP1_MIN_BUF_SIZE: usize = 8 * 1024;
+
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
 pub(crate) struct AppState {
@@ -116,6 +124,9 @@ pub(crate) struct ServerLimits {
     /// Budget of request-body bytes held across all in-flight requests, or
     /// `None` when unlimited (see [`reserve_request_bytes`]).
     pub(crate) max_inflight_request_bytes: Option<NonZeroU32>,
+    /// Cap on each connection's read buffer, in bytes; it also caps the size
+    /// of a request head. Values below [`HTTP1_MIN_BUF_SIZE`] are raised to it.
+    pub(crate) http1_max_buf_size: usize,
 }
 
 /// JSON body of the gateway's `/ready` response.
@@ -361,6 +372,12 @@ async fn accept_loop(
     // loop exists to close).
     let mut connection_builder = hyper::server::conn::http1::Builder::new();
     connection_builder.timer(TokioTimer::new()).header_read_timeout(limits.header_read_timeout);
+    // hyper's read buffer grows up to this cap and stays allocated while the
+    // connection lives, so a connection holding a buffered body costs the body
+    // plus this buffer; at hyper's default (about 408 KiB) a held 1 MiB body
+    // cost about 1.42 MiB. hyper panics below its minimum, which startup
+    // validation enforces; the clamp keeps that panic unreachable.
+    connection_builder.max_buf_size(limits.http1_max_buf_size.max(HTTP1_MIN_BUF_SIZE));
 
     let graceful = GracefulShutdown::new();
     let limiter =
@@ -513,6 +530,7 @@ mod tests {
             max_connection_duration: None,
             max_request_bytes: MAX_REQUEST_BYTES,
             max_inflight_request_bytes: None,
+            http1_max_buf_size: HTTP1_MAX_BUF_SIZE,
         }
     }
 
@@ -1696,5 +1714,116 @@ mod tests {
                 assert_eq!(response.status(), StatusCode::OK, "{path}");
             }
         }
+    }
+
+    /// Byte `i` of a recognizable test body: the alphabet, over and over.
+    fn pattern_byte(i: usize) -> u8 {
+        b'a' + u8::try_from(i % 26).expect("below 26")
+    }
+
+    #[tokio::test]
+    async fn large_body_still_forwards_with_a_small_read_buffer() {
+        // the upstream answers with the length it received and whether every
+        // byte is where the client put it
+        let mock = Router::new().route(
+            "/",
+            post(|body: axum::body::Bytes| async move {
+                let intact = body.iter().enumerate().all(|(i, byte)| *byte == pattern_byte(i));
+                format!("{} {intact}", body.len())
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        // hyper's minimum read buffer, 128 times smaller than the body
+        let limits = ServerLimits { http1_max_buf_size: HTTP1_MIN_BUF_SIZE, ..test_limits() };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let body: String = (0..MAX_REQUEST_BYTES).map(|i| char::from(pattern_byte(i))).collect();
+        let (status, text) = post_rpc(gateway, None, body).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "1048576 true"));
+    }
+
+    /// Peak resident memory of this process so far, in kB (`VmHWM`).
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    fn peak_rss_kb() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("VmHWM:"))
+            .and_then(|value| value.trim().strip_suffix("kB"))
+            .and_then(|value| value.trim().parse().ok())
+            .expect("VmHWM line")
+    }
+
+    /// The issue's acceptance criterion: peak RSS stays near the budget for
+    /// many parallel maximum-size bodies held against a slow upstream.
+    /// Everything (client, gateway, upstream) shares this process, so the
+    /// client sends one shared allocation and the upstream drains each body
+    /// without keeping it. The peak is measured above the idle process and
+    /// bounded in proportion to the budget, so a body reader that holds about
+    /// twice what it reserved fails. The bound relies on the read-buffer cap
+    /// both servers run with: at hyper's default every connection keeps up to
+    /// 408 KiB. Run by hand; the printed lines go in the PR body.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    #[ignore = "measures peak RSS; run alone with --run-ignored ignored-only --no-capture"]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn peak_rss_stays_near_the_budget_with_parallel_max_bodies() {
+        const BUDGET: u32 = 64 * 1024 * 1024;
+        const PARALLEL: usize = 128;
+        let slow = Router::new().route(
+            "/",
+            post(|body: axum::body::Body| async move {
+                let mut chunks = body.into_data_stream();
+                while futures::StreamExt::next(&mut chunks).await.is_some() {}
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                "slow"
+            }),
+        );
+        let wide = ServerLimits {
+            max_connections: NonZeroUsize::new(2 * PARALLEL).expect("nonzero"),
+            request_deadline: Duration::from_secs(30),
+            ..test_limits()
+        };
+        let (worker, _worker) = spawn_with_limits(slow, wide.clone()).await;
+        let client = proxy_client(Duration::from_secs(2), Duration::from_secs(30)).expect("client");
+        let state = test_state_with_client(&[upstream(worker)], client);
+        state.readiness.set_ready(0, true);
+        let app = router(state, Duration::from_secs(30), MAX_REQUEST_BYTES, Some(nz(BUDGET)), None);
+        let (gateway, _shutdown) = spawn_with_limits(app, wide).await;
+
+        let body = axum::body::Bytes::from(padded_call(1, MAX_REQUEST_BYTES));
+        let client = Client::new();
+        let before = peak_rss_kb();
+        let requests = (0..PARALLEL).map(|_| {
+            let request = client.post(format!("http://{gateway}/")).body(body.clone()).send();
+            async move { request.await.map(|response| response.status()) }
+        });
+        let outcomes = futures::future::join_all(requests).await;
+        let peak = peak_rss_kb();
+
+        let forwarded =
+            outcomes.iter().filter(|outcome| matches!(outcome, Ok(StatusCode::OK))).count();
+        let refused = outcomes
+            .iter()
+            .filter(|outcome| matches!(outcome, Ok(StatusCode::SERVICE_UNAVAILABLE)))
+            .count();
+        let failed = PARALLEL - forwarded - refused;
+        // the budget with a tenth for allocator slack, a full read buffer for
+        // every connection on both servers, and a fixed allowance; collecting
+        // the chunks and then joining them costs about 1.7 times the budget
+        // and does not fit
+        let above_kb = peak.saturating_sub(before);
+        let budget_kb = u64::from(BUDGET / 1024);
+        let buffers_kb = u64::try_from(PARALLEL * 2 * HTTP1_MAX_BUF_SIZE / 1024).expect("fits");
+        let bound_kb = budget_kb * 11 / 10 + buffers_kb + 16 * 1024;
+        println!(
+            "VmHWM: {peak} kB ({before} kB before the flood) for {PARALLEL} parallel \
+             {MAX_REQUEST_BYTES}-byte bodies against a {BUDGET}-byte budget: {forwarded} \
+             forwarded, {refused} refused with -32010, {failed} other"
+        );
+        println!("{above_kb} kB above the idle process, bound {bound_kb} kB");
+        assert!((1..=64).contains(&forwarded), "{forwarded} forwarded");
+        assert!(above_kb < bound_kb, "{above_kb} kB above the idle process, bound {bound_kb} kB");
     }
 }

@@ -107,6 +107,7 @@ Every flag has an environment-variable fallback.
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
 | `--max-inflight-request-bytes` | `WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES` | `536870912` | Request-body bytes held across all in-flight requests (512 MiB; at least `--max-request-bytes`, at most 4294967295; `0` disables; see [Request size](#request-size)). |
+| `--http1-max-buf-size` | `WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE` | `65536` | Per-connection read buffer cap, in bytes (64 KiB; minimum 8192; a request head must fit in it; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
@@ -232,6 +233,11 @@ A request that does not fit in what is left gets a JSON-RPC error at once (`503`
 Clients should retry it after a short backoff.
 The `/health` and `/ready` probes are exempt, and a rate-limited request costs no budget.
 The budget must be at least `--max-request-bytes`, so a chunked request can always fit; `0` disables it.
+
+`--http1-max-buf-size` (default 64 KiB) caps each connection's read buffer.
+hyper's own default lets the buffer grow to about 408 KiB, and it stays allocated while the connection is open, so with it a held 1 MiB body cost about 1.42 MiB.
+The minimum is 8 KiB, which hyper enforces.
+A request's head (request line and headers) must fit in the buffer, or the request is answered `431`; the cap also bounds how much of a streamed response is queued per connection.
 
 Size it from both ends:
 
