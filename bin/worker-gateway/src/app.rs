@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{
     cli::Settings,
@@ -25,6 +25,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         listen_addr,
         upstreams,
         query_upstream,
+        denied_method_prefixes,
         readiness_poll_interval,
         readiness_poll_timeout,
         upstream_connect_timeout,
@@ -61,14 +62,31 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         DEFAULT_MAX_PER_IP_ENTRIES,
         rate_limit_prefix,
     );
+    // the method policy applies only without a redirect, and an empty list
+    // (an empty or unset-in-template env var included) turns it off; say which
+    let method_policy = if query_upstream.is_some() {
+        String::from("off (--redirect-queries is set)")
+    } else if denied_method_prefixes.is_empty() {
+        String::from("off (--denied-method-prefixes is empty)")
+    } else {
+        format!("deny {}", denied_method_prefixes.join(","))
+    };
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         max_request_bytes,
         ?tcp_user_timeout,
         ?max_connection_duration,
+        %method_policy,
         "edge protections configured"
     );
+    if query_upstream.is_none() && denied_method_prefixes.is_empty() {
+        warn!(
+            target: "gateway",
+            "method policy is off: --denied-method-prefixes is empty and --redirect-queries is \
+             unset, so every method, tn_* included, reaches the worker"
+        );
+    }
 
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
@@ -119,7 +137,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
+    let state = AppState {
+        readiness: Arc::clone(&readiness),
+        http: proxy_client,
+        query_upstream,
+        denied_method_prefixes: denied_method_prefixes.into(),
+    };
 
     spawner.spawn_critical_task(
         "readiness-poller",
