@@ -56,7 +56,7 @@ pub(crate) struct Cli {
     /// batch made only of them, reach the worker; everything else, including a
     /// batch that mixes submissions with other calls, goes here, with no
     /// readiness gate and no fallback to the worker. Must not point at the
-    /// gateway itself or at a worker's RPC host and port.
+    /// gateway itself or at a worker's RPC or readiness host and port.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
     pub(crate) redirect_queries: Option<String>,
 
@@ -474,15 +474,19 @@ fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
 }
 
 /// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
-/// fragment, not the gateway itself, and not on any worker's RPC host and port.
+/// fragment, not the gateway itself, and not on any worker's RPC or readiness
+/// host and port.
 ///
 /// The last check is an error rather than a warning because reads sent to a
-/// worker land on the validator, which is the load the redirect exists to
-/// remove. It compares host and port whatever the scheme, so an `https` URL on
-/// a worker's `http` socket is caught too. Plain `http` to a host that is not a
-/// loopback or private address literal is accepted with a warning: the reads
-/// and their answers then cross the network unencrypted. Messages name the URL
-/// by origin only, since a hosted RPC URL can carry an API key in its path.
+/// worker's node land on the validator, which is the load the redirect exists
+/// to remove. It compares host and port whatever the scheme, so an `https` URL
+/// on a worker's `http` socket is caught too, and an IPv4-mapped IPv6 literal
+/// matches the IPv4 address it names. A URL on a worker's host but another
+/// port is accepted with a warning, since that port may serve a separate node
+/// on the validator's machine. Plain `http` to a host that is not a loopback
+/// or private address literal is accepted with a warning: the reads and their
+/// answers then cross the network unencrypted. Messages name the URL by origin
+/// only, since a hosted RPC URL can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
@@ -501,14 +505,29 @@ fn ensure_query_upstream(
         UpstreamOrigin(url)
     );
     ensure_not_gateway(listen_addr, url)?;
-    if let Some(worker) =
-        upstreams.iter().find(|upstream| same_host_and_port(url, &upstream.rpc_url))
-    {
-        eyre::bail!(
-            "--redirect-queries `{}` is worker {}'s RPC host and port, so reads would still \
-             reach the validator; point it at a separate JSON-RPC endpoint",
-            UpstreamOrigin(url),
-            worker.worker_id
+    upstreams.iter().try_for_each(|upstream| {
+        [("RPC", &upstream.rpc_url), ("readiness", &upstream.readiness_url)]
+            .into_iter()
+            .try_for_each(|(endpoint, worker_url)| {
+                eyre::ensure!(
+                    !same_host_and_port(url, worker_url),
+                    "--redirect-queries `{}` is worker {}'s {endpoint} host and port, so reads \
+                     would still reach the validator; point it at a separate JSON-RPC endpoint",
+                    UpstreamOrigin(url),
+                    upstream.worker_id
+                );
+                Ok(())
+            })
+    })?;
+    if let Some(worker) = upstreams.iter().find(|upstream| {
+        same_host(url, &upstream.rpc_url) || same_host(url, &upstream.readiness_url)
+    }) {
+        warn!(
+            target: "gateway",
+            upstream = %UpstreamOrigin(url),
+            worker_id = worker.worker_id,
+            "--redirect-queries is on a worker's host at another port; unless that port serves \
+             a separate node, reads still reach the validator's machine"
         );
     }
     if plaintext_to_public_host(url) {
@@ -524,11 +543,18 @@ fn ensure_query_upstream(
 
 /// Whether two URLs name the same host and port, whatever their schemes.
 fn same_host_and_port(a: &Url, b: &Url) -> bool {
-    a.port_or_known_default() == b.port_or_known_default()
-        && match (url_host_ip(a), url_host_ip(b)) {
-            (Some(a), Some(b)) => a == b,
-            _ => a.host() == b.host(),
-        }
+    a.port_or_known_default() == b.port_or_known_default() && same_host(a, b)
+}
+
+/// Whether two URLs name the same host. An IPv4-mapped IPv6 literal
+/// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names, and `localhost`
+/// matches the IPv4 loopback address (see [`url_host_ip`]); other domain names
+/// match only as written.
+fn same_host(a: &Url, b: &Url) -> bool {
+    match (url_host_ip(a), url_host_ip(b)) {
+        (Some(a), Some(b)) => a == b,
+        _ => a.host() == b.host(),
+    }
 }
 
 /// Whether `url` is plain `http` to anything but a loopback or private address
@@ -550,14 +576,13 @@ fn plaintext_to_public_host(url: &Url) -> bool {
 /// loops this startup check cannot see, e.g. a VIP that fronts the gateways.
 ///
 /// An IPv4-mapped IPv6 address (`[::ffff:127.0.0.1]`) is compared as the IPv4
-/// address it names, on either side, since a dual-stack socket reaches the
-/// same listener through both spellings.
+/// address it names, on either side (the URL's through [`url_host_ip`]), since
+/// a dual-stack socket reaches the same listener through both spellings.
 fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
     let same_port = url.port_or_known_default() == Some(listen_addr.port());
     let listen_ip = listen_addr.ip().to_canonical();
     let hits_gateway = url_host_ip(url)
         .map(|ip| {
-            let ip = ip.to_canonical();
             let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
             ip == listen_ip
                 || (same_family && ip.is_unspecified())
@@ -574,21 +599,26 @@ fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
 }
 
 /// The upstream host as an IP when it names one (`localhost` counts; other
-/// domain names cannot be checked without resolving them).
+/// domain names cannot be checked without resolving them). An IPv4-mapped IPv6
+/// literal is returned as the IPv4 address it names, so every caller compares
+/// and classifies it the same way.
 fn url_host_ip(url: &Url) -> Option<IpAddr> {
     url.host().and_then(|host| match host {
         url::Host::Domain(name) => {
             name.eq_ignore_ascii_case("localhost").then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))
         }
         url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip)),
+        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip).to_canonical()),
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write as _;
+    use std::{
+        io::Write as _,
+        sync::{Arc, Mutex},
+    };
 
     fn cli_with(config: Option<&str>, rpc: Option<&str>, readiness: Option<&str>) -> Cli {
         let mut argv = vec!["worker-gateway".to_string()];
@@ -1042,6 +1072,102 @@ mod tests {
     }
 
     #[test]
+    fn redirect_on_a_readiness_host_and_port_is_rejected() {
+        // the worker in `cli_with_flags` serves readiness on 10.0.0.7:8551
+        for url in [
+            "http://10.0.0.7:8551/",
+            "http://10.0.0.7:8551/k3y?token=t0k3n",
+            "https://10.0.0.7:8551/",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("{url} is the worker's readiness endpoint and must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("worker 0's readiness host and port"), "{message}");
+            for secret in ["k3y", "t0k3n"] {
+                assert!(!message.contains(secret), "`{secret}` leaked into: {message}");
+            }
+        }
+    }
+
+    /// Collects everything a fmt subscriber writes.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("capture lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Resolve `cli` while recording the gateway's log lines, and return the
+    /// settings with what was logged.
+    fn into_settings_logged(cli: Cli) -> (eyre::Result<Settings>, String) {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=debug")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let settings = tracing::subscriber::with_default(subscriber, || cli.into_settings());
+        let logs = String::from_utf8(captured.0.lock().expect("capture lock").clone())
+            .expect("utf-8 logs");
+        (settings, logs)
+    }
+
+    #[test]
+    fn redirect_on_a_worker_host_with_another_port_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--redirect-queries is on a worker's host at another port";
+        // the worker in `cli_with_flags` is 10.0.0.7 (RPC 8545, readiness 8551)
+        for url in [
+            "http://10.0.0.7:9545/k3y?token=t0k3n",
+            "https://10.0.0.7/k3y?token=t0k3n",
+            "http://[::ffff:10.0.0.7]:9545/k3y?token=t0k3n",
+        ] {
+            let flag = format!("--redirect-queries={url}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[flag.as_str()]));
+            settings?;
+            assert!(logs.contains(WARNING), "{url} must warn: {logs}");
+            assert!(logs.contains("worker_id=0"), "{logs}");
+            for secret in ["k3y", "t0k3n"] {
+                assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+            }
+        }
+        // another host does not warn
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--redirect-queries=http://10.0.0.9:8545/"]));
+        settings?;
+        assert!(!logs.contains(WARNING), "{logs}");
+        Ok(())
+    }
+
+    #[test]
+    fn mapped_ipv6_redirect_matches_an_ipv4_worker() {
+        // the worker in `cli_with_flags` is 10.0.0.7 (RPC 8545, readiness 8551)
+        for url in ["http://[::ffff:10.0.0.7]:8545/", "http://[::ffff:10.0.0.7]:8551/"] {
+            let flag = format!("--redirect-queries={url}");
+            let result = cli_with_flags(&[flag.as_str()]).into_settings();
+            assert!(result.is_err(), "{url} is the worker and must be rejected");
+        }
+        // and the other way round: a worker written as a mapped literal
+        let result = Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://[::ffff:10.0.0.7]:8545",
+            "--upstream-readiness-url=http://[::ffff:10.0.0.7]:8551/health/workers",
+            "--redirect-queries=http://10.0.0.7:8545/",
+        ])
+        .into_settings();
+        assert!(result.is_err(), "10.0.0.7:8545 is the mapped worker and must be rejected");
+    }
+
+    #[test]
     fn plaintext_warning_spares_loopback_and_private_hosts() -> eyre::Result<()> {
         for (url, warns) in [
             ("http://rpc.example.com/", true),
@@ -1055,6 +1181,9 @@ mod tests {
             ("http://192.168.1.10:8545/", false),
             ("http://[::1]:8545/", false),
             ("http://[fd00::7]:8545/", false),
+            ("http://[::ffff:10.0.0.7]:8545/", false),
+            ("http://[::ffff:127.0.0.1]:8545/", false),
+            ("http://[::ffff:203.0.113.5]:8545/", true),
         ] {
             assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
         }
