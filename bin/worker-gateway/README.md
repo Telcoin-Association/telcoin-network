@@ -169,6 +169,12 @@ Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
 
+The per-client bucket is checked first, and only a request it admits takes a
+global token, so a source over its own limit cannot drain the shared budget the
+other clients depend on. If the global bucket then refuses the request, its
+per-client token is refunded, so a global refusal costs the client nothing
+either.
+
 #### Prefix keying
 
 The per-client bucket is keyed on the client's **network prefix**, not its bare
