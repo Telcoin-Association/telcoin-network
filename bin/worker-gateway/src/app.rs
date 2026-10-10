@@ -1,7 +1,7 @@
 //! Gateway wiring: build the shared state, spawn the server and readiness
 //! poller as managed tasks, and run until shutdown.
 
-use std::sync::Arc;
+use std::{num::NonZeroUsize, sync::Arc, time::Duration};
 
 use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
@@ -9,7 +9,7 @@ use tracing::info;
 
 use crate::{
     cli::Settings,
-    dns::{CachingResolver, SystemLookup},
+    dns::{CachingResolver, LookupHost, SystemLookup},
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness},
@@ -77,17 +77,16 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     // Dedicated clients: the proxy enforces connect + per-request deadlines and
     // never follows redirects (see `proxy_client`); the poller bounds each
-    // probe with its own tokio timeout. The proxy resolves upstream names
-    // through a cache with a lookup cap (see `crate::dns`), so a slow resolver
-    // for one upstream cannot fill tokio's blocking pool.
-    let proxy_resolver = Arc::new(CachingResolver::new(
-        Arc::new(SystemLookup),
-        dns_cache_ttl,
-        max_concurrent_dns_lookups,
-    ));
-    let proxy_client =
-        proxy_client(upstream_connect_timeout, upstream_request_timeout, proxy_resolver)?;
-    let readiness_client = Client::builder().connect_timeout(upstream_connect_timeout).build()?;
+    // probe with its own tokio timeout. Each resolves upstream names through
+    // its own cache and lookup cap (see `UpstreamClients`).
+    let UpstreamClients { proxy: proxy_client, readiness: readiness_client } =
+        UpstreamClients::new(
+            Arc::new(SystemLookup),
+            dns_cache_ttl,
+            max_concurrent_dns_lookups,
+            upstream_connect_timeout,
+            upstream_request_timeout,
+        )?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
     // Let in-flight requests drain within the graceful deadline (plus a small
@@ -182,4 +181,44 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     task_manager.join_until_exit(shutdown).await?;
     Ok(())
+}
+
+/// The gateway's two upstream HTTP clients.
+#[derive(Debug)]
+pub(crate) struct UpstreamClients {
+    /// Forwards client requests to the workers and the query upstream (see
+    /// [`proxy_client`]).
+    pub(crate) proxy: Client,
+    /// Polls the workers' readiness endpoints.
+    pub(crate) readiness: Client,
+}
+
+impl UpstreamClients {
+    /// Build both clients, each with its own [`CachingResolver`] over `lookup`:
+    /// its own cache, and its own cap of `max_lookups` lookups at once.
+    ///
+    /// The readiness client must not share the proxy's resolver. Query traffic
+    /// to hosts that resolve slowly can hold every proxy lookup permit, and a
+    /// readiness poll refused a lookup then would mark the worker not-ready and
+    /// turn a slow query upstream into refused submissions. The node's health
+    /// listener closes the connection after each response, so every poll opens
+    /// a new connection and goes through the resolver.
+    pub(crate) fn new(
+        lookup: Arc<dyn LookupHost>,
+        dns_cache_ttl: Duration,
+        max_lookups: NonZeroUsize,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> reqwest::Result<Self> {
+        let proxy_resolver =
+            Arc::new(CachingResolver::new(Arc::clone(&lookup), dns_cache_ttl, max_lookups));
+        let readiness_resolver = Arc::new(CachingResolver::new(lookup, dns_cache_ttl, max_lookups));
+        Ok(Self {
+            proxy: proxy_client(connect_timeout, request_timeout, proxy_resolver)?,
+            readiness: Client::builder()
+                .connect_timeout(connect_timeout)
+                .dns_resolver(readiness_resolver)
+                .build()?,
+        })
+    }
 }

@@ -113,7 +113,9 @@ pub(crate) struct Cli {
     /// Most DNS lookups for upstream hosts that may run at once (default `8`).
     /// Only one lookup per host runs at a time; a lookup beyond the cap fails at
     /// once instead of waiting, so a request to a host with no cached answer is
-    /// answered as an unreachable upstream. Must be at least `1`.
+    /// answered as an unreachable upstream. The forwarding client and the
+    /// readiness poller each get their own cache and their own cap of this
+    /// size. Must be at least `1`.
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS", default_value = "8")]
     pub(crate) max_concurrent_dns_lookups: NonZeroUsize,
 
