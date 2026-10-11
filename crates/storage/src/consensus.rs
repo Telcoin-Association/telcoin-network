@@ -1418,6 +1418,40 @@ impl ConsensusChain {
         self.latest_consensus.number()
     }
 
+    /// Recover a stale saved-consensus hint from the canonical execution tip at epoch entry.
+    ///
+    /// The caller must supply the consensus header referenced by the latest executed block,
+    /// before starting the subscriber. An imported pack can contain a suffix that execution
+    /// already applied while the slot hint still names an older output. Do not promote to the
+    /// pack tip: it may contain unexecuted outputs, including an epoch boundary. Verify the
+    /// supplied header against the installed pack (never staging), then durably advance only
+    /// to that executed output. A newer saved hint is retained for normal restart replay.
+    pub async fn recover_latest_consensus_from_execution(
+        &self,
+        executed: &ConsensusHeader,
+    ) -> Result<(), ConsensusChainError> {
+        if executed.number <= self.latest_consensus.number() {
+            return Ok(());
+        }
+        let epoch = executed.sub_dag.leader_epoch();
+        let pack = match self.current_pack_for(epoch) {
+            Some(pack) => pack,
+            None => self.get_static(epoch).await?,
+        };
+        let stored = pack.consensus_header_by_number(executed.number).await?.digest();
+        let got = executed.digest();
+        if stored != got {
+            return Err(
+                PackError::ConflictingOutput { number: executed.number, stored, got }.into()
+            );
+        }
+        // Persist the pack before the hint; never leave a durable pointer to unflushed data.
+        pack.persist().await?;
+        self.latest_consensus.update(epoch, executed.number).await;
+        self.latest_consensus.persist().await;
+        Ok(())
+    }
+
     /// Reconcile the `LatestConsensus` hint down to the recovered current pack at startup.
     ///
     /// The hint (a durable, fsync'd slot) can end up AHEAD of the pack after a power loss: the slot
@@ -2331,7 +2365,10 @@ mod test {
 
     use crate::{
         consensus::{ConsensusChain, ConsensusChainError},
-        consensus_pack::test::{compare_outputs, make_test_output},
+        consensus_pack::{
+            test::{compare_outputs, make_test_output},
+            PackError,
+        },
         mem_db::MemDatabase,
     };
     use tn_reth::RethChainSpec;
@@ -2995,6 +3032,74 @@ mod test {
         let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
         assert_eq!(latest.number, k + 1);
         reopened.close().await;
+    }
+
+    /// Populate a pack independently of the saved marker, as an installed import does.
+    async fn executed_checkpoint_fixture(
+    ) -> (TempDir, ConsensusChain, Committee, Vec<ConsensusOutput>) {
+        let temp = TempDir::new().unwrap();
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let chain =
+            ConsensusChain::new_for_test(temp.path().to_owned(), committee.clone()).await.unwrap();
+        let spec: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut outputs = Vec::new();
+        let mut parent = ConsensusHeader::default().digest();
+        for number in 1..=3 {
+            let output = make_test_output(&committee, 0, spec.clone(), number, parent);
+            parent = output.consensus_header_hash();
+            chain.current_pack().save_consensus_output(output.clone()).await.unwrap();
+            outputs.push(output);
+        }
+        chain.save_consensus_output(outputs[0].clone()).await.unwrap();
+        chain.persist_current().await.unwrap();
+        assert_eq!(chain.latest_consensus_number(), 1);
+        (temp, chain, committee, outputs)
+    }
+
+    #[tokio::test]
+    async fn executed_checkpoint_recovery_is_durable_and_does_not_adopt_pack_tip() {
+        let (temp, chain, committee, outputs) = executed_checkpoint_fixture().await;
+        chain
+            .recover_latest_consensus_from_execution(&outputs[1].consensus_header())
+            .await
+            .unwrap();
+        assert_eq!(chain.latest_consensus_number(), 2);
+        assert_eq!(chain.latest_consensus_header_from_pack(0).await.unwrap().unwrap().number, 3);
+        // An older executed position must not regress an already saved marker.
+        chain
+            .recover_latest_consensus_from_execution(&outputs[0].consensus_header())
+            .await
+            .unwrap();
+        assert_eq!(chain.latest_consensus_number(), 2);
+        chain.close().await;
+        let reopened = ConsensusChain::new(temp.path().to_owned(), committee).unwrap();
+        assert_eq!(reopened.latest_consensus_number(), 2);
+        reopened.close().await;
+    }
+
+    #[tokio::test]
+    async fn executed_checkpoint_recovery_rejects_a_conflicting_header() {
+        let (_temp, chain, _committee, outputs) = executed_checkpoint_fixture().await;
+        let mut conflicting = outputs[1].consensus_header();
+        conflicting.parent_hash = tn_types::B256::repeat_byte(7).into();
+        let err = chain.recover_latest_consensus_from_execution(&conflicting).await.unwrap_err();
+        assert!(matches!(
+            err,
+            ConsensusChainError::PackError(PackError::ConflictingOutput { number: 2, .. })
+        ));
+        assert_eq!(chain.latest_consensus_number(), 1);
+        chain.close().await;
+    }
+
+    #[tokio::test]
+    async fn executed_checkpoint_recovery_rejects_a_missing_header() {
+        let (_temp, chain, _committee, outputs) = executed_checkpoint_fixture().await;
+        let mut missing = outputs[1].consensus_header();
+        missing.number = 99;
+        assert!(chain.recover_latest_consensus_from_execution(&missing).await.is_err());
+        assert_eq!(chain.latest_consensus_number(), 1);
+        chain.close().await;
     }
 
     #[tokio::test]

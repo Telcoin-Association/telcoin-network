@@ -52,6 +52,8 @@ use tracing::{debug, error, info, warn};
 mod close_epoch;
 mod endpoints;
 mod export_retention;
+#[cfg(test)]
+mod replay_checkpoint_tests;
 mod run_epoch;
 mod start_epoch;
 pub use close_epoch::build_epoch_record;
