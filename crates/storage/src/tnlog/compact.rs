@@ -819,6 +819,10 @@ fn run(core: &Core, rate: u64) {
                 Err("panicked".to_string())
             }
         };
+        #[cfg(test)]
+        if let Err(cause) = &last {
+            super::stats::abandoned(cause);
+        }
         let mut state = shared.state.lock();
         match &last {
             Ok(true) => (state.retry_at, state.backoff) = (None, AUTO_BACKOFF_MIN),

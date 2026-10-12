@@ -222,6 +222,12 @@ fn tnlog_stats_column<W: Workload, DB: Database>(
             s.switch_hold_max_ns as f64 / 1e3,
         );
     }
+    if s.abandoned > 0 {
+        println!(
+            "  {name}: {} compactions abandoned or cancelled; the last: {}",
+            s.abandoned, s.last_abandon
+        );
+    }
     col
 }
 
@@ -418,7 +424,7 @@ enum Better {
 }
 
 /// One backend's value for one report row.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct Cell {
     label: String,
     text: String,
@@ -500,6 +506,9 @@ fn row_extremes(cols: &[Column], row: usize) -> Option<(f64, f64)> {
 /// Print the columns side by side (rows labeled from the first column). On a terminal, each row's
 /// best value among the ranked columns is green and its worst red.
 fn print_table(title: &str, legend: &str, cols: &[Column]) {
+    // A column skipped by `TN_BENCH_COLUMNS` has no cells: leave it out.
+    let kept: Vec<Column> = cols.iter().filter(|(_, cells)| !cells.is_empty()).cloned().collect();
+    let cols = &kept[..];
     let Some((_, first)) = cols.first() else { return };
     let color = use_color();
     let label_w = first.iter().map(|cell| cell.label.len()).max().unwrap_or(0);
@@ -567,6 +576,18 @@ enum Layer {
 }
 
 /// Run `w` on one backend and label the result.
+/// Whether column `name` runs: every column, unless `TN_BENCH_COLUMNS` (set and not empty) lists
+/// the ones to run (comma-separated names, as the tables print them). A skipped column has no cells
+/// and is left out of its table. For a quick pass on a machine whose syncs are slow (a Linux disk
+/// flushing its cache on every `fsync`), where the columns that sync every write take most of the
+/// time.
+fn column_wanted(name: &str) -> bool {
+    match std::env::var("TN_BENCH_COLUMNS") {
+        Ok(list) if !list.trim().is_empty() => list.split(',').any(|wanted| wanted.trim() == name),
+        _ => true,
+    }
+}
+
 fn column<W: Workload, DB: Database>(
     rt: &Runtime,
     w: &mut W,
@@ -574,6 +595,10 @@ fn column<W: Workload, DB: Database>(
     db: DB,
     dir: Option<&Path>,
 ) -> Column {
+    if !column_wanted(&name) {
+        println!("  skipping {name} (not in TN_BENCH_COLUMNS)");
+        return (name, Vec::new());
+    }
     println!("  running {name} ...");
     w.open_tables(&db);
     let cells = w.run(rt, db, dir);
@@ -1028,20 +1053,25 @@ fn workload_mixed() {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_mixed_compaction() {
-    const PAIRS: usize = 6;
+    // `TN_BENCH_PAIRS` / `TN_BENCH_PAIR_ROUNDS` shorten it (a quick pass on a slow-sync machine).
+    let env = |name: &str, default: usize| {
+        std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    };
+    let pairs_wanted = env("TN_BENCH_PAIRS", 6);
+    let pair_rounds = env("TN_BENCH_PAIR_ROUNDS", 1000) as u32;
     let rt = Runtime::new().expect("tokio runtime");
     let value = |col: &Column, label: &str| -> f64 {
         let cell = col.1.iter().find(|c| c.label == label).expect("a measured cell");
         cell.text.trim().parse().expect("a number")
     };
     // (vote durable p99 us, ms per round) for compaction off and on, per pair.
-    let mut pairs = Vec::with_capacity(PAIRS);
-    for pair in 0..PAIRS {
+    let mut pairs = Vec::with_capacity(pairs_wanted);
+    for pair in 0..pairs_wanted {
         let mut measured = [(0.0, 0.0); 2];
         for on in [pair % 2 == 1, pair % 2 == 0] {
             let tmp = tempfile::tempdir().expect("temp dir");
             let mut w = MixedRounds {
-                consensus: ConsensusRounds { committee: 50, rounds: 1000 },
+                consensus: ConsensusRounds { committee: 50, rounds: pair_rounds },
                 batch: 256 << 10,
                 rate: None,
             };
@@ -1068,7 +1098,10 @@ fn workload_mixed_compaction() {
     let rounds: Vec<f64> = pairs.iter().map(|[off, on]| on.1 / off.1).collect();
     let list =
         |ratios: &[f64]| ratios.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>().join(" ");
-    println!("=== compaction's cost to consensus: {PAIRS} interleaved pairs, ratio on / off ===");
+    println!(
+        "=== compaction's cost to consensus: {pairs_wanted} interleaved pairs of {pair_rounds} \
+         rounds, ratio on / off ==="
+    );
     println!("vote durable p99: median {:.2} ({})", median(votes.clone()), list(&votes));
     println!("ms / round:       median {:.2} ({})", median(rounds.clone()), list(&rounds));
 }
@@ -1296,6 +1329,11 @@ fn reload<DB: Database>(
     open: impl Fn(&Path) -> DB,
     crash: Option<fn(DB)>,
 ) -> [Column; 2] {
+    let layered_name = format!("Layered<{name}>");
+    if !column_wanted(name) && !column_wanted(&layered_name) {
+        println!("  skipping {name} (not in TN_BENCH_COLUMNS)");
+        return [(name.to_string(), Vec::new()), (layered_name, Vec::new())];
+    }
     println!("  populating {name} ...");
     let rows = {
         let db = open(dir);
@@ -1349,9 +1387,10 @@ fn reload<DB: Database>(
             Cell::mb("disk MB", Some(disk)),
         ]
     };
+    let keep = |name: &str, cells: Vec<Cell>| if column_wanted(name) { cells } else { Vec::new() };
     [
-        (name.to_string(), cells(raw, crashed.map(|(raw, _)| raw))),
-        (format!("Layered<{name}>"), cells(layered, crashed.map(|(_, layered)| layered))),
+        (name.to_string(), keep(name, cells(raw, crashed.map(|(raw, _)| raw)))),
+        (layered_name.clone(), keep(&layered_name, cells(layered, crashed.map(|(_, l)| l)))),
     ]
 }
 
@@ -1436,8 +1475,49 @@ const CHURN_WINDOW: u64 = 2_048;
 /// The churn workload's value size.
 const CHURN_VALUE: usize = 4 * 1024;
 /// Steps: each inserts the next row and removes the one leaving the window; every fourth also
-/// overwrites a live row.
-const CHURN_STEPS: u64 = 40_000;
+/// overwrites a live row. A run takes at least this many, and keeps stepping until it has lasted
+/// [`churn_duration`]: a fixed step count ends in well under a second on a fast machine, before a
+/// compaction (whose catch-up rounds pay real flushes on Linux) can finish.
+const CHURN_MIN_STEPS: u64 = 2 * CHURN_WINDOW;
+
+/// The least time a churn run lasts: `TN_BENCH_CHURN_SECS` (default 3).
+fn churn_duration() -> Duration {
+    let secs = std::env::var("TN_BENCH_CHURN_SECS").ok().and_then(|s| s.parse().ok());
+    Duration::from_secs_f64(secs.unwrap_or(3.0))
+}
+
+/// Print every file under `dir` (relative path, length and allocated MB), largest first: what a
+/// column left on disk after its close.
+fn print_files(dir: &Path) {
+    fn walk(base: &Path, dir: &Path, out: &mut Vec<(String, u64, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.metadata() {
+                Ok(meta) if meta.is_dir() => walk(base, &path, out),
+                Ok(meta) => {
+                    let rel = path.strip_prefix(base).unwrap_or(&path).display().to_string();
+                    out.push((rel, meta.len(), meta.blocks() * 512));
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(dir, dir, &mut files);
+    files.sort_by_key(|file| std::cmp::Reverse(file.2));
+    let mb = |bytes: u64| bytes as f64 / 1e6;
+    for (rel, len, alloc) in files.iter().take(12) {
+        println!(
+            "    after close: {rel:<40} len {:>8.1} MB  alloc {:>8.1} MB",
+            mb(*len),
+            mb(*alloc)
+        );
+    }
+    if files.len() > 12 {
+        println!("    after close: ... {} more files", files.len() - 12);
+    }
+}
 
 /// A long-lived table under churn: single (autocommit) inserts, removes and overwrites.
 struct ChurnWorkload;
@@ -1462,7 +1542,8 @@ impl Workload for ChurnWorkload {
 
     fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell> {
         let value = filler(CHURN_VALUE, 11);
-        let mut steps = Vec::with_capacity(CHURN_STEPS as usize);
+        let mut steps = Vec::new();
+        let duration = churn_duration();
         let mut x = mix(7);
         let done = AtomicBool::new(false);
         let (total, peak) = std::thread::scope(|s| {
@@ -1479,7 +1560,8 @@ impl Workload for ChurnWorkload {
                 })
             });
             let start = Instant::now();
-            for i in 0..CHURN_STEPS {
+            let mut i = 0_u64;
+            while i < CHURN_MIN_STEPS || start.elapsed() < duration {
                 let step = Instant::now();
                 db.insert::<Churn>(&i, &value).expect("insert");
                 if i >= CHURN_WINDOW {
@@ -1492,6 +1574,7 @@ impl Workload for ChurnWorkload {
                     db.insert::<Churn>(&key, &value).expect("overwrite");
                 }
                 steps.push(step.elapsed());
+                i += 1;
             }
             rt.block_on(db.persist::<Churn>()).expect("persist");
             let total = start.elapsed();
@@ -1500,6 +1583,9 @@ impl Workload for ChurnWorkload {
         });
         assert_eq!(db.iter::<Churn>().count() as u64, CHURN_WINDOW, "the window's rows");
         drop(db);
+        if let Some(dir) = dir {
+            print_files(dir);
+        }
 
         let max = steps.iter().copied().max().unwrap_or_default();
         let compactions = dir.and_then(compactions_in).map_or_else(
@@ -1507,7 +1593,8 @@ impl Workload for ChurnWorkload {
             |n| Cell::count("compactions", n),
         );
         vec![
-            Cell::rate("K steps/s", CHURN_STEPS as f64 / total.as_secs_f64() / 1e3),
+            Cell::count("steps", steps.len()),
+            Cell::rate("K steps/s", steps.len() as f64 / total.as_secs_f64() / 1e3),
             Cell::us("step p50 us", quantile(&mut steps, 0.5)),
             Cell::us("step p99 us", quantile(&mut steps, 0.99)),
             Cell::ms("step max ms", max),
@@ -1574,8 +1661,9 @@ fn workload_compaction() {
     }
     print_table(
         &format!(
-            "compaction: {CHURN_STEPS} steps over a {CHURN_WINDOW}-row window of {} KB values \
-             (live data {} MiB)",
+            "compaction: at least {:.1} s (and {CHURN_MIN_STEPS} steps) over a {CHURN_WINDOW}-row \
+             window of {} KB values (live data {} MiB)",
+            churn_duration().as_secs_f64(),
             CHURN_VALUE / 1024,
             (CHURN_WINDOW * CHURN_VALUE as u64) >> 20
         ),

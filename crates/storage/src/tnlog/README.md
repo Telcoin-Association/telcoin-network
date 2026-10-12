@@ -310,8 +310,27 @@ environment's write lock), and reads of the epoch and kad tables come from memor
 tnlog replays its logs (about 0.8 s for a 229 MB log); MDBX recovers at once. Its disk use stays
 smaller (it reuses freed pages).
 
+**On Linux** (i7-1360P laptop, NVMe ext4 with FUA: a synchronous 4 KB write takes 1.74 ms; partial
+baseline run, 2026-10-12), every durable ack pays a drive-cache flush, and the gap to production
+widens:
+
+| N=50 | Split | Composite / layered MDBX |
+|---|---|---|
+| consensus alone: ms per round | **7.4** | 1127 |
+| vote durable p50 / p99 | **4.3 / 7.9 ms** | 871 ms / 2.2 s |
+| beside 1 MB batches at 25/s: ms per round | **8.4** | 1677 |
+| vote durable p50 / p99 | **4.7 / 10.0 ms** | 1.09 s / 4.97 s |
+
+A vote's durability there is about two sync rounds (~2.2 ms each). Beside 256 KB batches as fast as
+taken (~300 MB/s), Split degrades to 68 ms per round (vote p50 35 ms): each `fsync` flushes the whole
+drive cache, so separate logs share the flush cost on one drive.
+
 The node opens tnlog with the `tn-storage/tnlog` feature (`DatabaseType = SplitDatabase`, at
-`<consensus db>/tnlog`); MDBX stays the default.
+`<consensus db>/tnlog`); MDBX stays the default. On its first tnlog open, a node that ran on MDBX
+has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates)
+and kad tables copied over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done
+(`tnlog/mdbx-migrated`); a crash before the marker reruns the copy. The batch caches start empty,
+and the MDBX directories are left in place.
 
 ## Not yet
 

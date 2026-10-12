@@ -101,6 +101,13 @@ impl TnLogDatabase {
         write(&self.core, self.mode, ops)
     }
 
+    /// Block until every write so far is durable, running the sync here if none is in flight: for
+    /// a caller with no async runtime to await [`Database::persist`] on (e.g. a migration at open).
+    #[cfg(any(test, feature = "tnlog"))]
+    pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
+        super::commit::wait_durable(&self.core, self.core.durability.last_seq())
+    }
+
     /// Test-only, for a simulated crash (a leaked handle): stop the commit thread at once and
     /// release the database's lock, as a dead process's are.
     #[cfg(test)]

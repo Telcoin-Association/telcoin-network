@@ -47,6 +47,16 @@ pub(crate) mod stats {
     pub(crate) static SWITCH_HOLD_NS: AtomicU64 = AtomicU64::new(0);
     static SWITCH_HOLD_MAX_NS: AtomicU64 = AtomicU64::new(0);
 
+    /// Compactions abandoned (or cancelled), and the last one's cause.
+    pub(crate) static ABANDONED: AtomicU64 = AtomicU64::new(0);
+    static LAST_ABANDON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+    /// Count one abandoned (or cancelled) compaction and why.
+    pub(crate) fn abandoned(cause: &str) {
+        ABANDONED.fetch_add(1, Ordering::Relaxed);
+        *LAST_ABANDON.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = cause.to_string();
+    }
+
     /// Count one compaction's switch, which held the write lock for `took`.
     pub(crate) fn switch(took: Duration) {
         add(&COMPACTIONS, &SWITCH_HOLD_NS, took);
@@ -72,7 +82,7 @@ pub(crate) mod stats {
     }
 
     /// What happened since the last take (counts reset).
-    #[derive(Clone, Copy, Debug, Default)]
+    #[derive(Clone, Debug, Default)]
     pub(crate) struct Stats {
         pub(crate) syncs: u64,
         pub(crate) sync_ns: u64,
@@ -87,6 +97,8 @@ pub(crate) mod stats {
         pub(crate) compactions: u64,
         pub(crate) switch_hold_ns: u64,
         pub(crate) switch_hold_max_ns: u64,
+        pub(crate) abandoned: u64,
+        pub(crate) last_abandon: String,
     }
 
     pub(crate) fn take() -> Stats {
@@ -117,6 +129,10 @@ pub(crate) mod stats {
             compactions: take(&COMPACTIONS),
             switch_hold_ns: take(&SWITCH_HOLD_NS),
             switch_hold_max_ns: take(&SWITCH_HOLD_MAX_NS),
+            abandoned: take(&ABANDONED),
+            last_abandon: std::mem::take(
+                &mut *LAST_ABANDON.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+            ),
         }
     }
 }

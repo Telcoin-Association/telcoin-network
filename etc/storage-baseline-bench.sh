@@ -4,7 +4,12 @@
 # backends on the production OS. Written for Linux; also runs on macOS.
 #
 # Usage: etc/storage-baseline-bench.sh <empty dir on the disk under test> [report file]
-#   ROUNDS=1 ...            runs each workload once instead of three times (default 3)
+#   QUICK=1 ...             one pass with only the columns the backend decision needs (Split
+#                           tnlog, tnlog/tndb group, production MDBX); skips the reference columns
+#                           that sync every write, which dominate the run time on a disk whose
+#                           fsync flushes its cache (most Linux setups), and runs 3 compaction-cost
+#                           pairs of 300 rounds. About 20-30 minutes on a laptop NVMe.
+#   ROUNDS=1 ...            runs each workload once instead of three times (default 3; 1 if QUICK)
 #   ONLY="workload_mixed"   runs only the named workloads (space separated)
 #
 # Needs this checkout's tn-storage with the tnlog work (an uncommitted tree can be copied over
@@ -19,7 +24,14 @@ mkdir -p "$bench_dir"
 bench_dir="$(cd "$bench_dir" && pwd)"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 report="${2:-$repo/storage-baseline-$(hostname -s)-$(date +%Y%m%d-%H%M%S).txt}"
-rounds="${ROUNDS:-3}"
+quick="${QUICK:-}"
+if [ -n "$quick" ]; then
+    rounds="${ROUNDS:-1}"
+    # Fewer, shorter compaction-cost pairs.
+    export TN_BENCH_PAIRS="${TN_BENCH_PAIRS:-3}" TN_BENCH_PAIR_ROUNDS="${TN_BENCH_PAIR_ROUNDS:-300}"
+else
+    rounds="${ROUNDS:-3}"
+fi
 workloads="${ONLY:-workload_consensus_rounds workload_batch_cache workload_mixed workload_compaction}"
 os="$(uname -s)"
 
@@ -105,21 +117,41 @@ else
 fi
 rm -f "$probe"
 
+# The columns QUICK runs for each workload (TN_BENCH_COLUMNS; empty: every column).
+quick_columns() {
+    case "$1" in
+        workload_consensus_rounds)
+            echo "MemDb,TnDb-group,TnLog-group,Split<TnLog-group>,Layered<MDBX-prod>" ;;
+        workload_batch_cache)
+            echo "MemDb,TnDb-group,TnLog-group,Split<TnLog-group>,Layered-cache<MDBX-prod>" ;;
+        workload_mixed)
+            # Not tndb-group: beside the unpaced stream it collapses (~45 s a round on Linux).
+            echo "Split-nocompact,Split<TnLog-group>,Composite<MDBX-prod>" ;;
+        workload_compaction)
+            echo "TnDb-group,TnLog-group-nocompact,TnLog-group" ;;
+        workload_startup_reload)
+            echo "TnDb-group,Split<TnLog-group>,Layered<MDBX-prod>" ;;
+        *) echo "" ;;
+    esac
+}
+
 run() {
-    local name="$1" label="$2" out start end status rss=""
+    local name="$1" label="$2" out start end status rss="" columns=""
     out="$(mktemp)"
+    [ -n "$quick" ] && columns="$(quick_columns "$name")"
     echo "running $name ($label)..."
     section "WORKLOAD $name $label"
     kv load "$(uptime | sed 's/.*load average[s]*: //')"
+    [ -n "$columns" ] && kv columns "$columns"
     start="$(date +%s)"
     set +e
     if [ "$os" = "Linux" ] && [ -x /usr/bin/time ]; then
-        TMPDIR="$bench_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" "$bin" \
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" "$bin" \
             "workload_bench::$name" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
         rss="$(awk -F: '/Maximum resident set size/ {gsub(/ /, "", $2); print $2 " KiB"}' "$out.time")"
     else
-        TMPDIR="$bench_dir" NO_COLOR=1 "$bin" \
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 "$bin" \
             "workload_bench::$name" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
     fi

@@ -112,6 +112,12 @@ impl Durability {
         })
     }
 
+    /// The number of the last batch written.
+    #[cfg(any(test, feature = "tnlog"))]
+    pub(super) fn last_seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
+    }
+
     /// Record the number of the batch just written (under the write lock, before it is
     /// published).
     pub(super) fn set_seq(&self, seq: u64) {

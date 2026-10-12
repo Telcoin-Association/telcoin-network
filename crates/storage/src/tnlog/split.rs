@@ -71,6 +71,16 @@ impl SplitDatabase {
         })
     }
 
+    /// Block until every write so far, in every environment, is durable (see
+    /// [`TnLogDatabase::wait_durable_blocking`]).
+    #[cfg(any(test, feature = "tnlog"))]
+    pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
+        for db in &self.dbs {
+            db.wait_durable_blocking()?;
+        }
+        Ok(())
+    }
+
     fn db<T: Table>(&self) -> &TnLogDatabase {
         &self.dbs[env(T::HINT)]
     }

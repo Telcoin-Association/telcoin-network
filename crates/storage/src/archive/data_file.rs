@@ -546,6 +546,9 @@ pub struct MmapDataFile {
     /// Test-only: how many deferred size fsyncs barriers have run.
     #[cfg(test)]
     size_syncs: std::sync::atomic::AtomicUsize,
+    /// Test-only: how many open-time fsyncs of an unclean file's existing bytes this open ran.
+    #[cfg(test)]
+    open_syncs: std::sync::atomic::AtomicUsize,
     opts: MmapFileOptions,
 }
 
@@ -592,6 +595,24 @@ impl MmapDataFile {
         } else {
             None
         };
+
+        // An unclean file's bytes are readable but not necessarily durable: the process that
+        // crashed wrote them through its mapping and may never have msynced them, so they can
+        // still be dirty pages in the page cache. `flushed_end` below vouches for
+        // `[0, logical_end)`, and later barriers flush only from there on (a ranged msync does
+        // not flush pages outside its range), so fsync the whole file once first; that flushes
+        // the inode's dirty pages whichever process dirtied them. A clean close synced before it
+        // sealed, a read-only handle vouches for nothing, and a derived file is rebuilt after any
+        // unclean open, so none of those need it.
+        #[cfg(test)]
+        let mut open_syncs = 0;
+        if !read_only && opened_unclean && !opts.derived {
+            fsync_file(&file)?;
+            #[cfg(test)]
+            {
+                open_syncs += 1;
+            }
+        }
 
         // A writable reopen of a sealed file retires its clean-close sentinel on disk, durably,
         // before anything is written. The sentinel only vouches for the bytes as they were sealed;
@@ -670,7 +691,8 @@ impl MmapDataFile {
             seek_pos: 0,
             read_only,
             remove_on_drop: false,
-            // Existing content is already durable on disk, so the sync fast path starts here.
+            // Existing content is durable on disk (sealed after a sync, or synced above after an
+            // unclean open), so the sync fast path starts here.
             flushed_end: AtomicU64::new(logical_end),
             opened_unclean,
             committed_marker,
@@ -682,6 +704,8 @@ impl MmapDataFile {
             retired: Vec::new(),
             #[cfg(test)]
             size_syncs: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            open_syncs: std::sync::atomic::AtomicUsize::new(open_syncs),
             opts,
         };
         df.sync_view();
@@ -1916,6 +1940,73 @@ mod tests {
         let mut buf = vec![0u8; 400];
         df.read_exact(&mut buf).expect("read back");
         assert_eq!(buf, pattern(400));
+    }
+
+    /// Write `len` bytes and exit with no barrier and no clean-close seal, as a crash would: the
+    /// bytes may still be dirty pages in the page cache.
+    fn write_and_crash(path: &Path, opts: MmapFileOptions, len: usize) {
+        let mut df = MmapDataFile::open_with(path, false, opts).expect("open");
+        df.write_all(&pattern(len)).expect("write");
+        std::mem::forget(df);
+    }
+
+    fn open_syncs(df: &MmapDataFile) -> usize {
+        df.open_syncs.load(Ordering::Relaxed)
+    }
+
+    /// A writable open of an unclean file fsyncs it once before `flushed_end` vouches for its
+    /// existing bytes: the crashed writer may never have msynced them, and later barriers flush
+    /// only from `flushed_end` on.
+    #[test]
+    fn unclean_writable_open_syncs_existing_bytes_once() {
+        let tmp = TempDir::with_prefix("mmap_df_unclean_open_sync").expect("temp dir");
+        let path = tmp.path().join("data");
+        write_and_crash(&path, tiny_opts(), 200);
+        let df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("unclean reopen");
+        assert!(df.opened_unclean(), "precondition: opened unclean");
+        assert_eq!(open_syncs(&df), 1, "an unclean writable open syncs the file once");
+        assert_eq!(df.synced_end(), df.len(), "the synced bytes are the durable watermark");
+        std::mem::forget(df); // no recovery in this unit test; don't seal the padding on drop
+    }
+
+    /// A clean close synced before sealing, so a clean reopen trusts its bytes without a sync.
+    #[test]
+    fn clean_open_skips_the_open_sync() {
+        let tmp = TempDir::with_prefix("mmap_df_clean_open_sync").expect("temp dir");
+        let path = tmp.path().join("data");
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&pattern(200)).expect("write");
+            assert_eq!(open_syncs(&df), 0, "a fresh file has nothing to sync");
+        }
+        let df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("clean reopen");
+        assert!(!df.opened_unclean(), "precondition: opened clean");
+        assert_eq!(open_syncs(&df), 0, "a clean open needs no open-time sync");
+    }
+
+    /// A read-only handle never writes or advances a durable watermark, so it never syncs at open.
+    #[test]
+    fn read_only_open_skips_the_open_sync() {
+        let tmp = TempDir::with_prefix("mmap_df_ro_open_sync").expect("temp dir");
+        let path = tmp.path().join("data");
+        write_and_crash(&path, tiny_opts(), 200);
+        let df = MmapDataFile::open_with(&path, true, tiny_opts()).expect("read-only reopen");
+        assert!(df.opened_unclean(), "precondition: opened unclean");
+        assert_eq!(open_syncs(&df), 0, "a read-only open never syncs");
+    }
+
+    /// A derived file is rebuilt from the data log after any unclean open, so its existing bytes
+    /// are never trusted and need no open-time sync.
+    #[test]
+    fn derived_unclean_open_skips_the_open_sync() {
+        let tmp = TempDir::with_prefix("mmap_df_derived_open_sync").expect("temp dir");
+        let path = tmp.path().join("index");
+        let opts = MmapFileOptions { derived: true, ..tiny_opts() };
+        write_and_crash(&path, opts, 200);
+        let df = MmapDataFile::open_with(&path, false, opts).expect("unclean reopen");
+        assert!(df.opened_unclean(), "precondition: opened unclean");
+        assert_eq!(open_syncs(&df), 0, "a derived file is rebuilt, not synced, after a crash");
+        std::mem::forget(df);
     }
 
     /// The reserving mode's point: the mapping never moves while the file grows underneath it, and
