@@ -267,10 +267,15 @@ impl Cache {
             Ok(Ok(addrs)) if addrs.is_empty() => Err(LookupError::NoAddresses),
             // the client sets the URL's port only on port-0 addresses (a
             // non-zero port is kept when the URL has none), so clear any port
-            // a lookup returned
-            Ok(Ok(addrs)) => {
-                Ok(addrs.into_iter().map(|addr| SocketAddr::new(addr.ip(), 0)).collect())
-            }
+            // a lookup returned, in place: an IPv6 answer keeps its flow info
+            // and scope id, which a link-local address needs to be reachable
+            Ok(Ok(addrs)) => Ok(addrs
+                .into_iter()
+                .map(|mut addr| {
+                    addr.set_port(0);
+                    addr
+                })
+                .collect()),
             Ok(Err(err)) => Err(LookupError::Failed(Arc::new(err))),
             Err(_panic) => Err(LookupError::Aborted),
         };
@@ -484,7 +489,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::{
+        net::SocketAddrV6,
+        sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    };
 
     /// Per-outcome resolve counts, bumped beside the metric.
     #[derive(Debug, Default)]
@@ -598,6 +606,22 @@ mod tests {
 
         assert_eq!(resolve(&resolver, "a.test").await.expect("lookup"), vec![addr(1)]);
         assert_eq!(resolve(&resolver, "a.test").await.expect("cached"), vec![addr(1)]);
+    }
+
+    /// Clearing the port keeps every other field of the answer: a link-local
+    /// IPv6 address is only reachable through the interface its scope id
+    /// names, so a host whose only answer is `[fe80::1%7]` must not come back
+    /// as `[fe80::1]`.
+    #[tokio::test]
+    async fn clearing_the_port_keeps_the_ipv6_scope_id() {
+        let link_local = "fe80::1".parse().expect("ipv6");
+        let (lookup, _calls) =
+            scripted(move |_| Ok(vec![SocketAddr::V6(SocketAddrV6::new(link_local, 8_545, 0, 7))]));
+        let resolver = resolver(lookup, Duration::from_secs(60), 8);
+        let expected = vec![SocketAddr::V6(SocketAddrV6::new(link_local, 0, 0, 7))];
+
+        assert_eq!(resolve(&resolver, "scoped.test").await.expect("lookup"), expected);
+        assert_eq!(resolve(&resolver, "scoped.test").await.expect("cached"), expected);
     }
 
     #[tokio::test]
