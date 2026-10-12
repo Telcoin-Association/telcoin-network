@@ -43,16 +43,16 @@ use std::{
 };
 
 use axum::{
-    body::{Body, Bytes},
+    body::{Body, Bytes, HttpBody as _},
     extract::{
         rejection::{BytesRejection, FailedToBufferBody},
-        State,
+        FromRequest as _, Request, State,
     },
     http::{header, HeaderMap, HeaderName, HeaderValue, Method},
     response::Response,
-    Extension,
+    Extension, RequestExt as _,
 };
-use futures::Stream;
+use futures::{Stream, StreamExt as _};
 use reqwest::{redirect::Policy, Client, ClientBuilder};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -81,9 +81,10 @@ use crate::{
 /// via `--max-request-bytes` (this value is that flag's default). 1 MiB is four
 /// times the largest admissible submission: the worker's pool admits at most
 /// 128 KiB of raw transaction (reth's `DEFAULT_MAX_TX_INPUT_BYTES`), about
-/// 256 KiB once hex-encoded. Each open connection can buffer one body this
-/// large, so peak request memory is roughly `--max-connections` times this value
-/// (see the README's "Request size" section).
+/// 256 KiB once hex-encoded. Every in-flight request reserves its declared body
+/// size, or this whole cap when the body is chunked, against the in-flight byte
+/// budget (`--max-inflight-request-bytes`), which bounds the total buffered
+/// across connections (see the README's "Request size" section).
 pub(crate) const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 
 /// Default maximum number of calls in one JSON-RPC batch (`--max-batch-len`).
@@ -146,7 +147,7 @@ static SCREEN_WARNINGS: Throttle = Throttle::new("screen");
 static NO_UPSTREAM_WARNINGS: Throttle = Throttle::new("no_upstream");
 
 /// Throttle for the oversized-body warning.
-static OVERSIZED_BODY_WARNINGS: Throttle = Throttle::new("oversized_body");
+pub(crate) static OVERSIZED_BODY_WARNINGS: Throttle = Throttle::new("oversized_body");
 
 /// Throttles for the forwarding-failure warning, one per route, so a failing
 /// query upstream cannot hide a failing worker.
@@ -188,17 +189,25 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 11] = [
 /// `submission_budget` is present when `--rate-limit-submissions` is set and
 /// carries the global bucket's edge verdict, settled here once the request is
 /// classified (see [`SubmissionBudget`]).
-/// `body` is the final extractor (it consumes the request body), so it must
-/// stay last in the parameter list.
+/// `request` is the final extractor: its headers are taken first, then its
+/// body is read here, while the router's byte-budget layer
+/// (`server::reserve_request_bytes`) holds the bytes it reserved for it, so it
+/// must stay last in the parameter list.
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     Extension(forwarding): Extension<Forwarding>,
     method: Method,
-    headers: HeaderMap,
     limiters: Option<Extension<Arc<RateLimiters>>>,
     submission_budget: Option<Extension<SubmissionBudget>>,
-    body: Result<Bytes, BytesRejection>,
+    mut request: Request,
 ) -> Response {
+    // the headers move out of the request first; reading the body needs only
+    // its extensions (the body limit). the body is read before the guard below
+    // is entered, so a client still uploading its body is not counted in flight
+    // and the upload stays out of the duration
+    let headers = std::mem::take(request.headers_mut());
+    let body = read_body(request).await;
+
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
     // and time it. The guard releases both on every return path below, except
     // a relayed response: its body takes the guard and releases it once it has
@@ -207,7 +216,7 @@ pub(crate) async fn proxy(
 
     let body = match body {
         Ok(body) => body,
-        Err(rejection) => return reject_body(&rejection),
+        Err(response) => return response,
     };
 
     // A request that already carries the hop marker has passed through a
@@ -457,6 +466,38 @@ fn is_query(calls: Calls) -> bool {
         telemetry::record_mixed_batch();
     }
     calls.route() == Route::Query
+}
+
+/// Buffer the request body into one allocation.
+///
+/// A body with a declared length is copied chunk by chunk into a buffer of
+/// exactly that size, so each read-buffer chunk is released as soon as it is
+/// copied and the body is never copied again. The `Bytes` extractor would keep
+/// every chunk until the body ends and then join them into a fresh buffer,
+/// nearly doubling what a held body costs. A chunked body still goes through
+/// the extractor, which enforces `--max-request-bytes` while reading.
+async fn read_body(request: Request) -> Result<Bytes, Response> {
+    let declared = request.body().size_hint().exact().and_then(|len| usize::try_from(len).ok());
+    let Some(len) = declared else {
+        return Bytes::from_request(request, &())
+            .await
+            .map_err(|rejection| reject_body(&rejection));
+    };
+    // the router's byte-budget layer (`server::reserve_request_bytes`, always
+    // installed with the same cap as the body limit) refuses a declared length
+    // over the cap before this runs, and hyper never yields more than the
+    // declared length, so the body limit cannot trip here and the allocation is
+    // bounded by the cap: a read error is the client aborting the body
+    let mut body = Vec::with_capacity(len);
+    let mut chunks = request.into_limited_body().into_data_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk.map_err(|err| {
+            debug!(target: "gateway::proxy", %err, "failed to buffer request body");
+            error_response(&GatewayError::UnreadableBody, b"")
+        })?;
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Bytes::from(body))
 }
 
 /// Answer a body-buffering failure: a length-limit trip is a client error worth
@@ -2179,10 +2220,9 @@ mod tests {
                 State(state.clone()),
                 Extension(forwarding),
                 Method::POST,
-                HeaderMap::new(),
                 None,
                 None,
-                Ok(Bytes::from_static(body.as_bytes())),
+                Request::new(Body::from(body)),
             )
             .await;
             assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");

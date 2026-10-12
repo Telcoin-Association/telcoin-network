@@ -38,6 +38,8 @@
 //! it, so `tn_worker_gateway_route_inflight{route}` always equals the permits
 //! held on that route's cap, and `tn_worker_gateway_upstream_inflight` the
 //! permits held on the cap of concurrent requests to the worker.
+//! [`RequestBytesHeld`] keeps a gauge of the request-body bytes held against
+//! the in-flight byte budget (`--max-inflight-request-bytes`).
 //!
 //! [`record_dns_lookup`] counts the outcomes of name resolution by the upstream
 //! clients' caching resolvers, both clients in one series (see [`crate::dns`]).
@@ -95,6 +97,11 @@ const ROUTE_INFLIGHT: &str = "tn_worker_gateway_route_inflight";
 /// Requests this gateway is forwarding to a worker right now, under
 /// `--max-upstream-inflight`.
 const UPSTREAM_INFLIGHT: &str = "tn_worker_gateway_upstream_inflight";
+
+/// Request-body bytes currently held against the in-flight byte budget
+/// (`--max-inflight-request-bytes`): what admitted requests reserved before
+/// their bodies were read, until they are forwarded or rejected.
+const INFLIGHT_REQUEST_BYTES: &str = "tn_worker_gateway_inflight_request_bytes";
 
 /// Name resolutions by the upstream clients' caching resolvers, by `result`:
 /// `hit` (answered from the cache, fresh or stale), `miss` (a lookup was
@@ -177,6 +184,32 @@ impl InFlightSlot {
 impl Drop for InFlightSlot {
     fn drop(&mut self) {
         self.gauge.decrement(1.0);
+    }
+}
+
+/// RAII guard covering the bytes one request holds against the in-flight byte
+/// budget.
+///
+/// Entering raises the held-bytes gauge by the reservation; dropping lowers it
+/// by the same amount, so every exit path (forwarded, rejected, timed out, or
+/// cancelled by a client disconnect) is covered by one decrement.
+#[derive(Debug)]
+pub(crate) struct RequestBytesHeld {
+    /// The reservation this guard accounts for, in bytes.
+    bytes: u32,
+}
+
+impl RequestBytesHeld {
+    /// Account for `bytes` newly held against the budget.
+    pub(crate) fn enter(bytes: u32) -> Self {
+        gauge!(INFLIGHT_REQUEST_BYTES).increment(f64::from(bytes));
+        Self { bytes }
+    }
+}
+
+impl Drop for RequestBytesHeld {
+    fn drop(&mut self) {
+        gauge!(INFLIGHT_REQUEST_BYTES).decrement(f64::from(self.bytes));
     }
 }
 

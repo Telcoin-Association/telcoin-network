@@ -51,6 +51,9 @@ mod code {
     /// Every in-flight slot the request could use is taken (its route's cap,
     /// or the cap on concurrent requests to the worker).
     pub(super) const OVERLOADED: i32 = -32009;
+    /// The request did not fit in what is left of the gateway's in-flight
+    /// request-byte budget (`--max-inflight-request-bytes`).
+    pub(super) const INFLIGHT_BYTES_EXHAUSTED: i32 = -32010;
     /// The upstream answered with an error status and a body that is not
     /// JSON (a worker's `429` text/plain, for example).
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
@@ -92,6 +95,9 @@ pub(crate) enum GatewayError {
     /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
     /// transaction). Carries the EIP-2718 type byte, which the message names.
     UnsupportedTransactionType(u8),
+    /// The request's body bytes did not fit in what is left of the in-flight
+    /// request-byte budget, so it was refused before its body was read.
+    InflightBytesExhausted,
     /// The request body could not be read (e.g. the client aborted mid-body).
     /// Also answers a batch the gateway cannot read to its end, whose length,
     /// and so its cost, is unknown.
@@ -123,6 +129,7 @@ impl GatewayError {
             Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
                 StatusCode::BAD_REQUEST
             }
+            Self::InflightBytesExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamError { status } => *status,
@@ -141,6 +148,7 @@ impl GatewayError {
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
             Self::UnreadableBody => code::INVALID_REQUEST,
             Self::Overloaded => code::OVERLOADED,
             Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
@@ -175,6 +183,9 @@ impl GatewayError {
                     "unsupported transaction type: type {ty:#04x} transactions are not accepted"
                 ));
             }
+            Self::InflightBytesExhausted => {
+                "gateway is holding too many request bytes; retry shortly"
+            }
             Self::UnreadableBody => "request body could not be read",
             Self::Overloaded => "gateway overloaded; retry later",
             Self::UpstreamError { status } => {
@@ -201,6 +212,7 @@ impl GatewayError {
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
+            Self::InflightBytesExhausted => "inflight_bytes_exhausted",
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
             Self::UpstreamError { .. } => "upstream_error",
@@ -613,6 +625,7 @@ mod tests {
         assert_eq!(GatewayError::UnsupportedTransactionType(3).code(), -32008);
         assert_eq!(GatewayError::UnsupportedTransactionType(4).code(), -32008);
         assert_eq!(GatewayError::Overloaded.code(), -32009);
+        assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
     }
 
@@ -666,6 +679,18 @@ mod tests {
     }
 
     #[test]
+    fn inflight_bytes_code_and_reason_are_stable() {
+        // the budget refusal is a retryable overload signal with its own code
+        // and metric reason, so clients and dashboards can tell it apart from
+        // a rate limit or a missing upstream
+        let err = GatewayError::InflightBytesExhausted;
+        assert_eq!(err.code(), -32010);
+        assert_eq!(err.reason(), "inflight_bytes_exhausted");
+        assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error_response(&err, b"").status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
     fn reason_labels_are_stable() {
         // The reason labels are the `tn_worker_gateway_rejections_total{reason}`
         // metric contract (dashboards and alerts key on them); pin every variant
@@ -683,6 +708,7 @@ mod tests {
             GatewayError::UnsupportedTransactionType(4).reason(),
             "unsupported_transaction_type"
         );
+        assert_eq!(GatewayError::InflightBytesExhausted.reason(), "inflight_bytes_exhausted");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
         assert_eq!(GatewayError::Overloaded.reason(), "overloaded");
         assert_eq!(
