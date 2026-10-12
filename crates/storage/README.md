@@ -178,6 +178,9 @@ hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`cer
 **`tndb`** (`TnDatabase`) is a third `Database` backend built on this crate's own pack files and
 B+tree index (lock-free snapshot reads, crash recovery by replaying its logs, physical clears). It
 is benchmarked against MDBX but not yet used by `open_db`. See [`src/tndb/README.md`](src/tndb/README.md).
+**`tnlog`** (`TnLogDatabase`, work in progress) is the same idea with every table in one shared log
+(one sync per commit, transactions atomic across tables), built beside `tndb` to compare them. See
+[`src/tnlog/README.md`](src/tnlog/README.md).
 
 ### On-disk layout
 

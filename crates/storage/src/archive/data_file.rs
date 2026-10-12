@@ -272,8 +272,9 @@ impl MapView {
     }
 
     /// `msync(MS_SYNC)` the mapped bytes `[start, end)` (the start rounded down to a page), from
-    /// any thread. Used by [`SyncTicket::sync`] while the owner keeps appending past `end`.
-    fn msync(&self, start: u64, end: u64) -> io::Result<()> {
+    /// any thread, while the owner keeps appending past `end` (see [`SyncTicket::sync`]). The
+    /// caller keeps the file open for the call (see the type docs).
+    pub(crate) fn msync(&self, start: u64, end: u64) -> io::Result<()> {
         if start >= end {
             return Ok(());
         }
@@ -313,7 +314,13 @@ impl MapView {
     /// Borrow every published byte from `offset` on (`None` past the published end): one bounds
     /// check for a reader that learns a record's length from its own prefix.
     pub(crate) fn tail(&self, offset: u64) -> Option<&[u8]> {
-        let end = self.published.load(Ordering::Acquire).min(self.mapped.load(Ordering::Acquire));
+        self.tail_within(offset, self.published.load(Ordering::Acquire))
+    }
+
+    /// [`Self::tail`] bounded by `limit` instead of the view's published length: for a reader
+    /// whose snapshot carries its own limit (bytes its owner wrote in full before the snapshot).
+    pub(crate) fn tail_within(&self, offset: u64, limit: u64) -> Option<&[u8]> {
+        let end = limit.min(self.mapped.load(Ordering::Acquire));
         let len = end.checked_sub(offset)?;
         let base = self.base.load(Ordering::Acquire);
         if base.is_null() {
@@ -722,7 +729,7 @@ impl MmapDataFile {
 
     /// Latch the sticky write/sync poison (see [`Self::write_failed`]). Callable behind `&self` so
     /// the `&self` sync paths can set it.
-    fn poison(&self) {
+    pub(crate) fn poison(&self) {
         self.write_failed.store(true, Ordering::Relaxed);
     }
 
@@ -1376,6 +1383,23 @@ impl MmapDataFile {
     #[cfg(test)]
     pub(crate) fn synced_end(&self) -> u64 {
         self.flushed_end.load(Ordering::Relaxed)
+    }
+
+    /// How many times the file has grown (each growth leaves its new size to be fsynced).
+    pub(crate) fn growths(&self) -> u64 {
+        self.growths
+    }
+
+    /// Record that `[0, end)` was made durable by a sync this file did not run itself (an `msync`
+    /// through its [`MapView`] and an `fsync` of a duplicate descriptor): its watermark moves to
+    /// `end` (never past the current end, nor back), so a commit marker can be stamped up to it.
+    pub(crate) fn note_synced(&self, end: u64) {
+        self.flushed_end.fetch_max(end.min(self.end), Ordering::Relaxed);
+    }
+
+    /// A duplicate of the file's descriptor, for an `fsync` from another thread.
+    pub(crate) fn dup_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     /// Capture a [`SyncTicket`] for the appended bytes not yet synced, `[flushed_end, end)`, and

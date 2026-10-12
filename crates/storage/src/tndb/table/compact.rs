@@ -65,29 +65,29 @@ impl Default for CompactionConfig {
 
 /// A requested compaction ([`tn_types::Database::compact`]) skips a table whose data log is
 /// smaller than this.
-pub(super) const REQUESTED_MIN_BYTES: u64 = 1 << 20;
+pub(crate) const REQUESTED_MIN_BYTES: u64 = 1 << 20;
 
 /// Bytes copied between pacing (and cancellation) checks.
-const BATCH_BYTES: u64 = 1 << 20;
+pub(crate) const BATCH_BYTES: u64 = 1 << 20;
 
 /// The background catch-up stops once a round has had at most this many bytes to replay, leaving
 /// what accumulates after it to the writer's switch.
-const CATCHUP_BYTES: u64 = 1 << 20;
+pub(crate) const CATCHUP_BYTES: u64 = 1 << 20;
 
 /// Most background catch-up rounds before handing over to the writer regardless.
-const MAX_CATCHUP_ROUNDS: usize = 8;
+pub(crate) const MAX_CATCHUP_ROUNDS: usize = 8;
 
 /// The longest a pacing sleep goes without checking for a cancellation.
-const PACE_SLICE: Duration = Duration::from_millis(10);
+pub(crate) const PACE_SLICE: Duration = Duration::from_millis(10);
 
 /// Room a compaction needs beyond the current data log's length (the most its live rows can
 /// take): the new log's growth preallocation, at most this much past its data.
-pub(super) const DISK_HEADROOM: u64 = 128 << 20;
+pub(crate) const DISK_HEADROOM: u64 = 128 << 20;
 
 /// After a failed automatic compaction, the automatic trigger waits this long before trying again,
 /// doubling with each further failure up to [`AUTO_BACKOFF_MAX`].
-pub(super) const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
-pub(super) const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+pub(crate) const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
+pub(crate) const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 
 /// Where a generation's committed records end in its data log.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -416,7 +416,7 @@ pub(super) fn discard(handle: JoinHandle<eyre::Result<Compacted>>) {
 
 /// True when `e` comes from reading damaged committed data (a failed CRC, a corrupt record),
 /// rather than from the environment.
-pub(super) fn is_corruption(e: &eyre::Report) -> bool {
+pub(crate) fn is_corruption(e: &eyre::Report) -> bool {
     e.chain().any(|cause| {
         matches!(
             cause.downcast_ref::<FetchError>(),

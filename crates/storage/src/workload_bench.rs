@@ -89,13 +89,18 @@ use tokio::{runtime::Runtime, task::JoinSet};
 
 #[cfg(feature = "reth-libmdbx")]
 use crate::{
+    composite_db::CompositeDatabase,
     db_bench::open_mdbx_prod,
-    mdbx::database::{PROD_CACHE_GROWTH, PROD_CACHE_MAX, PROD_EPOCH_MAX, PROD_GROWTH},
+    mdbx::{
+        database::{PROD_CACHE_GROWTH, PROD_CACHE_MAX, PROD_EPOCH_MAX, PROD_GROWTH, PROD_KAD_MAX},
+        MdbxDatabase,
+    },
 };
 use crate::{
     layered_db::LayeredDatabase,
     mem_db::MemDatabase,
     tndb::{group_stats, CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
+    tnlog::{stats as tnlog_stats, SplitDatabase, TnLogDatabase, TnLogOptions},
     ROUNDS_TO_KEEP,
 };
 
@@ -136,6 +141,87 @@ fn group_column<W: Workload>(
         s.lock_holds as f64 / rounds,
         avg_us(s.lock_hold_ns, s.lock_holds),
     );
+    col
+}
+
+/// Open tnlog (one shared log) at `dir`, committing as `commit` says.
+fn open_tnlog(dir: &Path, commit: CommitMode) -> TnLogDatabase {
+    TnLogDatabase::open_with(dir, TnLogOptions { commit, ..Default::default() })
+        .expect("open tnlog")
+}
+
+/// Open tnlog as production would run it: a [`SplitDatabase`], one shared log per production
+/// environment (epoch, kad, cache) as `open_db` splits MDBX, with no layer in between, so the batch
+/// caches never share a write lock with consensus.
+fn open_split_tnlog(
+    root: &Path,
+    commit: CommitMode,
+    compaction: CompactionConfig,
+) -> SplitDatabase {
+    SplitDatabase::open_with(root, TnLogOptions { commit, compaction }).expect("open split tnlog")
+}
+
+/// The node's consensus DB as production opens it today: `open_db`'s
+/// `CompositeDatabase<MdbxDatabase>`, with the production geometry and `Durable` sync.
+#[cfg(feature = "reth-libmdbx")]
+fn open_composite_mdbx_prod(root: &Path) -> CompositeDatabase<MdbxDatabase> {
+    let env = |name: &str, tables, max_size, growth| {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).expect("create the environment's directory");
+        open_mdbx_prod(&dir, tables, max_size, growth)
+    };
+    CompositeDatabase::open(
+        env("epoch", 8, PROD_EPOCH_MAX, PROD_GROWTH),
+        env("kad", 8, PROD_KAD_MAX, PROD_GROWTH),
+        env("cache", 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH),
+    )
+}
+
+/// Run a tnlog column at `dir`, then print its commit thread's syncs and its write lock's waits
+/// and holds (see `tnlog::stats`).
+fn tnlog_column<W: Workload>(
+    rt: &Runtime,
+    w: &mut W,
+    dir: &Path,
+    commit: CommitMode,
+    name: &str,
+) -> Column {
+    tnlog_stats_column(rt, w, name, open_tnlog(dir, commit), dir)
+}
+
+/// [`column`] for a tnlog-backed `db` at `dir`, then print what its logs' sync rounds and write
+/// locks did (summed over every log it has).
+fn tnlog_stats_column<W: Workload, DB: Database>(
+    rt: &Runtime,
+    w: &mut W,
+    name: &str,
+    db: DB,
+    dir: &Path,
+) -> Column {
+    let _ = tnlog_stats::take();
+    let col = column(rt, w, name.to_string(), db, Some(dir));
+    let s = tnlog_stats::take();
+    let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
+    println!(
+        "  {name}: {} syncs (avg {:.0} us); write lock: {} waits (avg {:.1} us), holds avg {:.1} \
+         us, p50 <= {:.1} us, p99 <= {:.1} us, max {:.1} us",
+        s.syncs,
+        avg_us(s.sync_ns, s.syncs),
+        s.lock_waits,
+        avg_us(s.lock_wait_ns, s.lock_waits),
+        avg_us(s.hold_ns, s.holds),
+        s.hold_p50_ns as f64 / 1e3,
+        s.hold_p99_ns as f64 / 1e3,
+        s.hold_max_ns as f64 / 1e3,
+    );
+    if s.compactions > 0 {
+        println!(
+            "  {name}: {} compactions; the switch held the write lock avg {:.0} us, max {:.0} us",
+            s.compactions,
+            avg_us(s.switch_hold_ns, s.compactions),
+            s.switch_hold_max_ns as f64 / 1e3,
+        );
+    }
     col
 }
 
@@ -512,6 +598,11 @@ fn run_backends<W: Workload>(
     let db = TnDatabase::open(&dir).expect("open tndb");
     cols.push(column(rt, w, "TnDb".to_string(), db, Some(&dir)));
     cols.push(group_column(rt, w, &base.join("tndb_group"), CompactionConfig::default()));
+    cols.push(tnlog_column(rt, w, &base.join("tnlog"), CommitMode::Sync, "TnLog"));
+    cols.push(tnlog_column(rt, w, &base.join("tnlog_group"), CommitMode::Group, "TnLog-group"));
+    let root = base.join("split_tnlog");
+    let db = open_split_tnlog(&root, CommitMode::Group, CompactionConfig::default());
+    cols.push(tnlog_stats_column(rt, w, "Split<TnLog-group>", db, &root));
     let dir = base.join("tndb_layered");
     let db = LayeredDatabase::open(TnDatabase::open(&dir).expect("open tndb"), full_memory);
     cols.push(column(rt, w, format!("{layered}<TnDb>"), db, Some(&dir)));
@@ -798,6 +889,188 @@ fn workload_consensus_rounds() {
             &cols,
         );
     }
+}
+
+// ---- workload 1b: consensus beside a batch writer, one database ----
+
+/// Batches the mixed workload's cache holds: each insert past it evicts the oldest.
+const MIXED_WINDOW: u64 = 64;
+
+/// Consensus rounds while a batch writer streams large batches into the batch cache of the same
+/// database, as on a production node: in tnlog every table shares one log and one write lock, so
+/// a large batch append can hold up a vote; tndb has a writer per table.
+struct MixedRounds {
+    consensus: ConsensusRounds,
+    /// Each batch's size.
+    batch: usize,
+    /// Batches per second, or `None` for as fast as the database takes them.
+    rate: Option<u32>,
+}
+
+impl Workload for MixedRounds {
+    fn open_tables<DB: Database>(&self, db: &DB) {
+        open_epoch_tables(db);
+        db.open_table::<Batches>().expect("open Batches");
+    }
+
+    fn run<DB: Database>(&mut self, rt: &Runtime, db: DB, dir: Option<&Path>) -> Vec<Cell> {
+        let stop = Arc::new(AtomicBool::new(false));
+        let writer = {
+            let (db, stop, batch, rate) = (db.clone(), Arc::clone(&stop), self.batch, self.rate);
+            std::thread::spawn(move || {
+                let value = filler(batch, 9);
+                let mut calls = Vec::new();
+                let start = Instant::now();
+                let mut i = 0_u64;
+                while !stop.load(Ordering::Acquire) {
+                    if let Some(rate) = rate {
+                        let due = start + Duration::from_secs_f64(i as f64 / f64::from(rate));
+                        if let Some(wait) = due.checked_duration_since(Instant::now()) {
+                            std::thread::sleep(wait.min(Duration::from_millis(5)));
+                            continue;
+                        }
+                    }
+                    let call = Instant::now();
+                    db.insert::<Batches>(&digest(0xBA7C, i, 0), &value).expect("insert batch");
+                    if i >= MIXED_WINDOW {
+                        // Batches leave the cache once committed, as in production.
+                        let old = digest(0xBA7C, i - MIXED_WINDOW, 0);
+                        db.remove::<Batches>(&old).expect("evict batch");
+                    }
+                    calls.push(call.elapsed());
+                    i += 1;
+                }
+                (i, start.elapsed(), calls)
+            })
+        };
+        let mut cells = self.consensus.run(rt, db, dir);
+        stop.store(true, Ordering::Release);
+        let (batches, elapsed, mut calls) = writer.join().expect("batch writer");
+        cells.pop(); // the disk left by the epoch: the batches are not cleared here
+        cells.push(Cell::rate(
+            "batch MB/s alongside",
+            (batches * self.batch as u64) as f64 / elapsed.as_secs_f64() / 1e6,
+        ));
+        cells.push(Cell::us("batch write call p50 us", quantile(&mut calls, 0.50)));
+        cells.push(Cell::us("batch write call p99 us", quantile(&mut calls, 0.99)));
+        cells
+    }
+}
+
+/// Consensus rounds (N=50) while a batch writer streams large batches into the same database:
+/// 256 KB batches as fast as the database takes them (the worst case), and 1 MB batches at 25 a
+/// second (a busy node). Group mode only: tndb (a writer per table) against tnlog (one shared
+/// write lock).
+///
+/// On-demand perf test (kept out of the default suite). Run with:
+/// `cargo test --release -p tn-storage workload_mixed -- --ignored --nocapture --test-threads 1`.
+#[test]
+#[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
+fn workload_mixed() {
+    let rt = Runtime::new().expect("tokio runtime");
+    for (batch, rate) in [(256 << 10, None), (1 << 20, Some(25))] {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let mut w = MixedRounds {
+            consensus: ConsensusRounds { committee: 50, rounds: CONSENSUS_ROUNDS },
+            batch,
+            rate,
+        };
+        // No in-memory column: an unpaced batch writer would fill RAM.
+        let mut cols = vec![
+            group_column(&rt, &mut w, &tmp.path().join("tndb_group"), CompactionConfig::default()),
+            tnlog_column(
+                &rt,
+                &mut w,
+                &tmp.path().join("tnlog_group"),
+                CommitMode::Group,
+                "TnLog-group",
+            ),
+        ];
+        let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
+        let root = tmp.path().join("split_tnlog_nocompact");
+        let db = open_split_tnlog(&root, CommitMode::Group, off);
+        cols.push(tnlog_stats_column(&rt, &mut w, "Split-nocompact", db, &root));
+        let root = tmp.path().join("split_tnlog");
+        let db = open_split_tnlog(&root, CommitMode::Group, CompactionConfig::default());
+        cols.push(tnlog_stats_column(&rt, &mut w, "Split<TnLog-group>", db, &root));
+        // Production today, for scale: beside the paced stream only. Its cache layer queues
+        // writes unbounded, and beside the unpaced one that queue held 39 GB (resident; an
+        // 86 GB footprint) on a Mac, enough to take a smaller machine down.
+        #[cfg(feature = "reth-libmdbx")]
+        if rate.is_some() {
+            let root = tmp.path().join("composite_mdbx_prod");
+            let db = open_composite_mdbx_prod(&root);
+            cols.push(column(&rt, &mut w, "Composite<MDBX-prod>".to_string(), db, Some(&root)));
+        }
+        let pace = rate.map_or_else(|| "as fast as taken".to_string(), |r| format!("{r}/s"));
+        print_table(
+            &format!(
+                "mixed: consensus N=50 ({CONSENSUS_ROUNDS} rounds) beside {} KB batches ({pace})",
+                batch >> 10
+            ),
+            "one database; the batch writer runs on its own thread for the whole consensus run, \
+             keeping the last 64 batches (each insert evicts the oldest)",
+            &cols,
+        );
+    }
+}
+
+/// Compaction's cost to consensus, judged on interleaved pairs: the mixed workload (256 KB batches
+/// as fast as taken, 1000 rounds, so the cache log compacts several times a run) on
+/// `SplitDatabase` with compaction off and on, the order rotated each pair; reports each pair's
+/// ratio (on / off) of vote durable p99 and ms per round, and their medians. Vote p99 varies about
+/// 30% run to run in this workload, so one run, or a mean of three, does not show compaction's
+/// effect; the median of paired ratios does.
+///
+/// On-demand perf test (kept out of the default suite). Run with:
+/// `cargo test --release -p tn-storage workload_mixed_compaction -- --ignored --nocapture
+/// --test-threads 1`.
+#[test]
+#[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
+fn workload_mixed_compaction() {
+    const PAIRS: usize = 6;
+    let rt = Runtime::new().expect("tokio runtime");
+    let value = |col: &Column, label: &str| -> f64 {
+        let cell = col.1.iter().find(|c| c.label == label).expect("a measured cell");
+        cell.text.trim().parse().expect("a number")
+    };
+    // (vote durable p99 us, ms per round) for compaction off and on, per pair.
+    let mut pairs = Vec::with_capacity(PAIRS);
+    for pair in 0..PAIRS {
+        let mut measured = [(0.0, 0.0); 2];
+        for on in [pair % 2 == 1, pair % 2 == 0] {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let mut w = MixedRounds {
+                consensus: ConsensusRounds { committee: 50, rounds: 1000 },
+                batch: 256 << 10,
+                rate: None,
+            };
+            let config = if on {
+                CompactionConfig::default()
+            } else {
+                CompactionConfig { auto_min_bytes: None, ..Default::default() }
+            };
+            let root = tmp.path().join("split");
+            let name = if on { "Split" } else { "Split-nocompact" };
+            let db = open_split_tnlog(&root, CommitMode::Group, config);
+            let col = tnlog_stats_column(&rt, &mut w, name, db, &root);
+            measured[usize::from(on)] =
+                (value(&col, "vote durable p99 us"), value(&col, "ms / round"));
+        }
+        pairs.push(measured);
+    }
+    let median = |mut ratios: Vec<f64>| {
+        ratios.sort_by(f64::total_cmp);
+        let n = ratios.len();
+        (ratios[(n - 1) / 2] + ratios[n / 2]) / 2.0
+    };
+    let votes: Vec<f64> = pairs.iter().map(|[off, on]| on.0 / off.0).collect();
+    let rounds: Vec<f64> = pairs.iter().map(|[off, on]| on.1 / off.1).collect();
+    let list =
+        |ratios: &[f64]| ratios.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>().join(" ");
+    println!("=== compaction's cost to consensus: {PAIRS} interleaved pairs, ratio on / off ===");
+    println!("vote durable p99: median {:.2} ({})", median(votes.clone()), list(&votes));
+    println!("ms / round:       median {:.2} ({})", median(rounds.clone()), list(&rounds));
 }
 
 // ---- workload 2: the batch cache ----
@@ -1113,6 +1386,31 @@ fn workload_startup_reload() {
         }),
     );
     cols.push(group);
+    let crash_tnlog = |db: TnLogDatabase| {
+        db.release_locks_for_crash();
+        std::mem::forget(db);
+    };
+    let [tnlog, _] = reload(
+        "TnLog",
+        &tmp.path().join("tnlog"),
+        |dir| open_tnlog(dir, CommitMode::Sync),
+        Some(crash_tnlog),
+    );
+    cols.push(tnlog);
+    let [tnlog_group, _] = reload(
+        "TnLog-group",
+        &tmp.path().join("tnlog_group"),
+        |dir| open_tnlog(dir, CommitMode::Group),
+        Some(crash_tnlog),
+    );
+    cols.push(tnlog_group);
+    let [composite, _] = reload(
+        "Split<TnLog-group>",
+        &tmp.path().join("split_tnlog"),
+        |dir| open_split_tnlog(dir, CommitMode::Group, CompactionConfig::default()),
+        None,
+    );
+    cols.push(composite);
     #[cfg(feature = "reth-libmdbx")]
     cols.extend(reload(
         "MDBX-prod",
@@ -1144,14 +1442,17 @@ const CHURN_STEPS: u64 = 40_000;
 /// A long-lived table under churn: single (autocommit) inserts, removes and overwrites.
 struct ChurnWorkload;
 
-/// The compactions a tndb table has switched to: its generation number (the workload never
-/// clears), or `None` for another backend.
-fn tndb_compactions(dir: &Path) -> Option<usize> {
-    std::fs::read_dir(dir.join(Churn::NAME))
-        .ok()?
-        .flatten()
-        .filter_map(|entry| entry.file_name().to_str()?.strip_prefix("gen-")?.parse().ok())
-        .max()
+/// The compactions a tndb table (or a tnlog database) has switched to: its generation number (the
+/// workload never clears), or `None` for another backend.
+fn compactions_in(dir: &Path) -> Option<usize> {
+    let max_gen = |dir: &Path| {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.strip_prefix("gen-")?.parse().ok())
+            .max()
+    };
+    max_gen(&dir.join(Churn::NAME)).or_else(|| max_gen(dir))
 }
 
 impl Workload for ChurnWorkload {
@@ -1201,7 +1502,7 @@ impl Workload for ChurnWorkload {
         drop(db);
 
         let max = steps.iter().copied().max().unwrap_or_default();
-        let compactions = dir.and_then(tndb_compactions).map_or_else(
+        let compactions = dir.and_then(compactions_in).map_or_else(
             || Cell::new("compactions", Better::Unranked, "-".to_string()),
             |n| Cell::count("compactions", n),
         );
@@ -1242,6 +1543,18 @@ fn workload_compaction() {
         cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
     }
     cols.push(group_column(&rt, &mut w, &tmp.path().join("TnDb-group"), on));
+    let dir = tmp.path().join("TnLog-group-nocompact");
+    let db =
+        TnLogDatabase::open_with(&dir, TnLogOptions { commit: CommitMode::Group, compaction: off })
+            .expect("open tnlog");
+    cols.push(tnlog_stats_column(&rt, &mut w, "TnLog-group-nocompact", db, &dir));
+    cols.push(tnlog_column(
+        &rt,
+        &mut w,
+        &tmp.path().join("TnLog-group"),
+        CommitMode::Group,
+        "TnLog-group",
+    ));
     for (name, config) in [("Layered-cache<TnDb-nocompact>", off), ("Layered-cache<TnDb>", on)] {
         let (db, dir) = tndb(name, config);
         let db = LayeredDatabase::open(db, false);

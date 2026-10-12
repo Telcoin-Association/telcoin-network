@@ -74,6 +74,7 @@ use crate::{
     },
     mem_db::MemDatabase,
     tndb::TnDatabase,
+    tnlog::{TnLogDatabase, TnLogOptions},
 };
 
 #[cfg(feature = "reth-libmdbx")]
@@ -391,6 +392,75 @@ impl KvStore for TnGroupKv {
     }
 }
 
+// ---- tnlog (one shared log): `Sync` waits for the commit thread per write, `Group` for persist
+// ----
+
+struct TnLogKv {
+    db: TnLogDatabase,
+    rt: tokio::runtime::Runtime,
+    group: bool,
+}
+
+impl TnLogKv {
+    fn open_with(dir: &Path, group: bool) -> Self {
+        let commit =
+            if group { crate::tndb::CommitMode::Group } else { crate::tndb::CommitMode::Sync };
+        let db = TnLogDatabase::open_with(dir, TnLogOptions { commit, ..Default::default() })
+            .expect("open tnlog");
+        db.open_table::<KvTable>().expect("open table");
+        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
+        Self { db, rt, group }
+    }
+
+    fn open(dir: &Path) -> Self {
+        Self::open_with(dir, false)
+    }
+
+    fn open_group(dir: &Path) -> Self {
+        Self::open_with(dir, true)
+    }
+
+    /// Group mode's durability barrier (`Sync` mode was durable when each write returned).
+    fn persist(&self) {
+        if self.group {
+            self.rt.block_on(self.db.persist::<KvTable>()).expect("persist");
+        }
+    }
+}
+
+impl KvStore for TnLogKv {
+    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
+        let mut txn = self.db.write_txn().expect("write_txn");
+        for (k, v) in items {
+            txn.insert::<KvTable>(k, v).expect("insert");
+        }
+        txn.commit().expect("commit");
+        self.persist();
+    }
+
+    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
+        for (k, v) in items {
+            self.db.insert::<KvTable>(k, v).expect("insert");
+            self.persist();
+        }
+    }
+
+    fn read_rand(&mut self, keys: &[B256]) -> usize {
+        let txn = self.db.read_txn().expect("read_txn");
+        keys.iter().filter(|k| txn.get::<KvTable>(k).expect("get").is_some()).count()
+    }
+}
+
+impl SortedKvStore for TnLogKv {
+    fn scan_all(&mut self) -> usize {
+        self.db.iter::<KvTable>().count()
+    }
+
+    fn range_scan(&mut self, lo: B256, hi: B256) -> usize {
+        self.db.skip_to::<KvTable>(&lo).expect("skip_to").take_while(|(k, _)| *k < hi).count()
+    }
+}
+
 // ---- in-memory KV: the `MemDatabase` baseline (sorted `BTreeMap`, no disk) ----
 
 struct MemKv {
@@ -666,6 +736,10 @@ fn pack_vs_mdbx_bench() {
     cols.push(("tndb", column(TnKv::open)));
     println!("  running tndb-group ...");
     cols.push(("tndb-group", column(TnGroupKv::open)));
+    println!("  running tnlog ...");
+    cols.push(("tnlog", column(TnLogKv::open)));
+    println!("  running tnlog-group ...");
+    cols.push(("tnlog-group", column(TnLogKv::open_group)));
     println!("  running mem ...");
     cols.push(("mem", column(MemKv::open)));
 
@@ -695,10 +769,12 @@ fn pack_vs_mdbx_bench() {
     let hi = sorted_keys[(3 * N_BULK / 4) as usize];
 
     let sorted_rows = sorted_row_labels();
-    let mut sorted_cols: Vec<(&str, Vec<Duration>)> = Vec::new();
-    sorted_cols.push(("pack-btree", column_sorted(PackBtreeKv::open, lo, hi)));
-    sorted_cols.push(("tndb", column_sorted(TnKv::open, lo, hi)));
-    sorted_cols.push(("mem", column_sorted(MemKv::open, lo, hi)));
+    let mut sorted_cols: Vec<(&str, Vec<Duration>)> = vec![
+        ("pack-btree", column_sorted(PackBtreeKv::open, lo, hi)),
+        ("tndb", column_sorted(TnKv::open, lo, hi)),
+        ("tnlog", column_sorted(TnLogKv::open, lo, hi)),
+        ("mem", column_sorted(MemKv::open, lo, hi)),
+    ];
     #[cfg(feature = "reth-libmdbx")]
     {
         sorted_cols.push(("mdbx", column_sorted(|p| MdbxKv::open(p, false), lo, hi)));

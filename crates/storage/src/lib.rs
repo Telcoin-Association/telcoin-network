@@ -52,6 +52,7 @@ pub mod redb;
 mod workload_bench;
 
 pub mod tndb;
+pub mod tnlog;
 
 pub use tn_types::error::StoreError;
 
@@ -140,23 +141,30 @@ pub mod tables {
     );
 }
 
-// mdbx is the default, if redb is set then is used (so priority is mdbx -> redb)
+// mdbx is the default; redb replaces it when set, and tnlog replaces both (so priority is
+// tnlog -> redb -> mdbx)
 /// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tnlog")))]
 pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
 /// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(feature = "redb")]
+#[cfg(all(feature = "redb", not(feature = "tnlog")))]
 pub type DatabaseType = CompositeDatabase<ReDB>;
+/// The configured database backend: tnlog, one shared log per environment, when the `tnlog`
+/// feature is on.
+#[cfg(feature = "tnlog")]
+pub type DatabaseType = tnlog::SplitDatabase;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
 #[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
 pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the redb flag is
-    // set.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
+    // Open the right DB based on feature flags.  The default is MDBX unless the redb or tnlog
+    // flag is set.
+    #[cfg(feature = "tnlog")]
+    return _open_tnlog(store_path);
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tnlog")))]
     return _open_mdbx(store_path);
-    #[cfg(feature = "redb")]
+    #[cfg(all(feature = "redb", not(feature = "tnlog")))]
     return _open_redb(store_path);
     panic!("No DB configured!")
 }
@@ -195,6 +203,38 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
         .expect("Cannot open database (cache)");
 
     let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
+    // Epoch tables
+    db.open_table::<LastProposed>().expect("failed to open table!");
+    db.open_table::<Votes>().expect("failed to open table!");
+    db.open_table::<Certificates>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
+    db.open_table::<Payload>().expect("failed to open table!");
+    // Kad tables
+    db.open_table::<KadRecords>().expect("failed to open table!");
+    db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
+    // Cache tables
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
+    db
+}
+
+/// Open or reopen all the storage of the node backed by tnlog: one shared log per environment
+/// ([`tnlog::SplitDatabase`]) under `<store_path>/tnlog` (never sharing files with another
+/// backend's `epoch`, `kad` and `cache` directories, so switching backends starts empty), in group
+/// commit (a write returns at once; `persist` waits for the sync covering it), compacting in the
+/// background.
+#[cfg(feature = "tnlog")]
+fn _open_tnlog<P: AsRef<std::path::Path> + Send>(store_path: P) -> tnlog::SplitDatabase {
+    use tn_types::Database as _;
+
+    let options = tnlog::TnLogOptions { commit: tndb::CommitMode::Group, ..Default::default() };
+    let db = tnlog::SplitDatabase::open_with(store_path.as_ref().join("tnlog"), options)
+        .expect("Cannot open database (tnlog)");
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");

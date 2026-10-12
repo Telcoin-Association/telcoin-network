@@ -167,6 +167,30 @@ pub(crate) fn available_bytes(dir: &Path) -> io::Result<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+/// Delete a retired generation's directory on a short-lived thread named `thread` (its files are
+/// unlinked now; their space returns once no mapping of them is left), or here if no thread can be
+/// started. A failure leaves it for the next open to remove.
+pub(crate) fn remove_in_background(dir: PathBuf, thread: &str) {
+    let remove = |dir: &Path| {
+        if let Err(e) = fs::remove_dir_all(dir) {
+            tracing::warn!(target: "tndb", "remove retired generation {}: {e}", dir.display());
+        }
+    };
+    let thread_dir = dir.clone();
+    let spawned =
+        std::thread::Builder::new().name(thread.to_string()).spawn(move || remove(&thread_dir));
+    if spawned.is_err() {
+        remove(&dir);
+    }
+}
+
+/// Drop `value` (a retired generation's files: closing them unmaps them, and may delete them) on
+/// a short-lived thread named `thread`, off the path of whoever let go of it last; if no thread
+/// can be started, here.
+pub(crate) fn drop_in_background<T: Send + 'static>(value: T, thread: &str) {
+    let _ = std::thread::Builder::new().name(thread.to_string()).spawn(move || drop(value));
+}
+
 /// The directory of generation `n`.
 pub(crate) fn gen_dir(table: &Path, n: u64) -> PathBuf {
     table.join(format!("gen-{n}"))

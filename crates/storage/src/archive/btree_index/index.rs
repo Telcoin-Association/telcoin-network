@@ -119,6 +119,10 @@ pub struct BtreeIndex {
     superseded: Vec<u32>,
     /// The pin shared by snapshots of the latest published state (`None` if none was taken).
     latest_pin: Option<Weak<SnapshotPin>>,
+    /// The root, height and value count at the last publish (or sync, or clean open): what
+    /// [`Self::revert_to_published`] restores. `None` until a new or reset tree is first
+    /// published.
+    published_state: Option<(u32, u32, u64)>,
     /// Replaced pages per published state, oldest first, waiting until no snapshot can reach them.
     retiring: VecDeque<Retiring>,
     /// Pages no snapshot and not the working tree can reach: reused before the file grows.
@@ -375,6 +379,7 @@ impl BtreeIndex {
         if fresh {
             private.insert(header.root_page);
         }
+        let (root, height, values) = (header.root_page, header.height, header.values);
         let mut index = Self {
             header,
             file,
@@ -385,6 +390,7 @@ impl BtreeIndex {
             private,
             superseded: Vec::new(),
             latest_pin: None,
+            published_state: (!fresh).then_some((root, height, values)),
             retiring: VecDeque::new(),
             free: Vec::new(),
             view,
@@ -557,6 +563,7 @@ impl BtreeIndex {
         self.private.clear();
         self.private.insert(self.header.root_page);
         self.superseded.clear();
+        self.published_state = None;
         self.latest_pin = None;
         self.retiring.clear();
         self.free.clear();
@@ -1055,6 +1062,8 @@ impl BtreeIndex {
     /// view over them.
     fn publish_pages(&mut self) {
         self.crc_dirty_pages();
+        self.published_state =
+            Some((self.header.root_page, self.header.height, self.header.values));
         self.view.publish_len(self.header.page_count as u64 * PAGE_SIZE as u64);
         // The pages replaced since the previous publish were last visible in the previous state.
         let pin = self.latest_pin.take().filter(|pin| pin.strong_count() > 0);
@@ -1082,6 +1091,36 @@ impl BtreeIndex {
             values: self.header.values,
             _pin: pin,
         }
+    }
+
+    /// Undo every change since the last publish (or sync): the working tree is the published one
+    /// again. Exact and cheap: copy-on-write never modified a published page, so the published
+    /// root still names the published tree; the pages created since are freed, and the published
+    /// pages they replaced are live again. An error if nothing was published yet (a new or reset
+    /// tree), as its only tree is the working one.
+    pub(crate) fn revert_to_published(&mut self) -> Result<(), AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        let Some((root, height, values)) = self.published_state else {
+            return Err(AppendError::WriteDataError(io::Error::other(
+                "btree index: nothing published to revert to",
+            )));
+        };
+        // A private page retired since (e.g. by a clear) is already free: never list it twice.
+        let mut already_free = PageSet::default();
+        for &p in &self.free {
+            already_free.insert(p);
+        }
+        let created: Vec<u64> = self.private.drain().collect();
+        self.free
+            .extend(created.into_iter().filter(|&p| !already_free.contains(p)).map(|p| p as u32));
+        self.superseded.clear();
+        self.header.root_page = root;
+        self.header.height = height;
+        self.header.values = values;
+        self.synced = false;
+        Ok(())
     }
 
     /// Free the pages no snapshot can reach any more: pop retiring states from the front while no
@@ -1276,6 +1315,71 @@ mod tests {
         let mut k = [0_u8; 32];
         k.copy_from_slice(hasher.finalize().as_bytes());
         k
+    }
+
+    /// Reverting undoes every save, remove and clear since the last publish: the working tree reads
+    /// as the published one, and the freed pages are reused safely by later writes (randomized
+    /// against a model, with publishes, reverts and a clean reopen).
+    #[test]
+    fn test_archive_btx_revert_to_published() {
+        use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+        use std::collections::BTreeMap;
+
+        let tmp = TempDir::with_prefix("test_archive_btx_revert").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::None, 0);
+        let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+        assert!(idx.revert_to_published().is_err(), "a new tree has nothing published");
+        let mut rng = StdRng::seed_from_u64(0x5E7E_0001);
+        let mut published: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut working = published.clone();
+        let mut snapshot = idx.publish();
+        let check = |idx: &BtreeIndex, model: &BTreeMap<u64, u64>| {
+            assert_eq!(idx.len(), model.len());
+            for k in 0..400u64 {
+                let got = idx.load(&key_of(k)).ok();
+                assert_eq!(got, model.get(&k).copied(), "key {k}");
+            }
+        };
+        for step in 0..3_000u64 {
+            match rng.random_range(0..100) {
+                0..55 => {
+                    let k = rng.random_range(0..400);
+                    idx.save(&key_of(k), step).expect("save");
+                    working.insert(k, step);
+                }
+                55..80 => {
+                    let k = rng.random_range(0..400);
+                    assert_eq!(
+                        idx.remove(&key_of(k)).expect("remove"),
+                        working.remove(&k).is_some()
+                    );
+                }
+                80..82 => {
+                    idx.clear().expect("clear");
+                    working.clear();
+                }
+                82..91 => {
+                    snapshot = idx.publish();
+                    published = working.clone();
+                }
+                _ => {
+                    idx.revert_to_published().expect("revert");
+                    working = published.clone();
+                    check(&idx, &working);
+                }
+            }
+        }
+        // The last published snapshot still reads its state.
+        assert_eq!(snapshot.len(), published.len());
+        idx.revert_to_published().expect("revert");
+        check(&idx, &published);
+        idx.sync().expect("sync");
+        drop(snapshot);
+        drop(idx);
+        let idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen");
+        assert!(!idx.opened_unclean());
+        check(&idx, &published);
     }
 
     #[test]

@@ -71,16 +71,18 @@ use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 
 pub use compact::CompactionConfig;
-use compact::{
-    replay_delta, Committed, Compacted, Compaction, Job, AUTO_BACKOFF_MAX, AUTO_BACKOFF_MIN,
-    DISK_HEADROOM, REQUESTED_MIN_BYTES,
+pub(crate) use compact::{
+    is_corruption, AUTO_BACKOFF_MAX, AUTO_BACKOFF_MIN, BATCH_BYTES, CATCHUP_BYTES, DISK_HEADROOM,
+    MAX_CATCHUP_ROUNDS, PACE_SLICE, REQUESTED_MIN_BYTES,
 };
+use compact::{replay_delta, Committed, Compacted, Compaction, Job};
 
 use super::{
     commit::GroupCommit,
     layout::{
-        available_bytes, compact_dir, gen_dir, list_gens, lock_table, remove_meta_tmp,
-        remove_spares, spare_dir, sync_dir, KeyMode, TableMeta,
+        available_bytes, compact_dir, drop_in_background, gen_dir, list_gens, lock_table,
+        remove_in_background, remove_meta_tmp, remove_spares, spare_dir, sync_dir, KeyMode,
+        TableMeta,
     },
 };
 use crate::archive::{
@@ -174,28 +176,8 @@ impl Drop for GenAlive {
     /// of whichever writer or reader dropped the last snapshot; if no thread can be started, here.
     fn drop(&mut self) {
         if let Some(files) = self.retired.get_mut().take() {
-            let _ = std::thread::Builder::new().name("tndb-reap".to_string()).spawn(move || {
-                drop(files);
-            });
+            drop_in_background(files, "tndb-reap");
         }
-    }
-}
-
-/// Delete a retired generation's directory on a short-lived thread (its files are unlinked now;
-/// their space returns once no mapping of them is left), or here if no thread can be started. A
-/// failure leaves it for the next open to remove.
-fn remove_in_background(dir: PathBuf) {
-    let remove = |dir: &Path| {
-        if let Err(e) = fs::remove_dir_all(dir) {
-            tracing::warn!(target: "tndb", "remove retired generation {}: {e}", dir.display());
-        }
-    };
-    let thread_dir = dir.clone();
-    let spawned = std::thread::Builder::new()
-        .name("tndb-reap".to_string())
-        .spawn(move || remove(&thread_dir));
-    if spawned.is_err() {
-        remove(&dir);
     }
 }
 
@@ -838,7 +820,7 @@ impl Writer {
             Ok(builder) => builder,
             Err(e) => {
                 let table = self.table_dir.display();
-                if compact::is_corruption(&e) {
+                if is_corruption(&e) {
                     tracing::error!(target: "tndb", "table {table}: compaction abandoned: {e:#}");
                 } else {
                     tracing::warn!(target: "tndb", "table {table}: compaction abandoned: {e:#}");
@@ -860,7 +842,7 @@ impl Writer {
         let old_dir = self.install_gen(next, files);
         self.dead = dead;
         (self.auto_retry_at, self.auto_backoff) = (None, AUTO_BACKOFF_MIN);
-        remove_in_background(old_dir);
+        remove_in_background(old_dir, "tndb-reap");
         Ok(true)
     }
 
@@ -2740,8 +2722,13 @@ mod test {
         let mut rng = StdRng::seed_from_u64(0xC0_4AC7);
         let mut table = open();
         let (mut committed, mut working) = (Model::new(), Model::new());
+        // Switches to a compacted generation, wherever they happen: at a commit after the thread
+        // finished, at a close, or by `finish_compaction` (which of these depends on the thread's
+        // timing, so each is counted by its generation bump).
         let mut switches = 0;
         for step in 0..600 {
+            let gen_before = table.compaction_state().gen;
+            let mut cleared = false;
             match rng.random_range(0..100) {
                 0..45 => {
                     let i = rng.random_range(0..300);
@@ -2755,6 +2742,7 @@ mod test {
                     table.clear().expect("clear");
                     committed.clear();
                     working.clear();
+                    cleared = true;
                 }
                 67..80 => {
                     table.flush().expect("flush");
@@ -2769,7 +2757,6 @@ mod test {
                         let gen = table.compaction_state().gen;
                         table.finish_compaction().unwrap_or_else(|e| panic!("step {step}: {e}"));
                         assert_eq!(table.compaction_state().gen, gen + 1);
-                        switches += 1;
                         committed = working.clone();
                         assert_matches(&table, &committed);
                     }
@@ -2788,6 +2775,9 @@ mod test {
                     table = open();
                     assert_matches(&table, &committed);
                 }
+            }
+            if !cleared && table.compaction_state().gen > gen_before {
+                switches += 1;
             }
         }
         assert!(switches > 5, "{switches} switches");

@@ -129,6 +129,16 @@ where
         checked_payload_in(view.tail(pos))
     }
 
+    /// [`Self::record_bytes_in`] bounded by `limit` rather than the view's published length (see
+    /// [`MapView::tail_within`]).
+    pub(crate) fn record_bytes_within(
+        view: &MapView,
+        pos: u64,
+        limit: u64,
+    ) -> Result<&[u8], FetchError> {
+        checked_payload_in(view.tail_within(pos, limit))
+    }
+
     /// The on-disk size of the record at `pos` (its frame: payload plus 8 bytes), CRC-checked.
     /// Errors on IO or a failed CRC32 integrity check.
     pub fn record_size(&self, pos: u64) -> Result<u32, FetchError> {
@@ -287,6 +297,28 @@ where
     pub(crate) fn sync_ticket(&self) -> Result<SyncTicket, CommitError> {
         self.inner.failed_cause().map_err(CommitError::Failed)?;
         self.inner.data_file.sync_ticket().map_err(CommitError::DataFileSync)
+    }
+
+    /// Poison the data file: a sync of it failed elsewhere (see [`Self::note_synced`]), so its
+    /// state on disk is unknown. It refuses every later append and barrier, and is never sealed
+    /// as clean (the next open recovers it).
+    pub(crate) fn poison(&self) {
+        self.inner.data_file.poison();
+    }
+
+    /// How many times the data file has grown (see [`MmapDataFile::growths`]).
+    pub(crate) fn growths(&self) -> u64 {
+        self.inner.data_file.growths()
+    }
+
+    /// Record a sync made outside this pack (see [`MmapDataFile::note_synced`]).
+    pub(crate) fn note_synced(&self, end: u64) {
+        self.inner.data_file.note_synced(end);
+    }
+
+    /// A duplicate of the data file's descriptor (see [`MmapDataFile::dup_file`]).
+    pub(crate) fn dup_file(&self) -> std::io::Result<std::fs::File> {
+        self.inner.data_file.dup_file()
     }
 
     /// True once the pack is failed or its data file poisoned: every later append or commit
