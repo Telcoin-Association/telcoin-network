@@ -5,8 +5,10 @@
 //!
 //! - a full `http://` or `https://` URL. Without a port it keeps the scheme's default port, so an
 //!   `https` URL with no port dials 443. A path is allowed for reverse proxies. `user:password`
-//!   userinfo is sent as a basic-auth header; a username alone is refused, since the client sends
-//!   no header without a password. Query strings and fragments are refused.
+//!   userinfo is percent-decoded and sent as a basic-auth header, so `user:p%40ss` sends the
+//!   password `p@ss`; userinfo that does not decode to UTF-8 is refused. A username alone is
+//!   refused, since the client sends no header without a password. Query strings and fragments are
+//!   refused.
 //! - a bare IPv6 address, which dials port 8545. A bare IPv6 address cannot carry a port: the last
 //!   group parses as part of the address, so `2001:db8::1:8566` is that address on 8545. Bracket it
 //!   (`[2001:db8::1]:8566`) to name a port.
@@ -47,9 +49,24 @@ pub(crate) const MAX_TARGETS: usize = 8;
 pub struct ForwardTarget(Url);
 
 impl ForwardTarget {
-    /// The normalized URL the forwarding client dials.
-    pub(crate) fn as_str(&self) -> &str {
-        self.0.as_str()
+    /// The URL the forwarding client dials: the normalized URL without its userinfo, which
+    /// travels as [`Self::credentials`] instead.
+    pub(crate) fn endpoint(&self) -> Url {
+        let mut url = self.0.clone();
+        // both setters fail only on a URL that cannot carry userinfo, which leaves nothing to
+        // clear
+        let _ = url.set_password(None);
+        let _ = url.set_username("");
+        url
+    }
+
+    /// The URL's `user` and `password`, percent-decoded, or `None` when it names no password.
+    ///
+    /// The URL keeps its userinfo percent-encoded, so `user:p%40ss` yields the password `p@ss`.
+    /// [`parse_forward_targets`] refuses userinfo that does not decode to UTF-8, so every target
+    /// with a password has credentials.
+    pub(crate) fn credentials(&self) -> Option<(String, String)> {
+        decoded_credentials(&self.0)
     }
 }
 
@@ -224,6 +241,12 @@ fn parse_url_entry(position: usize, entry: &str) -> Result<Url, ForwardTargetErr
                 reason: "userinfo needs user:password; a username alone is not sent".to_string(),
             })
         }
+        () if url.password().is_some() && decoded_credentials(&url).is_none() => {
+            Err(ForwardTargetError::Invalid {
+                position,
+                reason: "userinfo does not percent-decode to UTF-8".to_string(),
+            })
+        }
         () => Ok(url),
     }
 }
@@ -263,6 +286,45 @@ fn parse_host_entry(position: usize, entry: &str) -> Result<Url, ForwardTargetEr
 /// `http://{host}:8545/` for a host that names no port.
 fn with_default_port(host: &str) -> Result<Url, url::ParseError> {
     Url::parse(&format!("http://{host}:{DEFAULT_HTTP_RPC_PORT}/"))
+}
+
+/// `url`'s `user` and `password`, percent-decoded. `None` when it names no password or either
+/// part does not decode to UTF-8.
+fn decoded_credentials(url: &Url) -> Option<(String, String)> {
+    let password = percent_decode(url.password()?)?;
+    Some((percent_decode(url.username())?, password))
+}
+
+/// Decode the `%XX` escapes in one userinfo component (RFC 3986 section 2.1). A `%` that does
+/// not start two hex digits is kept as written, as the URL parser keeps it. `None` when the
+/// decoded bytes are not UTF-8.
+fn percent_decode(component: &str) -> Option<String> {
+    let mut bytes = component.bytes();
+    let mut decoded = Vec::with_capacity(component.len());
+    while let Some(byte) = bytes.next() {
+        if byte == b'%' {
+            let mut escape = bytes.clone();
+            if let (Some(high), Some(low)) =
+                (escape.next().and_then(hex_digit), escape.next().and_then(hex_digit))
+            {
+                decoded.push(high << 4 | low);
+                bytes = escape;
+                continue;
+            }
+        }
+        decoded.push(byte);
+    }
+    String::from_utf8(decoded).ok()
+}
+
+/// The value of one ASCII hex digit.
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +497,40 @@ mod tests {
             parse_forward_targets(&over.join(",")),
             Err(ForwardTargetError::TooMany { count: MAX_TARGETS + 1, max: MAX_TARGETS })
         );
+    }
+
+    /// The userinfo is percent-decoded into the credentials and kept out of the dialed URL.
+    #[test]
+    fn test_target_credentials_are_percent_decoded() {
+        let targets = parse_forward_targets(
+            "http://us%20er:p%40ss%2Bw+rd%3A%C3%A9@10.0.0.1:8545,http://user:p%zz%@10.0.0.2",
+        )
+        .expect("valid list");
+        let [escaped, stray] = targets.as_slice() else { panic!("two targets") };
+        assert_eq!(escaped.credentials(), Some(("us er".to_string(), "p@ss+w+rd:é".to_string())));
+        assert_eq!(escaped.endpoint().as_str(), "http://10.0.0.1:8545/");
+        // a `%` that starts no escape is part of the password
+        assert_eq!(stray.credentials(), Some(("user".to_string(), "p%zz%".to_string())));
+        assert_eq!(stray.endpoint().as_str(), "http://10.0.0.2/");
+
+        let plain = parse_forward_targets("https://node1.telcoin.network").expect("valid");
+        assert_eq!(plain.as_slice()[0].credentials(), None);
+        assert_eq!(plain.as_slice()[0].endpoint().as_str(), "https://node1.telcoin.network/");
+    }
+
+    /// Userinfo whose escapes do not decode to UTF-8 cannot be sent as a basic-auth string, so
+    /// it is refused at startup.
+    #[test]
+    fn test_parse_target_refuses_userinfo_that_is_not_utf8() {
+        for value in ["http://user:%FF@10.0.0.1", "http://%C3:pass@10.0.0.1"] {
+            assert!(
+                matches!(
+                    parse_forward_targets(value),
+                    Err(ForwardTargetError::Invalid { position: 1, .. })
+                ),
+                "value {value:?} must be refused"
+            );
+        }
     }
 
     /// No `Debug` path prints a host, port, or credential.

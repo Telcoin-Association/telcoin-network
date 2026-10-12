@@ -131,6 +131,105 @@ pub(crate) async fn canned_endpoint(response: String) -> eyre::Result<String> {
     Ok(format!("http://{addr}"))
 }
 
+/// A validator behind an authenticating reverse proxy: a loopback HTTP endpoint that answers
+/// `eth_sendRawTransaction` with one hash when the request's only `Authorization` header is the
+/// expected value, and HTTP 401 otherwise.
+///
+/// Each connection serves one request and is closed. The `Authorization` values of every request
+/// are recorded, so a test can tell the decoded header from the verbatim one and see that only one
+/// was sent.
+#[derive(Debug)]
+pub(crate) struct BasicAuthUpstream {
+    /// The listening address; a test puts the userinfo in front of it.
+    addr: std::net::SocketAddr,
+    /// The `Authorization` values of each request served, in arrival order.
+    authorizations: Arc<Mutex<Vec<Vec<String>>>>,
+}
+
+impl BasicAuthUpstream {
+    /// Accept only `expected` as the `Authorization` value and answer with `hash`.
+    pub(crate) async fn start(expected: &'static str, hash: B256) -> eyre::Result<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let authorizations = Arc::new(Mutex::new(Vec::new()));
+        let seen = authorizations.clone();
+        tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    // a client that hangs up mid-request leaves nothing to answer
+                    let _ = serve_basic_auth(socket, expected, hash, &seen).await;
+                });
+            }
+        });
+        Ok(Self { addr, authorizations })
+    }
+
+    /// The target URL with `userinfo` in front of the listening address.
+    pub(crate) fn url(&self, userinfo: &str) -> String {
+        format!("http://{userinfo}@{}", self.addr)
+    }
+
+    /// The `Authorization` values of each request served so far.
+    pub(crate) fn authorizations(&self) -> Vec<Vec<String>> {
+        self.authorizations.lock().clone()
+    }
+}
+
+/// Serve one request for [`BasicAuthUpstream`]: read the head and the body, record the
+/// `Authorization` values, then answer with the hash under the request's id or with 401.
+async fn serve_basic_auth(
+    socket: tokio::net::TcpStream,
+    expected: &str,
+    hash: B256,
+    seen: &Mutex<Vec<Vec<String>>>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _};
+    let mut socket = tokio::io::BufReader::new(socket);
+    let mut content_length = 0;
+    let mut authorizations = Vec::new();
+    loop {
+        let mut line = String::new();
+        if socket.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        let line = line.trim_end();
+        if line.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse().unwrap_or(0);
+            } else if name.eq_ignore_ascii_case("authorization") {
+                authorizations.push(value.trim().to_string());
+            }
+        }
+    }
+    let mut body = vec![0; content_length];
+    socket.read_exact(&mut body).await?;
+    let authorized = authorizations == [expected];
+    seen.lock().push(authorizations);
+    let response = if authorized {
+        let request: serde_json::Value = serde_json::from_slice(&body)?;
+        let reply = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request.get("id").cloned().unwrap_or_default(),
+            "result": hash,
+        })
+        .to_string();
+        format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nconnection: close\r\n\
+             content-length: {}\r\n\r\n{reply}",
+            reply.len()
+        )
+    } else {
+        "HTTP/1.1 401 Unauthorized\r\nwww-authenticate: Basic realm=\"rpc\"\r\n\
+         connection: close\r\ncontent-length: 0\r\n\r\n"
+            .to_string()
+    };
+    socket.write_all(response.as_bytes()).await
+}
+
 /// A minimal HTTP/1.1 response.
 fn http_response(status: &str, body: &str) -> String {
     format!(
@@ -519,6 +618,36 @@ async fn test_forward_single_probe_after_cooldown() -> eyre::Result<()> {
         "exactly one of the eight submissions probed the hung target"
     );
     assert_eq!(healthy.calls().len(), 9);
+    Ok(())
+}
+
+/// The URL keeps its userinfo percent-encoded. The basic-auth header carries the decoded
+/// password, so a proxy that expects `user:p@ss` accepts `http://user:p%40ss@host`.
+#[tokio::test]
+async fn test_forward_basic_auth_decodes_percent_encoded_password() -> eyre::Result<()> {
+    let hash = B256::repeat_byte(11);
+    // base64("user:p@ss")
+    let upstream = BasicAuthUpstream::start("Basic dXNlcjpwQHNz", hash).await?;
+
+    let result = forwarder(&[upstream.url("user:p%40ss")])?.submit(&raw_tx()).await;
+
+    assert_eq!(result, Ok(hash));
+    // one header, decoded, and not the verbatim `user:p%40ss` next to it
+    assert_eq!(upstream.authorizations(), vec![vec!["Basic dXNlcjpwQHNz".to_string()]]);
+    Ok(())
+}
+
+/// Credentials without escapes go out as written.
+#[tokio::test]
+async fn test_forward_basic_auth_plain_credentials() -> eyre::Result<()> {
+    let hash = B256::repeat_byte(12);
+    // base64("user:pass")
+    let upstream = BasicAuthUpstream::start("Basic dXNlcjpwYXNz", hash).await?;
+
+    let result = forwarder(&[upstream.url("user:pass")])?.submit(&raw_tx()).await;
+
+    assert_eq!(result, Ok(hash));
+    assert_eq!(upstream.authorizations(), vec![vec!["Basic dXNlcjpwYXNz".to_string()]]);
     Ok(())
 }
 

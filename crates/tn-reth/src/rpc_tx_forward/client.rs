@@ -34,9 +34,12 @@ use std::{
     time::Duration,
 };
 
+use alloy::transports::Authorization;
 use jsonrpsee::{
     core::client::{ClientT as _, Error as ClientError},
-    http_client::{transport::Error as TransportError, HttpClient, HttpClientBuilder},
+    http_client::{
+        transport::Error as TransportError, HeaderMap, HeaderValue, HttpClient, HttpClientBuilder,
+    },
     rpc_params,
     types::{
         error::{INTERNAL_ERROR_CODE, OVERSIZED_REQUEST_CODE, OVERSIZED_REQUEST_MSG},
@@ -47,7 +50,10 @@ use tn_types::{Bytes, B256};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 
-use super::{target::ForwardTargets, SanitizeRules};
+use super::{
+    target::{ForwardTarget, ForwardTargets},
+    SanitizeRules,
+};
 use crate::metrics::{RpcTxForwardFailure, RpcTxForwardMetrics, RpcTxForwardOutcome};
 
 /// The longest one target gets to answer one submission, including the wait for a connection
@@ -111,6 +117,11 @@ impl TxForwarder {
     /// larger than the request this node accepted. Building an `https://` client installs rustls's
     /// `ring` crypto provider as the process default when none is installed yet (jsonrpsee does
     /// this to pick one of the two providers the build enables).
+    ///
+    /// A target's `user:password` goes out as a basic-auth header built from the percent-decoded
+    /// credentials, and the client dials the URL without its userinfo. jsonrpsee would otherwise
+    /// encode the userinfo exactly as the URL spells it, so `p%40ss` would reach the target
+    /// instead of `p@ss`.
     pub(crate) fn new(
         targets: &ForwardTargets,
         sanitize: Option<SanitizeRules>,
@@ -121,12 +132,7 @@ impl TxForwarder {
             .iter()
             .enumerate()
             .map(|(index, target)| {
-                HttpClientBuilder::default()
-                    .request_timeout(ATTEMPT_TIMEOUT)
-                    .max_response_size(MAX_RESPONSE_BYTES)
-                    .max_request_size(max_request_bytes.saturating_add(REQUEST_SIZE_HEADROOM))
-                    .max_concurrent_requests(MAX_INFLIGHT_PER_TARGET)
-                    .build(target.as_str())
+                target_client(target, max_request_bytes)
                     .map(|client| Target { client, demoted_until_ms: AtomicU64::new(0) })
                     .map_err(|e| {
                         eyre::eyre!("failed to build the client for forward target {index}: {e}")
@@ -362,6 +368,26 @@ impl Default for Timeouts {
     fn default() -> Self {
         Self { attempt: ATTEMPT_TIMEOUT, budget: SUBMIT_BUDGET, cooldown: DEMOTION_COOLDOWN }
     }
+}
+
+/// Build the lazily connecting client for one target. See [`TxForwarder::new`] for the limits
+/// and the credentials.
+fn target_client(target: &ForwardTarget, max_request_bytes: u32) -> eyre::Result<HttpClient> {
+    let mut headers = HeaderMap::new();
+    if let Some((user, password)) = target.credentials() {
+        let mut value = HeaderValue::from_str(&Authorization::basic(user, password).to_string())?;
+        // keeps the credentials out of the header's Debug output
+        value.set_sensitive(true);
+        headers.insert("authorization", value);
+    }
+    let client = HttpClientBuilder::default()
+        .set_headers(headers)
+        .request_timeout(ATTEMPT_TIMEOUT)
+        .max_response_size(MAX_RESPONSE_BYTES)
+        .max_request_size(max_request_bytes.saturating_add(REQUEST_SIZE_HEADROOM))
+        .max_concurrent_requests(MAX_INFLIGHT_PER_TARGET)
+        .build(target.endpoint())?;
+    Ok(client)
 }
 
 /// Classify an attempt that ended without a JSON-RPC reply.
