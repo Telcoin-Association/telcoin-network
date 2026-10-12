@@ -20,6 +20,14 @@
 //! worker; every other call goes to the query upstream (see [`scan`]),
 //! which is not readiness-gated, never falls back to the worker, and gets the
 //! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//!
+//! Every request is classified, redirect or not: a submission counts against
+//! `--max-inflight-submissions` and everything else against
+//! `--max-inflight-queries`. A request whose class has no free slot is answered
+//! at once with a `503` overload error instead of waiting, so a stalled route
+//! cannot pile up connections that the other route needs. A forward to a
+//! worker also takes a slot on `--max-upstream-inflight`, the same way, which
+//! bounds this gateway's share of the worker's RPC connection limit.
 
 use std::{borrow::Cow, fmt, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
 
@@ -46,7 +54,7 @@ use url::Url;
 use crate::{
     error::{error_response, error_response_with_id, GatewayError, RequestId},
     identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
-    ratelimit::RateLimiters,
+    ratelimit::{RateLimiters, SubmissionBudget},
     server::AppState,
     telemetry,
 };
@@ -115,6 +123,9 @@ const REDIRECT_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway-redire
 ///
 /// `limiters` is present when the rate-limit layer is installed and admitted
 /// the request on its first token (see [`crate::ratelimit::rate_limit`]).
+/// `submission_budget` is present when `--rate-limit-submissions` is set and
+/// carries the global bucket's edge verdict, settled here once the request is
+/// classified (see [`SubmissionBudget`]).
 /// `body` is the final extractor (it consumes the request body), so it must
 /// stay last in the parameter list.
 pub(crate) async fn proxy(
@@ -123,6 +134,7 @@ pub(crate) async fn proxy(
     method: Method,
     headers: HeaderMap,
     limiters: Option<Extension<Arc<RateLimiters>>>,
+    submission_budget: Option<Extension<SubmissionBudget>>,
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
@@ -188,7 +200,7 @@ pub(crate) async fn proxy(
     // resolved `ClientAddr`, not the TCP peer). Like the layer's own refusal,
     // this one cannot name an id.
     let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
-        limiters.charge(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
+        limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
     if let Err(err) = charged {
         return error_response(&err, b"");
@@ -203,6 +215,36 @@ pub(crate) async fn proxy(
         warn!(target: "gateway::proxy", ?err, "rejecting a raw-transaction submission before forwarding");
         return error_response_with_id(&err, id);
     }
+
+    // the class picks the rate budget, the in-flight cap and, with a
+    // redirect, the upstream
+    let class = scan.calls.class();
+
+    // with `--rate-limit-submissions` the edge left the global bucket's verdict
+    // for here: a submission is charged to its own budget whatever that
+    // verdict, and any other request is refused if the global bucket was empty
+    if let Some(Extension(budget)) = &submission_budget {
+        if let Err(err) = budget.charge(class == Class::Submission) {
+            return error_response(&err, body.as_ref());
+        }
+    }
+
+    // fail fast rather than queue: a route that has used up its slots (a
+    // stalled query upstream, say) must not hold connections the other route
+    // needs. the slot is held until the response body has been sent or
+    // dropped (see `hold_until_body_ends`); every early return frees it at once.
+    let class_slots = match class {
+        Class::Submission => &state.submission_slots,
+        Class::Query => &state.query_slots,
+    };
+    let Some(class_slot) = telemetry::InFlightSlot::route(class_slots, class.label()) else {
+        debug!(
+            target: "gateway::proxy",
+            route = class.label(),
+            "in-flight cap reached; rejecting request"
+        );
+        return error_response(&GatewayError::Overloaded, body.as_ref());
+    };
 
     // with a redirect configured, every call but a submission goes to the
     // query upstream, with no readiness gate and no fallback to the worker: a
@@ -220,16 +262,24 @@ pub(crate) async fn proxy(
         },
     };
 
-    match forward(
-        &state.http,
-        route,
-        method,
-        &headers,
-        body.clone(),
-        upstream_url.clone(),
-        forwarding,
-    )
-    .await
+    // every gateway in front of a worker draws on its one rpc connection
+    // limit, so this gateway holds at most `--max-upstream-inflight` of it,
+    // failing fast like the class caps above. unlike the class slot, this one
+    // is released at the response head: the worker frees its own permit once
+    // it has built the response, before the body is written.
+    let _upstream_slot = match route {
+        Route::Worker => match telemetry::InFlightSlot::upstream(&state.upstream_slots) {
+            Some(slot) => Some(slot),
+            None => {
+                debug!(target: "gateway::proxy", "worker in-flight cap reached; rejecting request");
+                return error_response(&GatewayError::Overloaded, body.as_ref());
+            }
+        },
+        Route::Query => None,
+    };
+
+    match forward(&state, route, method, &headers, body.clone(), upstream_url.clone(), forwarding)
+        .await
     {
         Ok(response) => {
             if route == Route::Worker {
@@ -237,7 +287,7 @@ pub(crate) async fn proxy(
             }
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
-            response
+            hold_until_body_ends(response, class_slot)
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -303,6 +353,26 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
+/// Keep `slot` held until `response`'s body has been sent in full or dropped.
+///
+/// [`proxy`] returns as soon as the upstream's response head arrives, but the
+/// body streams to the client after that, holding an inbound connection. Tying
+/// the class slot to the body keeps a query upstream that sends its head and
+/// then stalls inside `--max-inflight-queries`, so it cannot take the
+/// connections submissions need. hyper drops the body once it has written the
+/// last chunk, or when the stream fails or the connection closes, and that
+/// frees the slot.
+fn hold_until_body_ends(response: Response, slot: telemetry::InFlightSlot) -> Response {
+    use futures::StreamExt as _;
+    response.map(|body| {
+        Body::from_stream(body.into_data_stream().map(move |chunk| {
+            // moved into the closure, the slot lives exactly as long as the stream
+            let _held = &slot;
+            chunk
+        }))
+    })
+}
+
 /// Forward one request to `upstream_url` and adapt the upstream response back
 /// into an axum response, preserving the status, body, and content type.
 ///
@@ -310,11 +380,14 @@ fn reject_body(rejection: &BytesRejection) -> Response {
 /// [`REDIRECT_HEADER`] toward the query upstream, never both. `forwarding`
 /// supplies `X-Forwarded-For` and `X-Forwarded-Proto`; the client's own values
 /// of those headers are not copied.
+/// The query route also gets its own deadline (`--query-request-timeout`) in
+/// place of the client's, so a stalled query upstream frees its slots sooner;
+/// the worker route keeps the client's `--upstream-request-timeout`.
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
 async fn forward(
-    client: &Client,
+    state: &AppState,
     route: Route,
     method: Method,
     headers: &HeaderMap,
@@ -333,15 +406,21 @@ async fn forward(
         Route::Query => REDIRECT_HEADER,
     };
 
-    let upstream = client
+    let request = state
+        .http
         .request(method, upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
         .header(X_FORWARDED_FOR, forwarding.x_forwarded_for())
         .header(X_FORWARDED_PROTO, forwarding.x_forwarded_proto())
-        .body(body)
-        .send()
-        .await?;
+        .body(body);
+    // a per-request timeout replaces the client's total timeout for this
+    // request only
+    let request = match (route, state.query_request_timeout) {
+        (Route::Query, Some(timeout)) => request.timeout(timeout),
+        _ => request,
+    };
+    let upstream = request.send().await?;
 
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
@@ -478,6 +557,35 @@ impl Calls {
             Self::Queries | Self::MixedBatch => Route::Query,
         }
     }
+
+    /// Only an all-submission body is in the submission class; a mixed batch
+    /// counts as a query, as it is routed.
+    fn class(self) -> Class {
+        match self {
+            Self::Submissions => Class::Submission,
+            Self::Queries | Self::MixedBatch => Class::Query,
+        }
+    }
+}
+
+/// The capacity class a request counts against, whether or not
+/// `--redirect-queries` is set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Class {
+    /// A request made only of submissions.
+    Submission,
+    /// Everything else.
+    Query,
+}
+
+impl Class {
+    /// The `route` label on `tn_worker_gateway_route_inflight`.
+    fn label(self) -> &'static str {
+        match self {
+            Self::Submission => "submission",
+            Self::Query => "query",
+        }
+    }
 }
 
 /// What one pass over a request body found: where the body routes and whether
@@ -486,7 +594,8 @@ struct Scan {
     /// How many calls the body carries: 1 for anything but a batch, and for a
     /// batch its element count, which stops one past the length cap.
     len: usize,
-    /// How the body routes under `--redirect-queries`.
+    /// How the body routes under `--redirect-queries`, and so its in-flight
+    /// class.
     calls: Calls,
     /// The screen's verdict: the error and the request id to answer it with,
     /// or `None` to forward the body.
@@ -496,9 +605,9 @@ struct Scan {
     unreadable_batch: bool,
 }
 
-/// Read a request body once, counting its calls, classifying it for
-/// `--redirect-queries` and screening its raw-transaction submission in the
-/// same pass.
+/// Read a request body once, counting its calls, classifying it for its
+/// in-flight cap and for `--redirect-queries`, and screening its
+/// raw-transaction submission in the same pass.
 ///
 /// Length: a batch's elements are counted, every element whatever its shape,
 /// and the count stops one past `max_batch_len` (`None` counts them all), so

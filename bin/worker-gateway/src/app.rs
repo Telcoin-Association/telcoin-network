@@ -12,7 +12,7 @@ use crate::{
     proxy::{proxy_client, UpstreamOrigin},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, ReadinessThresholds},
-    server::{serve, AppState, ServerLimits},
+    server::{inflight_slots, serve, AppState, ServerLimits},
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
@@ -32,8 +32,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_failure_threshold,
         upstream_connect_timeout,
         upstream_request_timeout,
+        query_request_timeout,
         header_read_timeout,
         max_connections,
+        max_inflight_submissions,
+        max_inflight_queries,
+        max_upstream_inflight,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
@@ -43,6 +47,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_global,
         trusted_proxies,
         proxy_protocol,
+        rate_limit_submissions,
         graceful_shutdown_timeout,
         metrics_addr,
     } = settings;
@@ -64,11 +69,14 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     };
     let readiness = Arc::new(GatewayReadiness::new(&upstreams, thresholds));
 
-    // Edge rate limiters (per-IP and/or global), or `None` when both are
-    // disabled; in that case no rate-limit layer or sweep task is installed.
+    // Edge rate limiters (per-IP, global and the submission budget), or `None`
+    // when all are disabled; in that case no rate-limit layer or sweep task is
+    // installed.
+    let submission_budget = rate_limit_submissions.is_some();
     let rate_limiters = RateLimiters::new(
         rate_limit_per_ip,
         rate_limit_global,
+        rate_limit_submissions,
         DEFAULT_MAX_PER_IP_ENTRIES,
         rate_limit_prefix,
     );
@@ -86,8 +94,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limiting = rate_limiters.is_some(),
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol,
+        submission_budget,
         max_request_bytes,
         ?max_batch_len,
+        max_inflight_submissions,
+        max_inflight_queries,
+        max_upstream_inflight,
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
@@ -147,6 +159,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         http: proxy_client,
         query_upstream,
         max_batch_len,
+        query_request_timeout,
+        submission_slots: inflight_slots(max_inflight_submissions),
+        query_slots: inflight_slots(max_inflight_queries),
+        upstream_slots: inflight_slots(max_upstream_inflight),
     };
 
     spawner.spawn_critical_task(

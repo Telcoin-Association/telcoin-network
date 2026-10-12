@@ -9,7 +9,7 @@
 //!
 //! A JSON-RPC batch costs one token per call. The edge layer charges the first
 //! before the body is read; the proxy handler charges the rest once it has
-//! read the body and counted the calls (see [`RateLimiters::charge`]).
+//! read the body and counted the calls (see [`RateLimiters::charge_batch`]).
 //!
 //! The per-client key is the client address masked to a configurable prefix
 //! ([`PrefixPolicy`]), not the bare address. Keyed on the bare address, a client
@@ -28,6 +28,16 @@
 //! request for (see [`crate::identity`]). Behind a proxy that is not listed the
 //! peer is that proxy, so the per-IP bucket meters the proxy rather than the
 //! real client.
+//!
+//! A third bucket, the submission budget (`--rate-limit-submissions`), keeps
+//! reads from spending the rate that submissions need. With it set, the edge
+//! runs the per-IP check first and still refuses an over-limit client there,
+//! but no longer refuses a request the global bucket turns down: it hands the
+//! verdict to the proxy as a [`SubmissionBudget`] extension, and the proxy
+//! settles it once the request is classified. A submission is charged to the
+//! submission bucket whatever the global bucket said, and any other request is
+//! refused when the global bucket refused it. Without the flag the edge check
+//! is exactly what it was.
 
 use std::{
     collections::HashMap,
@@ -158,11 +168,18 @@ impl Bucket {
     }
 }
 
-/// The single gateway-wide bucket.
+/// A single gateway-wide bucket: the global limit, or the submission budget.
 #[derive(Debug)]
 struct GlobalLimiter {
     limit: RateLimit,
     bucket: Mutex<Bucket>,
+}
+
+impl GlobalLimiter {
+    /// Refill to `now`, then spend one token if one is available.
+    fn admit(&self, now: Instant) -> bool {
+        lock(&self.bucket).try_admit(now, self.limit.tokens_per_sec(), self.limit.capacity(), 1.0)
+    }
 }
 
 /// Width of an IPv4 address, in bits.
@@ -390,23 +407,28 @@ fn admit_new_ip(
     }
 }
 
-/// The gateway's rate limiters. Either limiter may be disabled (`None`).
+/// The gateway's rate limiters. Any limiter may be disabled (`None`).
 pub(crate) struct RateLimiters<C: Clock = SystemClock> {
     clock: C,
     global: Option<GlobalLimiter>,
     per_ip: Option<PerIpLimiter>,
+    /// The submission budget (`--rate-limit-submissions`), charged by the
+    /// proxy once a request is classified; see [`SubmissionBudget`].
+    submissions: Option<GlobalLimiter>,
 }
 
 impl RateLimiters<SystemClock> {
     /// Build the limiters from resolved settings using the system clock, or
-    /// `None` when both limiters are disabled (so no layer need be installed).
+    /// `None` when every limiter is disabled (so no layer need be installed).
     pub(crate) fn new(
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
+        submissions: Option<RateLimit>,
         max_per_ip_entries: usize,
         prefix: PrefixPolicy,
     ) -> Option<Arc<Self>> {
-        Self::with_clock(SystemClock, per_ip, global, max_per_ip_entries, prefix).map(Arc::new)
+        Self::with_clock(SystemClock, per_ip, global, submissions, max_per_ip_entries, prefix)
+            .map(Arc::new)
     }
 }
 
@@ -418,24 +440,27 @@ impl<C: Clock> RateLimiters<C> {
         clock: C,
         per_ip: Option<RateLimit>,
         global: Option<RateLimit>,
+        submissions: Option<RateLimit>,
         max_per_ip_entries: usize,
         prefix: PrefixPolicy,
     ) -> Option<Self> {
-        if per_ip.is_none() && global.is_none() {
+        if per_ip.is_none() && global.is_none() && submissions.is_none() {
             return None;
         }
         let now = clock.now();
-        let global = global.map(|limit| GlobalLimiter {
+        let bucket = |limit: RateLimit| GlobalLimiter {
             limit,
             bucket: Mutex::new(Bucket::full(now, limit.capacity())),
-        });
+        };
+        let global = global.map(bucket);
+        let submissions = submissions.map(bucket);
         let per_ip = per_ip.map(|limit| PerIpLimiter {
             limit,
             max_entries: max_per_ip_entries.max(1),
             buckets: Mutex::new(HashMap::new()),
             prefix,
         });
-        Some(Self { clock, global, per_ip })
+        Some(Self { clock, global, per_ip, submissions })
     }
 
     /// Admit or reject a request from `client` (its [`ClientAddr`]). A `None`
@@ -465,7 +490,7 @@ impl<C: Clock> RateLimiters<C> {
     }
 
     /// Charge `tokens` more to a request from `client` (its [`ClientAddr`])
-    /// that [`Self::check`] already admitted: the calls its batch carries
+    /// that the edge layer already admitted: the calls its batch carries
     /// beyond the first.
     ///
     /// The per-IP bucket is charged first and the global bucket only when the
@@ -475,7 +500,11 @@ impl<C: Clock> RateLimiters<C> {
     /// without `tokens` left keeps what it has. A `None` client skips the
     /// per-IP bucket. Charging nothing touches no bucket, so a single call
     /// costs only its edge token.
-    pub(crate) fn charge(&self, client: Option<IpAddr>, tokens: usize) -> Result<(), GatewayError> {
+    pub(crate) fn charge_batch(
+        &self,
+        client: Option<IpAddr>,
+        tokens: usize,
+    ) -> Result<(), GatewayError> {
         if tokens == 0 {
             return Ok(());
         }
@@ -502,6 +531,42 @@ impl<C: Clock> RateLimiters<C> {
         Ok(())
     }
 
+    /// Charge one submission-class request to the submission budget; always
+    /// admitted when there is none.
+    fn charge_submission(&self) -> Result<(), GatewayError> {
+        let now = self.clock.now();
+        self.submissions
+            .as_ref()
+            .is_none_or(|submissions| submissions.admit(now))
+            .then_some(())
+            .ok_or(GatewayError::RateLimited)
+    }
+
+    /// The edge verdict for a request from `client` (its [`ClientAddr`]),
+    /// before its body is read.
+    ///
+    /// Without a submission budget this is [`Self::check`] and nothing reaches
+    /// the proxy. With one, the per-IP bucket runs first and an over-limit
+    /// client is refused here, without spending a global token; a request the
+    /// global bucket refuses is let through, and the returned
+    /// [`SubmissionBudget`] tells the proxy so.
+    fn check_edge(
+        self: &Arc<Self>,
+        client: Option<IpAddr>,
+    ) -> Result<Option<SubmissionBudget<C>>, GatewayError> {
+        if self.submissions.is_none() {
+            return self.check(client).map(|()| None);
+        }
+        let now = self.clock.now();
+        let per_ip_ok =
+            self.per_ip.as_ref().zip(client).is_none_or(|(per_ip, ip)| per_ip.admit(now, ip, 1.0));
+        if !per_ip_ok {
+            return Err(GatewayError::RateLimited);
+        }
+        let global_exhausted = !self.global.as_ref().is_none_or(|global| global.admit(now));
+        Ok(Some(SubmissionBudget { limiters: Arc::clone(self), global_exhausted }))
+    }
+
     /// Drop idle (fully-refilled) per-IP buckets to bound memory. Called
     /// periodically from a background task.
     pub(crate) fn gc(&self) {
@@ -511,6 +576,36 @@ impl<C: Clock> RateLimiters<C> {
             let capacity = per_ip.limit.capacity();
             let mut buckets = lock(&per_ip.buckets);
             buckets.retain(|_, bucket| !bucket.is_idle(now, rate, capacity));
+        }
+    }
+}
+
+/// The global bucket's verdict on one request, handed by the edge layer to the
+/// proxy when a submission budget is configured.
+///
+/// The edge cannot tell a submission from a read (the body is not read yet), so
+/// it does not refuse a request the global bucket turns down; the proxy settles
+/// the verdict with [`Self::charge`] once it has classified the request. This
+/// keeps a read flood that drains the global bucket from refusing submissions.
+#[derive(Clone)]
+pub(crate) struct SubmissionBudget<C: Clock = SystemClock> {
+    /// The limiters holding the submission bucket.
+    limiters: Arc<RateLimiters<C>>,
+    /// Whether the global bucket refused this request at the edge.
+    global_exhausted: bool,
+}
+
+impl<C: Clock> SubmissionBudget<C> {
+    /// Settle the request's rate budget by class: a submission is charged to
+    /// the submission bucket whatever the global bucket said, and any other
+    /// request is refused when the global bucket refused it.
+    pub(crate) fn charge(&self, submission: bool) -> Result<(), GatewayError> {
+        if submission {
+            self.limiters.charge_submission()
+        } else if self.global_exhausted {
+            Err(GatewayError::RateLimited)
+        } else {
+            Ok(())
         }
     }
 }
@@ -544,11 +639,13 @@ pub(crate) async fn run_gc(
 
 /// Axum middleware: rate-limit by client IP ([`ClientAddr`]) and globally,
 /// rejecting an over-limit request with the gateway's JSON-RPC `429` envelope
-/// before its body is read.
+/// before its body is read. With a submission budget configured, the global
+/// verdict travels to the proxy as a [`SubmissionBudget`] extension instead
+/// (see [`RateLimiters::check_edge`]).
 ///
 /// An admitted request carries the limiters on to the proxy handler as a
 /// request extension, so the handler can charge a batch for its calls beyond
-/// the first once it has counted them (see [`RateLimiters::charge`]).
+/// the first once it has counted them (see [`RateLimiters::charge_batch`]).
 pub(crate) async fn rate_limit(
     State(limiters): State<Arc<RateLimiters>>,
     mut request: Request,
@@ -560,12 +657,15 @@ pub(crate) async fn rate_limit(
     let path = request.uri().path();
     let exempt = path == HEALTH_PATH || path == READY_PATH;
     let client = request.extensions().get::<ClientAddr>().map(|client| client.0);
-    let rejection = (!exempt).then(|| limiters.check(client).err()).flatten();
+    let verdict = if exempt { Ok(None) } else { limiters.check_edge(client) };
     // The final dispatch stays a `match`: one arm awaits `next`, which a
     // combinator closure cannot do.
-    match rejection {
-        Some(err) => error_response(&err, b""),
-        None => {
+    match verdict {
+        Err(err) => error_response(&err, b""),
+        Ok(budget) => {
+            if let Some(budget) = budget {
+                request.extensions_mut().insert(budget);
+            }
             request.extensions_mut().insert(limiters);
             next.run(request).await
         }
@@ -659,7 +759,7 @@ mod tests {
         max_entries: usize,
         prefix: PrefixPolicy,
     ) -> RateLimiters<C> {
-        RateLimiters::with_clock(clock, per_ip, global, max_entries, prefix)
+        RateLimiters::with_clock(clock, per_ip, global, None, max_entries, prefix)
             .expect("some limiter enabled")
     }
 
@@ -744,10 +844,10 @@ mod tests {
     #[test]
     fn single_request_charges_no_extra_token() {
         let limiters = limiters(ManualClock::new(), Some(limit(1, 2)), Some(limit(1, 2)), 16);
-        assert!(limiters.charge(Some(ip(1)), 0).is_ok());
+        assert!(limiters.charge_batch(Some(ip(1)), 0).is_ok());
         assert_eq!(limiters.per_ip_len(), 0, "charging nothing creates no bucket");
         assert!(limiters.check(Some(ip(1))).is_ok());
-        assert!(limiters.charge(Some(ip(1)), 0).is_ok());
+        assert!(limiters.charge_batch(Some(ip(1)), 0).is_ok());
         assert!(limiters.check(Some(ip(1))).is_ok(), "a zero charge spends no token");
         assert!(limiters.check(Some(ip(1))).is_err());
     }
@@ -757,11 +857,11 @@ mod tests {
         let limiters = limiters(ManualClock::new(), Some(limit(1, 4)), None, 16);
         assert!(limiters.check(Some(ip(1))).is_ok()); // 3 left
                                                       // a charge the bucket cannot cover in full spends nothing
-        assert!(matches!(limiters.charge(Some(ip(1)), 4), Err(GatewayError::RateLimited)));
-        assert!(limiters.charge(Some(ip(1)), 3).is_ok()); // 0 left
+        assert!(matches!(limiters.charge_batch(Some(ip(1)), 4), Err(GatewayError::RateLimited)));
+        assert!(limiters.charge_batch(Some(ip(1)), 3).is_ok()); // 0 left
         assert!(limiters.check(Some(ip(1))).is_err());
         // a charge without a peer skips the per-IP bucket
-        assert!(limiters.charge(None, 100).is_ok());
+        assert!(limiters.charge_batch(None, 100).is_ok());
     }
 
     #[test]
@@ -769,28 +869,106 @@ mod tests {
         let limiters = limiters(ManualClock::new(), Some(limit(1, 4)), Some(limit(1, 3)), 16);
         assert!(limiters.check(Some(ip(1))).is_ok()); // per-ip 3, global 2
                                                       // over its own limit: refused before the global bucket is touched
-        assert!(limiters.charge(Some(ip(1)), 4).is_err());
+        assert!(limiters.charge_batch(Some(ip(1)), 4).is_err());
         assert_eq!(
             (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
             (Some(3.0), Some(2.0))
         );
         // refused by the global bucket: the per-IP tokens come back
-        assert!(limiters.charge(Some(ip(1)), 3).is_err());
+        assert!(limiters.charge_batch(Some(ip(1)), 3).is_err());
         assert_eq!(
             (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
             (Some(3.0), Some(2.0))
         );
-        assert!(limiters.charge(Some(ip(1)), 2).is_ok());
+        assert!(limiters.charge_batch(Some(ip(1)), 2).is_ok());
         assert_eq!(
             (limiters.per_ip_tokens(ip(1)), limiters.global_tokens()),
             (Some(1.0), Some(0.0))
         );
     }
 
+    /// Limiters with a submission budget, shared the way the edge layer holds
+    /// them.
+    fn limiters_with_submissions<C: Clock>(
+        clock: C,
+        per_ip: Option<RateLimit>,
+        global: Option<RateLimit>,
+        submissions: RateLimit,
+    ) -> Arc<RateLimiters<C>> {
+        let limiters = RateLimiters::with_clock(
+            clock,
+            per_ip,
+            global,
+            Some(submissions),
+            16,
+            PrefixPolicy::default(),
+        );
+        Arc::new(limiters.expect("the submission budget is enabled"))
+    }
+
+    #[test]
+    fn submission_budget_admits_when_global_is_exhausted() {
+        let clock = ManualClock::new();
+        let limiters =
+            limiters_with_submissions(clock.clone(), None, Some(limit(1, 1)), limit(1, 1));
+
+        // a read spends the global bucket's only token
+        let read = limiters.check_edge(None).expect("edge").expect("a budget verdict");
+        assert!(read.charge(false).is_ok());
+
+        // the edge lets the next request through with the global bucket empty
+        let submission = limiters.check_edge(None).expect("edge").expect("a budget verdict");
+        assert!(submission.global_exhausted);
+        // a submission is admitted from its own bucket
+        assert!(submission.charge(true).is_ok());
+
+        // a second read is refused, and so is a submission once its own bucket
+        // is spent
+        let second_read = limiters.check_edge(None).expect("edge").expect("a budget verdict");
+        assert!(matches!(second_read.charge(false), Err(GatewayError::RateLimited)));
+        assert!(matches!(second_read.charge(true), Err(GatewayError::RateLimited)));
+
+        // both buckets refill over time
+        clock.advance(Duration::from_secs(1));
+        let refilled = limiters.check_edge(None).expect("edge").expect("a budget verdict");
+        assert!(!refilled.global_exhausted);
+        assert!(refilled.charge(true).is_ok());
+    }
+
+    #[test]
+    fn with_a_submission_budget_the_per_ip_check_runs_first_and_still_refuses() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 1)),
+            Some(limit(1, 2)),
+            limit(1, 1),
+        );
+        assert!(limiters.check_edge(Some(ip(1))).is_ok());
+        // the client's own bucket is empty: refused at the edge, without
+        // spending the global token another client can still use
+        assert!(matches!(limiters.check_edge(Some(ip(1))), Err(GatewayError::RateLimited)));
+        let other = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget verdict");
+        assert!(!other.global_exhausted);
+    }
+
+    #[test]
+    fn without_a_submission_budget_the_edge_verdict_is_check() {
+        let limiters = Arc::new(limiters(ManualClock::new(), None, Some(limit(1, 1)), 16));
+        assert!(matches!(limiters.check_edge(None), Ok(None)));
+        assert!(matches!(limiters.check_edge(None), Err(GatewayError::RateLimited)));
+    }
+
     #[test]
     fn both_disabled_yields_no_limiters() {
-        assert!(RateLimiters::with_clock(SystemClock, None, None, 16, PrefixPolicy::default())
-            .is_none());
+        assert!(RateLimiters::with_clock(
+            SystemClock,
+            None,
+            None,
+            None,
+            16,
+            PrefixPolicy::default()
+        )
+        .is_none());
     }
 
     #[test]
