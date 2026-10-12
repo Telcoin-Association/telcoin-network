@@ -11,19 +11,21 @@ use crate::{
     cli::Settings,
     proxy::{proxy_client, UpstreamOrigin, WARNING_THROTTLES},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
-    readiness::{run_poller, GatewayReadiness, ReadinessThresholds},
-    server::{inflight_slots, serve, AppState, ServerLimits},
+    readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
+    server::{inflight_slots, serve, serve_probes, AppState, ServerLimits},
     telemetry::run_throttle_summaries,
 };
 
 /// Run the gateway until SIGTERM / ctrl-c.
 ///
-/// Spawns two critical tasks (the HTTP server and the readiness poller) under a
-/// [`TaskManager`] and blocks on `join_until_exit`, which installs the
-/// SIGTERM/ctrl-c handler and drains the tasks on shutdown.
+/// Spawns the HTTP server, the probe listener (with `--probe-addr` set) and the
+/// readiness poller as critical tasks under a [`TaskManager`] and blocks on
+/// `join_until_exit`, which installs the SIGTERM/ctrl-c handler and drains the
+/// tasks on shutdown.
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     let Settings {
         listen_addr,
+        probe_addr,
         upstreams,
         query_upstream,
         readiness_poll_interval,
@@ -155,6 +157,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
+    // The poller probes the query upstream with the proxy client, so the probe
+    // travels like a redirected read.
+    let query_probe =
+        query_upstream.clone().map(|url| QueryProbe { url, client: proxy_client.clone() });
     let state = AppState {
         readiness: Arc::clone(&readiness),
         http: proxy_client,
@@ -171,6 +177,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         run_poller(
             readiness,
             readiness_client,
+            query_probe,
             readiness_poll_interval,
             readiness_poll_timeout,
             shutdown.subscribe(),
@@ -208,6 +215,14 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         "warning-summaries",
         run_throttle_summaries(&WARNING_THROTTLES, shutdown.subscribe()),
     );
+    // With `--probe-addr` set, the probes also get a listener of their own,
+    // outside the client connection cap and the rate limits.
+    if let Some(probe_addr) = probe_addr {
+        spawner.spawn_critical_task(
+            "probe-server",
+            serve_probes(probe_addr, state.clone(), header_read_timeout, shutdown.subscribe()),
+        );
+    }
 
     spawner.spawn_critical_task(
         "gateway-server",

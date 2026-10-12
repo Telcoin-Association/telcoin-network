@@ -6,11 +6,13 @@
 //! the gateway's own `/ready` endpoint reflects whether any upstream is ready.
 //!
 //! Readiness governs the worker route only. With `--redirect-queries` set,
-//! non-submission calls go to the query upstream whatever this state says, and
-//! that upstream is never probed: there is one query URL and no fallback, so a
-//! probe would have nothing to fail over to, while N gateways polling a shared
-//! public endpoint would add load to it. Its failures show up per request (as
-//! `502`/`504`) and in the routed-request metrics instead.
+//! non-submission calls go to the query upstream whatever this state says.
+//! The poller also sends that upstream one `eth_chainId` call per cycle,
+//! alongside the worker polls and under the same thresholds, but only so
+//! `/ready/any` can report whether reads can be served: there is one
+//! query URL and no fallback, so its state never gates routing, and its
+//! failures still show up per request (as `502`/`504`) and in the
+//! routed-request metrics.
 //!
 //! Every failure mode (unreachable, timed out, an HTTP error status, malformed
 //! payload, worker not accepting transactions or absent from the payload) is a
@@ -40,7 +42,7 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{Client, StatusCode};
+use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
 use serde::Deserialize;
 use tn_types::{Noticer, TaskError};
 use tokio::time::{interval, timeout, MissedTickBehavior};
@@ -58,6 +60,20 @@ const READINESS_VERSION: u32 = 1;
 /// few dozen bytes per worker; a larger body is a failed poll, so a broken or
 /// hostile health endpoint cannot grow the gateway's memory.
 const MAX_READINESS_BODY_BYTES: usize = 64 * 1024;
+
+/// The call the poller sends the query upstream: any node answers it cheaply
+/// and without side effects.
+const QUERY_PROBE_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
+
+/// The marker header every query-route request carries (the proxy's
+/// `REDIRECT_HEADER`), so the probe reaches the query upstream the way a
+/// redirected read does.
+const QUERY_PROBE_MARKER: &str = "x-tn-gateway-redirect";
+
+/// Largest probe reply the poller reads. An `eth_chainId` answer is a few dozen
+/// bytes; the cap keeps a misbehaving query upstream from making the poller
+/// buffer an unbounded body every cycle.
+const MAX_QUERY_PROBE_REPLY_BYTES: usize = 64 * 1024;
 
 /// Mirror of the node's per-worker readiness entry
 /// (`crates/node/src/health.rs`).
@@ -210,12 +226,18 @@ impl UpstreamReadiness {
 pub(crate) struct GatewayReadiness {
     upstreams: Vec<UpstreamReadiness>,
     thresholds: ReadinessThresholds,
+    /// Whether the query upstream (`--redirect-queries`) is up, published from
+    /// its probe results under the same `thresholds` as a worker's polls;
+    /// always `false` without a redirect, since nothing probes it.
+    query_ready: AtomicBool,
+    /// The run of consecutive probe results of the query upstream.
+    query_streak: Mutex<PollStreak>,
 }
 
 impl GatewayReadiness {
-    /// Build the readiness view, with every upstream initially not-ready
-    /// (fail closed until its first run of `thresholds.success` successful
-    /// polls).
+    /// Build the readiness view, with every upstream (and the query upstream)
+    /// initially not-ready (fail closed until its first run of
+    /// `thresholds.success` successful polls).
     pub(crate) fn new(upstreams: &[UpstreamWorker], thresholds: ReadinessThresholds) -> Self {
         let upstreams = upstreams
             .iter()
@@ -228,7 +250,12 @@ impl GatewayReadiness {
                 rpc_failures: AtomicU32::new(0),
             })
             .collect();
-        Self { upstreams, thresholds }
+        Self {
+            upstreams,
+            thresholds,
+            query_ready: AtomicBool::new(false),
+            query_streak: Mutex::new(PollStreak::default()),
+        }
     }
 
     /// The JSON-RPC base URL of the first ready upstream, in preference order.
@@ -278,6 +305,48 @@ impl GatewayReadiness {
         self.upstreams.iter().filter(move |upstream| &upstream.rpc_url == rpc_url)
     }
 
+    /// Whether the query upstream (`--redirect-queries`) is up, after the poll
+    /// thresholds. Always `false` without a redirect.
+    pub(crate) fn query_ready(&self) -> bool {
+        self.query_ready.load(Ordering::Relaxed)
+    }
+
+    /// Whether the gateway can serve any route: an upstream worker is ready,
+    /// or the query upstream is up. Without a redirect this is
+    /// [`Self::any_ready`].
+    pub(crate) fn any_route_ready(&self) -> bool {
+        self.any_ready() || self.query_ready()
+    }
+
+    /// Apply one probe result of the query upstream and publish the resulting
+    /// state, logging a change at info with the upstream's origin only.
+    ///
+    /// The query upstream flips like a worker's readiness (see
+    /// [`UpstreamReadiness::record_poll`]): up only on the `thresholds.success`-th
+    /// answered probe in a row, down only on the `thresholds.failure`-th failed
+    /// one, so one slow probe of an upstream every gateway shares does not drop
+    /// them all from `/ready/any` at once.
+    fn record_query_probe(&self, up: bool, url: &Url) {
+        let mut streak = self.query_streak.lock().unwrap_or_else(PoisonError::into_inner);
+        let ready = if up {
+            streak.failures = 0;
+            streak.successes = streak.successes.saturating_add(1);
+            self.query_ready() || streak.successes >= self.thresholds.success.get()
+        } else {
+            streak.successes = 0;
+            streak.failures = streak.failures.saturating_add(1);
+            self.query_ready() && streak.failures < self.thresholds.failure.get()
+        };
+        if self.query_ready.swap(ready, Ordering::Relaxed) != ready {
+            let upstream = UpstreamOrigin(url);
+            if ready {
+                info!(target: "gateway::readiness", %upstream, "query upstream became ready");
+            } else {
+                info!(target: "gateway::readiness", %upstream, "query upstream became not-ready");
+            }
+        }
+    }
+
     /// Test-only: force an upstream's readiness state.
     #[cfg(test)]
     pub(crate) fn set_ready(&self, worker_id: u16, ready: bool) {
@@ -305,12 +374,24 @@ pub(crate) struct ReadinessThresholds {
     pub(crate) rpc_failure: Option<NonZeroU32>,
 }
 
-/// Poll every upstream's readiness endpoint on `poll_interval` until `shutdown`
-/// fires. The first tick runs immediately so readiness converges promptly on
-/// startup.
+/// The query upstream (`--redirect-queries`) as the poller probes it.
+#[derive(Debug)]
+pub(crate) struct QueryProbe {
+    /// The query upstream's URL.
+    pub(crate) url: Url,
+    /// The proxy client (see [`crate::proxy::proxy_client`]), so the probe
+    /// travels like a redirected read: same connection pool, user agent and
+    /// redirect policy.
+    pub(crate) client: Client,
+}
+
+/// Poll every upstream's readiness endpoint, and probe the query upstream when
+/// `query_probe` is set, on `poll_interval` until `shutdown` fires. The first
+/// tick runs immediately so readiness converges promptly on startup.
 pub(crate) async fn run_poller(
     readiness: Arc<GatewayReadiness>,
     client: Client,
+    query_probe: Option<QueryProbe>,
     poll_interval: Duration,
     poll_timeout: Duration,
     shutdown: Noticer,
@@ -327,10 +408,19 @@ pub(crate) async fn run_poller(
             () = &shutdown => break,
             _ = ticker.tick() => {
                 // race the cycle against shutdown so teardown never waits on a
-                // slow poll; an abandoned cycle records nothing
+                // slow poll; an abandoned cycle records nothing. The query
+                // upstream is probed alongside the workers, so a cycle still
+                // lasts at most one `poll_timeout`.
+                let query = query_probe
+                    .as_ref()
+                    .map(|probe| poll_query_upstream(probe, &readiness, poll_timeout));
+                let cycle = futures::future::join(
+                    poll_cycle(&readiness, &client, poll_timeout),
+                    futures::future::OptionFuture::from(query),
+                );
                 tokio::select! {
                     () = &shutdown => break,
-                    () = poll_cycle(&readiness, &client, poll_timeout) => {}
+                    _ = cycle => {}
                 }
             }
         }
@@ -352,6 +442,69 @@ async fn poll_cycle(readiness: &GatewayReadiness, client: &Client, poll_timeout:
         upstream.record_poll(result, readiness.thresholds);
     });
     futures::future::join_all(polls).await;
+}
+
+/// Probe the query upstream once and record whether it is up; any failure
+/// counts as down.
+async fn poll_query_upstream(
+    probe: &QueryProbe,
+    readiness: &GatewayReadiness,
+    poll_timeout: Duration,
+) {
+    let upstream = UpstreamOrigin(&probe.url);
+    let ready = match timeout(poll_timeout, fetch_query_ready(&probe.client, &probe.url)).await {
+        Ok(Ok(ready)) => {
+            if !ready {
+                debug!(
+                    target: "gateway::readiness",
+                    %upstream,
+                    "query upstream did not answer the probe with a 2xx result"
+                );
+            }
+            ready
+        }
+        // a reqwest error renders the full request url, which can carry a
+        // credential, so it is logged without it
+        Ok(Err(err)) => {
+            debug!(
+                target: "gateway::readiness",
+                %upstream,
+                err = ?err.without_url(),
+                "query upstream probe failed"
+            );
+            false
+        }
+        Err(_) => {
+            debug!(target: "gateway::readiness", %upstream, "query upstream probe timed out");
+            false
+        }
+    };
+    readiness.record_query_probe(ready, &probe.url);
+}
+
+/// Send the probe call and report whether the reply is a `2xx` whose JSON body
+/// has a `result` member. A reply longer than [`MAX_QUERY_PROBE_REPLY_BYTES`]
+/// counts as down and is not read further.
+async fn fetch_query_ready(client: &Client, url: &Url) -> reqwest::Result<bool> {
+    let mut response = client
+        .post(url.clone())
+        .header(CONTENT_TYPE, "application/json")
+        .header(QUERY_PROBE_MARKER, "1")
+        .body(QUERY_PROBE_CALL)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(false);
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len().saturating_add(chunk.len()) > MAX_QUERY_PROBE_REPLY_BYTES {
+            return Ok(false);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(serde_json::from_slice::<serde_json::Value>(&body)
+        .is_ok_and(|reply| reply.get("result").is_some()))
 }
 
 /// Poll a single upstream: `Ok` when the worker reports it is accepting
@@ -994,6 +1147,7 @@ mod tests {
         let poller = tokio::spawn(run_poller(
             Arc::clone(&readiness),
             Client::new(),
+            None,
             Duration::from_secs(3600),
             Duration::from_secs(5),
             shutdown.subscribe(),
@@ -1033,5 +1187,105 @@ mod tests {
             !lines.iter().any(|line| line.contains("became") && line.contains("10.0.0.1")),
             "the not-ready node logged a transition: {lines:#?}"
         );
+    }
+
+    #[test]
+    fn query_probe_flips_at_the_poll_thresholds() {
+        let readiness = GatewayReadiness::new(&[], thresholds(3, 2));
+        let url = Url::parse("http://127.0.0.1:8545/").expect("url");
+
+        readiness.record_query_probe(true, &url);
+        assert!(!readiness.query_ready(), "one answered probe does not flip it up");
+        readiness.record_query_probe(true, &url);
+        assert!(readiness.query_ready(), "the second answered probe in a row does");
+
+        for _ in 0..2 {
+            readiness.record_query_probe(false, &url);
+            assert!(readiness.query_ready(), "fewer failed probes than the threshold keep it up");
+        }
+        readiness.record_query_probe(true, &url);
+        readiness.record_query_probe(false, &url);
+        readiness.record_query_probe(false, &url);
+        assert!(readiness.query_ready(), "an answered probe restarts the failure run");
+        readiness.record_query_probe(false, &url);
+        assert!(!readiness.query_ready(), "the third failed probe in a row flips it down");
+        assert!(!readiness.any_route_ready());
+    }
+
+    #[tokio::test]
+    async fn query_probe_transitions_are_logged_at_info() {
+        let captured = Captured::default();
+        let sink = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new("gateway=debug"))
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a query upstream whose answer the test flips from up to down
+        let up = Arc::new(AtomicBool::new(true));
+        let answer = Arc::clone(&up);
+        let mock = axum::Router::new().fallback(move || {
+            let up = answer.load(Ordering::SeqCst);
+            async move {
+                if up {
+                    (axum::http::StatusCode::OK, r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#)
+                } else {
+                    (axum::http::StatusCode::SERVICE_UNAVAILABLE, "")
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, mock).await });
+
+        // the url carries a credential in its userinfo, path and query; the
+        // logs may name only its origin
+        let client = crate::proxy::proxy_client(Duration::from_secs(1), Duration::from_secs(2))
+            .expect("client");
+        let probe = QueryProbe {
+            url: Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url"),
+            client: client.clone(),
+        };
+        let readiness = GatewayReadiness::new(&[], thresholds(1, 1));
+        let poll_timeout = Duration::from_secs(2);
+
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        assert!(readiness.query_ready());
+        assert!(readiness.any_route_ready());
+        // a repeat of the same state is not a transition
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        up.store(false, Ordering::SeqCst);
+        poll_query_upstream(&probe, &readiness, poll_timeout).await;
+        assert!(!readiness.query_ready());
+        assert!(!readiness.any_route_ready());
+
+        // a transport failure is logged without the url too
+        let unreachable = QueryProbe {
+            url: Url::parse("http://user:s3cr3t@127.0.0.1:1/k3y?token=t0k3n").expect("url"),
+            client,
+        };
+        poll_query_upstream(&unreachable, &readiness, poll_timeout).await;
+        assert!(!readiness.query_ready());
+
+        let logs = captured.lines().join("\n");
+        let transitions: Vec<&str> =
+            logs.lines().filter(|line| line.contains("query upstream became")).collect();
+        assert_eq!(transitions.len(), 2, "one line per transition, none for a repeat: {logs}");
+        let origin = format!("upstream=http://{addr}");
+        for (line, message) in transitions
+            .iter()
+            .zip(["query upstream became ready", "query upstream became not-ready"])
+        {
+            assert!(line.trim_start().starts_with("INFO "), "not at info: {line}");
+            assert!(line.contains(message), "expected `{message}`: {line}");
+            assert!(line.contains(&origin), "expected `{origin}`: {line}");
+        }
+        assert!(logs.contains("query upstream probe failed"), "{logs}");
+        for secret in ["s3cr3t", "k3y", "t0k3n"] {
+            assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+        }
     }
 }

@@ -32,9 +32,19 @@ spec:
           # Replace with your registry ref, e.g. registry.example.com/telcoin/worker-gateway:<tag>
           image: telcoin-worker-gateway:latest
           env:
-            # Client JSON-RPC + /health + /ready all listen here.
+            # Client JSON-RPC listens here. /health, /ready and /ready/any answer
+            # here too, for fronts that can only check the client port.
             - name: WORKER_GATEWAY_LISTEN_ADDR
               value: "0.0.0.0:8545"
+            # /health, /ready and /ready/any on a SEPARATE listener (equivalent
+            # to the --probe-addr flag), outside the client connection cap and
+            # rate limits, so a connection flood cannot time out the kubelet's
+            # probes. The Service leaves it out, but any pod can still reach it
+            # on the pod IP unless a NetworkPolicy admits only the client and
+            # metrics ports; the pod's own node, and so the kubelet, always
+            # gets through.
+            - name: WORKER_GATEWAY_PROBE_ADDR
+              value: "0.0.0.0:8546"
             # Prometheus /metrics listens on this SEPARATE address (equivalent
             # to the --metrics flag). Keep it cluster-internal; it is unauthenticated.
             - name: WORKER_GATEWAY_METRICS_ADDR
@@ -70,23 +80,31 @@ spec:
           ports:
             - name: rpc
               containerPort: 8545
+            - name: probe
+              containerPort: 8546
             - name: metrics
               containerPort: 9100
           livenessProbe:
-            # /health is liveness: always 200 while the process is up.
+            # /health is liveness: always 200 while the process is up. It is
+            # checked on the probe listener, so a flood that holds every client
+            # connection cannot get a healthy pod restarted.
             httpGet:
               path: /health
-              port: rpc
+              port: probe
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            # /ready is readiness: 200 when an upstream worker is ready, else 503.
-            # It reports whether submissions can be served, so a worker outage
-            # takes every replica out of the Service and reads stop too; see
-            # deploy/README.md ("Readiness and reads") for the alternative.
+            # /ready/any is 200 while the gateway can serve any route: an
+            # upstream worker is ready, or the WORKER_GATEWAY_REDIRECT_QUERIES
+            # endpoint answers the gateway's probe. Every replica polls the same
+            # worker, so /ready (submissions only) would take every replica out
+            # of the Service during a worker outage and stop reads too; with
+            # /ready/any the replicas keep serving reads, and submissions get
+            # 503 / -32000 until the worker is back. See deploy/README.md
+            # ("Readiness and reads").
             httpGet:
-              path: /ready
-              port: rpc
+              path: /ready/any
+              port: probe
             periodSeconds: 5
           resources:
             requests:
