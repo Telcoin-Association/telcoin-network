@@ -14,7 +14,9 @@
 //! [`crate::identity`]). The upstream response body is streamed through, never
 //! buffered whole. When no upstream is ready, or the upstream cannot be reached
 //! / times out, the client receives a well-formed JSON-RPC error instead (see
-//! [`crate::error`]).
+//! [`crate::error`]). So does a client whose upstream answers an error status
+//! without a JSON body (a worker's `429` text/plain, say): it keeps the
+//! upstream's status, with a JSON-RPC error in place of the body.
 //!
 //! With `--redirect-queries` set, only transaction submissions go to the
 //! worker; every other call goes to the query upstream (see [`scan`]),
@@ -29,7 +31,16 @@
 //! worker also takes a slot on `--max-upstream-inflight`, the same way, which
 //! bounds this gateway's share of the worker's RPC connection limit.
 
-use std::{borrow::Cow, fmt, marker::PhantomData, num::NonZeroUsize, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    fmt,
+    marker::PhantomData,
+    num::NonZeroUsize,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use axum::{
     body::{Body, Bytes},
@@ -41,6 +52,7 @@ use axum::{
     response::Response,
     Extension,
 };
+use futures::Stream;
 use reqwest::{redirect::Policy, Client};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
@@ -52,11 +64,13 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
-    error::{error_response, error_response_with_id, GatewayError, RequestId},
+    error::{
+        error_response, error_response_with_id, upstream_error_response, GatewayError, RequestId,
+    },
     identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
     ratelimit::{RateLimiters, SubmissionBudget},
     server::AppState,
-    telemetry,
+    telemetry::{self, Throttle},
 };
 
 /// Default maximum request body the gateway will buffer before forwarding.
@@ -111,6 +125,52 @@ pub(crate) const HOP_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway"
 /// example the deployment's own advertised endpoint) after one hop.
 const REDIRECT_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway-redirect");
 
+/// Throttle for the hop-marker loop warning.
+static HOP_LOOP_WARNINGS: Throttle = Throttle::new("hop_loop");
+
+/// Throttle for the redirect-marker loop warning.
+static REDIRECT_LOOP_WARNINGS: Throttle = Throttle::new("redirect_loop");
+
+/// Throttle for the warning on a batch the scan cannot read to its end.
+static UNREADABLE_BATCH_WARNINGS: Throttle = Throttle::new("unreadable_batch");
+
+/// Throttle for the warning on a batch over `--max-batch-len`.
+static BATCH_TOO_LONG_WARNINGS: Throttle = Throttle::new("batch_too_long");
+
+/// Throttle for the raw-transaction screen's rejection warning.
+static SCREEN_WARNINGS: Throttle = Throttle::new("screen");
+
+/// Throttle for the no-ready-upstream warning.
+static NO_UPSTREAM_WARNINGS: Throttle = Throttle::new("no_upstream");
+
+/// Throttle for the oversized-body warning.
+static OVERSIZED_BODY_WARNINGS: Throttle = Throttle::new("oversized_body");
+
+/// Throttles for the forwarding-failure warning, one per route, so a failing
+/// query upstream cannot hide a failing worker.
+static FORWARD_FAILURE_WARNINGS: PerRoute =
+    PerRoute::new("forward_failure_worker", "forward_failure_query");
+
+/// Throttles for the upstream-error warning, one per route.
+static UPSTREAM_ERROR_WARNINGS: PerRoute =
+    PerRoute::new("upstream_error_worker", "upstream_error_query");
+
+/// Every per-request warning throttle, summarized by
+/// [`telemetry::run_throttle_summaries`].
+pub(crate) static WARNING_THROTTLES: [&Throttle; 11] = [
+    &HOP_LOOP_WARNINGS,
+    &REDIRECT_LOOP_WARNINGS,
+    &UNREADABLE_BATCH_WARNINGS,
+    &BATCH_TOO_LONG_WARNINGS,
+    &SCREEN_WARNINGS,
+    &NO_UPSTREAM_WARNINGS,
+    &OVERSIZED_BODY_WARNINGS,
+    &FORWARD_FAILURE_WARNINGS.worker,
+    &FORWARD_FAILURE_WARNINGS.query,
+    &UPSTREAM_ERROR_WARNINGS.worker,
+    &UPSTREAM_ERROR_WARNINGS.query,
+];
+
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is not made only of
 /// submissions, to the query upstream.
@@ -138,8 +198,10 @@ pub(crate) async fn proxy(
     body: Result<Bytes, BytesRejection>,
 ) -> Response {
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
-    // and time it; the guard releases both on every return path below.
-    let _in_flight = telemetry::RequestInFlight::enter();
+    // and time it. The guard releases both on every return path below, except
+    // a relayed response: its body takes the guard and releases it once it has
+    // finished streaming to the client (or is dropped).
+    let in_flight = telemetry::RequestInFlight::enter();
 
     let body = match body {
         Ok(body) => body,
@@ -150,11 +212,14 @@ pub(crate) async fn proxy(
     // gateway before: some upstream URL points back at a gateway, and
     // forwarding again would loop until fds run out.
     if headers.contains_key(HOP_HEADER) {
-        warn!(
-            target: "gateway::proxy",
-            "proxy loop detected (inbound request already carries the gateway hop marker); \
-             check that upstream URLs point at workers, not gateways"
-        );
+        if let Some(suppressed) = HOP_LOOP_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "proxy loop detected (inbound request already carries the gateway hop marker); \
+                 check that upstream URLs point at workers, not gateways"
+            );
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -164,11 +229,14 @@ pub(crate) async fn proxy(
     // gateway without a redirect forwards such a request like any other, so a
     // gateway can front the public rpc.
     if state.query_upstream.is_some() && headers.contains_key(REDIRECT_HEADER) {
-        warn!(
-            target: "gateway::proxy",
-            "redirect loop detected (inbound request already carries the query-redirect marker); \
-             check that --redirect-queries does not lead to a gateway that redirects"
-        );
+        if let Some(suppressed) = REDIRECT_LOOP_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "redirect loop detected (inbound request already carries the query-redirect \
+                 marker); check that --redirect-queries does not lead to a gateway that redirects"
+            );
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -183,14 +251,26 @@ pub(crate) async fn proxy(
     // it would dodge the length cap and the per-call charge. It is refused
     // whole, before it is charged, and has no single id to echo.
     if scan.unreadable_batch {
-        warn!(target: "gateway::proxy", "rejecting a batch the gateway cannot read to its end");
+        if let Some(suppressed) = UNREADABLE_BATCH_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "rejecting a batch the gateway cannot read to its end"
+            );
+        }
         return error_response(&GatewayError::UnreadableBody, b"");
     }
 
     // A batch over the length cap is refused whole. A batch has no single id
     // to echo, so the error carries `null`.
     if state.max_batch_len.is_some_and(|max| scan.len > max.get()) {
-        warn!(target: "gateway::proxy", "rejecting a batch longer than --max-batch-len");
+        if let Some(suppressed) = BATCH_TOO_LONG_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                suppressed,
+                "rejecting a batch longer than --max-batch-len"
+            );
+        }
         return error_response(&GatewayError::BatchTooLong, b"");
     }
 
@@ -212,7 +292,14 @@ pub(crate) async fn proxy(
     // paying for an upstream round-trip. The scan recovers the refused call's
     // request id itself on the paths that reject.
     if let Some((err, id)) = scan.rejection {
-        warn!(target: "gateway::proxy", ?err, "rejecting a raw-transaction submission before forwarding");
+        if let Some(suppressed) = SCREEN_WARNINGS.admit() {
+            warn!(
+                target: "gateway::proxy",
+                ?err,
+                suppressed,
+                "rejecting a raw-transaction submission before forwarding"
+            );
+        }
         return error_response_with_id(&err, id);
     }
 
@@ -232,7 +319,7 @@ pub(crate) async fn proxy(
     // fail fast rather than queue: a route that has used up its slots (a
     // stalled query upstream, say) must not hold connections the other route
     // needs. the slot is held until the response body has been sent or
-    // dropped (see `hold_until_body_ends`); every early return frees it at once.
+    // dropped (see `UpstreamBody`); every early return frees it at once.
     let class_slots = match class {
         Class::Submission => &state.submission_slots,
         Class::Query => &state.query_slots,
@@ -256,7 +343,13 @@ pub(crate) async fn proxy(
         None => match state.readiness.first_ready_rpc_url() {
             Some(rpc_url) => (Route::Worker, rpc_url),
             None => {
-                warn!(target: "gateway::proxy", "no upstream worker ready; rejecting request");
+                if let Some(suppressed) = NO_UPSTREAM_WARNINGS.admit() {
+                    warn!(
+                        target: "gateway::proxy",
+                        suppressed,
+                        "no upstream worker ready; rejecting request"
+                    );
+                }
                 return error_response(&GatewayError::NoUpstreamReady, body.as_ref());
             }
         },
@@ -281,13 +374,34 @@ pub(crate) async fn proxy(
     match forward(&state, route, method, &headers, body.clone(), upstream_url.clone(), forwarding)
         .await
     {
-        Ok(response) => {
+        Ok(upstream) => {
+            // any answer, an error status included, shows that the worker's
+            // rpc port is up
             if route == Route::Worker {
                 state.readiness.record_rpc_success(&upstream_url);
             }
+            // an error status without a json body (a worker's `429`
+            // text/plain, say) carries no json-rpc answer: replace it with the
+            // gateway's envelope, keeping the status and echoing the request's
+            // id
+            if is_non_json_error(&upstream) {
+                let status = upstream.status();
+                telemetry::record_routed(route.label(), "upstream_error");
+                if let Some(suppressed) = UPSTREAM_ERROR_WARNINGS.get(route).admit() {
+                    warn!(
+                        target: "gateway::proxy",
+                        route = route.label(),
+                        upstream = %UpstreamOrigin(&upstream_url),
+                        status = status.as_u16(),
+                        suppressed,
+                        "upstream answered an error status without a JSON-RPC body"
+                    );
+                }
+                return upstream_error_response(status, body.as_ref());
+            }
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
-            hold_until_body_ends(response, class_slot)
+            relay(upstream, route, upstream_url, in_flight, class_slot)
         }
         Err(source) => {
             let err = classify_error(&source);
@@ -308,14 +422,17 @@ pub(crate) async fn proxy(
             // path or query can carry a credential, so the log names the
             // upstream by origin and renders the cause with the url removed.
             let source = source.without_url();
-            warn!(
-                target: "gateway::proxy",
-                ?err,
-                route = route.label(),
-                upstream = %UpstreamOrigin(&upstream_url),
-                cause = %ErrorChain(&source),
-                "forwarding to upstream failed"
-            );
+            if let Some(suppressed) = FORWARD_FAILURE_WARNINGS.get(route).admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    ?err,
+                    route = route.label(),
+                    upstream = %UpstreamOrigin(&upstream_url),
+                    cause = %ErrorChain(&source),
+                    suppressed,
+                    "forwarding to upstream failed"
+                );
+            }
             // passive health: a worker whose rpc port keeps failing to connect
             // is marked not-ready, so later requests go to the next ready
             // upstream. this request is answered with its own error and never
@@ -343,7 +460,14 @@ fn is_query(calls: Calls) -> bool {
 fn reject_body(rejection: &BytesRejection) -> Response {
     match rejection {
         BytesRejection::FailedToBufferBody(FailedToBufferBody::LengthLimitError(_)) => {
-            warn!(target: "gateway::proxy", %rejection, "rejecting oversized request body");
+            if let Some(suppressed) = OVERSIZED_BODY_WARNINGS.admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    %rejection,
+                    suppressed,
+                    "rejecting oversized request body"
+                );
+            }
             error_response(&GatewayError::RequestTooLarge, b"")
         }
         _ => {
@@ -353,28 +477,8 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
-/// Keep `slot` held until `response`'s body has been sent in full or dropped.
-///
-/// [`proxy`] returns as soon as the upstream's response head arrives, but the
-/// body streams to the client after that, holding an inbound connection. Tying
-/// the class slot to the body keeps a query upstream that sends its head and
-/// then stalls inside `--max-inflight-queries`, so it cannot take the
-/// connections submissions need. hyper drops the body once it has written the
-/// last chunk, or when the stream fails or the connection closes, and that
-/// frees the slot.
-fn hold_until_body_ends(response: Response, slot: telemetry::InFlightSlot) -> Response {
-    use futures::StreamExt as _;
-    response.map(|body| {
-        Body::from_stream(body.into_data_stream().map(move |chunk| {
-            // moved into the closure, the slot lives exactly as long as the stream
-            let _held = &slot;
-            chunk
-        }))
-    })
-}
-
-/// Forward one request to `upstream_url` and adapt the upstream response back
-/// into an axum response, preserving the status, body, and content type.
+/// Forward one request to `upstream_url` and return the upstream's response
+/// with its body still unread (see [`relay`]).
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
 /// [`REDIRECT_HEADER`] toward the query upstream, never both. `forwarding`
@@ -394,7 +498,7 @@ async fn forward(
     body: Bytes,
     upstream_url: Url,
     forwarding: Forwarding,
-) -> Result<Response, reqwest::Error> {
+) -> Result<reqwest::Response, reqwest::Error> {
     // JSON-RPC is content-type `application/json`; preserve the client's header
     // when present, default to it otherwise.
     let content_type = headers
@@ -420,8 +524,51 @@ async fn forward(
         (Route::Query, Some(timeout)) => request.timeout(timeout),
         _ => request,
     };
-    let upstream = request.send().await?;
+    request.send().await
+}
 
+/// Whether an upstream response is an error status without a JSON body, which
+/// the gateway replaces with its own JSON-RPC error rather than relaying.
+///
+/// Every non-2xx status counts, `3xx` included (redirects are never followed;
+/// see [`proxy_client`]). A JSON body, `application/json` or any `+json`
+/// subtype with any parameters, is relayed unchanged whatever the status: it
+/// is the upstream's own JSON-RPC error.
+fn is_non_json_error(upstream: &reqwest::Response) -> bool {
+    !upstream.status().is_success()
+        && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
+}
+
+/// Whether a `Content-Type` names JSON: `application/json` or any `+json`
+/// subtype, compared case-insensitively with parameters ignored. A missing or
+/// unreadable header is not JSON.
+fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
+    content_type
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .and_then(|essence| essence.trim().split_once('/'))
+        .is_some_and(|(kind, subtype)| {
+            (kind.eq_ignore_ascii_case("application") && subtype.eq_ignore_ascii_case("json"))
+                || subtype
+                    .rsplit_once('+')
+                    .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
+        })
+}
+
+/// Adapt an upstream response back into an axum response, preserving the
+/// status, body, and content type.
+///
+/// The body streams through an [`UpstreamBody`], so a failure after the head
+/// has gone out is still logged and counted against `route`, and `in_flight`
+/// and `class_slot` stay held until the body has streamed: the request stays
+/// in the in-flight gauge and its duration, and on its class's in-flight cap.
+fn relay(
+    upstream: reqwest::Response,
+    route: Route,
+    upstream_url: Url,
+    in_flight: telemetry::RequestInFlight,
+    class_slot: telemetry::InFlightSlot,
+) -> Response {
     let status = upstream.status();
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
 
@@ -435,12 +582,80 @@ async fn forward(
     // the body and the poll-driven timeout never fires. That side is bounded
     // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
     // connection-lifetime cap (see [`crate::server::accept_loop`]).
-    let mut response = Response::new(Body::from_stream(upstream.bytes_stream()));
+    let body = UpstreamBody {
+        inner: upstream.bytes_stream(),
+        route,
+        upstream_url,
+        _in_flight: in_flight,
+        _class_slot: class_slot,
+    };
+    let mut response = Response::new(Body::from_stream(body));
     *response.status_mut() = status;
     if let Some(content_type) = upstream_content_type {
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
-    Ok(response)
+    response
+}
+
+/// An upstream's response body on its way to the client, logging and counting
+/// a failure mid-stream.
+///
+/// By the time the body fails, its status and headers have gone to the
+/// client, which therefore sees a truncated response (a chunked body without
+/// its final chunk) whatever the gateway does. The failure is logged at debug,
+/// naming the upstream by origin, and counted as
+/// `routed_requests_total{route, result="body_failed"}` next to the
+/// `forwarded` result the head already recorded.
+///
+/// It is the one wrapper around a relayed body, and it holds the request's
+/// guards for as long as the body lives: [`proxy`] returns as soon as the
+/// upstream's response head arrives, but the body streams to the client after
+/// that, holding an inbound connection. hyper drops the body once it has
+/// written the last chunk, or when the stream fails or the connection closes,
+/// and that releases them.
+struct UpstreamBody<S> {
+    /// The upstream's body stream.
+    inner: S,
+    /// The route the request took.
+    route: Route,
+    /// The upstream the body comes from, only ever logged by origin.
+    upstream_url: Url,
+    /// Holds the request in the in-flight gauge and its duration timer until
+    /// the body has finished streaming, or is dropped because the client went
+    /// away or the connection closed.
+    _in_flight: telemetry::RequestInFlight,
+    /// The request's slot on its class's in-flight cap. Tying it to the body
+    /// keeps a query upstream that sends its head and then stalls inside
+    /// `--max-inflight-queries`, so it cannot take the connections
+    /// submissions need.
+    _class_slot: telemetry::InFlightSlot,
+}
+
+impl<S> Stream for UpstreamBody<S>
+where
+    S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
+{
+    type Item = reqwest::Result<Bytes>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Err(err))) => {
+                // a reqwest error's display can carry the request url, so the
+                // cause is rendered with it removed
+                let err = err.without_url();
+                telemetry::record_routed(self.route.label(), "body_failed");
+                debug!(
+                    target: "gateway::proxy",
+                    route = self.route.label(),
+                    upstream = %UpstreamOrigin(&self.upstream_url),
+                    cause = %ErrorChain(&err),
+                    "upstream response body failed mid-stream"
+                );
+                Poll::Ready(Some(Err(err)))
+            }
+            polled => polled,
+        }
+    }
 }
 
 /// Build the client that forwards requests on both routes.
@@ -533,6 +748,30 @@ impl Route {
         match self {
             Self::Worker => "worker",
             Self::Query => "query",
+        }
+    }
+}
+
+/// One [`Throttle`] per [`Route`], for a log call site that serves both.
+struct PerRoute {
+    /// The worker route's throttle.
+    worker: Throttle,
+    /// The query route's throttle.
+    query: Throttle,
+}
+
+impl PerRoute {
+    /// Two fresh throttles, whose summary lines name them `worker_site` and
+    /// `query_site`.
+    const fn new(worker_site: &'static str, query_site: &'static str) -> Self {
+        Self { worker: Throttle::new(worker_site), query: Throttle::new(query_site) }
+    }
+
+    /// The throttle for `route`.
+    fn get(&self, route: Route) -> &Throttle {
+        match route {
+            Route::Worker => &self.worker,
+            Route::Query => &self.query,
         }
     }
 }
@@ -1217,12 +1456,19 @@ fn decode_hex(value: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        config::UpstreamWorker,
+        identity::TrustedProxies,
+        readiness::{GatewayReadiness, ReadinessThresholds},
+        server::inflight_slots,
+    };
     use alloy::{
         consensus::{TxEip1559, TxEip2930, TxEip4844, TxEip4844WithSidecar, TxEip7702, TxLegacy},
         eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant},
     };
+    use axum::http::StatusCode;
     use serde_json::{value::RawValue, Value};
-    use std::cell::Cell;
+    use std::{cell::Cell, num::NonZeroU32, sync::Mutex};
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
 
     std::thread_local! {
@@ -1806,27 +2052,130 @@ mod tests {
         assert_eq!(ErrorChain(&Link("alone", None)).to_string(), "alone");
     }
 
-    /// A real transport failure: the raw error's `Display` carries the url, the
-    /// fields the proxy logs do not, and the cause reaches below reqwest's own
-    /// message.
-    #[tokio::test]
-    async fn forwarding_failure_log_fields_hide_the_url() {
-        // nothing listens on port 1, as in the server's unreachable-upstream test
-        let url = Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
-        let err =
-            Client::new().post(url.clone()).send().await.expect_err("nothing listens on port 1");
-        assert!(matches!(classify_error(&err), GatewayError::UpstreamUnreachable));
-        assert!(err.to_string().contains("apikey123"), "raw display should carry the url: {err}");
+    /// A `tracing` writer that keeps everything written to it.
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
-        let cause = ErrorChain(&err.without_url()).to_string();
-        for secret in ["secret", "apikey123", "xyz"] {
-            assert!(!cause.contains(secret), "cause leaks {secret:?}: {cause}");
+    impl CapturedLogs {
+        /// Everything logged so far.
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("logs lock")).into_owned()
         }
-        assert!(
-            cause.starts_with("error sending request: "),
-            "cause should have a source: {cause}"
-        );
-        assert_eq!(UpstreamOrigin(&url).to_string(), "http://127.0.0.1:1");
+    }
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("logs lock").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The warning `proxy()` itself writes when a forward fails, captured on
+    /// both routes: it names the upstream by origin and carries the cause from
+    /// below reqwest's own message, while the url's credential (userinfo,
+    /// path and query), which the raw error's `Display` would print, appears
+    /// nowhere in the gateway's logs.
+    ///
+    /// The throttles are process-wide statics, so this test relies on
+    /// nextest's one-process-per-test model, which `make test`, the gate and
+    /// CI use: under a single-process `cargo test`, another test failing a
+    /// forward on either route within 10 s suppresses the line this test reads.
+    #[tokio::test]
+    async fn forwarding_failure_log_hides_the_url() {
+        let logs = CapturedLogs::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=trace")
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+
+        // nothing listens on port 1, as in the server's unreachable-upstream test
+        let worker_url =
+            Url::parse("http://user:secret@127.0.0.1:1/apikey123?token=xyz").expect("url");
+        let query_url =
+            Url::parse("http://quser:qsecret@127.0.0.1:1/qkey456?token=qtok").expect("url");
+        let secrets = ["secret", "apikey123", "xyz", "qsecret", "qkey456", "qtok"];
+        let raw = Client::new().post(worker_url.clone()).send().await.expect_err("port 1");
+        assert!(matches!(classify_error(&raw), GatewayError::UpstreamUnreachable));
+        assert!(raw.to_string().contains("apikey123"), "raw display should carry the url: {raw}");
+
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: worker_url,
+            readiness_url: Url::parse("http://127.0.0.1:1/health/workers").expect("url"),
+        };
+        let nz = |n| NonZeroU32::new(n).expect("nonzero");
+        let thresholds = ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: None };
+        let state = AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
+            http: proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client"),
+            query_upstream: Some(query_url),
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
+            query_request_timeout: None,
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
+        };
+        state.readiness.set_ready(0, true);
+        let forwarding = TrustedProxies::default()
+            .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_call","params":[],"id":2}"#,
+        ] {
+            let response = proxy(
+                State(state.clone()),
+                Extension(forwarding),
+                Method::POST,
+                HeaderMap::new(),
+                None,
+                None,
+                Ok(Bytes::from_static(body.as_bytes())),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY, "{body}");
+        }
+
+        let text = logs.text();
+        let failures: Vec<_> =
+            text.lines().filter(|line| line.contains("forwarding to upstream failed")).collect();
+        assert_eq!(failures.len(), 2, "one warning per route: {text}");
+        for (line, route) in failures.iter().zip(["worker", "query"]) {
+            assert!(line.contains(&format!("route=\"{route}\"")), "{line}");
+            assert!(line.contains("upstream=http://127.0.0.1:1 "), "{line}");
+            assert!(line.contains("cause=error sending request: "), "cause has a source: {line}");
+        }
+        for secret in secrets {
+            assert!(!text.contains(secret), "the logs leak {secret:?}: {text}");
+        }
+    }
+
+    #[test]
+    fn json_content_types_are_recognized() {
+        let json =
+            |value: &'static str| is_json_content_type(Some(&HeaderValue::from_static(value)));
+        for value in [
+            "application/json",
+            "Application/JSON",
+            "application/json; charset=utf-8",
+            " application/json ;charset=utf-8",
+            "application/problem+json",
+            "application/vnd.api+JSON; ext=1",
+        ] {
+            assert!(json(value), "{value}");
+        }
+        for value in
+            ["text/plain", "text/plain; charset=utf-8", "text/html", "application/jsonp", ""]
+        {
+            assert!(!json(value), "{value}");
+        }
+        assert!(!is_json_content_type(None));
     }
 
     /// A JSON-RPC call to `method` with empty params.

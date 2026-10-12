@@ -3,7 +3,8 @@
 //! When the gateway itself cannot serve a request (no ready upstream, upstream
 //! unreachable, upstream timed out) it must answer with a JSON-RPC 2.0 error
 //! object rather than a bare connection reset, so clients see a structured
-//! failure they can handle.
+//! failure they can handle. The same envelope replaces an upstream's error
+//! answer whose body is not JSON (see [`upstream_error_response`]).
 
 use std::{borrow::Cow, fmt};
 
@@ -50,6 +51,9 @@ mod code {
     /// Every in-flight slot the request could use is taken (its route's cap,
     /// or the cap on concurrent requests to the worker).
     pub(super) const OVERLOADED: i32 = -32009;
+    /// The upstream answered with an error status and a body that is not
+    /// JSON (a worker's `429` text/plain, for example).
+    pub(super) const UPSTREAM_ERROR: i32 = -32012;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
@@ -96,6 +100,13 @@ pub(crate) enum GatewayError {
     /// answers at once instead of queueing, so one saturated route cannot
     /// hold the connection slots the other route needs.
     Overloaded,
+    /// The upstream answered with a non-2xx `status` and a body that is not
+    /// JSON, so it carries no JSON-RPC answer to relay. The client gets the
+    /// upstream's status with a JSON-RPC error in place of the body.
+    UpstreamError {
+        /// The upstream's HTTP status, passed through to the client.
+        status: StatusCode,
+    },
 }
 
 impl GatewayError {
@@ -114,6 +125,7 @@ impl GatewayError {
             }
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
+            Self::UpstreamError { status } => *status,
         }
     }
 
@@ -131,12 +143,14 @@ impl GatewayError {
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::UnreadableBody => code::INVALID_REQUEST,
             Self::Overloaded => code::OVERLOADED,
+            Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
         }
     }
 
     /// A human-readable message paired with this error. Every message is
     /// static except the one for a transaction type without a name here,
-    /// which the screen cannot produce today (it refuses only types 3 and 4).
+    /// which the screen cannot produce today (it refuses only types 3 and 4),
+    /// and the upstream error's, which names the upstream's status.
     fn message(&self) -> Cow<'static, str> {
         let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
@@ -163,6 +177,10 @@ impl GatewayError {
             }
             Self::UnreadableBody => "request body could not be read",
             Self::Overloaded => "gateway overloaded; retry later",
+            Self::UpstreamError { status } => {
+                return format!("upstream returned {} without a JSON-RPC body", status.as_u16())
+                    .into();
+            }
         };
         Cow::Borrowed(message)
     }
@@ -185,6 +203,7 @@ impl GatewayError {
             Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
+            Self::UpstreamError { .. } => "upstream_error",
         }
     }
 }
@@ -206,7 +225,25 @@ pub(crate) fn error_response_with_id(err: &GatewayError, id: RequestId) -> Respo
     // point that records the rejection metric (by reason, plus the `rejected`
     // arm of the request counter).
     crate::telemetry::record_rejection(err.reason());
+    render(err, id)
+}
 
+/// Replace an upstream's non-JSON error answer with a JSON-RPC error that
+/// keeps the upstream's `status` and echoes the request `id` recovered from
+/// `request_body`.
+///
+/// The gateway did forward this request, so it is counted under its own
+/// `upstream_error` outcome rather than as a rejection (see
+/// [`crate::telemetry::record_upstream_error`]).
+pub(crate) fn upstream_error_response(status: StatusCode, request_body: &[u8]) -> Response {
+    let err = GatewayError::UpstreamError { status };
+    crate::telemetry::record_upstream_error(err.reason());
+    render(&err, RequestId::recover(request_body))
+}
+
+/// Render `err` as a JSON-RPC 2.0 error response echoing `id`, without
+/// recording any metric.
+fn render(err: &GatewayError, id: RequestId) -> Response {
     let body = json!({
         "jsonrpc": "2.0",
         "error": { "code": err.code(), "message": err.message() },
@@ -576,6 +613,7 @@ mod tests {
         assert_eq!(GatewayError::UnsupportedTransactionType(3).code(), -32008);
         assert_eq!(GatewayError::UnsupportedTransactionType(4).code(), -32008);
         assert_eq!(GatewayError::Overloaded.code(), -32009);
+        assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
     }
 
     /// An over-length batch shares the "too large" code and status with an
@@ -647,6 +685,10 @@ mod tests {
         );
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
         assert_eq!(GatewayError::Overloaded.reason(), "overloaded");
+        assert_eq!(
+            GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.reason(),
+            "upstream_error"
+        );
     }
 
     #[tokio::test]
@@ -663,5 +705,36 @@ mod tests {
         assert_eq!(body["error"]["code"], json!(-32009));
         assert_eq!(body["error"]["message"], json!("gateway overloaded; retry later"));
         assert_eq!(body["id"], json!("slot-1"));
+    }
+
+    #[tokio::test]
+    async fn upstream_error_code_and_reason_are_stable() {
+        // every upstream status maps to the one code and reason, and the
+        // status itself passes through to the client
+        for status in [
+            StatusCode::FOUND,
+            StatusCode::FORBIDDEN,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            StatusCode::TOO_MANY_REQUESTS,
+            StatusCode::INTERNAL_SERVER_ERROR,
+        ] {
+            let err = GatewayError::UpstreamError { status };
+            assert_eq!((err.code(), err.reason()), (-32012, "upstream_error"), "{status}");
+
+            let response = upstream_error_response(status, br#"{"id":"call-3"}"#);
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json"))
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+            let body: Value = serde_json::from_slice(&bytes).expect("json");
+            assert_eq!(body["error"]["code"], json!(-32012));
+            assert_eq!(
+                body["error"]["message"],
+                json!(format!("upstream returned {} without a JSON-RPC body", status.as_u16()))
+            );
+            assert_eq!(body["id"], json!("call-3"));
+        }
     }
 }

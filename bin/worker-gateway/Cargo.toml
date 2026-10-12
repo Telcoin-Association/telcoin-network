@@ -67,6 +67,8 @@ alloy = { workspace = true }
 # workspace), for the test that checks the scan against how the worker parses
 # a body
 jsonrpsee-types = { workspace = true }
+# `DebuggingRecorder` for the metric assertions (see `telemetry::test_utils`)
+metrics-util = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

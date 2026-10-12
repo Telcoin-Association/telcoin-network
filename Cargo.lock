@@ -12566,6 +12566,7 @@ dependencies = [
  "hyper-util",
  "jsonrpsee-types",
  "metrics",
+ "metrics-util",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

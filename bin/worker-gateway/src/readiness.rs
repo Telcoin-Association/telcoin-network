@@ -165,7 +165,7 @@ impl UpstreamReadiness {
                 }
             }
         }
-        crate::telemetry::set_upstream_ready(self.worker_id, self.is_ready());
+        crate::telemetry::set_upstream_ready(self.worker_id, &self.rpc_url, self.is_ready());
     }
 
     /// Count one forward that failed to connect (a connect timeout included).
@@ -187,7 +187,7 @@ impl UpstreamReadiness {
         let mut streak = self.streak();
         streak.successes = 0;
         if self.ready.swap(false, Ordering::Relaxed) {
-            crate::telemetry::set_upstream_ready(self.worker_id, false);
+            crate::telemetry::set_upstream_ready(self.worker_id, &self.rpc_url, false);
             self.log_not_ready(NotReadyCause::RpcPath);
         }
     }
@@ -490,8 +490,10 @@ impl fmt::Display for NotReadyCause {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::test_utils::CapturedMetrics;
     use axum::{body::Body, response::IntoResponse as _, routing::get, Router};
     use std::{io, net::SocketAddr, sync::atomic::AtomicU8, time::Instant};
+    use tn_types::Notifier;
     use tokio::net::TcpListener;
 
     #[test]
@@ -934,5 +936,102 @@ mod tests {
         readiness.set_ready(0, true);
         poll_cycle(&readiness, &client, Duration::from_secs(2)).await;
         assert!(!readiness.any_ready(), "an oversized body must fail the poll");
+    }
+
+    /// Two nodes whose workers share id `0` publish two readiness series, told
+    /// apart by the origin of each node's RPC URL, rather than overwriting one,
+    /// and a readiness transition's log line names its node by that origin too.
+    #[tokio::test]
+    async fn upstream_ready_series_distinguish_nodes_sharing_a_worker_id() {
+        let mut metrics = CapturedMetrics::install();
+        // the poller runs on this test's thread, so a thread-local subscriber
+        // sees its lines
+        let logs = Captured::default();
+        let writer = logs.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=trace")
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        let _logging = tracing::subscriber::set_default(subscriber);
+        // one mock serves both nodes' readiness endpoints, each on its own path
+        let mock = Router::new()
+            .route(
+                "/a/health/workers",
+                get(|| async {
+                    r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":false}]}"#
+                }),
+            )
+            .route(
+                "/b/health/workers",
+                get(|| async {
+                    r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
+                }),
+            );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // the mock lives as long as the test; a serve error only fails the
+            // readiness wait below
+            let _ = axum::serve(listener, mock).await;
+        });
+        let node = |rpc_url: &str, path: &str| UpstreamWorker {
+            worker_id: 0,
+            rpc_url: Url::parse(rpc_url).expect("rpc url"),
+            readiness_url: Url::parse(&format!("http://{addr}{path}")).expect("readiness url"),
+        };
+        // one successful poll turns a node ready, so the poller's first cycle
+        // decides both
+        let readiness = Arc::new(GatewayReadiness::new(
+            &[
+                node("http://10.0.0.1:8545/", "/a/health/workers"),
+                node("http://10.0.0.2:8545/", "/b/health/workers"),
+            ],
+            thresholds(3, 1),
+        ));
+
+        let shutdown = Notifier::new();
+        let poller = tokio::spawn(run_poller(
+            Arc::clone(&readiness),
+            Client::new(),
+            Duration::from_secs(3600),
+            Duration::from_secs(5),
+            shutdown.subscribe(),
+        ));
+        // the cycle polls both nodes at once, so wait until each has recorded
+        // its poll: the second turns ready and the first logs its first failure
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !(readiness.any_ready()
+                && logs.lines().iter().any(|line| line.contains("not ready since startup")))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("both nodes are polled");
+        shutdown.notify();
+        poller.await.expect("join").expect("poller");
+
+        let labels = |upstream: &str| {
+            vec![
+                ("upstream".to_string(), upstream.to_string()),
+                ("worker_id".to_string(), "0".to_string()),
+            ]
+        };
+        assert_eq!(
+            metrics.series("tn_worker_gateway_upstream_ready"),
+            vec![(labels("http://10.0.0.1:8545"), 0.0), (labels("http://10.0.0.2:8545"), 1.0)]
+        );
+
+        // every upstream starts not-ready, so only the second node transitions
+        let lines = logs.lines();
+        let became_ready: Vec<_> =
+            lines.iter().filter(|line| line.contains("upstream worker became ready")).collect();
+        assert_eq!(became_ready.len(), 1, "one transition: {lines:#?}");
+        assert!(became_ready[0].contains("upstream=http://10.0.0.2:8545"), "{lines:#?}");
+        assert!(
+            !lines.iter().any(|line| line.contains("became") && line.contains("10.0.0.1")),
+            "the not-ready node logged a transition: {lines:#?}"
+        );
     }
 }
