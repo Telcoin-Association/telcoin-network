@@ -1,13 +1,14 @@
 //! The HTTP side of `--forward-txs`: one JSON-RPC client per target, tried in configured order.
 //!
 //! [`TxForwarder::submit`] sends the client's bytes as `eth_sendRawTransaction` to the first
-//! target that is not demoted, then down the list. A JSON-RPC error reply is the validator's
-//! verdict and ends the walk: the client receives the error object unchanged. A request too large
-//! to send (refused by the client's own size cap, or answered with HTTP 413) also ends the walk,
-//! with the oversized-request error: the bytes are at fault, not the target, and failing over
-//! would upload them to every target in turn. Anything else short of a reply (a refused or reset
-//! connection, a timeout, another non-2xx status, an oversized or malformed body) demotes the
-//! target for [`DEMOTION_COOLDOWN`] and moves to the next one.
+//! target that is not demoted, then down the list. A JSON-RPC error reply to the request is the
+//! validator's verdict and ends the walk: the client receives the error object unchanged. A
+//! request too large to send (refused by the client's own size cap, or answered with HTTP 413)
+//! also ends the walk, with the oversized-request error: the bytes are at fault, not the target,
+//! and failing over would upload them to every target in turn. Anything else short of a reply (a
+//! refused or reset connection, a timeout, another non-2xx status, an oversized or malformed
+//! body, a result or an error that carries another request's id) demotes the target for
+//! [`DEMOTION_COOLDOWN`] and moves to the next one.
 //!
 //! Demoted targets are still tried, after every healthy one, so a list whose targets are all
 //! demoted keeps serving. When a target's cooldown runs out, one submission probes it in its
@@ -30,20 +31,30 @@
 
 use std::{
     fmt,
+    future::Future,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
     time::Duration,
 };
 
 use alloy::transports::Authorization;
 use jsonrpsee::{
-    core::client::{ClientT as _, Error as ClientError},
+    core::{
+        client::{
+            ClientT as _, Error as ClientError, MiddlewareBatchResponse, MiddlewareMethodResponse,
+            MiddlewareNotifResponse,
+        },
+        middleware::{
+            layer::RpcLogger, Batch, Notification, Request, RpcServiceBuilder, RpcServiceT,
+        },
+    },
     http_client::{
-        transport::Error as TransportError, HeaderMap, HeaderValue, HttpClient, HttpClientBuilder,
+        transport::{Error as TransportError, HttpBackend},
+        HeaderMap, HeaderValue, HttpClient, HttpClientBuilder, RpcService,
     },
     rpc_params,
     types::{
         error::{INTERNAL_ERROR_CODE, OVERSIZED_REQUEST_CODE, OVERSIZED_REQUEST_MSG},
-        ErrorObject, ErrorObjectOwned,
+        ErrorObject, ErrorObjectOwned, InvalidRequestId,
     },
 };
 use tn_types::{Bytes, B256};
@@ -88,6 +99,9 @@ pub(crate) const UNAVAILABLE_MESSAGE: &str = "transaction submission unavailable
 
 /// Marks a timestamp slot that has never been written.
 const NEVER: u64 = u64::MAX;
+
+/// The longest request or reply jsonrpsee's request logger prints, its default.
+const RPC_LOG_MAX_LEN: u32 = 1024;
 
 /// Relays raw transactions to the ordered `--forward-txs` targets with failover and demotion.
 ///
@@ -202,7 +216,8 @@ impl TxForwarder {
                     return Ok(hash);
                 }
                 Ok(Err(ClientError::Call(error))) => {
-                    // the target answered: its verdict is final and the target is healthy
+                    // the target answered this request (`ReplyIdCheck` matched the id): its
+                    // verdict is final and the target is healthy
                     debug!(
                         target: "tn::rpc::forward",
                         target_index = index,
@@ -311,7 +326,7 @@ impl fmt::Debug for TxForwarder {
 /// One configured target and its demotion state.
 struct Target {
     /// The lazily connecting JSON-RPC client for this target.
-    client: HttpClient,
+    client: TargetClient,
     /// The forwarder clock (ms) until which this target is tried after the healthy ones; 0 when
     /// healthy. A probe claim moves an expired deadline one attempt timeout ahead.
     demoted_until_ms: AtomicU64,
@@ -370,9 +385,69 @@ impl Default for Timeouts {
     }
 }
 
+/// The client each target gets: [`ReplyIdCheck`] over jsonrpsee's default request logger over the
+/// HTTP transport.
+type TargetClient = HttpClient<ReplyIdCheck<RpcLogger<RpcService<HttpBackend>>>>;
+
+/// RPC middleware that refuses a reply whose id is not the request's.
+///
+/// The jsonrpsee client compares ids only for a result: it turns an error reply into
+/// [`ClientError::Call`] before any id check. Without this layer, an error that carries another
+/// request's id (a proxy that mixes up replies, a stale cached reply) would reach the client as
+/// the target's verdict and stop the failover. A mismatch on either kind of reply becomes
+/// [`ClientError::InvalidRequestId`], which [`failure_kind`] counts as malformed. A `null` id
+/// matches no request, so an error the target could not tie to the request fails over too.
+#[derive(Debug, Clone)]
+struct ReplyIdCheck<S>(S);
+
+impl<S> RpcServiceT for ReplyIdCheck<S>
+where
+    S: RpcServiceT<
+            MethodResponse = Result<MiddlewareMethodResponse, ClientError>,
+            BatchResponse = Result<MiddlewareBatchResponse, ClientError>,
+            NotificationResponse = Result<MiddlewareNotifResponse, ClientError>,
+        > + Send
+        + Sync,
+{
+    type MethodResponse = S::MethodResponse;
+    type BatchResponse = S::BatchResponse;
+    type NotificationResponse = S::NotificationResponse;
+
+    fn call<'a>(
+        &self,
+        request: Request<'a>,
+    ) -> impl Future<Output = Self::MethodResponse> + Send + 'a {
+        let id = request.id.clone();
+        let reply = self.0.call(request);
+        async move {
+            let reply = reply.await?;
+            if *reply.id() == id {
+                Ok(reply)
+            } else {
+                Err(InvalidRequestId::NotPendingRequest(reply.id().to_string()).into())
+            }
+        }
+    }
+
+    // the forwarder sends neither batches nor notifications, so both pass through unchecked
+    fn batch<'a>(
+        &self,
+        requests: Batch<'a>,
+    ) -> impl Future<Output = Self::BatchResponse> + Send + 'a {
+        self.0.batch(requests)
+    }
+
+    fn notification<'a>(
+        &self,
+        notification: Notification<'a>,
+    ) -> impl Future<Output = Self::NotificationResponse> + Send + 'a {
+        self.0.notification(notification)
+    }
+}
+
 /// Build the lazily connecting client for one target. See [`TxForwarder::new`] for the limits
 /// and the credentials.
-fn target_client(target: &ForwardTarget, max_request_bytes: u32) -> eyre::Result<HttpClient> {
+fn target_client(target: &ForwardTarget, max_request_bytes: u32) -> eyre::Result<TargetClient> {
     let mut headers = HeaderMap::new();
     if let Some((user, password)) = target.credentials() {
         let mut value = HeaderValue::from_str(&Authorization::basic(user, password).to_string())?;
@@ -381,6 +456,9 @@ fn target_client(target: &ForwardTarget, max_request_bytes: u32) -> eyre::Result
         headers.insert("authorization", value);
     }
     let client = HttpClientBuilder::default()
+        .set_rpc_middleware(
+            RpcServiceBuilder::new().layer_fn(ReplyIdCheck).rpc_logger(RPC_LOG_MAX_LEN),
+        )
         .set_headers(headers)
         .request_timeout(ATTEMPT_TIMEOUT)
         .max_response_size(MAX_RESPONSE_BYTES)
@@ -395,7 +473,8 @@ fn failure_kind(error: &ClientError) -> RpcTxForwardFailure {
     match error {
         ClientError::RequestTimeout => RpcTxForwardFailure::Timeout,
         // JSON that is not a JSON-RPC reply to the request: it does not parse as a response,
-        // carries another request's id, or its result is not a hash
+        // carries another request's id (a result or an error, see `ReplyIdCheck`), or its result
+        // is not a hash
         ClientError::ParseError(_) | ClientError::InvalidRequestId(_) => {
             RpcTxForwardFailure::Malformed
         }

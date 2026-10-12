@@ -550,6 +550,39 @@ async fn test_forward_tries_demoted_target_last_until_cooldown() -> eyre::Result
     Ok(())
 }
 
+/// A reply that carries another request's id is not the target's verdict on this transaction,
+/// whether it is a result or an error: either one counts as malformed, demotes the target, and
+/// the next target answers. The second submission goes to the healthy target only.
+#[tokio::test]
+async fn test_forward_fails_over_on_error_reply_with_foreign_id() -> eyre::Result<()> {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    // the test runtime polls every future on this thread, so the guard covers the awaits too
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let hash = B256::repeat_byte(13);
+    let foreign_error = r#"{"jsonrpc":"2.0","id":"stale-request","error":{"code":-32000,"message":"nonce too low"}}"#;
+    let foreign_result = format!(r#"{{"jsonrpc":"2.0","id":"stale-request","result":"{hash}"}}"#);
+
+    for body in [foreign_error, foreign_result.as_str()] {
+        let stale = canned_endpoint(http_response("200 OK", body)).await?;
+        let healthy = FakeUpstream::start(Reply::Hash(hash)).await?;
+        let forwarder = forwarder(&[&stale, &healthy.url])?;
+
+        assert_eq!(forwarder.submit(&raw_tx()).await, Ok(hash), "reply {body}");
+        assert_eq!(healthy.calls(), vec![raw_tx_call()], "reply {body}");
+        assert_eq!(forwarder.submit(&raw_tx()).await, Ok(hash), "reply {body}");
+        assert_eq!(healthy.calls().len(), 2, "reply {body}");
+
+        let counters = Counters::take(&snapshotter);
+        assert_eq!(counters.failures("0", RpcTxForwardFailure::Malformed), Some(1), "{body}");
+        assert_eq!(counters.failures("0", RpcTxForwardFailure::Transport), Some(0), "{body}");
+        assert_eq!(counters.failures("0", RpcTxForwardFailure::Timeout), Some(0), "{body}");
+        assert_eq!(counters.outcome("accepted"), Some(2), "reply {body}");
+        assert_eq!(counters.outcome("upstream_error"), Some(0), "reply {body}");
+    }
+    Ok(())
+}
+
 /// Every outcome and every per-target failure lands in its own series, labeled by the
 /// target's index.
 #[tokio::test]
