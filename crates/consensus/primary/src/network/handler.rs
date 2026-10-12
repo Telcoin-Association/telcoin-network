@@ -205,12 +205,9 @@ where
         // `Parameters::validate_operational_floors` keeps the configured `gc_depth` above this
         // buffer, so the window is positive.  `saturating_sub` still guards the test-fixture path,
         // where that floor is intentionally not enforced and a small `gc_depth` can zero the
-        // window.
-        let gc_depth = self
-            .consensus_config
-            .parameters()
-            .gc_depth
-            .saturating_sub(tn_types::GC_ACTIVITY_BUFFER);
+        // window.  The rejoin rule in the executor's subscriber derives its window from the same
+        // helper, so promotion always sits inside this demotion window.
+        let gc_depth = tn_types::gc_activity_window(self.consensus_config.parameters().gc_depth);
         // is our round outside the GC window
         // Will be false when not the same epoch (can't compare rounds) but
         // epoch_behind will work in that case.
