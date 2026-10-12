@@ -7,7 +7,8 @@
 //! 2. **copy**, holding no lock and paced: each table's rows in key order, each its own batch
 //!    (removed, overwritten and cleared records are never reached);
 //! 3. **catch-up**, holding no lock and unpaced: what the old log's batches since `E` changed, in
-//!    rounds (each synced) until one had little left. A round writes its **net effect**: each
+//!    rounds (each synced) until one had little left, or at most 8 (a writer faster than the
+//!    catch-up is caught up by the switch's last try). A round writes its **net effect**: each
 //!    touched key's last write (a live row, copied as its own batch, or a removal of a row the new
 //!    log holds), after a clear of each table it cleared. So what was written and made dead during
 //!    the compaction is not copied, and the new log stays about the size of the live rows. Batch
@@ -15,7 +16,10 @@
 //!    renamed into place, and only then can a crash recover it;
 //! 4. **switch**, under the registry lock and then the write lock: the last batches, a row-count
 //!    check, a sync, the rename into place (`gen-N+1`) and a directory sync, then the writer moves
-//!    to the new generation and publishes every table from it.
+//!    to the new generation and publishes every table from it. A try that finds more than 4 MiB
+//!    landed meanwhile lets go of both locks and catches up again; the last of three takes up to 64
+//!    MiB under the write lock (writers wait once), so a compaction finishes at any sustained write
+//!    rate.
 //!
 //! Both generations hold every batch from the moment the new one is renamed into place (it was
 //! synced first), so a crash on either side of the rename loses nothing; a `compact-*` directory
@@ -68,8 +72,15 @@ use crate::{
 /// and runs another background round first, so writers wait for a small tail only.
 const SWITCH_TAIL_MAX: u64 = 4 << 20;
 
-/// Switch attempts before a compaction is abandoned (the writer kept outrunning it).
+/// Switch attempts before a compaction is abandoned (the writer kept outrunning it). The last one
+/// takes a tail of up to [`STALL_TAIL_MAX`].
 const SWITCH_TRIES: usize = 3;
+
+/// The most the switch's last try replays under the write lock: when the writer has outrun every
+/// background round and every earlier try, writers wait once while the rest is caught up (a
+/// bounded stall), so a compaction finishes at any sustained write rate (and the table indexes,
+/// which grow while a copy pins their snapshot, are replaced by fresh ones).
+const STALL_TAIL_MAX: u64 = 64 << 20;
 
 /// Free bytes below which a running compaction gives way to the writer (abandons): a full disk
 /// under the writer's own log growth would stop the database until a restart.
@@ -623,8 +634,9 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     #[cfg(test)]
     checkpoint(&gate, 1);
 
-    // 2. What was written since, in rounds, each synced, until a round has little left. Unpaced:
-    // paced below the writer's rate it would fall further behind every round.
+    // 2. What was written since, in rounds, each synced, until a round has little left (or the
+    // rounds run out: a writer faster than the catch-up is caught up by the switch's last try).
+    // Unpaced: paced below the writer's rate it would fall further behind every round.
     let mut done = snap.end;
     let mut rounds = 0;
     loop {
@@ -642,13 +654,13 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         }
         rounds += 1;
         if rounds >= MAX_CATCHUP_ROUNDS {
-            bail!("tnlog: compaction abandoned: the writer outran {rounds} catch-up rounds");
+            break;
         }
     }
 
     // 3. The switch: the registry lock (so no table is registered, nor its key size fixed,
     // until it is done), then the write lock for the last few batches.
-    for _ in 0..SWITCH_TRIES {
+    for attempt in 1..=SWITCH_TRIES {
         let registry = core.registry.lock();
         for (id, ksize) in core.table_ksizes() {
             if ksize > 0 {
@@ -671,7 +683,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         writer.check()?;
         debug_assert_eq!(writer.gen(), snap.gen, "only the compaction thread switches");
         let end = writer.log_len();
-        if end - done > SWITCH_TAIL_MAX {
+        let cap = if attempt == SWITCH_TRIES { STALL_TAIL_MAX } else { SWITCH_TAIL_MAX };
+        if end - done > cap {
             // Too much landed meanwhile: catch up without the locks and try again.
             drop(writer);
             drop(registry);
@@ -744,7 +757,10 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         remove_in_background(old_dir, "tnlog-reap");
         return Ok(true);
     }
-    bail!("tnlog: compaction abandoned: the writer outran {SWITCH_TRIES} switches")
+    bail!(
+        "tnlog: compaction abandoned: the writer outran {SWITCH_TRIES} switches (the last over \
+         {STALL_TAIL_MAX} bytes)"
+    )
 }
 
 /// The `tnlog-compact` thread: waits for a request (the automatic trigger, or

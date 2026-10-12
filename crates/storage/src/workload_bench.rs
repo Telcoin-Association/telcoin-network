@@ -1143,14 +1143,24 @@ impl Workload for BatchCache {
                                 std::thread::yield_now();
                                 continue;
                             }
-                            let chunk: Vec<B256> = (0..CACHE_READ_CHUNK)
+                            let picks: Vec<u64> = (0..CACHE_READ_CHUNK)
                                 .map(|_| {
                                     x = mix(x);
-                                    keys[(low + x % (available - low)) as usize]
+                                    low + x % (available - low)
                                 })
                                 .collect();
+                            let chunk: Vec<B256> =
+                                picks.iter().map(|&i| keys[i as usize]).collect();
                             let got = db.multi_get::<Batches>(chunk.iter()).expect("multi_get");
-                            assert!(got.iter().all(Option::is_some), "a written batch is readable");
+                            // A reader descheduled for more than two outputs may find its picks
+                            // evicted meanwhile; only a batch still above the floor must be there.
+                            let floor_now = floor.load(Ordering::Acquire);
+                            for (pick, value) in picks.iter().zip(&got) {
+                                assert!(
+                                    value.is_some() || *pick < floor_now,
+                                    "a written batch is readable until it is evicted"
+                                );
+                            }
                             gets += chunk.len() as u64;
                         }
                         gets

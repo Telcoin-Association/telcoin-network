@@ -1282,3 +1282,73 @@ fn test_tnlog_compaction_sync_round_across_the_switch() {
     assert_eq!(db.get::<TestTable>(&101).expect("get"), Some("new gen".to_string()));
     assert_eq!(db.iter::<TestTable>().count(), 52);
 }
+
+/// A writer that keeps outrunning the catch-up (more than a round's worth lands during every
+/// round) no longer makes the compaction give up: once the rounds run out it goes to the switch,
+/// which takes the rest under the write lock, and every row is kept.
+#[test]
+fn test_tnlog_compaction_completes_when_the_catch_up_never_converges() {
+    let tmp = TempDir::with_prefix("tnlog_compact_outrun_rounds").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let value = "v".repeat(64 << 10);
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let mut next = 1_000_u64;
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        loop {
+            let n = next_checkpoint(&arrivals);
+            if n == 3 {
+                break;
+            }
+            // Over a round's worth (1 MiB), so no round ever counts as caught up.
+            for _ in 0..20 {
+                db.insert::<TestTable>(&next, &value).expect("insert");
+                next += 1;
+            }
+            release.send(()).expect("release");
+        }
+        drop(release);
+        assert_eq!(compaction.join().expect("compaction thread"), Ok(true));
+    });
+    assert_eq!(db.iter::<TestTable>().count() as u64, 10 + (next - 1_000));
+}
+
+/// A writer that lands more than the switch's usual cap before every try no longer makes the
+/// compaction give up: the last try takes the tail under the write lock (a bounded stall), and
+/// every row is kept.
+#[test]
+fn test_tnlog_compaction_last_switch_takes_a_large_tail() {
+    let tmp = TempDir::with_prefix("tnlog_compact_outrun_switch").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let value = "v".repeat(64 << 10);
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    let mut next = 1_000_u64;
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        for n in [1, 2] {
+            assert_eq!(next_checkpoint(&arrivals), n);
+            release.send(()).expect("release");
+        }
+        // Before every switch try, a tail over the usual 4 MiB cap.
+        while let Ok(n) = arrivals.recv_timeout(Duration::from_secs(30)) {
+            assert_eq!(n, 3, "only switch tries remain");
+            for _ in 0..80 {
+                db.insert::<TestTable>(&next, &value).expect("a 5 MiB tail");
+                next += 1;
+            }
+            if release.send(()).is_err() {
+                break;
+            }
+        }
+        assert_eq!(compaction.join().expect("compaction thread"), Ok(true));
+    });
+    let retries = db.core().compact.test.switch_retries.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(retries, 2, "the usual cap twice, then the bounded stall");
+    assert_eq!(db.iter::<TestTable>().count() as u64, 10 + (next - 1_000));
+}

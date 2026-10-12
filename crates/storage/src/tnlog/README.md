@@ -211,7 +211,7 @@ once (a log of at least 1 MiB). A failed compaction backs the trigger off (60 s,
 2. **Copy**, no lock, paced: each table's rows in key order, each its own batch (the stored put
    record with its batch-end flag set). Each snapshot is dropped once copied.
 3. **Catch-up**, no lock, unpaced, in rounds (each synced) until one had at most 1 MiB, at most
-   8 rounds. A round writes the **net effect** of the old log's batches since the last one: a
+   8 rounds (a writer faster than the catch-up is then caught up by the switch's last try). A round writes the **net effect** of the old log's batches since the last one: a
    clear of each table it cleared (if the new log holds rows of it), then each touched key's last
    write, in key order: a live row copied as its own batch, or a removal of a row the new log
    holds. What was written and made dead during the compaction is not copied, so the new log
@@ -221,12 +221,14 @@ once (a log of at least 1 MiB). A failed compaction backs the trigger off (60 s,
    and then the write lock: an empty index for each table with a key size and no rows, a last
    round, `compacted` written (temp file, sync, rename, directory sync); then under the write
    lock the last few batches (if more than 4 MiB landed meanwhile, it lets go of both locks and
-   tries again, at most 3 times), a row-count check against every table, a sync, the rename into
+   tries again; the third and last try takes up to 64 MiB under the write lock, so writers wait
+   once and a compaction finishes at any sustained write rate), a row-count check against every table, a sync, the rename into
    place, a directory sync, and the install: the writer moves to the new log, indexes, view and
    frontier, and publishes every table. The install does no I/O and cannot fail.
 
 **Failures.** Before the rename, a failure (or a panic, or less than 256 MiB free, checked before
-each round and the switch) abandons the compaction: its files are deleted after the locks are
+each round and the switch, or more than 64 MiB landing before the last switch try) abandons the
+compaction: its files are deleted after the locks are
 released, and the database carries on in its generation. After the rename, a failure (the
 directory sync) or a panic stops the writer, latched: which generation the next open picks is
 unknown. A compaction needs the generation's size plus 128 MiB free to start. A close cancels a
