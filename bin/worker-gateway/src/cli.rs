@@ -90,11 +90,14 @@ pub(crate) struct Cli {
     pub(crate) upstream_connect_timeout: Duration,
 
     /// Overall per-request deadline when forwarding to an upstream: a worker, or
-    /// the `--redirect-queries` endpoint.
+    /// the `--redirect-queries` endpoint. The default outlasts the 30 s reth
+    /// gives `eth_sendRawTransactionSync` to wait for its receipt
+    /// (`--rpc.send-raw-transaction-sync-timeout`), so a slow Sync call gets
+    /// the worker's own answer rather than a gateway timeout.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
-        default_value = "30s",
+        default_value = "35s",
         value_parser = humantime::parse_duration
     )]
     pub(crate) upstream_request_timeout: Duration,
@@ -165,11 +168,25 @@ pub(crate) struct Cli {
     )]
     pub(crate) max_request_bytes: usize,
 
+    /// Maximum number of calls in one JSON-RPC batch (default 50; `0` means
+    /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
+    /// long" error (`413`, `-32003`) before it is screened or forwarded, on
+    /// either route. The effective cap never exceeds the smallest enabled
+    /// rate-limit burst: a batch needs one token per call at once, so a longer
+    /// one could never pass.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_BATCH_LEN",
+        default_value_t = crate::proxy::DEFAULT_MAX_BATCH_LEN
+    )]
+    pub(crate) max_batch_len: usize,
+
     /// Sustained per-client-IP request rate, in requests per second (`0`
-    /// disables per-IP rate limiting). The client IP is the immediate TCP peer,
-    /// or, when that peer is in `--trusted-proxies`, the client it forwarded the
-    /// request for; behind a proxy that is not listed, every client shares the
-    /// proxy's bucket (see the README).
+    /// disables per-IP rate limiting); a batch counts one request per call.
+    /// The client IP is the immediate TCP peer, or, when that peer is in
+    /// `--trusted-proxies`, the client it forwarded the request for; behind a
+    /// proxy that is not listed, every client shares the proxy's bucket (see
+    /// the README).
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP", default_value_t = 100)]
     pub(crate) rate_limit_per_ip: u32,
 
@@ -203,7 +220,8 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_v4_prefix: u8,
 
     /// Sustained gateway-wide request rate across all clients, in requests per
-    /// second (`0` disables the global rate limit).
+    /// second (`0` disables the global rate limit); a batch counts one request
+    /// per call.
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_GLOBAL", default_value_t = 3_000)]
     pub(crate) rate_limit_global: u32,
 
@@ -290,6 +308,8 @@ pub(crate) struct Settings {
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
+    /// Maximum calls in one JSON-RPC batch, or `None` when unlimited.
+    pub(crate) max_batch_len: Option<NonZeroUsize>,
     /// Per-client-IP rate limit, or `None` when disabled.
     pub(crate) rate_limit_per_ip: Option<RateLimit>,
     /// Network prefix each client address is masked to before it keys a
@@ -368,6 +388,32 @@ impl Cli {
             "--proxy-protocol requires --trusted-proxies: the PROXY header is read only from a \
              trusted proxy, so with none listed it would never be read"
         );
+        let rate_limit_per_ip =
+            resolve_rate_limit(self.rate_limit_per_ip, self.rate_limit_per_ip_burst);
+        let rate_limit_global =
+            resolve_rate_limit(self.rate_limit_global, self.rate_limit_global_burst);
+        // a batch of k calls needs k tokens at once and no bucket ever holds
+        // more than its burst, so a batch longer than the smallest enabled
+        // burst could only ever get a 429 that no retry satisfies; cap batches
+        // there so such a batch gets the final 413 instead
+        let smallest_burst = [rate_limit_per_ip, rate_limit_global]
+            .iter()
+            .flatten()
+            .filter_map(|limit| NonZeroUsize::try_from(limit.burst()).ok())
+            .min();
+        let max_batch_len = match (NonZeroUsize::new(self.max_batch_len), smallest_burst) {
+            (cap, Some(burst)) if cap.is_none_or(|cap| burst < cap) => {
+                warn!(
+                    target: "gateway",
+                    max_batch_len = self.max_batch_len,
+                    burst = burst.get(),
+                    "--max-batch-len is above the smallest rate-limit burst, and a batch needs \
+                     one token per call at once; capping batches at the burst"
+                );
+                Some(burst)
+            }
+            (cap, _) => cap,
+        };
         Ok(Settings {
             listen_addr: self.listen_addr,
             upstreams,
@@ -381,15 +427,10 @@ impl Cli {
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
-            rate_limit_per_ip: resolve_rate_limit(
-                self.rate_limit_per_ip,
-                self.rate_limit_per_ip_burst,
-            ),
+            max_batch_len,
+            rate_limit_per_ip,
             rate_limit_prefix,
-            rate_limit_global: resolve_rate_limit(
-                self.rate_limit_global,
-                self.rate_limit_global_burst,
-            ),
+            rate_limit_global,
             trusted_proxies,
             proxy_protocol: self.proxy_protocol,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
@@ -635,15 +676,15 @@ mod tests {
 
     #[test]
     fn connection_cap_below_request_deadline_is_rejected() {
-        // Default single-request bound is 10s (header phase) + 30s + 10s
-        // (whole-request deadline) = 50s; a cap of the bare whole-request
-        // deadline (40s) could still cut off a request whose headers took the
+        // Default single-request bound is 10s (header phase) + 35s + 10s
+        // (whole-request deadline) = 55s; a cap of the bare whole-request
+        // deadline (45s) could still cut off a request whose headers took the
         // full header window to arrive.
         let result = Cli::parse_from([
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
-            "--max-connection-duration=40s",
+            "--max-connection-duration=45s",
         ])
         .into_settings();
         assert!(result.is_err(), "a cap below the single-request bound must be a startup error");
@@ -653,10 +694,23 @@ mod tests {
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
-            "--max-connection-duration=50s",
+            "--max-connection-duration=55s",
         ])
         .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
+    }
+
+    /// WG-32: reth gives `eth_sendRawTransactionSync` 30 s to wait for its
+    /// receipt by default (`--rpc.send-raw-transaction-sync-timeout`). The
+    /// gateway's default upstream deadline must outlast it, or a slow Sync
+    /// call races the gateway's own `504`.
+    #[test]
+    fn default_upstream_timeout_exceeds_reths_sync_deadline() -> eyre::Result<()> {
+        let reth_sync_deadline = Duration::from_secs(30);
+        let timeout = cli_with_flags(&[]).into_settings()?.upstream_request_timeout;
+        assert!(timeout > reth_sync_deadline, "{timeout:?}");
+        assert!(timeout >= Duration::from_secs(35), "{timeout:?}");
+        Ok(())
     }
 
     #[test]
@@ -725,6 +779,7 @@ mod tests {
     fn edge_protection_defaults() -> eyre::Result<()> {
         let settings = cli_with_flags(&[]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_048_576);
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(50));
         let per_ip = settings.rate_limit_per_ip.expect("per-ip limit on by default");
         assert_eq!(per_ip.rate().get(), 100);
         // A zero burst flag derives twice the sustained rate.
@@ -834,12 +889,12 @@ mod tests {
 
     #[test]
     fn proxy_protocol_counts_its_header_in_the_single_request_bound() {
-        // 10s for the proxy header, then the default 50s bound
+        // 10s for the proxy header, then the default 55s bound
         let flags = ["--proxy-protocol", "--trusted-proxies=10.0.0.0/8"];
-        let below = cli_with_flags(&[&flags[..], &["--max-connection-duration=50s"]].concat())
+        let below = cli_with_flags(&[&flags[..], &["--max-connection-duration=55s"]].concat())
             .into_settings();
         assert!(below.is_err(), "the proxy header's read time must count toward the bound");
-        let boundary = cli_with_flags(&[&flags[..], &["--max-connection-duration=60s"]].concat())
+        let boundary = cli_with_flags(&[&flags[..], &["--max-connection-duration=65s"]].concat())
             .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the bound must be accepted");
     }
@@ -848,6 +903,54 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn max_batch_len_is_configurable_and_zero_is_unlimited() -> eyre::Result<()> {
+        let settings = cli_with_flags(&["--max-batch-len=7"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(7));
+        let settings = cli_with_flags(&[
+            "--max-batch-len=0",
+            "--rate-limit-per-ip=0",
+            "--rate-limit-global=0",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.max_batch_len, None);
+        Ok(())
+    }
+
+    /// A batch needs one token per call at once and no bucket holds more than
+    /// its burst, so the effective cap stops at the smallest enabled burst: a
+    /// longer batch gets the final `413`, not a `429` no retry can satisfy.
+    #[test]
+    fn max_batch_len_is_capped_at_the_smallest_burst() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[
+            "--max-batch-len=500",
+            "--rate-limit-per-ip-burst=300",
+            "--rate-limit-global-burst=400",
+        ])
+        .into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(300));
+        // `0` means unlimited before the clamp, so the defaults cap it at the
+        // per-ip burst, or at the global one with per-ip limiting off
+        let settings = cli_with_flags(&["--max-batch-len=0"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(200));
+        let settings =
+            cli_with_flags(&["--max-batch-len=0", "--rate-limit-per-ip=0"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(6_000));
+        // a cap within every burst is kept
+        let settings = cli_with_flags(&["--max-batch-len=200"]).into_settings()?;
+        assert_eq!(settings.max_batch_len, NonZeroUsize::new(200));
+        // with both limiters off the cap is as given
+        for (flag, cap) in
+            [("--max-batch-len=500", NonZeroUsize::new(500)), ("--max-batch-len=0", None)]
+        {
+            let settings =
+                cli_with_flags(&[flag, "--rate-limit-per-ip=0", "--rate-limit-global=0"])
+                    .into_settings()?;
+            assert_eq!(settings.max_batch_len, cap, "{flag}");
+        }
         Ok(())
     }
 

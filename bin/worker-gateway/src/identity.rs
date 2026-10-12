@@ -103,6 +103,13 @@ pub(crate) struct Forwarding {
 }
 
 impl Forwarding {
+    /// The resolved client as the [`ClientAddr`] the identity middleware stores
+    /// for the rate limiter, so a charge made after the body is read (a batch's
+    /// calls beyond the first) keys on the same address as the edge layer.
+    pub(crate) fn client_addr(&self) -> ClientAddr {
+        ClientAddr(self.client)
+    }
+
     /// The upstream `X-Forwarded-For`: the peer alone, or the forwarded client
     /// followed by the trusted peer that vouched for it. An inbound chain is
     /// never copied, so an upstream that reads the header sees only addresses
@@ -259,7 +266,7 @@ pub(crate) async fn identify(
     let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip());
     if let Some(peer) = peer {
         let forwarding = trusted.resolve(peer, request.headers());
-        request.extensions_mut().insert(ClientAddr(forwarding.client));
+        request.extensions_mut().insert(forwarding.client_addr());
         request.extensions_mut().insert(forwarding);
     }
     next.run(request).await

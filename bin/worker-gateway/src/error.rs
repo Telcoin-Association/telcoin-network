@@ -13,7 +13,7 @@ use axum::{
     response::Response,
 };
 use serde::{
-    de::{IgnoredAny, MapAccess, Visitor},
+    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::{json, Value};
@@ -32,7 +32,8 @@ mod code {
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
     /// The upstream did not answer within the request deadline.
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
-    /// The request body exceeded the gateway's size limit.
+    /// The request body exceeded the gateway's size limit, or a batch its
+    /// length limit.
     pub(super) const REQUEST_TOO_LARGE: i32 = -32003;
     /// The request already passed through a worker gateway (forwarding loop).
     pub(super) const LOOP_DETECTED: i32 = -32004;
@@ -43,12 +44,19 @@ mod code {
     /// An `eth_sendRawTransaction` payload could not be decoded as a transaction.
     pub(super) const INVALID_TRANSACTION: i32 = -32007;
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
+    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
+    /// transaction).
     pub(super) const UNSUPPORTED_TRANSACTION_TYPE: i32 = -32008;
     /// The request body could not be read. This is the spec-defined
     /// "Invalid Request" code, not a gateway-range code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
 }
+
+/// The EIP-2718 type byte of an EIP-4844 blob transaction.
+const EIP4844_TX_TYPE: u8 = 3;
+
+/// The EIP-2718 type byte of an EIP-7702 set-code transaction.
+const EIP7702_TX_TYPE: u8 = 4;
 
 /// A gateway-side failure surfaced to the client as a JSON-RPC error.
 #[derive(Debug)]
@@ -62,6 +70,8 @@ pub(crate) enum GatewayError {
     UpstreamTimeout,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
+    /// A batch carried more calls than `--max-batch-len` allows.
+    BatchTooLong,
     /// The request already carried the gateway's hop marker (forwarding loop).
     LoopDetected,
     /// The request did not complete within the gateway's request deadline.
@@ -72,9 +82,12 @@ pub(crate) enum GatewayError {
     /// transaction (malformed hex or RLP).
     InvalidTransaction,
     /// An `eth_sendRawTransaction` payload decoded to a transaction type the
-    /// network does not accept (an EIP-4844 blob transaction).
-    UnsupportedTransactionType,
+    /// network does not accept (an EIP-4844 blob or EIP-7702 set-code
+    /// transaction). Carries the EIP-2718 type byte, which the message names.
+    UnsupportedTransactionType(u8),
     /// The request body could not be read (e.g. the client aborted mid-body).
+    /// Also answers a batch the gateway cannot read to its end, whose length,
+    /// and so its cost, is unknown.
     UnreadableBody,
 }
 
@@ -85,11 +98,13 @@ impl GatewayError {
             Self::NoUpstreamReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
-            Self::RequestTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
-            Self::InvalidTransaction | Self::UnsupportedTransactionType => StatusCode::BAD_REQUEST,
+            Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
+                StatusCode::BAD_REQUEST
+            }
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
         }
     }
@@ -100,34 +115,46 @@ impl GatewayError {
             Self::NoUpstreamReady => code::NO_UPSTREAM_READY,
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
-            Self::RequestTooLarge => code::REQUEST_TOO_LARGE,
+            Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
             Self::LoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
-            Self::UnsupportedTransactionType => code::UNSUPPORTED_TRANSACTION_TYPE,
+            Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::UnreadableBody => code::INVALID_REQUEST,
         }
     }
 
-    /// A human-readable message paired with this error.
-    fn message(&self) -> &'static str {
-        match self {
+    /// A human-readable message paired with this error. Every message is
+    /// static except the one for a transaction type without a name here,
+    /// which the screen cannot produce today (it refuses only types 3 and 4).
+    fn message(&self) -> Cow<'static, str> {
+        let message = match self {
             Self::NoUpstreamReady => "no upstream worker is ready",
             Self::UpstreamUnreachable => "upstream unreachable",
             Self::UpstreamTimeout => "upstream request timed out",
             Self::RequestTooLarge => "request body too large",
+            Self::BatchTooLong => "batch too long",
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"
             }
             Self::RequestTimeout => "request did not complete within the gateway's deadline",
             Self::RateLimited => "rate limit exceeded; slow down and retry",
             Self::InvalidTransaction => "raw transaction could not be decoded",
-            Self::UnsupportedTransactionType => {
+            Self::UnsupportedTransactionType(EIP4844_TX_TYPE) => {
                 "unsupported transaction type: EIP-4844 blob transactions are not accepted"
             }
+            Self::UnsupportedTransactionType(EIP7702_TX_TYPE) => {
+                "unsupported transaction type: EIP-7702 set-code transactions are not accepted"
+            }
+            Self::UnsupportedTransactionType(ty) => {
+                return Cow::Owned(format!(
+                    "unsupported transaction type: type {ty:#04x} transactions are not accepted"
+                ));
+            }
             Self::UnreadableBody => "request body could not be read",
-        }
+        };
+        Cow::Borrowed(message)
     }
 
     /// A stable, machine-readable reason label for the
@@ -140,11 +167,12 @@ impl GatewayError {
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::UpstreamTimeout => "upstream_timeout",
             Self::RequestTooLarge => "request_too_large",
+            Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
             Self::RequestTimeout => "request_timeout",
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
-            Self::UnsupportedTransactionType => "unsupported_transaction_type",
+            Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
             Self::UnreadableBody => "unreadable_body",
         }
     }
@@ -234,6 +262,47 @@ impl RequestId {
         serde_json::from_slice::<IdMember>(request_body)
             .map(|parsed| Self(parsed.0))
             .unwrap_or(Self(Value::Null))
+    }
+
+    /// Best-effort recovery of the `id` of the call at `index` in an unparsed
+    /// batch body, read the way [`Self::recover`] reads a single call's.
+    ///
+    /// The elements before it are skipped in place and the ones after it
+    /// drained, so this too costs one scan of the body and materializes only
+    /// the one `id`. Anything that is not a batch with an object at `index`
+    /// recovers `null`.
+    pub(crate) fn recover_element(request_body: &[u8], index: usize) -> Self {
+        let mut deserializer = serde_json::Deserializer::from_slice(request_body);
+        (&mut deserializer)
+            .deserialize_seq(ElementIdVisitor { index })
+            .and_then(|id| deserializer.end().map(|()| Self(id)))
+            .unwrap_or(Self(Value::Null))
+    }
+}
+
+/// Visitor behind [`RequestId::recover_element`]: the `id` of the batch
+/// element at `index`, every other element skipped in place.
+struct ElementIdVisitor {
+    /// The position of the element whose id is kept.
+    index: usize,
+}
+
+impl<'de> Visitor<'de> for ElementIdVisitor {
+    type Value = Value;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON-RPC batch")
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
+        for _ in 0..self.index {
+            if elements.next_element::<IgnoredAny>()?.is_none() {
+                return Ok(Value::Null);
+            }
+        }
+        let id = elements.next_element::<IdMember>()?.map_or(Value::Null, |IdMember(id)| id);
+        while elements.next_element::<IgnoredAny>()?.is_some() {}
+        Ok(id)
     }
 }
 
@@ -329,6 +398,20 @@ mod tests {
         // Last-wins is how a full parse into `Value` resolves a duplicated
         // member; recovery must not diverge from it on a malformed body.
         assert_eq!(recovered(br#"{"id":1,"id":2}"#), json!(2));
+    }
+
+    #[test]
+    fn recovers_the_id_of_a_batch_element() {
+        let batch = br#"[{"id":1},{"method":"m","params":["0x00"],"id":"tx-2"},{"id":[3]},7]"#;
+        let element = |index| RequestId::recover_element(batch, index).0;
+        assert_eq!(element(0), json!(1));
+        assert_eq!(element(1), json!("tx-2"));
+        assert_eq!(element(2), json!([3]));
+        // not an object, past the end, and not a batch at all
+        assert_eq!(element(3), Value::Null);
+        assert_eq!(element(4), Value::Null);
+        assert_eq!(RequestId::recover_element(br#"{"id":1}"#, 0).0, Value::Null);
+        assert_eq!(RequestId::recover_element(br#"[{"id":1}] trailing"#, 0).0, Value::Null);
     }
 
     #[test]
@@ -459,11 +542,15 @@ mod tests {
             StatusCode::TOO_MANY_REQUESTS
         );
         assert_eq!(
+            error_response(&GatewayError::BatchTooLong, b"{}").status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
+        assert_eq!(
             error_response(&GatewayError::InvalidTransaction, b"{}").status(),
             StatusCode::BAD_REQUEST
         );
         assert_eq!(
-            error_response(&GatewayError::UnsupportedTransactionType, b"{}").status(),
+            error_response(&GatewayError::UnsupportedTransactionType(4), b"{}").status(),
             StatusCode::BAD_REQUEST
         );
     }
@@ -472,9 +559,60 @@ mod tests {
     fn new_edge_protection_codes_are_stable() {
         // The codes are part of the client contract; pin them so a reorder or
         // renumber is caught.
+        assert_eq!(GatewayError::BatchTooLong.code(), -32003);
         assert_eq!(GatewayError::RateLimited.code(), -32006);
         assert_eq!(GatewayError::InvalidTransaction.code(), -32007);
-        assert_eq!(GatewayError::UnsupportedTransactionType.code(), -32008);
+        assert_eq!(GatewayError::UnsupportedTransactionType(3).code(), -32008);
+        assert_eq!(GatewayError::UnsupportedTransactionType(4).code(), -32008);
+    }
+
+    /// An over-length batch shares the "too large" code and status with an
+    /// oversized body, so a client that already handles `413` / `-32003`
+    /// handles it too, while its own reason label and message tell the two
+    /// apart.
+    #[tokio::test]
+    async fn batch_too_long_code_and_reason_are_stable() {
+        let err = GatewayError::BatchTooLong;
+        assert_eq!((err.code(), err.reason()), (-32003, "batch_too_long"));
+        assert_ne!(err.reason(), GatewayError::RequestTooLarge.reason());
+
+        let response = error_response(&err, br#"[{"id":1}]"#);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], json!(-32003));
+        assert_eq!(body["error"]["message"], json!("batch too long"));
+        assert_eq!(body["id"], Value::Null);
+    }
+
+    /// WG-52: an EIP-7702 rejection used to be reported as "EIP-4844 blob".
+    /// The message names the type that was refused; the code and reason stay
+    /// one per variant, so dashboards and clients are unaffected.
+    #[tokio::test]
+    async fn rejected_type_is_named() {
+        let message = |ty| GatewayError::UnsupportedTransactionType(ty).message();
+        assert_eq!(
+            message(4),
+            "unsupported transaction type: EIP-7702 set-code transactions are not accepted"
+        );
+        assert_eq!(
+            message(3),
+            "unsupported transaction type: EIP-4844 blob transactions are not accepted"
+        );
+        assert_eq!(
+            message(0x7f),
+            "unsupported transaction type: type 0x7f transactions are not accepted"
+        );
+
+        let response = error_response_with_id(
+            &GatewayError::UnsupportedTransactionType(4),
+            RequestId(json!(1)),
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(body["error"]["code"], json!(-32008));
+        let rendered = body["error"]["message"].as_str().expect("message");
+        assert!(rendered.contains("EIP-7702") && !rendered.contains("EIP-4844"), "{rendered}");
     }
 
     #[test]
@@ -486,12 +624,13 @@ mod tests {
         assert_eq!(GatewayError::UpstreamUnreachable.reason(), "upstream_unreachable");
         assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
+        assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
         assert_eq!(GatewayError::RequestTimeout.reason(), "request_timeout");
         assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");
         assert_eq!(GatewayError::InvalidTransaction.reason(), "invalid_transaction");
         assert_eq!(
-            GatewayError::UnsupportedTransactionType.reason(),
+            GatewayError::UnsupportedTransactionType(4).reason(),
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");

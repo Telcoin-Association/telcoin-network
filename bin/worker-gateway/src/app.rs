@@ -34,6 +34,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
+        max_batch_len,
         rate_limit_per_ip,
         rate_limit_prefix,
         rate_limit_global,
@@ -78,6 +79,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol,
         max_request_bytes,
+        ?max_batch_len,
         ?tcp_user_timeout,
         ?max_connection_duration,
         "edge protections configured"
@@ -132,7 +134,12 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    let state = AppState { readiness: Arc::clone(&readiness), http: proxy_client, query_upstream };
+    let state = AppState {
+        readiness: Arc::clone(&readiness),
+        http: proxy_client,
+        query_upstream,
+        max_batch_len,
+    };
 
     spawner.spawn_critical_task(
         "readiness-poller",
