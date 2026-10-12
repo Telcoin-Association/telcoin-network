@@ -884,21 +884,24 @@ where
 
     /// Spawn a long-running task that dials a peer by [`BlsPublicKey`], retrying with backoff.
     ///
-    /// Dialing self is skipped. Startup callers use the node-lifetime spawner, so their retries
-    /// survive epoch turnover; per-epoch callers use the epoch spawner and are cancelled at its
-    /// boundary. Backoff doubles up to 120s. Only a successful dial or an already-connected peer
-    /// ends retries immediately; an in-flight dial may still fail and must keep being retried.
-    /// Dial outcome waits and established-peer probes each have a one-second bound, including
-    /// channel admission. A timed-out outcome wait does not cancel the swarm's transport dial.
-    /// The task only gives up once it has retried enough and another peer is established.
-    /// It will not abandon dialing while isolated, and task-manager shutdown cancels retries.
+    /// Dialing self and hubs maintained by their swarm is skipped. Startup callers use the
+    /// node-lifetime spawner, so their retries survive epoch turnover; per-epoch callers use
+    /// the epoch spawner and are cancelled at its boundary. Backoff doubles up to 120s. Only a
+    /// successful dial or an already-connected peer ends retries immediately; an in-flight dial
+    /// may still fail and must keep being retried. Dial outcome waits and established-peer
+    /// probes each have a one-second bound, including channel admission. A timed-out outcome
+    /// wait does not cancel the swarm's transport dial. The task only gives up once it has
+    /// retried enough and another peer is established. It will not abandon dialing while
+    /// isolated, and task-manager shutdown cancels retries.
     pub(super) fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
         bls_pubkey: BlsPublicKey,
         task_spawner: TaskSpawner,
     ) {
-        if bls_pubkey == self.key_config.public_key() {
+        if bls_pubkey == self.key_config.public_key()
+            || self.trusted_peer_keys.contains(&bls_pubkey)
+        {
             // Don't try to dial ourselves.
             return;
         }

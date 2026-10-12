@@ -295,6 +295,8 @@ pub(crate) struct EpochManager<P, DB> {
     /// Bootstrap servers loaded once from the genesis committee, used to seed peer discovery on
     /// the long-running networks.
     bootstrap_servers: BTreeMap<BlsPublicKey, BootstrapServer>,
+    /// Hubs maintained by the swarm, excluded from per-epoch dial tasks.
+    trusted_peer_keys: HashSet<BlsPublicKey>,
 
     /// Static version string for the running node, reported by node-info surfaces.
     version_str: &'static str,
@@ -803,6 +805,7 @@ where
             last_forwarded_consensus_number: 0,
             consensus_chain,
             bootstrap_servers,
+            trusted_peer_keys: HashSet::new(),
             version_str,
             exec_state_exporter,
             state_export_retention,
@@ -1012,6 +1015,20 @@ where
                 network_config.validate_local_committee_peer(public_key, Some(id), worker)
             },
         )?;
+        let trusted_validation_peers = self
+            .bootstrap_servers
+            .iter()
+            .chain(network_config.committee_peers().iter())
+            .map(|(key, peer)| (*key, peer.clone()))
+            .collect();
+        network_config.validate_trusted_nodes(
+            &trusted_validation_peers,
+            node_info.p2p_info.workers.len(),
+            &self.key_config.primary_public_key(),
+            &node_info.p2p_info.primary,
+            &node_info.p2p_info.workers,
+        )?;
+        self.trusted_peer_keys = network_config.trusted_nodes().keys().copied().collect();
         network_config.set_chain_id(self.builder.tn_config.genesis().config.chain_id);
         let (primary_address, worker_addresses) = self
             .spawn_node_networks(
@@ -1110,6 +1127,16 @@ where
                     .map_err(Into::into)
             })
             .await?;
+        primary_network_handle
+            .inner_handle()
+            .add_trusted_peers(
+                network_config
+                    .trusted_nodes()
+                    .iter()
+                    .map(|(bls, node)| (*bls, node.primary().clone()))
+                    .collect(),
+            )
+            .await?;
         info!(target: "epoch-manager", ?primary_address, "listening to {primary_address}");
         primary_network_handle.inner_handle().start_listening(primary_address).await?;
         self.bootstrap_servers
@@ -1118,6 +1145,7 @@ where
             .copied()
             .collect::<std::collections::BTreeSet<_>>()
             .into_iter()
+            .filter(|key| !network_config.trusted_nodes().contains_key(key))
             .for_each(|key| {
                 self.dial_peer_bls(
                     primary_network_handle.inner_handle().clone(),
@@ -1128,6 +1156,8 @@ where
 
         let manager = &*self;
         let startup_spawner = &node_task_spawner;
+        let trusted_config = &network_config;
+        let trusted_nodes = network_config.trusted_nodes();
         let worker_addresses = &worker_addresses;
         futures::stream::iter(self.worker_network_handles.iter().map(Ok::<_, eyre::Report>))
             .try_for_each(|network_handle| async move {
@@ -1140,6 +1170,10 @@ where
                         peer.worker(worker_id).cloned().map(|worker| (*key, worker))
                     })
                     .collect();
+                network_handle
+                    .inner_handle()
+                    .add_trusted_peers(trusted_config.trusted_worker_peers(worker_id))
+                    .await?;
                 let seeded_peers: BTreeMap<_, _> = committee_peers
                     .iter()
                     .filter(|(key, _)| **key != public_key)
@@ -1157,6 +1191,7 @@ where
                     .chain(seeded_peers.into_keys())
                     .collect::<std::collections::BTreeSet<_>>()
                     .into_iter()
+                    .filter(|key| !trusted_nodes.contains_key(key))
                     .for_each(|key| {
                         manager.dial_peer_bls(
                             network_handle.inner_handle().clone(),
