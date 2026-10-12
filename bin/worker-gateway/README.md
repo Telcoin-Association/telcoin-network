@@ -26,8 +26,10 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 - TLS termination and auth/API keys are out of scope; run the gateway behind
   your own ingress/mTLS.
 - Header forwarding is minimal. Upstream gets the request method, body, and
-  `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (real client
-  identity) and the `X-TN-Gateway` hop marker (loop protection; calls sent to
+  `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client
+  identity the gateway resolved, never the client's own values; see
+  [Client identity behind a front](#client-identity-behind-a-front)) and the
+  `X-TN-Gateway` hop marker (loop protection; calls sent to
   the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
   gets the upstream status, body, and `Content-Type`. All other headers are
   dropped in both directions; in particular CORS is not terminated here, so
@@ -101,7 +103,7 @@ Every flag has an environment-variable fallback.
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `30s` | Upstream per-request deadline. |
-| `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard). |
+| `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard); a `--proxy-protocol` connection from a listed front gets one more for its PROXY header. |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
@@ -112,6 +114,8 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its bucket. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
+| `--trusted-proxies` | `WORKER_GATEWAY_TRUSTED_PROXIES` | (none) | Comma-separated CIDR ranges (a bare address is one host) of the fronts whose `X-Forwarded-For`, `X-Forwarded-Proto` and PROXY header the gateway believes; unset trusts none. See [Client identity behind a front](#client-identity-behind-a-front). |
+| `--proxy-protocol` | `WORKER_GATEWAY_PROXY_PROTOCOL` | `false` | Expect a PROXY protocol v2 header on every connection from a `--trusted-proxies` peer (the env value is `true` or `false`); requires `--trusted-proxies`. |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
@@ -123,6 +127,11 @@ Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
 Every inbound connection is served with a header read deadline
 (`--header-read-timeout`), `TCP_NODELAY`, and a global concurrency cap
 (`--max-connections`; further connections wait in the OS accept backlog).
+With `--proxy-protocol`, a connection from a listed front first has up to
+`--header-read-timeout` for its PROXY header and then the full deadline again
+for its request headers, so a slow client behind a front that sends the PROXY
+header only with the client's first bytes can hold a connection slot for twice
+`--header-read-timeout` before its headers complete.
 Each request additionally has a whole-request deadline of
 `--upstream-request-timeout` + `--header-read-timeout` covering the body read
 and the upstream response headers, so a request body trickled in below the
@@ -144,8 +153,9 @@ to be worth a slot but fast enough to defeat the transport guard. The cap
 closes abruptly: an exchange in flight on a long-lived keep-alive session is
 cut off at the cap, so size it well above the longest legitimate transfer.
 It must be at least the gateway's single-request bound
-(`--header-read-timeout` + the whole-request deadline above) so the first
-request on a connection can never be cut off.
+(`--header-read-timeout` + the whole-request deadline above, plus one more
+`--header-read-timeout` for the PROXY header with `--proxy-protocol`) so the
+first request on a connection can never be cut off.
 
 Every request forwarded to a worker carries the `X-TN-Gateway` hop marker (calls
 sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
@@ -199,10 +209,11 @@ landing in one `/64`.
 > keying raises the cost of the attack from free to the price of address space;
 > it does not eliminate it. Size `--rate-limit-global` accordingly.
 
-The client identity is the immediate TCP peer. Run the gateway **edge-facing**:
-behind an untrusted L7 proxy the peer is that proxy, so per-IP limiting would
-meter the proxy, not the real client. Terminate client identity at that proxy,
-or put the per-IP limit there.
+The client identity is the immediate TCP peer, unless that peer is listed in
+`--trusted-proxies`: then it is the client the proxy forwarded the request for
+(see [Client identity behind a front](#client-identity-behind-a-front)). Behind
+a front that is not listed, the peer is that front, so per-IP limiting meters
+the front, not the real client.
 
 > The default rates (`100`/s per IP, `3000`/s global) are conservative starting
 > points, not tuned figures. Set them to your workers' measured capacity before
@@ -217,6 +228,73 @@ the worst possible moment).
 Per-IP state is bounded: idle buckets are swept periodically and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
 limit.
+
+#### Client identity behind a front
+
+A front that terminates TCP (an ingress controller, an HTTP proxy, a load
+balancer in proxy mode) is the peer of every connection it relays, so without
+help every client behind it shares the front's per-IP bucket. Two mechanisms
+carry the client address through such a front. Both apply only to a peer listed
+in `--trusted-proxies` (comma-separated IPv4 and IPv6 CIDR ranges; a bare
+address is a single host):
+
+- **`X-Forwarded-For`**, for an HTTP proxy or ingress. A request from a listed
+  peer is attributed to the right-most `X-Forwarded-For` entry that is not
+  itself listed: every `X-Forwarded-For` line is read as one comma-separated
+  chain, walked from the right, listed addresses are skipped, and the walk stops
+  at the first unlisted one. Entries to its left are never read. An unparsable
+  entry reached first, a missing or empty chain, or a chain of nothing but
+  listed addresses falls back to the peer.
+- **PROXY protocol v2** (`--proxy-protocol`), for a TCP load balancer that
+  cannot add headers. Every connection from a listed peer must open with a
+  binary PROXY protocol v2 header for TCP over IPv4 or IPv6, and the source
+  address in it takes the peer's place. A `LOCAL` header (the balancer's own
+  health check) keeps the balancer's address. A missing or malformed header, a
+  header for another protocol, or one not complete within
+  `--header-read-timeout` closes the connection without a response; a peer
+  that is not listed is served as plain HTTP. The `X-Forwarded-For` rule then
+  runs against the address from the header, so it applies only when that
+  address is itself listed (an HTTP proxy behind the balancer).
+
+**What a listed front must do.** The gateway believes a listed front's headers
+because it assumes the front wrote them, so check each front before listing it:
+
+- An HTTP front must append the address it received the connection from to
+  `X-Forwarded-For` (nginx:
+  `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;`, HAProxy:
+  `option forwardfor` without `if-none`), or replace the header with that
+  address (nginx: `$remote_addr`), and must set `X-Forwarded-Proto` itself. A
+  front that passes the client's own `X-Forwarded-For` through unchanged, as a
+  plain nginx `proxy_pass` or HAProxy without `option forwardfor` does, lets
+  every client choose its own rate-limit key.
+- A TCP front must send a PROXY protocol v2 header on every connection before
+  `--proxy-protocol` is turned on, and must keep sending it. If a listed front
+  relays a connection without one, the gateway reads the client's own first
+  bytes as the header, so the client can name any source address.
+- Never list a TCP front without `--proxy-protocol`: it relays the client's own
+  `X-Forwarded-For` untouched.
+
+**Spoofing rule.** A client writes every header it sends and every byte its
+connection opens with, so the gateway believes `X-Forwarded-For`,
+`X-Forwarded-Proto` and the PROXY header only from a listed peer, and only the
+entries a listed hop vouched for. From any other peer they are ignored and the
+client is the peer. Behind a listed front, a client cannot choose its own
+rate-limit bucket as long as every listed front does what the list above
+requires. List only the fronts' own addresses: a range that also covers clients
+(or other workloads that can reach the gateway) lets them spoof, and a `/0`
+range logs a warning at startup. Firewall the gateways so that only the front
+reaches them (see [Firewalling](#firewalling)).
+
+An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches as IPv4 in the peer, the
+chain and the ranges alike, so a dual-stack listener needs no extra ranges. A
+range with bits set below its prefix (`10.0.0.1/8`), a prefix wider than its
+family, an empty element, or `--proxy-protocol` without `--trusted-proxies` is a
+startup error.
+
+Toward the upstream, `X-Forwarded-For` is the peer alone, or the resolved client
+followed by the listed peer that vouched for it; the inbound chain is never
+copied. `X-Forwarded-Proto` is copied from a listed peer when its right-most
+value is `http` or `https`, and is `http` otherwise.
 
 ### Request size
 
@@ -392,7 +470,7 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
   `/ready` means "can take submissions", so a gateway whose worker is down drops out even though it still serves reads; every gateway shares the worker, so probe `/health` instead if reads must survive a worker outage.
 - Lock the domain at the registrar and enable DNSSEC where the provider supports it; a hijacked name serves forged state to every client.
 - Absorb packet floods in front of the gateways.
-  A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer; use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
+  A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer, unless the front is listed in `--trusted-proxies` and passes the client address in `X-Forwarded-For` or a PROXY protocol v2 header (see [Client identity behind a front](#client-identity-behind-a-front)); otherwise use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
 - If you use a front, firewall the gateways so that only the front reaches them; a gateway reachable directly bypasses it.
 
 ### Firewalling
@@ -418,5 +496,28 @@ ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
 `tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
 turnkey install: see `deploy/README.md` for the placeholders to replace and the
 prometheus-adapter rule the autoscaler needs.
+
+The reference Service is a `ClusterIP`, so clients reach the gateways through a
+front, and the gateways see that front as every client's address until client
+identity is configured (see
+[Client identity behind a front](#client-identity-behind-a-front)):
+
+- **Behind an ingress controller or another HTTP proxy**, set `--trusted-proxies`
+  to the narrowest ranges that cover the proxy's own addresses, and configure
+  the proxy to append the address it received the connection from to
+  `X-Forwarded-For` (or replace the header with it) and to set
+  `X-Forwarded-Proto`, as
+  [Client identity behind a front](#client-identity-behind-a-front) requires. A
+  range as wide as the cluster's pod network also trusts every other pod that
+  can reach the gateway.
+- **Behind an L4 load balancer**, first check whether it preserves client
+  addresses: a `LoadBalancer` or `NodePort` Service with
+  `externalTrafficPolicy: Local` does, and the gateway then needs neither
+  mechanism. A balancer that terminates TCP needs PROXY protocol v2 enabled on
+  it, and the gateway started with `--proxy-protocol` and `--trusted-proxies`
+  set to the addresses the balancer connects from. Every connection from those
+  addresses must then carry the header, so keep the kubelet's probe source (the
+  node address, for the `/health` and `/ready` probes on the `rpc` port) out of
+  `--trusted-proxies`, or the probes are closed and the pod never turns ready.
 
 Before putting gateways in front of a validator, read the [production-readiness review](docs/production-readiness.md), in particular its operator guidance on DNS, the DDoS front, firewalling and sizing for N gateways.

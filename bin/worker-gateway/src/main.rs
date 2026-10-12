@@ -13,6 +13,7 @@ mod app;
 mod cli;
 mod config;
 mod error;
+mod identity;
 mod proxy;
 mod ratelimit;
 mod readiness;
