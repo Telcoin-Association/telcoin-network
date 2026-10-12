@@ -65,6 +65,7 @@ use url::Url;
 
 use crate::{
     cli::Settings,
+    dns::{self, CachingResolver, LookupHost},
     error::{
         error_response, error_response_with_id, upstream_error_response, GatewayError, RequestId,
     },
@@ -411,8 +412,11 @@ pub(crate) async fn proxy(
             // worker that drops syns still counts. a timeout or failure after
             // the request was sent neither counts nor resets the count: the
             // client's method and params decide how long the worker takes
-            // (eth_sendRawTransactionSync waits up to 30 s for inclusion).
-            let connect_failed = source.is_connect();
+            // (eth_sendRawTransactionSync waits up to 30 s for inclusion). a
+            // lookup the gateway's own resolver refused because every lookup
+            // slot was busy is a connect error too, but it says nothing about
+            // the worker, so it does not count either.
+            let connect_failed = source.is_connect() && !dns::is_saturated(&source);
             let result = if matches!(err, GatewayError::UpstreamTimeout) {
                 "timeout"
             } else {
@@ -662,7 +666,8 @@ where
 /// Start a client for the upstream hop with the settings every upstream client
 /// shares: rustls, trusting the platform's native root store plus every
 /// `--upstream-ca-cert` certificate, the `--upstream-client-cert` identity when
-/// one is configured, and the upstream connect timeout.
+/// one is configured, the upstream connect timeout, and a resolver over
+/// `lookup` (the system resolver, [`dns::SystemLookup`], outside tests).
 ///
 /// The forwarding client ([`proxy_client`]) and the readiness poller's client
 /// both start here, so an `https` worker URL and its readiness URL are verified
@@ -673,9 +678,23 @@ where
 /// one (rustls sends it only on request). An upstream whose
 /// certificate chains to none of these roots fails the handshake: a forward to
 /// it fails and a poll marks it not ready, so a wrong CA fails closed.
-pub(crate) fn client_builder(settings: &Settings) -> ClientBuilder {
+///
+/// Upstream names resolve through a [`CachingResolver`] that caches each
+/// host's addresses for `--dns-cache-ttl` and caps how many lookups run at once
+/// at `--max-concurrent-dns-lookups` (see [`crate::dns`]). Each call installs a
+/// new one, so every client built from here has its own cache and its own cap
+/// (see [`crate::app::UpstreamClients`]). A lookup the resolver refuses fails
+/// the connection at once, which [`classify_error`] reports as
+/// `UpstreamUnreachable`; passive health does not count that refusal against
+/// the worker (see [`dns::is_saturated`]).
+pub(crate) fn client_builder(settings: &Settings, lookup: Arc<dyn LookupHost>) -> ClientBuilder {
+    let resolver =
+        CachingResolver::new(lookup, settings.dns_cache_ttl, settings.max_concurrent_dns_lookups);
     let builder = settings.upstream_ca_certs.iter().cloned().fold(
-        Client::builder().use_rustls_tls().connect_timeout(settings.upstream_connect_timeout),
+        Client::builder()
+            .use_rustls_tls()
+            .connect_timeout(settings.upstream_connect_timeout)
+            .dns_resolver(Arc::new(resolver)),
         ClientBuilder::add_root_certificate,
     );
     match &settings.upstream_identity {
@@ -695,9 +714,10 @@ pub(crate) fn client_builder(settings: &Settings) -> ClientBuilder {
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either.
 ///
-/// TLS and the connect timeout come from `builder`. reqwest builds a client
-/// over an empty native root store without complaint, so startup checks the
-/// store itself when an `https` upstream depends on it (see [`crate::app`]).
+/// TLS, the connect timeout and the resolver come from `builder`. reqwest
+/// builds a client over an empty native root store without complaint, so
+/// startup checks the store itself when an `https` upstream depends on it (see
+/// [`crate::app`]).
 pub(crate) fn proxy_client(
     builder: ClientBuilder,
     request_timeout: Duration,
@@ -2682,7 +2702,10 @@ mod tests {
         ])
         .into_settings()
         .expect("settings");
-        let proxy = proxy_client(client_builder(&settings), Duration::from_secs(1));
+        let proxy = proxy_client(
+            client_builder(&settings, Arc::new(crate::dns::SystemLookup)),
+            Duration::from_secs(1),
+        );
         assert!(proxy.is_ok(), "{proxy:?}");
     }
 }

@@ -38,6 +38,9 @@
 //! it, so `tn_worker_gateway_route_inflight{route}` always equals the permits
 //! held on that route's cap, and `tn_worker_gateway_upstream_inflight` the
 //! permits held on the cap of concurrent requests to the worker.
+//!
+//! [`record_dns_lookup`] counts the outcomes of name resolution by the upstream
+//! clients' caching resolvers, both clients in one series (see [`crate::dns`]).
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -92,6 +95,15 @@ const ROUTE_INFLIGHT: &str = "tn_worker_gateway_route_inflight";
 /// Requests this gateway is forwarding to a worker right now, under
 /// `--max-upstream-inflight`.
 const UPSTREAM_INFLIGHT: &str = "tn_worker_gateway_upstream_inflight";
+
+/// Name resolutions by the upstream clients' caching resolvers, by `result`:
+/// `hit` (answered from the cache, fresh or stale), `miss` (a lookup was
+/// started), `error` (a started lookup failed) or `rejected` (a lookup was
+/// needed but every lookup slot was busy). A resolve that joins a lookup
+/// already in flight for the same host is counted only by that lookup's
+/// `miss`; a stale hit whose background refresh could not start counts as
+/// both `hit` and `rejected`.
+const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -200,6 +212,12 @@ pub(crate) fn record_routed(route: &'static str, result: &'static str) {
 /// submissions with other calls.
 pub(crate) fn record_mixed_batch() {
     counter!(MIXED_BATCHES_TOTAL).increment(1);
+}
+
+/// Record one name resolution with its `result` (`hit`, `miss`, `error` or
+/// `rejected`).
+pub(crate) fn record_dns_lookup(result: &'static str) {
+    counter!(DNS_LOOKUPS_TOTAL, "result" => result).increment(1);
 }
 
 /// Publish a worker's current readiness as a `0`/`1` gauge, keyed by its

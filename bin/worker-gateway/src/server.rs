@@ -575,8 +575,10 @@ fn set_tcp_user_timeout(_stream: &TcpStream, _timeout: Duration) -> std::io::Res
 mod tests {
     use super::*;
     use crate::{
+        app::UpstreamClients,
         cli::{Cli, Settings},
         config::UpstreamWorker,
+        dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
         proxy::{client_builder, proxy_client, DEFAULT_MAX_BATCH_LEN, MAX_REQUEST_BYTES},
         ratelimit::{PrefixPolicy, RateLimit},
@@ -3697,17 +3699,21 @@ mod tests {
     /// The gateway state with the production upstream client built from
     /// `settings`, as `app::run` builds it, with every worker not ready.
     fn production_state(settings: &Settings) -> AppState {
-        let http = proxy_client(client_builder(settings), settings.upstream_request_timeout)
-            .expect("proxy client");
+        let http = proxy_client(
+            client_builder(settings, Arc::new(SystemLookup)),
+            settings.upstream_request_timeout,
+        )
+        .expect("proxy client");
         test_state_with_client(&settings.upstreams, http)
     }
 
     /// Serve a gateway for `settings` with a live readiness poller using the
-    /// production readiness client, as `app::run` wires it. The two
-    /// `Notifier`s keep the server and the poller alive.
+    /// production clients, as `app::run` wires them. The two `Notifier`s keep
+    /// the server and the poller alive.
     async fn spawn_polled_gateway(settings: &Settings) -> (SocketAddr, Notifier, Notifier) {
-        let state = production_state(settings);
-        let readiness_client = client_builder(settings).build().expect("readiness client");
+        let UpstreamClients { proxy, readiness: readiness_client } =
+            UpstreamClients::new(settings, Arc::new(SystemLookup)).expect("upstream clients");
+        let state = test_state_with_client(&settings.upstreams, proxy);
         let query_probe = settings
             .query_upstream
             .clone()
@@ -3892,5 +3898,508 @@ mod tests {
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         assert_eq!(accepted.rpc_hits.load(Ordering::SeqCst), 1);
         assert_eq!(refused.rpc_hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// reqwest connects to an IP literal without calling its resolver, so a
+    /// literal upstream never takes a lookup permit or a cache entry.
+    #[tokio::test]
+    async fn ip_literal_upstreams_never_reach_the_resolver() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&lookups);
+        let lookup = lookup_fn(move |_host| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            async { Err(std::io::Error::other("no name should be looked up")) }
+        });
+        let settings =
+            worker_settings("http", worker, worker, &["--max-concurrent-dns-lookups=1".into()]);
+        let client =
+            proxy_client(client_builder(&settings, lookup), settings.upstream_request_timeout)
+                .expect("client");
+        let state = redirect_state_with_client(worker, Some(query), client);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+        assert_eq!(lookups.load(Ordering::SeqCst), 0, "an IP literal is never looked up");
+    }
+
+    /// The `Threads:` count from `/proc/self/status`.
+    fn thread_count() -> usize {
+        std::fs::read_to_string("/proc/self/status")
+            .expect("read /proc/self/status")
+            .lines()
+            .find_map(|line| line.strip_prefix("Threads:"))
+            .and_then(|count| count.trim().parse().ok())
+            .expect("Threads: line")
+    }
+
+    /// A node health endpoint reporting worker 0 ready.
+    async fn ready_node() -> (SocketAddr, Notifier) {
+        let node = Router::new().route(
+            "/health/workers",
+            get(|| async {
+                r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#
+            }),
+        );
+        spawn(node).await
+    }
+
+    /// `http://{host}:{port of addr}{path}`.
+    fn named_url(host: &str, addr: SocketAddr, path: &str) -> Url {
+        Url::parse(&format!("http://{host}:{}{path}", addr.port())).expect("url")
+    }
+
+    /// The #1614 stall: the query host's name takes 10 s to resolve, and each
+    /// lookup holds a blocking thread the way `getaddrinfo` does, while 100
+    /// reads per second go to that host. Readiness polls and submissions,
+    /// which resolve the worker's name, must keep working, and the lookups
+    /// must not pile up threads. Measures the process's thread count, so it is
+    /// ignored by default; run it by hand with `--run-ignored only
+    /// --no-capture` to see the numbers.
+    ///
+    /// The thread bound checks one lookup per host (single flight) together
+    /// with the lookup cap, not the cap alone: only `query.test` is slow, so
+    /// single flight already keeps it to one blocking thread, and the bound
+    /// would hold with the cap removed. The cap itself is asserted by the
+    /// `dns` unit tests, and
+    /// `held_query_host_lookup_leaves_ready_and_submissions_at_200` runs the
+    /// `/ready` and submission assertions without the thread count.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "measures the process thread count; run by hand"]
+    async fn slow_query_host_resolution_does_not_stall_readiness_or_submissions() {
+        const MAX_LOOKUPS: usize = 8;
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let (node, _node) = ready_node().await;
+
+        let query_lookups = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&query_lookups);
+        let lookup = lookup_fn(move |host| {
+            let slow = host == "query.test";
+            if slow {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            async move {
+                if slow {
+                    tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_secs(10)))
+                        .await
+                        .map_err(std::io::Error::other)?;
+                }
+                Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+            }
+        });
+        // the production wiring: separate resolvers for the two clients, and
+        // the query probe on the proxy client
+        let settings = worker_settings(
+            "http",
+            worker,
+            node,
+            &[
+                format!("--max-concurrent-dns-lookups={MAX_LOOKUPS}"),
+                "--upstream-connect-timeout=2s".into(),
+                "--upstream-request-timeout=5s".into(),
+            ],
+        );
+        let clients = UpstreamClients::new(&settings, lookup).expect("clients");
+
+        let query_url = named_url("query.test", query, "/");
+        let query_probe = QueryProbe { url: query_url.clone(), client: clients.proxy.clone() };
+        let state = AppState {
+            query_upstream: Some(query_url),
+            ..test_state_with_client(
+                &[UpstreamWorker {
+                    worker_id: 0,
+                    rpc_url: named_url("worker.test", worker, "/"),
+                    readiness_url: named_url("worker.test", node, "/health/workers"),
+                }],
+                clients.proxy,
+            )
+        };
+        let poller = Notifier::new();
+        tokio::spawn(run_poller(
+            Arc::clone(&state.readiness),
+            clients.readiness,
+            Some(query_probe),
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            poller.subscribe(),
+        ));
+        // room for every read in flight, so the connection cap is not what
+        // stalls the probes
+        let limits = ServerLimits {
+            max_connections: NonZeroUsize::new(4_096).expect("nonzero"),
+            ..test_limits()
+        };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let client = Client::new();
+        let mut ready = false;
+        for _ in 0..50 {
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            if response.status() == StatusCode::OK {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(ready, "the poller should mark the worker ready");
+        let start = thread_count();
+
+        let reader = Client::new();
+        let reads = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            let mut sent = Vec::with_capacity(300);
+            for id in 0..300_u64 {
+                ticker.tick().await;
+                let read = reader.post(format!("http://{gateway}/")).body(call("eth_chainId", id));
+                sent.push(tokio::spawn(async move { read.send().await.map(|r| r.status()) }));
+            }
+            sent
+        });
+
+        let mut peak = start;
+        let mut ticker = tokio::time::interval(Duration::from_millis(100));
+        for id in 0..30_u64 {
+            ticker.tick().await;
+            let response = client
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_sendRawTransaction", id))
+                .send()
+                .await
+                .expect("submission");
+            assert_eq!(response.status(), StatusCode::OK, "submission {id}");
+            assert_eq!(response.text().await.expect("text"), "worker");
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            assert_eq!(response.status(), StatusCode::OK, "/ready at tick {id}");
+            peak = peak.max(thread_count());
+        }
+        let end = thread_count();
+        println!("threads: start {start}, peak {peak}, end {end}");
+
+        let bound = start + MAX_LOOKUPS + 4;
+        assert!(peak < bound && end < bound, "threads grew from {start} to {peak} (bound {bound})");
+        assert_eq!(query_lookups.load(Ordering::SeqCst), 1, "every read shares one lookup");
+        for read in reads.await.expect("reads") {
+            let status = read.await.expect("join").expect("a gateway response");
+            assert!(
+                matches!(status, StatusCode::GATEWAY_TIMEOUT | StatusCode::BAD_GATEWAY),
+                "{status}"
+            );
+        }
+        assert_eq!(query_seen.hits(), 0);
+        assert!(worker_seen.hits() >= 30);
+    }
+
+    /// The #1614 acceptance assertions without the thread count, so they run
+    /// by default: while the query host's lookup is held, reads to it fail at
+    /// the connect timeout, and submissions and `/ready`, which resolve the
+    /// worker's name, keep answering `200`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn held_query_host_lookup_leaves_ready_and_submissions_at_200() {
+        const CONNECT_TIMEOUT: Duration = Duration::from_millis(200);
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let (node, _node) = ready_node().await;
+
+        // the query host's lookup waits on the gate; any other host resolves
+        // at once
+        let gate = Arc::new(Semaphore::new(0));
+        let query_lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let gate = Arc::clone(&gate);
+            let query_lookups = Arc::clone(&query_lookups);
+            lookup_fn(move |host| {
+                let held = host == "query.test";
+                if held {
+                    query_lookups.fetch_add(1, Ordering::SeqCst);
+                }
+                let gate = Arc::clone(&gate);
+                async move {
+                    if held {
+                        // closing the gate releases the lookup
+                        let _closed = gate.acquire().await;
+                    }
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+                }
+            })
+        };
+        // the production wiring: separate resolvers for the two clients, and
+        // the query probe on the proxy client
+        let settings = worker_settings(
+            "http",
+            worker,
+            node,
+            &[
+                "--max-concurrent-dns-lookups=8".into(),
+                format!("--upstream-connect-timeout={}ms", CONNECT_TIMEOUT.as_millis()),
+                "--upstream-request-timeout=5s".into(),
+            ],
+        );
+        let clients = UpstreamClients::new(&settings, lookup).expect("clients");
+        let query_url = named_url("query.test", query, "/");
+        let query_probe = QueryProbe { url: query_url.clone(), client: clients.proxy.clone() };
+        let state = AppState {
+            query_upstream: Some(query_url),
+            ..test_state_with_client(
+                &[UpstreamWorker {
+                    worker_id: 0,
+                    rpc_url: named_url("worker.test", worker, "/"),
+                    readiness_url: named_url("worker.test", node, "/health/workers"),
+                }],
+                clients.proxy,
+            )
+        };
+        let poller = Notifier::new();
+        tokio::spawn(run_poller(
+            Arc::clone(&state.readiness),
+            clients.readiness,
+            Some(query_probe),
+            Duration::from_millis(50),
+            Duration::from_secs(1),
+            poller.subscribe(),
+        ));
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let client = Client::new();
+        let mut ready = false;
+        for _ in 0..100 {
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            if response.status() == StatusCode::OK {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready, "the poller should mark the worker ready");
+
+        // a read starts the held lookup and gives up at the connect timeout,
+        // well before the 5 s request timeout
+        let started = tokio::time::Instant::now();
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 0)).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert!(elapsed >= CONNECT_TIMEOUT && elapsed < Duration::from_secs(2), "{elapsed:?}");
+
+        // reads keep arriving and join the held lookup, while submissions and
+        // `/ready` keep answering
+        let mut reads = Vec::with_capacity(10);
+        for id in 1..=10_u64 {
+            reads.push(tokio::spawn(post_rpc(gateway, None, call("eth_chainId", id))));
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "submission {id}");
+            let response =
+                client.get(format!("http://{gateway}/ready")).send().await.expect("ready");
+            assert_eq!(response.status(), StatusCode::OK, "/ready after submission {id}");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        for read in reads {
+            let (status, _) = read.await.expect("join");
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        }
+        assert_eq!(query_lookups.load(Ordering::SeqCst), 1, "every read joined the held lookup");
+        assert_eq!(query_seen.hits(), 0);
+        assert_eq!(worker_seen.hits(), 10);
+        gate.close();
+    }
+
+    /// Exhausting the proxy client's lookup permits leaves the readiness poll
+    /// resolving: [`UpstreamClients`] gives each client its own resolver.
+    #[tokio::test]
+    async fn readiness_resolver_is_independent_of_the_proxy_resolver() {
+        let (node, _node) = ready_node().await;
+        let gate = Arc::new(Semaphore::new(0));
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let gate = Arc::clone(&gate);
+            let lookups = Arc::clone(&lookups);
+            lookup_fn(move |host| {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                let gate = Arc::clone(&gate);
+                async move {
+                    if host == "slow.test" {
+                        // closing the gate releases the lookup
+                        let _closed = gate.acquire().await;
+                    }
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+                }
+            })
+        };
+        let settings = worker_settings(
+            "http",
+            node,
+            node,
+            &[
+                "--max-concurrent-dns-lookups=1".into(),
+                "--upstream-connect-timeout=5s".into(),
+                "--upstream-request-timeout=5s".into(),
+            ],
+        );
+        let clients = UpstreamClients::new(&settings, lookup).expect("clients");
+
+        // a read to a slow host takes the proxy client's only lookup permit
+        let proxy = clients.proxy.clone();
+        let slow_url = named_url("slow.test", node, "/");
+        let slow = tokio::spawn(async move { proxy.post(slow_url).send().await.map(|_| ()) });
+        let mut started = false;
+        for _ in 0..500 {
+            if lookups.load(Ordering::SeqCst) == 1 {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started, "the slow lookup should have started");
+
+        // the proxy client is out of permits: another host fails at once
+        let refused = tokio::time::Instant::now();
+        let err = clients
+            .proxy
+            .post(named_url("other.test", node, "/"))
+            .send()
+            .await
+            .expect_err("no lookup permit is free");
+        assert!(err.is_connect(), "{err:?}");
+        assert!(refused.elapsed() < Duration::from_secs(1), "the refusal must not wait");
+        assert_eq!(lookups.load(Ordering::SeqCst), 1);
+
+        // the readiness poller still resolves the worker's host
+        let readiness = Arc::new(GatewayReadiness::new(
+            &[UpstreamWorker {
+                worker_id: 0,
+                rpc_url: named_url("worker.test", node, "/"),
+                readiness_url: named_url("worker.test", node, "/health/workers"),
+            }],
+            test_thresholds(),
+        ));
+        let poller = Notifier::new();
+        tokio::spawn(run_poller(
+            Arc::clone(&readiness),
+            clients.readiness,
+            None,
+            Duration::from_millis(100),
+            Duration::from_secs(1),
+            poller.subscribe(),
+        ));
+        let mut ready = false;
+        for _ in 0..500 {
+            if readiness.any_ready() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ready, "the readiness poll must resolve while the proxy's permits are taken");
+        assert_eq!(lookups.load(Ordering::SeqCst), 2, "slow.test and worker.test only");
+
+        gate.close();
+        assert!(slow.await.expect("join").is_ok(), "the slow read completes once released");
+    }
+
+    /// A lookup the proxy's resolver refuses because every lookup slot is busy
+    /// is the gateway's own back-pressure, not a sign that the worker is down:
+    /// the submission fails as unreachable, but passive health does not count
+    /// it, so the worker stays ready however many submissions are refused.
+    #[tokio::test]
+    async fn saturated_dns_lookups_do_not_count_against_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+
+        // the query host's lookup waits on the gate, holding the only slot
+        let gate = Arc::new(Semaphore::new(0));
+        let query_lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let gate = Arc::clone(&gate);
+            let query_lookups = Arc::clone(&query_lookups);
+            lookup_fn(move |host| {
+                let held = host == "query.test";
+                if held {
+                    query_lookups.fetch_add(1, Ordering::SeqCst);
+                }
+                let gate = Arc::clone(&gate);
+                async move {
+                    if held {
+                        // closing the gate releases the lookup
+                        let _closed = gate.acquire().await;
+                    }
+                    Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))])
+                }
+            })
+        };
+        // a connect timeout the test never reaches, so the held read waits for
+        // its lookup however slowly the submissions below run
+        let settings = worker_settings(
+            "http",
+            worker,
+            worker,
+            &["--max-concurrent-dns-lookups=1".into(), "--upstream-connect-timeout=30s".into()],
+        );
+        let UpstreamClients { proxy, .. } =
+            UpstreamClients::new(&settings, lookup).expect("clients");
+        let state = AppState {
+            query_upstream: Some(named_url("query.test", query, "/")),
+            ..test_state_with_client(
+                &[UpstreamWorker {
+                    worker_id: 0,
+                    rpc_url: named_url("worker.test", worker, "/"),
+                    readiness_url: named_url("worker.test", worker, "/health/workers"),
+                }],
+                proxy.clone(),
+            )
+        };
+        state.readiness.set_ready(0, true);
+        let readiness = Arc::clone(&state.readiness);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // a read starts the query host's lookup, which takes the only slot
+        let read = tokio::spawn(post_rpc(gateway, None, call("eth_chainId", 0)));
+        let mut started = false;
+        for _ in 0..500 {
+            if query_lookups.load(Ordering::SeqCst) == 1 {
+                started = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started, "the query host's lookup should have started");
+
+        // the refusal is a connect error that carries the resolver's marker;
+        // a closed port is a connect error without it
+        let refused = proxy
+            .post(named_url("other.test", worker, "/"))
+            .send()
+            .await
+            .expect_err("no lookup slot is free");
+        assert!(refused.is_connect() && dns::is_saturated(&refused), "{refused:?}");
+        let closed = proxy.post("http://127.0.0.1:1/").send().await.expect_err("closed port");
+        assert!(closed.is_connect() && !dns::is_saturated(&closed), "{closed:?}");
+
+        // the worker's name has no cached answer and no slot is free, so every
+        // submission fails at once, well past `--upstream-failure-threshold`
+        let threshold = test_thresholds().rpc_failure.expect("passive health on").get();
+        for id in 1..=u64::from(threshold) + 2 {
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "submission {id}");
+            assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(id)));
+        }
+        assert!(readiness.any_ready(), "the gateway's own lookup cap must not mark the worker");
+        assert_eq!(worker_seen.hits(), 0);
+
+        // once the held lookup returns, the read completes, the worker's name
+        // resolves and the still-ready worker takes the next submission
+        gate.close();
+        let (status, text) = read.await.expect("join");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 99)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
     }
 }

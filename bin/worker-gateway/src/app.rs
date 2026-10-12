@@ -4,11 +4,13 @@
 use std::sync::Arc;
 
 use eyre::WrapErr as _;
+use reqwest::Client;
 use tn_types::{ShutdownNotifier, TaskManager};
 use tracing::{info, warn};
 
 use crate::{
     cli::Settings,
+    dns::{LookupHost, SystemLookup},
     proxy::{client_builder, proxy_client, UpstreamOrigin, WARNING_THROTTLES},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
@@ -32,10 +34,13 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     ensure_root_store(&settings, native_root_count)?;
 
-    // Both upstream clients start from the same TLS settings (see
-    // `client_builder`); they are finished below.
-    let proxy_client_builder = client_builder(&settings);
-    let readiness_client_builder = client_builder(&settings);
+    // Dedicated clients, both started from the same TLS settings (see
+    // `client_builder`): the proxy enforces connect + per-request deadlines and
+    // never follows redirects (see `proxy_client`); the poller bounds each
+    // probe with its own tokio timeout. Each resolves upstream names through
+    // its own cache and lookup cap (see `UpstreamClients`).
+    let UpstreamClients { proxy: proxy_client, readiness: readiness_client } =
+        UpstreamClients::new(&settings, Arc::new(SystemLookup)).wrap_err(TLS_SETTINGS_HINT)?;
     let Settings {
         listen_addr,
         probe_addr,
@@ -51,6 +56,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         query_request_timeout,
         upstream_ca_certs: _,
         upstream_identity: _,
+        dns_cache_ttl,
+        max_concurrent_dns_lookups,
         header_read_timeout,
         max_connections,
         max_inflight_submissions,
@@ -120,15 +127,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_upstream_inflight,
         ?tcp_user_timeout,
         ?max_connection_duration,
+        ?dns_cache_ttl,
+        %max_concurrent_dns_lookups,
         "edge protections configured"
     );
-
-    // Dedicated clients: the proxy enforces connect + per-request deadlines and
-    // never follows redirects (see `proxy_client`); the poller bounds each
-    // probe with its own tokio timeout.
-    let proxy_client =
-        proxy_client(proxy_client_builder, upstream_request_timeout).wrap_err(TLS_SETTINGS_HINT)?;
-    let readiness_client = readiness_client_builder.build().wrap_err(TLS_SETTINGS_HINT)?;
 
     let mut task_manager = TaskManager::new("worker-gateway");
     // Let in-flight requests drain within the graceful deadline (plus a small
@@ -174,7 +176,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     };
 
     // The poller probes the query upstream with the proxy client, so the probe
-    // travels like a redirected read.
+    // travels like a redirected read, through the same DNS cache and lookup cap.
     let query_probe =
         query_upstream.clone().map(|url| QueryProbe { url, client: proxy_client.clone() });
     let state = AppState {
@@ -255,6 +257,41 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     task_manager.join_until_exit(shutdown).await?;
     Ok(())
+}
+
+/// The gateway's two upstream HTTP clients, both started from
+/// [`client_builder`], so they share the TLS settings.
+#[derive(Debug)]
+pub(crate) struct UpstreamClients {
+    /// Forwards client requests to the workers and the query upstream, and
+    /// probes the query upstream for the poller (see [`proxy_client`] and
+    /// [`QueryProbe`]).
+    pub(crate) proxy: Client,
+    /// Polls the workers' readiness endpoints.
+    pub(crate) readiness: Client,
+}
+
+impl UpstreamClients {
+    /// Build both clients from `settings`, each with its own
+    /// [`crate::dns::CachingResolver`] over `lookup` (see [`client_builder`]):
+    /// its own cache, and its own cap of `--max-concurrent-dns-lookups`
+    /// lookups at once.
+    ///
+    /// The readiness client must not share the proxy's resolver. Query traffic
+    /// to hosts that resolve slowly can hold every proxy lookup permit, and a
+    /// readiness poll refused a lookup then would mark the worker not-ready and
+    /// turn a slow query upstream into refused submissions. The node's health
+    /// listener closes the connection after each response, so every poll opens
+    /// a new connection and goes through the resolver.
+    pub(crate) fn new(settings: &Settings, lookup: Arc<dyn LookupHost>) -> reqwest::Result<Self> {
+        Ok(Self {
+            proxy: proxy_client(
+                client_builder(settings, Arc::clone(&lookup)),
+                settings.upstream_request_timeout,
+            )?,
+            readiness: client_builder(settings, lookup).build()?,
+        })
+    }
 }
 
 /// Fail startup when an `https` upstream would be verified against the native
