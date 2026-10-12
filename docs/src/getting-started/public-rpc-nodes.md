@@ -39,6 +39,7 @@ A node with several workers serves RPC per worker: worker 0 listens on `--http.p
 Point the public nodes at the worker 0 port.
 
 A target URL may carry a path for a reverse proxy, and a `user:password@` prefix, which is sent as an HTTP basic-auth header.
+Percent-encoded characters in the userinfo are decoded before the basic-auth header is built, so `user:p%40ss@` sends the password `p@ss`, and userinfo that does not decode to UTF-8 is refused at startup.
 A username without a password is refused at startup, because the node would send no credentials for it.
 Over plain `http://` those credentials travel in cleartext too.
 
