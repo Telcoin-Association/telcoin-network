@@ -46,9 +46,10 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
 FROM debian:bookworm-slim
 
 # The gateway links rustls, not openssl, so no TLS library is installed.
-# ca-certificates is required for an https --redirect-queries URL: rustls reads
-# its trusted roots from the system store, which is empty without this package,
-# and every request to that URL would then fail. Worker upstreams stay http-only.
+# ca-certificates is required for an https worker or --redirect-queries URL
+# verified against the system roots: rustls reads its trusted roots from the
+# system store, which is empty without this package, and the gateway then
+# refuses to start with an https upstream unless --upstream-ca-cert names a CA.
 RUN apt-get update && \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     ca-certificates && \

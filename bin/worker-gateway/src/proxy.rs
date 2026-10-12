@@ -53,7 +53,7 @@ use axum::{
     Extension,
 };
 use futures::Stream;
-use reqwest::{redirect::Policy, Client};
+use reqwest::{redirect::Policy, Client, ClientBuilder};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
@@ -64,6 +64,7 @@ use tracing::{debug, warn};
 use url::Url;
 
 use crate::{
+    cli::Settings,
     error::{
         error_response, error_response_with_id, upstream_error_response, GatewayError, RequestId,
     },
@@ -658,7 +659,33 @@ where
     }
 }
 
-/// Build the client that forwards requests on both routes.
+/// Start a client for the upstream hop with the settings every upstream client
+/// shares: rustls, trusting the platform's native root store plus every
+/// `--upstream-ca-cert` certificate, the `--upstream-client-cert` identity when
+/// one is configured, and the upstream connect timeout.
+///
+/// The forwarding client ([`proxy_client`]) and the readiness poller's client
+/// both start here, so an `https` worker URL and its readiness URL are verified
+/// the same way and see the same client certificate. The forwarding client also
+/// serves the `--redirect-queries` route and the poller's probe of it (see
+/// [`crate::readiness::QueryProbe`]), so the extra CA certificates are trusted
+/// there too, and the client certificate goes to that endpoint if it asks for
+/// one (rustls sends it only on request). An upstream whose
+/// certificate chains to none of these roots fails the handshake: a forward to
+/// it fails and a poll marks it not ready, so a wrong CA fails closed.
+pub(crate) fn client_builder(settings: &Settings) -> ClientBuilder {
+    let builder = settings.upstream_ca_certs.iter().cloned().fold(
+        Client::builder().use_rustls_tls().connect_timeout(settings.upstream_connect_timeout),
+        ClientBuilder::add_root_certificate,
+    );
+    match &settings.upstream_identity {
+        Some(identity) => builder.identity(identity.clone()),
+        None => builder,
+    }
+}
+
+/// Finish `builder` (see [`client_builder`]) into the client that forwards
+/// requests on both routes.
 ///
 /// Redirects are never followed. reqwest follows up to ten by default and
 /// replays a POST body on `307`/`308`, so a query upstream answering with a
@@ -668,20 +695,14 @@ where
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either.
 ///
-/// TLS is rustls with the platform's native root store, which only the query
-/// route can use (worker URLs must be `http`). An image without CA
-/// certificates still builds the client, but every `https` request then fails.
+/// TLS and the connect timeout come from `builder`. reqwest builds a client
+/// over an empty native root store without complaint, so startup checks the
+/// store itself when an `https` upstream depends on it (see [`crate::app`]).
 pub(crate) fn proxy_client(
-    connect_timeout: Duration,
+    builder: ClientBuilder,
     request_timeout: Duration,
 ) -> reqwest::Result<Client> {
-    Client::builder()
-        .use_rustls_tls()
-        .redirect(Policy::none())
-        .user_agent(USER_AGENT)
-        .connect_timeout(connect_timeout)
-        .timeout(request_timeout)
-        .build()
+    builder.redirect(Policy::none()).user_agent(USER_AGENT).timeout(request_timeout).build()
 }
 
 /// Classify a `reqwest` forwarding failure into a client-facing gateway error.
@@ -1467,6 +1488,7 @@ mod tests {
         eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant},
     };
     use axum::http::StatusCode;
+    use clap::Parser as _;
     use serde_json::{value::RawValue, Value};
     use std::{cell::Cell, num::NonZeroU32, sync::Mutex};
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
@@ -2114,7 +2136,11 @@ mod tests {
         let thresholds = ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: None };
         let state = AppState {
             readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
-            http: proxy_client(Duration::from_secs(2), Duration::from_secs(5)).expect("client"),
+            http: proxy_client(
+                Client::builder().connect_timeout(Duration::from_secs(2)),
+                Duration::from_secs(5),
+            )
+            .expect("client"),
             query_upstream: Some(query_url),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
@@ -2649,7 +2675,14 @@ mod tests {
     fn rustls_backend_is_compiled_in() {
         let bare = Client::builder().use_rustls_tls().build();
         assert!(bare.is_ok(), "{bare:?}");
-        let proxy = proxy_client(Duration::from_secs(1), Duration::from_secs(1));
+        let settings = crate::cli::Cli::parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=https://10.0.0.7:8545",
+            "--upstream-readiness-url=https://10.0.0.7:8551/health/workers",
+        ])
+        .into_settings()
+        .expect("settings");
+        let proxy = proxy_client(client_builder(&settings), Duration::from_secs(1));
         assert!(proxy.is_ok(), "{proxy:?}");
     }
 }

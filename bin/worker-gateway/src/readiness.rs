@@ -1243,8 +1243,11 @@ mod tests {
 
         // the url carries a credential in its userinfo, path and query; the
         // logs may name only its origin
-        let client = crate::proxy::proxy_client(Duration::from_secs(1), Duration::from_secs(2))
-            .expect("client");
+        let client = crate::proxy::proxy_client(
+            Client::builder().connect_timeout(Duration::from_secs(1)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
         let probe = QueryProbe {
             url: Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url"),
             client: client.clone(),
