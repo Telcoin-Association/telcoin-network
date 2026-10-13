@@ -482,6 +482,25 @@ environments and notes the MDBX migration's marker; `telcoin-network db tndb-sta
   switch replaces the index). It is bounded per compaction and negligible at production rates;
   copying unpaced for small live sets would shorten the pin, but changes the I/O pattern, so it
   waits for a Linux measurement.
+- **The batch cache is evicted and compacted, not aged out.** We tried aging `NodeBatchesCache`
+  out wholesale instead of removing each committed batch (2026-10-13; a prototype, then removed).
+  It kept a ring of tndb databases ("segments") with compaction off and opened a new one every 5
+  saved outputs, keeping 6. Results:
+  - **No gain at a realistic rate.** It was measured against `Split` in interleaved pairs, N=50,
+    on a Mac. At 1 MB batches 25 times a second, consensus didn't change (vote p99 and ms per
+    round 1.01x) and the batch log stopped compacting. Those compactions weren't costing
+    consensus anything.
+  - **A gain only at an extreme rate.** At 330 MB/s of batches, vote p99 improved to 0.87x.
+  - **Costs.** About 8x the disk (1.8 GB against 0.2 GB at 25 MB/s), because a store that can't
+    see commits must keep 30-35 outputs for the worst case. Lookups of older batches checked up
+    to 7 indexes. It added a timing assumption (the window) where eviction on commit is exact.
+    The node would also have needed the worker to serve our own batches from
+    `OurNodeBatchesCache` once they aged out.
+  - **Why.** A compaction copies only live rows, and the batch cache's live set (the
+    uncommitted batches) is small. It also runs on its own log, away from consensus.
+
+  Faster compaction helps every log, so it is the better lever; a Linux profile of the switch
+  should come first.
 
 ## Not yet
 

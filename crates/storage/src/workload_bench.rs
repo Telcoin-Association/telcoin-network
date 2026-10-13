@@ -1008,7 +1008,8 @@ fn workload_mixed() {
 /// Compaction's cost to consensus, judged on interleaved pairs: the mixed workload (256 KB batches
 /// as fast as taken, 1000 rounds, so the cache log compacts several times a run) on
 /// `SplitDatabase` with compaction off and on, the order rotated each pair; reports each pair's
-/// ratio (on / off) of vote durable p99 and ms per round, and their medians. Vote p99 varies about
+/// ratio (on / off) of vote durable p99 and ms per round, and their medians (see
+/// [`consensus_cost_pairs`] for the knobs). Vote p99 varies about
 /// 30% run to run in this workload, so one run, or a mean of three, does not show compaction's
 /// effect; the median of paired ratios does.
 ///
@@ -1018,10 +1019,34 @@ fn workload_mixed() {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_mixed_compaction() {
-    // `TN_BENCH_PAIRS` / `TN_BENCH_PAIR_ROUNDS` shorten it (a quick pass on a slow-sync machine);
-    // `TN_BENCH_PAIR_BATCH_KB` / `TN_BENCH_PAIR_RATE` (batches a second; 0 = as fast as taken)
-    // set the batch stream, e.g. 1024 KB at 25/s for a node's realistic rate (run enough rounds
-    // for the cache log to reach its compaction threshold).
+    consensus_cost_pairs(
+        "compaction's cost to consensus",
+        ["Split-nocompact", "Split"],
+        |on, root| {
+            let config = if on {
+                CompactionConfig::default()
+            } else {
+                CompactionConfig { auto_min_bytes: None, ..Default::default() }
+            };
+            open_split_tndb(root, CommitMode::Group, config)
+        },
+    );
+}
+
+/// Interleaved pairs of consensus runs (N=50) beside a batch stream, each pair one run of
+/// `names[0]` (`open(false, ..)`) and one of `names[1]` (`open(true, ..)`), the order rotated each
+/// pair: each run's batch rate and disk after close, then the medians of the paired ratios (second
+/// / first) of vote durable p99 and ms per round. An unpaced stream's ratio means little without
+/// the batch rates: a database that takes batches faster also loads the drive consensus shares.
+/// `TN_BENCH_PAIRS` / `TN_BENCH_PAIR_ROUNDS` shorten it (a quick pass on a slow-sync machine);
+/// `TN_BENCH_PAIR_BATCH_KB` / `TN_BENCH_PAIR_RATE` (batches a second; 0 = as fast as taken) set the
+/// batch stream, e.g. 1024 KB at 25/s for a node's realistic rate (run enough rounds for the cache
+/// log to reach its compaction threshold).
+fn consensus_cost_pairs(
+    title: &str,
+    names: [&str; 2],
+    open: impl Fn(bool, &Path) -> SplitDatabase,
+) {
     let env = |name: &str, default: usize| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
@@ -1037,27 +1062,27 @@ fn workload_mixed_compaction() {
         let cell = col.1.iter().find(|c| c.label == label).expect("a measured cell");
         cell.text.trim().parse().expect("a number")
     };
-    // (vote durable p99 us, ms per round) for compaction off and on, per pair.
+    // (vote durable p99 us, ms per round) for the first and second, per pair.
     let mut pairs = Vec::with_capacity(pairs_wanted);
     for pair in 0..pairs_wanted {
         let mut measured = [(0.0, 0.0); 2];
-        for on in [pair % 2 == 1, pair % 2 == 0] {
+        for second in [pair % 2 == 1, pair % 2 == 0] {
             let tmp = tempfile::tempdir().expect("temp dir");
             let mut w = MixedRounds {
                 consensus: ConsensusRounds { committee: 50, rounds: pair_rounds },
                 batch,
                 rate,
             };
-            let config = if on {
-                CompactionConfig::default()
-            } else {
-                CompactionConfig { auto_min_bytes: None, ..Default::default() }
-            };
             let root = tmp.path().join("split");
-            let name = if on { "Split" } else { "Split-nocompact" };
-            let db = open_split_tndb(&root, CommitMode::Group, config);
+            let name = names[usize::from(second)];
+            let db = open(second, &root);
             let col = tndb_stats_column(&rt, &mut w, name, db, &root);
-            measured[usize::from(on)] =
+            println!(
+                "    {name}: {:.0} batch MB/s alongside, {:.0} MB on disk after close",
+                value(&col, "batch MB/s alongside"),
+                disk_bytes(&root) as f64 / 1e6
+            );
+            measured[usize::from(second)] =
                 (value(&col, "vote durable p99 us"), value(&col, "ms / round"));
         }
         pairs.push(measured);
@@ -1067,15 +1092,17 @@ fn workload_mixed_compaction() {
         let n = ratios.len();
         (ratios[(n - 1) / 2] + ratios[n / 2]) / 2.0
     };
-    let votes: Vec<f64> = pairs.iter().map(|[off, on]| on.0 / off.0).collect();
-    let rounds: Vec<f64> = pairs.iter().map(|[off, on]| on.1 / off.1).collect();
+    let votes: Vec<f64> = pairs.iter().map(|[first, second]| second.0 / first.0).collect();
+    let rounds: Vec<f64> = pairs.iter().map(|[first, second]| second.1 / first.1).collect();
     let list =
         |ratios: &[f64]| ratios.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>().join(" ");
     let pace = rate.map_or_else(|| "as fast as taken".to_string(), |r| format!("{r}/s"));
     println!(
-        "=== compaction's cost to consensus: {pairs_wanted} interleaved pairs of {pair_rounds} \
-         rounds beside {} KB batches ({pace}), ratio on / off ===",
-        batch >> 10
+        "=== {title}: {pairs_wanted} interleaved pairs of {pair_rounds} rounds beside {} KB \
+         batches ({pace}), ratio {} / {} ===",
+        batch >> 10,
+        names[1],
+        names[0]
     );
     println!("vote durable p99: median {:.2} ({})", median(votes.clone()), list(&votes));
     println!("ms / round:       median {:.2} ({})", median(rounds.clone()), list(&rounds));
