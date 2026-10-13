@@ -714,6 +714,21 @@ const EXIT_BEFORE_EPOCH_RECORD_ENV: &str = "TN_TEST_EXIT_BEFORE_EPOCH_RECORD";
 /// The warn line, with field `epoch`, a node logs as [`EXIT_BEFORE_EPOCH_RECORD_ENV`] stops it.
 const EXIT_HOOK_LOG: &str = "test hook: exiting before the epoch record is written";
 
+/// The test-utils hook that stops a node at the live close of the named epoch, after the epoch
+/// record is written and before the state export and the epoch tables clear
+/// (`tn_types::test_hooks`).
+const EXIT_AFTER_EPOCH_RECORD_ENV: &str = "TN_TEST_EXIT_AFTER_EPOCH_RECORD";
+
+/// The warn line, with field `epoch`, a node logs as [`EXIT_AFTER_EPOCH_RECORD_ENV`] stops it.
+const EXIT_AFTER_HOOK_LOG: &str = "test hook: exiting after the epoch record is written";
+
+/// The warn line, with fields `table`, `stale_epoch` and `current_epoch`, a restarted node logs
+/// when the previous epoch's record is present but the epoch tables still hold rows of an older
+/// epoch, before it clears them.
+const STALE_TABLES_CLEAR_LOG: &str =
+    "epoch record present but the consensus db tables still hold rows of an older epoch \
+     (killed between the record write and the tables clear); clearing them";
+
 /// The warn line, with fields `previous_epoch` and `current_epoch`, a restarted node logs when
 /// the previous epoch's record is missing and it rebuilds the record from the closing block.
 const REDERIVE_LOG: &str = "re-deriving it locally";
@@ -732,6 +747,37 @@ const FOREIGN_PARENTS_LOG: &str = "ignoring parent certificates from another epo
 
 /// The error peers answer a vote request with when the header's parents are from another epoch.
 const INVALID_EPOCH_LOG: &str = "Invalid epoch";
+
+/// A window of a live epoch close that [`restarts_cohort_in_epoch_boundary_window`] stops every
+/// validator inside, through the test-utils hook that stops a node there.
+struct BoundaryWindow {
+    /// The hook's environment variable, set to the epoch whose close the node stops in.
+    env: &'static str,
+    /// The warn line, with field `epoch`, a node logs as the hook stops it.
+    hook_log: &'static str,
+    /// The test's name for its temp dir and `test_logs/<name>/`. Short on purpose: node IPC socket
+    /// paths are built under the temp dir.
+    name: &'static str,
+    /// Whether the restart finds the record missing and rebuilds it, rather than finding it
+    /// written and the epoch tables stale.
+    rebuilds_record: bool,
+}
+
+/// After the closing block is executed and before the epoch record is written.
+const BEFORE_EPOCH_RECORD: BoundaryWindow = BoundaryWindow {
+    env: EXIT_BEFORE_EPOCH_RECORD_ENV,
+    hook_log: EXIT_HOOK_LOG,
+    name: "boundary",
+    rebuilds_record: true,
+};
+
+/// After the epoch record is written and before the epoch tables are cleared.
+const AFTER_EPOCH_RECORD: BoundaryWindow = BoundaryWindow {
+    env: EXIT_AFTER_EPOCH_RECORD_ENV,
+    hook_log: EXIT_AFTER_HOOK_LOG,
+    name: "recorded",
+    rebuilds_record: false,
+};
 
 /// Stop the whole cohort inside the epoch-boundary window, restart it on its own datadirs, and
 /// require the network to keep closing epochs.
@@ -776,15 +822,51 @@ fn test_restarts_cohort_exits_in_epoch_boundary_window() -> eyre::Result<()> {
         .enable_time()
         .build()
         .expect("tokio runtime");
-    runtime.block_on(restarts_cohort_in_epoch_boundary_window())
+    runtime.block_on(restarts_cohort_in_epoch_boundary_window(BEFORE_EPOCH_RECORD))
 }
 
-/// The body of [`test_restarts_cohort_exits_in_epoch_boundary_window`].
-async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
+/// Stop the whole cohort after the epoch record is written and before the epoch tables are
+/// cleared, restart it on its own datadirs, and require the network to keep closing epochs.
+///
+/// A live epoch close writes the epoch's record, exports the epoch's state, and only then clears
+/// the epoch's consensus tables, so the window between the record write and the clear holds the
+/// state export and is not small. A node restarted from it finds the record present and the
+/// tables still holding the closed epoch's rows.
+///
+/// Before the fix the restart found the record and took the no-op path, so the tables were never
+/// cleared. The new epoch's primary restored the old epoch's certificates into its DAG and started
+/// the certificate store and the digest indexes from them. The proposer refuses parents from
+/// another epoch, so the round no longer jumps, but nothing else kept the old rows out.
+///
+/// Every validator runs with [`EXIT_AFTER_EPOCH_RECORD_ENV`] set to [`BOUNDARY_WINDOW_EPOCH`]
+/// (E = 6). The hook stops each node in that window of E's close through the same graceful path a
+/// SIGTERM takes, which puts all four there on every run. They restart without the hook. Each must
+/// find epoch E's rows in the tables and clear them without rebuilding the record, then start
+/// epoch E + 1 with an empty DAG, and no proposer may see a parent from another epoch. The cohort
+/// must then reach epoch E + 2, serve verified records for epochs 0 to E + 1, agree on every block
+/// and commit time, return to active consensus without clamping an EVM timestamp, and execute a
+/// transfer.
+///
+/// The cohort, its epochs and the fork setup are those of
+/// [`test_restarts_cohort_exits_in_epoch_boundary_window`].
+#[test]
+#[ignore = "should not run with a default cargo test, run restart tests as seperate step"]
+fn test_restarts_cohort_exits_after_epoch_record() -> eyre::Result<()> {
+    let _permit = super::common::acquire_test_permit();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .expect("tokio runtime");
+    runtime.block_on(restarts_cohort_in_epoch_boundary_window(AFTER_EPOCH_RECORD))
+}
+
+/// The body of [`test_restarts_cohort_exits_in_epoch_boundary_window`] and
+/// [`test_restarts_cohort_exits_after_epoch_record`], which stop the cohort inside `window`.
+async fn restarts_cohort_in_epoch_boundary_window(window: BoundaryWindow) -> eyre::Result<()> {
     const E: Epoch = BOUNDARY_WINDOW_EPOCH;
     const REFERENCE: usize = 0;
-    // short on purpose: node IPC socket paths are built under the temp dir
-    let test = "boundary";
+    let test = window.name;
     let temp_dir = tempfile::TempDir::with_prefix(test)?;
     let temp_path = temp_dir.path();
     config_local_testnet_with_gc_depth_and_epoch_duration(
@@ -816,7 +898,7 @@ async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
             test,
             0,
             &["--metrics", metrics.as_str()],
-            &[(EXIT_BEFORE_EPOCH_RECORD_ENV, hook_epoch.as_str())],
+            &[(window.env, hook_epoch.as_str())],
         ));
     }
     let rpc_urls: [String; 4] = rpc_ports.map(|port| format!("http://127.0.0.1:{port}"));
@@ -878,10 +960,11 @@ async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
         };
         let log = node_log_lines(test, instance, 0)?;
         eyre::ensure!(
-            log.iter().any(|line| log_line_matches(line, EXIT_HOOK_LOG, &hook_fields)),
-            "validator-{} exited ({status}) without the hook's `{EXIT_HOOK_LOG}` line for epoch \
-             {E}: test_logs/{test}/node{instance}-run0.stderr.log carries its fatal error",
-            instance + 1
+            log.iter().any(|line| log_line_matches(line, window.hook_log, &hook_fields)),
+            "validator-{} exited ({status}) without the hook's `{}` line for epoch {E}: \
+             test_logs/{test}/node{instance}-run0.stderr.log carries its fatal error",
+            instance + 1,
+            window.hook_log
         );
         eyre::ensure!(
             status.success(),
@@ -891,8 +974,8 @@ async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
         );
         hooked.push(instance);
     }
-    // the halt needed at least two validators restarted from the window; the proof wants all four,
-    // and one straggler is the most a deterministic hook should leave
+    // the halt the rebuild window caused needed at least two validators restarted from inside it;
+    // the proof wants all four, and one straggler is the most a deterministic hook should leave
     eyre::ensure!(
         hooked.len() >= 3,
         "only validators at indices {hooked:?} stopped themselves inside the epoch {E} window \
@@ -920,22 +1003,51 @@ async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
     }
     futures::future::try_join_all(providers.iter().map(wait_for_rpc)).await?;
 
-    // the proof the window was hit: record E is missing on restart and rebuilt from the closing
-    // block, which the engine had already executed into epoch E + 1
     let window_fields = [format!("previous_epoch={E}"), format!("current_epoch={}", E + 1)];
-    for &instance in &hooked {
-        wait_for_node_log_line(
-            test,
-            instance,
-            1,
-            REDERIVE_LOG,
-            &window_fields,
-            Duration::from_secs(60),
-        )
-        .await?;
+    let stale_fields = [format!("stale_epoch={E}"), format!("current_epoch={}", E + 1)];
+    if window.rebuilds_record {
+        // the proof the window was hit: record E is missing on restart and rebuilt from the
+        // closing block, which the engine had already executed into epoch E + 1
+        for &instance in &hooked {
+            wait_for_node_log_line(
+                test,
+                instance,
+                1,
+                REDERIVE_LOG,
+                &window_fields,
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+    } else {
+        // the proof the window was hit: record E is present on restart, but epoch E's tables
+        // were never cleared
+        for &instance in &hooked {
+            wait_for_node_log_line(
+                test,
+                instance,
+                1,
+                STALE_TABLES_CLEAR_LOG,
+                &stale_fields,
+                Duration::from_secs(60),
+            )
+            .await?;
+        }
+        // the record was written before the node stopped, so nothing is rebuilt
+        for &instance in &hooked {
+            let log = node_log_lines(test, instance, 1)?;
+            if let Some(line) = log.iter().find(|line| line.contains(REDERIVE_LOG)) {
+                return Err(eyre::eyre!(
+                    "validator-{} rebuilt a record it wrote before it stopped: {line}",
+                    instance + 1
+                ));
+            }
+        }
     }
 
-    // before the fix the cohort never got past here: every epoch E + 1 header was refused
+    // before the fixes the cohort never got past here from the rebuild window (every epoch E + 1
+    // header was refused); from the after-record window the restarted primaries start from epoch
+    // E's certificates instead, which the DAG check below catches
     match tokio::time::timeout(
         Duration::from_secs(BOUNDARY_WINDOW_RECOVERY_SECS),
         wait_for_epoch_at_least(&providers[REFERENCE], E + 2),
@@ -960,19 +1072,33 @@ async fn restarts_cohort_in_epoch_boundary_window() -> eyre::Result<()> {
         }
     }
 
-    // the rebuild cleared epoch E's tables, so the epoch E + 1 primary started from an empty DAG
+    // the rebuild or the stale-tables clear emptied epoch E's tables, so the epoch E + 1 primary
+    // started from an empty DAG
     for &instance in &hooked {
         let log = node_log_lines(test, instance, 1)?;
-        let rederive = log
-            .iter()
-            .position(|line| log_line_matches(line, REDERIVE_LOG, &window_fields))
-            .ok_or_else(|| eyre::eyre!("node{instance}-run1.log lost its `{REDERIVE_LOG}` line"))?;
-        let after = &log[rederive..];
-        eyre::ensure!(
-            after.iter().any(|line| log_line_matches(line, RECORD_CLEAR_LOG, &window_fields)),
-            "validator-{} rebuilt the epoch {E} record without `{RECORD_CLEAR_LOG}`",
-            instance + 1
-        );
+        let after = if window.rebuilds_record {
+            let rederive = log
+                .iter()
+                .position(|line| log_line_matches(line, REDERIVE_LOG, &window_fields))
+                .ok_or_else(|| {
+                    eyre::eyre!("node{instance}-run1.log lost its `{REDERIVE_LOG}` line")
+                })?;
+            let after = &log[rederive..];
+            eyre::ensure!(
+                after.iter().any(|line| log_line_matches(line, RECORD_CLEAR_LOG, &window_fields)),
+                "validator-{} rebuilt the epoch {E} record without `{RECORD_CLEAR_LOG}`",
+                instance + 1
+            );
+            after
+        } else {
+            let clear = log
+                .iter()
+                .position(|line| log_line_matches(line, STALE_TABLES_CLEAR_LOG, &stale_fields))
+                .ok_or_else(|| {
+                    eyre::eyre!("node{instance}-run1.log lost its `{STALE_TABLES_CLEAR_LOG}` line")
+                })?;
+            &log[clear..]
+        };
         let dag = after
             .iter()
             .find(|line| line.contains(DAG_RESTORED_LOG))
