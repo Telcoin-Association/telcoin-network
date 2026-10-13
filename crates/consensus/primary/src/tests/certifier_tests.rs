@@ -1722,7 +1722,10 @@ async fn pending_republish(
         .node_storage()
         .insert::<ProposedCertificates>(&header.digest(), &stored)
         .expect("record the header's certificate before it is proposed");
-    let proposal = tokio::spawn(certifier.spawn_header_proposal(header));
+    let cancel = certifier.new_proposal.subscribe();
+    let proposal = tokio::spawn(async move {
+        certifier.spawn_header_proposal(header, cancel, &Notify::new()).await
+    });
     cx.network
         .assert_quiet(&format!(
             "{context}: nothing may be republished while the barrier is pending"
