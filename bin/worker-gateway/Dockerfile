@@ -76,10 +76,14 @@ USER nonroot
 
 COPY --from=builder /tmp/worker-gateway /usr/local/bin/worker-gateway
 
-# Client JSON-RPC plus the gateway's own /health and /ready endpoints (default
-# 8545). The Prometheus scrape endpoint, when enabled with --metrics, listens on
-# its own separate address/port (expose it too if you enable it).
+# Client JSON-RPC plus the gateway's own /health, /ready and /ready/any
+# endpoints (default 8545). The probe listener, when enabled with --probe-addr,
+# serves the same three endpoints outside the client connection cap (8546 in
+# the reference manifest). The Prometheus scrape endpoint, when enabled with
+# --metrics, listens on its own separate address/port (expose it too if you
+# enable it).
 EXPOSE 8545
+EXPOSE 8546
 
 # The gateway requires at least one upstream: pass --config, or the inline
 # --upstream-rpc-url / --upstream-readiness-url flags (or their WORKER_GATEWAY_*
