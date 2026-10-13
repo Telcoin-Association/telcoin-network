@@ -49,7 +49,7 @@ pub(crate) enum Severity {
 
 impl Penalty {
     /// Whether this is a temporary load signal rather than a protocol violation.
-    pub(super) fn is_load(self) -> bool {
+    pub(crate) fn is_load(self) -> bool {
         matches!(self, Self::Load(_))
     }
 

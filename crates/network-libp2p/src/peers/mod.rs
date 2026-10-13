@@ -16,7 +16,7 @@ pub use admission::{AdmissionFallback, AdmissionStatus};
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;
-pub(crate) use types::PeerEvent;
+pub(crate) use types::{PeerEvent, PenaltyOutcome};
 pub use types::{PeerExchangeMap, Penalty};
 
 // visibility for tests

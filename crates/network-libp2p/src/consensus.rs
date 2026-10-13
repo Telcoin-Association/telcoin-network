@@ -935,7 +935,7 @@ where
     fn peer_record_valid(&self, record: &kad::Record) -> Option<(BlsPublicKey, NodeRecord)> {
         let key = BlsPublicKey::from_literal_bytes(record.key.as_ref()).ok()?;
 
-        // decode (with legacy fallback for pre-upgrade peers) and verify bls signature
+        // decode the domain-scoped record (no legacy fallback) and verify bls signature
         let cached = self
             .verified_peer_records
             .peek(&record.key)
@@ -1250,6 +1250,10 @@ where
                 let _ = reply.send(result);
                 self.query_missing_required_records();
             }
+            NetworkCommand::AddTrustedPeers { peers, reply } => {
+                self.swarm.behaviour_mut().peer_manager.add_trusted_peers(peers);
+                send_or_log_error!(reply, Ok(()), "AddTrustedPeers");
+            }
             NetworkCommand::AddBootstrapPeers { peers, reply } => {
                 // update peer manager: always pin bootstrap peers (even when a record already
                 // exists, e.g. restored unpinned from persistence), but never overwrite an
@@ -1348,6 +1352,11 @@ where
                 let res = self.swarm.behaviour().peer_manager.connected_or_dialing_peers();
                 debug!(target: "network", ?res, "peer manager connected peers:");
                 send_or_log_error!(reply, res, "ConnectedPeers");
+            }
+            #[cfg(test)]
+            NetworkCommand::VerifiedPeerBls { peer, reply } => {
+                let binding = self.swarm.behaviour().peer_manager.peer_to_bls(&peer);
+                send_or_log_error!(reply, binding, "VerifiedPeerBls");
             }
             NetworkCommand::EstablishedPeerCount { reply } => {
                 send_or_log_error!(reply, self.connected_peers.len(), "EstablishedPeerCount");
@@ -2449,8 +2458,10 @@ where
                 // identifies the current BLS key even when it changed while disconnected.
                 self.request_current_record(peer_id);
 
-                // manage connected peers for
-                self.connected_peers.push_back(peer_id);
+                // Keep one routing entry per peer even when it has multiple connections.
+                if !self.connected_peers.contains(&peer_id) {
+                    self.connected_peers.push_back(peer_id);
+                }
 
                 // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {
