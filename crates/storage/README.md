@@ -6,8 +6,8 @@ Persistent storage for telcoin-network. Two independent families live here:
    `exec_state_pack`) — the mmap-backed, CRC-checked, compressed WALs that hold consensus output,
    the epoch record/certificate chain, and EVM state snapshots. This is the crate's centre of
    gravity and the focus of most of this document.
-2. **Key/value stores** (`redb`, `mdbx`, `layered_db`, `composite_db`, `mem_db`, `stores/`) — a
-   `Database` trait over reth's MDBX (the default) or redb, used for the primary/worker's live
+2. **Key/value stores** (`mdbx`, `tndb`, `layered_db`, `composite_db`, `mem_db`, `stores/`) — a
+   `Database` trait over reth's MDBX (the default) or tndb, used for the primary/worker's live
    consensus state (certificates, payloads, votes, proposer state) and libp2p/Kademlia records.
 
 > **Reviewers & automated scanners:** several patterns below look like bugs but are deliberate. See
@@ -168,14 +168,14 @@ certificate bundles and EVM state exports.
 ### 7. Key/value stores (the other family)
 
 A `Database` trait (in `tn-types::database_traits`: tables, read/write txns, `get`/`insert`/`remove`/
-`iter`/`skip`) with two backends: **`ReDB`** (redb — always compiled) and **`MdbxDatabase`** (reth's
-MDBX — behind the default `reth-libmdbx` feature). `LayeredDatabase` adds a write-through in-memory
-layer + a shared-txn guard; `CompositeDatabase` (the `DatabaseType`, backed by MDBX with the default
-feature, else redb) splits the workload into `epoch` / `kad` / `cache` sub-databases routed by a table
-hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`certificate_store`,
+`iter`/`skip`) with a persistent backend, **`MdbxDatabase`** (reth's MDBX, behind the default
+`reth-libmdbx` feature), and `tndb` below. `LayeredDatabase` adds a write-through in-memory layer +
+a shared-txn guard; `CompositeDatabase` (the `DatabaseType` with the default feature) splits the
+workload into `epoch` / `kad` / `cache` sub-databases routed by a table hint. A `redb` backend was
+removed: it was the slowest, and tndb replaces it. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`certificate_store`,
 `payload_store`, `proposer_store`, `vote_digest_store`) wrap the trait for primary/worker state.
 
-**`tndb`** (`TnDatabase`) is a third `Database` backend built on this crate's own pack files
+**`tndb`** (`TnDatabase`) is a `Database` backend built on this crate's own pack files
 and B+tree index: every table of a database in one shared, CRC-framed log (one sync per commit,
 transactions atomic across tables), lock-free snapshot reads, crash recovery by replaying the log,
 and compaction into a new generation. The `tndb` feature makes it the `DatabaseType`
@@ -192,7 +192,7 @@ commit (this engine was called `tnlog` while the two were compared). It exports
 <datadir>/
   db/                          reth execution DB (MDBX)
   static_files/                reth static file segments
-  consensus-db/                epoch/kad/cache sub-databases (redb or MDBX) + the epochs/ tree below
+  consensus-db/                epoch/kad/cache sub-databases (MDBX; tndb/ with the tndb feature) + the epochs/ tree below
     epochs/
       epoch-{N}/               one ConsensusPack per epoch
         data                   the record WAL (source of truth)  ── + clean-close sentinel

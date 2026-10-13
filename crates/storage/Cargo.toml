@@ -39,9 +39,6 @@ memmap2 = { workspace = true }
 # io::Error instead of a SIGBUS on the next memcpy into an unbacked page (see archive/data_file.rs).
 libc = "0.2"
 
-# redb backend
-redb = { version = "3.1.0", optional = false }
-
 # mdbx backend- default
 reth-libmdbx = { workspace = true, optional = true, features = [
     "return-borrowed",
@@ -64,9 +61,8 @@ roaring = { workspace = true }
 tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util", "io-util" ] }
 
 [features]
-redb = []
 # The node's consensus DB on tndb (`tndb::SplitDatabase`: one shared log per environment)
-# instead of MDBX. It takes priority over `redb` and the default MDBX.
+# instead of the default MDBX.
 tndb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]

@@ -122,8 +122,8 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
         keys.into_iter().map(|key| tx.get::<T>(key.borrow())).collect()
     }
 
-    /// If the underlying DB needs to be manually compacted (looking at redb here) then this can be
-    /// overwritten to allow this.  No-op for most backends.
+    /// If the underlying DB needs to be manually compacted then this can be overwritten to allow
+    /// this.  No-op for most backends.
     fn compact(&self) -> eyre::Result<()> {
         Ok(())
     }
@@ -134,7 +134,7 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// the disk write, returning before it is durable. This barrier resolves only once every write
     /// ordered before it is durably committed, including the subtle case where a concurrently-open
     /// write txn has *absorbed* this caller's bare insert, in which case the ack is deferred until
-    /// that physical txn commits. Synchronously-durable backends (raw MDBX / redb, `MemDatabase`)
+    /// that physical txn commits. Synchronously-durable backends (raw MDBX, `MemDatabase`)
     /// are already durable on return, so the default no-op is correct for them. Uses `Table` as a
     /// hint so a composite backend only waits on the relevant physical store.
     ///

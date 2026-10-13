@@ -927,8 +927,6 @@ impl<DB: Database> Debug for DBMessage<DB> {
 #[cfg(test)]
 mod test {
     use super::LayeredDatabase;
-    #[cfg(feature = "redb")]
-    use crate::redb::ReDB;
     use crate::{
         mdbx::{database::MEGABYTE, MdbxDatabase},
         test::*,
@@ -944,15 +942,6 @@ mod test {
     use tempfile::tempdir;
     use tn_types::Database as _;
 
-    #[cfg(feature = "redb")]
-    fn open_redb(path: &Path, full_memory: bool) -> LayeredDatabase<ReDB> {
-        let db = ReDB::open(path.join("redb")).expect("Cannot open database");
-        db.open_table::<TestTable>().expect("failed to open table!");
-        let db = LayeredDatabase::open(db, full_memory);
-        db.open_table::<TestTable>().expect("failed to open table!");
-        db
-    }
-
     fn open_mdbx(path: &Path, full_memory: bool) -> LayeredDatabase<MdbxDatabase> {
         let db =
             MdbxDatabase::open(path, 4, 16 * MEGABYTE, 8 * MEGABYTE).expect("Cannot open database");
@@ -965,13 +954,6 @@ mod test {
     #[test]
     fn test_layereddb_contains_key() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_contains_key(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_contains_key(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_contains_key_1"), true);
         test_contains_key(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_contains_key_2"), false);
@@ -981,13 +963,6 @@ mod test {
     #[test]
     fn test_layereddb_get() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_get(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_get(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_get_1"), true);
         test_get(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_get_2"), false);
@@ -997,13 +972,6 @@ mod test {
     #[test]
     fn test_layereddb_multi_get() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_multi_get(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_multi_get(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_get_1"), true);
         test_multi_get(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_get_2"), false);
@@ -1013,13 +981,6 @@ mod test {
     #[test]
     fn test_layereddb_skip() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_skip(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_skip(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_skip_1"), true);
         test_skip(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_skip_2"), false);
@@ -1029,13 +990,6 @@ mod test {
     #[test]
     fn test_layereddb_skip_to_previous_simple() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_skip_to_previous_simple(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_skip_to_previous_simple(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_skip_to_previous_simple_1"), true);
         test_skip_to_previous_simple(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_skip_to_previous_simple_2"), false);
@@ -1045,13 +999,6 @@ mod test {
     #[test]
     fn test_layereddb_iter_skip_to_previous_gap() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_iter_skip_to_previous_gap(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_iter_skip_to_previous_gap(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_skip_to_previous_gap_1"), true);
         test_iter_skip_to_previous_gap(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_skip_to_previous_gap_2"), false);
@@ -1061,13 +1008,6 @@ mod test {
     #[test]
     fn test_layereddb_remove() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_remove(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_remove(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_remove_1"), true);
         test_remove(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_remove_2"), false);
@@ -1077,13 +1017,6 @@ mod test {
     #[test]
     fn test_layereddb_iter() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_iter(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_iter(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_1"), true);
         test_iter(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_2"), false);
@@ -1093,13 +1026,6 @@ mod test {
     #[test]
     fn test_layereddb_iter_reverse() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_iter_reverse(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_iter_reverse(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_reverse_1"), true);
         test_iter_reverse(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_iter_reverse_2"), false);
@@ -1109,13 +1035,6 @@ mod test {
     #[test]
     fn test_layereddb_clear() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_clear(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_clear(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_clear_1"), true);
         test_clear(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_clear_2"), false);
@@ -1125,13 +1044,6 @@ mod test {
     #[test]
     fn test_layereddb_is_empty() {
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_is_empty(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_is_empty(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_is_empty_1"), true);
         test_is_empty(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_is_empty_2"), false);
@@ -1142,13 +1054,6 @@ mod test {
     fn test_layereddb_multi_insert() {
         // Init a DB
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_multi_insert(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_multi_insert(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_insert_1"), true);
         test_multi_insert(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_insert_2"), false);
@@ -1159,13 +1064,6 @@ mod test {
     fn test_layereddb_multi_remove() {
         // Init a DB
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            test_multi_remove(db);
-            let db = open_redb(temp_dir.path(), false);
-            test_multi_remove(db);
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_1"), true);
         test_multi_remove(db);
         let db = open_mdbx(&temp_dir.path().join("mdbx_multi_remove_2"), false);
@@ -1942,11 +1840,6 @@ mod test {
         // Only test with full memory.  Otherwise iterators, while correct, may not work the test.
         // Init a DB
         let temp_dir = tempdir().expect("failed to create temp dir");
-        #[cfg(feature = "redb")]
-        {
-            let db = open_redb(temp_dir.path(), true);
-            db_simp_bench(db, "LayeredDB<ReDB>");
-        }
         let db = open_mdbx(&temp_dir.path().join("mdbx_dbsimpbench_1"), true);
         db_simp_bench(db, "LayeredDB<MdbxDatabase>");
     }

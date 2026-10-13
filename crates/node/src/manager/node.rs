@@ -266,7 +266,7 @@ pub(crate) struct EpochManager<P, DB> {
     /// Reth (MDBX) database handle. Held for the whole process so the execution engine can be
     /// recreated without reopening storage.
     reth_db: RethDb,
-    /// Consensus (REDB) database handle. Held for the whole process; shared with the p2p networks
+    /// Consensus database handle. Held for the whole process; shared with the p2p networks
     /// and per-epoch consensus components.
     consensus_db: DB,
     /// Application-scoped consensus bus. Survives epoch boundaries and is reset between epochs via

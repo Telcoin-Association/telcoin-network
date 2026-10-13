@@ -10,9 +10,6 @@ mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
-// `redb` is always built; it backs tests/benches and the `redb` feature. MDBX is the default
-// consensus backend (see Cargo.toml `default = ["reth-libmdbx"]`).
-pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
@@ -44,9 +41,6 @@ mod pack_bench;
 #[cfg(test)]
 mod pack_kv_bench;
 pub mod pack_validate;
-/// The `redb`-backed database implementation (used by tests/benches and the `redb` feature; MDBX
-/// is the default consensus backend).
-pub mod redb;
 /// On-demand benchmarks replaying production's DB traffic (see `workload_bench.rs`).
 #[cfg(test)]
 mod workload_bench;
@@ -140,14 +134,10 @@ pub mod tables {
     );
 }
 
-// mdbx is the default; redb replaces it when set, and tndb replaces both (so priority is
-// tndb -> redb -> mdbx)
-/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tndb")))]
+// mdbx is the default; tndb replaces it when set.
+/// The configured composite database backend: MDBX (the default).
+#[cfg(all(feature = "reth-libmdbx", not(feature = "tndb")))]
 pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
-/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "redb", not(feature = "tndb")))]
-pub type DatabaseType = CompositeDatabase<ReDB>;
 /// The configured database backend: tndb, one shared log per environment, when the `tndb`
 /// feature is on.
 #[cfg(feature = "tndb")]
@@ -155,16 +145,13 @@ pub type DatabaseType = tndb::SplitDatabase;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
-#[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
+#[allow(unreachable_code)] // Need this so it compiles cleanly with every feature set.
 pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the redb or tndb
-    // flag is set.
+    // Open the right DB based on feature flags.  The default is MDBX unless the tndb flag is set.
     #[cfg(feature = "tndb")]
     return _open_tndb(store_path);
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tndb")))]
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "tndb")))]
     return _open_mdbx(store_path);
-    #[cfg(all(feature = "redb", not(feature = "tndb")))]
-    return _open_redb(store_path);
     panic!("No DB configured!")
 }
 
@@ -372,36 +359,6 @@ fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDat
     db
 }
 
-/// Open or reopen all the storage of the node backed by ReDB.
-#[cfg(feature = "redb")]
-fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<ReDB> {
-    use tn_types::Database as _;
-
-    let store_path = store_path.as_ref();
-    let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
-    let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
-    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
-    // Epoch tables
-    db.open_table::<LastProposed>().expect("failed to open table!");
-    db.open_table::<Votes>().expect("failed to open table!");
-    db.open_table::<Certificates>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    db.open_table::<ProposedCertificates>().expect("failed to open table!");
-    db.open_table::<Payload>().expect("failed to open table!");
-    // Kad tables
-    db.open_table::<KadRecords>().expect("failed to open table!");
-    db.open_table::<KadProviderRecords>().expect("failed to open table!");
-    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
-    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
-    // Cache tables
-    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusCache>().expect("failed to open table!");
-    db
-}
-
 #[cfg(all(test, feature = "reth-libmdbx"))]
 mod migrate_test {
     use tempfile::TempDir;
@@ -499,8 +456,8 @@ mod test {
     }
 
     /// Runs a simple bench/test for the provided DB.  Can use it for larger dataset tests as well
-    /// as comparing backends. For example run ```cargo test dbsimpbench --features redb --
-    /// --nocapture --test-threads 1``` to run each backend through the bench one at a time.
+    /// as comparing backends. For example run ```cargo test dbsimpbench -- --nocapture
+    /// --test-threads 1``` to run each backend through the bench one at a time.
     pub(crate) fn db_simp_bench<DB: Database>(db: DB, name: &str) {
         use tn_types::{DbTx, DbTxMut};
 
