@@ -1553,9 +1553,11 @@ struct Scan {
 /// goes to the worker. A method name is read as the worker reads it, unicode
 /// escapes included. Everything else goes to the query upstream, and so does
 /// everything ambiguous, which keeps it away from the validator: a body that
-/// is not JSON, a `method` that is not a string, an empty batch, and bytes
-/// trailing the JSON value. `eth_sendTransaction` is a query too: no node
-/// configures a signer, so the worker could only refuse it.
+/// is not JSON, a `method` that is not a string, a call with more than one
+/// `method` member, an empty batch, and bytes trailing the JSON value. A batch
+/// holding a call with more than one `method` is unreadable, like any batch
+/// the pass cannot read to its end. `eth_sendTransaction` is a query too: no
+/// node configures a signer, so the worker could only refuse it.
 ///
 /// A batch that mixes submissions with other calls goes, whole, to the query
 /// upstream; a batch element that is not an object counts as another call.
@@ -1841,16 +1843,25 @@ impl<'de> Call<'de> {
     /// Read a call object's `method` and first two `params` elements,
     /// skipping every other member in place.
     ///
-    /// A repeated member keeps its last occurrence, as a `Value` parse does.
-    /// jsonrpsee's derived request type rejects a duplicated member outright,
-    /// so such a call is an invalid request at either upstream; the choice
-    /// only decides which one says so.
+    /// A second `method` member, however its key is written, makes the call
+    /// unreadable, as jsonrpsee's derived request type refuses a duplicated
+    /// member outright: keeping either occurrence would let the route rest on
+    /// a name the worker never reads. A single call so refused routes like
+    /// any other body the scan cannot read, and a batch holding one is
+    /// unreadable (see [`scan`]). A repeated `params` keeps its last
+    /// occurrence, as a `Value` parse does; it decides no route, and
+    /// jsonrpsee refuses the call either way.
     fn read<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
         let mut call =
             Self { method: RpcMethod::Other, name: None, raw_transaction: None, pending: false };
+        let mut has_method = false;
         while let Some(member) = members.next_key::<Member>()? {
             match member {
                 Member::Method => {
+                    if has_method {
+                        return Err(de::Error::duplicate_field("method"));
+                    }
+                    has_method = true;
                     let name = members.next_value::<MaybeStr<'de>>()?.0;
                     call.method = RpcMethod::named(name.as_deref());
                     call.name = name;
@@ -3430,10 +3441,10 @@ mod tests {
 
     /// post-rev-5: the shield rests on the scan reading a body as the worker
     /// does. For every body the scan routes to the worker, each call jsonrpsee
-    /// would run must be a submission; a call the two read differently (a
-    /// duplicated member, which the scan resolves to its last occurrence) must
-    /// be one jsonrpsee refuses outright, because its derived request type
-    /// rejects duplicated fields. And wherever jsonrpsee reads calls, the
+    /// would run must be a submission. A duplicated `method`, which
+    /// jsonrpsee's derived request type refuses outright, is unreadable to the
+    /// scan too, so such a call never routes to the worker whichever name
+    /// comes last. And wherever jsonrpsee reads calls, the
     /// scan must count the same number or report a batch it cannot read to
     /// its end, which the gateway refuses whole; otherwise a batch could
     /// dodge the length cap and the per-call charge.
@@ -3447,8 +3458,8 @@ mod tests {
             r#"{"id":"a","params":[],"method":"eth_sendRawTransaction","jsonrpc":"2.0"}"#;
         let escaped_name = r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0054ransaction","id":1}"#;
         let escaped_key = r#"{"jsonrpc":"2.0","m\u0065thod":"eth_sendRawTransactionSync","id":1}"#;
-        // read differently: the scan keeps the last `method`, jsonrpsee
-        // refuses the duplicate
+        // a duplicated `method`: jsonrpsee refuses the call, and the scan
+        // cannot read it
         let duplicated =
             r#"{"jsonrpc":"2.0","method":"eth_call","method":"eth_sendRawTransaction","id":1}"#;
         let duplicated_escaped = r#"{"jsonrpc":"2.0","method":"eth_call","m\u0065thod":"eth_sendRawTransaction","id":1}"#;
@@ -3471,15 +3482,15 @@ mod tests {
             reordered.to_string(),
             escaped_name.to_string(),
             escaped_key.to_string(),
-            duplicated.to_string(),
-            duplicated_escaped.to_string(),
             format!("[{submission},{sync},{notification},{reordered}]"),
-            format!("[{escaped_name},{escaped_key},{duplicated}]"),
+            format!("[{escaped_name},{escaped_key}]"),
             format!("\u{c}{submission}"),
             format!(" \t\r\n\u{c}[{submission},{sync}]"),
         ];
         let kept_away: Vec<String> = vec![
             read.clone(),
+            duplicated.to_string(),
+            duplicated_escaped.to_string(),
             duplicated_last_read.to_string(),
             r#"{"jsonrpc":"2.0","method":"eth_sendRaw\u0074ransaction","id":1}"#.to_string(),
             r#"{"jsonrpc":"2.0","Method":"eth_sendRawTransaction","id":1}"#.to_string(),
@@ -3487,6 +3498,7 @@ mod tests {
             format!("[{read},{escaped_name}]"),
             format!("[{submission},1]"),
             format!("[{submission},{duplicated_last_read}]"),
+            format!("[{escaped_name},{escaped_key},{duplicated}]"),
             format!("\u{c}{read}"),
             format!("\u{c}[{submission},{read}]"),
             "[]".to_string(),
@@ -3530,9 +3542,14 @@ mod tests {
             let text = String::from_utf8_lossy(body);
             assert_eq!(classify(body).route(), Route::Query, "{text:?}");
         }
-        // the duplicate-key cases only stay safe because jsonrpsee refuses them
-        for body in [duplicated, duplicated_escaped] {
+        // jsonrpsee refuses a duplicated `method` whichever name comes last,
+        // and so does the scan
+        for body in [duplicated, duplicated_escaped, duplicated_last_read] {
             assert_eq!(worker_reads(body.as_bytes()), WorkerReads::Single(None), "{body}");
+            let single = scan(body.as_bytes(), None);
+            assert_eq!((single.calls, single.submitted), (Calls::Queries, None), "{body}");
+            let batch = format!("[{submission},{body}]");
+            assert!(scan(batch.as_bytes(), None).unreadable_batch, "{batch}");
         }
         assert_eq!(
             worker_reads(positional.as_bytes()),
@@ -3576,16 +3593,40 @@ mod tests {
         }
     }
 
+    /// A call with more than one `method` member is unreadable, as jsonrpsee
+    /// refuses it, whichever name comes last and however the key is written:
+    /// alone it routes like any body the scan cannot read, to the query
+    /// upstream, with no verdict, hash or pool read; in a batch it makes the
+    /// batch unreadable. A method policy in force denies it, like any other
+    /// call it cannot read.
     #[test]
-    fn duplicated_method_keeps_the_last() {
-        let last_submission =
-            r#"{"method":"eth_call","method":"eth_sendRawTransaction","params":[],"id":1}"#;
-        assert_eq!(classify(last_submission.as_bytes()), Calls::Submissions);
-        let last_read =
-            r#"{"method":"eth_sendRawTransaction","method":"eth_call","params":[],"id":1}"#;
-        assert_eq!(classify(last_read.as_bytes()), Calls::Queries);
-        let batch = format!("[{last_read},{}]", call("eth_sendRawTransaction"));
-        assert_eq!(classify(batch.as_bytes()), Calls::MixedBatch);
+    fn duplicated_method_makes_the_call_unreadable() {
+        let submission = call("eth_sendRawTransaction");
+        let duplicates = [
+            r#"{"method":"eth_call","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"method":"eth_sendRawTransaction","method":"eth_call","params":[],"id":1}"#,
+            r#"{"method":"eth_sendRawTransaction","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"method":"eth_call","m\u0065thod":"eth_sendRawTransactionSync","params":[],"id":1}"#,
+            r#"{"method":null,"method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"method":"eth_getTransactionCount","params":["0x00","pending"],"method":"eth_getTransactionCount","id":1}"#,
+        ];
+        let prefixes = ["debug_".to_string()];
+        for body in duplicates {
+            let single = scan(body.as_bytes(), None);
+            assert_eq!(single.calls, Calls::Queries, "{body}");
+            assert!(is_query(single.calls, single.pool_read, None), "{body}");
+            assert!(single.rejection.is_none() && single.submitted.is_none(), "{body}");
+            assert!(single.pool_read.is_none() && !single.unreadable_batch, "{body}");
+            assert!(calls_denied_method(body.as_bytes(), &prefixes), "{body}");
+            for batch in [format!("[{body}]"), format!("[{submission},{body}]")] {
+                assert!(scan(batch.as_bytes(), None).unreadable_batch, "{batch}");
+            }
+        }
+        // a repeated `params` decides no route, and keeps its last occurrence
+        let params_twice =
+            r#"{"method":"eth_sendRawTransaction","params":[],"params":["0xdeadbeef"],"id":1}"#;
+        assert_eq!(classify(params_twice.as_bytes()), Calls::Submissions);
+        assert!(screen_raw_transaction(params_twice.as_bytes()).is_some());
     }
 
     /// A JSON-RPC call to `method` with the given params.

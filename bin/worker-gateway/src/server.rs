@@ -2701,6 +2701,43 @@ mod tests {
         assert_eq!(query_seen.hits(), 3);
     }
 
+    /// A call with more than one `method` member never reaches the worker on
+    /// the strength of either name: with the redirect, alone it goes to the
+    /// query upstream like any body the gateway cannot read, and a batch
+    /// holding one is refused whole, with or without the redirect.
+    #[tokio::test]
+    async fn duplicated_method_never_routes_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let duplicates = [
+            r#"{"jsonrpc":"2.0","method":"eth_call","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","method":"eth_call","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_call","m\u0065thod":"eth_sendRawTransactionSync","params":[],"id":1}"#,
+        ];
+        let submission = call("eth_sendRawTransaction", 2);
+        for redirect in [Some(query), None] {
+            let state = redirect_state(worker, redirect);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+            for duplicate in duplicates {
+                if redirect.is_some() {
+                    let (status, text) = post_rpc(gateway, None, duplicate.to_string()).await;
+                    assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{duplicate}");
+                }
+                for body in [format!("[{duplicate}]"), format!("[{submission},{duplicate}]")] {
+                    let (status, text) = post_rpc(gateway, None, body.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                    assert_eq!(
+                        error_code_and_id(&text),
+                        (-32600, serde_json::Value::Null),
+                        "{body}"
+                    );
+                }
+            }
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, duplicates.len()));
+    }
+
     #[tokio::test]
     async fn worker_down_serves_queries_and_refuses_submissions() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
