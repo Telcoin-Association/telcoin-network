@@ -942,6 +942,7 @@ async fn accept_loop(
                     debug!(
                         target: "gateway::server",
                         %peer_addr,
+                        %client_addr,
                         "connection exceeded max lifetime; closing"
                     );
                     Some(request_deadline)
