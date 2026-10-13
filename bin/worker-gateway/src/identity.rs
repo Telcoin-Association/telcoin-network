@@ -412,15 +412,19 @@ impl FromStr for Cidr {
 }
 
 /// One `X-Forwarded-For` entry as a canonical address: a bare IPv4 or IPv6
-/// address, or one with a port (`203.0.113.7:4711`, `[2001:db8::7]:4711`),
-/// which some proxies append; the port is dropped.
+/// address, a bracketed IPv6 address (`[2001:db8::7]`), or an address with a
+/// port (`203.0.113.7:4711`, `[2001:db8::7]:4711`), which some proxies append;
+/// the port is dropped.
 fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
     let entry = entry.trim();
-    entry
-        .parse::<IpAddr>()
-        .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
-        .ok()
-        .map(|ip| ip.to_canonical())
+    let ip = match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(bracketed) => bracketed.parse::<Ipv6Addr>().map(IpAddr::V6).ok(),
+        None => entry
+            .parse::<IpAddr>()
+            .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
+            .ok(),
+    };
+    ip.map(|ip| ip.to_canonical())
 }
 
 /// A PROXY protocol header the gateway will not accept.
@@ -566,6 +570,25 @@ mod tests {
         assert_eq!(client(list, "10.0.0.1", &["[2001:db8::7]:4711"]), ip("2001:db8::7"));
         // a trusted hop with a port is still skipped
         assert_eq!(client(list, "10.0.0.1", &["203.0.113.5, 10.0.0.2:80"]), ip("203.0.113.5"));
+    }
+
+    #[test]
+    fn bracketed_ipv6_entry_without_a_port_is_read() {
+        let list = "10.0.0.0/8";
+        assert_eq!(client(list, "10.0.0.1", &["[2001:db8::7]"]), ip("2001:db8::7"));
+        assert_eq!(client(list, "10.0.0.1", &[" [2001:db8::7] , 10.0.0.2"]), ip("2001:db8::7"));
+        // a bracketed mapped address is the ipv4 address it maps
+        assert_eq!(client(list, "10.0.0.1", &["[::ffff:203.0.113.5]"]), ip("203.0.113.5"));
+        // a bracketed trusted hop is still skipped
+        assert_eq!(
+            client("10.0.0.0/8, 2001:db8::/32", "10.0.0.1", &["203.0.113.5, [2001:db8::2]"]),
+            ip("203.0.113.5")
+        );
+        // only one pair of brackets around an ipv6 address is taken off; anything
+        // else stays unparsable and falls back to the peer
+        for entry in ["[203.0.113.5]", "[[2001:db8::7]]", "[2001:db8::7", "2001:db8::7]", "[]"] {
+            assert_eq!(client(list, "10.0.0.1", &[entry]), ip("10.0.0.1"), "{entry}");
+        }
     }
 
     #[test]
