@@ -29,6 +29,7 @@ use super::{
     commit::Durability,
     compact::{read_base, CompactShared},
     manifest::Manifest,
+    metrics::TnDbMetrics,
     record::{self, Op, KIND_CLEAR, KIND_PUT, KIND_REMOVE},
     TableId,
 };
@@ -385,6 +386,9 @@ pub(super) struct Writer {
     /// Test-only: the next batch panics after appending this many records.
     #[cfg(test)]
     panic_after: Option<usize>,
+    /// Test-only: the next batch holds the write lock at least this long.
+    #[cfg(test)]
+    hold_next: Option<std::time::Duration>,
 }
 
 /// A compacted generation, ready to replace the current one (see [`Writer::install_gen`]).
@@ -705,6 +709,8 @@ pub(super) struct Core {
     pub(super) registry: Mutex<Manifest>,
     /// The compaction thread's requests and state.
     pub(super) compact: CompactShared,
+    /// The production metrics' handles.
+    pub(super) metrics: TnDbMetrics,
     /// Held by whoever runs a sync round (see `commit::sync_round`): one at a time.
     pub(super) sync_lock: Mutex<()>,
     /// The database's `LOCK` (an flock), held until the core drops: declared last, so the files
@@ -725,6 +731,7 @@ impl Core {
         root: &Path,
         durability: Arc<Durability>,
         config: CompactionConfig,
+        metrics: TnDbMetrics,
     ) -> eyre::Result<Self> {
         fs::create_dir_all(root)?;
         let lock = lock_dir(root)?;
@@ -807,6 +814,8 @@ impl Core {
             emptied: false,
             #[cfg(test)]
             panic_after: None,
+            #[cfg(test)]
+            hold_next: None,
         };
         let mut tables = Tables::default();
         for entry in &manifest.tables {
@@ -827,6 +836,7 @@ impl Core {
         // A log closed (or crashed) after a batch emptied every table, before the compaction
         // that followed: the next batch asks for it again.
         writer.note_if_emptied();
+        metrics.opened(gen, writer.log_len());
         Ok(Self {
             root: root.to_path_buf(),
             writer: Mutex::new(writer),
@@ -835,6 +845,7 @@ impl Core {
             durability,
             registry: Mutex::new(manifest),
             compact: CompactShared::default(),
+            metrics,
             sync_lock: Mutex::new(()),
             #[cfg(test)]
             rebuilt,
@@ -982,17 +993,16 @@ impl Core {
     /// Write `ops` as one batch: appended to the log, applied to the indexes and published, all
     /// or nothing. Returns the batch's number, or `None` if it changed nothing.
     pub(super) fn write(&self, ops: &[BatchOp<'_>]) -> eyre::Result<Option<u64>> {
-        #[cfg(test)]
         let wait_started = std::time::Instant::now();
         let mut writer = self.writer.lock();
-        #[cfg(test)]
-        super::stats::add(
-            &super::stats::LOCK_WAITS,
-            &super::stats::LOCK_WAIT_NS,
-            wait_started.elapsed(),
-        );
-        #[cfg(test)]
         let held_from = std::time::Instant::now();
+        let waited = held_from - wait_started;
+        #[cfg(test)]
+        super::stats::add(&super::stats::LOCK_WAITS, &super::stats::LOCK_WAIT_NS, waited);
+        #[cfg(test)]
+        if let Some(hold) = writer.hold_next.take() {
+            std::thread::sleep(hold);
+        }
         writer.check()?;
         writer.stamp_synced();
         let effective = writer.effective(ops)?;
@@ -1027,15 +1037,17 @@ impl Core {
         }
         writer.sync.growths.store(writer.log.growths(), Ordering::Release);
         self.store_frontier(&writer);
-        #[cfg(test)]
-        super::stats::hold(held_from.elapsed());
-        #[cfg(test)]
-        super::stats::log(self.stat_slot).hold(held_from.elapsed());
         let end = writer.log.file_len();
         let pending = end.saturating_sub(writer.sync.synced.load(Ordering::Acquire));
         writer.note_if_emptied();
         let compact = writer.wants_compaction();
+        let held = held_from.elapsed();
         drop(writer);
+        #[cfg(test)]
+        super::stats::hold(held);
+        #[cfg(test)]
+        super::stats::log(self.stat_slot).hold(held);
+        self.metrics.wrote(end, pending, waited, held);
         self.durability.wrote(pending);
         if compact {
             self.compact.request_auto();
@@ -1047,6 +1059,12 @@ impl Core {
     #[cfg(test)]
     pub(super) fn release_lock_for_crash(&self) {
         self.lock.lock().take();
+    }
+
+    /// Test-only: the next batch holds the write lock at least `hold` (a stall).
+    #[cfg(test)]
+    pub(super) fn hold_next_batch(&self, hold: std::time::Duration) {
+        self.writer.lock().hold_next = Some(hold);
     }
 
     /// Test-only: the next batch panics after appending `n` records.
@@ -1108,6 +1126,12 @@ fn empty_published(writer: &Writer, table: TableId) -> Published {
 pub(super) fn open_log(dir: &Path) -> eyre::Result<Log> {
     let opts = MmapFileOptions { reserve: LOG_MAP_RESERVE, ..Default::default() };
     Ok(Pack::open_with(dir.join("log"), 0, false, PackCompression::None, PACK_VERSION, opts)?)
+}
+
+/// Open a generation's log read-only (an inspection): nothing is created, healed or sealed.
+pub(super) fn open_log_read_only(dir: &Path) -> eyre::Result<Log> {
+    let opts = MmapFileOptions { reserve: LOG_MAP_RESERVE, ..Default::default() };
+    Ok(Pack::open_with(dir.join("log"), 0, true, PackCompression::None, PACK_VERSION, opts)?)
 }
 
 #[cfg(test)]
@@ -1195,7 +1219,7 @@ enum Pending {
 /// once its flagged last record reads back intact, so a crash keeps no part of a partly written
 /// batch. A sealed log must read whole; an unclean one may end in a tear, but not below its
 /// commit marker.
-fn replay(
+pub(super) fn replay(
     log: &Log,
     manifest: &Manifest,
     want: &impl Fn(TableId) -> bool,

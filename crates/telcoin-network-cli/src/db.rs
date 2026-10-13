@@ -74,6 +74,11 @@ enum DbSubcommand {
 
     /// Load an EVM state-export pack into a new reth database under the datadir.
     LoadState(DbLoadStateArgs),
+
+    /// Report what the node's tndb consensus database holds (a node built with the `tndb`
+    /// feature): per environment, its generation, log, live and dead bytes, and each table's rows
+    /// and index state. Read-only (changes no file); refuses while the node has it open.
+    TndbStat,
 }
 
 impl DbCommand {
@@ -105,6 +110,7 @@ impl DbCommand {
             DbSubcommand::Repair(args) => args.execute(datadir)?,
             DbSubcommand::Migrate(args) => args.execute(datadir)?,
             DbSubcommand::LoadState(args) => args.execute(datadir)?,
+            DbSubcommand::TndbStat => tndb_stat(&datadir)?,
         }
         Ok(())
     }
@@ -1497,6 +1503,86 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
     Ok(stats_table(&stats))
 }
 
+/// `db tndb-stat`: print the report of the node's tndb database (see
+/// [`tn_storage::tndb::inspect_split`]), failing if an environment could not be read.
+fn tndb_stat(datadir: &PathBuf) -> eyre::Result<()> {
+    let root = datadir.consensus_db_path().join(tn_storage::tndb::TNDB_DIR);
+    if !root.is_dir() {
+        println!("(no tndb database at {})", root.display());
+        return Ok(());
+    }
+    let report = tn_storage::tndb::inspect_split(&root);
+    let migrated = if report.migrated { " (the MDBX consensus tables were copied in)" } else { "" };
+    println!("tndb database at {}{migrated}", root.display());
+    let mut unreadable = 0;
+    for (env, result) in &report.envs {
+        println!();
+        match result {
+            Ok(env_report) => {
+                println!("{}", tndb_env_summary(env, env_report));
+                println!("{}", tndb_tables_table(env_report));
+            }
+            Err(e) => {
+                unreadable += 1;
+                println!("{env}: ERROR {e:#}");
+            }
+        }
+    }
+    if unreadable > 0 {
+        bail!("{unreadable} tndb environment(s) could not be read");
+    }
+    Ok(())
+}
+
+/// One environment's summary line(s): generation, log and live/dead bytes, leftovers.
+fn tndb_env_summary(env: &str, report: &tn_storage::tndb::EnvReport) -> String {
+    let bytes = |n: u64| human_bytes(n as f64);
+    let data = report.live_bytes + report.dead_bytes;
+    let dead_pct = if data == 0 { 0.0 } else { 100.0 * report.dead_bytes as f64 / data as f64 };
+    let mut summary = format!(
+        "{env}: generation {}, {}; log {} on disk, data {} (live {}, dead {}, {dead_pct:.0}% dead); \
+         compacted base {}",
+        report.generation,
+        if report.clean { "closed cleanly" } else { "NOT closed cleanly (replayed at open)" },
+        bytes(report.file_bytes),
+        bytes(report.data_end),
+        bytes(report.live_bytes),
+        bytes(report.dead_bytes),
+        bytes(report.base),
+    );
+    if !report.older_generations.is_empty() {
+        summary.push_str(&format!(
+            "\n  older generations on disk: {:?} (deleted at the next open)",
+            report.older_generations
+        ));
+    }
+    if report.unfinished_builds > 0 {
+        summary.push_str(&format!(
+            "\n  unfinished compaction builds: {} (deleted at the next open)",
+            report.unfinished_builds
+        ));
+    }
+    summary
+}
+
+/// One environment's tables: rows, live bytes and index state.
+fn tndb_tables_table(report: &tn_storage::tndb::EnvReport) -> ComfyTable {
+    let mut table = ComfyTable::new();
+    table.load_preset(comfy_table::presets::ASCII_MARKDOWN);
+    table.set_header(["Table", "Id", "Key bytes", "Rows", "Live", "Index"]);
+    for t in &report.tables {
+        table.add_row(Row::from(vec![
+            Cell::new(&t.name),
+            Cell::new(t.id),
+            Cell::new(t.key_size),
+            Cell::new(t.rows),
+            Cell::new(human_bytes(t.live_bytes as f64)),
+            Cell::new(t.index.label()),
+        ]));
+    }
+    table
+}
+
 #[cfg(test)]
 mod tests {
     use super::{file_len_if_exists, repair_targets, static_files_summary_table};
@@ -2513,5 +2599,32 @@ mod tests {
         super::chain_data_dirs(&datadir_path).iter().for_each(|dir| {
             assert!(!dir.exists(), "{} must not exist after a pre-import refusal", dir.display());
         });
+    }
+
+    #[test]
+    fn parse_db_tndb_stat_subcommand() {
+        let cli = Cli::<NoArgs>::try_parse_args_from(["tn", "db", "tndb-stat"]).expect("parsed");
+        let Commands::Db(_) = cli.command else {
+            panic!("expected the db subcommand");
+        };
+    }
+
+    /// `db tndb-stat` reports a closed tndb database, succeeds with none at all, and refuses one
+    /// the node has open.
+    #[test]
+    fn db_tndb_stat_reads_a_closed_database_and_refuses_an_open_one() {
+        use tn_config::TelcoinDirs as _;
+        let datadir = tempfile::tempdir().unwrap().keep();
+        let stat = super::DbCommand { command: super::DbSubcommand::TndbStat };
+        stat.execute(datadir.clone()).expect("no tndb database: nothing to report");
+        let root = datadir.consensus_db_path().join(tn_storage::tndb::TNDB_DIR);
+        let open =
+            || tn_storage::tndb::SplitDatabase::open_with(&root, Default::default()).expect("open");
+        drop(open());
+        stat.execute(datadir.clone()).expect("a closed database is reported");
+        let db = open();
+        assert!(stat.execute(datadir.clone()).is_err(), "the node has it open");
+        drop(db);
+        let _ = fs::remove_dir_all(&datadir);
     }
 }

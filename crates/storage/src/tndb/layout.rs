@@ -48,6 +48,27 @@ pub(super) fn lock_dir(root: &Path) -> eyre::Result<fs::File> {
     Ok(file)
 }
 
+/// Lock the database directory `root` for reading only: a shared, non-blocking `flock` on
+/// `<root>/LOCK`. It fails while a handle holds the exclusive lock (see [`lock_dir`]), and keeps
+/// one from opening until the returned file drops. A directory with no `LOCK` was never opened as
+/// a database.
+pub(super) fn lock_dir_shared(root: &Path) -> eyre::Result<fs::File> {
+    let file = fs::File::open(root.join("LOCK"))
+        .wrap_err_with(|| format!("tndb: {} is not a database (no LOCK)", root.display()))?;
+    // SAFETY: `flock` on a valid, open file descriptor borrowed for the call.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        let e = io::Error::last_os_error();
+        if e.kind() == io::ErrorKind::WouldBlock {
+            bail!(
+                "tndb: database {} is open (its LOCK is held); stop the node first",
+                root.display()
+            );
+        }
+        return Err(e).wrap_err("tndb: lock the database for reading");
+    }
+    Ok(file)
+}
+
 /// Bytes available to this process on the filesystem holding `dir` (`statvfs`: free blocks
 /// available to unprivileged users times the fragment size).
 pub(super) fn available_bytes(dir: &Path) -> io::Result<u64> {

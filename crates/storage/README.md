@@ -182,7 +182,8 @@ and compaction into a new generation. The `tndb` feature makes it the `DatabaseT
 (`SplitDatabase`: one log per `epoch` / `kad` / `cache` environment, as `open_db` splits MDBX), and
 the first open moves an existing MDBX consensus DB into it; MDBX stays the default. It replaced
 an earlier per-table engine of the same name, whose separate files cost a sync per table per
-commit (this engine was called `tnlog` while the two were compared). See
+commit (this engine was called `tnlog` while the two were compared). It exports
+`tn_storage_tndb_*` metrics, and `telcoin-network db tndb-stat` inspects it at rest. See
 [`src/tndb/README.md`](src/tndb/README.md).
 
 ### On-disk layout

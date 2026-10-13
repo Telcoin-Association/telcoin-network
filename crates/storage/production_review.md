@@ -113,7 +113,7 @@ still held rows its slow disk writes had not reached. The per-read CRC stays.
 - **Detail:** `checked_payload_in` (`pack.rs:781`). Batch-cache `multi_get` runs at 55–65% of production's layered MDBX.
 - **Fix:** measure first, by running the reads without the CRC. If it's confirmed, verify once per record instead of on every read. That trades some at-rest rot detection, so it's your call.
 
-**M7. tnlog has no production metrics.**
+**M7. [FIXED 2026-10-13: `tn_storage_tndb_*` metrics (batches, sync latency, unsynced and log bytes, generation, write-lock stalls, compactions by outcome, abandons by cause, compaction and switch durations, the `failed` latch), labeled by `env`, recorded at events through handles made at open; alerts in the tndb README; no write-path cost measured. Tests `test_tndb_metrics_*`, `test_tndb_compaction_abandon_causes`.] tnlog has no production metrics.**
 - **Detail:** its stats are `cfg(test)` only.
 - **Fix:** export sync latency, unsynced bytes, lock waits, compactions (duration, switch hold, abandons and causes) and latched failures through the node's metrics. Alert on latches and on repeated abandons.
 
@@ -150,7 +150,7 @@ still held rows its slow disk writes had not reached. The per-read CRC stays.
 - **L10. No CI test lane runs the node on tnlog;** only the `--all-features` clippy pass compiles it. Fix: a nightly lane (DB-using crates plus e2e epoch and restart tests with `tn-storage/tnlog`), until it becomes the default.
 - **L11. Address-space reservation:** 16 GiB per log and 1 GiB per index (~62 GiB at rest, more during compaction), shared mappings, not commit-charged; falls back under `ulimit -v`. Fix: document; consider 4 GiB log reserves.
 - **L12. `has_dead` is assumed true at every open,** so a restart may cost one unneeded compaction. Optional: keep a dead-row count in `compacted`.
-- **L13. No inspection tool** (MDBX has `mdbx_stat`). Fix: a `db tnlog-stat` subcommand; it also serves M7.
+- **L13. [FIXED 2026-10-13: `telcoin-network db tndb-stat` (`tndb::inspect` / `inspect_split`): read-only, refuses an open database via a shared lock; tests `test_tndb_inspect_*`, CLI `db_tndb_stat_*`.] No inspection tool** (MDBX has `mdbx_stat`). Fix: a `db tnlog-stat` subcommand; it also serves M7.
 - **L14. Cosmetic:**
   - the `Core::lock` doc comment is attached to the wrong field;
   - `persist`'s dead branch;

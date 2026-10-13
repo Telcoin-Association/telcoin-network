@@ -63,6 +63,8 @@ pub(super) struct Durability {
     durable_changed: Condvar,
     /// The first failure, if any (never cleared).
     failed: Mutex<Option<String>>,
+    /// Set to 1 at the first failure (the `tndb_failed` metric).
+    failed_gauge: ::metrics::Gauge,
     run: Mutex<Run>,
     wake: Condvar,
     /// The highest batch number a `persist` waits for.
@@ -88,8 +90,9 @@ pub(super) struct Durability {
 }
 
 impl Durability {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(failed_gauge: ::metrics::Gauge) -> Arc<Self> {
         Arc::new(Self {
+            failed_gauge,
             seq: AtomicU64::new(0),
             durable: tokio::sync::watch::Sender::new(0),
             durable_now: Mutex::new(0),
@@ -180,6 +183,7 @@ impl Durability {
             }
             tracing::error!(target: "tndb", "durability failed: {cause}; every later write and persist fails");
             *failed = Some(cause);
+            self.failed_gauge.set(1.0);
         }
         self.durable.send_modify(|_| {});
         let _now = self.durable_now.lock();
@@ -298,7 +302,6 @@ fn sync_round(core: &Core) {
             let _ = release.recv_timeout(std::time::Duration::from_secs(30));
         }
     }
-    #[cfg(test)]
     let started = std::time::Instant::now();
     let sync = &frontier.sync;
     let start = sync.synced.load(Ordering::Acquire);
@@ -328,6 +331,8 @@ fn sync_round(core: &Core) {
     match outcome {
         Ok(()) => {
             sync.synced.fetch_max(frontier.end, Ordering::AcqRel);
+            // Recorded before the watermark moves, so a persist that returns has it counted.
+            core.metrics.synced(started.elapsed(), core.unsynced());
             durability.advance(frontier.seq);
         }
         Err(e) => durability.fail(format!("sync the log: {e}")),

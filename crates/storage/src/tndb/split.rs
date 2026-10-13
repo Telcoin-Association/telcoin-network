@@ -16,6 +16,7 @@ use std::path::Path;
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table, TableHint};
 
 use super::database::{CompactionConfig, TnDatabase, TnDbOptions, TnDbTxMut};
+use crate::layered_db::{CACHE_ENV, EPOCH_ENV, KAD_ENV};
 
 /// The least log the cache environment compacts automatically at (a larger configured threshold
 /// is kept). The batch caches churn at the batch write rate: at the default 64 MiB, a heavy batch
@@ -31,6 +32,14 @@ pub const CACHE_AUTO_MIN_BYTES: u64 = 256 << 20;
 pub const EPOCH_AUTO_MIN_BYTES: u64 = 2 << 30;
 
 /// The environments, in [`SplitDatabase::dbs`] order.
+/// The environments' directories under a `SplitDatabase`'s root, in [`EPOCH`], [`KAD`],
+/// [`CACHE`] order.
+pub(super) const ENVIRONMENTS: [&str; 3] = ["epoch", "kad", "cache"];
+
+/// The file in a `SplitDatabase`'s root recording that the node's MDBX consensus tables were
+/// copied in (see `migrate_from_mdbx` in the crate root).
+pub const MDBX_MIGRATED: &str = "mdbx-migrated";
+
 const EPOCH: usize = 0;
 const KAD: usize = 1;
 const CACHE: usize = 2;
@@ -70,9 +79,21 @@ impl SplitDatabase {
         let root = root.as_ref();
         Ok(Self {
             dbs: [
-                TnDatabase::open_with(root.join("epoch"), env_options(options, EPOCH))?,
-                TnDatabase::open_with(root.join("kad"), env_options(options, KAD))?,
-                TnDatabase::open_with(root.join("cache"), env_options(options, CACHE))?,
+                TnDatabase::open_named(
+                    root.join(ENVIRONMENTS[EPOCH]),
+                    env_options(options, EPOCH),
+                    EPOCH_ENV,
+                )?,
+                TnDatabase::open_named(
+                    root.join(ENVIRONMENTS[KAD]),
+                    env_options(options, KAD),
+                    KAD_ENV,
+                )?,
+                TnDatabase::open_named(
+                    root.join(ENVIRONMENTS[CACHE]),
+                    env_options(options, CACHE),
+                    CACHE_ENV,
+                )?,
             ],
         })
     }

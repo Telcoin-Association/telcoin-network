@@ -11,6 +11,7 @@ use tn_types::{
 use super::{
     commit::{Committer, Durability},
     compact::Compactor,
+    metrics::{TnDbMetrics, UNNAMED_ENV},
     store::{BatchOp, Core, ScanKind, TableShared},
     TableId,
 };
@@ -115,8 +116,19 @@ impl TnDatabase {
 
     /// Open (creating if absent) the database at `path`, committing as `options` say.
     pub fn open_with<P: AsRef<Path>>(path: P, options: TnDbOptions) -> eyre::Result<Self> {
-        let durability = Durability::new();
-        let core = Arc::new(Core::open(path.as_ref(), durability, options.compaction)?);
+        Self::open_named(path, options, UNNAMED_ENV)
+    }
+
+    /// [`Self::open_with`], its metrics labeled `env` (a [`super::SplitDatabase`] names each of
+    /// its environments).
+    pub(super) fn open_named<P: AsRef<Path>>(
+        path: P,
+        options: TnDbOptions,
+        env: &'static str,
+    ) -> eyre::Result<Self> {
+        let metrics = TnDbMetrics::new(env);
+        let durability = Durability::new(metrics.failed_gauge());
+        let core = Arc::new(Core::open(path.as_ref(), durability, options.compaction, metrics)?);
         let committer = Arc::new(Committer::start(Arc::clone(&core))?);
         let rate = options.compaction.bytes_per_sec;
         let compactor = Arc::new(Compactor::start(Arc::clone(&core), rate)?);

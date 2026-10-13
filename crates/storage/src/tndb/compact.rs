@@ -53,6 +53,7 @@ use parking_lot::{Condvar, Mutex};
 use super::{
     commit::Durability,
     layout::{available_bytes, compact_dir, gen_dir, remove_in_background, sync_dir, sync_file},
+    metrics::{Cause, Outcome},
     record::{self, Op, BATCH_END, KIND_CLEAR, KIND_REMOVE},
     store::{idx_dir, open_log, Core, GenAlive, GenSync, Log, NewGen, ScanKind, SnapTable},
     TableId,
@@ -122,7 +123,7 @@ const COMPACTED: &str = "compacted";
 const COMPACTED_TMP: &str = "compacted.tmp";
 
 /// A record's frame beyond its payload: its length and CRC.
-const FRAME: u64 = 8;
+pub(super) const FRAME: u64 = 8;
 
 /// The log's length right after the compaction that made the generation at `gen_path`, or 0 when
 /// none did (or its `compacted` file is unreadable: it is only the trigger's starting point).
@@ -340,10 +341,41 @@ fn free_bytes(core: &Core) -> Option<u64> {
 /// Give way to the writer when the disk is nearly full (an unknown free space does not block).
 fn check_room(core: &Core) -> eyre::Result<()> {
     match free_bytes(core) {
-        Some(free) if free < MIN_FREE => {
-            bail!("tndb: compaction abandoned: {free} bytes free, below {MIN_FREE}")
-        }
+        Some(free) if free < MIN_FREE => Err(GiveWay::DiskFull(format!(
+            "tndb: compaction abandoned: {free} bytes free, below {MIN_FREE}"
+        ))
+        .into()),
         _ => Ok(()),
+    }
+}
+
+/// A compaction giving way to the writer for a cause other than damage, carried in its error so
+/// the run loop counts it by cause (see [`Cause`]).
+#[derive(Debug)]
+enum GiveWay {
+    /// Too little free disk.
+    DiskFull(String),
+    /// The writer outran every switch try.
+    WriterOutran(String),
+}
+
+impl std::fmt::Display for GiveWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DiskFull(why) | Self::WriterOutran(why) => f.write_str(why),
+        }
+    }
+}
+
+impl std::error::Error for GiveWay {}
+
+/// Why the compaction that failed with `e` was abandoned (a panic is counted by the run loop).
+fn cause(e: &eyre::Report) -> Cause {
+    match e.chain().find_map(|cause| cause.downcast_ref::<GiveWay>()) {
+        Some(GiveWay::DiskFull(_)) => Cause::DiskFull,
+        Some(GiveWay::WriterOutran(_)) => Cause::WriterOutran,
+        None if is_corruption(e) => Cause::Corruption,
+        None => Cause::Error,
     }
 }
 
@@ -700,7 +732,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let mut skip_a_row = shared.test.skip_a_row.swap(false, Ordering::Relaxed);
     let needed = dir_bytes(&snap.gen_dir) + DISK_HEADROOM;
     if let Some(free) = free_bytes(core).filter(|&free| free < needed) {
-        bail!("tndb: compaction skipped: {free} bytes free, {needed} needed");
+        let why = format!("tndb: compaction skipped: {free} bytes free, {needed} needed");
+        return Err(GiveWay::DiskFull(why).into());
     }
     // Keeps the old generation's files open (and so its view valid) until this returns.
     let _alive = Arc::clone(&snap.alive);
@@ -844,21 +877,23 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             has_dead,
         });
         core.store_frontier(&writer);
-        #[cfg(test)]
-        super::stats::switch(held.elapsed());
-        #[cfg(test)]
-        super::stats::log(core.stat_slot).switch(held.elapsed());
-        #[cfg(not(test))]
-        let _ = held;
+        let held = held.elapsed();
+        let log_len = writer.log_len();
         drop(writer);
+        core.metrics.switched(gen, log_len, held);
+        #[cfg(test)]
+        super::stats::switch(held);
+        #[cfg(test)]
+        super::stats::log(core.stat_slot).switch(held);
         drop(registry);
         remove_in_background(old_dir, "tndb-reap");
         return Ok(true);
     }
-    bail!(
+    Err(GiveWay::WriterOutran(format!(
         "tndb: compaction abandoned: the writer outran {SWITCH_TRIES} switches (the last over \
          {STALL_TAIL_MAX} bytes)"
-    )
+    ))
+    .into())
 }
 
 /// The `tndb-compact` thread: waits for a request (the automatic trigger, or
@@ -915,24 +950,34 @@ fn run(core: &Core, rate: u64) {
             shared.running.store(true, Ordering::Release);
             std::mem::take(&mut state.requested)
         };
+        let started = Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| compact_once(core, requested, rate)));
-        let last = match outcome {
-            Ok(Ok(switched)) => Ok(switched),
+        let took = started.elapsed();
+        let (last, ended) = match outcome {
+            Ok(Ok(true)) => (Ok(true), Outcome::Switched),
+            Ok(Ok(false)) => (Ok(false), Outcome::Skipped),
             Ok(Err(e)) => {
-                if shared.cancel.load(Ordering::Relaxed) {
+                let ended = if shared.cancel.load(Ordering::Relaxed) {
                     tracing::debug!(target: "tndb", "compaction cancelled: {e:#}");
-                } else if is_corruption(&e) {
-                    tracing::error!(target: "tndb", "compaction abandoned: {e:#}");
+                    Outcome::Cancelled
                 } else {
-                    tracing::warn!(target: "tndb", "compaction abandoned: {e:#}");
-                }
-                Err(format!("{e:#}"))
+                    let cause = cause(&e);
+                    if cause == Cause::Corruption {
+                        tracing::error!(target: "tndb", "compaction abandoned: {e:#}");
+                    } else {
+                        tracing::warn!(target: "tndb", "compaction abandoned: {e:#}");
+                    }
+                    Outcome::Abandoned(cause)
+                };
+                (Err(format!("{e:#}")), ended)
             }
             Err(_) => {
                 tracing::error!(target: "tndb", "the compaction thread panicked; abandoned");
-                Err("panicked".to_string())
+                (Err("panicked".to_string()), Outcome::Abandoned(Cause::Panic))
             }
         };
+        // Recorded before the compaction counts as done, so a waiter sees it counted.
+        core.metrics.compaction_ended(ended, took);
         #[cfg(test)]
         if let Err(cause) = &last {
             let cancelled = shared.cancel.load(Ordering::Relaxed);
@@ -952,5 +997,24 @@ fn run(core: &Core, rate: u64) {
         state.last = Some(last);
         shared.running.store(false, Ordering::Release);
         shared.finished.notify_all();
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    /// An abandon's cause comes from the typed error wherever it sits in the chain, then from
+    /// damage, else it is a plain error.
+    #[test]
+    fn test_tndb_compaction_abandon_causes() {
+        let disk = eyre::Report::new(GiveWay::DiskFull("no room".into()));
+        assert_eq!(cause(&disk), Cause::DiskFull);
+        let outran =
+            eyre::Report::new(GiveWay::WriterOutran("outran".into())).wrap_err("compaction");
+        assert_eq!(cause(&outran), Cause::WriterOutran);
+        let damaged = eyre::Report::new(FetchError::CrcFailed).wrap_err("copy a row");
+        assert_eq!(cause(&damaged), Cause::Corruption);
+        assert_eq!(cause(&eyre::eyre!("an I/O error")), Cause::Error);
     }
 }

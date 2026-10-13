@@ -16,14 +16,21 @@
 mod commit;
 mod compact;
 pub mod database;
+pub mod inspect;
 mod layout;
 mod manifest;
+mod metrics;
 mod record;
 pub mod split;
 mod store;
 
 pub use database::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions};
-pub use split::{SplitDatabase, CACHE_AUTO_MIN_BYTES};
+pub use inspect::{inspect, inspect_split, EnvReport, IndexState, SplitReport, TableReport};
+pub use split::{SplitDatabase, CACHE_AUTO_MIN_BYTES, MDBX_MIGRATED};
+
+/// The directory under the node's consensus DB path holding its tndb database (a
+/// [`SplitDatabase`]) when the `tndb` feature picks the backend.
+pub const TNDB_DIR: &str = "tndb";
 
 /// A table's id in the log's records (never reused).
 pub(crate) type TableId = u16;

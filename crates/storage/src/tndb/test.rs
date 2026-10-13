@@ -1591,3 +1591,334 @@ fn test_tndb_misindexed_row_is_corrupt_not_another_value() {
     let compacted = db.compact_now().expect_err("the copy finds the mismatch");
     assert!(compacted.contains("index"), "{compacted}");
 }
+
+// ---- production metrics ----
+
+type MetricsSnapshot = Vec<(
+    metrics_util::CompositeKey,
+    Option<metrics::Unit>,
+    Option<metrics::SharedString>,
+    metrics_util::debugging::DebugValue,
+)>;
+
+/// The value of the series `name` carrying every label in `labels`, if registered. A snapshot
+/// reports a counter's increments and a histogram's samples since the last one, a gauge's value.
+fn series<'a>(
+    snapshot: &'a MetricsSnapshot,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<&'a metrics_util::debugging::DebugValue> {
+    snapshot
+        .iter()
+        .find(|(key, ..)| {
+            key.key().name() == name
+                && labels.iter().all(|(k, v)| {
+                    key.key().labels().any(|label| label.key() == *k && label.value() == *v)
+                })
+        })
+        .map(|(.., value)| value)
+}
+
+fn counter(snapshot: &MetricsSnapshot, name: &str, labels: &[(&str, &str)]) -> u64 {
+    match series(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Counter(n)) => *n,
+        other => panic!("counter {name} {labels:?}: {other:?}"),
+    }
+}
+
+fn gauge(snapshot: &MetricsSnapshot, name: &str, labels: &[(&str, &str)]) -> f64 {
+    match series(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Gauge(v)) => v.into_inner(),
+        other => panic!("gauge {name} {labels:?}: {other:?}"),
+    }
+}
+
+/// The samples of histogram `name` since the last snapshot (none if never recorded).
+fn samples(snapshot: &MetricsSnapshot, name: &str, labels: &[(&str, &str)]) -> Vec<f64> {
+    match series(snapshot, name, labels) {
+        Some(metrics_util::debugging::DebugValue::Histogram(v)) => {
+            v.iter().map(|x| x.into_inner()).collect()
+        }
+        None => Vec::new(),
+        other => panic!("histogram {name} {labels:?}: {other:?}"),
+    }
+}
+
+const M_BATCHES: &str = "tn_storage.tndb_batches_total";
+const M_SYNC: &str = "tn_storage.tndb_sync_seconds";
+const M_UNSYNCED: &str = "tn_storage.tndb_unsynced_bytes";
+const M_LOG: &str = "tn_storage.tndb_log_bytes";
+const M_GEN: &str = "tn_storage.tndb_generation";
+const M_STALL: &str = "tn_storage.tndb_write_stall_seconds";
+const M_COMPACTIONS: &str = "tn_storage.tndb_compactions_total";
+const M_ABANDONS: &str = "tn_storage.tndb_compaction_abandons_total";
+const M_COMPACTION: &str = "tn_storage.tndb_compaction_seconds";
+const M_SWITCH: &str = "tn_storage.tndb_compaction_switch_seconds";
+const M_FAILED: &str = "tn_storage.tndb_failed";
+
+/// A database's metrics: every series registered at open (counters at 0), then batches, syncs,
+/// the log's and unsynced bytes, a compaction (outcome, generation, duration, switch hold) and
+/// an abandon by cause, each recorded as it happens, through handles the background threads
+/// share (no recorder lookup on their threads).
+#[test]
+fn test_tndb_metrics_record_writes_syncs_and_compactions() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let tmp = TempDir::with_prefix("tndb_metrics").expect("temp dir");
+    let db = metrics::with_local_recorder(&recorder, || {
+        open_compacting(tmp.path(), CommitMode::Group, manual())
+    });
+    let env = [("env", "unnamed")];
+
+    let opened = snapshotter.snapshot().into_vec();
+    assert_eq!(counter(&opened, M_BATCHES, &env), 0);
+    for outcome in ["switched", "skipped", "abandoned", "cancelled"] {
+        assert_eq!(counter(&opened, M_COMPACTIONS, &[env[0], ("outcome", outcome)]), 0);
+    }
+    for cause in ["disk_full", "writer_outran", "corruption", "panic", "error"] {
+        assert_eq!(counter(&opened, M_ABANDONS, &[env[0], ("cause", cause)]), 0);
+    }
+    assert_eq!(gauge(&opened, M_FAILED, &env), 0.0);
+    assert_eq!(gauge(&opened, M_GEN, &env), 0.0);
+
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    block_on(db.persist::<TestTable>()).expect("persist");
+    let wrote = snapshotter.snapshot().into_vec();
+    assert_eq!(counter(&wrote, M_BATCHES, &env), 10);
+    assert!(!samples(&wrote, M_SYNC, &env).is_empty(), "the syncs are timed");
+    assert_eq!(gauge(&wrote, M_LOG, &env), log_len(&db) as f64);
+    assert_eq!(gauge(&wrote, M_UNSYNCED, &env), 0.0, "all synced after the persist");
+
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &format!("w{i}")).expect("overwrite");
+    }
+    assert_eq!(db.compact_now(), Ok(true));
+    let compacted = snapshotter.snapshot().into_vec();
+    assert_eq!(counter(&compacted, M_COMPACTIONS, &[env[0], ("outcome", "switched")]), 1);
+    assert_eq!(gauge(&compacted, M_GEN, &env), 1.0);
+    assert_eq!(gauge(&compacted, M_LOG, &env), log_len(&db) as f64);
+    assert_eq!(samples(&compacted, M_COMPACTION, &env).len(), 1);
+    assert_eq!(samples(&compacted, M_SWITCH, &env).len(), 1);
+
+    *db.core().compact.test.free_space.lock() = Some(0);
+    assert!(db.compact_now().is_err());
+    *db.core().compact.test.free_space.lock() = None;
+    db.core().compact.test.fail_next.store(true, Relaxed);
+    assert!(db.compact_now().is_err());
+    let abandoned = snapshotter.snapshot().into_vec();
+    assert_eq!(counter(&abandoned, M_COMPACTIONS, &[env[0], ("outcome", "abandoned")]), 2);
+    assert_eq!(counter(&abandoned, M_ABANDONS, &[env[0], ("cause", "disk_full")]), 1);
+    assert_eq!(counter(&abandoned, M_ABANDONS, &[env[0], ("cause", "error")]), 1);
+    assert_eq!(gauge(&abandoned, M_FAILED, &env), 0.0, "an abandon latches nothing");
+}
+
+/// A write-lock hold of at least 1 ms is recorded as a stall; shorter ones are not.
+#[test]
+fn test_tndb_metrics_record_write_stalls() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let tmp = TempDir::with_prefix("tndb_metrics_stall").expect("temp dir");
+    let db = metrics::with_local_recorder(&recorder, || open(tmp.path(), CommitMode::Group));
+    let hold = [("env", "unnamed"), ("kind", "hold")];
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let _ = snapshotter.snapshot();
+    db.core().hold_next_batch(Duration::from_millis(5));
+    db.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
+    let stalled = snapshotter.snapshot().into_vec();
+    let held = samples(&stalled, M_STALL, &hold);
+    assert_eq!(held.len(), 1, "one stall: {held:?}");
+    assert!(held[0] >= 0.005, "held {}s", held[0]);
+}
+
+/// A latched failure (here a failed sync) sets the database's `failed` gauge.
+#[test]
+fn test_tndb_metrics_failed_gauge_latches() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let tmp = TempDir::with_prefix("tndb_metrics_failed").expect("temp dir");
+    let db = metrics::with_local_recorder(&recorder, || open(tmp.path(), CommitMode::Group));
+    db.core().durability.fail_next_sync.store(true, Relaxed);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    assert!(block_on(db.persist::<TestTable>()).is_err(), "the sync failed");
+    let failed = snapshotter.snapshot().into_vec();
+    assert_eq!(gauge(&failed, M_FAILED, &[("env", "unnamed")]), 1.0);
+}
+
+/// A close during a compaction counts it as cancelled, not abandoned.
+#[test]
+fn test_tndb_metrics_count_a_cancel() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let tmp = TempDir::with_prefix("tndb_metrics_cancel").expect("temp dir");
+    let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 20 };
+    let db = metrics::with_local_recorder(&recorder, || {
+        open_compacting(tmp.path(), CommitMode::Group, config)
+    });
+    let value = "v".repeat(4096);
+    for i in 0..2_048_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    db.compact().expect("request");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while compact_dirs(tmp.path()) == 0 {
+        assert!(std::time::Instant::now() < deadline, "the compaction started");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    drop(db);
+    let closed = snapshotter.snapshot().into_vec();
+    let env = ("env", "unnamed");
+    assert_eq!(counter(&closed, M_COMPACTIONS, &[env, ("outcome", "cancelled")]), 1);
+    assert_eq!(counter(&closed, M_COMPACTIONS, &[env, ("outcome", "abandoned")]), 0);
+}
+
+/// A `SplitDatabase` labels its three logs' series with their environments.
+#[test]
+fn test_tndb_metrics_split_labels_its_environments() {
+    let recorder = metrics_util::debugging::DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let tmp = TempDir::with_prefix("tndb_metrics_split").expect("temp dir");
+    let _db = metrics::with_local_recorder(&recorder, || {
+        super::SplitDatabase::open_with(tmp.path(), TnDbOptions::default()).expect("open")
+    });
+    let opened = snapshotter.snapshot().into_vec();
+    for env in ["epoch", "kad", "cache"] {
+        assert_eq!(gauge(&opened, M_FAILED, &[("env", env)]), 0.0, "{env}");
+    }
+    assert!(series(&opened, M_FAILED, &[("env", "unnamed")]).is_none());
+}
+
+// ---- inspection (`db tndb-stat`) ----
+
+/// Every file under `root` with its length and modification time (to show an inspection changed
+/// nothing).
+fn file_states(root: &Path) -> BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+    let mut states = BTreeMap::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir").flatten() {
+            let meta = entry.metadata().expect("metadata");
+            if meta.is_dir() {
+                dirs.push(entry.path());
+            } else {
+                states.insert(entry.path(), (meta.len(), meta.modified().expect("mtime")));
+            }
+        }
+    }
+    states
+}
+
+/// The report of `table` in `report`.
+fn table_report<'a>(report: &'a super::EnvReport, table: &str) -> &'a super::TableReport {
+    report.tables.iter().find(|t| t.name == table).expect("the table is reported")
+}
+
+/// An inspection reports each table's live rows and bytes, the log's dead bytes (removed and
+/// overwritten rows), the generation and its compacted base; after a compaction nothing is dead.
+#[test]
+fn test_tndb_inspect_reports_rows_and_dead_bytes() {
+    use tn_types::Table as _;
+    let tmp = TempDir::with_prefix("tndb_inspect").expect("temp dir");
+    {
+        let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+        for i in 0..100_u64 {
+            db.insert::<TestTable>(&i, &format!("value {i}")).expect("insert");
+        }
+        for i in 0..10_u64 {
+            db.remove::<TestTable>(&i).expect("remove");
+        }
+        for i in 10..20_u64 {
+            db.insert::<TestTable>(&i, &format!("again {i}")).expect("overwrite");
+        }
+        block_on(db.persist::<TestTable>()).expect("persist");
+    }
+    let report = super::inspect(tmp.path()).expect("inspect");
+    assert_eq!(report.generation, 0);
+    assert!(report.clean, "closed cleanly");
+    let test = table_report(&report, TestTable::NAME);
+    assert_eq!(test.rows, 90);
+    assert_eq!(test.index, super::IndexState::Current);
+    let other = table_report(&report, OtherTable::NAME);
+    assert_eq!((other.rows, other.index), (0, super::IndexState::NoKeySize));
+    assert!(report.dead_bytes > 0, "removed and overwritten rows are dead");
+    let header = crate::archive::pack::DATA_HEADER_BYTES as u64;
+    assert_eq!(header + report.live_bytes + report.dead_bytes, report.data_end);
+    assert_eq!(report.live_bytes, test.live_bytes);
+
+    {
+        let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+        assert_eq!(db.compact_now(), Ok(true));
+    }
+    let report = super::inspect(tmp.path()).expect("inspect");
+    assert_eq!(report.generation, 1);
+    assert_eq!(report.dead_bytes, 0, "a compacted log holds only live rows");
+    assert_eq!(report.base, report.data_end);
+    assert_eq!(table_report(&report, TestTable::NAME).rows, 90);
+}
+
+/// An inspection after a crash reports the log unclean and the index as the next open would
+/// rebuild it, and changes no file (the next open still recovers every row).
+#[test]
+fn test_tndb_inspect_changes_nothing_after_a_crash() {
+    use tn_types::Table as _;
+    let tmp = TempDir::with_prefix("tndb_inspect_crash").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    for i in 0..50_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    block_on(db.persist::<TestTable>()).expect("persist");
+    crash(db);
+    let before = file_states(tmp.path());
+    let report = super::inspect(tmp.path()).expect("inspect");
+    assert!(!report.clean, "a crashed log is unclean");
+    let test = table_report(&report, TestTable::NAME);
+    assert_eq!(test.rows, 50);
+    assert_ne!(test.index, super::IndexState::Current, "the next open rebuilds it");
+    assert_eq!(file_states(tmp.path()), before, "the inspection changed nothing");
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db).len(), 50);
+}
+
+/// An inspection refuses a database another handle has open (the node's), and runs once it
+/// closes.
+#[test]
+fn test_tndb_inspect_refuses_an_open_database() {
+    let tmp = TempDir::with_prefix("tndb_inspect_open").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let err = super::inspect(tmp.path()).expect_err("the database is open");
+    assert!(format!("{err:#}").contains("is open"), "{err:#}");
+    drop(db);
+    super::inspect(tmp.path()).expect("closed: inspected");
+}
+
+/// A damaged log fails the inspection (the record a replay cannot place), as it would fail the
+/// next open.
+#[test]
+fn test_tndb_inspect_reports_damage() {
+    let tmp = TempDir::with_prefix("tndb_inspect_damage").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Sync);
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    }
+    append_unsealed(&log_path(tmp.path()), &record::head(KIND_PUT, 9, true));
+    assert!(super::inspect(tmp.path()).is_err(), "a record of an unknown table");
+}
+
+/// A `SplitDatabase`'s inspection covers each environment present, and notes the MDBX
+/// migration's marker.
+#[test]
+fn test_tndb_inspect_split() {
+    let tmp = TempDir::with_prefix("tndb_inspect_split").expect("temp dir");
+    drop(super::SplitDatabase::open_with(tmp.path(), TnDbOptions::default()).expect("open"));
+    let report = super::inspect_split(tmp.path());
+    let names: Vec<&str> = report.envs.iter().map(|(name, _)| *name).collect();
+    assert_eq!(names, ["epoch", "kad", "cache"]);
+    assert!(report.envs.iter().all(|(_, env)| env.is_ok()));
+    assert!(!report.migrated);
+    std::fs::write(tmp.path().join(super::MDBX_MIGRATED), b"").expect("marker");
+    assert!(super::inspect_split(tmp.path()).migrated);
+}

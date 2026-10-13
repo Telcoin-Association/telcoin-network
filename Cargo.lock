@@ -12439,6 +12439,7 @@ dependencies = [
  "libc",
  "memmap2",
  "metrics",
+ "metrics-util",
  "ouroboros",
  "page_size",
  "parking_lot",

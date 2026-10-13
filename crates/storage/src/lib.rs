@@ -239,10 +239,6 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
     MdbxDatabase::open(store_path.join(dir), tables, max_size, growth)
 }
 
-/// The file in the tndb root saying the MDBX tables were copied in (see [`migrate_from_mdbx`]).
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
-const MDBX_MIGRATED: &str = "mdbx-migrated";
-
 /// Copy the node's epoch and kad tables from MDBX (the backend before tndb, under `store_path`)
 /// into `db`, the tndb one, the first time the node opens tndb. Returns the rows copied.
 ///
@@ -262,7 +258,7 @@ pub(crate) fn migrate_from_mdbx(
 ) -> eyre::Result<usize> {
     use std::io::Write as _;
 
-    let marker = tndb_root.join(MDBX_MIGRATED);
+    let marker = tndb_root.join(tndb::MDBX_MIGRATED);
     if marker.exists() {
         return Ok(0);
     }
@@ -287,7 +283,7 @@ pub(crate) fn migrate_from_mdbx(
         copied += copy_table::<KadWorkerProviderRecords, _>(&src, db)?;
     }
     db.wait_durable_blocking()?;
-    let tmp = tndb_root.join(format!("{MDBX_MIGRATED}.tmp"));
+    let tmp = tndb_root.join(format!("{}.tmp", tndb::MDBX_MIGRATED));
     {
         let mut file = std::fs::File::create(&tmp)?;
         writeln!(file, "copied {copied} rows from MDBX")?;
@@ -335,7 +331,7 @@ fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDat
     use tn_types::Database as _;
 
     let store_path = store_path.as_ref();
-    let root = store_path.join("tndb");
+    let root = store_path.join(tndb::TNDB_DIR);
     let options = tndb::TnDbOptions { commit: tndb::CommitMode::Group, ..Default::default() };
     let db = tndb::SplitDatabase::open_with(&root, options).expect("Cannot open database (tndb)");
     // Epoch tables
@@ -399,8 +395,7 @@ mod migrate_test {
     use super::{
         migrate_from_mdbx,
         tables::*,
-        tndb::{CommitMode, SplitDatabase, TnDbOptions},
-        MDBX_MIGRATED,
+        tndb::{CommitMode, SplitDatabase, TnDbOptions, MDBX_MIGRATED, TNDB_DIR},
     };
 
     /// tndb opened as `_open_tndb` opens it (its tables open), without the migration.
@@ -432,7 +427,7 @@ mod migrate_test {
                 .expect("batch");
             mdbx.sync_persist();
         }
-        let root = store.join("tndb");
+        let root = store.join(TNDB_DIR);
         let db = open_split(&root);
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 3, "rows copied");
         assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote.clone()));
@@ -458,7 +453,7 @@ mod migrate_test {
     #[test]
     fn test_migrate_from_mdbx_on_a_fresh_node() {
         let tmp = TempDir::with_prefix("migrate_fresh").expect("temp dir");
-        let root = tmp.path().join("tndb");
+        let root = tmp.path().join(TNDB_DIR);
         let db = open_split(&root);
         assert_eq!(migrate_from_mdbx(tmp.path(), &root, &db).expect("migrate"), 0);
         assert!(root.join(MDBX_MIGRATED).exists(), "the marker");

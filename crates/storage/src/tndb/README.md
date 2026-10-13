@@ -199,7 +199,12 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
   across the switch; the disk filling during the copy; an emptied log compacting at once (also
   after a reopen); writeback as the copy goes; and compactions inside the randomized crash model;
 - hardening: a failed open keeping the older generation; an interrupted creation reopening; a
-  removal through a damaged index failing; a misindexed row read as `CorruptIndex`.
+  removal through a damaged index failing; a misindexed row read as `CorruptIndex`;
+- metrics: every series registered at open, then batches, syncs, log and unsynced bytes, a
+  compaction (outcome, generation, duration, switch hold), abandons by cause, a cancel, a stall,
+  the `failed` latch, and a `SplitDatabase`'s `env` labels (`metrics_util`'s debugging recorder);
+- inspection: rows and dead bytes before and after a compaction, a crashed log reported unclean
+  with no file changed, an open database refused, damage reported, and a `SplitDatabase`.
 
 **Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
 revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
@@ -208,7 +213,8 @@ wakes an idle commit thread. Accepting writes after a latch is still refused, by
 For compaction: skipping the last catch-up, copied rows without the batch-end flag, a catch-up
 that ignores CLEAR, installing before the rename, `base` not read at open, no empty indexes,
 caching an unfixed key size, no cap on the switch's tail, a switch without the registry lock,
-ignoring `has_dead`, and no latch after the rename.
+ignoring `has_dead`, and no latch after the rename. For metrics and inspection: no `failed`
+gauge at a latch, abandon causes not told apart, and an inspection that takes no lock.
 
 ## Compaction (`compact.rs`)
 
@@ -369,6 +375,55 @@ has its epoch tables (its anti-equivocation records: last proposal, votes, propo
 and kad tables copied over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done
 (`tndb/mdbx-migrated`); a crash before the marker reruns the copy. The batch caches start empty,
 and the MDBX directories are left in place.
+
+## Metrics (`metrics.rs`)
+
+Each database creates its metric handles when it opens, labeled `env` (`epoch`, `kad`, `cache`
+in a `SplitDatabase`; `unnamed` otherwise), and every series exists from then on (counters at 0,
+so an `increase` rule sees the first event). The writers and the commit and compaction threads
+record through the handles; the node's recorder is installed before any database opens.
+Rendered names (the `tn_storage.` prefix becomes `tn_storage_`):
+
+| metric | type | what |
+|---|---|---|
+| `tn_storage_tndb_batches_total` | counter | batches written (a bare write or a transaction) |
+| `tn_storage_tndb_sync_seconds` | histogram | sync rounds (msync, plus fsync after a growth) |
+| `tn_storage_tndb_unsynced_bytes` | gauge | log bytes not yet synced (writers wait past 64 MiB) |
+| `tn_storage_tndb_log_bytes` | gauge | the current log's length |
+| `tn_storage_tndb_generation` | gauge | the current generation |
+| `tn_storage_tndb_write_stall_seconds{kind}` | histogram | write-lock `wait`s and `hold`s of at least 1 ms only |
+| `tn_storage_tndb_compactions_total{outcome}` | counter | `switched`, `skipped`, `abandoned`, `cancelled` |
+| `tn_storage_tndb_compaction_abandons_total{cause}` | counter | `disk_full`, `writer_outran`, `corruption`, `panic`, `error` |
+| `tn_storage_tndb_compaction_seconds` | histogram | a switched compaction, snapshot to install |
+| `tn_storage_tndb_compaction_switch_seconds` | histogram | how long the switch held the write lock |
+| `tn_storage_tndb_failed` | gauge | 1 once a failure latched (a failed sync, a stopped writer): writes fail until a restart |
+
+The write path pays a few clock reads around the write lock, one counter increment and two
+gauge stores; a histogram sample only on a stall. The consensus bench showed no difference
+(within noise, 6 interleaved pairs on macOS).
+
+**Alerts** (Prometheus):
+- page: `max by (env) (tn_storage_tndb_failed) > 0`: the database stopped taking writes;
+- warn: `sum by (env) (increase(tn_storage_tndb_compaction_abandons_total[1h])) >= 3`: the log
+  is not being compacted (the `cause` label says why; `disk_full` needs room, `corruption` an
+  operator);
+- warn: `max by (env) (tn_storage_tndb_unsynced_bytes) > 32 * 2^20` for 1m: syncs fall behind
+  the writers (half the cap at which writers wait);
+- warn: `histogram_quantile(0.99, sum by (env, le) (rate(tn_storage_tndb_sync_seconds_bucket[5m])))
+  > 0.1`: slow syncs.
+
+## Inspection (`inspect.rs`, `telcoin-network db tndb-stat`)
+
+`inspect` reports what a database holds, from its files, changing none of them: its generation,
+whether the log was closed cleanly, its length, live and dead bytes (what a compaction would give
+back) and compacted base, older generations or unfinished builds left behind, and per table the
+live rows and bytes and the index's state as the next open would find it (current, stale,
+unclean, missing, unreadable). It opens the log read-only and replays it as an open would, so a
+damaged log fails it as it would fail the open. It takes a shared lock on the database's `LOCK`,
+so it refuses a database the node has open (and keeps the node from opening until it is done):
+a live node is watched through the metrics. `inspect_split` covers a `SplitDatabase`'s
+environments and notes the MDBX migration's marker; `telcoin-network db tndb-stat` prints it for
+`<datadir>/consensus-db/tndb`, exiting non-zero if an environment could not be read.
 
 ## Not yet
 
