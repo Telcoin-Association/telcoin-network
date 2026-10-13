@@ -231,9 +231,9 @@ pub(crate) struct ServerLimits {
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
     /// The peers whose connections must open with a PROXY protocol v2 header
-    /// (`--proxy-protocol`, which reads it from the `--trusted-proxies`
-    /// ranges), or `None` when PROXY protocol is off. Every other connection
-    /// is served as plain HTTP.
+    /// (`--proxy-protocol-from`, by default the `--trusted-proxies` ranges),
+    /// or `None` when PROXY protocol (`--proxy-protocol`) is off. Every other
+    /// connection is served as plain HTTP.
     pub(crate) proxy_protocol: Option<Arc<TrustedProxies>>,
     /// Budget of request-body bytes held across all in-flight requests, or
     /// `None` when unlimited (see [`reserve_request_bytes`]).
@@ -972,8 +972,8 @@ pub(crate) async fn serve(
 /// polled independent of connection progress, so it fires even against a
 /// client trickling one byte per interval to keep the transport alive.
 ///
-/// With `--proxy-protocol`, a connection from a trusted proxy is first read
-/// for its PROXY protocol v2 header, on the connection's own task (a slow
+/// With `--proxy-protocol`, a connection from a `--proxy-protocol-from` peer
+/// is first read for its PROXY protocol v2 header, on the connection's own task (a slow
 /// front never stalls `accept()`) and within the header read timeout; the
 /// source address it names becomes the connection's `ConnectInfo`. A `LOCAL`
 /// header keeps the front's address and marks the connection
@@ -1072,12 +1072,12 @@ async fn accept_loop(
             debug!(target: "gateway::server", %err, "failed to set TCP_USER_TIMEOUT");
         }
 
-        // Only a trusted peer's connection opens with a PROXY header; every
-        // other connection is plain HTTP.
+        // Only a `--proxy-protocol-from` peer's connection opens with a PROXY
+        // header; every other connection is plain HTTP.
         let proxy_header_deadline = limits
             .proxy_protocol
             .as_ref()
-            .filter(|trusted| trusted.contains(peer_addr.ip()))
+            .filter(|senders| senders.contains(peer_addr.ip()))
             .map(|_| limits.header_read_timeout);
         let app = app.clone();
         let connection_builder = connection_builder.clone();
@@ -3332,14 +3332,28 @@ mod tests {
     }
 
     /// Serve the gateway router with `limiters` and `--proxy-protocol` on,
-    /// trusting the proxies in `list`.
+    /// trusting the proxies in `list`, which are also the peers that must
+    /// send a PROXY header (`--proxy-protocol-from` unset).
     async fn spawn_proxy_protocol(
         state: AppState,
         limiters: Option<Arc<RateLimiters>>,
         list: &str,
         header_read_timeout: Duration,
     ) -> (SocketAddr, Notifier) {
-        let trusted = Arc::new(list.parse::<TrustedProxies>().expect("trusted proxies"));
+        spawn_proxy_protocol_from(state, limiters, list, list, header_read_timeout).await
+    }
+
+    /// [`spawn_proxy_protocol`] trusting the proxies in `trusted` and reading
+    /// a PROXY header from the peers in `senders` (`--proxy-protocol-from`).
+    async fn spawn_proxy_protocol_from(
+        state: AppState,
+        limiters: Option<Arc<RateLimiters>>,
+        trusted: &str,
+        senders: &str,
+        header_read_timeout: Duration,
+    ) -> (SocketAddr, Notifier) {
+        let trusted = Arc::new(trusted.parse::<TrustedProxies>().expect("trusted proxies"));
+        let senders = Arc::new(senders.parse::<TrustedProxies>().expect("proxy protocol senders"));
         let app = router(
             state,
             Duration::from_secs(5),
@@ -3348,11 +3362,8 @@ mod tests {
             RouterLayers { rate_limiters: limiters, ..RouterLayers::default() },
             Arc::clone(&trusted),
         );
-        let limits = ServerLimits {
-            header_read_timeout,
-            proxy_protocol: Some(Arc::clone(&trusted)),
-            ..test_limits()
-        };
+        let limits =
+            ServerLimits { header_read_timeout, proxy_protocol: Some(senders), ..test_limits() };
         spawn_trusting(app, limits, trusted).await
     }
 
@@ -3487,6 +3498,61 @@ mod tests {
         let response = raw_exchange(gateway, b"", "").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("127.0.0.1|http"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_from_peer_must_send_a_header_without_being_trusted() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // the loopback peer must send a PROXY header, but only an l7 range
+        // behind it is a trusted proxy
+        let (gateway, _shutdown) = spawn_proxy_protocol_from(
+            state,
+            None,
+            "192.0.2.0/24",
+            "127.0.0.1/32",
+            Duration::from_secs(5),
+        )
+        .await;
+        let forwarded = "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Proto: https\r\n";
+
+        // without a header the connection is closed without a response
+        assert_eq!(raw_exchange(gateway, b"", forwarded).await, "");
+        // with one, the source it names is resolved as before: an untrusted
+        // source is the client whatever it forwards
+        let header = proxy_v2_header(socket("203.0.113.5:4711"), &[]);
+        let response = raw_exchange(gateway, &header, forwarded).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("203.0.113.5|http"), "{response}");
+        assert!(!response.contains("6.6.6.6"), "{response}");
+        // and a trusted source vouches for its client
+        let header = proxy_v2_header(socket("192.0.2.10:4711"), &[]);
+        let response = raw_exchange(gateway, &header, forwarded).await;
+        assert!(response.contains("6.6.6.6, 192.0.2.10|https"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_outside_proxy_protocol_from_is_served_as_http() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // the loopback peer is a trusted proxy, but not one that sends PROXY
+        // headers
+        let (gateway, _shutdown) = spawn_proxy_protocol_from(
+            state,
+            None,
+            "127.0.0.1/32",
+            "10.0.0.0/8",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // served without a header, and its `X-Forwarded-For` is believed
+        let forwarded = "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Proto: https\r\n";
+        let response = raw_exchange(gateway, b"", forwarded).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("6.6.6.6, 127.0.0.1|https"), "{response}");
     }
 
     #[tokio::test]

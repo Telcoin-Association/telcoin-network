@@ -161,8 +161,9 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
-| `--trusted-proxies` | `WORKER_GATEWAY_TRUSTED_PROXIES` | (none) | Comma-separated CIDR ranges (a bare address is one host) of the fronts whose `X-Forwarded-For`, `X-Forwarded-Proto` and PROXY header the gateway believes; unset trusts none. See [Client identity behind a front](#client-identity-behind-a-front). |
-| `--proxy-protocol` | `WORKER_GATEWAY_PROXY_PROTOCOL` | `false` | Expect a PROXY protocol v2 header on every connection from a `--trusted-proxies` peer (the env value is `true` or `false`); requires `--trusted-proxies`. |
+| `--trusted-proxies` | `WORKER_GATEWAY_TRUSTED_PROXIES` | (none) | Comma-separated CIDR ranges (a bare address is one host) of the fronts whose `X-Forwarded-For` and `X-Forwarded-Proto` the gateway believes, and, unless `--proxy-protocol-from` is set, that send a PROXY header under `--proxy-protocol`; unset trusts none. See [Client identity behind a front](#client-identity-behind-a-front). |
+| `--proxy-protocol` | `WORKER_GATEWAY_PROXY_PROTOCOL` | `false` | Expect a PROXY protocol v2 header on every connection from a `--proxy-protocol-from` peer (the env value is `true` or `false`); requires a non-empty `--proxy-protocol-from` or `--trusted-proxies`. |
+| `--proxy-protocol-from` | `WORKER_GATEWAY_PROXY_PROTOCOL_FROM` | `--trusted-proxies` | Comma-separated CIDR ranges of the peers that must open every connection with a PROXY protocol v2 header; unset or blank, the `--trusted-proxies` ranges. Listing a peer here does not make its `X-Forwarded-For` believed or exempt it from `--max-connections-per-ip`; requires `--proxy-protocol`. |
 | `--shutdown-delay` | `WORKER_GATEWAY_SHUTDOWN_DELAY` | `0s` | How long to keep serving after SIGTERM, with `/ready` and `/ready/any` reporting draining, before the listeners close (`0` disables; at most `60s`); see [Graceful shutdown](#graceful-shutdown). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
@@ -383,9 +384,11 @@ while the table is full shares the overflow bucket too.
 A front that terminates TCP (an ingress controller, an HTTP proxy, a load
 balancer in proxy mode) is the peer of every connection it relays, so without
 help every client behind it shares the front's per-IP bucket. Two mechanisms
-carry the client address through such a front. Both apply only to a peer listed
-in `--trusted-proxies` (comma-separated IPv4 and IPv6 CIDR ranges; a bare
-address is a single host):
+carry the client address through such a front. `X-Forwarded-For` applies only
+to a peer listed in `--trusted-proxies`, and PROXY protocol only to a peer
+listed in `--proxy-protocol-from`, which is the `--trusted-proxies` list unless
+set (both comma-separated IPv4 and IPv6 CIDR ranges; a bare address is a single
+host):
 
 - **`X-Forwarded-For`**, for an HTTP proxy or ingress. A request from a listed
   peer is attributed to the right-most `X-Forwarded-For` entry that is not
@@ -395,9 +398,9 @@ address is a single host):
   entry reached first, a missing or empty chain, or a chain of nothing but
   listed addresses falls back to the peer.
 - **PROXY protocol v2** (`--proxy-protocol`), for a TCP load balancer that
-  cannot add headers. Every connection from a listed peer must open with a
-  binary PROXY protocol v2 header for TCP over IPv4 or IPv6, and the source
-  address in it takes the peer's place. A `LOCAL` header (the balancer's own
+  cannot add headers. Every connection from a `--proxy-protocol-from` peer must
+  open with a binary PROXY protocol v2 header for TCP over IPv4 or IPv6, and
+  the source address in it takes the peer's place. A `LOCAL` header (the balancer's own
   health check) keeps the balancer's address, and the `X-Forwarded-For` and
   `X-Forwarded-Proto` on that connection are ignored: a `LOCAL` connection
   carries no forwarded client, so a balancer that sends `LOCAL` for relayed
@@ -406,9 +409,13 @@ address is a single host):
   `--header-read-timeout` closes the connection without a response, counts
   under `tn_worker_gateway_connections_refused_total{reason="proxy_header"}`
   and logs a warning naming the peer (throttled to one line per 10 s); a peer
-  that is not listed is served as plain HTTP. The `X-Forwarded-For` rule then
-  runs against the address from the header, so it applies only when that
-  address is itself listed (an HTTP proxy behind the balancer).
+  that is not in `--proxy-protocol-from` is served as plain HTTP. The
+  `X-Forwarded-For` rule then runs against the address from the header, so it
+  applies only when that address is itself in `--trusted-proxies` (an HTTP
+  proxy behind the balancer). Set `--proxy-protocol-from` apart from
+  `--trusted-proxies` when the two sets differ: a balancer whose address must
+  not vouch for any `X-Forwarded-For`, or an HTTP proxy that is trusted but
+  sends no PROXY header.
 
 **What a listed front must do.** The gateway believes a listed front's headers
 because it assumes the front wrote them, so check each front before listing it:
@@ -422,11 +429,13 @@ because it assumes the front wrote them, so check each front before listing it:
   plain nginx `proxy_pass` or HAProxy without `option forwardfor` does, lets
   every client choose its own rate-limit key.
 - A TCP front must send a PROXY protocol v2 header on every connection before
-  `--proxy-protocol` is turned on, and must keep sending it. If a listed front
-  relays a connection without one, the gateway reads the client's own first
-  bytes as the header, so the client can name any source address.
-- Never list a TCP front without `--proxy-protocol`: it relays the client's own
-  `X-Forwarded-For` untouched.
+  `--proxy-protocol` is turned on, and must keep sending it. If a front in
+  `--proxy-protocol-from` relays a connection without one, the gateway reads
+  the client's own first bytes as the header, so the client can name any
+  source address.
+- Never list a TCP front in `--trusted-proxies` unless PROXY protocol is on
+  for it (`--proxy-protocol`, with the front in `--proxy-protocol-from` when
+  that is set): it relays the client's own `X-Forwarded-For` untouched.
 
 **Spoofing rule.** A client writes every header it sends and every byte its
 connection opens with, so the gateway believes `X-Forwarded-For`,
@@ -445,15 +454,16 @@ it. Firewall the gateways so that only the front reaches them (see
 An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches as IPv4 in the peer, the
 chain and the ranges alike, so a dual-stack listener needs no extra ranges. A
 range with bits set below its prefix (`10.0.0.1/8`), a prefix wider than its
-family, an empty element, or `--proxy-protocol` without `--trusted-proxies` is a
-startup error.
+family, an empty element, `--proxy-protocol` with neither
+`--proxy-protocol-from` nor `--trusted-proxies`, or `--proxy-protocol-from`
+without `--proxy-protocol` is a startup error.
 
 Toward the upstream, `X-Forwarded-For` is the peer alone, or the resolved client
 followed by the listed peer that vouched for it; the inbound chain is never
 copied. `X-Forwarded-Proto` is copied from a listed peer when its right-most
 value is `http` or `https`, and is `http` otherwise.
 
-The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is listed, a front sending `X-Forwarded-For` or a `LOCAL` health check, is not counted, since its requests belong to many clients.
+The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is in `--trusted-proxies`, a front sending `X-Forwarded-For` or a listed front's `LOCAL` health check, is not counted, since its requests belong to many clients.
 
 ### Per-route capacity
 
@@ -976,12 +986,16 @@ identity is configured (see
   addresses: a `LoadBalancer` or `NodePort` Service with
   `externalTrafficPolicy: Local` does, and the gateway then needs neither
   mechanism. A balancer that terminates TCP needs PROXY protocol v2 enabled on
-  it, and the gateway started with `--proxy-protocol` and `--trusted-proxies`
-  set to the addresses the balancer connects from. Every connection from those
-  addresses must then carry the header, so keep the kubelet's probe source (the
-  node address, for probes on the `rpc` port) out of `--trusted-proxies`, or
-  the probes are closed and the pod never turns ready. The probe listener
-  (`--probe-addr`, which the reference manifest's probes target) never reads
-  the header.
+  it, and the gateway started with `--proxy-protocol` and
+  `--proxy-protocol-from` (or `--trusted-proxies`) set to the addresses the
+  balancer connects from. Every connection from those addresses must then
+  carry the header, so a kubelet probe on the `rpc` port from one of them is
+  closed and the pod never turns ready: the probe listener (`--probe-addr`,
+  which the reference manifest's probes target) never reads the header. With
+  `externalTrafficPolicy: Cluster`, kube-proxy SNATs the balancer's
+  connections to the node addresses, the same addresses the kubelet probes
+  from: list the node range in `--proxy-protocol-from` and keep it out of
+  `--trusted-proxies`, so a node address vouches for no `X-Forwarded-For`, and
+  keep the probes on `--probe-addr`.
 
 Before putting gateways in front of a validator, read the [production-readiness review](docs/production-readiness.md), in particular its operator guidance on DNS, the DDoS front, firewalling and sizing for N gateways.

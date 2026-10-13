@@ -86,6 +86,7 @@ The same choice applies to an external load balancer or DNS health check, which 
 Check `/ready/any` to keep a gateway published while it can serve reads; that suits a validator's gateways, which all share one worker.
 Check `/ready` only when a gateway that cannot take submissions should receive no traffic at all, for example when the front can send submissions to another validator's gateways instead.
 On the client port the probes share the client connection cap, so a connection flood can still make an external check time out.
+With `--proxy-protocol`, a check from an address in `--proxy-protocol-from` (by default `--trusted-proxies`) must open with a PROXY header too (a `LOCAL` one will do), or the gateway closes it, counts it under `tn_worker_gateway_connections_refused_total{reason="proxy_header"}` and logs a warning; a bare TCP connect check that sends nothing is closed without either.
 
 ## Memory limit
 

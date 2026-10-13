@@ -159,7 +159,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
         trusted_proxies = trusted_proxies.len(),
-        proxy_protocol,
+        proxy_protocol = proxy_protocol.is_some(),
         submission_budget,
         ?max_connections_per_ip,
         max_request_bytes,
@@ -312,8 +312,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
-        // `into_settings` rejects `--proxy-protocol` without trusted proxies
-        proxy_protocol: proxy_protocol.then(|| Arc::clone(&trusted_proxies)),
+        // `into_settings` rejects `--proxy-protocol` with no peer to read from
+        proxy_protocol: proxy_protocol.map(Arc::new),
         max_inflight_request_bytes,
         http1_max_buf_size,
         shutdown_delay,

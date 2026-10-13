@@ -25,9 +25,10 @@
 //! proxy matches an IPv4 range on any listener and a mapped entry cannot dodge
 //! a trusted-range check. An IPv6 range matches native IPv6 addresses only.
 //!
-//! With `--proxy-protocol`, a connection from a trusted peer must open with a
-//! PROXY protocol v2 header ([`read_proxy_header`]), and the source address it
-//! names stands in for the peer: it becomes the connection's `ConnectInfo`, and
+//! With `--proxy-protocol`, a connection from a peer in `--proxy-protocol-from`
+//! (by default the trusted proxies) must open with a PROXY protocol v2 header
+//! ([`read_proxy_header`]), and the source address it names stands in for the
+//! peer: it becomes the connection's `ConnectInfo`, and
 //! the rule above then runs against it, so `X-Forwarded-For` is believed only
 //! when that source is itself a trusted proxy. A `LOCAL` header names no
 //! source: the connection is the front's own (a health check, say) and carries
@@ -160,8 +161,9 @@ impl Forwarding {
     }
 }
 
-/// The `--trusted-proxies` ranges: the peers whose `X-Forwarded-For` and
-/// `X-Forwarded-Proto` the gateway believes.
+/// A list of address ranges: the `--trusted-proxies`, the peers whose
+/// `X-Forwarded-For` and `X-Forwarded-Proto` the gateway believes, or the
+/// `--proxy-protocol-from` peers, which must open with a PROXY header.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TrustedProxies(Vec<Cidr>);
 
