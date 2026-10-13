@@ -410,10 +410,14 @@ drive cache, so separate logs share the flush cost on one drive.
 
 The node opens tndb with the `tn-storage/tndb` feature (`DatabaseType = SplitDatabase`, at
 `<consensus db>/tndb`); MDBX stays the default. On its first tndb open, a node that ran on MDBX
-has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates)
-and kad tables copied over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done
-(`tndb/mdbx-migrated`); a crash before the marker reruns the copy. The batch caches start empty,
-and the MDBX directories are left in place.
+has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates),
+kad tables and own uncommitted batches (`OurNodeBatchesCache`: no other copy holds them) copied
+over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done (`tndb/mdbx-migrated`); a
+crash before the marker reruns the copy. The other caches start empty (they refill), and the MDBX
+directories are left in place. Abandoning the epoch tables instead would be safe only while the
+network keeps making rounds as validators restart: after a stop-all halt every node would return
+to the same round with no memory of what it proposed and voted there. The migration is kept for
+the release that switches backends; the next one removes it with the MDBX consensus backend.
 
 ## Metrics (`metrics.rs`)
 

@@ -207,8 +207,6 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 enum MdbxEnv {
     Epoch,
     Kad,
-    /// Opened only by `_open_mdbx` (unused when the `tndb` feature picks the backend).
-    #[cfg_attr(feature = "tndb", allow(dead_code))]
     Cache,
 }
 
@@ -239,13 +237,18 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
     MdbxDatabase::open(store_path.join(dir), tables, max_size, growth)
 }
 
-/// Copy the node's epoch and kad tables from MDBX (the backend before tndb, under `store_path`)
-/// into `db`, the tndb one, the first time the node opens tndb. Returns the rows copied.
+/// Copy the node's epoch and kad tables and its own uncommitted batches from MDBX (the backend
+/// before tndb, under `store_path`) into `db`, the tndb one, the first time the node opens tndb.
+/// Returns the rows copied. Kept for the release that switches backends only: the next one drops
+/// it with the MDBX consensus backend.
 ///
 /// The epoch tables hold the node's anti-equivocation records for the current epoch (its last
 /// proposal, its votes, its proposed certificates): a node switching backends mid-epoch must not
-/// forget them, or it could sign a conflicting header in a round it already voted in. The kad
-/// tables hold its peer records. The batch caches are not copied (they refill).
+/// forget them, or it could sign a conflicting header in a round it already voted in. That is
+/// safe to skip only while the network keeps making rounds as nodes restart; after a stop-all
+/// halt every node would return to the same round with no memory of it. The kad tables hold its
+/// peer records. Of the caches, only `OurNodeBatchesCache` is copied: its sealed but uncommitted
+/// batches have no other copy (their transactions would be lost); the others refill.
 ///
 /// The copy is made durable before a marker file in `tndb_root` records that it is done; until
 /// then every open runs it again (MDBX is not written meanwhile, so copying it again only rewrites
@@ -267,20 +270,25 @@ pub(crate) fn migrate_from_mdbx(
     let mut copied = 0;
     if present("epoch") {
         let src = open_mdbx_env(store_path, MdbxEnv::Epoch)?;
-        copied += copy_table::<LastProposed, _>(&src, db)?;
-        copied += copy_table::<Votes, _>(&src, db)?;
-        copied += copy_table::<Certificates, _>(&src, db)?;
-        copied += copy_table::<CertificateDigestByRound, _>(&src, db)?;
-        copied += copy_table::<CertificateDigestByOrigin, _>(&src, db)?;
-        copied += copy_table::<ProposedCertificates, _>(&src, db)?;
-        copied += copy_table::<Payload, _>(&src, db)?;
+        copied += copy_table::<LastProposed, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Votes, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Certificates, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<CertificateDigestByRound, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<CertificateDigestByOrigin, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<ProposedCertificates, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Payload, _>(&src, db, ROWS_PER_TXN)?;
     }
     if present("kad") {
         let src = open_mdbx_env(store_path, MdbxEnv::Kad)?;
-        copied += copy_table::<KadRecords, _>(&src, db)?;
-        copied += copy_table::<KadProviderRecords, _>(&src, db)?;
-        copied += copy_table::<KadWorkerRecords, _>(&src, db)?;
-        copied += copy_table::<KadWorkerProviderRecords, _>(&src, db)?;
+        copied += copy_table::<KadRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadWorkerRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadWorkerProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
+    }
+    if present("cache") {
+        let src = open_mdbx_env(store_path, MdbxEnv::Cache)?;
+        // A batch is up to 1 MB, and a transaction holds its rows until it commits.
+        copied += copy_table::<OurNodeBatchesCache, _>(&src, db, 64)?;
     }
     db.wait_durable_blocking()?;
     let tmp = tndb_root.join(format!("{}.tmp", tndb::MDBX_MIGRATED));
@@ -297,12 +305,17 @@ pub(crate) fn migrate_from_mdbx(
     Ok(copied)
 }
 
-/// Copy every row of table `T` from `src` into `dst`, in transactions of at most 10,000 rows (the
-/// whole copy is made durable, and marked done, by the caller). Returns the rows copied.
+/// Rows per transaction when copying a table of small values (see [`copy_table`]).
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+const ROWS_PER_TXN: usize = 10_000;
+
+/// Copy every row of table `T` from `src` into `dst`, in transactions of at most `rows_per_txn`
+/// rows (the whole copy is made durable, and marked done, by the caller). Returns the rows copied.
 #[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
 fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     src: &MdbxDatabase,
     dst: &D,
+    rows_per_txn: usize,
 ) -> eyre::Result<usize> {
     use tn_types::{Database as _, DbTxMut as _};
 
@@ -312,7 +325,7 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     for (key, value) in src.iter::<T>() {
         txn.insert::<T>(&key, &value)?;
         rows += 1;
-        if rows % 10_000 == 0 {
+        if rows % rows_per_txn == 0 {
             txn.commit()?;
             txn = dst.write_txn()?;
         }
@@ -325,7 +338,8 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
 /// ([`tndb::SplitDatabase`]) under `<store_path>/tndb` (never sharing files with MDBX's `epoch`,
 /// `kad` and `cache` directories), in group commit (a write returns at once; `persist` waits for
 /// the sync covering it), compacting in the background. A node that ran on MDBX has its epoch and
-/// kad tables copied over on the first open ([`migrate_from_mdbx`]).
+/// kad tables and its own uncommitted batches copied over on the first open
+/// ([`migrate_from_mdbx`]).
 #[cfg(feature = "tndb")]
 fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDatabase {
     use tn_types::Database as _;
@@ -351,7 +365,8 @@ fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDat
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
     db.open_table::<ConsensusCache>().expect("failed to open table!");
-    // Bring over the anti-equivocation records (and peer records) of a node that ran on MDBX.
+    // Bring over the anti-equivocation records, peer records and own uncommitted batches of a
+    // node that ran on MDBX.
     #[cfg(feature = "reth-libmdbx")]
     migrate_from_mdbx(store_path, &root, &db).expect("Cannot migrate the consensus DB from MDBX");
     db
@@ -406,11 +421,13 @@ mod migrate_test {
         db.open_table::<Payload>().expect("open table");
         db.open_table::<KadRecords>().expect("open table");
         db.open_table::<NodeBatchesCache>().expect("open table");
+        db.open_table::<OurNodeBatchesCache>().expect("open table");
         db
     }
 
     /// A node switching from MDBX to tndb keeps its epoch tables (its votes: anti-equivocation
-    /// records) and its kad tables, but not the batch caches; the copy runs once.
+    /// records), its kad tables and its own uncommitted batches (no other copy), but not the
+    /// other caches (they refill); the copy runs once.
     #[test]
     fn test_migrate_from_mdbx_keeps_epoch_and_kad_tables() {
         let tmp = TempDir::with_prefix("migrate_mdbx").expect("temp dir");
@@ -425,15 +442,21 @@ mod migrate_test {
             mdbx.insert::<KadRecords>(&peer, &vec![1, 2, 3]).expect("kad");
             mdbx.insert::<NodeBatchesCache>(&B256::repeat_byte(2), &Default::default())
                 .expect("batch");
+            mdbx.insert::<OurNodeBatchesCache>(&B256::repeat_byte(3), &Default::default())
+                .expect("our batch");
             mdbx.sync_persist();
         }
         let root = store.join(TNDB_DIR);
         let db = open_split(&root);
-        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 3, "rows copied");
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 4, "rows copied");
+        assert!(
+            db.get::<OurNodeBatchesCache>(&B256::repeat_byte(3)).expect("get").is_some(),
+            "our own uncommitted batch is carried over"
+        );
         assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote.clone()));
         assert_eq!(db.get::<Payload>(&(B256::repeat_byte(1), 0)).expect("get"), Some(1));
         assert_eq!(db.get::<KadRecords>(&peer).expect("get"), Some(vec![1, 2, 3]));
-        assert!(db.is_empty::<NodeBatchesCache>(), "the batch caches start empty");
+        assert!(db.is_empty::<NodeBatchesCache>(), "the peers' batch cache starts empty");
         assert!(root.join(MDBX_MIGRATED).exists(), "the marker");
         drop(db);
 

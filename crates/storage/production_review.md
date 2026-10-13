@@ -45,7 +45,12 @@ recovery treats data that was never synced as durable** (confirmed; likely in to
 - **Test:** a power-loss model that drops bytes past the synced end. Today's `crash()` keeps the page cache, so it can't catch this.
 
 **H2. [FIXED 2026-10-12: `migrate_from_mdbx` in `lib.rs`, called from `_open_tnlog`; tests in
-`migrate_test`.] Switching a node from MDBX to tnlog mid-epoch loses its anti-equivocation
+`migrate_test`. 2026-10-13 decision (user): keep the migration for the release that switches
+backends, then delete it and the MDBX consensus backend; it now also carries `OurNodeBatchesCache`
+(own uncommitted batches, no other copy). Abandoning MDBX instead was ruled out: safe only while
+the network keeps making rounds (a rolling upgrade) or at an epoch boundary; a stop-all halt
+returns every node to the same round with no vote or proposal memory (two certificates for one
+author and round).] Switching a node from MDBX to tnlog mid-epoch loses its anti-equivocation
 records** (both reviews).
 - **Where:** `_open_tnlog` (`lib.rs`) opens a fresh `<consensus db>/tnlog`, so `Votes`, `LastProposed` and `ProposedCertificates` (issues #934, #962, #963, #975) start empty.
 - **Scenario:** a validator restarts on the tnlog build mid-round. It can vote for, or propose, a conflicting header in the same round.
