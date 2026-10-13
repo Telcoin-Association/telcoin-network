@@ -9,7 +9,7 @@ use std::{
 };
 
 use axum::http::HeaderValue;
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use eyre::WrapErr as _;
 use reqwest::{Certificate, Identity};
 use tracing::warn;
@@ -33,7 +33,7 @@ pub(crate) const DEFAULT_DENIED_METHOD_PREFIXES: &str = "tn_,debug_,trace_,admin
 /// period, so the orchestrator would kill it before the drain even starts.
 const MAX_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
 
-/// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
+/// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Cli {
@@ -557,6 +557,13 @@ pub(crate) struct Cli {
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
+
+    /// Log line format: `text` (the default), human-readable lines, or `json`,
+    /// one JSON object per line for a log collector. `text` carries colour
+    /// codes only when stdout is a terminal and `NO_COLOR` is unset or empty;
+    /// `json` never does. Any other value is rejected at startup.
+    #[arg(long, env = "WORKER_GATEWAY_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
+    pub(crate) log_format: LogFormat,
 }
 
 /// Fully-resolved runtime settings, derived from [`Cli`].
@@ -958,6 +965,16 @@ fn resolve_denied_method_prefixes(prefixes: Vec<String>) -> Vec<String> {
         .map(|prefix| prefix.trim().to_owned())
         .filter(|prefix| !prefix.is_empty())
         .collect()
+}
+
+/// Log line format selected by `--log-format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(crate) enum LogFormat {
+    /// Human-readable lines.
+    Text,
+    /// One JSON object per line, with the event's `timestamp`, `level`,
+    /// `target` and `fields`.
+    Json,
 }
 
 /// Turn a duration flag into `Some(duration)`, or `None` when zero (the
@@ -2446,5 +2463,29 @@ mod tests {
                 assert!(!message.contains(text), "`{text}` leaked into: {message}");
             }
         }
+    }
+
+    #[test]
+    fn unknown_log_format_is_rejected_at_startup() -> eyre::Result<()> {
+        let argv = |format: Option<&str>| {
+            let mut argv = vec![
+                "worker-gateway".to_string(),
+                "--upstream-rpc-url=http://10.0.0.7:8545".to_string(),
+                "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
+            ];
+            argv.extend(format.map(|format| format!("--log-format={format}")));
+            argv
+        };
+
+        for unknown in ["yaml", "JSON", "logfmt", ""] {
+            let err = Cli::try_parse_from(argv(Some(unknown)))
+                .expect_err("an unknown --log-format must fail to parse");
+            assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{unknown:?}");
+        }
+
+        assert_eq!(Cli::try_parse_from(argv(None))?.log_format, LogFormat::Text);
+        assert_eq!(Cli::try_parse_from(argv(Some("text")))?.log_format, LogFormat::Text);
+        assert_eq!(Cli::try_parse_from(argv(Some("json")))?.log_format, LogFormat::Json);
+        Ok(())
     }
 }

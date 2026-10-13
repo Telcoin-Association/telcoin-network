@@ -19,9 +19,12 @@ A Grafana dashboard for the metrics these expose lives at
 
 ## Placeholders to replace
 
-- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:latest` is a local
-  build tag. Point it at your registry, e.g.
-  `registry.example.com/telcoin/worker-gateway:<tag>`.
+- **Image ref** (`deployment.yaml`): `telcoin-worker-gateway:<tag>` is a
+  placeholder for a local build tag. Point it at your registry with a versioned
+  tag, e.g. `registry.example.com/telcoin/worker-gateway:<tag>`, and pin it by
+  digest (`...:<tag>@sha256:<digest>`) so every replica runs the same build;
+  `docker buildx imagetools inspect <ref>:<tag>` prints the digest after a push.
+  Do not deploy `:latest`.
 - **Upstream worker endpoints** (`deployment.yaml`):
   `WORKER_GATEWAY_UPSTREAM_RPC_URL` and `WORKER_GATEWAY_UPSTREAM_READINESS_URL`
   are placeholders pointing at an in-cluster worker Service DNS name. Replace
@@ -95,7 +98,7 @@ In a test process that also ran the client and the upstream, 128 parallel 1 MiB 
 Each extra connection adds at most `--http1-max-buf-size`.
 Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
 About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
-On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); a per-IP connection cap is tracked in #1599.
+On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold.
 If the limit has to stay lower, lower the budget (`--max-inflight-request-bytes 268435456`, 256 MiB, needs about 352 MiB); a 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it (about 336 MiB).
 The probe port is not counted in the formula: each open probe connection holds up to about 24 KiB of buffers for at most `--header-read-timeout`, and nothing caps how many are open, which is why it must stay unreachable from clients.
 
@@ -165,7 +168,8 @@ spec:
       app: worker-gateway
   policyTypes: [Ingress]
   ingress:
-    # allow client RPC from anywhere in-cluster
+    # allow client RPC from any source: a rule without `from` admits every
+    # peer that can reach the pod, inside or outside the cluster
     - ports:
         - port: 8545
     # restrict metrics to the monitoring namespace only
