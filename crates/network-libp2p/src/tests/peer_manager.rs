@@ -438,6 +438,79 @@ async fn trusted_hub_lookups_back_off_and_skip_bootstrap_keys() -> eyre::Result<
     Ok(())
 }
 
+/// Exercise status-only recovery through the manager, including its independent ban cache.
+async fn assert_trusted_hub_status_only_ban_recovers(duration: Duration) -> eyre::Result<()> {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().excess_peers_reconnection_timeout = duration;
+    let mut manager = create_test_peer_manager(Some(config));
+    let (bls, endpoint) = configured_hub(5);
+    let id: PeerId = endpoint.network_key.clone().into();
+    manager.add_trusted_peers([(bls, endpoint.clone())].into_iter().collect());
+    assert_eq!(manager.peer_score(&id), Some(ScoreConfig::default().default_score));
+    manager.dial_requests.clear();
+    assert!(manager.register_peer_connection(
+        &id,
+        ConnectionType::IncomingConnection { multiaddr: endpoint.network_address }
+    ));
+    (0..4).for_each(|_| manager.process_penalty(id, Penalty::Medium));
+    assert!(manager
+        .events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::DisconnectPeer(peer_id) if *peer_id == id) }));
+    manager.register_disconnected(&id);
+    assert!(manager
+        .peers
+        .get_peer(&id)
+        .is_some_and(|peer| matches!(peer.connection_status(), ConnectionStatus::Banned { .. })));
+    assert!(manager.temporarily_banned.contains(&id));
+    manager.retry_trusted_peers();
+    assert!(manager.dial_requests.is_empty());
+
+    // Tokio drives retry scheduling, but both ban records use std::time::Instant. Model cache
+    // expiry with an empty cache and age the status explicitly, without a wall-clock sleep.
+    // Cache expiry itself is covered by its injected-clock tests in cache_peers.rs.
+    tokio::time::advance(duration + manager.heartbeat.period()).await;
+    manager.temporarily_banned =
+        BannedPeerCache::new(duration, manager.config.max_temporarily_banned_peers);
+    let expired = std::time::Instant::now()
+        .checked_sub(duration)
+        .ok_or_else(|| eyre::eyre!("ban duration exceeds monotonic clock range"))?;
+    manager
+        .peers
+        .get_peer_mut(&id)
+        .ok_or_else(|| eyre::eyre!("missing hub"))?
+        .set_connection_status(ConnectionStatus::Banned { instant: expired });
+    manager.events.clear();
+    manager.heartbeat();
+    assert!(manager.peers.get_peer(&id).is_some_and(|peer| matches!(
+        peer.connection_status(),
+        ConnectionStatus::Disconnected { .. }
+    )));
+    assert!(!manager.peer_banned(&id));
+    assert!(manager
+        .events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::Unbanned(peer_id) if *peer_id == id) }));
+    manager.retry_trusted_peers();
+    assert!(manager.dial_requests.iter().any(|request| request.peer_id == id));
+    Ok(())
+}
+
+/// Four Medium penalties must not permanently strand a configured, non-committee hub.
+#[tokio::test(start_paused = true)]
+async fn trusted_hub_status_only_ban_recovers() -> eyre::Result<()> {
+    assert_trusted_hub_status_only_ban_recovers(
+        tn_config::PeerConfig::default().excess_peers_reconnection_timeout,
+    )
+    .await
+}
+
+/// The manager passes its configured timeout through to status recovery.
+#[tokio::test(start_paused = true)]
+async fn trusted_hub_status_only_ban_recovers_with_custom_timeout() -> eyre::Result<()> {
+    assert_trusted_hub_status_only_ban_recovers(Duration::from_secs(17)).await
+}
+
 /// A hub outside the committee keeps its protocol ban across rotation and reinstall, and
 /// committee admission forgives it because committee members are exempt for now.
 #[tokio::test(start_paused = true)]

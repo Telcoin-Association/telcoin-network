@@ -409,7 +409,10 @@ impl AllPeers {
     /// Peers that fail to connect within dial timeout are updated to
     /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
     /// dialing peers are counted towards the limit on inbound connections.
-    pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
+    pub(super) fn heartbeat_maintenance(
+        &mut self,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         let peers_to_disconnect: Vec<PeerId> = self
             .peers
             .iter()
@@ -437,7 +440,7 @@ impl AllPeers {
         }
 
         // update scores for all other peers
-        self.update_peer_scores()
+        self.update_peer_scores(Instant::now(), temporary_ban_duration)
     }
 
     /// Update scores for heartbeat interval.
@@ -446,8 +449,17 @@ impl AllPeers {
     /// updated. Peers are possibly unbanned, but penalties are not applied with this method.
     /// It's impossible for a peer to become banned during heartbeat maintenance.
     ///
-    /// See [Self::apply_penalty] for ban logic.
-    fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
+    /// A disconnect-level penalty can ban the connection without banning the reputation. Recover
+    /// that status after the same timeout used by the manager's temporary-ban cache. Reputation
+    /// bans retain their score-decay lockout. The explicit instant keeps expiry tests
+    /// deterministic.
+    ///
+    /// See [Self::process_penalty] for ban logic.
+    fn update_peer_scores(
+        &mut self,
+        now: Instant,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         // filter peers that are eligible to become unbanned
         let previous = &self.previous_committee;
         let current = &self.current_committee;
@@ -476,7 +488,16 @@ impl AllPeers {
                     );
                     None
                 },
-                ReputationUpdate::None => None,
+                ReputationUpdate::None => {
+                    let expired_status_ban = matches!(
+                        peer.connection_status(),
+                        ConnectionStatus::Banned { instant }
+                            if now.saturating_duration_since(*instant) >= temporary_ban_duration
+                    );
+                    (expired_status_ban && !peer.reputation().banned())
+                        .then(|| Self::peer_id_for(id, peer))
+                        .flatten()
+                },
             }
         }).collect::<Vec<_>>();
 

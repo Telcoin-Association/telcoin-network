@@ -380,6 +380,9 @@ impl PeerManager {
     ///
     /// Repeated installation cannot create duplicate dials or forgive an existing ban.
     /// Seeded launch bindings remain authoritative for identities and dial addresses.
+    /// Hubs start at the configured default score, like ordinary peers, rather than the maximum:
+    /// operator trust protects retention and exempts load penalties, but protocol faults still
+    /// need to reach the normal disconnect and ban thresholds.
     pub(crate) fn add_trusted_peers(
         &mut self,
         peers: std::collections::BTreeMap<BlsPublicKey, P2pNode>,
@@ -678,7 +681,8 @@ impl PeerManager {
     /// is routine and can not further penalize peers.
     pub(super) fn heartbeat(&mut self) {
         // update peers
-        let actions = self.peers.heartbeat_maintenance();
+        let actions =
+            self.peers.heartbeat_maintenance(self.config.excess_peers_reconnection_timeout);
         for (peer_id, action) in actions {
             self.apply_peer_action(peer_id, action);
         }
