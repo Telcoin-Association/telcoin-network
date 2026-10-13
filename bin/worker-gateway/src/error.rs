@@ -142,7 +142,21 @@ pub(crate) enum GatewayError {
     NonPostMethod,
 }
 
+/// The `Retry-After` value, in seconds, on the capacity `503`s
+/// ([`GatewayError::Overloaded`] and [`GatewayError::InflightBytesExhausted`]).
+/// Both free up as soon as a request in flight finishes, so a short fixed wait
+/// is enough, and a client or proxy that honours the header backs off instead
+/// of retrying at once against the cap.
+const CAPACITY_RETRY_AFTER_SECS: &str = "1";
+
 impl GatewayError {
+    /// The `Retry-After` header this error's response carries: only the
+    /// capacity `503`s, whose messages ask the client to retry.
+    fn retry_after(&self) -> Option<HeaderValue> {
+        matches!(self, Self::Overloaded | Self::InflightBytesExhausted)
+            .then(|| HeaderValue::from_static(CAPACITY_RETRY_AFTER_SECS))
+    }
+
     /// The HTTP status paired with this error.
     fn status(&self) -> StatusCode {
         match self {
@@ -312,9 +326,11 @@ fn render(err: &GatewayError, id: RequestId) -> Response {
 
     let mut response = Response::new(Body::from(text));
     *response.status_mut() = err.status();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    let headers = response.headers_mut();
+    headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    if let Some(retry_after) = err.retry_after() {
+        headers.insert(header::RETRY_AFTER, retry_after);
+    }
     response
 }
 
@@ -1066,6 +1082,25 @@ mod tests {
         assert_eq!(body["error"]["code"], json!(-32009));
         assert_eq!(body["error"]["message"], json!("gateway overloaded; retry later"));
         assert_eq!(body["id"], json!("slot-1"));
+    }
+
+    #[test]
+    fn capacity_503s_carry_retry_after() {
+        // both capacity refusals ask the client to retry, so both say when
+        for err in [GatewayError::Overloaded, GatewayError::InflightBytesExhausted] {
+            let response = error_response(&err, b"");
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{err:?}");
+            assert_eq!(
+                response.headers().get(header::RETRY_AFTER),
+                Some(&HeaderValue::from_static("1")),
+                "{err:?}"
+            );
+        }
+        // the rate limit's 429, and the 503 for a missing upstream, are unchanged
+        for err in [GatewayError::RateLimited, GatewayError::NoUpstreamReady] {
+            let response = error_response(&err, b"");
+            assert_eq!(response.headers().get(header::RETRY_AFTER), None, "{err:?}");
+        }
     }
 
     #[tokio::test]

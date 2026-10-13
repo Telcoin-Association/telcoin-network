@@ -455,7 +455,7 @@ Every request is classified, with or without `--redirect-queries`.
 A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync` calls is a submission; everything else, including a batch that mixes the two kinds, is a query.
 
 - Each class has its own in-flight cap: `--max-inflight-submissions` and `--max-inflight-queries`, 256 each by default (`0` means unlimited; without `--redirect-queries` the query cap is lowered, see below).
-  A request whose class has no free slot is answered at once with `503` / `-32009` ("gateway overloaded; retry later"), never queued, so a stalled query upstream fills only the query slots and submissions keep theirs.
+  A request whose class has no free slot is answered at once with `503` / `-32009` ("gateway overloaded; retry later") and `Retry-After: 1`, never queued, so a stalled query upstream fills only the query slots and submissions keep theirs.
   The inbound connection cap (`--max-connections`) still bounds both classes together, so keep `--max-inflight-queries` well below it: the difference is what a saturated query route leaves for submissions, and the gateway warns at startup when the query cap is unlimited or not below `--max-connections`.
 - Every forward to a worker, of either class, also takes a slot on `--max-upstream-inflight` (100 by default, `0` means unlimited), with the same `503` when none is free.
   Without `--redirect-queries` that is every request, so reads and submissions share the cap.
@@ -480,7 +480,7 @@ A declared `Content-Length` over the cap is rejected before any of the body is r
 
 `--max-inflight-request-bytes` (default 512 MiB) budgets the request-body bytes held across all in-flight requests.
 Each request reserves its `Content-Length`, or the whole `--max-request-bytes` when its body is chunked, before the body is read, and returns the reservation once the request has been forwarded or rejected.
-A request that does not fit in what is left gets a JSON-RPC error at once (`503`, `-32010`) instead of waiting; its `id` echoes as `null`, since its body is never read.
+A request that does not fit in what is left gets a JSON-RPC error at once (`503`, `-32010`, with `Retry-After: 1`) instead of waiting; its `id` echoes as `null`, since its body is never read.
 Clients should retry it after a short backoff.
 The `/health`, `/ready` and `/ready/any` probes are exempt, and a rate-limited request costs no budget.
 The budget must be at least `--max-request-bytes`, so a chunked request can always fit; `0` disables it.
@@ -726,6 +726,8 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
 | Upstream answered an error status without a JSON body | the upstream's | `-32012` |
+
+The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
 An upstream error answer with a JSON body (`application/json` or any `+json`
 subtype) is the upstream's own JSON-RPC error and passes through unchanged:
