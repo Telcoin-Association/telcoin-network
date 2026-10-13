@@ -25,11 +25,15 @@
 //! proxy matches an IPv4 range on any listener and a mapped entry cannot dodge
 //! a trusted-range check. An IPv6 range matches native IPv6 addresses only.
 //!
-//! With `--proxy-protocol`, a connection from a trusted peer must open with a
-//! PROXY protocol v2 header ([`read_proxy_header`]), and the source address it
-//! names stands in for the peer: it becomes the connection's `ConnectInfo`, and
+//! With `--proxy-protocol`, a connection from a peer in `--proxy-protocol-from`
+//! (by default the trusted proxies) must open with a PROXY protocol v2 header
+//! ([`read_proxy_header`]), and the source address it names stands in for the
+//! peer: it becomes the connection's `ConnectInfo`, and
 //! the rule above then runs against it, so `X-Forwarded-For` is believed only
-//! when that source is itself a trusted proxy.
+//! when that source is itself a trusted proxy. A `LOCAL` header names no
+//! source: the connection is the front's own (a health check, say) and carries
+//! no forwarded client, so it keeps the front's address and its
+//! `X-Forwarded-For` and `X-Forwarded-Proto` are ignored ([`LocalConnection`]).
 
 use std::{
     fmt, io,
@@ -90,6 +94,24 @@ const PROXY_V2_TCP6_LEN: u16 = 36;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientAddr(pub(crate) IpAddr);
 
+/// Marks a connection that opened with a PROXY protocol `LOCAL` header: the
+/// front's own connection, which carries no forwarded client. The accept loop
+/// adds it to the connection's requests, and [`identify`] then attributes them
+/// to the front whatever forwarding headers they carry, so a client whose
+/// connection a front relays under `LOCAL` cannot choose its own rate-limit
+/// key.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalConnection;
+
+/// What a PROXY protocol v2 header says about its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProxyHeader {
+    /// A `PROXY` header: the front relays this client's connection.
+    Proxy(SocketAddr),
+    /// A `LOCAL` header: the front's own connection, with no client.
+    Local,
+}
+
 /// What the upstream hop is told about a request's client, resolved together
 /// with its [`ClientAddr`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +125,13 @@ pub(crate) struct Forwarding {
 }
 
 impl Forwarding {
+    /// A request attributed to its peer, whatever forwarding headers it
+    /// carries.
+    fn from_peer(peer: IpAddr) -> Self {
+        let peer = peer.to_canonical();
+        Self { client: peer, peer, proto: DEFAULT_PROTO }
+    }
+
     /// The resolved client as the [`ClientAddr`] the identity middleware stores
     /// for the rate limiter, so a charge made after the body is read (a batch's
     /// calls beyond the first) keys on the same address as the edge layer.
@@ -132,8 +161,9 @@ impl Forwarding {
     }
 }
 
-/// The `--trusted-proxies` ranges: the peers whose `X-Forwarded-For` and
-/// `X-Forwarded-Proto` the gateway believes.
+/// A list of address ranges: the `--trusted-proxies`, the peers whose
+/// `X-Forwarded-For` and `X-Forwarded-Proto` the gateway believes, or the
+/// `--proxy-protocol-from` peers, which must open with a PROXY header.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TrustedProxies(Vec<Cidr>);
 
@@ -148,11 +178,30 @@ impl TrustedProxies {
         self.0.is_empty()
     }
 
-    /// Whether a range spans a whole address family (`/0`, or the IPv4-mapped
-    /// `::ffff:0:0/96`), which makes every client that can reach the gateway a
-    /// trusted proxy.
-    pub(crate) fn has_catch_all(&self) -> bool {
-        self.0.iter().any(|cidr| cidr.prefix.bits() == 0)
+    /// Whether the ranges together cover every IPv4 address (`0.0.0.0/0`, the
+    /// IPv4-mapped `::ffff:0:0/96`, or ranges that add up to it, such as
+    /// `0.0.0.0/1,128.0.0.0/1`), which makes every IPv4 client that can reach
+    /// the gateway a trusted proxy, an IPv4-mapped one on a dual-stack
+    /// listener included.
+    pub(crate) fn covers_all_ipv4(&self) -> bool {
+        let spans = self.0.iter().filter(|cidr| cidr.network.is_ipv4()).map(Cidr::span);
+        covers_up_to(spans, u128::from(u32::MAX))
+    }
+
+    /// Whether the ranges together cover every native IPv6 address (`::/0`, or
+    /// ranges that add up to it), which makes every IPv6 client that can reach
+    /// the gateway a trusted proxy. IPv4 and IPv4-mapped clients are matched
+    /// against the IPv4 ranges only, so the mapped block `::ffff:0:0/96` need
+    /// not be covered.
+    pub(crate) fn covers_all_ipv6(&self) -> bool {
+        let mapped = u128::from(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+        let spans = self
+            .0
+            .iter()
+            .filter(|cidr| cidr.network.is_ipv6())
+            .map(Cidr::span)
+            .chain([(mapped, mapped | u128::from(u32::MAX))]);
+        covers_up_to(spans, u128::MAX)
     }
 
     /// Whether `ip` falls inside a trusted range. An IPv4-mapped IPv6 address
@@ -166,7 +215,7 @@ impl TrustedProxies {
     pub(crate) fn resolve(&self, peer: IpAddr, headers: &HeaderMap) -> Forwarding {
         let peer = peer.to_canonical();
         if !self.contains(peer) {
-            return Forwarding { client: peer, peer, proto: DEFAULT_PROTO };
+            return Forwarding::from_peer(peer);
         }
         Forwarding {
             client: self.forwarded_client(headers).unwrap_or(peer),
@@ -259,7 +308,8 @@ impl std::error::Error for CidrError {}
 /// rate limiter (see `crate::server::router`), so each of them sees the
 /// resolved client. A request without `ConnectInfo` (never the case behind the
 /// accept loop) gets neither: the rate limiter then skips its per-IP bucket,
-/// as it did before.
+/// as it did before. A request on a [`LocalConnection`] is attributed to its
+/// peer, the front.
 pub(crate) async fn identify(
     State(trusted): State<Arc<TrustedProxies>>,
     mut request: Request,
@@ -267,7 +317,11 @@ pub(crate) async fn identify(
 ) -> Response {
     let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip());
     if let Some(peer) = peer {
-        let forwarding = trusted.resolve(peer, request.headers());
+        let forwarding = if request.extensions().get::<LocalConnection>().is_some() {
+            Forwarding::from_peer(peer)
+        } else {
+            trusted.resolve(peer, request.headers())
+        };
         request.extensions_mut().insert(forwarding.client_addr());
         request.extensions_mut().insert(forwarding);
     }
@@ -275,9 +329,9 @@ pub(crate) async fn identify(
 }
 
 /// Read the PROXY protocol v2 header a trusted proxy sends ahead of a
-/// connection's first byte, returning the client address it carries, or `None`
-/// for a `LOCAL` header (the proxy's own connection, which keeps the proxy's
-/// address).
+/// connection's first byte, returning the client address it carries, or
+/// [`ProxyHeader::Local`] for a `LOCAL` header (the proxy's own connection,
+/// which keeps the proxy's address).
 ///
 /// Only the header's own bytes are read, never past the length it declares, so
 /// the HTTP request behind it stays in the stream; TLVs after the address
@@ -288,7 +342,7 @@ pub(crate) async fn identify(
 /// (a front sending one is misconfigured, and serving the connection as the
 /// front's own would merge its clients into the front's rate-limit key). The
 /// caller bounds the read with the header read timeout.
-pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<Option<SocketAddr>>
+pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<ProxyHeader>
 where
     R: AsyncRead + Unpin,
 {
@@ -303,20 +357,20 @@ where
     }
     let len = u16::from_be_bytes([len_high, len_low]);
     let (source, block_len) = match (version_command & 0x0f, family) {
-        (PROXY_V2_LOCAL, _) => (None, 0),
+        (PROXY_V2_LOCAL, _) => (ProxyHeader::Local, 0),
         (PROXY_V2_PROXY, PROXY_V2_TCP4) if len >= PROXY_V2_TCP4_LEN => {
             let source = Ipv4Addr::from(stream.read_u32().await?);
             let _destination = stream.read_u32().await?;
             let port = stream.read_u16().await?;
             let _destination_port = stream.read_u16().await?;
-            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP4_LEN)
+            (ProxyHeader::Proxy(SocketAddr::from((source, port))), PROXY_V2_TCP4_LEN)
         }
         (PROXY_V2_PROXY, PROXY_V2_TCP6) if len >= PROXY_V2_TCP6_LEN => {
             let source = Ipv6Addr::from(stream.read_u128().await?);
             let _destination = stream.read_u128().await?;
             let port = stream.read_u16().await?;
             let _destination_port = stream.read_u16().await?;
-            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP6_LEN)
+            (ProxyHeader::Proxy(SocketAddr::from((source, port))), PROXY_V2_TCP6_LEN)
         }
         (PROXY_V2_PROXY, PROXY_V2_TCP4 | PROXY_V2_TCP6) => {
             return Err(invalid_proxy_header("PROXY protocol address block is too short"));
@@ -358,6 +412,37 @@ impl Cidr {
             _ => false,
         }
     }
+
+    /// The first and last address of the range as integers, an IPv4 range in
+    /// the low 32 bits.
+    fn span(&self) -> (u128, u128) {
+        let (first, unused_bits) = match self.network {
+            IpAddr::V4(network) => (u128::from(u32::from(network)), 96),
+            IpAddr::V6(network) => (u128::from(network), 0),
+        };
+        // every host bit below the prefix set; a full-length prefix has none
+        let hosts = u128::MAX.checked_shr(u32::from(self.prefix.bits()) + unused_bits).unwrap_or(0);
+        (first, first | hosts)
+    }
+}
+
+/// Whether the inclusive `(first, last)` spans together cover every integer
+/// from `0` to `max`.
+fn covers_up_to(spans: impl Iterator<Item = (u128, u128)>, max: u128) -> bool {
+    let mut spans: Vec<_> = spans.collect();
+    spans.sort_unstable();
+    // the lowest value no span seen so far covers
+    let mut next = 0_u128;
+    for (first, last) in spans {
+        if first > next {
+            return false;
+        }
+        if last >= max {
+            return true;
+        }
+        next = next.max(last + 1);
+    }
+    false
 }
 
 impl FromStr for Cidr {
@@ -414,15 +499,19 @@ impl FromStr for Cidr {
 }
 
 /// One `X-Forwarded-For` entry as a canonical address: a bare IPv4 or IPv6
-/// address, or one with a port (`203.0.113.7:4711`, `[2001:db8::7]:4711`),
-/// which some proxies append; the port is dropped.
+/// address, a bracketed IPv6 address (`[2001:db8::7]`), or an address with a
+/// port (`203.0.113.7:4711`, `[2001:db8::7]:4711`), which some proxies append;
+/// the port is dropped.
 fn parse_forwarded_entry(entry: &str) -> Option<IpAddr> {
     let entry = entry.trim();
-    entry
-        .parse::<IpAddr>()
-        .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
-        .ok()
-        .map(|ip| ip.to_canonical())
+    let ip = match entry.strip_prefix('[').and_then(|rest| rest.strip_suffix(']')) {
+        Some(bracketed) => bracketed.parse::<Ipv6Addr>().map(IpAddr::V6).ok(),
+        None => entry
+            .parse::<IpAddr>()
+            .or_else(|_| entry.parse::<SocketAddr>().map(|addr| addr.ip()))
+            .ok(),
+    };
+    ip.map(|ip| ip.to_canonical())
 }
 
 /// A PROXY protocol header the gateway will not accept.
@@ -549,11 +638,59 @@ mod tests {
 
     #[test]
     fn catch_all_ranges_are_detected() {
-        for list in ["0.0.0.0/0", "::/0", "::ffff:0:0/96", "10.0.0.0/8, ::/0"] {
-            assert!(trusted(list).has_catch_all(), "{list}");
-        }
-        assert!(!trusted("10.0.0.0/8, 192.0.2.7, 2001:db8::/32").has_catch_all());
-        assert!(!TrustedProxies::default().has_catch_all());
+        let covered = |list: &str| {
+            let list = trusted(list);
+            (list.covers_all_ipv4(), list.covers_all_ipv6())
+        };
+        assert_eq!(covered("0.0.0.0/0"), (true, false));
+        assert_eq!(covered("::ffff:0:0/96"), (true, false));
+        assert_eq!(covered("10.0.0.0/8, ::/0"), (false, true));
+        assert_eq!(covered("0.0.0.0/0, ::/0"), (true, true));
+        assert_eq!(covered("10.0.0.0/8, 192.0.2.7, 2001:db8::/32"), (false, false));
+        assert_eq!(
+            covered("255.255.255.255, ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            (false, false)
+        );
+        let none = TrustedProxies::default();
+        assert_eq!((none.covers_all_ipv4(), none.covers_all_ipv6()), (false, false));
+    }
+
+    #[test]
+    fn ranges_that_add_up_to_a_family_are_detected() {
+        let covered = |list: &str| {
+            let list = trusted(list);
+            (list.covers_all_ipv4(), list.covers_all_ipv6())
+        };
+        // split halves, in any order and overlapping
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/1"), (true, false));
+        assert_eq!(covered("128.0.0.0/1, 0.0.0.0/2, 64.0.0.0/2, 10.0.0.0/8"), (true, false));
+        assert_eq!(covered("::/1, 8000::/1"), (false, true));
+        // the mapped halves are the ipv4 halves
+        assert_eq!(covered("::ffff:0:0/97, ::ffff:128.0.0.0/97"), (true, false));
+        // a gap anywhere, however small, leaves the family uncovered
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/2, 192.0.0.0/3, 224.0.0.0/4"), (false, false));
+        assert_eq!(covered("0.0.0.0/1, 192.0.0.0/2"), (false, false));
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/2, 192.0.0.0/2, ::/1"), (true, false));
+        // two halves of the same half are not the whole family
+        assert_eq!(covered("0.0.0.0/2, 64.0.0.0/2, 0.0.0.0/1"), (false, false));
+        // `::/0` covers native ipv6 only, and no ipv6 range needs to cover the
+        // mapped block, which is matched as ipv4
+        assert!(!trusted("::/0").contains(ip("::ffff:10.0.0.1")));
+        // the ranges tiling every ipv6 address around the mapped block
+        // `::ffff:0:0/96` (2^48 - 2^32 to 2^48 - 1): /81 to /96 below it, /80 to
+        // /1 above it
+        let below = (81..=96_u32).map(|bits| ((1_u128 << 48) - (1_u128 << (129 - bits)), bits));
+        let above = (1..=80_u32).map(|bits| (1_u128 << (128 - bits), bits));
+        let tiles: Vec<String> = below
+            .chain(above)
+            .map(|(first, bits)| format!("{}/{bits}", Ipv6Addr::from(first)))
+            .collect();
+        assert_eq!(covered(&tiles.join(",")), (false, true));
+        // without the tile right below the mapped block, or the first one,
+        // there is a gap
+        assert_eq!(tiles[15], "::fffe:0:0/96");
+        assert_eq!(covered(&[&tiles[..15], &tiles[16..]].concat().join(",")), (false, false));
+        assert_eq!(covered(&tiles[1..].join(",")), (false, false));
     }
 
     #[test]
@@ -568,6 +705,25 @@ mod tests {
         assert_eq!(client(list, "10.0.0.1", &["[2001:db8::7]:4711"]), ip("2001:db8::7"));
         // a trusted hop with a port is still skipped
         assert_eq!(client(list, "10.0.0.1", &["203.0.113.5, 10.0.0.2:80"]), ip("203.0.113.5"));
+    }
+
+    #[test]
+    fn bracketed_ipv6_entry_without_a_port_is_read() {
+        let list = "10.0.0.0/8";
+        assert_eq!(client(list, "10.0.0.1", &["[2001:db8::7]"]), ip("2001:db8::7"));
+        assert_eq!(client(list, "10.0.0.1", &[" [2001:db8::7] , 10.0.0.2"]), ip("2001:db8::7"));
+        // a bracketed mapped address is the ipv4 address it maps
+        assert_eq!(client(list, "10.0.0.1", &["[::ffff:203.0.113.5]"]), ip("203.0.113.5"));
+        // a bracketed trusted hop is still skipped
+        assert_eq!(
+            client("10.0.0.0/8, 2001:db8::/32", "10.0.0.1", &["203.0.113.5, [2001:db8::2]"]),
+            ip("203.0.113.5")
+        );
+        // only one pair of brackets around an ipv6 address is taken off; anything
+        // else stays unparsable and falls back to the peer
+        for entry in ["[203.0.113.5]", "[[2001:db8::7]]", "[2001:db8::7", "2001:db8::7]", "[]"] {
+            assert_eq!(client(list, "10.0.0.1", &[entry]), ip("10.0.0.1"), "{entry}");
+        }
     }
 
     #[test]
@@ -690,7 +846,7 @@ mod tests {
 
     /// Run the reader over `bytes`, returning its verdict and the bytes it left
     /// unread.
-    async fn read_header(bytes: &[u8]) -> (io::Result<Option<SocketAddr>>, Vec<u8>) {
+    async fn read_header(bytes: &[u8]) -> (io::Result<ProxyHeader>, Vec<u8>) {
         let mut reader = bytes;
         let verdict = read_proxy_header(&mut reader).await;
         (verdict, reader.to_vec())
@@ -707,7 +863,7 @@ mod tests {
         ] {
             let bytes = [proxy_v2_header(source, tlvs), request.to_vec()].concat();
             let (verdict, rest) = read_header(&bytes).await;
-            assert_eq!(verdict.expect("valid header"), Some(source));
+            assert_eq!(verdict.expect("valid header"), ProxyHeader::Proxy(source));
             assert_eq!(rest, request);
         }
     }
@@ -718,7 +874,7 @@ mod tests {
         for block in [&[][..], &[0_u8; 12][..]] {
             let bytes = [raw_header(0x20, 0x00, block), b"GET".to_vec()].concat();
             let (verdict, rest) = read_header(&bytes).await;
-            assert_eq!(verdict.expect("valid header"), None);
+            assert_eq!(verdict.expect("valid header"), ProxyHeader::Local);
             assert_eq!(rest, b"GET");
         }
     }

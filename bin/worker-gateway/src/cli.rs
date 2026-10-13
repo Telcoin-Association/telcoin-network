@@ -509,16 +509,29 @@ pub(crate) struct Cli {
 
     /// Expect a PROXY protocol v2 header (the binary form, for TCP over IPv4
     /// or IPv6) at the start of every connection from a peer in
-    /// `--trusted-proxies`, and take the client address from it;
-    /// `X-Forwarded-For` is then believed only when that address is itself in
-    /// `--trusted-proxies`. A connection from a trusted peer whose header is
-    /// missing, malformed or not complete within `--header-read-timeout` is
-    /// closed; any other peer is served as plain HTTP. Off by default; requires
-    /// `--trusted-proxies`. Turn it on only once every listed proxy sends the
-    /// header on every connection: from a listed proxy that does not, a
-    /// client's own first bytes are read as the header.
+    /// `--proxy-protocol-from` (by default the `--trusted-proxies` ranges),
+    /// and take the client address from it; `X-Forwarded-For` is then
+    /// believed only when that address is itself in `--trusted-proxies`. A
+    /// connection from such a peer whose header is missing, malformed or not
+    /// complete within `--header-read-timeout` is closed; any other peer is
+    /// served as plain HTTP. Off by default; requires a non-empty
+    /// `--proxy-protocol-from` or `--trusted-proxies`. Turn it on only once
+    /// every listed peer sends the header on every connection: from a listed
+    /// peer that does not, a client's own first bytes are read as the header.
     #[arg(long, env = "WORKER_GATEWAY_PROXY_PROTOCOL")]
     pub(crate) proxy_protocol: bool,
+
+    /// Comma-separated IPv4/IPv6 CIDR ranges of the peers whose connections
+    /// must open with a PROXY protocol v2 header under `--proxy-protocol` (a
+    /// bare address is a single host). Unset or blank, the `--trusted-proxies`
+    /// ranges. `--trusted-proxies` keeps naming the peers whose
+    /// `X-Forwarded-For` is believed and whose own connections
+    /// `--max-connections-per-ip` does not count, so an L4 balancer can be
+    /// listed here without its address vouching for any `X-Forwarded-For`,
+    /// and an HTTP proxy can be trusted without sending PROXY headers.
+    /// Requires `--proxy-protocol`.
+    #[arg(long, env = "WORKER_GATEWAY_PROXY_PROTOCOL_FROM")]
+    pub(crate) proxy_protocol_from: Option<String>,
 
     /// How long to keep accepting and serving after SIGTERM while `/ready` and
     /// `/ready/any` answer `503` with `"draining": true`, so fronts that probe
@@ -679,9 +692,10 @@ pub(crate) struct Settings {
     /// Proxies whose `X-Forwarded-For` identifies the client; empty when no
     /// proxy is trusted.
     pub(crate) trusted_proxies: TrustedProxies,
-    /// Whether a trusted proxy's connection opens with a PROXY protocol v2
-    /// header naming the client.
-    pub(crate) proxy_protocol: bool,
+    /// The peers whose connections must open with a PROXY protocol v2 header
+    /// naming the client (`--proxy-protocol-from`, else the trusted proxies),
+    /// or `None` when `--proxy-protocol` is off.
+    pub(crate) proxy_protocol: Option<TrustedProxies>,
     /// How long to keep serving, with `/ready` and `/ready/any` reporting
     /// draining, between the shutdown notice and closing the listeners; zero
     /// closes them at once.
@@ -842,10 +856,41 @@ impl Cli {
             .unwrap_or_default()
             .parse::<TrustedProxies>()
             .map_err(|err| eyre::eyre!("invalid --trusted-proxies: {err}"))?;
+        warn_on_whole_families(
+            "--trusted-proxies",
+            &trusted_proxies,
+            "is a trusted proxy, may choose its own rate-limit key and is not counted by \
+             --max-connections-per-ip",
+        );
+        // blank, as an unset variable templated to "" is, means unset
+        let proxy_protocol_from = self
+            .proxy_protocol_from
+            .as_deref()
+            .filter(|list| !list.trim().is_empty())
+            .map(|list| {
+                list.parse::<TrustedProxies>()
+                    .map_err(|err| eyre::eyre!("invalid --proxy-protocol-from: {err}"))
+            })
+            .transpose()?;
         eyre::ensure!(
-            !self.proxy_protocol || !trusted_proxies.is_empty(),
-            "--proxy-protocol requires --trusted-proxies: the PROXY header is read only from a \
-             trusted proxy, so with none listed it would never be read"
+            self.proxy_protocol || proxy_protocol_from.is_none(),
+            "--proxy-protocol-from requires --proxy-protocol: without it no PROXY header is read"
+        );
+        if let Some(senders) = &proxy_protocol_from {
+            warn_on_whole_families(
+                "--proxy-protocol-from",
+                senders,
+                "must open with a PROXY header and so may name any source address as its own",
+            );
+        }
+        let proxy_protocol = self
+            .proxy_protocol
+            .then(|| proxy_protocol_from.unwrap_or_else(|| trusted_proxies.clone()));
+        eyre::ensure!(
+            proxy_protocol.as_ref().is_none_or(|senders| !senders.is_empty()),
+            "--proxy-protocol requires --proxy-protocol-from or --trusted-proxies: the PROXY \
+             header is read only from the peers they list, so with none listed it would never \
+             be read"
         );
         let rate_limit_per_ip =
             resolve_rate_limit(self.rate_limit_per_ip, self.rate_limit_per_ip_burst);
@@ -955,7 +1000,7 @@ impl Cli {
             // no burst flag: the burst derives like a `0` burst on the others
             rate_limit_submissions: resolve_rate_limit(self.rate_limit_submissions, 0),
             trusted_proxies,
-            proxy_protocol: self.proxy_protocol,
+            proxy_protocol,
             shutdown_delay: self.shutdown_delay,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
@@ -1038,6 +1083,26 @@ pub(crate) enum LogFormat {
     /// One JSON object per line, with the event's `timestamp`, `level`,
     /// `target` and `fields`.
     Json,
+}
+
+/// Warn when the ranges of `flag` cover a whole address family, naming the
+/// family and what every client of it that can reach the gateway then does
+/// (`consequence`). IPv4 and IPv4-mapped clients are matched against the IPv4
+/// ranges only and native IPv6 clients against the IPv6 ranges only, so each
+/// family is judged on its own.
+fn warn_on_whole_families(flag: &str, ranges: &TrustedProxies, consequence: &str) {
+    for (family, covered) in [
+        ("IPv4 address, IPv4-mapped ones included", ranges.covers_all_ipv4()),
+        ("native IPv6 address", ranges.covers_all_ipv6()),
+    ] {
+        if covered {
+            warn!(
+                target: "gateway",
+                "{flag} covers every {family}: every such client that can reach the gateway \
+                 {consequence}; list only the fronts' own addresses"
+            );
+        }
+    }
 }
 
 /// Reject a zero value for a duration flag that has no disabled sentinel. A
@@ -2347,16 +2412,132 @@ mod tests {
     }
 
     #[test]
+    fn trusted_ranges_covering_a_whole_family_warn_for_that_family() -> eyre::Result<()> {
+        const IPV4: &str = "--trusted-proxies covers every IPv4 address, IPv4-mapped ones included";
+        const IPV6: &str = "--trusted-proxies covers every native IPv6 address";
+        for (list, warns_v4, warns_v6) in [
+            ("0.0.0.0/0", true, false),
+            // halves that add up to the whole family
+            ("0.0.0.0/1,128.0.0.0/1", true, false),
+            ("::ffff:0:0/96", true, false),
+            // `::/0` covers native ipv6 only
+            ("::/0", false, true),
+            ("::/1,8000::/1,0.0.0.0/0", true, true),
+            ("10.0.0.0/8,2001:db8::/32", false, false),
+            ("0.0.0.0/1,::/0", false, true),
+        ] {
+            let flag = format!("--trusted-proxies={list}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[flag.as_str()]));
+            settings?;
+            assert_eq!(logs.contains(IPV4), warns_v4, "{list}: {logs}");
+            assert_eq!(logs.contains(IPV6), warns_v6, "{list}: {logs}");
+            assert_eq!(
+                logs.matches("covers every").count(),
+                usize::from(warns_v4) + usize::from(warns_v6),
+                "{list}: {logs}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn proxy_protocol_without_trusted_proxies_is_rejected_at_startup() -> eyre::Result<()> {
-        assert!(!cli_with_flags(&[]).into_settings()?.proxy_protocol, "off by default");
-        let message = match cli_with_flags(&["--proxy-protocol"]).into_settings() {
-            Ok(_) => panic!("--proxy-protocol with no trusted proxy must fail startup"),
-            Err(err) => format!("{err:?}"),
-        };
-        assert!(message.contains("--trusted-proxies"), "{message}");
+        assert!(cli_with_flags(&[]).into_settings()?.proxy_protocol.is_none(), "off by default");
+        // a blank --proxy-protocol-from falls back to the (empty) trusted list
+        for flags in [&["--proxy-protocol"][..], &["--proxy-protocol", "--proxy-protocol-from= "]] {
+            let message = match cli_with_flags(flags).into_settings() {
+                Ok(_) => panic!("{flags:?} with no peer to read the header from must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("--trusted-proxies"), "{message}");
+            assert!(message.contains("--proxy-protocol-from"), "{message}");
+        }
         let settings = cli_with_flags(&["--proxy-protocol", "--trusted-proxies=10.0.0.0/8"])
             .into_settings()?;
-        assert!(settings.proxy_protocol);
+        assert!(settings.proxy_protocol.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_from_defaults_to_the_trusted_proxies_and_is_kept_apart() -> eyre::Result<()> {
+        let trusted = "--trusted-proxies=192.0.2.0/24";
+        // unset or blank: the trusted proxies send the header
+        for flags in [
+            &["--proxy-protocol", trusted][..],
+            &["--proxy-protocol", trusted, "--proxy-protocol-from="],
+            &["--proxy-protocol", trusted, "--proxy-protocol-from= "],
+        ] {
+            let settings = cli_with_flags(flags).into_settings()?;
+            assert_eq!(
+                settings.proxy_protocol.as_ref(),
+                Some(&settings.trusted_proxies),
+                "{flags:?}"
+            );
+        }
+        // set: its own list, and the trusted proxies stay as they are
+        let settings = cli_with_flags(&[
+            "--proxy-protocol",
+            trusted,
+            "--proxy-protocol-from=10.0.0.0/8, 2001:db8::/32",
+        ])
+        .into_settings()?;
+        let senders = settings.proxy_protocol.expect("PROXY protocol on");
+        assert_eq!(senders.len(), 2);
+        assert!(senders.contains("10.1.2.3".parse()?));
+        assert!(senders.contains("2001:db8::1".parse()?));
+        assert!(!senders.contains("192.0.2.1".parse()?));
+        assert_eq!(settings.trusted_proxies, "192.0.2.0/24".parse::<TrustedProxies>()?);
+        // a sender list needs no trusted proxy at all
+        let settings = cli_with_flags(&["--proxy-protocol", "--proxy-protocol-from=10.0.0.0/8"])
+            .into_settings()?;
+        assert!(settings.trusted_proxies.is_empty());
+        assert_eq!(settings.proxy_protocol.map(|senders| senders.len()), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn proxy_protocol_from_without_proxy_protocol_or_invalid_is_rejected() {
+        for (flags, expected) in [
+            (
+                &["--trusted-proxies=10.0.0.0/8", "--proxy-protocol-from=10.0.0.0/8"][..],
+                "--proxy-protocol-from requires --proxy-protocol",
+            ),
+            (
+                &["--proxy-protocol", "--proxy-protocol-from=10.0.0.1/8"],
+                "invalid --proxy-protocol-from",
+            ),
+            (
+                &["--proxy-protocol", "--proxy-protocol-from=10.0.0.0/8,,"],
+                "invalid --proxy-protocol-from",
+            ),
+        ] {
+            let message = match cli_with_flags(flags).into_settings() {
+                Ok(_) => panic!("{flags:?} must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(expected), "{flags:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn proxy_protocol_from_covering_a_whole_family_warns_once() -> eyre::Result<()> {
+        const SENDERS: &str = "--proxy-protocol-from covers every IPv4 address";
+        const TRUSTED: &str = "--trusted-proxies covers every IPv4 address";
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[
+            "--proxy-protocol",
+            "--proxy-protocol-from=0.0.0.0/1,128.0.0.0/1",
+        ]));
+        settings?;
+        assert_eq!(logs.matches(SENDERS).count(), 1, "{logs}");
+        assert!(!logs.contains(TRUSTED), "{logs}");
+        // by default the senders are the trusted proxies, warned about once
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[
+            "--proxy-protocol",
+            "--trusted-proxies=0.0.0.0/0",
+        ]));
+        settings?;
+        assert_eq!(logs.matches(TRUSTED).count(), 1, "{logs}");
+        assert!(!logs.contains(SENDERS), "{logs}");
         Ok(())
     }
 

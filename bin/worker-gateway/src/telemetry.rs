@@ -121,7 +121,8 @@ const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 
 /// Inbound connections closed at accept without being served, by `reason`
 /// (`per_ip_cap`: the client's prefix already held `--max-connections-per-ip`
-/// connections).
+/// connections; `proxy_header`: a `--proxy-protocol` peer's PROXY header was
+/// missing, malformed or late).
 const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.

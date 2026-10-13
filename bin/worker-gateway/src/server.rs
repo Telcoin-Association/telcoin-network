@@ -64,14 +64,16 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    identity::{identify, read_proxy_header, ClientAddr, TrustedProxies},
+    identity::{
+        identify, read_proxy_header, ClientAddr, LocalConnection, ProxyHeader, TrustedProxies,
+    },
     proxy::{
         proxy, reject_non_post, AccessRecord, ForwardingStarted, QueryHeader,
         OVERSIZED_BODY_WARNINGS,
     },
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
-    telemetry,
+    telemetry::{self, Throttle},
 };
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
@@ -114,6 +116,17 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// `reason` label on `tn_worker_gateway_connections_refused_total` for a
 /// connection closed because its client prefix was at its cap.
 const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
+
+/// `reason` label on `tn_worker_gateway_connections_refused_total` for a
+/// connection from a `--proxy-protocol` peer closed because its PROXY header
+/// was missing, malformed or late.
+const REFUSED_PROXY_HEADER: &str = "proxy_header";
+
+/// Throttle for the warning on a connection closed for its PROXY header. A
+/// misconfigured front has every connection closed this way, so the warning
+/// shows at the default log level, once per window.
+pub(crate) static PROXY_HEADER_WARNINGS: Throttle = Throttle::new("proxy_header");
+
 /// How long a browser may cache the gateway's answer to a CORS preflight
 /// (`Access-Control-Max-Age`).
 const CORS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
@@ -224,9 +237,9 @@ pub(crate) struct ServerLimits {
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
     /// The peers whose connections must open with a PROXY protocol v2 header
-    /// (`--proxy-protocol`, which reads it from the `--trusted-proxies`
-    /// ranges), or `None` when PROXY protocol is off. Every other connection
-    /// is served as plain HTTP.
+    /// (`--proxy-protocol-from`, by default the `--trusted-proxies` ranges),
+    /// or `None` when PROXY protocol (`--proxy-protocol`) is off. Every other
+    /// connection is served as plain HTTP.
     pub(crate) proxy_protocol: Option<Arc<TrustedProxies>>,
     /// Budget of request-body bytes held across all in-flight requests, or
     /// `None` when unlimited (see [`reserve_request_bytes`]).
@@ -965,11 +978,13 @@ pub(crate) async fn serve(
 /// polled independent of connection progress, so it fires even against a
 /// client trickling one byte per interval to keep the transport alive.
 ///
-/// With `--proxy-protocol`, a connection from a trusted proxy is first read
-/// for its PROXY protocol v2 header, on the connection's own task (a slow
+/// With `--proxy-protocol`, a connection from a `--proxy-protocol-from` peer
+/// is first read for its PROXY protocol v2 header, on the connection's own task (a slow
 /// front never stalls `accept()`) and within the header read timeout; the
-/// source address it names becomes the connection's `ConnectInfo`. A missing,
-/// late or malformed header closes the connection.
+/// source address it names becomes the connection's `ConnectInfo`. A `LOCAL`
+/// header keeps the front's address and marks the connection
+/// ([`LocalConnection`]) so its forwarding headers are ignored. A missing, late
+/// or malformed header closes the connection.
 ///
 /// The per-client cap counts a connection against its resolved client, the
 /// address the identity middleware starts from: the PROXY header's source, or
@@ -1063,12 +1078,12 @@ async fn accept_loop(
             debug!(target: "gateway::server", %err, "failed to set TCP_USER_TIMEOUT");
         }
 
-        // Only a trusted peer's connection opens with a PROXY header; every
-        // other connection is plain HTTP.
+        // Only a `--proxy-protocol-from` peer's connection opens with a PROXY
+        // header; every other connection is plain HTTP.
         let proxy_header_deadline = limits
             .proxy_protocol
             .as_ref()
-            .filter(|trusted| trusted.contains(peer_addr.ip()))
+            .filter(|senders| senders.contains(peer_addr.ip()))
             .map(|_| limits.header_read_timeout);
         let app = app.clone();
         let connection_builder = connection_builder.clone();
@@ -1094,11 +1109,11 @@ async fn accept_loop(
         let mut drain_signal = drain.subscribe();
         let connection = async move {
             let mut lifetime_cap = pin!(lifetime_cap);
-            let client_addr = match proxy_header_deadline {
+            let (client_addr, local) = match proxy_header_deadline {
                 Some(deadline) => {
-                    let source = tokio::select! {
+                    let header = tokio::select! {
                         biased;
-                        source = proxy_source(&mut stream, peer_addr, deadline) => source,
+                        header = proxy_header(&mut stream, peer_addr, deadline) => header,
                         () = lifetime_cap.as_mut() => {
                             debug!(
                                 target: "gateway::server",
@@ -1108,12 +1123,14 @@ async fn accept_loop(
                             None
                         }
                     };
-                    match source {
-                        Some(source) => source,
+                    match header {
+                        Some(ProxyHeader::Proxy(source)) => (source, false),
+                        // the front's own connection: no client to name
+                        Some(ProxyHeader::Local) => (peer_addr, true),
                         None => return,
                     }
                 }
-                None => peer_addr,
+                None => (peer_addr, false),
             };
             // Per-client cap, keyed on the resolved client and taken before
             // the connection is served: a client prefix already at its cap
@@ -1146,8 +1163,11 @@ async fn accept_loop(
             };
             // Hand the identity middleware the client's address
             // (`ConnectInfo`): the peer, or the source its PROXY header named.
-            // It resolves the client the rate limiter and the proxy use.
-            let service = TowerToHyperService::new(app.layer(Extension(ConnectInfo(client_addr))));
+            // It resolves the client the rate limiter and the proxy use, and
+            // believes no forwarding header on a `LOCAL` connection.
+            let app = app.layer(Extension(ConnectInfo(client_addr)));
+            let app = if local { app.layer(Extension(LocalConnection)) } else { app };
+            let service = TowerToHyperService::new(app);
             let mut connection =
                 pin!(connection_builder.serve_connection(TokioIo::new(stream), service));
             // `biased` so a connection that finishes in the same poll as the
@@ -1249,35 +1269,46 @@ async fn until_listener_closes(
 }
 
 /// Read the PROXY protocol v2 header a trusted front opens `stream` with,
-/// within `deadline`, and return the address the connection's requests come
-/// from: the source the header names, or `peer_addr` for a `LOCAL` header.
-/// `None` means the header was missing, late or malformed, and the connection
-/// is to be closed without a response.
-async fn proxy_source(
+/// within `deadline`. `None` means the connection is to be closed without a
+/// response: the header was missing, late or malformed, which is counted and
+/// logged as a (throttled) warning naming the peer, or the peer went away
+/// before sending a byte (a TCP connect health check, say), which is not.
+async fn proxy_header(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     deadline: Duration,
-) -> Option<SocketAddr> {
-    match tokio::time::timeout(deadline, read_proxy_header(stream)).await {
-        Ok(Ok(source)) => Some(source.unwrap_or(peer_addr)),
-        Ok(Err(err)) => {
+) -> Option<ProxyHeader> {
+    let read = async {
+        if matches!(stream.peek(&mut [0_u8; 1]).await, Ok(0) | Err(_)) {
+            return Ok(None);
+        }
+        read_proxy_header(stream).await.map(Some)
+    };
+    let reason = match tokio::time::timeout(deadline, read).await {
+        Ok(Ok(Some(header))) => return Some(header),
+        Ok(Ok(None)) => {
             debug!(
                 target: "gateway::server",
                 %peer_addr,
-                %err,
-                "unreadable PROXY protocol header; closing connection"
+                "connection closed before its PROXY protocol header"
             );
-            None
+            return None;
         }
-        Err(_) => {
-            debug!(
-                target: "gateway::server",
-                %peer_addr,
-                "no PROXY protocol header within the header read timeout; closing connection"
-            );
-            None
-        }
+        Ok(Err(err)) => err.to_string(),
+        Err(_elapsed) => String::from("not complete within the header read timeout"),
+    };
+    telemetry::record_connection_refused(REFUSED_PROXY_HEADER);
+    if let Some(suppressed) = PROXY_HEADER_WARNINGS.admit() {
+        warn!(
+            target: "gateway::server",
+            %peer_addr,
+            %reason,
+            suppressed,
+            "missing, malformed or late PROXY protocol header from a peer that must send one; \
+             closing connection"
+        );
     }
+    None
 }
 
 /// Build the probe-only router served on `--probe-addr`: the health, readiness
@@ -3487,14 +3518,28 @@ mod tests {
     }
 
     /// Serve the gateway router with `limiters` and `--proxy-protocol` on,
-    /// trusting the proxies in `list`.
+    /// trusting the proxies in `list`, which are also the peers that must
+    /// send a PROXY header (`--proxy-protocol-from` unset).
     async fn spawn_proxy_protocol(
         state: AppState,
         limiters: Option<Arc<RateLimiters>>,
         list: &str,
         header_read_timeout: Duration,
     ) -> (SocketAddr, Notifier) {
-        let trusted = Arc::new(list.parse::<TrustedProxies>().expect("trusted proxies"));
+        spawn_proxy_protocol_from(state, limiters, list, list, header_read_timeout).await
+    }
+
+    /// [`spawn_proxy_protocol`] trusting the proxies in `trusted` and reading
+    /// a PROXY header from the peers in `senders` (`--proxy-protocol-from`).
+    async fn spawn_proxy_protocol_from(
+        state: AppState,
+        limiters: Option<Arc<RateLimiters>>,
+        trusted: &str,
+        senders: &str,
+        header_read_timeout: Duration,
+    ) -> (SocketAddr, Notifier) {
+        let trusted = Arc::new(trusted.parse::<TrustedProxies>().expect("trusted proxies"));
+        let senders = Arc::new(senders.parse::<TrustedProxies>().expect("proxy protocol senders"));
         let app = router(
             state,
             Duration::from_secs(5),
@@ -3503,11 +3548,8 @@ mod tests {
             RouterLayers { rate_limiters: limiters, ..RouterLayers::default() },
             Arc::clone(&trusted),
         );
-        let limits = ServerLimits {
-            header_read_timeout,
-            proxy_protocol: Some(Arc::clone(&trusted)),
-            ..test_limits()
-        };
+        let limits =
+            ServerLimits { header_read_timeout, proxy_protocol: Some(senders), ..test_limits() };
         spawn_trusting(app, limits, trusted).await
     }
 
@@ -3591,6 +3633,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_proxy_header_ignores_forwarded_headers() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn_proxy_protocol(
+            state,
+            one_request_per_ip(),
+            "127.0.0.1/32",
+            Duration::from_secs(5),
+        )
+        .await;
+        let local = [&b"\r\n\r\n\0\r\nQUIT\n"[..], &[0x20, 0x00, 0x00, 0x00]].concat();
+        let forwarded =
+            |client: &str| format!("X-Forwarded-For: {client}\r\nX-Forwarded-Proto: https\r\n");
+
+        // a `PROXY` header naming the trusted front itself still lets it vouch
+        // for a client, which then has a bucket of its own
+        let header = proxy_v2_header(socket("127.0.0.1:4711"), &[]);
+        let response = raw_exchange(gateway, &header, &forwarded("6.6.6.6")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("6.6.6.6, 127.0.0.1|https"), "{response}");
+        // under `LOCAL` the same front vouches for no one: the request is the
+        // front's own, upstream and in the rate limiter
+        let response = raw_exchange(gateway, &local, &forwarded("7.7.7.7")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("127.0.0.1|http"), "{response}");
+        assert!(!response.contains("7.7.7.7"), "{response}");
+        // so another forwarded address cannot pick a fresh bucket: the front's
+        // one token is spent
+        let response = raw_exchange(gateway, &local, &forwarded("8.8.8.8")).await;
+        assert!(response.starts_with("HTTP/1.1 429"), "{response}");
+    }
+
+    #[tokio::test]
     async fn proxy_protocol_header_from_an_untrusted_peer_is_not_parsed() {
         let (worker, _worker) = forwarding_echo().await;
         let state = redirect_state(worker, None);
@@ -3608,6 +3684,61 @@ mod tests {
         let response = raw_exchange(gateway, b"", "").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert!(response.contains("127.0.0.1|http"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn proxy_protocol_from_peer_must_send_a_header_without_being_trusted() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // the loopback peer must send a PROXY header, but only an l7 range
+        // behind it is a trusted proxy
+        let (gateway, _shutdown) = spawn_proxy_protocol_from(
+            state,
+            None,
+            "192.0.2.0/24",
+            "127.0.0.1/32",
+            Duration::from_secs(5),
+        )
+        .await;
+        let forwarded = "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Proto: https\r\n";
+
+        // without a header the connection is closed without a response
+        assert_eq!(raw_exchange(gateway, b"", forwarded).await, "");
+        // with one, the source it names is resolved as before: an untrusted
+        // source is the client whatever it forwards
+        let header = proxy_v2_header(socket("203.0.113.5:4711"), &[]);
+        let response = raw_exchange(gateway, &header, forwarded).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("203.0.113.5|http"), "{response}");
+        assert!(!response.contains("6.6.6.6"), "{response}");
+        // and a trusted source vouches for its client
+        let header = proxy_v2_header(socket("192.0.2.10:4711"), &[]);
+        let response = raw_exchange(gateway, &header, forwarded).await;
+        assert!(response.contains("6.6.6.6, 192.0.2.10|https"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_outside_proxy_protocol_from_is_served_as_http() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // the loopback peer is a trusted proxy, but not one that sends PROXY
+        // headers
+        let (gateway, _shutdown) = spawn_proxy_protocol_from(
+            state,
+            None,
+            "127.0.0.1/32",
+            "10.0.0.0/8",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        // served without a header, and its `X-Forwarded-For` is believed
+        let forwarded = "X-Forwarded-For: 6.6.6.6\r\nX-Forwarded-Proto: https\r\n";
+        let response = raw_exchange(gateway, b"", forwarded).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("6.6.6.6, 127.0.0.1|https"), "{response}");
     }
 
     #[tokio::test]
@@ -3643,6 +3774,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bad_proxy_headers_are_counted_and_warned_once_per_window() {
+        const WARNING: &str = "missing, malformed or late PROXY protocol header";
+        let mut metrics = CapturedMetrics::install();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) =
+            spawn_proxy_protocol(state, None, "127.0.0.1/32", Duration::from_millis(300)).await;
+        let mut refused = || {
+            metrics.value(
+                "tn_worker_gateway_connections_refused_total",
+                &[("reason", REFUSED_PROXY_HEADER)],
+            )
+        };
+
+        // a missing header (plain http), a malformed one, and a late one (half
+        // a header, then nothing until the header read timeout)
+        assert_eq!(raw_exchange(gateway, b"", "").await, "");
+        let v1 = b"PROXY TCP4 198.51.100.1 127.0.0.1 4711 8545\r\n";
+        assert_eq!(raw_exchange(gateway, v1, "").await, "");
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let mut late = TcpStream::connect(gateway).await.expect("connect");
+        late.write_all(&header[..8]).await.expect("write");
+        let read = tokio::time::timeout(Duration::from_secs(5), late.read(&mut [0_u8; 1]))
+            .await
+            .expect("closed at the header read timeout");
+        assert_eq!(read.expect("read"), 0, "expected EOF");
+        assert_eq!(refused(), 3.0);
+        // the throttle lets one warning through per window, naming the peer
+        // and why
+        let text = logs.contents();
+        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+        assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
+        assert!(line.contains("suppressed=0"), "{line}");
+
+        // a peer that connects and closes without a byte (a tcp connect check)
+        // is neither counted nor warned about
+        drop(TcpStream::connect(gateway).await.expect("connect"));
+        // a good header is served, and the closed connection was seen by then
+        let response = raw_exchange(gateway, &header, "").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(refused(), 3.0);
+        let text = logs.contents();
+        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        assert!(text.contains("connection closed before its PROXY protocol header"), "{text}");
+    }
+
+    #[tokio::test]
     async fn slow_proxy_header_neither_stalls_accept_nor_outlives_the_header_timeout() {
         let (worker, _worker) = forwarding_echo().await;
         let state = redirect_state(worker, None);
@@ -3667,6 +3856,154 @@ mod tests {
             .await
             .expect("connection should be closed by the header read timeout");
         assert_eq!(read.expect("read"), 0, "expected EOF from the server");
+    }
+
+    /// The accept loop for the probe-only `/health` router with PROXY protocol
+    /// read from the loopback peer, `header_read_timeout` for the header,
+    /// lifetime cap `cap` and drain deadline `graceful_timeout`, on a fresh
+    /// ephemeral port: the address, the shutdown `Notifier` and the loop's
+    /// handle.
+    async fn spawn_proxy_header_loop(
+        header_read_timeout: Duration,
+        cap: Duration,
+        graceful_timeout: Duration,
+    ) -> (SocketAddr, Notifier, JoinHandle<Result<(), TaskError>>) {
+        let trusted = Arc::new("127.0.0.1/32".parse::<TrustedProxies>().expect("trusted"));
+        let limits = ServerLimits {
+            header_read_timeout,
+            max_connection_duration: Some(cap),
+            proxy_protocol: Some(Arc::clone(&trusted)),
+            ..test_limits()
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            probe_router(test_state(&[])),
+            limits,
+            trusted,
+            Arc::default(),
+            graceful_timeout,
+            shutdown.subscribe(),
+        ));
+        (addr, shutdown, accept)
+    }
+
+    /// How long the real-clock part of a PROXY header test waits for the
+    /// gateway to act on what the test just sent.
+    const SETTLE: Duration = Duration::from_millis(50);
+
+    /// Run a shutdown while two connections are halfway through their PROXY
+    /// header: one completes it after the notice and sends a request, the
+    /// other stalls. Returns how long after the connections opened the accept
+    /// loop's drain ended, having checked that the completed one was served
+    /// and that the drain waited for the stalled one.
+    ///
+    /// The clock is paused only once the test has no socket of its own left
+    /// to wait on. A paused clock jumps to the next pending timer whenever the
+    /// runtime parks, and waiting on a socket parks it, so pausing before the
+    /// exchange would fire the stalled header's timeout while the test's own
+    /// bytes were still in flight. After the pause, the first of the loop's
+    /// timers to run out fires at its exact deadline.
+    async fn drain_during_proxy_headers(header_read_timeout: Duration, cap: Duration) -> Duration {
+        // far longer than either bound, so only they can end the drain
+        const GRACE: Duration = Duration::from_secs(600);
+        let (addr, shutdown, accept) =
+            spawn_proxy_header_loop(header_read_timeout, cap, GRACE).await;
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
+        let mut stalled = TcpStream::connect(addr).await.expect("connect");
+        stalled.write_all(&header[..8]).await.expect("write");
+        let mut completing = TcpStream::connect(addr).await.expect("connect");
+        completing.write_all(&header[..8]).await.expect("write");
+        // the loop accepts both and starts reading their headers
+        tokio::time::sleep(SETTLE).await;
+
+        shutdown.notify();
+        tokio::time::sleep(SETTLE).await;
+        assert!(!accept.is_finished(), "the drain must wait for the header reads");
+
+        // a header completed after the notice is served, request and all
+        let request = b"GET /health HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n";
+        completing.write_all(&[&header[8..], &request[..]].concat()).await.expect("write");
+        let mut response = Vec::new();
+        completing.read_to_end(&mut response).await.expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!accept.is_finished(), "the stalled header still holds the drain");
+
+        // the stalled one is closed by the first bound to run out, and the
+        // drain ends with it
+        tokio::time::pause();
+        let read = stalled.read(&mut [0_u8; 1]).await.expect("read");
+        assert_eq!(read, 0, "expected EOF from the server");
+        accept.await.expect("join").expect("accept loop");
+        let ended = started.elapsed();
+        tokio::time::resume();
+        ended
+    }
+
+    /// The drain takes a connection still reading its PROXY header into
+    /// account (its receiver is taken at accept) but never cuts the read: it
+    /// ends when the header read timeout does, or the lifetime cap if that
+    /// comes first. Both bound the read from accept, so with the clock paused
+    /// for the wait the drain ends at the bound to within the connect time.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_proxy_header_until_its_bound() {
+        let margin = Duration::from_millis(500);
+        let header_read = Duration::from_secs(5);
+        let ended = drain_during_proxy_headers(header_read, Duration::from_secs(30)).await;
+        assert!(ended >= header_read && ended < header_read + margin, "{ended:?}");
+        // a lifetime cap shorter than the header read timeout ends it sooner
+        // (startup validation rules that out; the loop does not rely on it)
+        let cap = Duration::from_secs(3);
+        let ended = drain_during_proxy_headers(Duration::from_secs(30), cap).await;
+        assert!(ended >= cap && ended < cap + margin, "{ended:?}");
+    }
+
+    /// The clock is paused once the half header has been read, as in
+    /// [`drain_during_proxy_headers`], so the cap fires at its exact deadline.
+    #[tokio::test]
+    async fn lifetime_cap_closes_a_connection_still_reading_its_proxy_header() {
+        const CAP_LINE: &str = "connection exceeded max lifetime; closing";
+        let mut metrics = CapturedMetrics::install();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let cap = Duration::from_secs(5);
+        let (addr, _shutdown, _accept) =
+            spawn_proxy_header_loop(Duration::from_secs(60), cap, GRACEFUL_TIMEOUT).await;
+
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
+        let mut stalled = TcpStream::connect(addr).await.expect("connect");
+        stalled.write_all(&header[..8]).await.expect("write");
+        tokio::time::sleep(SETTLE).await;
+        tokio::time::pause();
+        let read = stalled.read(&mut [0_u8; 1]).await.expect("read");
+        assert_eq!(read, 0, "expected EOF from the server");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= cap && elapsed < cap + Duration::from_millis(500), "{elapsed:?}");
+
+        // the cap's own debug line, naming the peer only: no client is known
+        // before the header is read
+        let text = logs.contents();
+        let line = text.lines().find(|line| line.contains(CAP_LINE)).expect("the cap line");
+        assert!(line.contains("DEBUG"), "{line}");
+        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+        assert!(!line.contains("client_addr"), "{line}");
+        // the cap is not a header failure
+        assert!(!text.contains("PROXY protocol header from a peer"), "{text}");
+        let refused = metrics.value(
+            "tn_worker_gateway_connections_refused_total",
+            &[("reason", REFUSED_PROXY_HEADER)],
+        );
+        assert_eq!(refused, 0.0);
     }
 
     /// Gateway state over `upstreams`, every one marked ready, using the
