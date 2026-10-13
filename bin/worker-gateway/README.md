@@ -3,7 +3,7 @@
 A reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
 It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
 With `--redirect-queries` it sends transaction submissions, and the few reads only the worker's pool can answer, to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
-"Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
+"Unchanged" applies to the JSON-RPC body and content type of a `POST`, the only method the gateway forwards; the header contract is deliberately minimal (see Scope).
 
 Every instance is identical and any replica can serve any request, so the gateway can be scaled horizontally.
 Each replica keeps its own bounded set of recent submission hashes, which only steers where a lookup goes (see [Reads kept on the worker](#reads-kept-on-the-worker)).
@@ -26,19 +26,12 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   With `--redirect-queries`, only `eth_sendRawTransaction`, `eth_sendRawTransactionSync` and the [reads kept on the worker](#reads-kept-on-the-worker) go to the worker, and every other call goes to the query URL (see [Query redirect](#query-redirect)).
 - TLS termination for clients and auth/API keys are out of scope; run the gateway behind your own ingress/mTLS.
   The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
-- Header forwarding is minimal. Upstream gets the request method, body, and
-  `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client
-  identity the gateway resolved, never the client's own values; see
-  [Client identity behind a front](#client-identity-behind-a-front)) and the
-  `X-TN-Gateway` hop marker (loop protection; calls sent to
-  the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead). The client
-  gets the upstream status, body, and `Content-Type` (an error status without a
-  JSON body gets a JSON-RPC error body; see "Behaviour on failure"). All other headers are
-  dropped in both directions; in particular CORS is not terminated here, so
-  browser dApps need CORS handled at the ingress (or a later PR).
-- The request path and query string are not forwarded: every request goes to
-  the configured upstream base URL (JSON-RPC carries its method in the body,
-  so `POST /` is the whole HTTP surface).
+- Header forwarding is minimal.
+  Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)) and the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead).
+  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
+  All other headers are dropped in both directions; in particular CORS is not terminated here, so browser dApps need CORS handled at the ingress (or a later PR).
+  Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
+- The request path and query string are not forwarded: a `POST` to any path but `/health`, `/ready` and `/ready/any` goes to the configured upstream base URL, since JSON-RPC carries its method in the body (see [Gateway endpoints](#gateway-endpoints)).
 
 ## Readiness contract
 
@@ -151,7 +144,7 @@ Every flag has an environment-variable fallback.
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
 | `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
-| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Hard cap on one connection's total lifetime (`0` disables). |
+| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
 | `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest enabled rate-limit burst; a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
 | `--max-inflight-request-bytes` | `WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES` | `536870912` | Request-body bytes held across all in-flight requests (512 MiB; at least `--max-request-bytes`, at most 4294967295; `0` disables; see [Request size](#request-size)). |
@@ -246,9 +239,11 @@ socket, so a peer black-holed past the deadline is dropped where stock TCP
 might have recovered), and a connection-lifetime cap
 (`--max-connection-duration`) closes any connection, keep-alive sessions
 included, that outlives it, catching a client that trickles reads too slowly
-to be worth a slot but fast enough to defeat the transport guard. The cap
-closes abruptly: an exchange in flight on a long-lived keep-alive session is
-cut off at the cap, so size it well above the longest legitimate transfer.
+to be worth a slot but fast enough to defeat the transport guard. At the cap
+the connection stops taking new requests: an idle keep-alive session closes
+at once, and an exchange in flight gets the whole-request deadline above to
+finish before the connection is closed, so a response still streaming then
+is cut off; size the cap well above the longest legitimate transfer.
 It must be at least the gateway's single-request bound
 (`--header-read-timeout` + the whole-request deadline above, plus one more
 `--header-read-timeout` for the PROXY header with `--proxy-protocol`) so the
@@ -586,9 +581,10 @@ That bound assumes the worker runs with its default `--rpc.pending-block none`, 
 - `GET /ready/any`: read availability, `200` when the gateway can serve any route, else `503`.
   It answers `200` when `/ready` would, or when `--redirect-queries` is set and the gateway's probes find the query URL up (see [Query redirect](#query-redirect)); without `--redirect-queries` it is exactly `/ready`.
   The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports and `queries` whether the query URL is up.
-- everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
-  with `--redirect-queries`, to the query URL unless it is a submission or one
-  of the [reads kept on the worker](#reads-kept-on-the-worker).
+- `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker, or, with `--redirect-queries`, to the query URL unless it is a submission or one of the [reads kept on the worker](#reads-kept-on-the-worker).
+  The path is not forwarded, so `POST /` and `POST /anything` are the same call.
+- Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
+  On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
 
 The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
@@ -599,11 +595,14 @@ Point orchestrator probes at it, and keep it reachable from the orchestrator onl
 
 ## Behaviour on failure
 
-Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
-connection reset) when the gateway cannot serve them. The request `id` is
-echoed when it can be recovered. A connection over `--max-connections-per-ip`
-is the exception: it is closed before any request is read (see
-[Connection handling](#connection-handling)).
+Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare connection reset) when the gateway cannot serve them.
+The error carries the HTTP status in the table below and a JSON-RPC error object as its body (`Content-Type: application/json`); there is no option to answer gateway errors with `200`.
+A client library that treats every non-`2xx` status as a transport failure reports these as HTTP errors, so read the body whatever the status.
+The request `id` is echoed when it can be recovered from the body.
+It is `null` for a batch (see below), and always `null` on a `405`, `408`, `413`, `429`, the `503` for an exhausted byte budget (`-32010`) or the `400` for an unreadable body, which the gateway answers without recovering the id.
+
+The exceptions are a request whose head hyper, the HTTP library underneath, cannot parse (below), a connection that does not finish its request head within `--header-read-timeout` (closed without a response), a connection over `--max-connections-per-ip`, which is closed before any request is read, and an exchange still running when the connection-lifetime grace or `--graceful-shutdown-timeout` ends (see [Connection handling](#connection-handling) and [Graceful shutdown](#graceful-shutdown)).
+Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |
@@ -618,6 +617,7 @@ is the exception: it is closed before any request is read (see
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
 | Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` |
+| Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` |
 | In-flight cap reached (overloaded) | `503` | `-32009` |
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Upstream answered an error status without a JSON body | the upstream's | `-32012` |
@@ -639,10 +639,26 @@ and counts it as `result="body_failed"` in
 `tn_worker_gateway_routed_requests_total`.
 The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32001`, and the forward counts as `body_failed` only, without a `forwarded`.
 
+The `408` message says whether the request may have been delivered.
+"request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
+"request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
+An upstream's own `408` is not rewritten; the client gets it with the upstream's status and body.
+Nor does the deadline cut a request whose upstream has already answered: the client gets that answer.
+
+A `504`, and a `502`, do not mean the request was not delivered: the gateway may already have sent it when the upstream timed out or the connection failed.
+With the default timeouts a slow worker produces the `504`, not the `408`.
+Treat either like the second `408` message and look a submission up by hash before sending it again.
+
+A gateway error answering a batch (a JSON array) is one error object with `id: null`, not an array of per-call errors.
+The gateway refuses a batch only as a whole: it never splits one, and it decides a `405` or `429` before reading the body.
+That is the shape JSON-RPC 2.0 prescribes when a batch cannot be taken as a whole (invalid JSON or an empty array).
+A batch the upstream answers comes back as the upstream sent it.
+
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
 disambiguate by HTTP status and message, not by code alone (`-32600` is the
-spec's standard "Invalid Request" code).
+spec's standard "Invalid Request" code, used for both the unreadable-body
+`400` and the `405`).
 
 ## Graceful shutdown
 
@@ -671,7 +687,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency, up to the end of the response body. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`, and a worker's answer to a submission that was lost while the gateway read it whole, without one (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`, and a worker's answer to a submission that was lost while the gateway read it whole, without one (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls (an element that is not a call object counts as another call). |
 | `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
@@ -681,6 +697,9 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
+A request to `/health`, `/ready` or `/ready/any` with a method other than
+`GET` or `HEAD` is refused with the `405`, counted as a `method_not_post`
+rejection, and is not rate-limited.
 `tn_worker_gateway_connections_refused_total` is the exception: it counts connections before any request is read, so a probe connection to the client listener refused at the per-client cap is counted with the rest (the `--probe-addr` listener has no per-client cap).
 
 Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
@@ -693,7 +712,7 @@ then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
 by a line that names its call site (`site`) and the count it suppressed. The
 counters above still count every request, including the rejections that log
-nothing per request (`429`, `408`, `-32010` and an aborted body). The scrape also
+nothing per request (`405`, `429`, `408`, `-32010` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.

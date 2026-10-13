@@ -1,31 +1,33 @@
 //! JSON-RPC reverse-proxy handler.
 //!
-//! Forwards a client request's method, JSON-RPC body, and content type to the
+//! Forwards a client's `POST` (its JSON-RPC body and content type) to the
 //! first ready upstream worker and returns the upstream's status, body, and
-//! content type. Other headers are not forwarded in either direction, with
-//! three deliberate additions on the upstream hop: `X-Forwarded-For` /
-//! `X-Forwarded-Proto` (client identity for worker-side logs and the PR3 rate
-//! limits) and the `X-TN-Gateway` hop marker (loop protection; an inbound
-//! request that already carries it is rejected instead of forwarded). The two
-//! identity headers are built from the client the gateway resolved, never
-//! copied from the request: `X-Forwarded-For` names the peer, or the forwarded
-//! client and then the trusted proxy that vouched for it, and
-//! `X-Forwarded-Proto` is `http` unless a trusted proxy reported `https` (see
-//! [`crate::identity`]). The upstream response body is streamed through, never
-//! buffered whole, except the small answer to a submission whose hash the
-//! gateway would remember (see [`submission_accepted`]). When no upstream is
-//! ready, or the upstream cannot be reached / times out, the client receives a
-//! well-formed JSON-RPC error instead (see [`crate::error`]). So does a client
-//! whose upstream answers an error status without a JSON body (a worker's
-//! `429` text/plain, say): it keeps the upstream's status, with a JSON-RPC
-//! error in place of the body.
+//! content type; a request with any other method is answered locally with a
+//! `405` error envelope before its body is read. Other headers are not
+//! forwarded in either direction, with three deliberate additions on the
+//! upstream hop: `X-Forwarded-For` / `X-Forwarded-Proto` (client identity for
+//! worker-side logs and the PR3 rate limits) and the `X-TN-Gateway` hop
+//! marker (loop protection; an inbound request that already carries it is
+//! rejected instead of forwarded). The two identity headers are built from the
+//! client the gateway resolved, never copied from the request:
+//! `X-Forwarded-For` names the peer, or the forwarded client and then the
+//! trusted proxy that vouched for it, and `X-Forwarded-Proto` is `http` unless
+//! a trusted proxy reported `https` (see [`crate::identity`]). The upstream
+//! response body is streamed through, never buffered whole, except the small
+//! answer to a submission whose hash the gateway would remember (see
+//! [`submission_accepted`]). When no upstream is ready, or the upstream cannot
+//! be reached / times out, the client receives a well-formed JSON-RPC error
+//! instead (see [`crate::error`]). So does a client whose upstream answers an
+//! error status without a JSON body (a worker's `429` text/plain, say): it
+//! keeps the upstream's status, with a JSON-RPC error in place of the body.
 //!
 //! With `--redirect-queries` set, transaction submissions go to the worker,
 //! and so do the few single reads only its pool can answer: a nonce at the
 //! `pending` tag, and a lookup of a submission this gateway forwarded recently
 //! (see [`scan`] and [`PoolRead`]). Every other call goes to the query
-//! upstream, which is not readiness-gated, never falls back to the worker, and
-//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! upstream, which is not readiness-gated, never falls back to the worker,
+//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, and has
+//! its response content type passed through only when it is JSON.
 //!
 //! Every request is classified, redirect or not: a submission counts against
 //! `--max-inflight-submissions` and everything else against
@@ -41,7 +43,10 @@ use std::{
     marker::PhantomData,
     num::NonZeroUsize,
     pin::Pin,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    },
     task::{Context, Poll},
     time::Duration,
 };
@@ -50,9 +55,9 @@ use axum::{
     body::{Body, Bytes, HttpBody as _},
     extract::{
         rejection::{BytesRejection, FailedToBufferBody},
-        FromRequest as _, Request, State,
+        FromRequest as _, FromRequestParts, Request, State,
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
+    http::{header, request::Parts, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
     Extension, RequestExt as _,
 };
@@ -218,6 +223,10 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
 /// any response resets the count. A timeout after the request was sent does
 /// not count, since the method and params decide how long the worker takes.
 ///
+/// Only a `POST` gets this far: [`PostOnly`] answers any other method before
+/// the body is read. `forwarding_started` is the request-deadline
+/// middleware's marker (see [`ForwardingStarted`]), set here just before the
+/// request is sent upstream and again once the upstream has answered.
 /// `limiters` is present when the rate-limit layer is installed and admitted
 /// the request on its first token (see [`crate::ratelimit::rate_limit`]).
 /// `submission_budget` is present when `--rate-limit-submissions` is set and
@@ -230,7 +239,8 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     Extension(forwarding): Extension<Forwarding>,
-    method: Method,
+    _post: PostOnly,
+    forwarding_started: Option<Extension<ForwardingStarted>>,
     limiters: Option<Extension<Arc<RateLimiters>>>,
     submission_budget: Option<Extension<SubmissionBudget>>,
     mut request: Request,
@@ -420,10 +430,20 @@ pub(crate) async fn proxy(
         Route::Query => None,
     };
 
-    match forward(&state, route, method, &headers, body.clone(), upstream_url.clone(), forwarding)
-        .await
-    {
+    // from here on the upstream may receive the request, so a deadline that
+    // fires later can no longer tell the client it was not delivered
+    if let Some(Extension(forwarding_started)) = &forwarding_started {
+        forwarding_started.mark();
+    }
+
+    match forward(&state, route, &headers, body.clone(), upstream_url.clone(), forwarding).await {
         Ok(upstream) => {
+            // the upstream has answered: what is left only passes that answer
+            // on, so the request deadline no longer cuts it (see
+            // [`ForwardingStarted`])
+            if let Some(Extension(forwarding_started)) = &forwarding_started {
+                forwarding_started.mark_answered();
+            }
             // any answer, an error status included, shows that the worker's
             // rpc port is up
             if route == Route::Worker {
@@ -686,8 +706,16 @@ fn reject_body(rejection: &BytesRejection) -> Response {
     }
 }
 
-/// Forward one request to `upstream_url` and return the upstream's response
-/// with its body still unread (see [`relay`]).
+/// Answer a request whose method is not `POST` with the `405` error envelope,
+/// without reading its body or forwarding it (JSON-RPC over HTTP is `POST`
+/// only).
+pub(crate) fn reject_non_post(method: &Method) -> Response {
+    debug!(target: "gateway::proxy", %method, "rejecting non-POST request");
+    error_response(&GatewayError::NonPostMethod, b"")
+}
+
+/// Forward one request to `upstream_url` as a `POST` and return the
+/// upstream's response with its body still unread (see [`relay`]).
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
 /// [`REDIRECT_HEADER`] toward the query upstream, never both. `forwarding`
@@ -702,7 +730,6 @@ fn reject_body(rejection: &BytesRejection) -> Response {
 async fn forward(
     state: &AppState,
     route: Route,
-    method: Method,
     headers: &HeaderMap,
     body: Bytes,
     upstream_url: Url,
@@ -721,7 +748,7 @@ async fn forward(
 
     let request = state
         .http
-        .request(method, upstream_url)
+        .post(upstream_url)
         .header(header::CONTENT_TYPE, content_type)
         .header(marker, HeaderValue::from_static("1"))
         .header(X_FORWARDED_FOR, forwarding.x_forwarded_for())
@@ -748,24 +775,38 @@ fn is_non_json_error(upstream: &reqwest::Response) -> bool {
         && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
 }
 
-/// Whether a `Content-Type` names JSON: `application/json` or any `+json`
-/// subtype, compared case-insensitively with parameters ignored. A missing or
-/// unreadable header is not JSON.
+/// Whether a `Content-Type` names JSON: `application/json` or an
+/// `application/*+json` subtype, in any letter case and whatever its
+/// parameters (such as `charset`). A missing or unreadable header is not
+/// JSON, and neither is a comma-separated list.
 fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
-    content_type
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .and_then(|essence| essence.trim().split_once('/'))
-        .is_some_and(|(kind, subtype)| {
-            (kind.eq_ignore_ascii_case("application") && subtype.eq_ignore_ascii_case("json"))
-                || subtype
-                    .rsplit_once('+')
-                    .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"))
-        })
+    let Some(Ok(content_type)) = content_type.map(HeaderValue::to_str) else {
+        return false;
+    };
+    // a browser splits a Content-Type value on commas and takes the last valid
+    // type (Fetch "extract a MIME type"), so a list must never pass on the
+    // strength of its first element
+    if content_type.contains(',') {
+        return false;
+    }
+    let essence = content_type
+        .split_once(';')
+        .map_or(content_type, |(essence, _parameters)| essence)
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || essence.strip_prefix("application/").is_some_and(|subtype| subtype.ends_with("+json"))
 }
 
 /// Adapt an upstream response back into an axum response, preserving the
 /// status, body, and content type.
+///
+/// The `route` decides how far the content type is trusted: a worker's passes
+/// through as is, while the query upstream's passes only when it is JSON
+/// ([`is_json_content_type`]) and is replaced by `application/json` otherwise.
+/// The query upstream is outside the operator's control and its answer is
+/// served on the validator's origin, so it must not be able to label that
+/// answer HTML or script.
 ///
 /// The body streams through an [`UpstreamBody`], so a failure after the head
 /// has gone out is still logged and counted against `route`, and `in_flight`
@@ -779,7 +820,16 @@ fn relay(
     class_slot: telemetry::InFlightSlot,
 ) -> Response {
     let status = upstream.status();
-    let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE);
+    let content_type = match route {
+        Route::Worker => upstream_content_type.cloned(),
+        Route::Query => Some(
+            upstream_content_type
+                .filter(|content_type| is_json_content_type(Some(content_type)))
+                .cloned()
+                .unwrap_or_else(|| HeaderValue::from_static("application/json")),
+        ),
+    };
 
     // Stream the upstream body through instead of buffering it whole: response
     // sizes are client-controlled (`eth_getLogs`, `debug_*`, large batches can
@@ -798,7 +848,7 @@ fn relay(
         _in_flight: in_flight,
         _class_slot: class_slot,
     };
-    upstream_response(status, upstream_content_type, Body::from_stream(body))
+    upstream_response(status, content_type, Body::from_stream(body))
 }
 
 /// The response passed on for an upstream's answer: its status and content
@@ -946,6 +996,71 @@ fn classify_error(err: &reqwest::Error) -> GatewayError {
         GatewayError::UpstreamTimeout
     } else {
         GatewayError::UpstreamUnreachable
+    }
+}
+
+/// Extractor that admits only `POST` requests and answers any other method
+/// through [`reject_non_post`], with `Allow: POST`.
+///
+/// It reads nothing but the request head, so ahead of the body extractor it
+/// refuses a request before any of its body is read: a client cannot make the
+/// gateway buffer a body it is going to refuse anyway.
+pub(crate) struct PostOnly;
+
+impl<S: Send + Sync> FromRequestParts<S> for PostOnly {
+    type Rejection = Response;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if parts.method == Method::POST {
+            return Ok(Self);
+        }
+        // a 405 must name the methods the resource supports (rfc 9110,
+        // section 15.5.6)
+        let mut response = reject_non_post(&parts.method);
+        response.headers_mut().insert(header::ALLOW, HeaderValue::from_static("POST"));
+        Err(response)
+    }
+}
+
+/// How far [`proxy`] has got with sending a request upstream.
+///
+/// The request-deadline middleware (`crate::server::enforce_request_deadline`)
+/// puts a fresh marker in every request's extensions and reads it when the
+/// deadline fires: a request that never started forwarding cannot have reached
+/// an upstream, one that did may have, and the client is told which. Once the
+/// upstream has answered, the deadline no longer cuts the request: all that is
+/// left is passing that answer on (the worker's answer to a submission is read
+/// whole first, under the proxy client's request timeout), and cutting it then
+/// would turn an answer the upstream already gave, a transaction it accepted
+/// included, into a timeout.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ForwardingStarted(Arc<AtomicU8>);
+
+impl ForwardingStarted {
+    /// The request is about to be sent upstream.
+    const STARTED: u8 = 1;
+    /// The upstream has answered with a response head.
+    const ANSWERED: u8 = 2;
+
+    /// Record that the request is about to be sent upstream.
+    fn mark(&self) {
+        self.0.store(Self::STARTED, Ordering::Release);
+    }
+
+    /// Record that the upstream has answered.
+    fn mark_answered(&self) {
+        self.0.store(Self::ANSWERED, Ordering::Release);
+    }
+
+    /// Whether the request may have reached an upstream.
+    pub(crate) fn is_marked(&self) -> bool {
+        self.0.load(Ordering::Acquire) >= Self::STARTED
+    }
+
+    /// Whether the upstream has answered, so that only passing the answer on
+    /// is left.
+    pub(crate) fn is_answered(&self) -> bool {
+        self.0.load(Ordering::Acquire) == Self::ANSWERED
     }
 }
 
@@ -2562,7 +2677,8 @@ mod tests {
             let response = proxy(
                 State(state.clone()),
                 Extension(forwarding),
-                Method::POST,
+                PostOnly,
+                None,
                 None,
                 None,
                 Request::new(Body::from(body)),

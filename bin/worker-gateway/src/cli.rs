@@ -300,14 +300,15 @@ pub(crate) struct Cli {
     )]
     pub(crate) tcp_user_timeout: Duration,
 
-    /// Hard cap on a single inbound connection's total lifetime, keep-alive
+    /// Cap on a single inbound connection's total lifetime, keep-alive
     /// sessions included. The cap fires independent of connection progress, so
     /// it also bounds a client that trickles reads slowly enough to keep the
-    /// transport-stall guard from firing. The close is abrupt: an exchange
-    /// still in flight when a long-lived keep-alive session hits the cap is
-    /// cut off mid-stream, so size the cap well above the longest legitimate
-    /// transfer. Must be at least the gateway's own single-request bound
-    /// (`--header-read-timeout`, twice with `--proxy-protocol`, plus the
+    /// transport-stall guard from firing. At the cap the connection takes no
+    /// new requests: an idle one closes at once, and an exchange still in
+    /// flight gets the whole-request deadline to finish before the connection
+    /// is closed, so a response still streaming then is cut off; size the cap
+    /// well above the longest legitimate transfer. Must be at least the gateway's own
+    /// single-request bound (`--header-read-timeout`, twice with `--proxy-protocol`, plus the
     /// whole-request deadline `--upstream-request-timeout` +
     /// `--header-read-timeout`) so the first request on a connection can never
     /// be cut off. `0` disables.

@@ -1,9 +1,11 @@
 //! The gateway's HTTP surface: the JSON-RPC proxy plus liveness / readiness.
 //!
-//! A single server serves all three on one address: any request that is not
-//! `GET /health`, `GET /ready` or `GET /ready/any` falls through to the proxy,
-//! so JSON-RPC (`POST /`) is forwarded while orchestration probes hit the
-//! health routes.
+//! A single server serves all three on one address: `GET` (or `HEAD`) on
+//! `/health`, `/ready` and `/ready/any` are the orchestration probes, a `POST`
+//! to any other path is JSON-RPC and goes to the proxy, and every other
+//! request gets a `405` JSON-RPC error envelope without reaching an upstream.
+//! Every response the service produces carries
+//! `X-Content-Type-Options: nosniff`.
 //! With `--probe-addr` set, a second listener serves the probes alone, outside
 //! the connection cap and the rate limits, so a flood that holds every client
 //! connection cannot make them time out.
@@ -26,6 +28,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
+    pin::pin,
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
 };
@@ -33,7 +36,7 @@ use std::{
 use axum::{
     body::HttpBody as _,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -50,20 +53,23 @@ use serde::Serialize;
 use tn_types::{Noticer, TaskError, B256};
 use tokio::{
     net::{TcpListener, TcpStream},
-    sync::{OwnedSemaphorePermit, Semaphore},
+    sync::{watch, OwnedSemaphorePermit, Semaphore},
 };
-use tower_http::timeout::TimeoutLayer;
 use tracing::{debug, info, warn};
 use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
     identity::{identify, read_proxy_header, TrustedProxies},
-    proxy::{proxy, OVERSIZED_BODY_WARNINGS},
+    proxy::{proxy, reject_non_post, ForwardingStarted, OVERSIZED_BODY_WARNINGS},
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
     telemetry,
 };
+
+// the manifest still declares tower-http, but nothing in the crate uses it
+// since the request deadline moved to a middleware of its own
+use tower_http as _;
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
 /// error (e.g. fd exhaustion) cannot spin the loop hot.
@@ -76,7 +82,7 @@ pub(crate) const HEALTH_PATH: &str = "/health";
 pub(crate) const READY_PATH: &str = "/ready";
 
 /// Read-availability probe path. Never rate limited: [`router`] adds it after
-/// every layer.
+/// every layer but the `nosniff` one.
 pub(crate) const READY_ANY_PATH: &str = "/ready/any";
 
 /// Default budget of request-body bytes held across all in-flight requests
@@ -157,6 +163,8 @@ pub(crate) struct ServerLimits {
     pub(crate) header_read_timeout: Duration,
     /// Deadline for a whole request: body read plus upstream response headers.
     /// A body trickled in below the size limit must still finish inside this.
+    /// It is also the grace an exchange in flight gets to finish once its
+    /// connection reaches the lifetime cap.
     pub(crate) request_deadline: Duration,
     /// Maximum concurrently-open inbound connections; further connections wait
     /// in the OS accept backlog.
@@ -180,8 +188,10 @@ pub(crate) struct ServerLimits {
     /// included), or `None` when uncapped. Enforced by the runtime independent
     /// of connection progress, so it fires even when hyper's write path is
     /// backpressured by a slow-reading client and no future the connection
-    /// owns is being polled forward. The close is abrupt: an exchange still
-    /// in flight when a keep-alive session hits the cap is cut off mid-stream.
+    /// owns is being polled forward. At the cap the connection stops taking
+    /// new requests, and an exchange still in flight gets
+    /// [`Self::request_deadline`] more to finish before the connection is
+    /// closed.
     pub(crate) max_connection_duration: Option<Duration>,
     /// Maximum accepted request body size, in bytes.
     pub(crate) max_request_bytes: usize,
@@ -440,32 +450,40 @@ impl Drop for ClientSlot {
 
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
-/// `request_deadline` bounds each whole request; the bare `408` the timeout
-/// layer produces is rewritten into the gateway's JSON-RPC error envelope so
-/// the "always a well-formed JSON-RPC error" contract holds. Streamed
-/// *response* bodies are written after the handler returns, outside this
-/// deadline; they are bounded by the accept loop's transport-stall deadline
-/// and connection-lifetime cap (the upstream client's total timeout is only
-/// checked when the body is polled, which a slow-reading client can prevent;
-/// see [`accept_loop`]). `max_request_bytes` caps the buffered request body.
+/// `request_deadline` bounds each whole request, and an overrun is answered
+/// with the gateway's own `408` JSON-RPC error envelope (see
+/// [`enforce_request_deadline`]); a `408` from an upstream passes through
+/// untouched. Streamed *response* bodies are written after the handler
+/// returns, outside this deadline; they are bounded by the accept loop's
+/// transport-stall deadline and connection-lifetime cap (the upstream
+/// client's total timeout is only checked when the body is polled, which a
+/// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
+/// caps the buffered request body.
 ///
 /// `max_inflight_request_bytes` budgets the body bytes held across all
 /// in-flight requests (see [`reserve_request_bytes`]); `None` leaves the total
 /// unbounded, though a declared `Content-Length` over `max_request_bytes` is
 /// still refused before the body is read.
 ///
-/// When `rate_limiters` is present it is installed outside every other layer
-/// but one, so an over-limit request is shed with a JSON-RPC `429` before its
-/// body is buffered or forwarded, and before it reserves any of the byte
-/// budget. The one layer outside it is the identity middleware
-/// ([`identify`]), which resolves the client address the rate limiter keys on
-/// and the proxy forwards, believing `X-Forwarded-For` only from a peer in
-/// `trusted_proxies`.
+/// The probe paths answer `GET` and `HEAD`; any other method on them, `POST`
+/// included, gets the same `405` envelope as a non-`POST` request anywhere
+/// else, with axum's `Allow: GET,HEAD` in place of the proxy's `Allow: POST`.
+/// A `POST` to a probe path is not proxied because the rate limiter exempts
+/// those paths, so proxying it would let JSON-RPC skip the limits.
 ///
-/// `/ready/any` is added after every layer, the identity layer included, so it
-/// answers from memory with none of them applied: it is never rate limited,
-/// metered, charged against the byte budget or deadline-bound, like `/health`
-/// and `/ready`.
+/// When `rate_limiters` is present it is installed outside every other layer
+/// but two, so an over-limit request is shed with a JSON-RPC `429` before its
+/// body is buffered or forwarded, and before it reserves any of the byte
+/// budget. Outside it are the identity middleware ([`identify`]), which
+/// resolves the client address the rate limiter keys on and the proxy
+/// forwards, believing `X-Forwarded-For` only from a peer in
+/// `trusted_proxies`, and, outermost, the `nosniff` layer ([`set_nosniff`]),
+/// so every response the service produces carries it, that `429` included.
+///
+/// `/ready/any` is added after every layer but the `nosniff` one, the identity
+/// layer included, so it answers from memory with none of them applied: it is
+/// never rate limited, metered, charged against the byte budget or
+/// deadline-bound, like `/health` and `/ready`.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -479,10 +497,10 @@ pub(crate) fn router(
     let router = Router::new()
         .route(HEALTH_PATH, get(liveness))
         .route(READY_PATH, get(readiness))
+        .method_not_allowed_fallback(probe_method_not_allowed)
         .fallback(proxy)
         .layer(DefaultBodyLimit::max(max_request_bytes))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, request_deadline))
-        .layer(map_response(envelope_request_timeout))
+        .layer(from_fn_with_state(request_deadline, enforce_request_deadline))
         // inside the rate limit, so a rate-limited request costs no budget, and
         // outside the body read and the request deadline, so a refused request
         // is answered without reading its body
@@ -498,25 +516,63 @@ pub(crate) fn router(
     let router = router.layer(from_fn_with_state(trusted_proxies, identify));
     // a layer wraps only the routes added before it, so this probe, like
     // `/health` and `/ready` (exempt in `crate::ratelimit`), is never rate
-    // limited; it stays the last route added, outside every layer
-    router.route(READY_ANY_PATH, get(ready_any)).with_state(state)
+    // limited; it stays the last route added, outside every layer but the
+    // `nosniff` one, and refuses other methods like the two probes above
+    router
+        .route(READY_ANY_PATH, get(ready_any).fallback(probe_method_not_allowed))
+        // Outermost, so every response the service produces carries it, the
+        // identity and rate-limit layers' included.
+        .layer(map_response(set_nosniff))
+        .with_state(state)
 }
 
-/// Rewrite the timeout layer's bare `408` into the gateway's JSON-RPC error
-/// envelope. The request `id` is unrecoverable here (the body never finished
-/// arriving), so it echoes as `null`, per spec.
-///
-/// The timeout layer's response is the only `408` without a `Content-Type`:
-/// every response the proxy returns carries one (the gateway's own envelope,
-/// or an upstream answer relayed because its body is JSON), so an upstream's
-/// own `408` reaches the client as the proxy shaped it and is counted once.
-async fn envelope_request_timeout(response: Response) -> Response {
-    if response.status() == StatusCode::REQUEST_TIMEOUT
-        && !response.headers().contains_key(header::CONTENT_TYPE)
-    {
-        return error_response(&GatewayError::RequestTimeout, b"");
-    }
+/// Mark a response `X-Content-Type-Options: nosniff`, so a browser takes its
+/// `Content-Type` as given and never sniffs a body served on the validator's
+/// origin into HTML or script.
+async fn set_nosniff(mut response: Response) -> Response {
     response
+        .headers_mut()
+        .insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    response
+}
+
+/// Answer a probe path requested with a method other than `GET` or `HEAD`.
+async fn probe_method_not_allowed(method: Method) -> Response {
+    reject_non_post(&method)
+}
+
+/// Bound a whole request by `deadline`, answering an overrun with the
+/// gateway's `408` JSON-RPC error envelope.
+///
+/// Only an overrun of this deadline produces the envelope; the response of a
+/// request that finishes in time, an upstream's own `408` included, passes
+/// through unchanged. The request `id` is not recovered (the body may never
+/// have finished arriving), so it echoes as `null`, per spec. The message
+/// says whether the request may have reached an upstream, from the
+/// [`ForwardingStarted`] marker the proxy sets just before it forwards.
+///
+/// A request whose upstream has already answered when the deadline passes is
+/// not cut: the proxy is only passing that answer on (it reads the worker's
+/// answer to a submission whole, under the proxy client's request timeout),
+/// and cutting it would report an answer the upstream already gave, a
+/// transaction it accepted included, as a timeout. It finishes and the proxy
+/// counts it, once.
+async fn enforce_request_deadline(
+    State(deadline): State<Duration>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let forwarding = ForwardingStarted::default();
+    request.extensions_mut().insert(forwarding.clone());
+    let mut response = pin!(next.run(request));
+    match tokio::time::timeout(deadline, response.as_mut()).await {
+        Ok(response) => response,
+        Err(_elapsed) if forwarding.is_answered() => response.await,
+        Err(_elapsed) => error_response(
+            &GatewayError::RequestTimeout { forwarding_started: forwarding.is_marked() },
+            b"",
+        ),
+    }
 }
 
 /// Reserve a request's body bytes against the in-flight budget before the body
@@ -531,14 +587,16 @@ async fn envelope_request_timeout(response: Response) -> Response {
 /// the proxy has the upstream's response head; the buffered body is dropped by
 /// then. It cannot ride in the request extensions instead: the proxy drops the
 /// request's parts before it reads the body. Probes are exempt, as they are
-/// from rate limiting.
+/// from rate limiting, and so is a request that is not a `POST`: it is refused
+/// with the `405` before its body is read (see [`crate::proxy::PostOnly`]), so
+/// it holds no bytes, and its `405` is not masked by a `413` or a `503`.
 async fn reserve_request_bytes(
     State(budget): State<Arc<RequestByteBudget>>,
     request: Request,
     next: Next,
 ) -> Response {
     let path = request.uri().path();
-    if path == HEALTH_PATH || path == READY_PATH {
+    if request.method() != Method::POST || path == HEALTH_PATH || path == READY_PATH {
         return next.run(request).await;
     }
     let held = match budget.reserve(request.body().size_hint().exact()) {
@@ -659,6 +717,12 @@ pub(crate) async fn serve(
 /// in `trusted_proxies` is not counted: `X-Forwarded-For` attributes its
 /// requests to clients one at a time, and counting the front would put every
 /// client behind it under one cap.
+///
+/// Neither the cap nor shutdown cuts a request off mid-exchange: either one
+/// asks the connection to take no further requests and close once the
+/// exchange in flight (if any) finishes, and only drops it if that takes
+/// longer than a grace of `request_deadline` after the cap or
+/// `graceful_timeout` at shutdown.
 async fn accept_loop(
     listener: TcpListener,
     app: Router,
@@ -679,7 +743,11 @@ async fn accept_loop(
     // validation enforces; the clamp keeps that panic unreachable.
     connection_builder.max_buf_size(limits.http1_max_buf_size.max(HTTP1_MIN_BUF_SIZE));
 
-    let graceful = GracefulShutdown::new();
+    // Shutdown fan-out: every connection task holds a receiver, watches it
+    // for the drain signal, and drops it when its connection ends, so the
+    // sender's `closed()` resolves once every connection has finished.
+    let (drain, _) = watch::channel(());
+    let request_deadline = limits.request_deadline;
     let limiter =
         Arc::new(Semaphore::new(limits.max_connections.get().min(Semaphore::MAX_PERMITS)));
     let client_connections = limits
@@ -734,15 +802,41 @@ async fn accept_loop(
         let connection_builder = connection_builder.clone();
         let client_connections = client_connections.clone();
         let trusted_proxies = Arc::clone(&trusted_proxies);
+        // The lifetime cap is a runtime timer, deliberately NOT a timeout on
+        // any body future: the runtime polls it regardless of whether hyper's
+        // backpressured write path ever polls the connection forward again.
+        // Constructed here (not inside the task) so the deadline counts from
+        // accept even if the spawned task's first poll is delayed. `None` caps
+        // nothing (a never-ready future).
+        let lifetime_cap = limits.max_connection_duration.map_or_else(
+            || Either::Left(future::pending::<()>()),
+            |cap| Either::Right(tokio::time::sleep(cap)),
+        );
         // Taken at accept, so a shutdown that starts while a PROXY header is
-        // still arriving waits for this connection too.
-        let watcher = graceful.watcher();
+        // still arriving waits for this connection too. The future below owns
+        // it and drops it when the connection ends.
+        let mut draining = drain.subscribe();
         let connection = async move {
+            let mut lifetime_cap = pin!(lifetime_cap);
             let client_addr = match proxy_header_deadline {
-                Some(deadline) => match proxy_source(&mut stream, peer_addr, deadline).await {
-                    Some(source) => source,
-                    None => return,
-                },
+                Some(deadline) => {
+                    let source = tokio::select! {
+                        biased;
+                        source = proxy_source(&mut stream, peer_addr, deadline) => source,
+                        () = lifetime_cap.as_mut() => {
+                            debug!(
+                                target: "gateway::server",
+                                %peer_addr,
+                                "connection exceeded max lifetime; closing"
+                            );
+                            None
+                        }
+                    };
+                    match source {
+                        Some(source) => source,
+                        None => return,
+                    }
+                }
                 None => peer_addr,
             };
             // Per-client cap, keyed on the resolved client and taken before
@@ -778,47 +872,65 @@ async fn accept_loop(
             // (`ConnectInfo`): the peer, or the source its PROXY header named.
             // It resolves the client the rate limiter and the proxy use.
             let service = TowerToHyperService::new(app.layer(Extension(ConnectInfo(client_addr))));
-            let served =
-                watcher.watch(connection_builder.serve_connection(TokioIo::new(stream), service));
-            if let Err(err) = served.await {
-                debug!(target: "gateway::server", %err, "connection error");
-            }
-        };
-        // The lifetime cap is a runtime timer, deliberately NOT a timeout on
-        // any body future: the runtime polls it regardless of whether hyper's
-        // backpressured write path ever polls the connection forward again.
-        // Constructed here (not inside the task) so the deadline counts from
-        // accept even if the spawned task's first poll is delayed. `None` caps
-        // nothing (a never-ready future).
-        let lifetime_cap = limits.max_connection_duration.map_or_else(
-            || Either::Left(future::pending::<()>()),
-            |cap| Either::Right(tokio::time::sleep(cap)),
-        );
-        tokio::spawn(async move {
+            let mut connection =
+                pin!(connection_builder.serve_connection(TokioIo::new(stream), service));
             // `biased` so a connection that finishes in the same poll as the
             // cap expires is reported as what it was (completion or its real
             // error), never mislabeled as cap-killed.
-            tokio::select! {
+            let grace = tokio::select! {
                 biased;
-                () = connection => {}
+                result = connection.as_mut() => {
+                    if let Err(err) = result {
+                        debug!(target: "gateway::server", %err, "connection error");
+                    }
+                    None
+                }
                 () = lifetime_cap => {
                     debug!(
                         target: "gateway::server",
                         %peer_addr,
                         "connection exceeded max lifetime; closing"
                     );
+                    Some(request_deadline)
+                }
+                // an error means the accept loop has returned, which it only
+                // does after shutdown, so both outcomes mean "drain"
+                _ = draining.changed() => Some(graceful_timeout),
+            };
+            // Take no further requests: hyper closes an idle connection at
+            // once and lets the exchange in flight finish first. The grace
+            // bounds that exchange, so a client that stops reading cannot
+            // hold the connection past it.
+            if let Some(grace) = grace {
+                connection.as_mut().graceful_shutdown();
+                match tokio::time::timeout(grace, connection).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => debug!(target: "gateway::server", %err, "connection error"),
+                    Err(_elapsed) => debug!(
+                        target: "gateway::server",
+                        %peer_addr,
+                        ?grace,
+                        "connection did not finish within its grace; closing"
+                    ),
                 }
             }
+        };
+        tokio::spawn(async move {
+            // the connection future drops its client slot and its drain
+            // receiver as it ends, before the global permit goes back
+            connection.await;
             drop(permit);
         });
     }
 
-    // Stop accepting (drop the listener), then drain in-flight connections
-    // until they finish or the graceful deadline elapses.
+    // Stop accepting (drop the listener), ask every connection to finish its
+    // current exchange and close, then wait until they all have or the
+    // graceful deadline elapses.
     drop(listener);
     info!(target: "gateway::server", "shutdown signal received; draining in-flight requests");
+    drain.send_replace(());
     tokio::select! {
-        () = graceful.shutdown() => {
+        () = drain.closed() => {
             info!(target: "gateway::server", "in-flight requests drained");
         }
         () = tokio::time::sleep(graceful_timeout) => {
@@ -1162,19 +1274,24 @@ mod tests {
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
-        let response = Client::new()
-            .post(format!("http://{gateway_addr}/"))
-            .header("content-type", "application/json")
-            .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
-            .send()
-            .await
-            .expect("send");
+        // the gateway does not forward the path, so the mock's `/` route
+        // answers a POST to any path
+        for path in ["/", "/anything"] {
+            let response = Client::new()
+                .post(format!("http://{gateway_addr}{path}"))
+                .header("content-type", "application/json")
+                .body(r#"{"jsonrpc":"2.0","method":"eth_chainId","id":1}"#)
+                .send()
+                .await
+                .expect("send");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.text().await.expect("text"),
-            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
-        );
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                response.text().await.expect("text"),
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#,
+                "{path}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1339,6 +1456,10 @@ mod tests {
             .expect("send");
 
         assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+            Some(&HeaderValue::from_static("nosniff"))
+        );
         let body: serde_json::Value = response.json().await.expect("json");
         assert_eq!(body["error"]["code"], -32003);
     }
@@ -1442,7 +1563,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_body_gets_enveloped_timeout() {
+    async fn gateway_408_before_forwarding_says_not_delivered() {
         let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
         state.readiness.set_ready(0, true);
         // Short whole-request deadline; generous header timeout so only the
@@ -1476,7 +1597,89 @@ mod tests {
             .expect("read");
         let response = String::from_utf8_lossy(&response);
         assert!(response.starts_with("HTTP/1.1 408"), "expected 408, got: {response}");
-        assert!(response.contains("-32005"), "expected enveloped timeout code, got: {response}");
+        let (head, body) = response.split_once("\r\n\r\n").expect("response head and body");
+        assert!(
+            head.to_ascii_lowercase().contains("\r\nx-content-type-options: nosniff"),
+            "gateway 408 must carry nosniff: {head}"
+        );
+        let body: serde_json::Value = serde_json::from_str(body).expect("json error body");
+        assert_eq!(body["error"]["code"], -32005);
+        // the body never finished arriving, so nothing was forwarded and the
+        // message must not hedge about delivery
+        assert_eq!(
+            body["error"]["message"],
+            "request did not complete within the gateway's deadline"
+        );
+        assert_eq!(body["id"], serde_json::Value::Null);
+    }
+
+    #[tokio::test]
+    async fn gateway_408_after_forwarding_says_delivery_unknown() {
+        // A worker slower than the whole-request deadline: the request reaches
+        // it, then the deadline fires while the gateway waits for the answer.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                "late"
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        // the forwarding client has no timeout of its own, so only the
+        // gateway's deadline can end the request
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(router(
+            state,
+            Duration::from_millis(300),
+            MAX_REQUEST_BYTES,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 3)).await;
+        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+        assert_eq!(body["error"]["code"], -32005);
+        assert_eq!(
+            body["error"]["message"],
+            "request did not complete within the gateway's deadline; the request may have \
+             reached the upstream"
+        );
+        assert_eq!(body["id"], serde_json::Value::Null);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "the request reached the upstream");
+    }
+
+    #[tokio::test]
+    async fn upstream_408_passes_through_unchanged() {
+        // Only the gateway's own deadline produces its 408 envelope; a 408
+        // from an upstream is relayed like any other upstream status.
+        const UPSTREAM_BODY: &str =
+            r#"{"jsonrpc":"2.0","error":{"code":-1,"message":"upstream timeout"},"id":1}"#;
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                (
+                    StatusCode::REQUEST_TIMEOUT,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    UPSTREAM_BODY,
+                )
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::REQUEST_TIMEOUT, UPSTREAM_BODY));
     }
 
     #[tokio::test]
@@ -1529,9 +1732,14 @@ mod tests {
         state.readiness.set_ready(0, true);
         // The cap is generous enough that the response head always arrives
         // inside it, even on a loaded CI host where the whole 3-hop round
-        // trip shares one test runtime.
-        let limits =
-            ServerLimits { max_connection_duration: Some(Duration::from_secs(2)), ..test_limits() };
+        // trip shares one test runtime. The exchange in flight gets the
+        // limits' request deadline as its grace past the cap, kept short here
+        // so the test can wait out both.
+        let limits = ServerLimits {
+            max_connection_duration: Some(Duration::from_secs(2)),
+            request_deadline: Duration::from_millis(500),
+            ..test_limits()
+        };
         let (gateway_addr, _shutdown) = spawn_with_limits(test_router(state), limits).await;
 
         let mut stream = TcpStream::connect(gateway_addr).await.expect("connect");
@@ -1544,19 +1752,19 @@ mod tests {
             .expect("write");
 
         // Read one chunk (the response head plus some body), then stall past
-        // the lifetime cap without reading further.
+        // the lifetime cap and its grace without reading further.
         let mut first = [0_u8; 4096];
         let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut first))
             .await
             .expect("response head should arrive well inside the lifetime cap")
             .expect("first read");
         assert!(read > 0, "expected the response head to arrive");
-        tokio::time::sleep(Duration::from_millis(2_500)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
-        // Drain what the socket still holds. The cap closed the connection
-        // mid-body, so the drain must end (EOF or reset both count) well short
-        // of the full body; pre-fix the stream resumes here and delivers all
-        // of it.
+        // Drain what the socket still holds. The grace ran out with the body
+        // still stalled, so the connection was closed mid-body and the drain
+        // must end (EOF or reset both count) well short of the full body;
+        // without the cap the stream resumes here and delivers all of it.
         let mut rest = Vec::new();
         let drained = tokio::time::timeout(Duration::from_secs(10), stream.read_to_end(&mut rest))
             .await
@@ -1567,6 +1775,116 @@ mod tests {
             "expected a truncated body, got all {} bytes",
             read + rest.len(),
         );
+    }
+
+    #[tokio::test]
+    async fn lifetime_cap_lets_the_inflight_request_finish() {
+        // A worker that answers 150ms after it is asked, and counts the asks.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+        let limits = ServerLimits {
+            max_connection_duration: Some(Duration::from_millis(300)),
+            ..test_limits()
+        };
+        let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
+
+        let body = call("eth_chainId", 1);
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+
+        // The request starts at 250ms, inside the 300ms cap, and its answer
+        // comes at about 400ms, past it.
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        stream.write_all(request.as_bytes()).await.expect("write");
+
+        // The exchange in flight finishes, then the connection closes.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+            .await
+            .expect("the connection should close once the exchange in flight finishes")
+            .expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+        assert!(response.contains(r#""result":"0x1""#), "expected the worker's answer: {response}");
+
+        // The next request on that connection fails: nothing answers it and
+        // it never reaches the worker.
+        let written = stream.write_all(request.as_bytes()).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut rest))
+            .await
+            .expect("a closed connection answers at once");
+        assert!(
+            written.is_err() || read.is_err() || rest.is_empty(),
+            "a second request was answered: {}",
+            String::from_utf8_lossy(&rest)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_inflight_request() {
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+            }),
+        );
+        let (upstream_addr, _mock) = spawn(mock).await;
+        let state = test_state(&[upstream(upstream_addr)]);
+        state.readiness.set_ready(0, true);
+
+        // A drain deadline far past the test's bounds, so the accept loop can
+        // only return in time by seeing every connection finish.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let server = tokio::spawn(accept_loop(
+            listener,
+            test_router(state),
+            test_limits(),
+            Arc::default(),
+            Duration::from_secs(30),
+            shutdown.subscribe(),
+        ));
+
+        let request = tokio::spawn(
+            Client::new().post(format!("http://{addr}/")).body(call("eth_chainId", 1)).send(),
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.notify();
+
+        // The request in flight when shutdown began still gets its answer.
+        let response = request.await.expect("join").expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.text().await.expect("text"),
+            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+        );
+
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the drain should end as soon as the last connection closes")
+            .expect("join")
+            .expect("accept loop");
+        assert!(TcpStream::connect(addr).await.is_err(), "the listener should be closed");
     }
 
     #[tokio::test]
@@ -6051,5 +6369,290 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
             assert!(response.contains("198.51.100.2|http"), "{response}");
         }
+    }
+
+    #[tokio::test]
+    async fn non_post_requests_get_a_405_envelope() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // Every body below is over this 8-byte limit, so a 405 rather than a
+        // 413 shows the method is checked before the body is read.
+        let (gateway, _shutdown) =
+            spawn(router(state, Duration::from_secs(5), 8, None, None, Arc::default())).await;
+
+        let client = Client::new();
+        // a POST to a probe path is refused too: the rate limiter exempts
+        // those paths, so it must not reach the proxy
+        for (method, path, allow) in [
+            (Method::GET, "/", "POST"),
+            (Method::PUT, "/", "POST"),
+            (Method::DELETE, "/x", "POST"),
+            (Method::PUT, "/health", "GET,HEAD"),
+            (Method::POST, "/ready", "GET,HEAD"),
+        ] {
+            let response = client
+                .request(method.clone(), format!("http://{gateway}{path}"))
+                .body(call("eth_chainId", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+            assert_eq!(
+                response.headers().get(header::ALLOW),
+                Some(&HeaderValue::from_static(allow)),
+                "{method} {path}"
+            );
+            let body: serde_json::Value = response.json().await.expect("json error body");
+            assert_eq!(body["error"]["code"], -32600, "{method} {path}");
+            assert_eq!(body["error"]["message"], "only POST is accepted", "{method} {path}");
+            assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a non-POST request must never reach the upstream");
+
+        // the probes still answer GET
+        let response = client.get(format!("http://{gateway}/health")).send().await.expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// A query upstream that answers every POST with an HTML page labelled
+    /// `content_type` (no `Content-Type` at all when `None`).
+    async fn labelled_query_mock(content_type: Option<&'static str>) -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                let mut response =
+                    Response::new(axum::body::Body::from("<html><script>alert(1)</script></html>"));
+                if let Some(content_type) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+                }
+                response
+            }),
+        );
+        spawn(mock).await
+    }
+
+    /// POST a query through a gateway whose `--redirect-queries` URL answers
+    /// with `content_type`, and return the response the client gets.
+    async fn query_through_labelled_upstream(
+        content_type: Option<&'static str>,
+    ) -> reqwest::Response {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (query, _query) = labelled_query_mock(content_type).await;
+        let (gateway, _shutdown) = spawn(test_router(redirect_state(worker, Some(query)))).await;
+        Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_call", 1))
+            .send()
+            .await
+            .expect("send")
+    }
+
+    #[tokio::test]
+    async fn query_route_non_json_content_type_is_replaced() {
+        for content_type in [
+            Some("text/html; charset=utf-8"),
+            Some("text/plain"),
+            Some("image/svg+xml"),
+            Some("application/javascript"),
+            Some("application/jsonp"),
+            Some("application/json-seq"),
+            Some("text/foo+json"),
+            Some("application/json;a=b,text/html"),
+            Some("application/json;,text/html"),
+            Some("application/json, text/html"),
+            None,
+        ] {
+            let response = query_through_labelled_upstream(content_type).await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type:?}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static("application/json")),
+                "{content_type:?}"
+            );
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{content_type:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_route_json_content_type_passes_through() {
+        for content_type in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "Application/JSON",
+            "application/problem+json",
+        ] {
+            let response = query_through_labelled_upstream(Some(content_type)).await;
+            assert_eq!(response.status(), StatusCode::OK, "{content_type}");
+            assert_eq!(
+                response.headers().get(header::CONTENT_TYPE),
+                Some(&HeaderValue::from_static(content_type)),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_response_carries_nosniff() {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        // one request a second with no burst headroom, so the second POST is
+        // shed by the rate limiter, the layer just inside the nosniff one
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            None,
+            16,
+            PrefixPolicy::default(),
+        )
+        .expect("limiters");
+        let (gateway, _shutdown) = spawn(router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            None,
+            Some(limiters),
+            Arc::default(),
+        ))
+        .await;
+
+        let client = Client::new();
+        let url = |path: &str| format!("http://{gateway}{path}");
+        let cases = [
+            ("proxied", client.post(url("/")).body(call("eth_chainId", 1)), StatusCode::OK),
+            (
+                "rate limited",
+                client.post(url("/")).body(call("eth_chainId", 2)),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            ("liveness", client.get(url("/health")), StatusCode::OK),
+            ("readiness", client.get(url("/ready")), StatusCode::OK),
+            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
+        ];
+        for (case, request, status) in cases {
+            let response = request.send().await.expect("send");
+            assert_eq!(response.status(), status, "{case}");
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{case}"
+            );
+        }
+    }
+
+    /// `/ready/any` sits outside the router's other layers but answers like
+    /// the other probes: `nosniff` on every answer, and the `405` envelope
+    /// with `Allow: GET,HEAD` for any method but `GET` and `HEAD`, `POST`
+    /// included, which never reaches an upstream.
+    #[tokio::test]
+    async fn ready_any_refuses_other_methods_like_the_probes() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        let url = format!("http://{gateway}{READY_ANY_PATH}");
+        let nosniff = |response: &reqwest::Response| {
+            response.headers().get(header::X_CONTENT_TYPE_OPTIONS)
+                == Some(&HeaderValue::from_static("nosniff"))
+        };
+
+        let response = Client::new().get(&url).send().await.expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(nosniff(&response), "GET");
+
+        for method in [Method::POST, Method::PUT] {
+            let response = Client::new()
+                .request(method.clone(), &url)
+                .body(call("eth_chainId", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method}");
+            assert_eq!(
+                response.headers().get(header::ALLOW),
+                Some(&HeaderValue::from_static("GET,HEAD")),
+                "{method}"
+            );
+            assert!(nosniff(&response), "{method}");
+            let body: serde_json::Value = response.json().await.expect("json error body");
+            assert_eq!(body["error"]["code"], -32600, "{method}");
+            assert_eq!(body["id"], serde_json::Value::Null, "{method}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a probe path must never reach the upstream");
+    }
+
+    /// A worker that sends each answer's head at once and its body, `ACCEPTED`,
+    /// `delay` later.
+    async fn slow_body_mock(delay: Duration) -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                tokio::spawn(async move {
+                    read_request(&mut stream).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\n\r\n",
+                        ACCEPTED.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.expect("write head");
+                    tokio::time::sleep(delay).await;
+                    stream.write_all(ACCEPTED.as_bytes()).await.expect("write body");
+                });
+            }
+        });
+        addr
+    }
+
+    /// The request deadline cuts a request only until its upstream answers:
+    /// once the head is in, the answer reaches the client whether it streams
+    /// through or is read whole first (a submission whose hash is remembered),
+    /// and the forward counts once, as `forwarded`, with no `request_timeout`.
+    #[tokio::test]
+    async fn deadline_after_the_answer_head_keeps_the_answer() {
+        let mut metrics = CapturedMetrics::install();
+        let state = redirect_state(slow_body_mock(Duration::from_millis(600)).await, None);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(router(
+            state,
+            Duration::from_millis(300),
+            MAX_REQUEST_BYTES,
+            None,
+            None,
+            Arc::default(),
+        ))
+        .await;
+
+        // read whole inside the handler, past the deadline
+        let (status, text) = post_rpc(gateway, None, submission(1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, ACCEPTED));
+        assert!(recent.contains(&submitted_hash()), "the accepted submission is remembered");
+        // streamed after the handler returned
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, ACCEPTED));
+
+        let forwarded = vec![
+            ("result".to_string(), "forwarded".to_string()),
+            ("route".to_string(), "worker".to_string()),
+        ];
+        assert_eq!(
+            metrics.series("tn_worker_gateway_routed_requests_total"),
+            vec![(forwarded, 2.0)]
+        );
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 2.0);
+        assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 0.0);
+        assert_eq!(
+            metrics.value("tn_worker_gateway_rejections_total", &[("reason", "request_timeout")]),
+            0.0
+        );
     }
 }

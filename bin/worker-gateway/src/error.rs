@@ -57,8 +57,9 @@ mod code {
     /// The upstream answered with an error status and a body that is not
     /// JSON (a worker's `429` text/plain, for example).
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
-    /// The request body could not be read. This is the spec-defined
-    /// "Invalid Request" code, not a gateway-range code.
+    /// The request body could not be read, or the request was not a `POST`.
+    /// This is the spec-defined "Invalid Request" code, not a gateway-range
+    /// code.
     pub(super) const INVALID_REQUEST: i32 = -32600;
 }
 
@@ -85,7 +86,13 @@ pub(crate) enum GatewayError {
     /// The request already carried the gateway's hop marker (forwarding loop).
     LoopDetected,
     /// The request did not complete within the gateway's request deadline.
-    RequestTimeout,
+    RequestTimeout {
+        /// Whether the gateway had started sending the request upstream when
+        /// the deadline fired. If it had, the upstream may have received and
+        /// acted on it, so the client cannot treat the error as "not
+        /// delivered".
+        forwarding_started: bool,
+    },
     /// The client exceeded the gateway's per-IP or global rate limit.
     RateLimited,
     /// An `eth_sendRawTransaction` payload could not be decoded as a
@@ -113,6 +120,10 @@ pub(crate) enum GatewayError {
         /// The upstream's HTTP status, passed through to the client.
         status: StatusCode,
     },
+    /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is
+    /// `POST` only, so the request is answered locally, without reading its
+    /// body or forwarding it.
+    NonPostMethod,
 }
 
 impl GatewayError {
@@ -124,7 +135,7 @@ impl GatewayError {
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected => StatusCode::LOOP_DETECTED,
-            Self::RequestTimeout => StatusCode::REQUEST_TIMEOUT,
+            Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
                 StatusCode::BAD_REQUEST
@@ -133,6 +144,7 @@ impl GatewayError {
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamError { status } => *status,
+            Self::NonPostMethod => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -144,12 +156,12 @@ impl GatewayError {
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
             Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
             Self::LoopDetected => code::LOOP_DETECTED,
-            Self::RequestTimeout => code::REQUEST_TIMEOUT,
+            Self::RequestTimeout { .. } => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
-            Self::UnreadableBody => code::INVALID_REQUEST,
+            Self::UnreadableBody | Self::NonPostMethod => code::INVALID_REQUEST,
             Self::Overloaded => code::OVERLOADED,
             Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
         }
@@ -169,7 +181,13 @@ impl GatewayError {
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"
             }
-            Self::RequestTimeout => "request did not complete within the gateway's deadline",
+            Self::RequestTimeout { forwarding_started: false } => {
+                "request did not complete within the gateway's deadline"
+            }
+            Self::RequestTimeout { forwarding_started: true } => {
+                "request did not complete within the gateway's deadline; the request may have \
+                 reached the upstream"
+            }
             Self::RateLimited => "rate limit exceeded; slow down and retry",
             Self::InvalidTransaction => "raw transaction could not be decoded",
             Self::UnsupportedTransactionType(EIP4844_TX_TYPE) => {
@@ -192,6 +210,7 @@ impl GatewayError {
                 return format!("upstream returned {} without a JSON-RPC body", status.as_u16())
                     .into();
             }
+            Self::NonPostMethod => "only POST is accepted",
         };
         Cow::Borrowed(message)
     }
@@ -208,7 +227,7 @@ impl GatewayError {
             Self::RequestTooLarge => "request_too_large",
             Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
-            Self::RequestTimeout => "request_timeout",
+            Self::RequestTimeout { .. } => "request_timeout",
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
@@ -216,6 +235,7 @@ impl GatewayError {
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
             Self::UpstreamError { .. } => "upstream_error",
+            Self::NonPostMethod => "method_not_post",
         }
     }
 }
@@ -590,7 +610,8 @@ mod tests {
             StatusCode::LOOP_DETECTED
         );
         assert_eq!(
-            error_response(&GatewayError::RequestTimeout, b"{}").status(),
+            error_response(&GatewayError::RequestTimeout { forwarding_started: false }, b"{}")
+                .status(),
             StatusCode::REQUEST_TIMEOUT
         );
         assert_eq!(
@@ -613,6 +634,10 @@ mod tests {
             error_response(&GatewayError::UnsupportedTransactionType(4), b"{}").status(),
             StatusCode::BAD_REQUEST
         );
+        assert_eq!(
+            error_response(&GatewayError::NonPostMethod, b"{}").status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
     }
 
     #[test]
@@ -627,6 +652,7 @@ mod tests {
         assert_eq!(GatewayError::Overloaded.code(), -32009);
         assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
+        assert_eq!(GatewayError::NonPostMethod.code(), -32600);
     }
 
     /// An over-length batch shares the "too large" code and status with an
@@ -701,7 +727,14 @@ mod tests {
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
         assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
-        assert_eq!(GatewayError::RequestTimeout.reason(), "request_timeout");
+        assert_eq!(
+            GatewayError::RequestTimeout { forwarding_started: false }.reason(),
+            "request_timeout"
+        );
+        assert_eq!(
+            GatewayError::RequestTimeout { forwarding_started: true }.reason(),
+            "request_timeout"
+        );
         assert_eq!(GatewayError::RateLimited.reason(), "rate_limited");
         assert_eq!(GatewayError::InvalidTransaction.reason(), "invalid_transaction");
         assert_eq!(
@@ -715,6 +748,7 @@ mod tests {
             GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.reason(),
             "upstream_error"
         );
+        assert_eq!(GatewayError::NonPostMethod.reason(), "method_not_post");
     }
 
     #[tokio::test]
@@ -762,5 +796,17 @@ mod tests {
             );
             assert_eq!(body["id"], json!("call-3"));
         }
+    }
+
+    #[test]
+    fn non_post_code_and_reason_are_stable() {
+        // A non-POST request shares the spec's "Invalid Request" code with an
+        // unreadable body; its status, message and reason label tell the two
+        // apart, so pin all of them.
+        let err = GatewayError::NonPostMethod;
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(err.code(), -32600);
+        assert_eq!(err.message(), "only POST is accepted");
+        assert_eq!(err.reason(), "method_not_post");
     }
 }
