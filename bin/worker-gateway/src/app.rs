@@ -88,6 +88,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_inflight_submissions,
         max_inflight_queries,
         max_upstream_inflight,
+        max_worker_pool_reads,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,
@@ -175,6 +176,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_inflight_submissions,
         max_inflight_queries,
         max_upstream_inflight,
+        // the reads kept on the worker take their share only with a redirect
+        max_worker_pool_reads = ?query_upstream.as_ref().map(|_| max_worker_pool_reads),
         max_inflight_request_bytes = max_inflight_request_bytes.map_or(0, NonZeroU32::get),
         http1_max_buf_size,
         ?tcp_user_timeout,
@@ -281,6 +284,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         submission_slots: inflight_slots(max_inflight_submissions),
         query_slots: inflight_slots(max_inflight_queries),
         upstream_slots: inflight_slots(max_upstream_inflight),
+        pool_read_slots: inflight_slots(max_worker_pool_reads),
         draining: Arc::default(),
     };
 
@@ -875,6 +879,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
             draining: Arc::default(),
         }
     }

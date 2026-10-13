@@ -147,7 +147,7 @@ Every flag has an environment-variable fallback.
 | `--max-connections-per-ip` | `WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP` | `32` | Concurrent inbound connections per client prefix, keyed on the resolved client (the PROXY header's source, else the peer); connections from `--trusted-proxies` are not counted (`0` disables; see [Connection handling](#connection-handling)). |
 | `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
-| `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). |
+| `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). With `--redirect-queries`, the reads kept on the worker may hold at most a fifth of it (20 by default; see [Per-route capacity](#per-route-capacity)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
@@ -459,6 +459,9 @@ A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync`
   Without `--redirect-queries` that is every request, so reads and submissions share the cap.
   The gateway then lowers `--max-inflight-queries` at startup to at most `--max-upstream-inflight` less a fifth of it (80 with the defaults, and an unlimited query cap is lowered too), and logs a warning when it lowers a value you set.
   Unless the worker cap is 1, reads then never hold every worker slot: the fifth held back stays free for submissions.
+  With `--redirect-queries` the query cap is kept as given, and the only reads a worker sees are the [reads kept on the worker](#reads-kept-on-the-worker); together they may hold at most a fifth of `--max-upstream-inflight` (20 with the defaults, at least 1, no limit when the worker cap is `0`).
+  One over that share gets the same `503` / `-32009` at once, even with worker slots free, so a slow worker cannot let those reads take the slots submissions need; submissions do not count against that share.
+  Startup logs the share as `max_worker_pool_reads` on the "edge protections configured" line.
   The worker cap bounds how much of the worker's shared RPC connection limit one gateway can hold; size it with [Sizing for N gateways](#sizing-for-n-gateways).
 - With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never answers frees each query slot after 10 s rather than 35 s.
   Requests to the worker keep `--upstream-request-timeout`.
@@ -643,6 +646,7 @@ The rule is exact:
 These reads are gated on worker readiness like submissions: with no worker ready they get `503` / `-32000` and are not sent to the query URL, which could only give the stale answer.
 They count on `tn_worker_gateway_routed_requests_total{route="worker"}`, and the per-IP and global rate limits bound what they cost the validator.
 They are reads for [Per-route capacity](#per-route-capacity): each holds a `--max-inflight-queries` slot, and a `--max-upstream-inflight` slot like a submission, so while a stalled query URL holds every query slot they are refused with `503` / `-32009` as well.
+Together they hold at most a fifth of the `--max-upstream-inflight` slots (20 with the defaults, at least 1, no limit when that cap is `0`); one over that share is refused at once with `503` / `-32009` (`reason="overloaded"`), so while the worker is slow these reads cannot take every worker slot and leave submissions none.
 That bound assumes the worker runs with its default `--rpc.pending-block none`, where a nonce read at `pending` is a state lookup plus a pool lookup; with `full`, the worker may build a pending block from its pool to answer one, which costs more than a submission.
 
 ### Query upstream header

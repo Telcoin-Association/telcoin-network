@@ -161,6 +161,12 @@ pub(crate) struct AppState {
     /// Cap on concurrent requests forwarded to a worker
     /// (`--max-upstream-inflight`); see [`inflight_slots`].
     pub(crate) upstream_slots: Arc<Semaphore>,
+    /// Cap on the reads kept on the worker under `--redirect-queries`, a fifth
+    /// of the worker cap, so they cannot hold the worker slots submissions
+    /// need (see `crate::cli::Settings::max_worker_pool_reads`); taken in
+    /// addition to an `upstream_slots` slot, and only with a redirect. See
+    /// [`inflight_slots`].
+    pub(crate) pool_read_slots: Arc<Semaphore>,
     /// Set by both accept loops once the shutdown notice arrives, so `/ready`
     /// and `/ready/any` answer `503` with `"draining": true` during
     /// `--shutdown-delay` while the listeners still accept and serve.
@@ -1501,6 +1507,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
             draining: Arc::default(),
         }
     }
@@ -2473,6 +2480,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
             draining: Arc::default(),
         }
     }
@@ -6733,6 +6741,130 @@ mod tests {
         let (status, text) = post_rpc(gateway, None, nonce_read("latest", 4)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
         assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+    }
+
+    /// A worker that answers every submission with `worker` and never answers
+    /// anything else, counting the requests it receives.
+    async fn worker_stalling_reads() -> (SocketAddr, Arc<AtomicUsize>, Notifier) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+        let mock = Router::new().route(
+            "/",
+            post(move |body: String| {
+                let seen = Arc::clone(&seen);
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    if !body.contains("eth_sendRawTransaction") {
+                        future::pending::<()>().await;
+                    }
+                    "worker"
+                }
+            }),
+        );
+        let (addr, server) = spawn(mock).await;
+        (addr, hits, server)
+    }
+
+    /// Send `count` pending nonce reads (ids from 100) that a
+    /// [`worker_stalling_reads`] mock holds unanswered, and wait until it has
+    /// received them all.
+    async fn hold_pending_nonce_reads(
+        gateway: SocketAddr,
+        worker_hits: &AtomicUsize,
+        count: usize,
+    ) {
+        for (_, id) in (0..count).zip(100_u64..) {
+            tokio::spawn(post_rpc(gateway, None, nonce_read("pending", id)));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker_hits.load(Ordering::SeqCst) < count {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stalled pending nonce reads should reach the worker");
+    }
+
+    /// With a redirect, a pending nonce read stays on the worker as a query,
+    /// so while the worker is slow such reads alone could take every worker
+    /// slot and leave submissions a `503`. They hold at most a fifth of the
+    /// worker slots instead.
+    #[tokio::test]
+    async fn submissions_succeed_while_pool_reads_hold_their_worker_share() {
+        let (worker, worker_hits, _worker) = worker_stalling_reads().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        // a worker cap of 10 gives the reads kept on the worker 2 of its slots
+        // (see `worker_pool_read_cap` in cli.rs)
+        state.upstream_slots = inflight_slots(10);
+        state.pool_read_slots = inflight_slots(2);
+        state.readiness.set_ready(0, true);
+        let upstream_slots = Arc::clone(&state.upstream_slots);
+        let (gateway, _gateway) = spawn(test_router(state)).await;
+
+        hold_pending_nonce_reads(gateway, &worker_hits, 2).await;
+        assert_eq!(upstream_slots.available_permits(), 8);
+
+        // a third is over the share and is refused at once, though eight
+        // worker slots are free
+        let (status, text) = tokio::time::timeout(
+            Duration::from_secs(1),
+            post_rpc(gateway, None, nonce_read("pending", 3)),
+        )
+        .await
+        .expect("a pool read over its share must be refused, not forwarded");
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{text}");
+        assert_eq!(error_code_and_id(&text), (-32009, serde_json::json!(3)));
+
+        // the submission does not count against that share
+        let (status, text) =
+            tokio::time::timeout(Duration::from_secs(1), post_rpc(gateway, None, submission(1)))
+                .await
+                .expect("a submission must not wait behind stalled pool reads");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!((worker_hits.load(Ordering::SeqCst), query_seen.hits()), (3, 0));
+    }
+
+    #[tokio::test]
+    async fn pending_nonce_reads_are_ordinary_queries_without_a_redirect() {
+        let (worker, worker_hits, _worker) = worker_stalling_reads().await;
+        let mut state = redirect_state(worker, None);
+        state.upstream_slots = inflight_slots(10);
+        state.pool_read_slots = inflight_slots(2);
+        state.readiness.set_ready(0, true);
+        let (gateway, _gateway) = spawn(test_router(state)).await;
+
+        // without a redirect every read is a worker forward bounded by the
+        // query cap alone, so the pool-read share does not apply
+        hold_pending_nonce_reads(gateway, &worker_hits, 3).await;
+        let (status, text) =
+            tokio::time::timeout(Duration::from_secs(1), post_rpc(gateway, None, submission(1)))
+                .await
+                .expect("a submission must not wait behind stalled reads");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(worker_hits.load(Ordering::SeqCst), 4);
+    }
+
+    #[tokio::test]
+    async fn pool_reads_are_unlimited_when_the_worker_cap_is() {
+        let (worker, worker_hits, _worker) = worker_stalling_reads().await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        // `--max-upstream-inflight 0` leaves the pool-read share unlimited too
+        // (see `worker_pool_read_cap` in cli.rs)
+        state.upstream_slots = inflight_slots(0);
+        state.pool_read_slots = inflight_slots(0);
+        state.readiness.set_ready(0, true);
+        let (gateway, _gateway) = spawn(test_router(state)).await;
+
+        // more than the default share of 20
+        hold_pending_nonce_reads(gateway, &worker_hits, 25).await;
+        let (status, text) =
+            tokio::time::timeout(Duration::from_secs(1), post_rpc(gateway, None, submission(1)))
+                .await
+                .expect("a submission must not wait behind stalled reads");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!((worker_hits.load(Ordering::SeqCst), query_seen.hits()), (26, 0));
     }
 
     #[test]

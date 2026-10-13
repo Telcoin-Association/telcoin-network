@@ -818,6 +818,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
             draining: Arc::default(),
         };
         let app = router(

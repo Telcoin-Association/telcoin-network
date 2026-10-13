@@ -329,7 +329,10 @@ pub(crate) struct Cli {
     /// (500 by default), so keep the number of gateways times this cap below
     /// it. Without `--redirect-queries`, reads may hold at most this cap less a
     /// fifth of it (at least one slot), so the rest stays free for submissions
-    /// (see `--max-inflight-queries`).
+    /// (see `--max-inflight-queries`). With it, the reads kept on the worker
+    /// (pending nonce reads and recent submission lookups) may hold at most a
+    /// fifth of it (at least one slot), and one over that share is answered at
+    /// once with the same `503`.
     #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
     pub(crate) max_upstream_inflight: usize,
 
@@ -642,6 +645,10 @@ pub(crate) struct Settings {
     pub(crate) max_inflight_queries: usize,
     /// Cap on concurrent requests forwarded to the worker (`0` = unlimited).
     pub(crate) max_upstream_inflight: usize,
+    /// Cap on concurrent reads kept on the worker under `--redirect-queries`
+    /// (`0` = unlimited), derived from `max_upstream_inflight` by
+    /// [`worker_pool_read_cap`]; without a redirect nothing takes it.
+    pub(crate) max_worker_pool_reads: usize,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) for inbound connections,
     /// or `None` when disabled.
     pub(crate) tcp_user_timeout: Option<Duration>,
@@ -915,6 +922,7 @@ impl Cli {
             max_inflight_submissions: self.max_inflight_submissions,
             max_inflight_queries,
             max_upstream_inflight: self.max_upstream_inflight,
+            max_worker_pool_reads: worker_pool_read_cap(self.max_upstream_inflight),
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
             max_request_bytes: self.max_request_bytes,
@@ -1054,7 +1062,8 @@ const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 256;
 /// unlimited; an unlimited query cap counts as above that ceiling. With a
 /// redirect, or an unlimited worker cap, the value is kept as given: with a
 /// redirect the only reads a worker sees are the single nonce reads and
-/// lookups kept on it (see `crate::proxy`), and those finish quickly.
+/// lookups kept on it (see `crate::proxy`), and those have their own share of
+/// the worker slots (see [`worker_pool_read_cap`]).
 fn effective_query_cap(
     max_inflight_queries: usize,
     max_upstream_inflight: usize,
@@ -1063,12 +1072,36 @@ fn effective_query_cap(
     if redirect || max_upstream_inflight == 0 {
         return max_inflight_queries;
     }
-    let reserve = (max_upstream_inflight / 5).max(1);
+    let reserve = worker_slot_fifth(max_upstream_inflight);
     let ceiling = max_upstream_inflight.saturating_sub(reserve).max(1);
     match max_inflight_queries {
         0 => ceiling,
         cap => cap.min(ceiling),
     }
+}
+
+/// The most worker slots the reads kept on the worker under
+/// `--redirect-queries` (pending nonce reads and recent submission lookups,
+/// see `crate::proxy`) may hold at once: a fifth of `--max-upstream-inflight`,
+/// at least one slot, or `0` (unlimited) when the worker cap is.
+///
+/// Those reads are queries, but they share the worker slots with the
+/// submissions the redirect keeps on the worker; while the worker is slow they
+/// would otherwise pile up until every worker slot is theirs and every
+/// submission is refused with `503`.
+fn worker_pool_read_cap(max_upstream_inflight: usize) -> usize {
+    match max_upstream_inflight {
+        0 => 0,
+        cap => worker_slot_fifth(cap),
+    }
+}
+
+/// A fifth of a worker cap of `max_upstream_inflight` slots, at least one:
+/// without a redirect, the share reads leave free for submissions (see
+/// [`effective_query_cap`]); with one, the share the reads kept on the worker
+/// may hold (see [`worker_pool_read_cap`]).
+fn worker_slot_fifth(max_upstream_inflight: usize) -> usize {
+    (max_upstream_inflight / 5).max(1)
 }
 
 /// Whether a query cap of `cap` (`0` = unlimited) lets a saturated query route
@@ -2215,10 +2248,36 @@ mod tests {
         assert_eq!(query_cap(&["--max-upstream-inflight=0"])?, 256);
         assert_eq!(query_cap(&["--max-upstream-inflight=0", "--max-inflight-queries=0"])?, 0);
         // with a redirect only the few reads kept on the worker take a worker
-        // slot, so the cap is kept as given
+        // slot, and they have their own share, so the cap is kept as given
         let redirect = "--redirect-queries=https://rpc.example.com/";
         assert_eq!(query_cap(&[redirect])?, 256);
         assert_eq!(query_cap(&[redirect, "--max-inflight-queries=0"])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn reads_kept_on_the_worker_hold_at_most_a_fifth_of_its_slots() -> eyre::Result<()> {
+        let pool_read_cap = |flags: &[&str]| -> eyre::Result<usize> {
+            Ok(cli_with_flags(flags).into_settings()?.max_worker_pool_reads)
+        };
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        // the default worker cap of 100 lets them hold 20 slots
+        assert_eq!(pool_read_cap(&[redirect])?, 20);
+        assert_eq!(pool_read_cap(&[redirect, "--max-upstream-inflight=10"])?, 2);
+        // a small worker cap still lets one through
+        for cap in ["1", "4", "9"] {
+            let flag = format!("--max-upstream-inflight={cap}");
+            assert_eq!(pool_read_cap(&[redirect, &flag])?, 1, "{flag}");
+        }
+        // an unlimited worker cap leaves them unlimited too
+        let settings = cli_with_flags(&[redirect, "--max-upstream-inflight=0"]).into_settings()?;
+        assert_eq!(settings.max_worker_pool_reads, 0);
+        assert_eq!(
+            crate::server::inflight_slots(settings.max_worker_pool_reads).available_permits(),
+            tokio::sync::Semaphore::MAX_PERMITS
+        );
+        // the share follows the worker cap, never the query cap
+        assert_eq!(pool_read_cap(&[redirect, "--max-inflight-queries=4"])?, 20);
         Ok(())
     }
 

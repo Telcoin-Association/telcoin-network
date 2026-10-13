@@ -39,7 +39,9 @@
 //! at once with a `503` overload error instead of waiting, so a stalled route
 //! cannot pile up connections that the other route needs. A forward to a
 //! worker also takes a slot on `--max-upstream-inflight`, the same way, which
-//! bounds this gateway's share of the worker's RPC connection limit.
+//! bounds this gateway's share of the worker's RPC connection limit; with
+//! `--redirect-queries`, the reads kept on the worker hold at most a fifth of
+//! those slots, so they cannot crowd out the submissions.
 
 use std::{
     borrow::Cow,
@@ -470,6 +472,28 @@ pub(crate) async fn proxy(
             }
         },
     };
+
+    // with a redirect, the reads kept on the worker (see [`PoolRead`]) are
+    // queries that take worker slots, so together they may hold at most a
+    // fifth of them (`pool_read_slots`), failing fast like the caps above:
+    // while the worker is slow they cannot take every worker slot and leave
+    // submissions a `503`. without a redirect every read is a worker forward,
+    // and the lowered query cap already keeps a fifth free for submissions.
+    let _pool_read_slot =
+        if route == Route::Worker && class == Class::Query && state.query_upstream.is_some() {
+            match Arc::clone(&state.pool_read_slots).try_acquire_owned() {
+                Ok(permit) => Some(permit),
+                Err(_) => {
+                    debug!(
+                        target: "gateway::proxy",
+                        "worker pool-read cap reached; rejecting request"
+                    );
+                    return error_response(&GatewayError::Overloaded, body.as_ref());
+                }
+            }
+        } else {
+            None
+        };
 
     // every gateway in front of a worker draws on its one rpc connection
     // limit, so this gateway holds at most `--max-upstream-inflight` of it,
@@ -3068,6 +3092,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
             draining: Arc::default(),
         };
         state.readiness.set_ready(0, true);
