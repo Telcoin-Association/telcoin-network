@@ -479,6 +479,20 @@ where
                 // Write the epoch record to DB and save in manager for next epoch.
                 self.write_epoch_record(current_epoch, engine).await?;
 
+                // e2e fault injection, always false without `tn-types/test-utils`: the record is
+                // durable, the state export and the epoch tables clear that follow it are not done
+                if tn_types::test_hooks::exit_after_epoch_record(current_epoch) {
+                    warn!(
+                        target: "epoch-manager",
+                        epoch = current_epoch,
+                        "test hook: exiting after the epoch record is written",
+                    );
+                    // same stop as the before-record hook: `run` sees the shutdown and drops this
+                    // future while it is parked
+                    self.node_shutdown.notify();
+                    std::future::pending::<()>().await;
+                }
+
                 // Export the epoch's final execution state (no-op unless --enable-state-export).
                 self.export_epoch_state(&primary, &reth_env).await?;
 
