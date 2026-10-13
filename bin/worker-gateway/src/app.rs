@@ -67,6 +67,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_concurrent_dns_lookups,
         header_read_timeout,
         max_connections,
+        max_connections_per_ip,
         max_inflight_submissions,
         max_inflight_queries,
         max_upstream_inflight,
@@ -120,8 +121,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         warn!(
             target: "gateway",
             "--trusted-proxies contains a /0 range: every client that can reach the gateway is \
-             a trusted proxy and may choose its own rate-limit key; list only the fronts' own \
-             addresses"
+             a trusted proxy, may choose its own rate-limit key and is not counted by \
+             --max-connections-per-ip; list only the fronts' own addresses"
         );
     }
     info!(
@@ -130,6 +131,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol,
         submission_budget,
+        ?max_connections_per_ip,
         max_request_bytes,
         ?max_batch_len,
         max_inflight_submissions,
@@ -241,6 +243,10 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // any connection-lifetime cap is at least this deadline.)
         request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
         max_connections,
+        max_connections_per_ip,
+        // The per-client cap keys clients by the rate limiter's prefix
+        // policy, which applies here even when per-IP rate limiting is off.
+        client_prefix: rate_limit_prefix,
         tcp_user_timeout,
         max_connection_duration,
         max_request_bytes,

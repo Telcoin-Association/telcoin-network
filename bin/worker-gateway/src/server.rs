@@ -13,8 +13,8 @@
 //! hyper's header read timeout is silently disabled and a slow-loris client
 //! could hold connections open forever. Here every connection gets a header
 //! read deadline, a whole-request deadline, `TCP_NODELAY`, a bounded read
-//! buffer, a global concurrent-connection cap, and two write-path guards for
-//! the response-side slow loris (a client that stops or trickles its reads
+//! buffer, global and per-client connection caps, and two write-path guards
+//! for the response-side slow loris (a client that stops or trickles its reads
 //! while a response body streams to it): a transport-stall deadline
 //! (`TCP_USER_TIMEOUT`) and a hard cap on total connection lifetime.
 //!
@@ -23,8 +23,8 @@
 //! take is bounded by one number rather than by the connection count.
 
 use std::{
-    collections::{HashSet, VecDeque},
-    net::SocketAddr,
+    collections::{HashMap, HashSet, VecDeque},
+    net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     sync::{Arc, Mutex, MutexGuard, PoisonError},
     time::{Duration, Instant},
@@ -60,7 +60,7 @@ use crate::{
     error::{error_response, GatewayError},
     identity::{identify, read_proxy_header, TrustedProxies},
     proxy::{proxy, OVERSIZED_BODY_WARNINGS},
-    ratelimit::{rate_limit, RateLimiters},
+    ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
     telemetry,
 };
@@ -96,6 +96,15 @@ pub(crate) const HTTP1_MIN_BUF_SIZE: usize = 8 * 1024;
 /// `Instant` in the queue plus the hash again in the index, so a full set
 /// stays around a megabyte.
 pub(crate) const RECENT_SUBMISSIONS_CAPACITY: usize = 10_000;
+
+/// Default `--max-connections-per-ip`: room for a busy client's connection
+/// pool, far below the default `--max-connections` (500), so one client
+/// cannot hold every slot.
+pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
+
+/// `reason` label on `tn_worker_gateway_connections_refused_total` for a
+/// connection closed because its client prefix was at its cap.
+const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -152,6 +161,16 @@ pub(crate) struct ServerLimits {
     /// Maximum concurrently-open inbound connections; further connections wait
     /// in the OS accept backlog.
     pub(crate) max_connections: NonZeroUsize,
+    /// Maximum concurrently-open inbound connections per client prefix, or
+    /// `None` when uncapped. A client is the connection's resolved address
+    /// (a PROXY header's source, else the peer), and a trusted proxy's
+    /// connection is not counted. A connection over the cap is closed before
+    /// it is served, without a response, and its global slot is returned at
+    /// once.
+    pub(crate) max_connections_per_ip: Option<NonZeroUsize>,
+    /// How a client address is masked to the key the per-client cap counts by
+    /// (the rate limiter's prefix policy).
+    pub(crate) client_prefix: PrefixPolicy,
     /// Transport-stall deadline (`TCP_USER_TIMEOUT`) armed on every accepted
     /// connection, or `None` when disabled. Closes a connection whose peer
     /// leaves written data unacknowledged (or its receive window closed) this
@@ -348,6 +367,77 @@ struct HeldRequestBytes {
     _permit: OwnedSemaphorePermit,
 }
 
+/// Open inbound connections per client prefix, enforcing
+/// `--max-connections-per-ip` in the accept loop (which decides what a
+/// connection's client address is, and which connections are not counted).
+///
+/// A key's entry is removed when its count returns to zero, so the map holds
+/// at most one entry per open connection and never grows with the number of
+/// distinct clients seen over time.
+#[derive(Debug)]
+struct ClientConnections {
+    /// Most connections one client prefix may hold open at once.
+    max_per_client: NonZeroUsize,
+    /// How a client address is masked to its key.
+    prefix: PrefixPolicy,
+    /// Open connections per client key.
+    open: Mutex<HashMap<IpAddr, usize>>,
+}
+
+impl ClientConnections {
+    fn new(max_per_client: NonZeroUsize, prefix: PrefixPolicy) -> Self {
+        Self { max_per_client, prefix, open: Mutex::new(HashMap::new()) }
+    }
+
+    /// Take one of `client`'s slots, or return its client key when that
+    /// prefix already holds `max_per_client` connections.
+    fn try_acquire(self: &Arc<Self>, client: IpAddr) -> Result<ClientSlot, IpAddr> {
+        let key = self.prefix.key(client);
+        let mut open = self.lock();
+        let count = open.entry(key).or_insert(0);
+        // The cap is at least one, so a refused key always has a live entry
+        // and a refusal never leaves a zero count behind.
+        if *count >= self.max_per_client.get() {
+            return Err(key);
+        }
+        *count += 1;
+        Ok(ClientSlot { connections: Arc::clone(self), key })
+    }
+
+    /// Return one of `key`'s slots, dropping its entry once none are left.
+    fn release(&self, key: IpAddr) {
+        let mut open = self.lock();
+        if let Some(count) = open.get_mut(&key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                open.remove(&key);
+            }
+        }
+    }
+
+    /// Lock the map, recovering it if a previous holder panicked: neither
+    /// critical section can leave a count half-updated.
+    fn lock(&self) -> MutexGuard<'_, HashMap<IpAddr, usize>> {
+        self.open.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// One open connection's hold on a slot of its client prefix. Dropping it,
+/// however the connection task ends, returns the slot.
+#[derive(Debug)]
+struct ClientSlot {
+    /// The table the slot was taken from.
+    connections: Arc<ClientConnections>,
+    /// The client key the slot counts against.
+    key: IpAddr,
+}
+
+impl Drop for ClientSlot {
+    fn drop(&mut self) {
+        self.connections.release(self.key);
+    }
+}
+
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
 /// `request_deadline` bounds each whole request; the bare `408` the timeout
@@ -536,15 +626,15 @@ pub(crate) async fn serve(
         limits.max_request_bytes,
         limits.max_inflight_request_bytes,
         rate_limiters,
-        trusted_proxies,
+        Arc::clone(&trusted_proxies),
     );
-    accept_loop(listener, app, limits, graceful_timeout, shutdown).await
+    accept_loop(listener, app, limits, trusted_proxies, graceful_timeout, shutdown).await
 }
 
 /// Accept connections until `shutdown` fires, serving each on its own task
 /// with the configured header deadline, `TCP_NODELAY`, transport-stall
-/// deadline, lifetime cap, and connection cap, then drain within
-/// `graceful_timeout`.
+/// deadline, lifetime cap, and global and per-client connection caps, then
+/// drain within `graceful_timeout`.
 ///
 /// The two write-path guards close the response-side slow loris: the
 /// whole-request deadline stops covering a response once its head is produced,
@@ -561,10 +651,19 @@ pub(crate) async fn serve(
 /// front never stalls `accept()`) and within the header read timeout; the
 /// source address it names becomes the connection's `ConnectInfo`. A missing,
 /// late or malformed header closes the connection.
+///
+/// The per-client cap counts a connection against its resolved client, the
+/// address the identity middleware starts from: the PROXY header's source, or
+/// else the peer. It is taken once that address is known, so behind an L4
+/// front each client counts on its own. A connection whose resolved address is
+/// in `trusted_proxies` is not counted: `X-Forwarded-For` attributes its
+/// requests to clients one at a time, and counting the front would put every
+/// client behind it under one cap.
 async fn accept_loop(
     listener: TcpListener,
     app: Router,
     limits: ServerLimits,
+    trusted_proxies: Arc<TrustedProxies>,
     graceful_timeout: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
@@ -583,6 +682,9 @@ async fn accept_loop(
     let graceful = GracefulShutdown::new();
     let limiter =
         Arc::new(Semaphore::new(limits.max_connections.get().min(Semaphore::MAX_PERMITS)));
+    let client_connections = limits
+        .max_connections_per_ip
+        .map(|max| Arc::new(ClientConnections::new(max, limits.client_prefix)));
 
     loop {
         // Backpressure: once `max_connections` are open, leave new connections
@@ -630,6 +732,8 @@ async fn accept_loop(
             .map(|_| limits.header_read_timeout);
         let app = app.clone();
         let connection_builder = connection_builder.clone();
+        let client_connections = client_connections.clone();
+        let trusted_proxies = Arc::clone(&trusted_proxies);
         // Taken at accept, so a shutdown that starts while a PROXY header is
         // still arriving waits for this connection too.
         let watcher = graceful.watcher();
@@ -640,6 +744,35 @@ async fn accept_loop(
                     None => return,
                 },
                 None => peer_addr,
+            };
+            // Per-client cap, keyed on the resolved client and taken before
+            // the connection is served: a client prefix already at its cap
+            // has this connection closed at once, and the global permit goes
+            // back when the task ends, so one client cannot take every slot.
+            // A connection-level refusal cannot answer JSON-RPC, so the close
+            // carries no response. A trusted proxy's connection is not counted
+            // (see above). The slot lives as long as this future, which the
+            // task drops before it returns the global permit, so the
+            // connection that permit lets in never finds this one still
+            // counted against its prefix.
+            let _client_slot = match client_connections
+                .as_ref()
+                .filter(|_| !trusted_proxies.contains(client_addr.ip()))
+                .map(|connections| connections.try_acquire(client_addr.ip()))
+                .transpose()
+            {
+                Ok(slot) => slot,
+                Err(key) => {
+                    telemetry::record_connection_refused(REFUSED_PER_IP_CAP);
+                    debug!(
+                        target: "gateway::server",
+                        %peer_addr,
+                        %client_addr,
+                        %key,
+                        "client prefix at its connection cap; closing"
+                    );
+                    return;
+                }
             };
             // Hand the identity middleware the client's address
             // (`ConnectInfo`): the peer, or the source its PROXY header named.
@@ -846,7 +979,7 @@ mod tests {
             client_builder, proxy_client, DEFAULT_MAX_BATCH_LEN, MAX_REQUEST_BYTES,
             SUBMISSION_ANSWER_SLACK,
         },
-        ratelimit::{PrefixPolicy, RateLimit},
+        ratelimit::RateLimit,
         readiness::{run_poller, QueryProbe, ReadinessThresholds},
         telemetry::test_utils::CapturedMetrics,
     };
@@ -886,6 +1019,8 @@ mod tests {
             header_read_timeout: Duration::from_secs(5),
             request_deadline: Duration::from_secs(5),
             max_connections: NonZeroUsize::new(64).expect("nonzero"),
+            max_connections_per_ip: None,
+            client_prefix: PrefixPolicy::default(),
             tcp_user_timeout: None,
             max_connection_duration: None,
             max_request_bytes: MAX_REQUEST_BYTES,
@@ -922,12 +1057,24 @@ mod tests {
     /// connection cap, `ConnectInfo` injection) on an ephemeral port. The
     /// returned `Notifier` keeps the server alive for the test's duration.
     async fn spawn_with_limits(app: Router, limits: ServerLimits) -> (SocketAddr, Notifier) {
+        spawn_trusting(app, limits, Arc::default()).await
+    }
+
+    /// [`spawn_with_limits`], with `trusted` as the accept loop's
+    /// `--trusted-proxies` (whose connections the per-client cap does not
+    /// count); `app` should trust the same ranges, as in [`serve`].
+    async fn spawn_trusting(
+        app: Router,
+        limits: ServerLimits,
+        trusted: Arc<TrustedProxies>,
+    ) -> (SocketAddr, Notifier) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let shutdown = Notifier::new();
         let noticer = shutdown.subscribe();
         tokio::spawn(async move {
-            let _ = accept_loop(listener, app, limits, Duration::from_secs(1), noticer).await;
+            let _ =
+                accept_loop(listener, app, limits, trusted, Duration::from_secs(1), noticer).await;
         });
         (addr, shutdown)
     }
@@ -2191,9 +2338,12 @@ mod tests {
             limiters,
             Arc::clone(&trusted),
         );
-        let limits =
-            ServerLimits { header_read_timeout, proxy_protocol: Some(trusted), ..test_limits() };
-        spawn_with_limits(app, limits).await
+        let limits = ServerLimits {
+            header_read_timeout,
+            proxy_protocol: Some(Arc::clone(&trusted)),
+            ..test_limits()
+        };
+        spawn_trusting(app, limits, trusted).await
     }
 
     /// Send `preamble` and then a JSON-RPC POST carrying the raw header lines
@@ -5618,5 +5768,288 @@ mod tests {
         entries.forget_expired(start + ttl, ttl);
         assert!(!entries.index.contains(&hash), "forgotten at exactly the ttl");
         assert!(entries.order.is_empty(), "the queue and the index agree");
+    }
+
+    /// The per-client table counts by client key, not by bare peer address,
+    /// and forgets a key once its last slot is returned. Network-free, so it
+    /// covers the IPv6 and IPv4-mapped peers the loopback tests below cannot
+    /// produce.
+    #[test]
+    fn client_cap_counts_by_prefix_key_and_forgets_idle_keys() {
+        let cap = NonZeroUsize::new(1).expect("nonzero");
+        let connections = Arc::new(ClientConnections::new(cap, PrefixPolicy::default()));
+
+        // Two addresses in one /64 are one client: the second is refused with
+        // the /64 key.
+        let first: IpAddr = "2001:db8:0:1::1".parse().expect("addr");
+        let rotated: IpAddr = "2001:db8:0:1::2".parse().expect("addr");
+        let v6_slot = connections.try_acquire(first).expect("first connection of the /64");
+        let refused = connections.try_acquire(rotated).expect_err("the /64 is at its cap");
+        assert_eq!(refused, "2001:db8:0:1::".parse::<IpAddr>().expect("addr"));
+
+        // A dual-stack listener's mapped IPv4 peer counts against the bare
+        // IPv4 key.
+        let bare = IpAddr::from([10, 0, 0, 1]);
+        let mapped = IpAddr::V6(std::net::Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped());
+        let v4_slot = connections.try_acquire(mapped).expect("first connection of 10.0.0.1");
+        let refused = connections.try_acquire(bare).expect_err("10.0.0.1 is at its cap");
+        assert_eq!(refused, bare);
+
+        // Returning every slot leaves no entry behind.
+        drop(v6_slot);
+        drop(v4_slot);
+        assert!(connections.lock().is_empty(), "a zero count must not keep its entry");
+    }
+
+    /// The per-client connection cap. Each test plays several clients by
+    /// binding distinct loopback source addresses, which Linux routes to
+    /// loopback without configuration (other platforms only configure
+    /// `127.0.0.1`), hence the gate.
+    #[cfg(any(target_os = "android", target_os = "linux"))]
+    mod per_client_cap {
+        use super::*;
+        use tokio::net::TcpSocket;
+
+        /// Three clients, one prefix each under the default `/32` IPv4 policy.
+        const CLIENT_A: [u8; 4] = [127, 0, 0, 2];
+        const CLIENT_B: [u8; 4] = [127, 0, 0, 3];
+        const CLIENT_C: [u8; 4] = [127, 0, 0, 4];
+
+        /// Long enough for any of these tests to run on a loaded host, short
+        /// enough that a client stuck in the accept backlog fails the test
+        /// long before the header read deadline would free a slot for it.
+        const SERVED_WITHIN: Duration = Duration::from_secs(2);
+
+        /// `test_limits` with a per-client cap (`0` disables it) and a global
+        /// cap, and a header read deadline far beyond any test so idle
+        /// sockets keep holding their slots.
+        fn cap_limits(per_client: usize, max_connections: usize) -> ServerLimits {
+            ServerLimits {
+                header_read_timeout: Duration::from_secs(60),
+                max_connections: NonZeroUsize::new(max_connections).expect("nonzero"),
+                max_connections_per_ip: NonZeroUsize::new(per_client),
+                ..test_limits()
+            }
+        }
+
+        /// A gateway whose only route under test is `/health`.
+        fn health_router() -> Router {
+            test_router(test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]))
+        }
+
+        /// Connect to `server` from the loopback address `source`.
+        async fn connect_from(source: [u8; 4], server: SocketAddr) -> TcpStream {
+            let socket = TcpSocket::new_v4().expect("socket");
+            socket.bind(SocketAddr::from((source, 0))).expect("bind the source address");
+            socket.connect(server).await.expect("connect")
+        }
+
+        /// `GET /health` from `source` on a fresh connection; the raw
+        /// response, empty when the gateway closed the connection unanswered.
+        async fn health_from(source: [u8; 4], server: SocketAddr) -> std::io::Result<String> {
+            let mut stream = connect_from(source, server).await;
+            stream
+                .write_all(b"GET /health HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n")
+                .await?;
+            let mut response = Vec::new();
+            stream.read_to_end(&mut response).await?;
+            Ok(String::from_utf8_lossy(&response).into_owned())
+        }
+
+        /// `health_from`, required to answer `200` within [`SERVED_WITHIN`].
+        async fn assert_served(source: [u8; 4], server: SocketAddr, why: &str) {
+            let response = tokio::time::timeout(SERVED_WITHIN, health_from(source, server))
+                .await
+                .unwrap_or_else(|_| panic!("{why}: no response within {SERVED_WITHIN:?}"))
+                .expect("read the response");
+            assert!(response.starts_with("HTTP/1.1 200"), "{why}: got {response:?}");
+        }
+
+        /// Assert the gateway closes `stream` within one second without a
+        /// single response byte: a read sees EOF, or a reset.
+        async fn assert_closed_at_once(stream: &mut TcpStream) {
+            let mut buf = [0_u8; 16];
+            let read = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut buf))
+                .await
+                .expect("a connection over the cap must be closed at once");
+            if let Ok(read) = read {
+                assert_eq!(read, 0, "a connection over the cap must get no response");
+            }
+        }
+
+        #[tokio::test]
+        async fn one_prefix_at_the_cap_does_not_block_a_second_prefix() {
+            let (addr, _shutdown) = spawn_with_limits(health_router(), cap_limits(2, 8)).await;
+
+            // The issue's flood: one client opens as many idle sockets as the
+            // gateway has slots. The cap keeps two and closes the rest, so the
+            // global slots they would have held stay free; without it all
+            // eight are held until the header read deadline.
+            let mut sockets = Vec::new();
+            for _ in 0..8 {
+                sockets.push(connect_from(CLIENT_A, addr).await);
+            }
+
+            assert_served(CLIENT_B, addr, "a second prefix must be served").await;
+        }
+
+        #[tokio::test]
+        async fn excess_connection_from_one_prefix_is_closed_at_once() {
+            // One global slot beyond the per-client cap: if the refused
+            // connection kept its permit, the last client could not get in.
+            let (addr, _shutdown) = spawn_with_limits(health_router(), cap_limits(2, 3)).await;
+
+            let _held = [connect_from(CLIENT_A, addr).await, connect_from(CLIENT_A, addr).await];
+            let mut excess = connect_from(CLIENT_A, addr).await;
+            assert_closed_at_once(&mut excess).await;
+
+            assert_served(CLIENT_C, addr, "the refused connection's global slot must be free")
+                .await;
+        }
+
+        #[tokio::test]
+        async fn closing_a_connection_frees_its_slot() {
+            let (addr, _shutdown) = spawn_with_limits(health_router(), cap_limits(1, 64)).await;
+
+            let held = connect_from(CLIENT_A, addr).await;
+            let mut excess = connect_from(CLIENT_A, addr).await;
+            assert_closed_at_once(&mut excess).await;
+
+            // The gateway sees the client's close on its own schedule, so
+            // retry until the prefix is served again; a slot that is never
+            // returned keeps refusing until the timeout fails the test.
+            drop(held);
+            let served = tokio::time::timeout(SERVED_WITHIN, async {
+                loop {
+                    match health_from(CLIENT_A, addr).await {
+                        Ok(response) if response.starts_with("HTTP/1.1 200") => break,
+                        _ => tokio::time::sleep(Duration::from_millis(10)).await,
+                    }
+                }
+            })
+            .await;
+            assert!(served.is_ok(), "closing the held connection must free its slot");
+        }
+
+        #[tokio::test]
+        async fn refused_connections_are_counted() {
+            // `#[tokio::test]` runs every task on this thread, so a
+            // thread-local recorder sees the accept loop's metrics.
+            let mut metrics = CapturedMetrics::install();
+            let (addr, _shutdown) = spawn_with_limits(health_router(), cap_limits(1, 64)).await;
+
+            let _held = connect_from(CLIENT_A, addr).await;
+            for _ in 0..3 {
+                let mut excess = connect_from(CLIENT_A, addr).await;
+                assert_closed_at_once(&mut excess).await;
+            }
+            // A connection under its prefix's cap is served and not counted.
+            assert_served(CLIENT_B, addr, "a second prefix must be served").await;
+
+            assert_eq!(
+                metrics.value(
+                    "tn_worker_gateway_connections_refused_total",
+                    &[("reason", "per_ip_cap")]
+                ),
+                3.0
+            );
+        }
+
+        #[tokio::test]
+        async fn zero_disables_the_cap() {
+            let (addr, _shutdown) = spawn_with_limits(health_router(), cap_limits(0, 64)).await;
+
+            // More idle sockets than the default cap, all from one prefix.
+            let mut sockets = Vec::new();
+            for _ in 0..=DEFAULT_MAX_CONNECTIONS_PER_IP {
+                sockets.push(connect_from(CLIENT_A, addr).await);
+            }
+
+            assert_served(CLIENT_A, addr, "an uncapped prefix must still be served").await;
+        }
+
+        /// A trusted front's connections are not counted: its requests are
+        /// attributed by `X-Forwarded-For` one at a time, so counting the
+        /// front would put every client behind it under one cap.
+        #[tokio::test]
+        async fn trusted_front_is_not_held_to_the_per_client_cap() {
+            let front = "127.0.0.2/32";
+            let trusted = Arc::new(front.parse::<TrustedProxies>().expect("trusted proxies"));
+            let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+            let app = identity_router(state, None, front);
+            let (addr, _shutdown) = spawn_trusting(app, cap_limits(2, 8), trusted).await;
+
+            // the front holds twice the cap and is still served
+            let mut sockets = Vec::new();
+            for _ in 0..4 {
+                sockets.push(connect_from(CLIENT_A, addr).await);
+            }
+            assert_served(CLIENT_A, addr, "a trusted front must not be capped").await;
+
+            // a client of the same gateway is still held to the cap
+            sockets.push(connect_from(CLIENT_B, addr).await);
+            sockets.push(connect_from(CLIENT_B, addr).await);
+            let mut excess = connect_from(CLIENT_B, addr).await;
+            assert_closed_at_once(&mut excess).await;
+        }
+
+        /// Open a connection from the loopback front with a PROXY header
+        /// naming `source`, and hold it open once a keep-alive `GET /health`
+        /// on it is answered, by which point it holds its client's slot.
+        async fn hold_proxied(gateway: SocketAddr, source: &str) -> TcpStream {
+            let mut stream = TcpStream::connect(gateway).await.expect("connect");
+            let head = b"GET /health HTTP/1.1\r\nHost: gateway\r\n\r\n";
+            let preamble = proxy_v2_header(socket(source), &[]);
+            stream.write_all(&[&preamble[..], &head[..]].concat()).await.expect("write");
+            let mut response = Vec::new();
+            let mut buf = [0_u8; 512];
+            while !response.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = tokio::time::timeout(SERVED_WITHIN, stream.read(&mut buf))
+                    .await
+                    .expect("the held connection must be answered")
+                    .expect("read");
+                assert_ne!(read, 0, "the held connection must stay open");
+                response.extend_from_slice(&buf[..read]);
+            }
+            assert!(
+                response.starts_with(b"HTTP/1.1 200"),
+                "{}",
+                String::from_utf8_lossy(&response)
+            );
+            stream
+        }
+
+        /// Behind an L4 front sending PROXY headers every connection comes from
+        /// the front, and the cap counts each one against the source its
+        /// header names.
+        #[tokio::test]
+        async fn proxy_sourced_client_is_capped_on_its_proxy_source() {
+            let (worker, _worker) = forwarding_echo().await;
+            let state = redirect_state(worker, None);
+            state.readiness.set_ready(0, true);
+            let trusted = Arc::new("127.0.0.1/32".parse::<TrustedProxies>().expect("trusted"));
+            let app = router(
+                state,
+                Duration::from_secs(5),
+                MAX_REQUEST_BYTES,
+                None,
+                None,
+                Arc::clone(&trusted),
+            );
+            let limits =
+                ServerLimits { proxy_protocol: Some(Arc::clone(&trusted)), ..cap_limits(1, 64) };
+            let (gateway, _shutdown) = spawn_trusting(app, limits, trusted).await;
+
+            let _held = hold_proxied(gateway, "198.51.100.1:4711").await;
+            // that client's next connection is over its cap: closed unanswered
+            let same = proxy_v2_header(socket("198.51.100.1:4712"), &[]);
+            let response = raw_exchange(gateway, &same, "").await;
+            assert!(response.is_empty(), "the source is at its cap: {response}");
+            // another client behind the same front has a slot of its own
+            let other = proxy_v2_header(socket("198.51.100.2:4711"), &[]);
+            let response = raw_exchange(gateway, &other, "").await;
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(response.contains("198.51.100.2|http"), "{response}");
+        }
     }
 }

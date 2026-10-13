@@ -45,6 +45,10 @@
 //!
 //! [`record_dns_lookup`] counts the outcomes of name resolution by the upstream
 //! clients' caching resolvers, both clients in one series (see [`crate::dns`]).
+//!
+//! [`record_connection_refused`] counts inbound connections the accept loop
+//! closed without serving, by `reason`. They never carry a request to the
+//! proxy, so they appear in neither request counter.
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -114,6 +118,11 @@ const INFLIGHT_REQUEST_BYTES: &str = "tn_worker_gateway_inflight_request_bytes";
 /// `miss`; a stale hit whose background refresh could not start counts as
 /// both `hit` and `rejected`.
 const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
+
+/// Inbound connections closed at accept without being served, by `reason`
+/// (`per_ip_cap`: the client's prefix already held `--max-connections-per-ip`
+/// connections).
+const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -248,6 +257,12 @@ pub(crate) fn record_routed(route: &'static str, result: &'static str) {
 /// submissions with other calls.
 pub(crate) fn record_mixed_batch() {
     counter!(MIXED_BATCHES_TOTAL).increment(1);
+}
+
+/// Record an inbound connection closed at accept without being served, keyed
+/// by a stable machine-readable `reason`.
+pub(crate) fn record_connection_refused(reason: &'static str) {
+    counter!(CONNECTIONS_REFUSED_TOTAL, "reason" => reason).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or

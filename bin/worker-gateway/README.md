@@ -146,6 +146,7 @@ Every flag has an environment-variable fallback.
 | `--max-concurrent-dns-lookups` | `WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS` | `8` | Upstream DNS lookups that may run at once, for the proxy and the readiness poller each (at least `1`); a lookup over the cap fails at once and does not count toward `--upstream-failure-threshold`. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard); a `--proxy-protocol` connection from a listed front gets one more for its PROXY header. |
 | `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--max-connections-per-ip` | `WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP` | `32` | Concurrent inbound connections per client prefix, keyed on the resolved client (the PROXY header's source, else the peer); connections from `--trusted-proxies` are not counted (`0` disables; see [Connection handling](#connection-handling)). |
 | `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
 | `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). |
@@ -157,8 +158,8 @@ Every flag has an environment-variable fallback.
 | `--http1-max-buf-size` | `WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE` | `65536` | Per-connection read buffer cap, in bytes (64 KiB; minimum 8192; a request head must fit in it; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
-| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its bucket. |
-| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its bucket. |
+| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
+| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
@@ -217,6 +218,19 @@ Each request additionally has a whole-request deadline of
 and the upstream response headers, so a request body trickled in below the
 size limit cannot hold a slot indefinitely.
 The probe listener (`--probe-addr`) has no connection cap: it applies the header read deadline, serves one request per connection and refuses a request head over 8 KiB; see [Gateway endpoints](#gateway-endpoints).
+
+A per-client cap (`--max-connections-per-ip`, default `32`; `0` disables it) keeps one client from holding every `--max-connections` slot.
+A client is its network prefix: the connection's client address masked by `--rate-limit-per-ip-v4-prefix` / `--rate-limit-per-ip-v6-prefix` exactly as the per-client rate limiter masks it (see [Prefix keying](#prefix-keying)), and the masking applies even when per-IP rate limiting is off.
+The client address is the one [Client identity behind a front](#client-identity-behind-a-front) starts from: the peer, or with `--proxy-protocol` the source a listed front's PROXY header names, so behind an L4 balancer that sends PROXY headers each client counts on its own.
+The check runs as soon as that address is known, right after `accept` or right after the PROXY header is read, and before the connection is served: a connection whose prefix already holds the cap is closed at once without a response (a connection-level limit has no request to answer, so it cannot send a JSON-RPC error), and the global slot it was accepted into is returned immediately.
+Each refusal increments `tn_worker_gateway_connections_refused_total{reason="per_ip_cap"}` and logs at debug level with the peer, the resolved client and the prefix key.
+A connection whose client address is in `--trusted-proxies` is not counted at all: `X-Forwarded-For` attributes its requests to clients one at a time (the per-IP rate limit still meters each of them), and counting the front would put every client behind it under one cap, so the 33rd connection from the front would be refused.
+Every other connection counts, the `/health`, `/ready` and `/ready/any` probes on this listener included (the `--probe-addr` listener has no per-client cap), so behind a NAT, load balancer or proxy that hides client addresses and is not listed in `--trusted-proxies`, all clients share one prefix; list the front (with `X-Forwarded-For` or PROXY protocol), or raise the cap or disable it there.
+
+> **Residual limitation.** The per-client cap bounds one prefix, not many.
+> `ceil(--max-connections / --max-connections-per-ip)` distinct prefixes still hold every slot: 16 at the defaults (500 / 32), which is 16 IPv4 addresses, or on an IPv6 (or dual-stack) listener a single `/60` under the default `/64` key (a residential `/56` holds 256 keys).
+> A listed front's own connections are not counted at all, so they are bounded by `--max-connections` alone.
+> Across prefixes only `--max-connections` bounds the total, so absorb wide floods in front of the gateway (see [DNS and the DDoS front](#dns-and-the-ddos-front)).
 
 Upstream response bodies are streamed through, never buffered whole (except
 the short, capped answer to a submission whose hash is remembered; see
@@ -387,6 +401,8 @@ Toward the upstream, `X-Forwarded-For` is the peer alone, or the resolved client
 followed by the listed peer that vouched for it; the inbound chain is never
 copied. `X-Forwarded-Proto` is copied from a listed peer when its right-most
 value is `http` or `https`, and is `http` otherwise.
+
+The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is listed, a front sending `X-Forwarded-For` or a `LOCAL` health check, is not counted, since its requests belong to many clients.
 
 ### Per-route capacity
 
@@ -585,7 +601,9 @@ Point orchestrator probes at it, and keep it reachable from the orchestrator onl
 
 Client requests always receive a well-formed JSON-RPC 2.0 error (never a bare
 connection reset) when the gateway cannot serve them. The request `id` is
-echoed when it can be recovered.
+echoed when it can be recovered. A connection over `--max-connections-per-ip`
+is the exception: it is closed before any request is read (see
+[Connection handling](#connection-handling)).
 
 | Condition | HTTP | JSON-RPC error code |
 | --- | --- | --- |
@@ -659,9 +677,11 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
 | `tn_worker_gateway_inflight_request_bytes` | gauge | | Request-body bytes held against `--max-inflight-request-bytes` by requests in flight. |
 | `tn_worker_gateway_dns_lookups_total` | counter | `result` (`hit` / `miss` / `error` / `rejected`) | Upstream name resolutions: answered from the cache (fresh or stale), lookup started, lookup failed, or refused because every lookup slot was busy. A request that waits on a lookup already running for its host adds nothing. A stale answer whose background refresh is refused counts as both `hit` and `rejected`, and the request is still answered. The proxy and the readiness poller share the series. |
+| `tn_worker_gateway_connections_refused_total` | counter | `reason` (`per_ip_cap`) | Inbound connections closed before any request is read, by reason (`per_ip_cap`: the connection's client prefix already held `--max-connections-per-ip` connections; see [Connection handling](#connection-handling)). |
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
+`tn_worker_gateway_connections_refused_total` is the exception: it counts connections before any request is read, so a probe connection to the client listener refused at the per-client cap is counted with the rest (the `--probe-addr` listener has no per-client cap).
 
 Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
@@ -720,7 +740,10 @@ With `--redirect-queries`, reads are answered by a node that has not seen this v
   `/ready/any` keeps a gateway published while it can serve reads; `/ready` means "can take submissions", and every gateway shares the worker, so with it every gateway drops out at once when the worker is down, reads included.
 - Lock the domain at the registrar and enable DNSSEC where the provider supports it; a hijacked name serves forged state to every client.
 - Absorb packet floods in front of the gateways.
-  A front that terminates TCP makes every client share the front's rate-limit buckets, because the gateway keys its limits on the TCP peer, unless the front is listed in `--trusted-proxies` and passes the client address in `X-Forwarded-For` or a PROXY protocol v2 header (see [Client identity behind a front](#client-identity-behind-a-front)); otherwise use an L4 front that preserves client addresses, or set the per-IP limit for the front's addresses.
+  A front that terminates TCP, or one that SNATs (such as a Kubernetes `LoadBalancer` or `NodePort` Service left at `externalTrafficPolicy: Cluster`), makes every client share the front's addresses, because the gateway keys its limits on the TCP peer, unless the front is listed in `--trusted-proxies` and passes the client address in `X-Forwarded-For` or a PROXY protocol v2 header (see [Client identity behind a front](#client-identity-behind-a-front)).
+  An unlisted front's clients share its rate-limit buckets and its `--max-connections-per-ip` count (default `32`), so every connection past 32 open at once from one front prefix is closed without a response, health probes from that prefix included.
+  A listed front is not counted by `--max-connections-per-ip`, and with PROXY protocol each client behind it counts on its own (see [Connection handling](#connection-handling)).
+  Otherwise use an L4 front that preserves client addresses (`externalTrafficPolicy: Local` on Kubernetes), or set the per-IP rate limit for the front's addresses and raise `--max-connections-per-ip` to the front's upstream connection pool size, or set it to `0`.
 - If you use a front, firewall the gateways so that only the front reaches them; a gateway reachable directly bypasses it.
 
 The gateway resolves the names in its own upstream URLs (worker RPC and readiness URLs, `--redirect-queries`) through a cache with a cap on concurrent lookups.

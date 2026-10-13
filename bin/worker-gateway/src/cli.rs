@@ -233,6 +233,24 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_MAX_CONNECTIONS", default_value = "500")]
     pub(crate) max_connections: NonZeroUsize,
 
+    /// Maximum concurrently-open inbound connections from one client (default
+    /// 32; `0` disables the cap). A client is its network prefix, masked by
+    /// `--rate-limit-per-ip-v4-prefix` / `--rate-limit-per-ip-v6-prefix` exactly
+    /// as the per-IP rate limiter masks it, even when per-IP rate limiting is
+    /// off. The address masked is the peer's, or with `--proxy-protocol` the
+    /// source a trusted front's PROXY header names. A connection from an
+    /// address in `--trusted-proxies` is not counted: its requests are
+    /// attributed to clients by `X-Forwarded-For` one at a time, and counting
+    /// it would put every client behind that front under one cap. A connection
+    /// over the cap is closed at once, without a response, so one client
+    /// cannot hold every `--max-connections` slot.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP",
+        default_value_t = crate::server::DEFAULT_MAX_CONNECTIONS_PER_IP
+    )]
+    pub(crate) max_connections_per_ip: usize,
+
     /// Maximum in-flight requests made only of transaction submissions
     /// (default 256; `0` means unlimited). A submission over the cap is
     /// answered at once with a `503` overload error instead of waiting. The
@@ -370,10 +388,12 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_burst: u32,
 
     /// IPv6 network prefix, in bits, that a client address is masked to before
-    /// it keys its per-IP bucket. The default `/64` is the smallest subnet
-    /// routed to one customer, so a client rotating addresses inside its own
-    /// allocation keeps spending one bucket instead of minting a fresh one per
-    /// address. Widen it (up to `/128`) only to meter individual addresses.
+    /// it keys its per-IP bucket and its `--max-connections-per-ip` count (the
+    /// cap uses it even when per-IP rate limiting is off). The default `/64` is
+    /// the smallest subnet routed to one customer, so a client rotating
+    /// addresses inside its own allocation keeps spending one bucket instead of
+    /// minting a fresh one per address. Widen it (up to `/128`) only to meter
+    /// individual addresses.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX",
@@ -382,10 +402,12 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_per_ip_v6_prefix: u8,
 
     /// IPv4 network prefix, in bits, that a client address is masked to before
-    /// it keys its per-IP bucket. The default `/32` is a single address: it
-    /// preserves the gateway's per-address behaviour and never groups unrelated
-    /// customers that share one carrier-grade NAT. Narrow it only for a
-    /// deployment whose clients genuinely map to larger IPv4 allocations.
+    /// it keys its per-IP bucket and its `--max-connections-per-ip` count (the
+    /// cap uses it even when per-IP rate limiting is off). The default `/32` is
+    /// a single address: it preserves the gateway's per-address behaviour and
+    /// never groups unrelated customers that share one carrier-grade NAT.
+    /// Narrow it only for a deployment whose clients genuinely map to larger
+    /// IPv4 allocations.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX",
@@ -417,9 +439,11 @@ pub(crate) struct Cli {
     /// inside one is attributed to the right-most `X-Forwarded-For` address that
     /// is not itself in a listed range, and that proxy's `X-Forwarded-Proto` is
     /// passed on; every other request is attributed to its peer, whatever
-    /// headers it carries. Unset (the default) trusts no proxy. List only the
-    /// proxies' own addresses: a range that also covers clients lets them choose
-    /// their own rate-limit key. Each listed proxy must append the address it
+    /// headers it carries. A listed proxy's own connections are not counted by
+    /// `--max-connections-per-ip`. Unset (the default) trusts no proxy. List
+    /// only the proxies' own addresses: a range that also covers clients lets
+    /// them choose their own rate-limit key and escape the per-client
+    /// connection cap. Each listed proxy must append the address it
     /// received the connection from to `X-Forwarded-For` (or replace the header
     /// with it) and set `X-Forwarded-Proto` itself; one that passes a client's
     /// headers through lets that client choose its own rate-limit key.
@@ -509,6 +533,9 @@ pub(crate) struct Settings {
     pub(crate) header_read_timeout: Duration,
     /// Maximum concurrently-open inbound connections.
     pub(crate) max_connections: NonZeroUsize,
+    /// Maximum concurrently-open inbound connections per client prefix (keyed
+    /// by `rate_limit_prefix`), or `None` when the cap is disabled.
+    pub(crate) max_connections_per_ip: Option<NonZeroUsize>,
     /// In-flight cap for submission requests (`0` = unlimited).
     pub(crate) max_inflight_submissions: usize,
     /// In-flight cap for every other request (`0` = unlimited), as lowered by
@@ -705,6 +732,23 @@ impl Cli {
             self.http1_max_buf_size,
             crate::server::HTTP1_MIN_BUF_SIZE,
         );
+        // A per-client cap at or above the global cap never refuses anything,
+        // since the global permit runs out first. Warn rather than reject:
+        // raising the cap that far is a legitimate way to neutralise it behind
+        // a front that hides client addresses.
+        let max_connections_per_ip = NonZeroUsize::new(self.max_connections_per_ip);
+        if let Some(per_ip) =
+            max_connections_per_ip.filter(|per_ip| *per_ip >= self.max_connections)
+        {
+            warn!(
+                target: "gateway",
+                max_connections = %self.max_connections,
+                max_connections_per_ip = %per_ip,
+                "--max-connections-per-ip is at least --max-connections, so one client prefix can \
+                 still hold every connection slot; lower it below --max-connections, or set it to \
+                 0 to disable the cap explicitly"
+            );
+        }
         Ok(Settings {
             listen_addr: self.listen_addr,
             probe_addr: self.probe_addr,
@@ -725,6 +769,7 @@ impl Cli {
             max_concurrent_dns_lookups: self.max_concurrent_dns_lookups,
             header_read_timeout: self.header_read_timeout,
             max_connections: self.max_connections,
+            max_connections_per_ip,
             max_inflight_submissions: self.max_inflight_submissions,
             max_inflight_queries,
             max_upstream_inflight: self.max_upstream_inflight,
@@ -1466,6 +1511,25 @@ mod tests {
         let global = settings.rate_limit_global.expect("global limit on by default");
         assert_eq!(global.rate().get(), 3_000);
         assert_eq!(global.burst().get(), 6_000);
+        Ok(())
+    }
+
+    #[test]
+    fn per_ip_connection_cap_defaults_to_32_and_zero_disables_it() -> eyre::Result<()> {
+        let default = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(default.max_connections_per_ip, NonZeroUsize::new(32));
+        let disabled = cli_with_flags(&["--max-connections-per-ip=0"]).into_settings()?;
+        assert_eq!(disabled.max_connections_per_ip, None);
+        Ok(())
+    }
+
+    #[test]
+    fn per_ip_connection_cap_at_the_global_cap_is_kept() -> eyre::Result<()> {
+        // Warned about at startup, not rejected: raising the cap that far is
+        // how a gateway behind an address-hiding front neutralises it.
+        let settings = cli_with_flags(&["--max-connections=8", "--max-connections-per-ip=8"])
+            .into_settings()?;
+        assert_eq!(settings.max_connections_per_ip, NonZeroUsize::new(8));
         Ok(())
     }
 
