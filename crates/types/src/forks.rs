@@ -217,17 +217,26 @@ pub const CONSENSUS_REGISTRY_FORK_EPOCH: Epoch = 407;
 /// this constant does not exist there.
 pub const SEED_SIGNATURE_FORK_EPOCH: Epoch = 383;
 
-/// Whether `epoch` is at or past `fork`: the activation rule every fork gate in this module uses.
+/// Whether `epoch` is at or past `fork`: the `>=` activation rule for every gate in this module
+/// that stays on from its fork epoch onward.
 ///
-/// Every adiri `*_build_fork_active` gate, every `test-utils` override and every `>=` arming
-/// assert calls this function. Do not compare an epoch against a fork constant directly. Because
-/// the fork epoch is a parameter, Clippy does not see a constant at the comparison, so a
-/// `u32::MAX` "not yet scheduled" placeholder does not trip `clippy::absurd_extreme_comparisons`
-/// and needs no `#[expect]`. To arm a placeholder fork, change only its constant. A new fork gets
-/// the same rule when its gate copies a sibling.
+/// Every adiri `*_build_fork_active` gate, every `test-utils` override closure and every `>=`
+/// arming assert calls this function, and a new gate of that kind should too, rather than spell
+/// out `epoch >= FORK`. Because the fork epoch is a parameter, Clippy does not see a constant at
+/// the comparison, so a `u32::MAX` "not yet scheduled" placeholder does not trip
+/// `clippy::absurd_extreme_comparisons` and needs no `#[expect]`. To arm a placeholder fork,
+/// change only its constant.
 ///
-/// Strict floor asserts (`FORK > FLOOR`) do not use it: Clippy does not flag `FLOOR < u32::MAX`,
-/// so a placeholder on the left needs no expectation there.
+/// Comparisons that are not `>=` activation gates keep their own operators and must not be
+/// rewritten to this rule:
+/// - strict floor asserts (`FORK > FLOOR`): Clippy does not flag `FLOOR < u32::MAX`, so a
+///   placeholder on the left needs no expectation there;
+/// - the one-shot boundary triggers in `tn-reth::evm::block` (`concluding.checked_add(1) ==
+///   Some(FORK)` for `CONSENSUS_REGISTRY_FORK_EPOCH` and `governance_safe_fork_epoch()`): each
+///   fires in exactly one epoch-closing block, and under `>=` it would re-run at every later epoch
+///   close;
+/// - the duplicate-batch replay cutoffs (`epoch > ADIRI_DUP_BATCH_EPOCH`): that constant is the
+///   last legacy epoch, not a fork's first epoch.
 ///
 /// `const fn` keeps the arming asserts at compile time. Compiled only where a caller exists (the
 /// `adiri` gates and asserts, the `test-utils` overrides), so the default feature set has no dead
