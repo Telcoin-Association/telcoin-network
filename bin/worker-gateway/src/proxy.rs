@@ -49,7 +49,7 @@ use std::{
     pin::Pin,
     sync::{
         atomic::{AtomicU8, Ordering},
-        Arc,
+        Arc, OnceLock,
     },
     task::{Context, Poll},
     time::Duration,
@@ -84,7 +84,7 @@ use crate::{
     },
     identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
     ratelimit::{RateLimiters, SubmissionBudget},
-    server::{AppState, RecentSubmissions},
+    server::{AccessSampled, AppState, RecentSubmissions},
     telemetry::{self, Throttle},
 };
 
@@ -224,6 +224,10 @@ const CHAIN_ID_CALL: &str = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":
 /// under a hundred bytes.
 const MAX_CHAIN_ID_ANSWER_BYTES: usize = 64 * 1024;
 
+/// The access log's `route` for a request the gateway answered itself,
+/// without forwarding it to an upstream.
+pub(crate) const REJECTED_ROUTE: &str = "rejected";
+
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is neither made only of
 /// submissions nor one of the reads only the worker's pool can answer (see
@@ -250,6 +254,12 @@ const MAX_CHAIN_ID_ANSWER_BYTES: usize = 64 * 1024;
 /// body is read here, while the router's byte-budget layer
 /// (`server::reserve_request_bytes`) holds the bytes it reserved for it, so it
 /// must stay last in the parameter list.
+///
+/// When the access log samples the request, its [`AccessSampled`] extension
+/// is taken from `request` (the handler is at its extractor limit) and the
+/// proxy notes the request's class once it has read the body and its route
+/// once it starts the forward (see [`AccessRecord`]); a request the log skips
+/// is not classified for it at all.
 pub(crate) async fn proxy(
     State(state): State<AppState>,
     Extension(forwarding): Extension<Forwarding>,
@@ -264,6 +274,9 @@ pub(crate) async fn proxy(
     // is entered, so a client still uploading its body is not counted in flight
     // and the upload stays out of the duration
     let headers = std::mem::take(request.headers_mut());
+    // the access log's record, on a request it samples
+    let access =
+        request.extensions_mut().remove::<AccessSampled>().map(|AccessSampled(record)| record);
     let body = read_body(request).await;
 
     // Track this proxied request in the in-flight gauge (the autoscaling signal)
@@ -289,6 +302,11 @@ pub(crate) async fn proxy(
                  check that upstream URLs point at workers, not gateways"
             );
         }
+        // the loop checks come before the scan, so a sampled request is
+        // scanned here for the access log's class
+        if let Some(access) = &access {
+            access.classify(&body, scan(&body, None, &[]).calls);
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -306,6 +324,9 @@ pub(crate) async fn proxy(
                  marker); check that --redirect-queries does not lead to a gateway that redirects"
             );
         }
+        if let Some(access) = &access {
+            access.classify(&body, scan(&body, None, &[]).calls);
+        }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
@@ -319,6 +340,12 @@ pub(crate) async fn proxy(
     // many calls it carries, whether the method policy or the transaction
     // screen refuses it, and where it routes.
     let scan = scan(body.as_ref(), state.max_batch_len, denied_prefixes);
+    // a sampled request is classified for the access log here, whatever comes
+    // of it below: a request answered without a forward is logged with its
+    // class and the `rejected` route
+    if let Some(access) = &access {
+        access.classify(&body, scan.calls);
+    }
 
     // A batch the scan could not read to its end has an unknown length: the
     // worker skips an element serde's typed readers refuse (an out-of-range
@@ -461,9 +488,13 @@ pub(crate) async fn proxy(
     };
 
     // from here on the upstream may receive the request, so a deadline that
-    // fires later can no longer tell the client it was not delivered
+    // fires later can no longer tell the client it was not delivered, and the
+    // access log names the route whatever the forward's result
     if let Some(Extension(forwarding_started)) = &forwarding_started {
         forwarding_started.mark();
+    }
+    if let Some(access) = &access {
+        access.forwarding(route);
     }
 
     match forward(&state, route, &headers, body.clone(), upstream_url.clone(), forwarding).await {
@@ -1276,6 +1307,56 @@ impl fmt::Display for ErrorChain<'_> {
             source = err.source();
         }
         Ok(())
+    }
+}
+
+/// What the proxy learned about a request the access log samples, kept in
+/// the request's [`AccessSampled`] slot for the log to read as it writes the
+/// request's line (see [`crate::server::AccessLog`]): the class and size
+/// once the body has been read and classified, and the route once a forward
+/// has started. A request answered or dropped before its body was read has
+/// neither.
+///
+/// It holds two fixed labels and a length, never text copied from the
+/// request, so the line built from it cannot carry a URL, header value, body,
+/// params or method name.
+#[derive(Debug, Default)]
+pub(crate) struct AccessRecord {
+    /// Method class (`batch`, `submission` or `query`) and the buffered
+    /// body's length in bytes, set once the proxy has classified the body.
+    classified: OnceLock<(&'static str, u64)>,
+    /// The upstream a forward was started to, whatever its result (a request
+    /// timeout or a cancellation included).
+    forwarded: OnceLock<Route>,
+}
+
+impl AccessRecord {
+    /// Note the class of a request whose body the proxy read: `batch` for a
+    /// JSON-RPC batch, whatever it holds; otherwise `submission` for a single
+    /// call to one of the [`SUBMISSION_METHODS`] and `query` for anything
+    /// else, a body that is not JSON-RPC included, as the scan's `calls` has
+    /// it. Only the first note counts.
+    fn classify(&self, body: &[u8], calls: Calls) {
+        let class = if is_batch(body.trim_ascii_start()) { "batch" } else { calls.class().label() };
+        let bytes_in = u64::try_from(body.len()).unwrap_or(u64::MAX);
+        self.classified.get_or_init(|| (class, bytes_in));
+    }
+
+    /// Note that a forward to `route` has started.
+    fn forwarding(&self, route: Route) {
+        self.forwarded.get_or_init(|| route);
+    }
+
+    /// The method class and the body's length, or `None` when the request was
+    /// answered or dropped before the proxy read and classified its body.
+    pub(crate) fn class(&self) -> Option<(&'static str, u64)> {
+        self.classified.get().copied()
+    }
+
+    /// `worker` or `query` once a forward has started, or [`REJECTED_ROUTE`]
+    /// for a request the gateway answered without forwarding it.
+    pub(crate) fn route(&self) -> &'static str {
+        self.forwarded.get().map_or(REJECTED_ROUTE, |route| route.label())
     }
 }
 

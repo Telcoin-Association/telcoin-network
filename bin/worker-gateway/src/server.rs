@@ -30,7 +30,7 @@ use std::{
     num::{NonZeroU32, NonZeroUsize},
     pin::pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
     },
     time::{Duration, Instant},
@@ -64,8 +64,11 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    identity::{identify, read_proxy_header, TrustedProxies},
-    proxy::{proxy, reject_non_post, ForwardingStarted, QueryHeader, OVERSIZED_BODY_WARNINGS},
+    identity::{identify, read_proxy_header, ClientAddr, TrustedProxies},
+    proxy::{
+        proxy, reject_non_post, AccessRecord, ForwardingStarted, QueryHeader,
+        OVERSIZED_BODY_WARNINGS,
+    },
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
     telemetry,
@@ -114,6 +117,11 @@ const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
 /// How long a browser may cache the gateway's answer to a CORS preflight
 /// (`Access-Control-Max-Age`).
 const CORS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
+
+/// The access log's `status` for a sampled request dropped before it had a
+/// response (the client closed the connection, the connection lifetime cap,
+/// shutdown): nginx's "client closed request".
+const CLIENT_CLOSED_REQUEST: u16 = 499;
 
 /// Shared state handed to every request handler.
 #[derive(Clone, Debug)]
@@ -332,6 +340,89 @@ pub(crate) struct RouterLayers {
     /// Origins allowed to call the gateway cross-origin
     /// (`--cors-allowed-origins`); `None` leaves CORS off.
     pub(crate) cors: Option<CorsOrigins>,
+    /// The sampled access log (`--access-log-sample`), installed outside the
+    /// CORS layer; `None` when the sample rate is `0`.
+    pub(crate) access_log: Option<Arc<AccessLog>>,
+}
+
+/// The sampled access log (`--access-log-sample`): one `gateway::access` line
+/// for each sampled request (see [`log_access`]), written when the response
+/// head is ready or, when the request is cancelled first, as it is dropped.
+///
+/// Sampling is deterministic and needs no random source: the `n`th counted
+/// request, counting from one, is logged when `floor(n * rate)` exceeds
+/// `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n`
+/// requests are logged, evenly spread. A rate of `1` logs every request. The
+/// probes are not counted.
+#[derive(Debug)]
+pub(crate) struct AccessLog {
+    /// Fraction of requests logged, in `(0, 1]`.
+    rate: f64,
+    /// Requests counted so far.
+    requests: AtomicU64,
+    /// Reduces a client address to the rate limiter's key for it (its network
+    /// prefix), so a line names the client the way the limiter meters it.
+    prefix: PrefixPolicy,
+}
+
+impl AccessLog {
+    /// Build the access log for a sample `rate` already validated to `0..=1`,
+    /// or `None` at `0`, where the log is off and no layer is installed.
+    pub(crate) fn new(rate: f64, prefix: PrefixPolicy) -> Option<Arc<Self>> {
+        (rate > 0.0).then(|| Arc::new(Self { rate, requests: AtomicU64::new(0), prefix }))
+    }
+
+    /// Count one request and report whether it is logged.
+    fn sample(&self) -> bool {
+        // the counter only hands each request a distinct position, which
+        // `fetch_add` does under any ordering
+        let before = self.requests.fetch_add(1, Ordering::Relaxed);
+        // exact while the count stays below 2^53, which takes centuries at any
+        // rate the gateway can serve
+        (before.saturating_add(1) as f64 * self.rate).floor() > (before as f64 * self.rate).floor()
+    }
+}
+
+/// Request extension marking a request the access log samples. The proxy
+/// notes the request's class and route in the [`AccessRecord`] as it learns
+/// them, so the line names them even when the request's future is dropped
+/// before a response exists; a request the log skips carries no slot and is
+/// not classified for it.
+#[derive(Clone, Debug)]
+pub(crate) struct AccessSampled(pub(crate) Arc<AccessRecord>);
+
+/// One sampled request's access line, written exactly once as the guard
+/// drops: after [`log_access`] has the response head, or with the request's
+/// future when the request is cancelled first.
+#[derive(Debug)]
+struct AccessEntry {
+    /// The resolved client's network prefix, as the rate limiter keys it.
+    client: String,
+    /// When the access log took the request.
+    started: Instant,
+    /// The declared `Content-Length` (`0` when there is none), logged as
+    /// `bytes_in` when the proxy never read the body.
+    declared_bytes: u64,
+    /// What the proxy noted about the request.
+    record: Arc<AccessRecord>,
+    /// The response status, or `None` while the request has no response.
+    status: Option<u16>,
+}
+
+impl Drop for AccessEntry {
+    fn drop(&mut self) {
+        let (class, bytes_in) = self.record.class().unwrap_or(("unknown", self.declared_bytes));
+        info!(
+            target: "gateway::access",
+            client = %self.client,
+            class,
+            route = self.record.route(),
+            status = self.status.unwrap_or(CLIENT_CLOSED_REQUEST),
+            latency_ms = u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            bytes_in,
+            "request"
+        );
+    }
 }
 
 /// JSON body of the gateway's `/ready` response.
@@ -524,15 +615,21 @@ impl Drop for ClientSlot {
 /// those paths, so proxying it would let JSON-RPC skip the limits.
 ///
 /// `layers` carries the optional layers (see [`RouterLayers`]). When it holds
-/// rate limiters, the rate-limit layer is installed inside three layers and
-/// outside every other one, so an over-limit request is shed with a JSON-RPC
-/// `429` before its body is buffered or forwarded, and before it reserves any
-/// of the byte budget. Outside it are, innermost first, the CORS layer when
-/// `layers` holds allowed origins, the identity middleware ([`identify`]),
-/// which resolves the client address the rate limiter keys on and the proxy
-/// forwards, believing `X-Forwarded-For` only from a peer in
+/// rate limiters, the rate-limit layer is installed inside up to four layers
+/// and outside every other one, so an over-limit request is shed with a
+/// JSON-RPC `429` before its body is buffered or forwarded, and before it
+/// reserves any of the byte budget. Outside it are, innermost first, the CORS
+/// layer when `layers` holds allowed origins, the access log ([`log_access`])
+/// when it holds one, the identity middleware ([`identify`]), which resolves
+/// the client address the rate limiter keys on, the access log names and the
+/// proxy forwards, believing `X-Forwarded-For` only from a peer in
 /// `trusted_proxies`, and, outermost, the `nosniff` layer ([`set_nosniff`]),
 /// so every response the service produces carries it, that `429` included.
+///
+/// The access log sits outside every layer that can answer a request itself,
+/// so a request answered there is logged like a proxied one: a `429`, a
+/// byte-budget `413` or `503`, a `405`, a `408` and, with CORS on, a preflight.
+/// `/health` and `/ready` are exempt by path, as from the rate limiter.
 ///
 /// The CORS layer answers every `OPTIONS` itself as a preflight, so a
 /// preflight is never forwarded, never refused by the proxy's `POST`-only
@@ -542,11 +639,11 @@ impl Drop for ClientSlot {
 /// installed and no CORS header is ever added; an `OPTIONS` then gets the
 /// same `405` as any other method but `POST`.
 ///
-/// `/ready/any` is added after every layer but the `nosniff` one, the identity
-/// and CORS layers included, so it answers from memory with none of them
-/// applied: it is never rate limited, metered, charged against the byte
-/// budget or deadline-bound, like `/health` and `/ready`, and it never carries
-/// a CORS header (an `OPTIONS` to it gets the probes' `405`). `/health` and
+/// `/ready/any` is added after every layer but the `nosniff` one, the identity,
+/// access-log and CORS layers included, so it answers from memory with none of
+/// them applied: it is never rate limited, metered, logged, charged against
+/// the byte budget or deadline-bound, like `/health` and `/ready`, and it never
+/// carries a CORS header (an `OPTIONS` to it gets the probes' `405`). `/health` and
 /// `/ready` sit inside the CORS layer, which answers an `OPTIONS` to them and
 /// adds `Access-Control-Allow-Origin` to their answers for an allowed `Origin`.
 pub(crate) fn router(
@@ -584,8 +681,15 @@ pub(crate) fn router(
         Some(origins) => router.layer(cors_layer(origins)),
         None => router,
     };
-    // Add the identity layer after the CORS and rate-limit layers so it runs
-    // before them: the limiter reads the client address this layer stores.
+    // Add the access log after CORS so it runs before it and logs every
+    // answer the layers inside give (a preflight, a `429`, a `503`), and
+    // before the identity layer so it names the resolved client.
+    let router = match layers.access_log {
+        Some(log) => router.layer(from_fn_with_state(log, log_access)),
+        None => router,
+    };
+    // Add the identity layer after the access-log, CORS and rate-limit layers
+    // so it runs before them: they read the client address this layer stores.
     let router = router.layer(from_fn_with_state(trusted_proxies, identify));
     // a layer wraps only the routes added before it, so this probe, like
     // `/health` and `/ready` (exempt in `crate::ratelimit`), is never rate
@@ -630,6 +734,57 @@ fn cors_layer(origins: CorsOrigins) -> CorsLayer {
         .allow_methods([Method::POST])
         .allow_headers([header::CONTENT_TYPE])
         .max_age(CORS_MAX_AGE)
+}
+
+/// Axum middleware: write one `gateway::access` line for each request the
+/// [`AccessLog`] samples. The probes `/health` and `/ready` are neither
+/// counted nor logged (`/ready/any` and the probe listener never reach it).
+///
+/// An [`AccessEntry`] guard writes the line exactly once: when the response
+/// head is ready, or, when the request's future is dropped before it has a
+/// response (the client closed the connection while the request was being
+/// forwarded, the connection lifetime cap, shutdown), with status
+/// [`CLIENT_CLOSED_REQUEST`].
+///
+/// The line's fields are `client` (the resolved client's [`ClientAddr`]
+/// masked to its network prefix, as the rate limiter keys it, so behind a
+/// trusted front it names the forwarded client, never the front), `class`
+/// and `route` (from the [`AccessRecord`] the proxy keeps in the request's
+/// [`AccessSampled`] slot, or `unknown` and `rejected` for a request answered
+/// or dropped before the proxy read its body: a rate-limit `429`, a byte
+/// budget refusal, a `405`, a request timeout before the forward started),
+/// `status`, `latency_ms` (until the response head is ready or the request is
+/// dropped; a streamed body is still being written) and `bytes_in` (the
+/// buffered body's length, or the declared `Content-Length` when the body was
+/// never read). It carries no URL, header value, body, params or method name.
+async fn log_access(
+    State(log): State<Arc<AccessLog>>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    if path == HEALTH_PATH || path == READY_PATH || !log.sample() {
+        return next.run(request).await;
+    }
+    let started = Instant::now();
+    let client = request.extensions().get::<ClientAddr>().map_or_else(
+        || String::from("unknown"),
+        |ClientAddr(client)| log.prefix.key(*client).to_string(),
+    );
+    let declared_bytes = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let record = Arc::new(AccessRecord::default());
+    request.extensions_mut().insert(AccessSampled(Arc::clone(&record)));
+    // the guard writes the line as it drops: on return, once the response head
+    // is ready, or with this future if the request is cancelled first
+    let mut entry = AccessEntry { client, started, declared_bytes, record, status: None };
+    let response = next.run(request).await;
+    entry.status = Some(response.status().as_u16());
+    response
 }
 
 /// Bound a whole request by `deadline`, answering an overrun with the
@@ -1248,7 +1403,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{check_chain_ids, log_chain_id_check, ChainIdCheck, UpstreamClients},
-        cli::{Cli, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
+        cli::{Cli, LogFormat, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
         config::UpstreamWorker,
         dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
@@ -1272,6 +1427,8 @@ mod tests {
     };
     use reqwest::redirect::Policy;
     use std::{
+        collections::BTreeMap,
+        fmt,
         io::Write as _,
         sync::atomic::{AtomicUsize, Ordering},
         time::Instant,
@@ -1290,6 +1447,15 @@ mod tests {
             server::WebPkiClientVerifier, RootCertStore, ServerConfig,
         },
         TlsAcceptor,
+    };
+    use tracing::{
+        field::{Field, Visit},
+        subscriber::DefaultGuard,
+        Event, Subscriber,
+    };
+    use tracing_subscriber::{
+        layer::{Context, SubscriberExt as _},
+        Layer,
     };
 
     /// Graceful drain timeout of the accept loops the helpers below spawn.
@@ -7748,7 +7914,11 @@ mod tests {
             Duration::from_secs(5),
             MAX_REQUEST_BYTES,
             NonZeroU32::new(MAX_INFLIGHT_REQUEST_BYTES),
-            RouterLayers { rate_limiters: Some(limiters), cors: cors_list(&[origin]) },
+            RouterLayers {
+                rate_limiters: Some(limiters),
+                cors: cors_list(&[origin]),
+                ..RouterLayers::default()
+            },
             Arc::default(),
         );
         let (gateway, _shutdown) = spawn(app).await;
@@ -7872,5 +8042,519 @@ mod tests {
         assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(header_value(&response, header::ALLOW), "GET,HEAD");
         assert_eq!(cors_headers(&response), Vec::<String>::new());
+    }
+
+    /// The fields every access-log line carries, besides its message.
+    const ACCESS_FIELDS: [&str; 6] =
+        ["client", "class", "route", "status", "latency_ms", "bytes_in"];
+
+    /// One captured `gateway::access` line: each field by name, the message
+    /// included, with its value as the log renders it.
+    type AccessLine = BTreeMap<String, String>;
+
+    /// A tracing layer that keeps every `gateway::access` event.
+    #[derive(Clone, Debug, Default)]
+    struct AccessLines(Arc<Mutex<Vec<AccessLine>>>);
+
+    impl AccessLines {
+        /// Capture this thread's `gateway::access` lines until the guard
+        /// drops. `#[tokio::test]` runs every task on the test's thread, the
+        /// gateway's connections included, so their lines land here.
+        fn capture() -> (Self, DefaultGuard) {
+            let lines = Self::default();
+            let subscriber = tracing_subscriber::registry().with(lines.clone());
+            (lines, tracing::subscriber::set_default(subscriber))
+        }
+
+        /// The lines captured so far, oldest first.
+        fn lines(&self) -> Vec<AccessLine> {
+            self.0.lock().expect("capture lock").clone()
+        }
+    }
+
+    impl<S: Subscriber> Layer<S> for AccessLines {
+        fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+            if event.metadata().target() == "gateway::access" {
+                let mut line = AccessLine::new();
+                event.record(&mut LineFields(&mut line));
+                self.0.lock().expect("capture lock").push(line);
+            }
+        }
+    }
+
+    /// Collects an event's fields into an [`AccessLine`].
+    struct LineFields<'a>(&'a mut AccessLine);
+
+    impl Visit for LineFields<'_> {
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    /// The gateway router with the access log at `rate` (and, when given,
+    /// rate limiters), keying clients by the default prefixes and trusting no
+    /// proxy.
+    fn access_router(state: AppState, rate: f64, limiters: Option<Arc<RateLimiters>>) -> Router {
+        access_router_with(
+            state,
+            rate,
+            RouterLayers { rate_limiters: limiters, ..RouterLayers::default() },
+            Arc::default(),
+        )
+    }
+
+    /// [`access_router`] with other optional `layers` and `trusted` proxies;
+    /// the access log in `layers` is replaced by one at `rate`.
+    fn access_router_with(
+        state: AppState,
+        rate: f64,
+        layers: RouterLayers,
+        trusted: Arc<TrustedProxies>,
+    ) -> Router {
+        let access_log = AccessLog::new(rate, PrefixPolicy::default());
+        router(
+            state,
+            Duration::from_secs(5),
+            MAX_REQUEST_BYTES,
+            NonZeroU32::new(MAX_INFLIGHT_REQUEST_BYTES),
+            RouterLayers { access_log, ..layers },
+            trusted,
+        )
+    }
+
+    /// A gateway state whose one worker is the ready mock at `worker`.
+    fn ready_state(worker: SocketAddr) -> AppState {
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        state
+    }
+
+    /// A mock upstream that counts each POST as it arrives and answers it only
+    /// after `delay` ([`slow_mock`] with a hit count). The `Notifier` keeps it
+    /// alive.
+    async fn counted_slow_mock(delay: Duration) -> (SocketAddr, Seen, Notifier) {
+        let seen = Seen::default();
+        let counters = seen.clone();
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let counters = counters.clone();
+                async move {
+                    counters.hits.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(delay).await;
+                    "late"
+                }
+            }),
+        );
+        let (addr, shutdown) = spawn(mock).await;
+        (addr, seen, shutdown)
+    }
+
+    #[tokio::test]
+    async fn sample_rate_one_logs_every_request_including_429s() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        // two requests of burst and a refill too slow to matter inside the
+        // test, so the third request is shed with a `429`
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(2))),
+            None,
+            16,
+            PrefixPolicy::default(),
+        );
+        let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 1.0, limiters)).await;
+
+        let body = call("eth_chainId", 1);
+        let mut statuses = Vec::new();
+        for _ in 0..3 {
+            statuses.push(post_rpc(gateway, None, body.clone()).await.0);
+        }
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::OK, StatusCode::TOO_MANY_REQUESTS]);
+
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 3, "one line per request: {lines:?}");
+        for line in &lines {
+            let mut fields: Vec<&str> = line.keys().map(String::as_str).collect();
+            fields.retain(|field| *field != "message");
+            let mut expected = ACCESS_FIELDS.to_vec();
+            expected.sort_unstable();
+            assert_eq!(fields, expected, "{line:?}");
+            assert_eq!(line["client"], "127.0.0.1");
+            line["latency_ms"].parse::<u64>().expect("latency_ms is whole milliseconds");
+        }
+        let seen: Vec<[&str; 4]> = lines
+            .iter()
+            .map(|line| {
+                [&line["status"], &line["class"], &line["route"], &line["bytes_in"]]
+                    .map(String::as_str)
+            })
+            .collect();
+        // the shed request never reached the proxy: no class, no route, and
+        // its size is the declared `Content-Length`
+        let size = body.len().to_string();
+        assert_eq!(
+            seen,
+            [
+                ["200", "query", "worker", size.as_str()],
+                ["200", "query", "worker", size.as_str()],
+                ["429", "unknown", "rejected", size.as_str()],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sample_rate_zero_logs_nothing() {
+        let (lines, _capture) = AccessLines::capture();
+        assert!(
+            AccessLog::new(0.0, PrefixPolicy::default()).is_none(),
+            "a zero rate installs no access log"
+        );
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let limiters = RateLimiters::new(
+            None,
+            Some(RateLimit::new(nz(1), nz(1))),
+            None,
+            16,
+            PrefixPolicy::default(),
+        );
+        let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 0.0, limiters)).await;
+
+        let mut statuses = Vec::new();
+        for id in 1..=3 {
+            statuses.push(post_rpc(gateway, None, call("eth_chainId", id)).await.0);
+        }
+        assert_eq!(
+            statuses,
+            [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS, StatusCode::TOO_MANY_REQUESTS]
+        );
+        assert_eq!(lines.lines(), Vec::<AccessLine>::new());
+    }
+
+    #[tokio::test]
+    async fn sample_rate_half_logs_every_other_request() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 0.5, None)).await;
+
+        // ids of different widths give every request its own body length, so
+        // a line's `bytes_in` names the request it logged
+        let bodies = [1, 22, 333, 4_444, 55_555, 666_666].map(|id| call("eth_chainId", id));
+        for body in &bodies {
+            assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::OK);
+        }
+
+        let logged: Vec<String> =
+            lines.lines().iter().map(|line| line["bytes_in"].clone()).collect();
+        let every_other: Vec<String> =
+            bodies.iter().skip(1).step_by(2).map(|body| body.len().to_string()).collect();
+        assert_eq!(logged, every_other, "the 2nd, 4th and 6th requests are logged");
+    }
+
+    #[tokio::test]
+    async fn access_log_carries_no_url_body_or_params() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(access_router(state, 1.0, None)).await;
+
+        // a read for the query upstream and a submission for the worker, each
+        // with a path, a query string, a header value and params that must
+        // stay out of the log
+        let read = r#"{"jsonrpc":"2.0","method":"eth_getBalance","params":["0x5ec2e75ec2e75ec2e75ec2e75ec2e75ec2e75ec2","latest"],"id":"read-id"}"#;
+        // a transaction the screen passes: it decodes both submission methods
+        let submission = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransactionSync","params":["{SIGNED_TX}"],"id":"submission-id"}}"#
+        );
+        let client = Client::new();
+        for body in [read.to_string(), submission.clone()] {
+            let response = client
+                .post(format!("http://{gateway}/private/path?api_key=SECRET"))
+                .header("authorization", "Bearer SECRET-TOKEN")
+                .body(body)
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!((query_seen.hits(), worker_seen.hits()), (1, 1));
+
+        let lines = lines.lines();
+        let routes: Vec<(&str, &str)> =
+            lines.iter().map(|line| (line["class"].as_str(), line["route"].as_str())).collect();
+        assert_eq!(routes, [("query", "query"), ("submission", "worker")]);
+        let rendered = format!("{lines:?}");
+        let secrets = [
+            query.to_string(),
+            worker.to_string(),
+            gateway.to_string(),
+            read.to_string(),
+            submission.clone(),
+            SIGNED_TX[..18].to_string(),
+            "eth_getBalance".to_string(),
+            "eth_sendRawTransactionSync".to_string(),
+            "0x5ec2e7".to_string(),
+            "latest".to_string(),
+            "read-id".to_string(),
+            "submission-id".to_string(),
+            "private".to_string(),
+            "api_key".to_string(),
+            "SECRET".to_string(),
+        ];
+        for secret in secrets {
+            assert!(!rendered.contains(&secret), "the access log leaks {secret:?}: {rendered}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probes_are_not_logged() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        // at 0.5 a probe that took a sample position would shift which
+        // proxied request is logged
+        let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 0.5, None)).await;
+
+        let client = Client::new();
+        for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH, HEALTH_PATH] {
+            let response =
+                client.get(format!("http://{gateway}{path}")).send().await.expect("send");
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        assert_eq!(lines.lines(), Vec::<AccessLine>::new(), "a probe was logged");
+
+        // bodies of different lengths name the request each line logged
+        let bodies = [call("eth_chainId", 1), call("eth_chainId", 22)];
+        for body in &bodies {
+            assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::OK);
+        }
+        let logged: Vec<String> =
+            lines.lines().iter().map(|line| line["bytes_in"].clone()).collect();
+        assert_eq!(logged, [bodies[1].len().to_string()], "probes took sample positions");
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_logged_unknown_rejected() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let layers = RouterLayers { access_log, ..RouterLayers::default() };
+        let app =
+            router(ready_state(worker), Duration::from_secs(5), 64, None, layers, Arc::default());
+        let (gateway, _shutdown) = spawn(app).await;
+
+        let body = call("eth_chainId", 1).repeat(4);
+        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::PAYLOAD_TOO_LARGE);
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let size = body.len().to_string();
+        assert_eq!(
+            [&lines[0]["class"], &lines[0]["route"], &lines[0]["status"], &lines[0]["bytes_in"]]
+                .map(String::as_str),
+            ["unknown", "rejected", "413", size.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_request_is_logged_with_status_499() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(2)).await;
+        let (gateway, _shutdown) = spawn(access_router(ready_state(worker), 1.0, None)).await;
+
+        // a complete request, then a close while the gateway awaits the worker
+        let body = call("eth_chainId", 1);
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        for _ in 0..60 {
+            if worker_seen.hits() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(worker_seen.hits(), 1, "the request never reached the worker");
+        drop(stream);
+
+        for _ in 0..60 {
+            if !lines.lines().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 1, "one line for the cancelled request: {lines:?}");
+        let mut fields: Vec<&str> = lines[0].keys().map(String::as_str).collect();
+        fields.retain(|field| *field != "message");
+        let mut expected = ACCESS_FIELDS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(fields, expected, "{lines:?}");
+        let size = body.len().to_string();
+        assert_eq!(
+            [&lines[0]["class"], &lines[0]["route"], &lines[0]["status"], &lines[0]["bytes_in"]]
+                .map(String::as_str),
+            ["query", "worker", "499", size.as_str()]
+        );
+    }
+
+    #[tokio::test]
+    async fn request_timeout_after_forward_keeps_class_and_route() {
+        let (lines, _capture) = AccessLines::capture();
+        // the worker answers after the whole-request deadline but well inside
+        // the proxy client's own timeout, so the deadline fires mid-forward
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(1)).await;
+        let proxy_client =
+            Client::builder().timeout(Duration::from_secs(5)).build().expect("build client");
+        let state = test_state_with_client(&[upstream(worker)], proxy_client);
+        state.readiness.set_ready(0, true);
+        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let layers = RouterLayers { access_log, ..RouterLayers::default() };
+        let app = router(
+            state,
+            Duration::from_millis(300),
+            MAX_REQUEST_BYTES,
+            None,
+            layers,
+            Arc::default(),
+        );
+        let (gateway, _shutdown) = spawn(app).await;
+
+        let body = call("eth_chainId", 1);
+        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(worker_seen.hits(), 1, "the request was forwarded");
+        let lines = lines.lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let size = body.len().to_string();
+        assert_eq!(
+            [&lines[0]["class"], &lines[0]["route"], &lines[0]["status"], &lines[0]["bytes_in"]]
+                .map(String::as_str),
+            ["query", "worker", "408", size.as_str()]
+        );
+    }
+
+    /// Behind a trusted front the line names the client the front forwarded
+    /// for, masked to the rate limiter's prefix, as the limiter keys it; never
+    /// the front's own address.
+    #[tokio::test]
+    async fn access_log_names_the_forwarded_client_behind_a_trusted_proxy() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, _seen, _worker) = named_mock("worker").await;
+        let trusted = Arc::new("127.0.0.1/32".parse::<TrustedProxies>().expect("trusted proxies"));
+        let layers =
+            RouterLayers { rate_limiters: one_request_per_ip(), ..RouterLayers::default() };
+        let (gateway, _shutdown) =
+            spawn(access_router_with(ready_state(worker), 1.0, layers, trusted)).await;
+
+        // the second request from the first client is shed by its own bucket,
+        // and logged against it
+        let mut statuses = Vec::new();
+        for client in ["198.51.100.1", "198.51.100.1", "2001:db8::1:2:3:4"] {
+            statuses.push(post_with(gateway, &[("x-forwarded-for", client)]).await.0);
+        }
+        assert_eq!(statuses, [StatusCode::OK, StatusCode::TOO_MANY_REQUESTS, StatusCode::OK]);
+        let logged: Vec<[String; 2]> = lines
+            .lines()
+            .iter()
+            .map(|line| [line["client"].clone(), line["status"].clone()])
+            .collect();
+        // an IPv6 client is masked to the default /64
+        assert_eq!(
+            logged,
+            [["198.51.100.1", "200"], ["198.51.100.1", "429"], ["2001:db8::", "200"]]
+                .map(|line| line.map(String::from))
+        );
+    }
+
+    /// The layers that answer a request themselves sit inside the access log,
+    /// so a CORS preflight and a non-`POST` request are logged (`unknown`,
+    /// `rejected`, their own status) and take sample positions like any other.
+    #[tokio::test]
+    async fn edge_answers_are_logged_unknown_rejected() {
+        let (lines, _capture) = AccessLines::capture();
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let origin = "https://app.example";
+        let layers = RouterLayers { cors: cors_list(&[origin]), ..RouterLayers::default() };
+        let (gateway, _shutdown) =
+            spawn(access_router_with(ready_state(worker), 1.0, layers, Arc::default())).await;
+
+        let preflight_status = preflight(gateway, origin).await.status();
+        assert!(preflight_status.is_success(), "{preflight_status}");
+        let put = Client::new().put(format!("http://{gateway}/")).send().await.expect("send");
+        assert_eq!(put.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(worker_seen.hits(), 0);
+
+        let logged: Vec<[String; 3]> = lines
+            .lines()
+            .iter()
+            .map(|line| [line["class"].clone(), line["route"].clone(), line["status"].clone()])
+            .collect();
+        assert_eq!(
+            logged,
+            [["unknown", "rejected", preflight_status.as_str()], ["unknown", "rejected", "405"],]
+                .map(|line| line.map(String::from))
+        );
+    }
+
+    /// The access line carries the same six fields under `--log-format json`
+    /// as under `text`, and no others.
+    #[test]
+    fn access_line_has_the_same_fields_in_json_and_text() -> eyre::Result<()> {
+        let line = |format| {
+            let logs = CapturedLogs::default();
+            let scoped = crate::subscriber("info", format, false, logs.clone());
+            tracing::subscriber::with_default(scoped, || {
+                drop(AccessEntry {
+                    client: String::from("198.51.100.0"),
+                    started: Instant::now(),
+                    declared_bytes: 7,
+                    record: Arc::default(),
+                    status: Some(429),
+                });
+            });
+            logs.contents()
+        };
+        let expected = [
+            ("client", "198.51.100.0"),
+            ("class", "unknown"),
+            ("route", "rejected"),
+            ("status", "429"),
+            ("bytes_in", "7"),
+        ];
+
+        let json = line(LogFormat::Json);
+        let json: serde_json::Value = serde_json::from_str(json.trim())?;
+        assert_eq!(json["target"], "gateway::access");
+        assert_eq!(json["level"], "INFO");
+        let fields = json["fields"].as_object().expect("fields object");
+        let mut names: Vec<&str> = fields.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        let mut want = ACCESS_FIELDS.to_vec();
+        want.push("message");
+        want.sort_unstable();
+        assert_eq!(names, want, "{json}");
+        for (name, value) in expected {
+            assert_eq!(fields[name].to_string().trim_matches('"'), value, "{name}");
+        }
+        assert!(fields["latency_ms"].is_u64(), "{json}");
+
+        let text = line(LogFormat::Text);
+        assert_eq!(text.lines().count(), 1, "{text:?}");
+        assert!(text.contains("gateway::access"), "{text:?}");
+        // the text format quotes a string field, as it renders every `&str`
+        for (name, value) in expected {
+            let plain = format!("{name}={value}");
+            let quoted = format!("{name}=\"{value}\"");
+            assert!(text.contains(&plain) || text.contains(&quoted), "{name}: {text:?}");
+        }
+        assert!(text.contains("latency_ms="), "{text:?}");
+        Ok(())
     }
 }

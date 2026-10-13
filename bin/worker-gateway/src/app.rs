@@ -25,7 +25,7 @@ use crate::{
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
     server::{
-        inflight_slots, serve, serve_probes, AppState, CorsOrigins, RecentSubmissions,
+        inflight_slots, serve, serve_probes, AccessLog, AppState, CorsOrigins, RecentSubmissions,
         RouterLayers, ServerLimits, RECENT_SUBMISSIONS_CAPACITY,
     },
     telemetry::run_throttle_summaries,
@@ -103,6 +103,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         graceful_shutdown_timeout,
         metrics_addr,
         cors_allowed_origins,
+        access_log_sample,
     } = settings;
 
     info!(
@@ -158,6 +159,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     } else {
         format!("deny {}", denied_method_prefixes.join(","))
     };
+    // The sampled access log keys clients by the same prefix as the per-IP
+    // limiter, or `None` when `--access-log-sample` is `0`.
+    let access_log = AccessLog::new(access_log_sample, rate_limit_prefix);
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
@@ -177,6 +181,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         ?dns_cache_ttl,
         %max_concurrent_dns_lookups,
         %method_policy,
+        access_log = %access_log
+            .as_ref()
+            .map_or_else(|| String::from("off"), |_| format!("sampling {access_log_sample}")),
         "edge protections configured"
     );
     if let Some(idle_heads) =
@@ -357,7 +364,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             listen_addr,
             state,
             limits,
-            RouterLayers { rate_limiters, cors: cors_allowed_origins },
+            RouterLayers { rate_limiters, cors: cors_allowed_origins, access_log },
             trusted_proxies,
             graceful_shutdown_timeout,
             shutdown.subscribe(),

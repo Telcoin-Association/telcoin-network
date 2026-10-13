@@ -554,6 +554,16 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_CORS_ALLOWED_ORIGINS")]
     pub(crate) cors_allowed_origins: Option<String>,
 
+    /// Fraction of proxied requests written to the access log (tracing target
+    /// `gateway::access`), from `0` to `1`: `1` logs every request, rate-limit
+    /// `429`s included, `0.01` one in a hundred, and the default `0` disables
+    /// the log. A line carries the client's network prefix, the method class,
+    /// the route, the status, the latency and the request size, never a URL,
+    /// body, params or header value. A value outside `0..=1` is a startup
+    /// error.
+    #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_SAMPLE", default_value_t = 0.0)]
+    pub(crate) access_log_sample: f64,
+
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
@@ -673,6 +683,9 @@ pub(crate) struct Settings {
     /// Origins allowed to call the gateway cross-origin, or `None` when CORS is
     /// off.
     pub(crate) cors_allowed_origins: Option<CorsOrigins>,
+    /// Fraction of proxied requests the access log samples, in `0..=1`; `0`
+    /// disables the log.
+    pub(crate) access_log_sample: f64,
 }
 
 impl Cli {
@@ -855,6 +868,13 @@ impl Cli {
         );
         let cors_allowed_origins =
             self.cors_allowed_origins.as_deref().map(resolve_cors_origins).transpose()?;
+        // `contains` is false for NaN too, so every value that is not a
+        // fraction fails here
+        eyre::ensure!(
+            (0.0..=1.0).contains(&self.access_log_sample),
+            "invalid --access-log-sample {}: use a fraction from 0 to 1",
+            self.access_log_sample
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             probe_addr: self.probe_addr,
@@ -898,6 +918,7 @@ impl Cli {
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
             cors_allowed_origins,
+            access_log_sample: self.access_log_sample,
         })
     }
 
@@ -1944,6 +1965,23 @@ mod tests {
         for (cap, warns) in [(0, true), (80, false), (499, false), (500, true), (600, true)] {
             assert_eq!(query_cap_reaches_connections(cap, connections), warns, "{cap}");
         }
+    }
+
+    #[test]
+    fn rate_out_of_range_is_rejected_at_startup() -> eyre::Result<()> {
+        for rate in ["-0.1", "1.01", "2", "NaN", "inf"] {
+            let result = cli_with_flags(&[&format!("--access-log-sample={rate}")]).into_settings();
+            assert!(result.is_err(), "--access-log-sample={rate} must fail startup");
+        }
+        // the access log is off unless asked for, and both ends of the range
+        // are accepted
+        assert!(cli_with_flags(&[]).into_settings()?.access_log_sample.abs() < f64::EPSILON);
+        for (flag, rate) in [("0", 0.0), ("0.25", 0.25), ("1", 1.0)] {
+            let settings =
+                cli_with_flags(&[&format!("--access-log-sample={flag}")]).into_settings()?;
+            assert!((settings.access_log_sample - rate).abs() < f64::EPSILON, "{flag}");
+        }
+        Ok(())
     }
 
     #[test]

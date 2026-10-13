@@ -162,6 +162,7 @@ Every flag has an environment-variable fallback.
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
+| `--access-log-sample` | `WORKER_GATEWAY_ACCESS_LOG_SAMPLE` | `0` | Fraction of proxied requests written to the access log, from `0` to `1` (`0` disables); see [Access log](#access-log). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 | `--log-format` | `WORKER_GATEWAY_LOG_FORMAT` | `text` | Log line format: `text` or `json` (one JSON object per line). `text` is coloured only when stdout is a terminal and `NO_COLOR` is unset or empty; `json` is never coloured. |
 
@@ -808,6 +809,33 @@ nothing per request (`405`, `429`, `408`, `-32010`, `-32011` and an aborted body
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
+
+### Access log
+
+Pass `--access-log-sample <rate>` (or `WORKER_GATEWAY_ACCESS_LOG_SAMPLE`) to write one `info` line per sampled request on the client listener under the tracing target `gateway::access`.
+The rate is a fraction from `0` to `1`: `1` logs every request, `0.01` one in a hundred, and the default `0` turns the log off.
+A value outside that range, or one that is not a number, stops the gateway at startup.
+
+Sampling is deterministic and uses no random source.
+The gateway counts the requests and logs the `n`th one when `floor(n * rate)` is greater than `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n` requests are logged, evenly spread: at `0.5` every second request, at `0.25` every fourth.
+The probes are neither counted nor logged: `/health` and `/ready` are exempt by path, `/ready/any` is outside the log, and the `--probe-addr` listener has no access log.
+The log sits outside every layer that answers a request itself, so such a request is logged like any other: a `429` from the rate limiter, a `413` or `503` from the request-size checks, a `405` for a method other than `POST`, a `408`, and, with `--cors-allowed-origins` set, a CORS preflight.
+
+| Field | Meaning |
+| --- | --- |
+| `client` | The resolved client address (the peer, or behind a `--trusted-proxies` front the client it forwarded for; see [Client identity behind a front](#client-identity-behind-a-front)), never the front's own, masked to the per-IP rate limiter's prefix (`--rate-limit-per-ip-v4-prefix`, `--rate-limit-per-ip-v6-prefix`), so a line names a client the way the limiter meters it. At the default IPv4 `/32` this is the full address. |
+| `class` | `submission` for a single `eth_sendRawTransaction` or `eth_sendRawTransactionSync` call, `batch` for any JSON-RPC batch whatever it holds, `query` for any other request body, and `unknown` when the gateway answered before reading the body. It does not depend on `--redirect-queries`. |
+| `route` | `worker` or `query` for a request forwarded to that upstream, whatever the forward's result, a timeout included; `rejected` for a request the gateway answered itself (rate limit, request size or in-flight byte budget, a method other than `POST`, a CORS preflight, a request timeout before the forward started, loop marker, unreadable or over-long batch, denied method, transaction screen, submission budget, in-flight cap, no ready worker). |
+| `status` | The HTTP status returned to the client, or `499` when the connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
+| `latency_ms` | Whole milliseconds from the request reaching the gateway until the response head is ready, or until the connection closed for a `499`; a streamed response body may still be in flight. |
+| `bytes_in` | The request body's length in bytes, or, when the gateway answered before reading the body, the `Content-Length` the client declared: unverified, so a client can inflate it, and `0` for a chunked body that declares none. |
+
+A line never carries the request URL, a header value, the body, the params, or a method name beyond its class.
+Under `--log-format json` a line is one object with `target` `gateway::access` and the same fields under `fields`, next to `message` `request`.
+With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
+The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, with no ceiling of its own, so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
+One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, not by its rate limit.
+Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
 
 ## Operator guidance
 
