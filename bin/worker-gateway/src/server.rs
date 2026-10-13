@@ -73,7 +73,7 @@ use crate::{
     },
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
-    telemetry,
+    telemetry::{self, Throttle},
 };
 
 /// Pause before re-polling `accept()` after it fails, so a persistent accept
@@ -116,6 +116,17 @@ pub(crate) const DEFAULT_MAX_CONNECTIONS_PER_IP: usize = 32;
 /// `reason` label on `tn_worker_gateway_connections_refused_total` for a
 /// connection closed because its client prefix was at its cap.
 const REFUSED_PER_IP_CAP: &str = "per_ip_cap";
+
+/// `reason` label on `tn_worker_gateway_connections_refused_total` for a
+/// connection from a `--proxy-protocol` peer closed because its PROXY header
+/// was missing, malformed or late.
+const REFUSED_PROXY_HEADER: &str = "proxy_header";
+
+/// Throttle for the warning on a connection closed for its PROXY header. A
+/// misconfigured front has every connection closed this way, so the warning
+/// shows at the default log level, once per window.
+pub(crate) static PROXY_HEADER_WARNINGS: Throttle = Throttle::new("proxy_header");
+
 /// How long a browser may cache the gateway's answer to a CORS preflight
 /// (`Access-Control-Max-Age`).
 const CORS_MAX_AGE: Duration = Duration::from_secs(60 * 60);
@@ -1252,33 +1263,46 @@ async fn until_listener_closes(
 }
 
 /// Read the PROXY protocol v2 header a trusted front opens `stream` with,
-/// within `deadline`. `None` means the header was missing, late or malformed,
-/// and the connection is to be closed without a response.
+/// within `deadline`. `None` means the connection is to be closed without a
+/// response: the header was missing, late or malformed, which is counted and
+/// logged as a (throttled) warning naming the peer, or the peer went away
+/// before sending a byte (a TCP connect health check, say), which is not.
 async fn proxy_header(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     deadline: Duration,
 ) -> Option<ProxyHeader> {
-    match tokio::time::timeout(deadline, read_proxy_header(stream)).await {
-        Ok(Ok(header)) => Some(header),
-        Ok(Err(err)) => {
+    let read = async {
+        if matches!(stream.peek(&mut [0_u8; 1]).await, Ok(0) | Err(_)) {
+            return Ok(None);
+        }
+        read_proxy_header(stream).await.map(Some)
+    };
+    let reason = match tokio::time::timeout(deadline, read).await {
+        Ok(Ok(Some(header))) => return Some(header),
+        Ok(Ok(None)) => {
             debug!(
                 target: "gateway::server",
                 %peer_addr,
-                %err,
-                "unreadable PROXY protocol header; closing connection"
+                "connection closed before its PROXY protocol header"
             );
-            None
+            return None;
         }
-        Err(_) => {
-            debug!(
-                target: "gateway::server",
-                %peer_addr,
-                "no PROXY protocol header within the header read timeout; closing connection"
-            );
-            None
-        }
+        Ok(Err(err)) => err.to_string(),
+        Err(_elapsed) => String::from("not complete within the header read timeout"),
+    };
+    telemetry::record_connection_refused(REFUSED_PROXY_HEADER);
+    if let Some(suppressed) = PROXY_HEADER_WARNINGS.admit() {
+        warn!(
+            target: "gateway::server",
+            %peer_addr,
+            %reason,
+            suppressed,
+            "missing, malformed or late PROXY protocol header from a peer that must send one; \
+             closing connection"
+        );
     }
+    None
 }
 
 /// Build the probe-only router served on `--probe-addr`: the health, readiness
@@ -3495,6 +3519,64 @@ mod tests {
         let response = raw_exchange(gateway, &valid, "").await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
         assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn bad_proxy_headers_are_counted_and_warned_once_per_window() {
+        const WARNING: &str = "missing, malformed or late PROXY protocol header";
+        let mut metrics = CapturedMetrics::install();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) =
+            spawn_proxy_protocol(state, None, "127.0.0.1/32", Duration::from_millis(300)).await;
+        let mut refused = || {
+            metrics.value(
+                "tn_worker_gateway_connections_refused_total",
+                &[("reason", REFUSED_PROXY_HEADER)],
+            )
+        };
+
+        // a missing header (plain http), a malformed one, and a late one (half
+        // a header, then nothing until the header read timeout)
+        assert_eq!(raw_exchange(gateway, b"", "").await, "");
+        let v1 = b"PROXY TCP4 198.51.100.1 127.0.0.1 4711 8545\r\n";
+        assert_eq!(raw_exchange(gateway, v1, "").await, "");
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let mut late = TcpStream::connect(gateway).await.expect("connect");
+        late.write_all(&header[..8]).await.expect("write");
+        let read = tokio::time::timeout(Duration::from_secs(5), late.read(&mut [0_u8; 1]))
+            .await
+            .expect("closed at the header read timeout");
+        assert_eq!(read.expect("read"), 0, "expected EOF");
+        assert_eq!(refused(), 3.0);
+        // the throttle lets one warning through per window, naming the peer
+        // and why
+        let text = logs.contents();
+        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        let line = text.lines().find(|line| line.contains(WARNING)).expect("the warning");
+        assert!(line.contains("WARN"), "{line}");
+        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+        assert!(line.contains("missing the PROXY protocol v2 signature"), "{line}");
+        assert!(line.contains("suppressed=0"), "{line}");
+
+        // a peer that connects and closes without a byte (a tcp connect check)
+        // is neither counted nor warned about
+        drop(TcpStream::connect(gateway).await.expect("connect"));
+        // a good header is served, and the closed connection was seen by then
+        let response = raw_exchange(gateway, &header, "").await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(refused(), 3.0);
+        let text = logs.contents();
+        assert_eq!(text.matches(WARNING).count(), 1, "{text}");
+        assert!(text.contains("connection closed before its PROXY protocol header"), "{text}");
     }
 
     #[tokio::test]

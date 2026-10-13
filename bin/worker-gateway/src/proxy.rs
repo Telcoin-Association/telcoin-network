@@ -84,7 +84,7 @@ use crate::{
     },
     identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
     ratelimit::{RateLimiters, SubmissionBudget},
-    server::{AccessSampled, AppState, RecentSubmissions},
+    server::{AccessSampled, AppState, RecentSubmissions, PROXY_HEADER_WARNINGS},
     telemetry::{self, Throttle},
 };
 
@@ -199,9 +199,9 @@ static FORWARD_FAILURE_WARNINGS: PerRoute =
 static UPSTREAM_ERROR_WARNINGS: PerRoute =
     PerRoute::new("upstream_error_worker", "upstream_error_query");
 
-/// Every per-request warning throttle, summarized by
-/// [`telemetry::run_throttle_summaries`].
-pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
+/// Every per-request (or, for a PROXY header, per-connection) warning
+/// throttle, summarized by [`telemetry::run_throttle_summaries`].
+pub(crate) static WARNING_THROTTLES: [&Throttle; 13] = [
     &HOP_LOOP_WARNINGS,
     &REDIRECT_LOOP_WARNINGS,
     &UNREADABLE_BATCH_WARNINGS,
@@ -214,6 +214,7 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
     &FORWARD_FAILURE_WARNINGS.query,
     &UPSTREAM_ERROR_WARNINGS.worker,
     &UPSTREAM_ERROR_WARNINGS.query,
+    &PROXY_HEADER_WARNINGS,
 ];
 
 /// The JSON-RPC call [`chain_id_request`] builds: the startup chain-id check

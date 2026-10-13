@@ -403,7 +403,9 @@ address is a single host):
   carries no forwarded client, so a balancer that sends `LOCAL` for relayed
   traffic puts those clients under its own address. A missing or malformed
   header, a header for another protocol, or one not complete within
-  `--header-read-timeout` closes the connection without a response; a peer
+  `--header-read-timeout` closes the connection without a response, counts
+  under `tn_worker_gateway_connections_refused_total{reason="proxy_header"}`
+  and logs a warning naming the peer (throttled to one line per 10 s); a peer
   that is not listed is served as plain HTTP. The `X-Forwarded-For` rule then
   runs against the address from the header, so it applies only when that
   address is itself listed (an HTTP proxy behind the balancer).
@@ -812,7 +814,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
 | `tn_worker_gateway_inflight_request_bytes` | gauge | | Request-body bytes held against `--max-inflight-request-bytes` by requests in flight. |
 | `tn_worker_gateway_dns_lookups_total` | counter | `result` (`hit` / `miss` / `error` / `rejected`) | Upstream name resolutions: answered from the cache (fresh or stale), lookup started, lookup failed, or refused because every lookup slot was busy. A request that waits on a lookup already running for its host adds nothing. A stale answer whose background refresh is refused counts as both `hit` and `rejected`, and the request is still answered. The proxy and the readiness poller share the series. |
-| `tn_worker_gateway_connections_refused_total` | counter | `reason` (`per_ip_cap`) | Inbound connections closed before any request is read, by reason (`per_ip_cap`: the connection's client prefix already held `--max-connections-per-ip` connections; see [Connection handling](#connection-handling)). |
+| `tn_worker_gateway_connections_refused_total` | counter | `reason` (`per_ip_cap` / `proxy_header`) | Inbound connections closed before any request is read, by reason (`per_ip_cap`: the connection's client prefix already held `--max-connections-per-ip` connections, see [Connection handling](#connection-handling); `proxy_header`: a connection from a peer that must send a PROXY protocol v2 header sent a missing, malformed or late one, see [Client identity behind a front](#client-identity-behind-a-front); a peer that closes before its first byte, such as a TCP connect health check, is not counted). |
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
@@ -825,7 +827,8 @@ Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
 ready upstream, an oversized body, a worker's answer to a submission that
 could not be read whole, and, per route, a forwarding failure or an
-upstream error answer) are throttled per call site, so neither clients nor a
+upstream error answer), and the per-connection warning on a missing,
+malformed or late PROXY header, are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
