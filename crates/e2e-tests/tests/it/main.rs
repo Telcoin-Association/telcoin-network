@@ -9,6 +9,7 @@ mod eject;
 mod epochs;
 #[cfg(feature = "faucet")]
 mod faucet;
+mod forward_txs;
 mod genesis_tests;
 mod governance_safe_fork;
 mod metrics;

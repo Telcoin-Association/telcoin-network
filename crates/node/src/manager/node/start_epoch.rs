@@ -222,6 +222,7 @@ where
     /// down at its close. The node mode is (re)identified first, and the previous epoch's
     /// committee keys — resolved by `run_epoch`'s batched read pinned to `epoch_start_header` —
     /// are threaded in so peers from the outgoing committee are not banned during the handover.
+    /// A committee member running with `--forward-txs` gets a one-time warning here.
     ///
     /// After all nodes are up, the next two committees' validator keys are prefetched through
     /// the primary and worker network handles so their network info is already resolved when
@@ -238,7 +239,10 @@ where
         previous_committee_keys: HashSet<BlsPublicKey>,
     ) -> eyre::Result<(PrimaryNode<DB>, Vec<WorkerNode<DB>>)> {
         // create config for consensus
-        let _mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        let mode = self.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        if mode.is_cvv() {
+            engine.get_reth_env().await.warn_if_forwarding_on_committee_member();
+        }
 
         let primary = self
             .create_primary_node_components(

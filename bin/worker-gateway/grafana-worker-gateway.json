@@ -25,7 +25,7 @@
       "title": "Request rate by outcome",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -37,7 +37,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total[5m]))",
           "refId": "A",
@@ -52,7 +52,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Proxied requests per second split by terminal outcome (forwarded vs rejected)."
+      "description": "Proxied requests per second split by terminal outcome (forwarded, rejected, or upstream_error: an upstream error status without a JSON body)."
     },
     {
       "id": 3,
@@ -60,7 +60,7 @@
       "title": "In-flight requests (autoscaling signal)",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -72,7 +72,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "tn_worker_gateway_inflight_requests",
           "refId": "A",
@@ -87,7 +87,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Concurrent proxied requests in flight. This is the gauge the HorizontalPodAutoscaler targets."
+      "description": "Concurrent proxied requests in flight, a relayed response counting until its body has finished streaming. This is the gauge the HorizontalPodAutoscaler targets."
     },
     {
       "id": 4,
@@ -107,7 +107,7 @@
       "title": "Rejections by reason",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -119,7 +119,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total[5m]))",
           "refId": "A",
@@ -140,7 +140,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Rejected requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body)."
+      "description": "Rejected and upstream-error requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body, upstream_error)."
     },
     {
       "id": 6,
@@ -148,7 +148,7 @@
       "title": "Reject ratio",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -160,9 +160,9 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
-          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=\"rejected\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
+          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=~\"rejected|upstream_error\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
           "refId": "A",
           "legendFormat": "reject ratio"
         }
@@ -183,7 +183,7 @@
           ]
         }
       },
-      "description": "Fraction of proxied requests rejected. Denominator is clamped to >= 1 req/s so the ratio reads 0 (not NaN) when there is no traffic."
+      "description": "Fraction of proxied requests rejected by the gateway or answered with an upstream error status without a JSON body. Denominator is clamped to >= 1 req/s so the ratio reads 0 (not NaN) when there is no traffic."
     },
     {
       "id": 7,
@@ -203,7 +203,7 @@
       "title": "Request duration p50/p90/p99",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -215,7 +215,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "A",
@@ -224,7 +224,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "B",
@@ -233,7 +233,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
           "refId": "C",
@@ -248,7 +248,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "End-to-end proxied-request latency quantiles derived from the request duration histogram."
+      "description": "Proxied-request latency quantiles from the request duration histogram, timed from the buffered request body to the end of the response body streamed to the client (or the gateway's own error). Not end-to-end: the request body read and rate-limited requests are left out."
     },
     {
       "id": 9,
@@ -268,7 +268,7 @@
       "title": "Upstream readiness",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -280,11 +280,11 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "tn_worker_gateway_upstream_ready",
           "refId": "A",
-          "legendFormat": "worker {{worker_id}}"
+          "legendFormat": "worker {{worker_id}} @ {{upstream}}"
         }
       ],
       "fieldConfig": {
@@ -296,7 +296,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Per-worker upstream readiness (1 ready / 0 not ready). No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
+      "description": "Per-worker upstream readiness (1 ready / 0 not ready), one series per worker id and upstream RPC origin. No worker at 1 means /ready returns 503 and requests reject with no_upstream_ready."
     },
     {
       "id": 11,
@@ -316,7 +316,7 @@
       "title": "CPU",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -328,7 +328,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "rate(reth_process_cpu_seconds_total[5m])",
           "refId": "A",
@@ -351,7 +351,7 @@
       "title": "Resident memory",
       "datasource": {
         "type": "prometheus",
-        "uid": "prometheus"
+        "uid": "${datasource}"
       },
       "gridPos": {
         "h": 8,
@@ -363,7 +363,7 @@
         {
           "datasource": {
             "type": "prometheus",
-            "uid": "prometheus"
+            "uid": "${datasource}"
           },
           "expr": "reth_process_resident_memory_bytes",
           "refId": "A",
@@ -388,7 +388,22 @@
     "worker-gateway"
   ],
   "templating": {
-    "list": []
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Data source",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 1,
+        "regex": "",
+        "skipUrlSync": false
+      }
+    ]
   },
   "time": {
     "from": "now-1h",

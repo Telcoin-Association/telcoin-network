@@ -1,6 +1,6 @@
 //! Prometheus metrics for the reth execution environment.
 //!
-//! The counter series are exported under the `tn_reth` scope, in three unrelated groups.
+//! The counter series are exported under the `tn_reth` scope, in four unrelated groups.
 //!
 //! Block building. Two series count transactions that `build_block_from_batch_payload`
 //! declines to include in a block: `tn_reth.unrecoverable_txs_dropped_total` (alertable - a
@@ -28,6 +28,12 @@
 //! post-lag resync absorbed and retried. See [`RethEnvMetrics`] for per-series semantics.
 //! `tn_reth.txpool_expired_txs_total` counts parked transactions removed by the age sweep.
 //!
+//! RPC submission forwarding (`--forward-txs`). `tn_reth.rpc_tx_forwarded_total` counts every
+//! raw submission by how it ended (labeled by `outcome`, see [`RpcTxForwardOutcome`]), and
+//! `tn_reth.rpc_tx_forward_target_failures_total` counts failed attempts against one target
+//! (labeled by the target's index and the failure `kind`, see [`RpcTxForwardFailure`]). See
+//! [`RpcTxForwardMetrics`].
+//!
 //! [`report_db_metrics`] additionally samples reth database metrics as a pre-scrape hook.
 //!
 //! Three gauges under the same scope report what the epoch-boundary system calls spend against
@@ -54,10 +60,10 @@
 //!
 //! Everything here binds to the process-global `metrics` recorder, so
 //! `tn_metrics::install_recorder` must run first — the node installs it before opening the
-//! database (`RethEnv::new_database`), and the two registration entry points ([`init`], called
-//! from `RethEnv::new`, and [`ForwarderMetrics::init`], called from
-//! `WorkerRpcForwarder::new`) then force registration so every counter exists at zero from
-//! process start.
+//! database (`RethEnv::new_database`), and the registration entry points ([`init`], called
+//! from `RethEnv::new`, [`ForwarderMetrics::init`], called from `WorkerRpcForwarder::new`, and
+//! [`RpcTxForwardMetrics::init`], called when `RethEnv::new` builds the submission forwarder)
+//! then force registration so every counter exists at zero from process start.
 
 use alloy_evm::InvalidTxError;
 use reth_metrics::{metrics::Counter, Metrics};
@@ -502,6 +508,132 @@ impl ForwarderMetrics {
     /// signal.
     pub(crate) fn record_rejection_overridden() {
         metrics::counter!(FORWARDED_REJECTIONS_OVERRIDDEN).increment(1);
+    }
+}
+
+/// Counter names for `--forward-txs` submission forwarding (`crate::rpc_tx_forward`), kept next
+/// to their only emission sites so registration and increments cannot drift apart.
+const RPC_TX_FORWARDED: &str = "tn_reth.rpc_tx_forwarded_total";
+const RPC_TX_FORWARD_TARGET_FAILURES: &str = "tn_reth.rpc_tx_forward_target_failures_total";
+
+/// How one raw submission on a forwarding node ended.
+///
+/// Labels `tn_reth.rpc_tx_forwarded_total`, one series per outcome, all registered at zero by
+/// [`RpcTxForwardMetrics::init`]. The four outcomes partition the submissions the forwarding
+/// handler received.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RpcTxForwardOutcome {
+    /// A target returned a transaction hash.
+    Accepted,
+    /// A target returned a JSON-RPC error, which the client received unchanged, or the request
+    /// was too large to forward (a target answered HTTP 413, or the client's own size cap refused
+    /// it) and the client received the oversized-request error. Expected traffic (nonce too low,
+    /// already known, underpriced), but alertable when it climbs while `accepted` stays flat: a
+    /// target that answers every request with an error (method not found on a port without the
+    /// `eth` namespace) is never failed over.
+    UpstreamError,
+    /// The node's own checks refused the transaction before any target saw it.
+    RejectedLocally,
+    /// No target answered within the submission budget, and the client received the fixed
+    /// unavailable error. Alertable: the node is refusing every submission while this lasts.
+    Unavailable,
+}
+
+impl RpcTxForwardOutcome {
+    /// Every variant, for zero-registration in [`RpcTxForwardMetrics::init`].
+    ///
+    /// Hand-maintained alongside the exhaustive match in [`Self::label`].
+    const ALL: [Self; 4] =
+        [Self::Accepted, Self::UpstreamError, Self::RejectedLocally, Self::Unavailable];
+
+    /// The `outcome` label value this variant records under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::UpstreamError => "upstream_error",
+            Self::RejectedLocally => "rejected_locally",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+/// Why one forward attempt against one target ended without a JSON-RPC reply.
+///
+/// Labels `tn_reth.rpc_tx_forward_target_failures_total` together with the target's index.
+/// Every such failure demotes the target and moves the submission to the next one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RpcTxForwardFailure {
+    /// The target did not answer within the attempt timeout.
+    Timeout,
+    /// The connection failed, the target answered with a non-2xx status other than 413, or its
+    /// body was oversized, empty or not JSON.
+    Transport,
+    /// The target answered 2xx with JSON that is not a JSON-RPC reply to the request: it does not
+    /// parse as a response, carries another request's id, or its result is not a hash.
+    Malformed,
+}
+
+impl RpcTxForwardFailure {
+    /// Every variant, for zero-registration in [`RpcTxForwardMetrics::init`].
+    ///
+    /// Hand-maintained alongside the exhaustive match in [`Self::label`].
+    const ALL: [Self; 3] = [Self::Timeout, Self::Transport, Self::Malformed];
+
+    /// The `kind` label value this variant records under.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Malformed => "malformed",
+        }
+    }
+}
+
+/// Metrics for `--forward-txs` submission forwarding (`crate::rpc_tx_forward`).
+///
+/// A target is labeled by its index in the configured list, never by its URL: the list is
+/// private operator configuration, and a scrape endpoint is not. Associated functions rather
+/// than instance handles, for the same late-binding reason as [`ForwarderMetrics`].
+pub(crate) struct RpcTxForwardMetrics;
+
+impl RpcTxForwardMetrics {
+    /// Register every outcome series, and every failure series of each of the `target_count`
+    /// targets, at zero.
+    ///
+    /// Called once when `RethEnv::new` builds the forwarder, after the CLI installed the
+    /// global recorder, for the reason [`init`] gives.
+    pub(crate) fn init(target_count: usize) {
+        RpcTxForwardOutcome::ALL.iter().for_each(|outcome| {
+            metrics::counter!(RPC_TX_FORWARDED, "outcome" => outcome.label()).increment(0);
+        });
+        (0..target_count).for_each(|index| {
+            RpcTxForwardFailure::ALL.iter().for_each(|kind| {
+                metrics::counter!(
+                    RPC_TX_FORWARD_TARGET_FAILURES,
+                    "target" => index.to_string(),
+                    "kind" => kind.label()
+                )
+                .increment(0);
+            });
+        });
+    }
+
+    /// Count one submission by how it ended.
+    pub(crate) fn record_outcome(outcome: RpcTxForwardOutcome) {
+        metrics::counter!(RPC_TX_FORWARDED, "outcome" => outcome.label()).increment(1);
+    }
+
+    /// Count one failed attempt against the target at `index` in the configured list.
+    ///
+    /// The call site pairs with a `debug!` line carrying the error, which names the target by
+    /// the same index.
+    pub(crate) fn record_target_failure(index: usize, kind: RpcTxForwardFailure) {
+        metrics::counter!(
+            RPC_TX_FORWARD_TARGET_FAILURES,
+            "target" => index.to_string(),
+            "kind" => kind.label()
+        )
+        .increment(1);
     }
 }
 

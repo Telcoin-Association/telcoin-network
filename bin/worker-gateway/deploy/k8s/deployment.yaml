@@ -21,19 +21,33 @@ spec:
         app.kubernetes.io/name: worker-gateway
         app.kubernetes.io/part-of: telcoin-network
     spec:
-      # Slightly longer than the gateway's own --graceful-shutdown-timeout
-      # (default 30s, WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT) so the process
-      # can finish draining in-flight proxied requests before the kubelet sends
-      # SIGKILL.
-      terminationGracePeriodSeconds: 40
+      # Longer than the gateway's --shutdown-delay (5s, set below) plus its
+      # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin:
+      # 5s + 45s + 1s = 51s, so the process can finish draining in-flight
+      # proxied requests before the kubelet sends SIGKILL. Recompute it if
+      # you change either value.
+      terminationGracePeriodSeconds: 55
       containers:
         - name: worker-gateway
-          # Replace with your registry ref, e.g. registry.example.com/telcoin/worker-gateway:<tag>
-          image: telcoin-worker-gateway:latest
+          # Replace with your registry ref and a versioned tag, e.g.
+          # registry.example.com/telcoin/worker-gateway:<tag>, and pin it by
+          # digest (<ref>:<tag>@sha256:<digest>) so every replica runs the same
+          # build. Never deploy :latest.
+          image: telcoin-worker-gateway:<tag>
           env:
-            # Client JSON-RPC + /health + /ready all listen here.
+            # Client JSON-RPC listens here. /health, /ready and /ready/any answer
+            # here too, for fronts that can only check the client port.
             - name: WORKER_GATEWAY_LISTEN_ADDR
               value: "0.0.0.0:8545"
+            # /health, /ready and /ready/any on a SEPARATE listener (equivalent
+            # to the --probe-addr flag), outside the client connection cap and
+            # rate limits, so a connection flood cannot time out the kubelet's
+            # probes. The Service leaves it out, but any pod can still reach it
+            # on the pod IP unless a NetworkPolicy admits only the client and
+            # metrics ports; the pod's own node, and so the kubelet, always
+            # gets through.
+            - name: WORKER_GATEWAY_PROBE_ADDR
+              value: "0.0.0.0:8546"
             # Prometheus /metrics listens on this SEPARATE address (equivalent
             # to the --metrics flag). Keep it cluster-internal; it is unauthenticated.
             - name: WORKER_GATEWAY_METRICS_ADDR
@@ -43,25 +57,75 @@ spec:
             # from a ConfigMap (WORKER_GATEWAY_CONFIG / --config) instead.
             - name: WORKER_GATEWAY_UPSTREAM_RPC_URL
               value: "http://tn-worker.telcoin-network.svc.cluster.local:8545"
+            # Readiness comes from the healthcheck listener of the node that
+            # serves the RPC URL above, not from the worker RPC: the port the
+            # node was started with via --healthcheck (HEALTHCHECK_TCP_PORT),
+            # path /health/workers. The node has no default healthcheck port,
+            # so replace <HEALTHCHECK_TCP_PORT>; the gateway refuses to start
+            # until you do.
             - name: WORKER_GATEWAY_UPSTREAM_READINESS_URL
-              value: "http://tn-worker.telcoin-network.svc.cluster.local:8545/ready"
+              value: "http://tn-worker.telcoin-network.svc.cluster.local:<HEALTHCHECK_TCP_PORT>/health/workers"
+            # Every call except eth_sendRawTransaction and
+            # eth_sendRawTransactionSync goes to this JSON-RPC endpoint, a public
+            # RPC for the same chain, so the worker receives only submissions.
+            # Required in front of a validator: replace <PUBLIC_RPC_HOST>; the
+            # gateway refuses to start until you do.
+            - name: WORKER_GATEWAY_REDIRECT_QUERIES
+              value: "https://<PUBLIC_RPC_HOST>"
+            # After SIGTERM, keep serving for 5s while /ready and /ready/any
+            # answer 503 ("draining": true) on both listeners: long enough for
+            # the pod's removal from the Service endpoints to reach kube-proxy
+            # and load balancers, as the old preStop sleep was. A front outside
+            # Kubernetes that probes /ready or /ready/any needs its interval x
+            # unhealthy threshold to fit in it; for a slower front raise this
+            # and terminationGracePeriodSeconds. The drain starts after it. No
+            # preStop sleep is needed.
+            - name: WORKER_GATEWAY_SHUTDOWN_DELAY
+              value: "5s"
+            # Drain in-flight requests for up to the gateway's whole-request
+            # deadline (--upstream-request-timeout 35s + --header-read-timeout
+            # 10s), so a request accepted just before the listener closes,
+            # such as an eth_sendRawTransactionSync waiting for its receipt,
+            # still finishes; the 30s default would cut it short. The drain
+            # ends as soon as the last request does.
+            - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
+              value: "45s"
+            # Keep N x --max-upstream-inflight below the worker's
+            # --rpc.max-connections (500 by default): at the HPA's ceiling of
+            # 10 replicas, 49 each leaves 490 worker connections at most, so a
+            # fully scaled fleet never drives the worker into answering 429.
+            # Raise it when the worker's limit is raised; lower it for a higher
+            # replica ceiling (see README.md, "Sizing for N gateways").
+            - name: WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT
+              value: "49"
           ports:
             - name: rpc
               containerPort: 8545
+            - name: probe
+              containerPort: 8546
             - name: metrics
               containerPort: 9100
           livenessProbe:
-            # /health is liveness: always 200 while the process is up.
+            # /health is liveness: always 200 while the process is up. It is
+            # checked on the probe listener, so a flood that holds every client
+            # connection cannot get a healthy pod restarted.
             httpGet:
               path: /health
-              port: rpc
+              port: probe
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            # /ready is readiness: 200 when an upstream worker is ready, else 503.
+            # /ready/any is 200 while the gateway can serve any route: an
+            # upstream worker is ready, or the WORKER_GATEWAY_REDIRECT_QUERIES
+            # endpoint answers the gateway's probe. Every replica polls the same
+            # worker, so /ready (submissions only) would take every replica out
+            # of the Service during a worker outage and stop reads too; with
+            # /ready/any the replicas keep serving reads, and submissions get
+            # 503 / -32000 until the worker is back. See deploy/README.md
+            # ("Readiness and reads").
             httpGet:
-              path: /ready
-              port: rpc
+              path: /ready/any
+              port: probe
             periodSeconds: 5
           resources:
             requests:
@@ -69,7 +133,13 @@ spec:
               memory: 64Mi
             limits:
               cpu: "1"
-              memory: 256Mi
+              # Sized for the gateway's defaults: buffered request bodies are
+              # bounded by --max-inflight-request-bytes (512 MiB), plus a read
+              # buffer of up to --http1-max-buf-size per connection:
+              # 512 MiB + 500 x 64 KiB + 64 MiB for the process is about
+              # 608 MiB. Recompute it if you change those flags (see
+              # deploy/README.md, "Memory limit").
+              memory: 1Gi
           securityContext:
             runAsNonRoot: true
             # Matches the non-root uid baked into the image.
