@@ -255,9 +255,11 @@ impl std::error::Error for CidrError {}
 /// Axum middleware: resolve the request's [`ClientAddr`] and [`Forwarding`] and
 /// store both in its extensions, for the rate limiter and the proxy.
 ///
-/// It is the outermost router layer, so it runs before the rate limiter. A
-/// request without `ConnectInfo` (never the case behind the accept loop) gets
-/// neither: the rate limiter then skips its per-IP bucket, as it did before.
+/// Only `set_nosniff` wraps it; it runs before the access log, CORS and the
+/// rate limiter (see `crate::server::router`), so each of them sees the
+/// resolved client. A request without `ConnectInfo` (never the case behind the
+/// accept loop) gets neither: the rate limiter then skips its per-IP bucket,
+/// as it did before.
 pub(crate) async fn identify(
     State(trusted): State<Arc<TrustedProxies>>,
     mut request: Request,

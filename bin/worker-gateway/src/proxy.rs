@@ -6,10 +6,10 @@
 //! `405` error envelope before its body is read. Other headers are not
 //! forwarded in either direction, with three deliberate additions on the
 //! upstream hop: `X-Forwarded-For` / `X-Forwarded-Proto` (client identity for
-//! worker-side logs and the PR3 rate limits) and the `X-TN-Gateway` hop
-//! marker (loop protection; an inbound request that already carries it is
-//! rejected instead of forwarded). The two identity headers are built from the
-//! client the gateway resolved, never copied from the request:
+//! the upstream's logs and any per-client limits it applies) and the
+//! `X-TN-Gateway` hop marker (loop protection; an inbound request that already
+//! carries it is rejected instead of forwarded). The two identity headers are
+//! built from the client the gateway resolved, never copied from the request:
 //! `X-Forwarded-For` names the peer, or the forwarded client and then the
 //! trusted proxy that vouched for it, and `X-Forwarded-Proto` is `http` unless
 //! a trusted proxy reported `https` (see [`crate::identity`]). The upstream

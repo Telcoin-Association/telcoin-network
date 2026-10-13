@@ -162,7 +162,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 | WG-46 | `upstream_ready{worker_id}` collides; in-flight gauge misses streaming | Low | #1612 (P25): fixed by #1626 (merged into this branch) | S |
 | WG-47 | Unthrottled warns on some rejects; none on others | Low | #1612 (P25): fixed by #1626 (merged into this branch) | S |
 | WG-48 | A never-ready gateway logs no reason at info | Low | #1612 (P25): fixed by #1624 (merged into this branch) | S |
-| WG-49 | Docs contradict the code in several places | Low | #1612 (P25): mostly fixed by #1639 (merged into this branch); the `src/proxy.rs` module doc still says "the PR3 rate limits" | S |
+| WG-49 | Docs contradict the code in several places | Low | #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch | S |
 | WG-50 | ANSI escapes in non-TTY logs; no structured format | Low | #1612 (P25): fixed by #1639 (merged into this branch) | S |
 | WG-51 | The Grafana datasource uid is hard-coded | Low | #1612 (P25): fixed by #1639 (merged into this branch) | S |
 | WG-52 | An EIP-7702 rejection is reported as "EIP-4844 blob" | Low | #1612 (P25): fixed by #1627 (merged into this branch) | S |
@@ -760,7 +760,7 @@ New with `--redirect-queries`.
 - **Impact:** misleads sizing; the underlying issues have their own ids.
 - **Recommendation:** correct each item.
 - **Effort:** S.
-- **Status:** #1612 (P25): mostly fixed by #1639 (merged into this branch); the `src/proxy.rs` module doc still says "the PR3 rate limits".
+- **Status:** #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch.
 
 ### WG-50 ANSI escapes in non-TTY logs; no structured format — Low
 
@@ -867,7 +867,7 @@ WG-02 and WG-08 (P3, P4) were small and recommended before any public deployment
 | P22 | WG-24 | An authentication header for the query upstream and a chain-id consistency check | the header reaches the query mock and never the worker mock; startup warns when the redirect's `eth_chainId` differs from the worker's | follow-up: worker-gateway: public RPC auth header + chain-id consistency warning — #1609, fixed by #1635 (merged into this branch) |
 | P23 | WG-26 | An optional sampled access log | with the option on, a sampled request logs one structured line with client prefix, method class, route, status and latency | follow-up: worker-gateway: sampled access log — #1610, fixed by #1640 (merged into this branch) |
 | P24 | (design) | Split mixed batches between the two upstreams and merge the answers in order | a mixed batch's submissions reach the worker, its reads the query mock, and the client gets one array in request order | follow-up: worker-gateway: split-and-merge mixed batches — #1611; only if `tn_worker_gateway_mixed_batches_total` shows real use, so it stays open until that counter gives evidence |
-| P25 | WG-28 to WG-52 | The Low findings, as one checklist | each item's recommendation above | follow-up: worker-gateway: low-severity hardening — #1612; fixed in part by #1623, #1624, #1626, #1627, #1629, #1634, #1639, #1641 and #1643 (merged into this branch), with WG-34 and parts of WG-32, WG-33, WG-35, WG-38 and WG-49 still open |
+| P25 | WG-28 to WG-52 | The Low findings, as one checklist | each item's recommendation above | follow-up: worker-gateway: low-severity hardening — #1612; fixed in part by #1623, #1624, #1626, #1627, #1629, #1634, #1639, #1641 and #1643 (merged into this branch), with WG-34 and parts of WG-32, WG-33, WG-35 and WG-38 still open |
 | P26 | WG-14, post-rev-1 | A probe that keeps a redirecting gateway in rotation while its worker is down | with the worker down and the query upstream up, the new probe returns `200` while `/ready` returns `503`; the reference `readinessProbe` uses it | follow-up: worker-gateway: probe that keeps redirecting gateways in rotation while the worker is down — #1613, fixed by #1628 (merged into this branch) |
 | P27 | post-dos-2 | Cache upstream addresses and cap concurrent DNS lookups | with a resolver that delays the query host by 10 s and 100 reads per second, `/ready` and submissions stay `200` | follow-up: worker-gateway: bound and cache DNS lookups for upstream hosts — #1614, fixed by #1630 (merged into this branch) |
 

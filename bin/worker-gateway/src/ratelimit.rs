@@ -29,11 +29,13 @@
 //! bucket caps their total.
 //!
 //! The client identity is the request's [`ClientAddr`], resolved by the
-//! identity middleware that runs just before this one: the immediate TCP peer,
-//! or, when that peer is in `--trusted-proxies`, the client it forwarded the
-//! request for (see [`crate::identity`]). Behind a proxy that is not listed the
-//! peer is that proxy, so the per-IP bucket meters the proxy rather than the
-//! real client.
+//! identity middleware, which runs before this one: outermost first, the
+//! router's layers are `set_nosniff`, `identify`, the access log, CORS, this
+//! rate limit, the byte budget, the request deadline and the body limit (see
+//! `crate::server::router`). It is the immediate TCP peer, or, when that peer
+//! is in `--trusted-proxies`, the client it forwarded the request for (see
+//! [`crate::identity`]). Behind a proxy that is not listed the peer is that
+//! proxy, so the per-IP bucket meters the proxy rather than the real client.
 //!
 //! A third bucket, the submission budget (`--rate-limit-submissions`), keeps
 //! reads from spending the rate that submissions need. With it set, the edge
