@@ -12,6 +12,18 @@
 //! restarts on the upgraded binary. Any other undecodable row stops the open with an error that
 //! names it, because `LastProposed` and `ProposedCertificates` are records the proposer and the
 //! certifier stop the node for rather than run without.
+//!
+//! That stop is final for the database as it stands: retrying the start finds the same rows, so
+//! the error names the way out. The epoch database, `consensus-db/epoch` under the datadir, holds
+//! only the working state of the epoch in progress, including the `Votes` and `LastProposed` rows
+//! that keep this node from voting twice in a round or proposing two headers for one. Remove that
+//! directory (the committed chain in `consensus-db/epochs` and the execution `db` stay) and start
+//! the node again once the network has closed the epoch in progress, so those guards are no
+//! longer needed; a node that then still cannot follow the network is restored into a fresh
+//! datadir from a state export bundle with `db load-state`. One case reaches the stop by design
+//! rather than through corruption: when a quorum of validators ran past a fork epoch on the old
+//! binary, they certified each other's old-layout headers, and each of them refuses here on
+//! upgrade because the chain they built is not the upgraded chain.
 
 use tn_types::{
     encoded_size, forks::subsecond_timestamp_active, try_decode, try_decode_key,
@@ -38,8 +50,11 @@ pub(crate) fn discard_seconds_only_proposal<DB: RawRows>(
     epoch_db: &DB,
 ) -> eyre::Result<Option<UndecodableTable>> {
     let stale = scan_table::<LastProposed, _>(epoch_db, is_seconds_only_fork_header)?;
-    // a stale binary never stores a fork-epoch certificate (its own needs votes from peers that
-    // cannot decode its header, and theirs do not decode on it), so nothing here is removed. an
+    // with fewer than a quorum of validators left on the stale binary, no fork-epoch certificate
+    // is ever stored here (the node's own header needs votes from peers that cannot decode it, and
+    // theirs do not decode on it), so nothing here is removed. with a quorum or more still on it
+    // they certify among themselves, and each of them refuses below on upgrade: the right outcome,
+    // since the chain they built is not the upgraded chain, and the error names the way out. an
     // undecodable row here would stop the full-memory load as well; checking first names the row
     // in the error and keeps the `LastProposed` removal from happening before that stop
     scan_table::<Certificates, _>(epoch_db, |_| false)?;
@@ -167,7 +182,14 @@ fn scan_table<T: Table, DB: RawRows>(
             "epoch table {} holds {} row(s) this binary cannot decode, the first at key {} with \
              header epoch {} ({}); only a header this node proposed for a sub-second fork epoch \
              on a binary without that layout is discarded at startup and this row is not one, so \
-             the node stops instead of running without it (the epoch database may be corrupt)",
+             the node stops instead of running without it (the epoch database may be corrupt, or \
+             this validator certified fork-epoch headers on the old binary as one of a quorum \
+             still running it). Retrying the start finds the same rows. Remove the epoch database \
+             directory `consensus-db/epoch` under the datadir, which holds only the epoch in \
+             progress (keep `consensus-db/epochs` and `db`), and start again once the network has \
+             closed that epoch, since the directory also held this node's guards against voting \
+             or proposing twice in it; or restore the node into a fresh datadir from a state \
+             export bundle with `db load-state`",
             row.table,
             row.rows,
             row.key,
