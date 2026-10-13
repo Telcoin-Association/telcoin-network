@@ -329,8 +329,9 @@ fn dir_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Paces the copy at `rate` bytes a second (0: unpaced), checking for a cancellation once per
-/// [`BATCH_BYTES`] and during each sleep.
+/// Paces the copy at `rate` bytes a second (0: unpaced), checking for a cancellation and for
+/// room on the disk (the copy is the longest phase) once per [`BATCH_BYTES`], and for a
+/// cancellation during each sleep.
 struct Pacer {
     rate: u64,
     written: u64,
@@ -343,13 +344,15 @@ impl Pacer {
         Self { rate, written: 0, next_check: BATCH_BYTES, started: Instant::now() }
     }
 
-    fn pace(&mut self, bytes: u64, shared: &CompactShared) -> eyre::Result<()> {
+    fn pace(&mut self, bytes: u64, core: &Core) -> eyre::Result<()> {
+        let shared = &core.compact;
         self.written += bytes;
         if self.written < self.next_check {
             return Ok(());
         }
         self.next_check = self.written + BATCH_BYTES;
         shared.check_cancel()?;
+        check_room(core)?;
         if self.rate > 0 {
             let due = Duration::from_secs_f64(self.written as f64 / self.rate as f64);
             let mut ahead = due.saturating_sub(self.started.elapsed());
@@ -366,6 +369,9 @@ impl Pacer {
 
 /// The generation being built. Unless it is handed over ([`Self::finish`]), its files and
 /// directory are deleted when it drops, so a cancelled or failed compaction leaves nothing.
+/// The page size [`Builder::write_behind`] rounds its ranges down to.
+const WRITE_BEHIND_PAGE: u64 = 4096;
+
 struct Builder {
     /// Emptied once handed over.
     dir: PathBuf,
@@ -374,6 +380,11 @@ struct Builder {
     idxs: BTreeMap<TableId, BtreeIndex>,
     /// The catch-up made a row dead (overwritten, removed or cleared).
     dead: bool,
+    /// A duplicate of the new log's descriptor (Linux: for `sync_file_range`), and where the
+    /// bytes not yet handed to writeback begin (see [`Self::write_behind`]).
+    #[cfg(target_os = "linux")]
+    file: fs::File,
+    written_back: u64,
 }
 
 impl Builder {
@@ -386,8 +397,25 @@ impl Builder {
                 return Err(e);
             }
         };
-        let builder =
-            Self { dir, header: *log.header(), log: Some(log), idxs: BTreeMap::new(), dead: false };
+        #[cfg(target_os = "linux")]
+        let file = match log.dup_file() {
+            Ok(file) => file,
+            Err(e) => {
+                drop(log);
+                let _ = fs::remove_dir_all(&dir);
+                return Err(e.into());
+            }
+        };
+        let builder = Self {
+            dir,
+            header: *log.header(),
+            written_back: log.file_len(),
+            log: Some(log),
+            idxs: BTreeMap::new(),
+            dead: false,
+            #[cfg(target_os = "linux")]
+            file,
+        };
         // The log's entry, durable before anything relies on it (dropped on failure, the
         // builder deletes its directory).
         sync_dir(&builder.dir)?;
@@ -432,7 +460,42 @@ impl Builder {
         idx.save(key, pos)?;
         // An overwrite of a row copied earlier leaves that copy dead.
         self.dead |= idx.len() == rows;
+        self.write_behind();
         Ok(())
+    }
+
+    /// Once [`BATCH_BYTES`] have been appended since the last call, start writing them back to
+    /// disk without waiting for it, so the compaction's output never piles up unflushed: on Linux
+    /// a pile of dirty pages throttles every thread that writes, the database's writers included.
+    /// On Linux this is `sync_file_range(SYNC_FILE_RANGE_WRITE)`, which neither waits nor flushes
+    /// the drive's cache; elsewhere there is no such call and the pages wait for the round's sync.
+    /// A hint: the round syncs remain the durability points, and an I/O error surfaces there.
+    fn write_behind(&mut self) {
+        // Whole pages only: the last, partly written one would be written again once filled.
+        let end = self.log_len() & !(WRITE_BEHIND_PAGE - 1);
+        if end.saturating_sub(self.written_back) < BATCH_BYTES {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd as _;
+            let (from, len) = (self.written_back, end - self.written_back);
+            if let (Ok(from), Ok(len)) = (i64::try_from(from), i64::try_from(len)) {
+                // SAFETY: `sync_file_range` on a descriptor this builder owns and keeps open for
+                // the call; it touches no Rust memory.
+                let _ = unsafe {
+                    libc::sync_file_range(
+                        self.file.as_raw_fd(),
+                        from,
+                        len,
+                        libc::SYNC_FILE_RANGE_WRITE,
+                    )
+                };
+            }
+        }
+        #[cfg(test)]
+        super::stats::WRITEBACKS.fetch_add(1, Ordering::Relaxed);
+        self.written_back = end;
     }
 
     /// Remove `key` from table `id`: a removal record, as its own batch, if the new log holds the
@@ -440,7 +503,7 @@ impl Builder {
     fn remove(&mut self, id: TableId, key: &[u8]) -> eyre::Result<()> {
         self.dead = true;
         let Some(idx) = self.idxs.get_mut(&id) else { return Ok(()) };
-        if idx.contains(key) {
+        if idx.contains(key)? {
             let log = self.log.as_mut().expect("a builder holds its log until it finishes");
             log.append_raw_parts(&[&record::head(KIND_REMOVE, id, true), key])?;
             idx.remove(key)?;
@@ -627,8 +690,10 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
                 continue;
             }
             let payload = Log::record_bytes_within(&published.view, pos, published.limit)?;
+            // A damaged index entry is abandoned on, not copied into the new generation.
+            record::put_value(payload, id, key)?;
             out.copy_row(id, ksize, key, payload)?;
-            pacer.pace(payload.len() as u64 + FRAME, shared)?;
+            pacer.pace(payload.len() as u64 + FRAME, core)?;
         }
     }
     #[cfg(test)]
@@ -750,6 +815,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         core.store_frontier(&writer);
         #[cfg(test)]
         super::stats::switch(held.elapsed());
+        #[cfg(test)]
+        super::stats::log(core.stat_slot).switch(held.elapsed());
         #[cfg(not(test))]
         let _ = held;
         drop(writer);
@@ -837,7 +904,9 @@ fn run(core: &Core, rate: u64) {
         };
         #[cfg(test)]
         if let Err(cause) = &last {
-            super::stats::abandoned(cause);
+            let cancelled = shared.cancel.load(Ordering::Relaxed);
+            super::stats::ended(cause, cancelled);
+            super::stats::log(core.stat_slot).ended(cancelled);
         }
         let mut state = shared.state.lock();
         match &last {

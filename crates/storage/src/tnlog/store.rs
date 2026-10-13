@@ -29,7 +29,7 @@ use super::{
     commit::Durability,
     compact::{read_base, CompactShared},
     manifest::Manifest,
-    record::{self, Op, HEAD, KIND_CLEAR, KIND_PUT, KIND_REMOVE},
+    record::{self, Op, KIND_CLEAR, KIND_PUT, KIND_REMOVE},
     TableId,
 };
 use crate::{
@@ -45,13 +45,17 @@ use crate::{
         pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
     },
     tndb::{
-        layout::{drop_in_background, gen_dir, list_gens, lock_table, remove_spares},
+        layout::{compact_dir, drop_in_background, gen_dir, list_gens, lock_table, remove_spares},
         CompactionConfig,
     },
 };
 
 /// Pack format version of the shared log.
 const PACK_VERSION: u16 = 1;
+
+/// The least log a batch that empties every table compacts (see `Writer::emptied`): below it, an
+/// emptied log is not worth a compaction.
+const EMPTIED_MIN_BYTES: u64 = 1 << 20;
 
 /// Address space reserved for the log's mapping (virtual only; see
 /// [`MmapFileOptions::reserve`]): the log never moves while open unless it outgrows this.
@@ -125,18 +129,18 @@ pub(super) struct Published {
     /// The log's length at the publish: every record the snapshot reaches lies below it, written
     /// in full.
     pub(super) limit: u64,
-    /// Bytes before a value in a put record: its head and key.
-    value_offset: usize,
+    /// The table's id: what each record an index entry points at must carry.
+    table: TableId,
     /// Keeps the snapshot's generation open (declared last, so it drops after the snapshot).
     _alive: Arc<GenAlive>,
 }
 
 impl Published {
-    /// The value bytes of the put record at `pos`.
-    fn value_at(&self, pos: u64) -> Result<&[u8], FetchError> {
-        Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit)?
-            .get(self.value_offset..)
-            .ok_or_else(|| FetchError::CorruptIndex("a record is shorter than its key".into()))
+    /// The value bytes of the put record at `pos`, which the index gave for `key` (checked to
+    /// be that row's: see [`record::put_value`]).
+    fn value_at(&self, pos: u64, key: &[u8]) -> Result<&[u8], FetchError> {
+        let payload = Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit)?;
+        record::put_value(payload, self.table, key)
     }
 
     fn get_with<R>(&self, key: &[u8], decode: impl FnOnce(&[u8]) -> R) -> eyre::Result<Option<R>> {
@@ -146,7 +150,7 @@ impl Published {
             Err(FetchError::NotFound) => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        Ok(Some(decode(self.value_at(pos)?)))
+        Ok(Some(decode(self.value_at(pos, key)?)))
     }
 
     fn contains(&self, key: &[u8]) -> Result<bool, FetchError> {
@@ -223,7 +227,7 @@ impl TableShared {
         let found = kind.cursor(index).and_then(|mut cursor| {
             let Some(item) = cursor.next(index) else { return Ok(None) };
             let (key, pos) = item?;
-            Ok(Some((key, published.value_at(pos)?)))
+            Ok(Some((key, published.value_at(pos, key)?)))
         });
         match found {
             Ok(Some((key, value))) => Some(f(key, value)),
@@ -258,7 +262,7 @@ impl TableScan {
         let index = published.index.as_ref()?;
         let row = self.cursor.as_mut()?.next(index).map(|item| {
             let (key, pos) = item?;
-            Ok((key, published.value_at(pos)?))
+            Ok((key, published.value_at(pos, key)?))
         });
         match row {
             Some(Ok((key, value))) => Some(f(key, value)),
@@ -371,6 +375,11 @@ pub(super) struct Writer {
     /// A row may have been made dead (overwritten, removed or cleared) since the last compaction
     /// (assumed at open, unless the log is empty): a log that only grows does not compact.
     has_dead: bool,
+    /// A batch left every table empty while the log held at least [`EMPTIED_MIN_BYTES`] (the
+    /// epoch tables are all cleared at an epoch's end): the log compacts at once, whatever its
+    /// growth threshold, since nothing live is left to copy. Kept until a compaction switches, so
+    /// writes that resume meanwhile do not cancel it.
+    emptied: bool,
     /// Test-only: the next batch panics after appending this many records.
     #[cfg(test)]
     panic_after: Option<usize>,
@@ -450,9 +459,15 @@ impl Writer {
                     out.push(i);
                 }
                 BatchOp::Remove(_, key) => {
-                    if !cleared.contains(&id)
-                        && table.idx.as_ref().is_some_and(|idx| idx.contains(key))
-                    {
+                    let held = match &table.idx {
+                        Some(idx) if !cleared.contains(&id) => {
+                            idx.contains(key).wrap_err_with(|| {
+                                format!("tnlog: remove from table {}", table.shared.name)
+                            })?
+                        }
+                        _ => false,
+                    };
+                    if held {
                         out.push(i);
                     }
                 }
@@ -551,7 +566,7 @@ impl Writer {
             index: table.idx.as_mut().map(BtreeIndex::publish),
             view,
             limit,
-            value_offset: HEAD + table.ksize as usize,
+            table: id,
             _alive: alive,
         };
         table.shared.published.store(Arc::new(published));
@@ -562,9 +577,21 @@ impl Writer {
     /// every batch.
     fn wants_compaction(&self) -> bool {
         let len = self.log.file_len();
-        self.has_dead
-            && self.config.auto_min_bytes.is_some_and(|min| len >= min)
-            && len >= self.base.saturating_mul(2)
+        self.config.auto_min_bytes.is_some_and(|min| {
+            self.emptied || (self.has_dead && len >= min && len >= self.base.saturating_mul(2))
+        })
+    }
+
+    /// Note a batch that left every table empty in a log of at least [`EMPTIED_MIN_BYTES`] (see
+    /// `emptied`). O(tables), and only once the log is that long and holds dead rows.
+    fn note_if_emptied(&mut self) {
+        if !self.emptied
+            && self.has_dead
+            && self.log.file_len() >= EMPTIED_MIN_BYTES
+            && self.tables.values().all(|table| table.idx.as_ref().is_none_or(BtreeIndex::is_empty))
+        {
+            self.emptied = true;
+        }
     }
 
     /// The current generation's number.
@@ -610,6 +637,7 @@ impl Writer {
         self.stamped = self.log.file_len();
         self.base = self.log.file_len();
         self.has_dead = has_dead;
+        self.emptied = false;
         let ids: Vec<TableId> = self.tables.keys().copied().collect();
         for id in ids {
             self.publish(id);
@@ -682,6 +710,9 @@ pub(super) struct Core {
     /// Test-only: the tables whose indexes the open rebuilt.
     #[cfg(test)]
     rebuilt: Vec<TableId>,
+    /// Test-only: this log's slot in the per-log stats.
+    #[cfg(test)]
+    pub(super) stat_slot: usize,
     #[cfg_attr(not(test), allow(dead_code))]
     lock: Mutex<Option<fs::File>>,
 }
@@ -699,7 +730,7 @@ impl Core {
         // An unfinished compaction is never a generation.
         remove_spares(root)?;
         let manifest = Manifest::read(root)?.unwrap_or_default();
-        let (gen, mut log) = open_current_gen(root)?;
+        let (gen, mut log, older) = open_current_gen(root)?;
         let gen_path = gen_dir(root, gen);
         remove_orphan_indexes(&gen_path, &manifest)?;
         let header = *log.header();
@@ -741,6 +772,13 @@ impl Core {
             }
             recover(&mut log, &manifest, &gen_path, &header, &mut idxs, rebuild)?;
         }
+        // The current generation has opened: an older one (left by a crash right after a switch)
+        // is no longer the only other copy.
+        for old in older {
+            if let Err(e) = fs::remove_dir_all(gen_dir(root, old)) {
+                tracing::warn!(target: "tnlog", "remove old generation {old}: {e}");
+            }
+        }
 
         let view = log.view();
         let alive = Arc::new(GenAlive::default());
@@ -764,6 +802,7 @@ impl Core {
             base,
             // Unknown for a log with records; a new one holds nothing dead.
             has_dead: stamped > DATA_HEADER_BYTES as u64,
+            emptied: false,
             #[cfg(test)]
             panic_after: None,
         };
@@ -773,7 +812,7 @@ impl Core {
                 id: entry.id,
                 name: entry.name.clone(),
                 ksize: AtomicU16::new(entry.ksize),
-                published: ArcSwap::from_pointee(empty_published(&writer)),
+                published: ArcSwap::from_pointee(empty_published(&writer, entry.id)),
             });
             let idx = idxs.remove(&entry.id).flatten();
             writer.tables.insert(
@@ -783,6 +822,9 @@ impl Core {
             writer.publish(entry.id);
             tables.insert(entry.name.clone(), shared);
         }
+        // A log closed (or crashed) after a batch emptied every table, before the compaction
+        // that followed: the next batch asks for it again.
+        writer.note_if_emptied();
         Ok(Self {
             root: root.to_path_buf(),
             writer: Mutex::new(writer),
@@ -794,6 +836,8 @@ impl Core {
             sync_lock: Mutex::new(()),
             #[cfg(test)]
             rebuilt,
+            #[cfg(test)]
+            stat_slot: super::stats::slot(root),
             lock: Mutex::new(Some(lock)),
         })
     }
@@ -879,7 +923,7 @@ impl Core {
                 id,
                 name: name.to_string(),
                 ksize: AtomicU16::new(0),
-                published: ArcSwap::from_pointee(empty_published(&writer)),
+                published: ArcSwap::from_pointee(empty_published(&writer, id)),
             });
             writer
                 .tables
@@ -983,8 +1027,11 @@ impl Core {
         self.store_frontier(&writer);
         #[cfg(test)]
         super::stats::hold(held_from.elapsed());
+        #[cfg(test)]
+        super::stats::log(self.stat_slot).hold(held_from.elapsed());
         let end = writer.log.file_len();
         let pending = end.saturating_sub(writer.sync.synced.load(Ordering::Acquire));
+        writer.note_if_emptied();
         let compact = writer.wants_compaction();
         drop(writer);
         self.durability.wrote(pending);
@@ -1030,13 +1077,27 @@ fn check_ksize(table: &TableShared, fixed: u16, ksize: usize) -> eyre::Result<()
     Ok(())
 }
 
+#[cfg(test)]
+impl Core {
+    /// Test-only index damage: point `key`'s entry in table `id` at the record of row `other`,
+    /// and publish it.
+    pub(super) fn misindex(&self, id: TableId, key: &[u8], other: &[u8]) {
+        let mut writer = self.writer.lock();
+        let idx =
+            writer.tables.get_mut(&id).and_then(|t| t.idx.as_mut()).expect("an indexed table");
+        let pos = idx.load(other).expect("the other row");
+        idx.save(key, pos).expect("save");
+        writer.publish(id);
+    }
+}
+
 /// The snapshot of a table with no index yet.
-fn empty_published(writer: &Writer) -> Published {
+fn empty_published(writer: &Writer, table: TableId) -> Published {
     Published {
         index: None,
         view: Arc::clone(&writer.view),
         limit: 0,
-        value_offset: HEAD,
+        table,
         _alive: Arc::clone(&writer.alive),
     }
 }
@@ -1047,18 +1108,32 @@ pub(super) fn open_log(dir: &Path) -> eyre::Result<Log> {
     Ok(Pack::open_with(dir.join("log"), 0, false, PackCompression::None, PACK_VERSION, opts)?)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next creation of a database fails once its first generation's
+    /// directory exists, before its log does (as a crash there would leave it).
+    pub(super) static FAIL_GEN0_BUILD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// The current generation of the database at `root`, opened: the newest one (an error if it does
-/// not open), with every older one deleted; a new database gets generation 0, created durably.
-fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log)> {
+/// not open), and the older ones, for the caller to delete once the newest has replayed (until
+/// then, the only other copy); a new database gets generation 0, created durably.
+fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
     let gens = list_gens(root)?;
     let Some(&current) = gens.last() else {
+        // Built aside and renamed into place, so a failure (or a crash) part way leaves no
+        // log-less generation 0, which every later open would refuse; a leftover build is
+        // deleted by the next open (`remove_spares`).
+        let build = compact_dir(root, 0);
+        if let Err(e) = build_gen0(&build) {
+            let _ = fs::remove_dir_all(&build);
+            return Err(e);
+        }
         let dir = gen_dir(root, 0);
-        fs::create_dir(&dir).wrap_err_with(|| format!("tnlog: create {}", dir.display()))?;
-        let log = open_log(&dir)?;
-        log.commit()?;
-        crate::archive::data_file::fsync_directory(&dir)?;
+        fs::rename(&build, &dir)
+            .wrap_err_with(|| format!("tnlog: rename {} into place", build.display()))?;
         crate::archive::data_file::fsync_directory(root)?;
-        return Ok((0, log));
+        return Ok((0, open_log(&dir)?, Vec::new()));
     };
     let dir = gen_dir(root, current);
     if !dir.join("log").exists() {
@@ -1066,12 +1141,22 @@ fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log)> {
     }
     let log = open_log(&dir)
         .wrap_err_with(|| format!("tnlog: open generation {current} of {}", root.display()))?;
-    for &old in gens.iter().filter(|&&n| n < current) {
-        if let Err(e) = fs::remove_dir_all(gen_dir(root, old)) {
-            tracing::warn!(target: "tnlog", "remove old generation {old}: {e}");
-        }
+    let older = gens.into_iter().filter(|&n| n < current).collect();
+    Ok((current, log, older))
+}
+
+/// Build an empty first generation in `dir`: its log, committed and closed, and the directory
+/// synced.
+fn build_gen0(dir: &Path) -> eyre::Result<()> {
+    fs::create_dir(dir).wrap_err_with(|| format!("tnlog: create {}", dir.display()))?;
+    #[cfg(test)]
+    if FAIL_GEN0_BUILD.with(|fail| fail.replace(false)) {
+        bail!("tnlog: injected failure building generation 0");
     }
-    Ok((current, log))
+    let log = open_log(dir)?;
+    log.commit()?;
+    drop(log);
+    Ok(crate::archive::data_file::fsync_directory(dir)?)
 }
 
 /// Delete the index directories of tables the manifest does not have (or whose key size it has

@@ -27,8 +27,12 @@ Compaction).
 <root>/compact-<N+1>-<pid>-<n>/    a compaction's new generation, being built
 ```
 
-The newest `gen-<N>` is the current generation; an open deletes older ones and any `compact-*`
-(an unfinished compaction is never a generation), and refuses a generation with no log.
+The newest `gen-<N>` is the current generation. An open deletes any `compact-*` (an unfinished
+compaction is never a generation), refuses a generation with no log, and deletes older generations
+only once the newest has replayed: after a crash right after a switch the older one is the only
+other copy (no automatic fallback to it, since the newest may hold acked batches). A new
+database's `gen-0` is built in a `compact-0-*` directory and renamed into place, so no failure or
+crash leaves a generation without a log.
 
 **Manifest.** It lists table ids (`u16`, never reused), names and key sizes. It is rewritten
 atomically (tmp, `fsync`, rename, directory `fsync`) when a table is first opened, or when its first
@@ -84,6 +88,13 @@ taken only before the write lock, never while holding it. The commit thread hold
 Readers take no lock. Each table's `Published` snapshot holds its index snapshot, the log's
 `MapView`, and its own byte **limit**: the log's length at the publish. Reads check against
 `min(limit, mapped)`, so no shared atomic is written per write.
+
+**Index damage is an error, never a wrong answer.** A read (a get, a scan, or a compaction's
+copy) checks that the record an index entry points at is a put of that table and that key
+(`record::put_value`), so a damaged position is `CorruptIndex`, not another row's value; a scan
+ends there (logged), and a compaction abandons rather than copy it. A removal whose key the index
+cannot read fails the batch (nothing written) rather than counting the key absent, which would
+leave the row in place.
 
 A scan holds the database core, so its files stay open while the scan lives, even after every
 handle has dropped. The database's `LOCK` is the core's last field, so it is released only once the
@@ -184,7 +195,10 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
   registry; the switch's tail cap; a crash after the switch; copied rows as whole batches; a
   leftover `compact-*` deleted and a generation without a log refused; a close cancelling; the
   failures before the rename (abandoned) and after it (the writer stopped); a sync round paused
-  across the switch; and compactions inside the randomized crash model.
+  across the switch; the disk filling during the copy; an emptied log compacting at once (also
+  after a reopen); writeback as the copy goes; and compactions inside the randomized crash model;
+- hardening: a failed open keeping the older generation; an interrupted creation reopening; a
+  removal through a damaged index failing; a misindexed row read as `CorruptIndex`.
 
 **Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
 revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
@@ -202,14 +216,22 @@ paced at 64 MiB/s) when it is at least `auto_min_bytes` long, at least twice `ba
 right after the last compaction, kept in the generation's `compacted` file; 0 if none), and may
 hold a dead row (`has_dead`: set by an overwrite, an effective removal or a clear of a non-empty
 table; assumed at open unless the log is empty). In steady state that is "dead ≥ live", with no
-accounting per write; a log that only grows never compacts. `Database::compact` asks for one at
-once (a log of at least 1 MiB). A failed compaction backs the trigger off (60 s, doubling to 1 h).
+accounting per write; a log that only grows never compacts. A batch that leaves every table
+empty, in a log of at least 1 MiB with a dead row, also asks for one at once (automatic
+compaction on), whatever the threshold. The epoch tables are all cleared at every epoch's end,
+so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms.
+`Database::compact` asks for one at once (a log of at least 1 MiB). A failed compaction backs
+the trigger off (60 s, doubling to 1 h).
 
 **Steps.** One `tnlog-compact` thread per database:
 1. **Snapshot**, under the write lock: every table's last publish and the log's end `E`, one
    point between two batches.
 2. **Copy**, no lock, paced: each table's rows in key order, each its own batch (the stored put
-   record with its batch-end flag set). Each snapshot is dropped once copied.
+   record with its batch-end flag set). Each snapshot is dropped once copied. Every MiB the copy
+   or a catch-up appends is handed to writeback at once (Linux: `sync_file_range(WRITE)`, which
+   neither waits nor flushes the drive's cache), so the new log never piles up unflushed: on
+   Linux a pile of dirty pages throttles every thread that writes, the database's writers
+   included. The round syncs stay the durability points.
 3. **Catch-up**, no lock, unpaced, in rounds (each synced) until one had at most 1 MiB, at most
    8 rounds (a writer faster than the catch-up is then caught up by the switch's last try). A round writes the **net effect** of the old log's batches since the last one: a
    clear of each table it cleared (if the new log holds rows of it), then each touched key's last
@@ -226,8 +248,9 @@ once (a log of at least 1 MiB). A failed compaction backs the trigger off (60 s,
    place, a directory sync, and the install: the writer moves to the new log, indexes, view and
    frontier, and publishes every table. The install does no I/O and cannot fail.
 
-**Failures.** Before the rename, a failure (or a panic, or less than 256 MiB free, checked before
-each round and the switch, or more than 64 MiB landing before the last switch try) abandons the
+**Failures.** Before the rename, a failure (or a panic, or less than 256 MiB free, checked once
+per MiB of the copy, before each round and before the switch, or more than 64 MiB landing before
+the last switch try) abandons the
 compaction: its files are deleted after the locks are
 released, and the database carries on in its generation. After the rename, a failure (the
 directory sync) or a panic stops the writer, latched: which generation the next open picks is
@@ -247,7 +270,9 @@ fast as it takes them, about 400 MB/s), the epoch log's sync p99 rises from abou
 0.4–0.8 ms while the cache log compacts, most of all under the catch-up rounds' flushes. Neither
 preallocating the new log, flushing it in 1 MiB pieces, nor utility I/O priority helped the
 consensus measure. Compacting less often did: `SplitDatabase` compacts the cache log
-automatically only from 256 MiB (`CACHE_AUTO_MIN_BYTES`, four times the default).
+automatically only from 256 MiB (`CACHE_AUTO_MIN_BYTES`, four times the default), and the epoch
+log only from 2 GiB (`EPOCH_AUTO_MIN_BYTES`, a safety net: it resets at each epoch's end, above),
+so consensus writes see no compaction of their own log mid-epoch.
 `workload_mixed_compaction` judges it on interleaved pairs (1000 rounds each, compaction on and
 off, order rotated), since vote p99 varies about 30% run to run here and short runs hide the
 effect:
@@ -257,7 +282,17 @@ effect:
 | 64 MiB | 1.26 (1.10–1.33) | 1.07 | 11–12 |
 | 256 MiB | 1.06–1.09 (0.90–1.18) | 1.01–1.03 | 4–5 |
 
-At a realistic batch rate (1 MB at 25/s) neither shows a measurable effect.
+At a realistic batch rate (1 MB at 25/s, 3 pairs of 12,000 rounds on macOS), with the epoch log
+compacting only at the epoch end: the cache log compacts 5 times a run, the switch holding its
+write lock 0.3–0.6 ms on average (at most 1.4 ms), and the ratios are 1.01 (vote p99) and 1.01
+(ms per round). Linux, before the epoch-end reset and the writeback: 9–10 compactions per
+29-second run across the epoch and cache logs, the switch holding the lock 15–35 ms (outliers
+to 232 ms), ordinary write-lock holds up to ~0.5 s while a compaction ran (1.3–2.3 ms without),
+vote p99 ratios 1.23–1.70. Linux after both (4 pairs of 6,000 rounds): the cache log compacts 6–7
+times a run, the switch holding its lock 7–10 ms on average (at most 26 ms: two or three drive
+flushes, the new log's and the directory's, which block only that log's writers); the epoch log's
+longest write-lock hold is the same with compaction on as off (4–26 ms); vote p99 1.04 (pairs
+0.98–1.18), ms per round 1.04.
 
 ## Production shape: one log per environment (`split.rs`)
 

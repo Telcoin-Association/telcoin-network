@@ -24,18 +24,27 @@ use super::database::{CompactionConfig, TnLogDatabase, TnLogOptions, TnLogTxMut}
 /// makes those compactions four times rarer, for up to that much more cache log on disk.
 pub const CACHE_AUTO_MIN_BYTES: u64 = 256 << 20;
 
+/// The least log the epoch environment compacts automatically at mid-epoch: a safety net only.
+/// The epoch tables are all cleared at every epoch's end, which compacts the log at once (nothing
+/// live to copy; see the tnlog README's Compaction section), so consensus writes see no
+/// compaction stalls mid-epoch.
+pub const EPOCH_AUTO_MIN_BYTES: u64 = 2 << 30;
+
 /// The environments, in [`SplitDatabase::dbs`] order.
 const EPOCH: usize = 0;
 const KAD: usize = 1;
 const CACHE: usize = 2;
 
 /// The options for environment `env`: `options`, with the cache's automatic threshold raised to
-/// at least [`CACHE_AUTO_MIN_BYTES`] (automatic compaction left off if it is off).
+/// at least [`CACHE_AUTO_MIN_BYTES`] and the epoch's to at least [`EPOCH_AUTO_MIN_BYTES`]
+/// (automatic compaction left off if it is off).
 fn env_options(options: TnLogOptions, env: usize) -> TnLogOptions {
-    if env != CACHE {
-        return options;
-    }
-    let auto_min_bytes = options.compaction.auto_min_bytes.map(|min| min.max(CACHE_AUTO_MIN_BYTES));
+    let floor = match env {
+        CACHE => CACHE_AUTO_MIN_BYTES,
+        EPOCH => EPOCH_AUTO_MIN_BYTES,
+        _ => return options,
+    };
+    let auto_min_bytes = options.compaction.auto_min_bytes.map(|min| min.max(floor));
     TnLogOptions {
         compaction: CompactionConfig { auto_min_bytes, ..options.compaction },
         ..options
@@ -279,8 +288,9 @@ mod test {
         run(test_multi_remove);
     }
 
-    /// The cache environment's automatic threshold is raised to [`CACHE_AUTO_MIN_BYTES`] (a larger
-    /// one kept, an off one left off); the other environments keep the configured one.
+    /// The cache environment's automatic threshold is raised to [`CACHE_AUTO_MIN_BYTES`] and the
+    /// epoch environment's to [`EPOCH_AUTO_MIN_BYTES`] (a larger one kept, an off one left off);
+    /// kad keeps the configured one.
     #[test]
     fn test_tnlog_split_cache_compacts_less_often() {
         let with = |auto_min_bytes| TnLogOptions {
@@ -289,7 +299,6 @@ mod test {
         };
         let auto = |options: TnLogOptions, env| env_options(options, env).compaction;
         let default = with(Some(64 << 20));
-        assert_eq!(auto(default, EPOCH), default.compaction);
         assert_eq!(auto(default, KAD), default.compaction);
         assert_eq!(
             auto(default, CACHE),
@@ -297,6 +306,12 @@ mod test {
         );
         assert_eq!(auto(with(Some(1 << 30)), CACHE).auto_min_bytes, Some(1 << 30));
         assert_eq!(auto(with(None), CACHE).auto_min_bytes, None, "off stays off");
+        // The epoch log compacts at the epoch boundary; mid-epoch only past a safety threshold.
+        assert_eq!(
+            auto(default, EPOCH),
+            CompactionConfig { auto_min_bytes: Some(EPOCH_AUTO_MIN_BYTES), bytes_per_sec: 7 }
+        );
+        assert_eq!(auto(with(None), EPOCH).auto_min_bytes, None, "off stays off");
     }
 
     /// Each table lives in its hint's database; a transaction over both environments writes its

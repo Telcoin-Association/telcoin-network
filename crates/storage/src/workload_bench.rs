@@ -199,6 +199,7 @@ fn tnlog_stats_column<W: Workload, DB: Database>(
     dir: &Path,
 ) -> Column {
     let _ = tnlog_stats::take();
+    let _ = tnlog_stats::take_logs();
     let col = column(rt, w, name.to_string(), db, Some(dir));
     let s = tnlog_stats::take();
     let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
@@ -223,9 +224,24 @@ fn tnlog_stats_column<W: Workload, DB: Database>(
         );
     }
     if s.abandoned > 0 {
+        println!("  {name}: {} compactions abandoned; the last: {}", s.abandoned, s.last_abandon);
+    }
+    if s.cancelled > 0 {
+        println!("  {name}: {} compactions cancelled by a close", s.cancelled);
+    }
+    for log in tnlog_stats::take_logs() {
         println!(
-            "  {name}: {} compactions abandoned or cancelled; the last: {}",
-            s.abandoned, s.last_abandon
+            "    [{}] {} syncs (avg {:.0} us); write-lock hold max {:.1} ms; {} compactions \
+             (switch hold avg {:.1} ms, max {:.1} ms); {} abandoned, {} cancelled",
+            log.name,
+            log.syncs,
+            avg_us(log.sync_ns, log.syncs),
+            log.hold_max_ns as f64 / 1e6,
+            log.compactions,
+            avg_us(log.switch_ns, log.compactions) / 1e3,
+            log.switch_max_ns as f64 / 1e6,
+            log.abandoned,
+            log.cancelled,
         );
     }
     col
@@ -1053,12 +1069,20 @@ fn workload_mixed() {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_mixed_compaction() {
-    // `TN_BENCH_PAIRS` / `TN_BENCH_PAIR_ROUNDS` shorten it (a quick pass on a slow-sync machine).
+    // `TN_BENCH_PAIRS` / `TN_BENCH_PAIR_ROUNDS` shorten it (a quick pass on a slow-sync machine);
+    // `TN_BENCH_PAIR_BATCH_KB` / `TN_BENCH_PAIR_RATE` (batches a second; 0 = as fast as taken)
+    // set the batch stream, e.g. 1024 KB at 25/s for a node's realistic rate (run enough rounds
+    // for the cache log to reach its compaction threshold).
     let env = |name: &str, default: usize| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
     let pairs_wanted = env("TN_BENCH_PAIRS", 6);
     let pair_rounds = env("TN_BENCH_PAIR_ROUNDS", 1000) as u32;
+    let batch = env("TN_BENCH_PAIR_BATCH_KB", 256) << 10;
+    let rate = match env("TN_BENCH_PAIR_RATE", 0) {
+        0 => None,
+        rate => Some(u32::try_from(rate).expect("a batch rate")),
+    };
     let rt = Runtime::new().expect("tokio runtime");
     let value = |col: &Column, label: &str| -> f64 {
         let cell = col.1.iter().find(|c| c.label == label).expect("a measured cell");
@@ -1072,8 +1096,8 @@ fn workload_mixed_compaction() {
             let tmp = tempfile::tempdir().expect("temp dir");
             let mut w = MixedRounds {
                 consensus: ConsensusRounds { committee: 50, rounds: pair_rounds },
-                batch: 256 << 10,
-                rate: None,
+                batch,
+                rate,
             };
             let config = if on {
                 CompactionConfig::default()
@@ -1098,9 +1122,11 @@ fn workload_mixed_compaction() {
     let rounds: Vec<f64> = pairs.iter().map(|[off, on]| on.1 / off.1).collect();
     let list =
         |ratios: &[f64]| ratios.iter().map(|r| format!("{r:.2}")).collect::<Vec<_>>().join(" ");
+    let pace = rate.map_or_else(|| "as fast as taken".to_string(), |r| format!("{r}/s"));
     println!(
         "=== compaction's cost to consensus: {pairs_wanted} interleaved pairs of {pair_rounds} \
-         rounds, ratio on / off ==="
+         rounds beside {} KB batches ({pace}), ratio on / off ===",
+        batch >> 10
     );
     println!("vote durable p99: median {:.2} ({})", median(votes.clone()), list(&votes));
     println!("ms / round:       median {:.2} ({})", median(rounds.clone()), list(&rounds));

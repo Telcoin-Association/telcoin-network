@@ -71,6 +71,34 @@ fn log_path(root: &Path) -> std::path::PathBuf {
     root.join("gen-0").join("log")
 }
 
+/// Append a well-framed record carrying `payload` to the log at `path` with a fresh pack handle,
+/// and leave the log unsealed, so the next open replays it.
+fn append_unsealed(path: &Path, payload: &[u8]) {
+    use crate::archive::{
+        data_file::MmapFileOptions,
+        pack::{Pack, PackCompression},
+    };
+    let mut log: Pack<Vec<u8>> =
+        Pack::open_with(path, 0, false, PackCompression::None, 1, MmapFileOptions::default())
+            .expect("open log");
+    log.append_raw(payload).expect("append");
+    log.commit().expect("sync");
+    log.poison();
+}
+
+/// Copy the directory tree at `from` to `to`.
+fn copy_dir(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).expect("mkdir");
+    for entry in std::fs::read_dir(from).expect("read dir").flatten() {
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).expect("copy");
+        }
+    }
+}
+
 fn truncate(path: &Path, len: u64) {
     std::fs::OpenOptions::new()
         .write(true)
@@ -319,25 +347,7 @@ fn test_tnlog_unknown_record_fails_closed() {
             db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
             drop(db);
         }
-        // Append a well-framed record carrying `bad` with a fresh pack handle, unsealed.
-        {
-            use crate::archive::{
-                data_file::MmapFileOptions,
-                pack::{Pack, PackCompression},
-            };
-            let mut log: Pack<Vec<u8>> = Pack::open_with(
-                log_path(tmp.path()),
-                0,
-                false,
-                PackCompression::None,
-                1,
-                MmapFileOptions::default(),
-            )
-            .expect("open log");
-            log.append_raw(&bad).expect("append");
-            log.commit().expect("sync");
-            log.poison(); // unsealed: the next open replays it
-        }
+        append_unsealed(&log_path(tmp.path()), &bad);
         let len = std::fs::metadata(log_path(tmp.path())).expect("log").len();
         assert!(TnLogDatabase::open(tmp.path()).is_err(), "{bad:?} fails the open");
         assert_eq!(std::fs::metadata(log_path(tmp.path())).expect("log").len(), len);
@@ -1351,4 +1361,233 @@ fn test_tnlog_compaction_last_switch_takes_a_large_tail() {
     let retries = db.core().compact.test.switch_retries.load(std::sync::atomic::Ordering::Relaxed);
     assert_eq!(retries, 2, "the usual cap twice, then the bounded stall");
     assert_eq!(db.iter::<TestTable>().count() as u64, 10 + (next - 1_000));
+}
+
+/// When every table of a log has been emptied (the epoch log at an epoch's end clears all of its
+/// tables), the log compacts at once, whatever its growth threshold: nothing is live, so the
+/// compaction is a near-free reset that returns the disk. Clearing only some tables does not.
+#[test]
+fn test_tnlog_compaction_when_every_table_is_emptied() {
+    let tmp = TempDir::with_prefix("tnlog_compact_emptied").expect("temp dir");
+    let config = CompactionConfig { auto_min_bytes: Some(1 << 40), bytes_per_sec: 0 };
+    let db = open_compacting(tmp.path(), CommitMode::Group, config);
+    let value = "v".repeat(64 << 10);
+    for i in 0..20_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+        db.insert::<OtherTable>(&i, &value).expect("insert");
+    }
+    db.clear_table::<TestTable>().expect("clear");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(db.core().compact.done(), 0, "a table still holds rows: no compaction");
+    db.clear_table::<OtherTable>().expect("clear");
+    assert_eq!(db.core().compact.wait_done(1), Some(Ok(true)), "every table emptied: compacted");
+    wait_only_gen(tmp.path(), 1);
+    assert!(log_len(&db) < 64 << 10, "nothing live was copied: {} bytes", log_len(&db));
+}
+
+/// With compaction off, emptying every table compacts nothing.
+#[test]
+fn test_tnlog_no_compaction_when_emptied_with_compaction_off() {
+    let tmp = TempDir::with_prefix("tnlog_compact_emptied_off").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let value = "v".repeat(64 << 10);
+    for i in 0..20_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    db.clear_table::<TestTable>().expect("clear");
+    db.clear_table::<OtherTable>().expect("clear");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(db.core().compact.done(), 0);
+}
+
+/// A compaction starts writing its new log back as it goes (every MiB), so its output never piles
+/// up unflushed (on Linux, dirty pages throttle every writer); its round syncs stay the durability
+/// points. The counter shows the calls; whether pages were written back is not observable here.
+#[test]
+fn test_tnlog_compaction_writes_back_as_it_goes() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tmp = TempDir::with_prefix("tnlog_compact_writeback").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let value = "v".repeat(64 << 10);
+    for i in 0..48_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    let before = super::stats::WRITEBACKS.load(Relaxed);
+    assert_eq!(db.compact_now(), Ok(true));
+    let started = super::stats::WRITEBACKS.load(Relaxed) - before;
+    assert!(started >= 2, "3 MiB copied: writeback started {started} times");
+}
+
+/// A close (or a crash) between emptying every table and the compaction that follows loses no
+/// reset: the next open notes the emptied log, and its first batch asks for the compaction.
+#[test]
+fn test_tnlog_compaction_after_reopening_an_emptied_log() {
+    let tmp = TempDir::with_prefix("tnlog_compact_emptied_reopen").expect("temp dir");
+    let value = "v".repeat(64 << 10);
+    {
+        // Compaction off: the clears leave the log as it is.
+        let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+        for i in 0..20_u64 {
+            db.insert::<TestTable>(&i, &value).expect("insert");
+            db.insert::<OtherTable>(&i, &value).expect("insert");
+        }
+        db.clear_table::<TestTable>().expect("clear");
+        db.clear_table::<OtherTable>().expect("clear");
+    }
+    let config = CompactionConfig { auto_min_bytes: Some(1 << 40), bytes_per_sec: 0 };
+    let db = open_compacting(tmp.path(), CommitMode::Group, config);
+    db.insert::<TestTable>(&1, &"new epoch".to_string()).expect("insert");
+    assert_eq!(db.core().compact.wait_done(1), Some(Ok(true)), "the reopened emptied log resets");
+    wait_only_gen(tmp.path(), 1);
+    assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("new epoch".to_string()));
+}
+
+/// An open keeps an older generation until the newest one has opened: after a crash right after
+/// a switch (the rename done, the old generation not yet deleted), the old one is the only other
+/// copy if the newest fails to replay. No fallback to it: the newest may hold acked batches.
+#[test]
+fn test_tnlog_failed_open_keeps_the_older_generation() {
+    let tmp = TempDir::with_prefix("tnlog_keep_old_gen").expect("temp dir");
+    let saved = TempDir::with_prefix("tnlog_keep_old_gen_saved").expect("temp dir");
+    let root = tmp.path();
+    {
+        let db = open_compacting(root, CommitMode::Sync, manual());
+        for i in 0..10_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.remove::<TestTable>(&0).expect("remove");
+    }
+    copy_dir(&root.join("gen-0"), saved.path());
+    {
+        let db = open_compacting(root, CommitMode::Sync, manual());
+        assert_eq!(db.compact_now(), Ok(true));
+    }
+    wait_only_gen(root, 1);
+
+    // Both generations whole: the open takes the newest and deletes the older one.
+    copy_dir(saved.path(), &root.join("gen-0"));
+    {
+        let db = open_compacting(root, CommitMode::Sync, manual());
+        assert_eq!(rows::<TestTable>(&db).len(), 9);
+    }
+    wait_only_gen(root, 1);
+
+    // The newest fails to replay: the open fails, and the older generation is still there.
+    copy_dir(saved.path(), &root.join("gen-0"));
+    append_unsealed(&root.join("gen-1").join("log"), &record::head(KIND_PUT, 9, true));
+    assert!(TnLogDatabase::open(root).is_err(), "the damaged newest generation fails the open");
+    assert!(root.join("gen-0").join("log").exists(), "the older generation is kept");
+}
+
+/// The free-space guard also runs during the copy, the longest phase (once per MiB): a disk that
+/// fills meanwhile abandons the compaction before its copy ends, not after it.
+#[test]
+fn test_tnlog_compaction_copy_gives_way_to_a_full_disk() {
+    let tmp = TempDir::with_prefix("tnlog_compact_copy_room").expect("temp dir");
+    // Paced at 1 MiB/s: the 4 MiB copy takes about 4 s.
+    let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 20 };
+    let db = open_compacting(tmp.path(), CommitMode::Group, config);
+    let value = "v".repeat(64 << 10);
+    for i in 0..64_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    let hooks = &db.core().compact.test;
+    let (arrivals, release) = hooks.gate_next();
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        std::thread::sleep(Duration::from_millis(300));
+        *hooks.free_space.lock() = Some(1 << 20);
+        // The gate's sender drops when the compaction ends; checkpoint 1 is the copy's end.
+        let reached = arrivals.recv_timeout(Duration::from_secs(20));
+        drop(release);
+        let result = compaction.join().expect("compaction thread");
+        assert!(reached.is_err(), "the copy ran to its end on a full disk: {reached:?}");
+        let err = result.expect_err("abandoned");
+        assert!(err.contains("bytes free, below"), "{err}");
+    });
+    *hooks.free_space.lock() = None;
+    assert_eq!(compact_dirs(tmp.path()), 0, "nothing left");
+    assert_eq!(db.iter::<TestTable>().count(), 64);
+}
+
+/// Zero the CRC trailer of every page of each index in generation directory `gen` but its header
+/// and root: at-rest damage the index reports as `CorruptIndex` on a read through those pages
+/// (the open checks only the header and the root).
+fn damage_index_below_the_root(gen: &Path) {
+    use crate::archive::btree_index::{header::BtreeHeader, page::PAGE_SIZE};
+    let mut damaged = 0;
+    for entry in std::fs::read_dir(gen).expect("read gen").flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("idx-") {
+            continue;
+        }
+        let file = entry.path().join("index.btx");
+        let mut bytes = std::fs::read(&file).expect("read index");
+        let header = BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("index header");
+        for page in (1..header.page_count).filter(|&p| p != header.root_page) {
+            let end = (page as usize + 1) * PAGE_SIZE;
+            bytes[end - 4..end].fill(0);
+            damaged += 1;
+        }
+        std::fs::write(&file, bytes).expect("write index");
+    }
+    assert!(damaged > 0, "an index with pages below its root");
+}
+
+/// A removal whose key the index cannot read (a damaged page) fails: counted as "absent", it
+/// would write nothing, and the row would silently survive its removal.
+#[test]
+fn test_tnlog_remove_through_a_damaged_index_fails() {
+    let tmp = TempDir::with_prefix("tnlog_remove_damaged").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..2_000_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+    }
+    // Closed cleanly: the next open trusts the index.
+    damage_index_below_the_root(&tmp.path().join("gen-0"));
+    let db = open(tmp.path(), CommitMode::Group);
+    let removed = db.remove::<TestTable>(&1_000);
+    assert!(removed.is_err(), "a removal through a damaged index: {removed:?}");
+}
+
+/// Creating a database's first generation is atomic: a failure (or a crash) once its directory
+/// exists but before its log does leaves no log-less generation, which every later open would
+/// refuse; the next open creates the database afresh.
+#[test]
+fn test_tnlog_interrupted_creation_reopens() {
+    let tmp = TempDir::with_prefix("tnlog_gen0_build").expect("temp dir");
+    super::store::FAIL_GEN0_BUILD.with(|fail| fail.set(true));
+    assert!(TnLogDatabase::open(tmp.path()).is_err(), "the injected failure");
+    // A crash part way would also leave its build directory: the next open deletes it.
+    std::fs::create_dir(tmp.path().join("compact-0-1-1")).expect("a leftover build");
+    let db = open(tmp.path(), CommitMode::Sync);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    drop(db);
+    assert_eq!(crate::tndb::layout::list_gens(tmp.path()).expect("gens"), [0]);
+    assert_eq!(compact_dirs(tmp.path()), 0, "no build left behind");
+    let db = open(tmp.path(), CommitMode::Sync);
+    assert_eq!(rows::<TestTable>(&db), [(1, "a".to_string())]);
+}
+
+/// A read checks that the record at an index position is the row it asked for: a damaged index
+/// entry that lands on another row's record is `CorruptIndex`, never that row's value, and a
+/// compaction abandons rather than copy the mismatch.
+#[test]
+fn test_tnlog_misindexed_row_is_corrupt_not_another_value() {
+    let tmp = TempDir::with_prefix("tnlog_misindexed").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    let id = db.core().table(<TestTable as tn_types::Table>::NAME).expect("open").id;
+    db.core().misindex(id, &tn_types::encode_key(&3_u64), &tn_types::encode_key(&7_u64));
+
+    let read = db.get::<TestTable>(&3);
+    assert!(read.is_err(), "the record at 3's position is row 7's: {read:?}");
+    assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("v7".to_string()), "7 itself reads");
+    let scanned: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
+    assert_eq!(scanned, [0, 1, 2], "a scan ends at the mismatch");
+    let compacted = db.compact_now().expect_err("the copy finds the mismatch");
+    assert!(compacted.contains("index"), "{compacted}");
 }

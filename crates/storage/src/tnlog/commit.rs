@@ -322,6 +322,7 @@ fn sync_round(core: &Core) {
     #[cfg(test)]
     {
         super::stats::add(&super::stats::SYNCS, &super::stats::SYNC_NS, started.elapsed());
+        super::stats::log(core.stat_slot).sync(started.elapsed());
         durability.syncs.fetch_add(1, Ordering::Relaxed);
     }
     match outcome {

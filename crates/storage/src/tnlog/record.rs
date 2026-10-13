@@ -14,6 +14,8 @@
 
 use eyre::bail;
 
+use crate::archive::error::fetch::FetchError;
+
 use super::TableId;
 
 pub(super) const KIND_PUT: u8 = 1;
@@ -78,9 +80,46 @@ pub(super) fn parse(
     Ok(Record { table, op, end })
 }
 
+/// The value of `payload`, a record an index entry points at, checked to be table `table`'s put
+/// of `key`: a damaged entry that lands on any other record is `CorruptIndex`, never another
+/// row's value.
+pub(super) fn put_value<'a>(
+    payload: &'a [u8],
+    table: TableId,
+    key: &[u8],
+) -> Result<&'a [u8], FetchError> {
+    let value_at = HEAD + key.len();
+    let row = payload.get(..value_at).is_some_and(|row| {
+        row[0] & KIND_MASK == KIND_PUT && row[1..HEAD] == table.to_le_bytes() && &row[HEAD..] == key
+    });
+    if !row {
+        return Err(FetchError::CorruptIndex(format!(
+            "a record an index entry points at is not the row it indexes (table {table})"
+        )));
+    }
+    Ok(&payload[value_at..])
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// `put_value` returns the value only for the indexed table's put of the asked key.
+    #[test]
+    fn test_tnlog_record_put_value_checks_the_row() {
+        let mut put = head(KIND_PUT, 2, true).to_vec();
+        put.extend_from_slice(b"keyXvalue");
+        assert_eq!(put_value(&put, 2, b"keyX").expect("the row"), b"value");
+        let corrupt = |payload: &[u8], table, key: &[u8]| {
+            matches!(put_value(payload, table, key), Err(FetchError::CorruptIndex(_)))
+        };
+        assert!(corrupt(&put, 3, b"keyX"), "another table's record");
+        assert!(corrupt(&put, 2, b"keyY"), "another key's record");
+        let mut remove = head(KIND_REMOVE, 2, true).to_vec();
+        remove.extend_from_slice(b"keyX");
+        assert!(corrupt(&remove, 2, b"keyX"), "a removal, not a put");
+        assert!(corrupt(&put[..5], 2, b"keyX"), "shorter than its key");
+    }
 
     #[test]
     fn test_tnlog_record_parse() {

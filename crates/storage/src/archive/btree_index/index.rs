@@ -1028,9 +1028,15 @@ impl BtreeIndex {
         self.get_value(key)
     }
 
-    /// True if the index contains `key`.
-    pub fn contains(&self, key: &[u8]) -> bool {
-        self.load(key).is_ok()
+    /// True if the index contains `key` (a key of another size is never in it). A read error
+    /// (a damaged page) is an error, never "absent": a caller deciding whether to remove a row
+    /// would otherwise leave it in place.
+    pub fn contains(&self, key: &[u8]) -> Result<bool, FetchError> {
+        match self.load(key) {
+            Ok(_) => Ok(true),
+            Err(FetchError::NotFound | FetchError::KeySize { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Flush and sync all index data to disk (see the lazy-CRC, header-last commit regime).
@@ -2567,7 +2573,7 @@ mod tests {
             idx.remove(&[7_u8; 33]),
             Err(AppendError::KeySize { expected: 32, got: 33 })
         ));
-        assert!(!idx.contains(&short));
+        assert!(matches!(idx.contains(&short), Ok(false)), "never in the index");
         assert!(idx.is_empty(), "nothing was written");
     }
 
