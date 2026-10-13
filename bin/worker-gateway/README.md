@@ -202,7 +202,7 @@ worker-gateway \
   The error names the flag, and the path of a file that cannot be read or parsed, but never quotes a file's content.
 - **Fail closed.** A worker whose certificate does not chain to a trusted root or does not name the URL's host, or whose terminator refuses the client certificate, fails the handshake.
   Its readiness poll then fails, so it is not ready: `/ready` answers `503` and submissions get `503` / `-32000`, and a forward sent before the next poll notices gets `502` / `-32001`.
-- **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback or private address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
+- **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
   A domain name other than `localhost` counts as public, because the gateway does not resolve it.
   When the hop leaves a network you control, use `https` or a tunnel.
 
@@ -584,7 +584,7 @@ A batch the gateway cannot read to its end is refused rather than routed (see [B
 The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
 The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and `localhost` as both loopback addresses.
-A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback or private address.
+A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address.
 A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
 A batch goes to the worker only when every element is a submission.

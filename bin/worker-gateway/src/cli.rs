@@ -716,8 +716,9 @@ impl Cli {
                 target: "gateway",
                 worker_id,
                 upstream = %UpstreamOrigin(url),
-                "worker upstream uses plain http to a host that is not a loopback or private \
-                 address; submissions, reads and readiness cross the network unencrypted"
+                "worker upstream uses plain http to a host that is not a loopback, private, \
+                 CGNAT or link-local address; submissions, reads and readiness cross the network \
+                 unencrypted"
             );
         });
         self.probe_addr
@@ -1327,10 +1328,11 @@ fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
 /// matches the IPv4 address it names, and `localhost` either loopback address
 /// (see [`same_host`]). A URL on a worker's host but another port is accepted
 /// with a warning, since that port may serve a separate node on the
-/// validator's machine. Plain `http` to a host that is not a loopback or
-/// private address literal is accepted with a warning: the reads and their
-/// answers then cross the network unencrypted. Messages name the URL by origin
-/// only, since a hosted RPC URL can carry an API key in its path.
+/// validator's machine. Plain `http` to a host that is not an address literal
+/// unroutable from the internet (see [`plaintext_to_public_host`]) is accepted
+/// with a warning: the reads and their answers then cross the network
+/// unencrypted. Messages name the URL by origin only, since a hosted RPC URL
+/// can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
@@ -1378,15 +1380,16 @@ fn ensure_query_upstream(
         warn!(
             target: "gateway",
             upstream = %UpstreamOrigin(url),
-            "--redirect-queries uses plain http to a host that is not a loopback or private \
-             address; reads and their answers cross the network unencrypted"
+            "--redirect-queries uses plain http to a host that is not a loopback, private, \
+             CGNAT or link-local address; reads and their answers cross the network unencrypted"
         );
     }
     Ok(())
 }
 
 /// The worker RPC and readiness URLs that use plain `http` to a host that is
-/// not a loopback or private address literal, each with its worker id.
+/// not an address literal unroutable from the internet (see
+/// [`plaintext_to_public_host`]), each with its worker id.
 ///
 /// Such a hop may cross a network the operator does not control, where an
 /// on-path attacker can drop submissions behind their computable hash and
@@ -1417,14 +1420,23 @@ fn same_host(a: &Url, b: &Url) -> bool {
         .map_or_else(|| a.host() == b.host(), |(a, b)| a.iter().any(|ip| b.contains(ip)))
 }
 
-/// Whether `url` is plain `http` to anything but a loopback or private address
-/// literal. A domain name (other than `localhost`) counts as public, since it
-/// cannot be checked without resolving it.
+/// Whether `url` is plain `http` to anything but an address literal that is
+/// not routable from the internet: loopback, private (RFC 1918 and IPv6
+/// unique local), shared (the `100.64.0.0/10` carrier-grade NAT range) or link
+/// local (`169.254.0.0/16`, `fe80::/10`). A domain name (other than
+/// `localhost`) counts as public, since it cannot be checked without resolving
+/// it.
 fn plaintext_to_public_host(url: &Url) -> bool {
     let local = url_host_ips(url).is_some_and(|ips| {
         ips.iter().all(|ip| match ip {
-            IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
-            IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+            IpAddr::V4(ip) => {
+                let [first, second, ..] = ip.octets();
+                let shared = first == 100 && (second & 0b1100_0000) == 64;
+                ip.is_loopback() || ip.is_private() || shared || ip.is_link_local()
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
         })
     });
     url.scheme() == "http" && !local
@@ -2823,6 +2835,43 @@ mod tests {
         ] {
             assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
         }
+        Ok(())
+    }
+
+    /// Carrier-grade NAT (`100.64.0.0/10`) and link-local addresses are not
+    /// routable from the internet either, so a plain `http` hop to one draws
+    /// no warning; the addresses just outside each range still do.
+    #[test]
+    fn plaintext_warning_spares_cgnat_and_link_local_hosts() -> eyre::Result<()> {
+        for (url, warns) in [
+            // 100.64.0.0/10
+            ("http://100.64.0.1:8545/", false),
+            ("http://100.100.1.2:8545/", false),
+            ("http://100.127.255.254:8545/", false),
+            ("http://[::ffff:100.64.0.1]:8545/", false),
+            ("http://100.63.255.255:8545/", true),
+            ("http://100.128.0.1:8545/", true),
+            // 169.254.0.0/16
+            ("http://169.254.0.1:8545/", false),
+            ("http://169.254.255.254:8545/", false),
+            ("http://169.253.255.255:8545/", true),
+            ("http://169.255.0.1:8545/", true),
+            // fe80::/10
+            ("http://[fe80::1]:8545/", false),
+            ("http://[febf:ffff::1]:8545/", false),
+            ("http://[fe7f::1]:8545/", true),
+            ("http://[fec0::1]:8545/", true),
+        ] {
+            assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
+        }
+        // and at startup, for a worker URL
+        let (settings, logs) = into_settings_logged(cli_with(
+            None,
+            Some("http://100.64.0.7:8545"),
+            Some("http://[fe80::7]:8551/health/workers"),
+        ));
+        settings?;
+        assert!(!logs.contains("worker upstream uses plain http"), "{logs}");
         Ok(())
     }
 
