@@ -26,7 +26,7 @@ use eyre::{bail, WrapErr as _};
 use parking_lot::Mutex;
 
 use super::{
-    commit::Durability,
+    commit::{Durability, UnwindLatch},
     compact::{read_base, CompactShared},
     manifest::Manifest,
     metrics::TnDbMetrics,
@@ -142,7 +142,8 @@ impl Published {
     /// The value bytes of the put record at `pos`, which the index gave for `key` (checked to
     /// be that row's: see [`record::put_value`]).
     fn value_at(&self, pos: u64, key: &[u8]) -> Result<&[u8], FetchError> {
-        let payload = Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit)?;
+        let payload =
+            Pack::<Vec<u8>>::record_bytes_within(&self.view, pos, self.limit, MAX_RECORD)?;
         record::put_value(payload, self.table, key)
     }
 
@@ -389,6 +390,20 @@ pub(super) struct Writer {
     /// Test-only: the next batch holds the write lock at least this long.
     #[cfg(test)]
     hold_next: Option<std::time::Duration>,
+    /// Test-only: the next rollback, or the next publish of a batch, panics.
+    #[cfg(test)]
+    panic_in_rollback: bool,
+    #[cfg(test)]
+    panic_in_publish: bool,
+    /// Test-only: rolled-back batches whose zeroed bytes were flushed.
+    #[cfg(test)]
+    rollback_flushes: u64,
+    /// Test-only: the next batch fails once all its records are appended; the next rollback
+    /// first flushes the batch's bytes, as the system's writeback might have.
+    #[cfg(test)]
+    fail_after_append: bool,
+    #[cfg(test)]
+    writeback_before_rollback: bool,
 }
 
 /// A compacted generation, ready to replace the current one (see [`Writer::install_gen`]).
@@ -402,6 +417,9 @@ pub(super) struct NewGen {
     pub(super) sync: Arc<GenSync>,
     /// Whether the compaction's catch-up made a row dead.
     pub(super) has_dead: bool,
+    /// The trigger's `base`: the length written to the generation's `compacted` file (the log's
+    /// length before the switch's tail), so a restart compacts on the same schedule.
+    pub(super) base: u64,
 }
 
 impl Writer {
@@ -496,6 +514,8 @@ impl Writer {
     ) -> eyre::Result<()> {
         #[cfg(test)]
         let panic_after = self.panic_after.take();
+        #[cfg(test)]
+        let fail_after = std::mem::take(&mut self.fail_after_append);
         let Self { log, tables, has_dead, .. } = self;
         let last = effective.last().copied();
         for (n, &i) in effective.iter().enumerate() {
@@ -537,6 +557,10 @@ impl Writer {
                 }
             }
         }
+        #[cfg(test)]
+        if fail_after {
+            bail!("tndb: injected failure after a batch's records were appended");
+        }
         Ok(())
     }
 
@@ -544,11 +568,44 @@ impl Writer {
     /// last publish (which, under the write lock, is its state before the batch). A batch that
     /// cannot be taken back stops the writer.
     fn rollback(&mut self, start: u64, touched: &[TableId]) {
+        // A panic part way leaves the writer half-reverted: latched, nothing builds on it.
+        if catch_unwind(AssertUnwindSafe(|| self.revert(start, touched))).is_err() {
+            self.stop("a failed batch's rollback panicked".to_string());
+        }
+    }
+
+    /// Take back a failed batch that began at `start` (see [`Self::rollback`]).
+    fn revert(&mut self, start: u64, touched: &[TableId]) {
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_in_rollback) {
+            panic!("injected panic in a rollback");
+        }
+        let end = self.log.file_len();
+        #[cfg(test)]
+        if std::mem::take(&mut self.writeback_before_rollback) {
+            let _ = self.view.msync(start, end);
+        }
         self.log.rewind_to(start);
+        if end > start {
+            // The batch's bytes may be on disk already (a sync round's msync of the page the
+            // batch shares with the last published one, or the system's writeback): the zeros
+            // must reach the disk too, or a power loss could bring the failed batch back.
+            if let Err(e) = self.view.msync(start, end) {
+                self.stop(format!("flush a failed batch's rollback: {e}"));
+            }
+            #[cfg(test)]
+            {
+                self.rollback_flushes += 1;
+            }
+        }
         for id in touched {
             if let Some(idx) = self.tables.get_mut(id).and_then(|table| table.idx.as_mut()) {
                 if let Err(e) = idx.revert_to_published() {
                     self.stop(format!("revert table {id}'s index: {e}"));
+                } else if idx.is_poisoned() {
+                    // It refuses every later growth: rather than one table failing its writes
+                    // while the rest carry on, the database stops (the next open rebuilds it).
+                    self.stop(format!("table {id}'s index is poisoned"));
                 }
             }
         }
@@ -623,7 +680,7 @@ impl Writer {
     /// its `GenAlive`, to be deleted once its last snapshot drops. Does no I/O and cannot fail.
     /// Returns the old generation's directory, for the caller to delete.
     pub(super) fn install_gen(&mut self, new: NewGen) -> PathBuf {
-        let NewGen { gen, dir, log, mut idxs, view, alive, sync, has_dead } = new;
+        let NewGen { gen, dir, log, mut idxs, view, alive, sync, has_dead, base } = new;
         let mut old_log = std::mem::replace(&mut self.log, log);
         old_log.set_remove_on_drop();
         let mut old_idxs = Vec::new();
@@ -641,7 +698,7 @@ impl Writer {
         self.sync = sync;
         self.gen = gen;
         self.stamped = self.log.file_len();
-        self.base = self.log.file_len();
+        self.base = base;
         self.has_dead = has_dead;
         self.emptied = false;
         let ids: Vec<TableId> = self.tables.keys().copied().collect();
@@ -713,14 +770,14 @@ pub(super) struct Core {
     pub(super) metrics: TnDbMetrics,
     /// Held by whoever runs a sync round (see `commit::sync_round`): one at a time.
     pub(super) sync_lock: Mutex<()>,
-    /// The database's `LOCK` (an flock), held until the core drops: declared last, so the files
-    /// close first. Taken out by a test's simulated crash.
     /// Test-only: the tables whose indexes the open rebuilt.
     #[cfg(test)]
     rebuilt: Vec<TableId>,
     /// Test-only: this log's slot in the per-log stats.
     #[cfg(test)]
     pub(super) stat_slot: usize,
+    /// The database's `LOCK` (an flock), held until the core drops: declared last, so the files
+    /// close first. Taken out by a test's simulated crash.
     #[cfg_attr(not(test), allow(dead_code))]
     lock: Mutex<Option<fs::File>>,
 }
@@ -816,6 +873,16 @@ impl Core {
             panic_after: None,
             #[cfg(test)]
             hold_next: None,
+            #[cfg(test)]
+            panic_in_rollback: false,
+            #[cfg(test)]
+            panic_in_publish: false,
+            #[cfg(test)]
+            rollback_flushes: 0,
+            #[cfg(test)]
+            fail_after_append: false,
+            #[cfg(test)]
+            writeback_before_rollback: false,
         };
         let mut tables = Tables::default();
         for entry in &manifest.tables {
@@ -866,7 +933,9 @@ impl Core {
         self.tables.load().get(name).cloned()
     }
 
-    /// Table `id`'s key size (0 if not yet fixed), or `None` if the database has no such table.
+    /// Table `id`'s key size (0 if not yet fixed), or `None` if the database has no such table. A
+    /// scan of the tables (a dozen), which is fine for its one caller: a compaction's `Ksizes`
+    /// asks at most once per table (it caches every fixed size).
     pub(super) fn table_ksize(&self, id: TableId) -> Option<u16> {
         self.tables.load().values().find(|table| table.id == id).map(|table| table.ksize())
     }
@@ -1021,22 +1090,30 @@ impl Core {
                 return Err(e);
             }
             Err(panic) => {
-                writer.rollback(start, &touched);
+                // Latched first, whatever the rollback then does.
                 writer.stop("a write panicked".to_string());
+                writer.rollback(start, &touched);
                 drop(writer);
                 resume_unwind(panic);
             }
         }
+        // A panic from here leaves the batch appended but not (wholly) published: latched.
+        let latch = UnwindLatch(&self.durability, "a batch's publish panicked");
         // Numbered before it is published: a reader that sees it and then writes takes a later
         // number, so a persist covering the reader's write covers this one.
         writer.seq += 1;
         let seq = writer.seq;
         self.durability.set_seq(seq);
+        #[cfg(test)]
+        if std::mem::take(&mut writer.panic_in_publish) {
+            panic!("injected panic while publishing a batch");
+        }
         for &id in &touched {
             writer.publish(id);
         }
         writer.sync.growths.store(writer.log.growths(), Ordering::Release);
         self.store_frontier(&writer);
+        drop(latch);
         let end = writer.log.file_len();
         let pending = end.saturating_sub(writer.sync.synced.load(Ordering::Acquire));
         writer.note_if_emptied();
@@ -1059,6 +1136,45 @@ impl Core {
     #[cfg(test)]
     pub(super) fn release_lock_for_crash(&self) {
         self.lock.lock().take();
+    }
+
+    /// Test-only: the compaction trigger's `base` (the log's length after the last compaction).
+    #[cfg(test)]
+    pub(super) fn base(&self) -> u64 {
+        self.writer.lock().base
+    }
+
+    /// Test-only: the next rollback panics.
+    #[cfg(test)]
+    pub(super) fn panic_in_next_rollback(&self) {
+        self.writer.lock().panic_in_rollback = true;
+    }
+
+    /// Test-only: the next batch's publish panics.
+    #[cfg(test)]
+    pub(super) fn panic_in_next_publish(&self) {
+        self.writer.lock().panic_in_publish = true;
+    }
+
+    /// Test-only: the next batch fails once all its records are appended (it is rolled back).
+    #[cfg(test)]
+    pub(super) fn fail_next_batch(&self) {
+        self.writer.lock().fail_after_append = true;
+    }
+
+    /// Test-only: the next batch fails once all its records are appended (it is rolled back),
+    /// and its rollback first flushes the batch's bytes, as the system's writeback might have.
+    #[cfg(test)]
+    pub(super) fn fail_next_batch_after_writeback(&self) {
+        let mut writer = self.writer.lock();
+        writer.fail_after_append = true;
+        writer.writeback_before_rollback = true;
+    }
+
+    /// Test-only: rolled-back batches whose zeroed bytes were flushed.
+    #[cfg(test)]
+    pub(super) fn rollback_flushes(&self) -> u64 {
+        self.writer.lock().rollback_flushes
     }
 
     /// Test-only: the next batch holds the write lock at least `hold` (a stall).
@@ -1122,15 +1238,35 @@ fn empty_published(writer: &Writer, table: TableId) -> Published {
     }
 }
 
+/// The largest record the log takes: far past a default pack's 16 MiB (a large consensus output
+/// is one value), and safe for a local log no peer ever serves (reads borrow from the mapping).
+pub(super) const MAX_RECORD: u32 = 1 << 30;
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the address space this thread's next log opens reserve, instead of
+    /// [`LOG_MAP_RESERVE`] (a small one makes a log outgrow it, remapping).
+    pub(super) static LOG_RESERVE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+/// The options every generation's log opens with.
+fn log_options() -> MmapFileOptions {
+    #[cfg(test)]
+    let reserve = LOG_RESERVE.with(std::cell::Cell::get).unwrap_or(LOG_MAP_RESERVE);
+    #[cfg(not(test))]
+    let reserve = LOG_MAP_RESERVE;
+    MmapFileOptions { reserve, max_record_size: Some(MAX_RECORD), ..Default::default() }
+}
+
 /// Open (creating if absent) a generation's log.
 pub(super) fn open_log(dir: &Path) -> eyre::Result<Log> {
-    let opts = MmapFileOptions { reserve: LOG_MAP_RESERVE, ..Default::default() };
+    let opts = log_options();
     Ok(Pack::open_with(dir.join("log"), 0, false, PackCompression::None, PACK_VERSION, opts)?)
 }
 
 /// Open a generation's log read-only (an inspection): nothing is created, healed or sealed.
 pub(super) fn open_log_read_only(dir: &Path) -> eyre::Result<Log> {
-    let opts = MmapFileOptions { reserve: LOG_MAP_RESERVE, ..Default::default() };
+    let opts = log_options();
     Ok(Pack::open_with(dir.join("log"), 0, true, PackCompression::None, PACK_VERSION, opts)?)
 }
 

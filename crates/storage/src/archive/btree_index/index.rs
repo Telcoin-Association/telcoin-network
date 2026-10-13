@@ -412,6 +412,24 @@ impl BtreeIndex {
         self.fail_allocs_after = n;
     }
 
+    /// True once the index's file is poisoned (a failed growth or flush): it refuses every later
+    /// growth and barrier, and is never sealed (the next open rebuilds it).
+    pub(crate) fn is_poisoned(&self) -> bool {
+        self.file.is_poisoned()
+    }
+
+    /// Test-only: the pages written since the last publish (their CRCs are stamped by the next).
+    #[cfg(test)]
+    pub(crate) fn private_pages(&self) -> usize {
+        self.private.count()
+    }
+
+    /// Test-only: poison the index's file, as a failed growth does.
+    #[cfg(test)]
+    pub(crate) fn poison_for_test(&mut self) {
+        self.file.poison();
+    }
+
     /// Pages in the file, including free ones (the allocation high-water mark).
     #[cfg(test)]
     pub(crate) fn page_count(&self) -> u32 {

@@ -51,11 +51,13 @@ use eyre::{bail, WrapErr as _};
 use parking_lot::{Condvar, Mutex};
 
 use super::{
-    commit::Durability,
+    commit::UnwindLatch,
     layout::{available_bytes, compact_dir, gen_dir, remove_in_background, sync_dir, sync_file},
     metrics::{Cause, Outcome},
     record::{self, Op, BATCH_END, KIND_CLEAR, KIND_REMOVE},
-    store::{idx_dir, open_log, Core, GenAlive, GenSync, Log, NewGen, ScanKind, SnapTable},
+    store::{
+        idx_dir, open_log, Core, GenAlive, GenSync, Log, NewGen, ScanKind, SnapTable, MAX_RECORD,
+    },
     TableId,
 };
 use crate::archive::{
@@ -302,6 +304,9 @@ pub(super) struct TestHooks {
     pub(super) gate: Mutex<Option<Gate>>,
     /// Switch attempts that let go of their locks to catch up first.
     pub(super) switch_retries: std::sync::atomic::AtomicU64,
+    /// The most unpublished pages a compacted index had when the last switch installed it (their
+    /// CRCs are stamped under the write lock).
+    pub(super) private_at_switch: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -587,11 +592,16 @@ impl Builder {
     }
 
     /// Make the new log durable up to its end, and stamp its commit marker. Its indexes are
-    /// derived: synced only by a clean close, as any generation's are.
+    /// derived: synced only by a clean close, as any generation's are. They are published here
+    /// (their pages CRC-stamped) so the switch, under the write lock, stamps only the pages its
+    /// own tail writes.
     fn sync(&mut self) -> eyre::Result<()> {
         let log = self.log();
         log.commit()?;
         log.stamp_commit_marker();
+        for idx in self.idxs.values_mut() {
+            drop(idx.publish());
+        }
         Ok(())
     }
 
@@ -666,7 +676,7 @@ fn catch_up(
     let mut net: BTreeMap<(TableId, Vec<u8>), Net> = BTreeMap::new();
     let mut pos = from;
     while pos < to {
-        let payload = Log::record_bytes_within(view, pos, to)?;
+        let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
         let record = record::parse(payload, |id| ksizes.get(id))
             .wrap_err_with(|| format!("tndb: compaction: the record at {pos}"))?;
         let id = record.table;
@@ -690,7 +700,7 @@ fn catch_up(
     for ((id, key), last) in net {
         match last {
             Net::Put(pos) => {
-                let payload = Log::record_bytes_within(view, pos, to)?;
+                let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
                 let ksize = ksizes.get(id).unwrap_or(0);
                 out.copy_row(id, ksize, &key, payload)?;
             }
@@ -698,18 +708,6 @@ fn catch_up(
         }
     }
     Ok(())
-}
-
-/// Stops the database if a switch unwinds after its rename: which generation the next open picks
-/// is then unknown to this writer.
-struct SwitchLatch<'a>(&'a Durability);
-
-impl Drop for SwitchLatch<'_> {
-    fn drop(&mut self) {
-        if std::thread::panicking() {
-            self.0.fail("a compaction's switch panicked after its rename".to_string());
-        }
-    }
 }
 
 /// One compaction: `Ok(true)` if the database switched to a compacted generation, `Ok(false)` if
@@ -753,7 +751,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             if std::mem::take(&mut skip_a_row) {
                 continue;
             }
-            let payload = Log::record_bytes_within(&published.view, pos, published.limit)?;
+            let payload =
+                Log::record_bytes_within(&published.view, pos, published.limit, MAX_RECORD)?;
             // A damaged index entry is abandoned on, not copied into the new generation.
             record::put_value(payload, id, key)?;
             out.copy_row(id, ksize, key, payload)?;
@@ -803,7 +802,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         catch_up(&mut out, &view, done, to, &ksizes)?;
         done = to;
         out.sync()?;
-        write_base(&out.dir, out.log_len())?;
+        let base = out.log_len();
+        write_base(&out.dir, base)?;
         #[cfg(test)]
         checkpoint(&gate, 3);
 
@@ -847,8 +847,14 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         }
         fs::rename(&out.dir, &dir).wrap_err("tndb: compaction: rename into place")?;
         let (log, idxs, has_dead) = out.finish();
+        #[cfg(test)]
+        shared.test.private_at_switch.store(
+            idxs.values().map(|idx| idx.private_pages() as u64).max().unwrap_or(0),
+            Ordering::Relaxed,
+        );
         // From here the next open may pick the new generation: a failure stops the writer.
-        let _latch = SwitchLatch(&core.durability);
+        let _latch =
+            UnwindLatch(&core.durability, "a compaction's switch panicked after its rename");
         #[cfg(test)]
         if shared.test.panic_after_rename.swap(false, Ordering::Relaxed) {
             panic!("injected panic after the rename");
@@ -875,6 +881,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             alive,
             sync,
             has_dead,
+            base,
         });
         core.store_frontier(&writer);
         let held = held.elapsed();

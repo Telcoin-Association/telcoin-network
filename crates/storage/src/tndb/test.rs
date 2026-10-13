@@ -473,12 +473,37 @@ fn test_tndb_stale_index_rebuilds_alone() {
 /// and never older than that persist.
 #[test]
 fn test_tndb_random_crashes_against_model() {
+    random_crashes_against_model(0x7E10_6001, false);
+}
+
+/// The randomized model of [`test_tndb_random_crashes_against_model`], with half its crashes also
+/// losing power: every reopen still finds a state written since the last persist.
+#[test]
+fn test_tndb_random_power_losses_against_model() {
+    random_crashes_against_model(0x7E10_6002, true);
+}
+
+/// The log of the current generation under `root`.
+fn current_log(root: &Path) -> std::path::PathBuf {
+    let gens = super::layout::list_gens(root).expect("gens");
+    root.join(format!("gen-{}", gens.last().expect("a generation"))).join("log")
+}
+
+/// Random writes, transactions, clears, persists, compactions and crashes (each a power loss too
+/// when `power` and a coin says so), checked after every reopen against the states written since
+/// the last persist.
+fn random_crashes_against_model(seed: u64, power: bool) {
     use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+
+    use crate::archive::data_file::disk_model;
 
     type Model = (BTreeMap<u64, String>, BTreeMap<u64, String>);
     let tmp = TempDir::with_prefix("tndb_random").expect("temp dir");
-    let mut rng = StdRng::seed_from_u64(0x7E10_6001);
+    let mut rng = StdRng::seed_from_u64(seed);
     let mut db = open(tmp.path(), CommitMode::Group);
+    if power {
+        disk_model::track(&current_log(tmp.path()));
+    }
     let mut model: Model = Default::default();
     let mut states = vec![model.clone()];
     for step in 0..800 {
@@ -541,11 +566,21 @@ fn test_tndb_random_crashes_against_model() {
                 states = vec![model.clone()];
             }
             86..90 => {
-                // A compaction changes no state.
+                // A compaction changes no state; the model follows the new generation's log.
+                if power {
+                    disk_model::untrack(&current_log(tmp.path()));
+                }
                 assert_eq!(db.compact_now(), Ok(true), "step {step}: compacted");
+                if power {
+                    disk_model::track(&current_log(tmp.path()));
+                }
             }
             _ => {
+                let lose_power = power && rng.random_bool(0.5);
                 crash(db);
+                if lose_power {
+                    disk_model::power_loss(&current_log(tmp.path()));
+                }
                 db = open(tmp.path(), CommitMode::Group);
                 let found: Model =
                     (db.iter::<TestTable>().collect(), db.iter::<OtherTable>().collect());
@@ -557,6 +592,10 @@ fn test_tndb_random_crashes_against_model() {
                 states = vec![model.clone()];
             }
         }
+    }
+    if power {
+        drop(db);
+        disk_model::untrack(&current_log(tmp.path()));
     }
 }
 
@@ -1921,4 +1960,399 @@ fn test_tndb_inspect_split() {
     assert!(!report.migrated);
     std::fs::write(tmp.path().join(super::MDBX_MIGRATED), b"").expect("marker");
     assert!(super::inspect_split(tmp.path()).migrated);
+}
+
+// ---- failure handling: rollback, latches ----
+
+/// A panic inside a failed batch's rollback leaves the writer half-reverted: the database latches
+/// (every later write fails, on any table) instead of writing on after it.
+#[test]
+fn test_tndb_panic_in_rollback_latches() {
+    let tmp = TempDir::with_prefix("tndb_rollback_panic").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    db.core().panic_next_batch_after(1);
+    db.core().panic_in_next_rollback();
+    let mut txn = db.write_txn().expect("txn");
+    txn.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
+    txn.insert::<TestTable>(&3, &"c".to_string()).expect("insert");
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| txn.commit()));
+    assert!(panicked.is_err(), "the batch and its rollback panicked");
+    assert!(db.insert::<OtherTable>(&9, &"z".to_string()).is_err(), "latched");
+}
+
+/// A panic after a batch's records are appended (publishing it) leaves the writer half-applied:
+/// the database latches.
+#[test]
+fn test_tndb_panic_in_publish_latches() {
+    let tmp = TempDir::with_prefix("tndb_publish_panic").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    db.core().panic_in_next_publish();
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        db.insert::<TestTable>(&2, &"b".to_string())
+    }));
+    assert!(panicked.is_err(), "the publish panicked");
+    assert!(db.insert::<OtherTable>(&9, &"z".to_string()).is_err(), "latched");
+}
+
+/// A failed batch whose index is poisoned (a failed growth: the file is never sealed and refuses
+/// every later growth) stops the writer: rather than one table refusing writes while the rest
+/// carry on, the whole database latches.
+#[test]
+fn test_tndb_poisoned_index_latches() {
+    let tmp = TempDir::with_prefix("tndb_index_poisoned").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&0, &"a".to_string()).expect("insert");
+    db.insert::<OtherTable>(&0, &"o".to_string()).expect("insert");
+    let id = db.core().table(<TestTable as tn_types::Table>::NAME).expect("open").id;
+    db.core().with_index(id, |idx| idx.poison_for_test()).expect("index");
+    let mut txn = db.write_txn().expect("txn");
+    for i in 1..2_000_u64 {
+        txn.insert::<TestTable>(&i, &"v".to_string()).expect("insert");
+    }
+    assert!(txn.commit().is_err(), "the poisoned index cannot grow");
+    assert!(db.insert::<OtherTable>(&1, &"o".to_string()).is_err(), "latched");
+}
+
+/// A rolled-back batch's zeroed bytes are flushed at once: a sync or a writeback may already have
+/// put the batch on disk, and only the zeros reaching it keep a power loss from bringing it back.
+#[test]
+fn test_tndb_rollback_flushes_the_zeroed_batch() {
+    let tmp = TempDir::with_prefix("tndb_rollback_flush").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let other = db.core().table(<OtherTable as tn_types::Table>::NAME).expect("open").id;
+    db.insert::<OtherTable>(&1, &"o".to_string()).expect("insert");
+    db.core().with_index(other, |idx| idx.fail_allocations_after(Some(0))).expect("index");
+    let before = db.core().rollback_flushes();
+    let mut txn = db.write_txn().expect("txn");
+    for i in 2..2_000_u64 {
+        txn.insert::<OtherTable>(&i, &"v".repeat(64)).expect("insert");
+    }
+    assert!(txn.commit().is_err(), "the index step fails");
+    assert_eq!(db.core().rollback_flushes() - before, 1, "the zeroed batch was flushed");
+    db.core().with_index(other, |idx| idx.fail_allocations_after(None)).expect("index");
+    db.insert::<TestTable>(&2, &"b".to_string()).expect("not latched: a later write works");
+}
+
+/// In `Sync` mode a write that changes nothing (removing an absent key) still waits until the
+/// state it observed is durable: here the key's removal by another writer, whose sync is paused.
+#[test]
+fn test_tndb_sync_no_op_waits_for_the_state_it_saw() {
+    let tmp = TempDir::with_prefix("tndb_sync_no_op").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Sync);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let (arrived, release) = db.core().durability.gate_next_sync();
+    let db = &db;
+    std::thread::scope(|s| {
+        let first = s.spawn(|| db.remove::<TestTable>(&1));
+        arrived.recv_timeout(Duration::from_secs(10)).expect("the removal's sync paused");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let no_op = s.spawn(move || {
+            let removed = db.remove::<TestTable>(&1);
+            let _ = done_tx.send(());
+            removed
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the no-op returned before the removal it saw was durable"
+        );
+        drop(release);
+        first.join().expect("thread").expect("the removal");
+        no_op.join().expect("thread").expect("the no-op");
+    });
+}
+
+/// A `persist` waiting when the commit thread stops (a crashed process's) fails instead of
+/// waiting forever for a sync no thread will run.
+#[test]
+fn test_tndb_persist_fails_once_the_commit_thread_stops() {
+    let tmp = TempDir::with_prefix("tndb_persist_stopped").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.stop_commit_thread();
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let waited = block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), db.persist::<TestTable>()).await
+    });
+    let persisted = waited.expect("persist returned instead of hanging");
+    assert!(persisted.is_err(), "nothing will sync the write");
+}
+
+/// A thread's encode buffers do not keep the capacity of the largest value it ever wrote.
+#[test]
+fn test_tndb_encode_buffers_shrink_after_a_large_value() {
+    let tmp = TempDir::with_prefix("tndb_bufs").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"v".repeat(8 << 20)).expect("insert");
+    let (key, value) = super::database::buf_capacities();
+    assert!(key <= 4 << 20 && value <= 4 << 20, "kept ({key}, {value}) bytes");
+}
+
+/// The trigger's `base` after a compaction is the one written to the generation's `compacted`
+/// file, even when batches landed in the switch's tail after it was written: a restart then
+/// compacts on the same schedule as the running database.
+#[test]
+fn test_tndb_compaction_base_matches_the_written_one() {
+    let tmp = TempDir::with_prefix("tndb_compact_base").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..20_u64 {
+        db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        for n in [1, 2] {
+            assert_eq!(next_checkpoint(&arrivals), n);
+            release.send(()).expect("release");
+        }
+        assert_eq!(next_checkpoint(&arrivals), 3);
+        db.insert::<TestTable>(&100, &"in the switch's tail".to_string()).expect("insert");
+        drop(release);
+        assert_eq!(compaction.join().expect("compaction thread"), Ok(true));
+    });
+    let written = super::compact::read_base(&tmp.path().join("gen-1"));
+    assert_eq!(db.core().base(), written);
+}
+
+/// A value past the 16 MiB a default pack allows (a large consensus output can be): tndb's log
+/// takes records up to 1 GiB, so it is written, read back, replayed after a crash and copied by a
+/// compaction.
+#[test]
+fn test_tndb_values_past_16_mib() {
+    let tmp = TempDir::with_prefix("tndb_big_value").expect("temp dir");
+    let big = "v".repeat(20 << 20);
+    {
+        let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+        db.insert::<TestTable>(&1, &big).expect("a 20 MiB value");
+        db.insert::<TestTable>(&2, &"small".to_string()).expect("insert");
+        assert_eq!(db.get::<TestTable>(&1).expect("get").as_deref(), Some(big.as_str()));
+        block_on(db.persist::<TestTable>()).expect("persist");
+        crash(db);
+    }
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    assert_eq!(db.get::<TestTable>(&1).expect("replayed").as_deref(), Some(big.as_str()));
+    db.insert::<TestTable>(&2, &"dead".to_string()).expect("overwrite");
+    assert_eq!(db.compact_now(), Ok(true));
+    assert_eq!(db.get::<TestTable>(&1).expect("compacted").as_deref(), Some(big.as_str()));
+}
+
+/// A compaction stamps its new indexes' pages in its background rounds, so the switch (under the
+/// write lock) stamps only the pages its own tail wrote, not the whole index.
+#[test]
+fn test_tndb_compaction_stamps_index_pages_before_the_switch() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tmp = TempDir::with_prefix("tndb_compact_stamp").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..20_000_u64 {
+        db.insert::<TestTable>(&i, &"v".to_string()).expect("insert");
+    }
+    db.remove::<TestTable>(&0).expect("a dead row");
+    assert_eq!(db.compact_now(), Ok(true));
+    let private = db.core().compact.test.private_at_switch.load(Relaxed);
+    assert!(private <= 8, "{private} pages left to stamp under the write lock");
+}
+
+// ---- power loss (the disk model in `archive::data_file`) ----
+
+/// Crash `db` (a dead process: its writes stay in the page cache), then lose power: the log
+/// keeps only what reached the disk.
+fn power_loss(db: TnDatabase, root: &Path) {
+    crash(db);
+    crate::archive::data_file::disk_model::power_loss(&log_path(root));
+}
+
+/// Rows a crashed process wrote but never synced are made durable by the next open before it
+/// builds on them: a power loss after that open's later (acknowledged) writes keeps them all.
+#[test]
+fn test_tndb_power_loss_keeps_rows_from_before_an_unclean_reopen() {
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_unclean").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    disk_model::track(&log_path(tmp.path()));
+    db.stop_commit_thread();
+    // 40 KiB of rows: they span pages (16 KiB on Apple silicon) that a later msync, from where
+    // the log then ends, does not reach.
+    for i in 0..10_u64 {
+        db.insert::<TestTable>(&i, &"v".repeat(4096)).expect("insert, never synced");
+    }
+    crash(db);
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db).len(), 10, "replayed from the page cache");
+    for i in 10..20_u64 {
+        db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+    }
+    block_on(db.persist::<TestTable>()).expect("persist: acknowledged");
+    power_loss(db, tmp.path());
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db).len(), 20, "every row the reopened log built on");
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
+}
+
+/// A failed batch whose bytes reached the disk before its rollback (the system's writeback) does
+/// not come back after a power loss: the rollback's zeros are flushed over it.
+#[test]
+fn test_tndb_power_loss_never_brings_back_a_rolled_back_batch() {
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_power_rollback").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    disk_model::track(&log_path(tmp.path()));
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    db.core().fail_next_batch_after_writeback();
+    let mut txn = db.write_txn().expect("txn");
+    txn.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
+    txn.insert::<TestTable>(&3, &"c".to_string()).expect("insert");
+    assert!(txn.commit().is_err(), "the batch failed after its records were written");
+    power_loss(db, tmp.path());
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db), [(1, "a".to_string())], "the failed batch stays gone");
+    drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
+}
+
+// ---- concurrency ----
+
+/// Writers (bare writes and transactions, each on its own keys), a scanner, a persister and
+/// compactions, all at once: afterwards the tables hold exactly what the writers' models say, and
+/// so does a reopen after a crash (all of it persisted).
+#[test]
+fn test_tndb_concurrent_stress() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+
+    use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
+
+    type Model = (BTreeMap<u64, String>, BTreeMap<u64, String>);
+    let tmp = TempDir::with_prefix("tndb_stress").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    let stop = AtomicBool::new(false);
+    let (models, compacted) = std::thread::scope(|s| {
+        let (db, stop) = (&db, &stop);
+        let writers: Vec<_> = (0..4_u64)
+            .map(|w| {
+                s.spawn(move || {
+                    let mut rng = StdRng::seed_from_u64(0x5713_0000 + w);
+                    let mut model = Model::default();
+                    let mut n = 0_u64;
+                    while !stop.load(Relaxed) {
+                        n += 1;
+                        let k = w * 1_000 + rng.random_range(0..200);
+                        let v = format!("w{w}-{n}");
+                        match rng.random_range(0..10) {
+                            0..4 => {
+                                db.insert::<TestTable>(&k, &v).expect("insert");
+                                model.0.insert(k, v);
+                            }
+                            4..6 => {
+                                db.remove::<TestTable>(&k).expect("remove");
+                                model.0.remove(&k);
+                            }
+                            6..8 => {
+                                db.insert::<OtherTable>(&k, &v).expect("insert");
+                                model.1.insert(k, v);
+                            }
+                            _ => {
+                                let mut txn = db.write_txn().expect("txn");
+                                txn.insert::<TestTable>(&k, &v).expect("txn insert");
+                                txn.insert::<OtherTable>(&(k + 1), &v).expect("txn insert");
+                                txn.remove::<TestTable>(&(k + 2)).expect("txn remove");
+                                txn.commit().expect("commit");
+                                model.0.insert(k, v.clone());
+                                model.1.insert(k + 1, v);
+                                model.0.remove(&(k + 2));
+                            }
+                        }
+                    }
+                    model
+                })
+            })
+            .collect();
+        let scanner = s.spawn(move || {
+            while !stop.load(Relaxed) {
+                let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
+                assert!(keys.windows(2).all(|pair| pair[0] < pair[1]), "a scan is in key order");
+                assert!(keys.iter().all(|k| k % 1_000 < 202), "only keys some writer wrote");
+            }
+        });
+        let persister = s.spawn(move || {
+            while !stop.load(Relaxed) {
+                block_on(db.persist::<TestTable>()).expect("persist");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let compactor = s.spawn(move || {
+            let mut switched = 0;
+            while !stop.load(Relaxed) {
+                if db.compact_now() == Ok(true) {
+                    switched += 1;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            switched
+        });
+        std::thread::sleep(Duration::from_millis(1_500));
+        stop.store(true, Relaxed);
+        scanner.join().expect("scanner");
+        persister.join().expect("persister");
+        let compacted = compactor.join().expect("compactor");
+        let models: Vec<Model> =
+            writers.into_iter().map(|writer| writer.join().expect("writer")).collect();
+        (models, compacted)
+    });
+    assert!(compacted > 0, "compactions ran alongside");
+    let mut expected = Model::default();
+    for (test, other) in models {
+        expected.0.extend(test);
+        expected.1.extend(other);
+    }
+    let found = |db: &TnDatabase| -> Model {
+        (db.iter::<TestTable>().collect(), db.iter::<OtherTable>().collect())
+    };
+    assert!(found(&db) == expected, "the tables are the writers' models");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    crash(db);
+    let db = open(tmp.path(), CommitMode::Group);
+    assert!(found(&db) == expected, "and so is the reopened database");
+}
+
+/// The log outgrows its mapping's reservation several times (each time remapping) while the
+/// commit thread syncs and a reader scans: every read sees whole, correct rows, and the database
+/// reopens after a crash with all of them.
+#[test]
+fn test_tndb_log_grows_past_its_reservation() {
+    use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+    let tmp = TempDir::with_prefix("tndb_reserve").expect("temp dir");
+    super::store::LOG_RESERVE.with(|reserve| reserve.set(Some(1 << 20)));
+    let db = open(tmp.path(), CommitMode::Group);
+    super::store::LOG_RESERVE.with(|reserve| reserve.set(None));
+    let value = |i: u64| format!("{i:08}").repeat(64);
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let (db, stop) = (&db, &stop);
+        let reader = s.spawn(move || {
+            let mut scans = 0;
+            while !stop.load(Relaxed) {
+                for (k, v) in db.iter::<TestTable>() {
+                    assert_eq!(v, value(k), "row {k} reads whole");
+                }
+                scans += 1;
+            }
+            scans
+        });
+        for i in 0..16_000_u64 {
+            db.insert::<TestTable>(&i, &value(i)).expect("insert");
+            if i % 1_000 == 999 {
+                block_on(db.persist::<TestTable>()).expect("persist");
+            }
+        }
+        stop.store(true, Relaxed);
+        assert!(reader.join().expect("reader") > 0, "the reader scanned meanwhile");
+    });
+    assert!(log_len(&db) > 8 << 20, "the log outgrew its 1 MiB reservation several times");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    crash(db);
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(db.iter::<TestTable>().count(), 16_000);
+    assert_eq!(db.get::<TestTable>(&12_345).expect("get"), Some(value(12_345)));
 }

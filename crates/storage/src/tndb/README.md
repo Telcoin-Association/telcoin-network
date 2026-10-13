@@ -75,11 +75,25 @@ So the log holds only whole batches between writes, and no snapshot ever sees pa
 **A batch that fails is taken back exactly.** The log is rewound to the batch's start (nothing else
 can have appended since), and each touched index is reverted to its last publish
 (`BtreeIndex::revert_to_published`). Under the lock, that last publish is its state before the
-batch. A batch that panics is taken back the same way, and also latches the failure. A batch that
-can't be taken back stops the writer.
+batch. The rewind's zeros are flushed at once: a sync round's msync of the page the batch shares
+with the last published one, or the system's writeback, may already have put the batch on disk,
+and only the zeros reaching it keep a power loss from bringing it back. A batch that panics is
+latched first, then taken back the same way. A batch that can't be taken back stops the writer, as
+does a rollback that panics, a batch whose index is poisoned (a failed growth: it would refuse
+every later growth, so one table would fail its writes while the rest carried on), and a panic
+while a batch is being published.
 
 **Removals.** A removal of a key that isn't present writes nothing. A batch that changes nothing
-isn't numbered.
+isn't numbered; in `Sync` mode it still waits until the state it observed is durable (an earlier
+batch, perhaps not yet synced).
+
+**Encode buffers.** Bare writes and point reads encode into per-thread buffers; one grown past
+4 MiB by a large value is let go after use, so a thread does not keep the largest value it ever
+wrote.
+
+**Record size.** The log takes records up to 1 GiB (a large consensus output is one value), where a
+default pack allows 16 MiB: the cap is per pack (`MmapFileOptions::max_record_size`), so packs read
+from peers keep the smaller one, which guards against decompression bombs.
 
 **Lock order.** The registry lock (table registration, key-size fixes, and each manifest rewrite) is
 taken only before the write lock, never while holding it. The commit thread holds neither.
@@ -131,6 +145,10 @@ nobody waits on (the batch caches are never persisted) can't outrun the disk wit
 **Failures latch.** The first failure (a failed sync, a writer that stopped, a panic) is latched.
 Every later write and `persist` fails, the watermark never moves again, and the log is never sealed
 as clean, so the next open recovers it.
+
+**`persist` covers the writes made before it is called** (it reads the last batch number then, not
+at its first poll). A `persist` still waiting when the commit thread exits (a close that could not
+sync, or a crash in a test) fails rather than waiting for a sync no thread will run.
 
 ## Transactions
 
@@ -204,7 +222,20 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
   compaction (outcome, generation, duration, switch hold), abandons by cause, a cancel, a stall,
   the `failed` latch, and a `SplitDatabase`'s `env` labels (`metrics_util`'s debugging recorder);
 - inspection: rows and dead bytes before and after a compaction, a crashed log reported unclean
-  with no file changed, an open database refused, damage reported, and a `SplitDatabase`.
+  with no file changed, an open database refused, damage reported, and a `SplitDatabase`;
+- failures: a panic in a rollback and in a publish latching, a poisoned index latching, a
+  rollback flushing its zeros, a `Sync` no-op waiting for the state it saw, a `persist` failing
+  once the commit thread stops, encode buffers shrinking, a 20 MiB value (written, replayed,
+  compacted), the switch's `base` matching the written one, and index pages stamped before the
+  switch;
+- power loss (`archive::data_file::disk_model`: an image per tracked file of the bytes real
+  flushes put on disk; a power loss keeps only the image): rows from before an unclean reopen
+  surviving that open's later writes, a rolled-back batch staying gone, and the randomized model
+  with half its crashes losing power;
+- concurrency and scale: writers, a scanner, a persister and compactions at once; a
+  `SplitDatabase` crash of all three environments and a transaction whose cache part fails
+  (atomic per environment); the log outgrowing its reservation (a test-only 1 MiB one) while a
+  reader scans.
 
 **Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
 revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
@@ -214,7 +245,12 @@ For compaction: skipping the last catch-up, copied rows without the batch-end fl
 that ignores CLEAR, installing before the rename, `base` not read at open, no empty indexes,
 caching an unfixed key size, no cap on the switch's tail, a switch without the registry lock,
 ignoring `has_dead`, and no latch after the rename. For metrics and inspection: no `failed`
-gauge at a latch, abandon causes not told apart, and an inspection that takes no lock.
+gauge at a latch, abandon causes not told apart, and an inspection that takes no lock. For
+failures and power loss: no latch before a panicking rollback, no latch over the publish, no stop
+on a poisoned index, no flush of a rollback's zeros (the power-loss model sees the batch come
+back), no open-time fsync of an unclean log (the model loses rows the reopened log built on), a
+sync round that skips its msync (the randomized power-loss model), and tndb's log at the default
+16 MiB record cap.
 
 ## Compaction (`compact.rs`)
 
@@ -234,7 +270,9 @@ the trigger off (60 s, doubling to 1 h).
 1. **Snapshot**, under the write lock: every table's last publish and the log's end `E`, one
    point between two batches.
 2. **Copy**, no lock, paced: each table's rows in key order, each its own batch (the stored put
-   record with its batch-end flag set). Each snapshot is dropped once copied. Every MiB the copy
+   record with its batch-end flag set). Each snapshot is dropped once copied. Each round's sync
+   also publishes the new indexes (CRC-stamping their pages), so the switch stamps under the write
+   lock only the pages its own tail writes. Every MiB the copy
    or a catch-up appends is handed to writeback at once (Linux: `sync_file_range(WRITE)`, which
    neither waits nor flushes the drive's cache), so the new log never piles up unflushed: on
    Linux a pile of dirty pages throttles every thread that writes, the database's writers
@@ -263,7 +301,8 @@ released, and the database carries on in its generation. After the rename, a fai
 directory sync) or a panic stops the writer, latched: which generation the next open picks is
 unknown. A compaction needs the generation's size plus 128 MiB free to start. A close cancels a
 running compaction (checked each MiB of the copy, during pacing sleeps, between rounds and
-before each sync).
+before each sync); its unfinished log is discarded without a flush, so the close does not wait on
+writing out what it throws away.
 
 **Durability across the switch.** The new log is synced before the rename, and the root
 directory before the new frontier is stored, so no round acks a batch while the next open might
@@ -424,6 +463,21 @@ so it refuses a database the node has open (and keeps the node from opening unti
 a live node is watched through the metrics. `inspect_split` covers a `SplitDatabase`'s
 environments and notes the MDBX migration's marker; `telcoin-network db tndb-stat` prints it for
 `<datadir>/consensus-db/tndb`, exiting non-zero if an environment could not be read.
+
+## Limits and choices
+
+- **Address space.** Each log reserves 16 GiB of address space and each index 1 GiB (about 62 GiB
+  for a `SplitDatabase` at rest, more while a compaction holds both generations). The
+  reservations are virtual, shared and not commit-charged; a process under a `ulimit -v` too small
+  for them falls back to mapping each file at its length, remapping as it grows.
+- **`has_dead` at open.** A log with records is assumed to hold dead rows when it opens, so a
+  restart can cost one compaction that frees little. It happens only when the log is already past
+  its threshold and twice its base, so it is kept as is rather than recording a dead-row count.
+- **Index growth during a compaction.** Under extreme churn a table's index grows while a
+  compaction's copy pins its snapshot (pages superseded meanwhile can't be reused until the
+  switch replaces the index). It is bounded per compaction and negligible at production rates;
+  copying unpaced for small live sets would shorten the pin, but changes the I/O pattern, so it
+  waits for a Linux measurement.
 
 ## Not yet
 

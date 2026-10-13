@@ -34,6 +34,12 @@ impl PageSet {
         self.words.get(word).is_some_and(|word| word & bit != 0)
     }
 
+    /// Test-only: how many numbers the set holds.
+    #[cfg(test)]
+    pub(crate) fn count(&self) -> usize {
+        self.words.iter().map(|word| word.count_ones() as usize).sum()
+    }
+
     /// Empty the set, keeping its allocation.
     pub(crate) fn clear(&mut self) {
         self.words.fill(0);

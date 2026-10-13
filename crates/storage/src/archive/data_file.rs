@@ -104,19 +104,20 @@ pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
 /// (see the module docs' Durability section) and this is a plain `fsync`.
 pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
     #[cfg(target_os = "macos")]
-    {
-        // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches
-        // no Rust memory.
-        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
+    // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches no
+    // Rust memory.
+    let synced = if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    };
     #[cfg(not(target_os = "macos"))]
-    {
-        file.sync_all()
+    let synced = file.sync_all();
+    #[cfg(test)]
+    if synced.is_ok() {
+        disk_model::flushed_all(file);
     }
+    synced
 }
 
 /// `fdatasync(2)` `file`: [`File::sync_data`] everywhere but macOS, where that is `F_FULLFSYNC`
@@ -128,7 +129,121 @@ pub(crate) fn fdatasync_file(file: &File) -> io::Result<()> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        file.sync_data()
+        let synced = file.sync_data();
+        #[cfg(test)]
+        if synced.is_ok() {
+            disk_model::flushed_all(file);
+        }
+        synced
+    }
+}
+
+/// Test-only model of what a power loss keeps (the tndb power-loss tests use it): for each
+/// tracked file (by inode, so a rename keeps it), an image of the bytes that reached the disk.
+/// Every real flush updates it: an msync copies the pages it covers (whole pages, as the kernel
+/// flushes them), an fsync the whole file. A power loss writes the image back over the file and
+/// zeroes everything past it: bytes never flushed are gone. Untracked files cost one atomic load
+/// per flush.
+#[cfg(test)]
+pub(crate) mod disk_model {
+    use std::{
+        collections::HashMap,
+        fs::{File, OpenOptions},
+        os::unix::fs::{FileExt as _, MetadataExt as _},
+        path::Path,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Mutex, PoisonError,
+        },
+    };
+
+    static TRACKED: AtomicUsize = AtomicUsize::new(0);
+    static IMAGES: Mutex<Option<HashMap<u64, Vec<u8>>>> = Mutex::new(None);
+
+    fn images() -> std::sync::MutexGuard<'static, Option<HashMap<u64, Vec<u8>>>> {
+        IMAGES.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Start modeling the file at `path`: its current bytes are taken as on disk.
+    pub(crate) fn track(path: &Path) {
+        let ino = std::fs::metadata(path).expect("metadata").ino();
+        let bytes = std::fs::read(path).expect("read the tracked file");
+        images().get_or_insert_with(HashMap::new).insert(ino, bytes);
+        TRACKED.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Stop modeling the file at `path`.
+    pub(crate) fn untrack(path: &Path) {
+        let ino = std::fs::metadata(path).expect("metadata").ino();
+        if images().as_mut().and_then(|images| images.remove(&ino)).is_some() {
+            TRACKED.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    /// An msync of `[start, end)` of the file with inode `ino`, whose mapping is `map`.
+    pub(crate) fn flushed_range(ino: u64, map: &[u8], start: u64, end: u64) {
+        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end {
+            return;
+        }
+        let mut images = images();
+        let Some(image) = images.as_mut().and_then(|images| images.get_mut(&ino)) else {
+            return;
+        };
+        let page = super::page_size();
+        let from = (start - start % page) as usize;
+        let to = (end.div_ceil(page) * page).min(map.len() as u64) as usize;
+        if from >= to {
+            return;
+        }
+        if image.len() < to {
+            image.resize(to, 0);
+        }
+        image[from..to].copy_from_slice(&map[from..to]);
+    }
+
+    /// The inode of `file`, if any file is tracked (else 0, never a tracked one).
+    pub(crate) fn ino_if_tracking(file: &File) -> u64 {
+        if TRACKED.load(Ordering::Relaxed) == 0 {
+            return 0;
+        }
+        file.metadata().map(|meta| meta.ino()).unwrap_or(0)
+    }
+
+    /// An fsync of `file`: every byte of it is on disk.
+    pub(crate) fn flushed_all(file: &File) {
+        let ino = ino_if_tracking(file);
+        if ino == 0 {
+            return;
+        }
+        let mut images = images();
+        let Some(image) = images.as_mut().and_then(|images| images.get_mut(&ino)) else {
+            return;
+        };
+        let len = file.metadata().map(|meta| meta.len()).unwrap_or(0) as usize;
+        let mut bytes = vec![0_u8; len];
+        if file.read_exact_at(&mut bytes, 0).is_ok() {
+            *image = bytes;
+        }
+    }
+
+    /// A power loss: the file at `path` keeps only what its image holds (its length is kept,
+    /// every byte past the image reads zero).
+    pub(crate) fn power_loss(path: &Path) {
+        let ino = std::fs::metadata(path).expect("metadata").ino();
+        let image = images()
+            .as_ref()
+            .and_then(|images| images.get(&ino).cloned())
+            .expect("the file is tracked");
+        let file = OpenOptions::new().write(true).open(path).expect("open");
+        let len = file.metadata().expect("metadata").len() as usize;
+        file.write_all_at(&image[..image.len().min(len)], 0).expect("write the image");
+        let zeros = vec![0_u8; 1 << 20];
+        let mut at = image.len();
+        while at < len {
+            let n = zeros.len().min(len - at);
+            file.write_all_at(&zeros[..n], at as u64).expect("zero the lost bytes");
+            at += n;
+        }
     }
 }
 
@@ -214,6 +329,11 @@ pub struct MmapFileOptions {
     /// only case in which the mapping moves. Virtual address space only; read-only handles (which
     /// map sealed files) ignore it.
     pub reserve: u64,
+    /// For a [`Pack`](crate::archive::pack::Pack) over this file: the largest record it writes and
+    /// reads (`None`: [`MAX_RECORD_SIZE`](crate::archive::pack_iter::MAX_RECORD_SIZE)). A local
+    /// log that is never read from a peer may take more (tndb's does); the data file ignores
+    /// it.
+    pub max_record_size: Option<u32>,
 }
 
 impl Default for MmapFileOptions {
@@ -226,6 +346,7 @@ impl Default for MmapFileOptions {
             access: MmapAccess::Normal,
             derived: false,
             reserve: 0,
+            max_record_size: None,
         }
     }
 }
@@ -246,6 +367,9 @@ pub(crate) struct MapView {
     base: AtomicPtr<u8>,
     mapped: AtomicU64,
     published: AtomicU64,
+    /// Test-only: the file's inode, for the disk model (see [`disk_model`]).
+    #[cfg(test)]
+    ino: AtomicU64,
 }
 
 impl MapView {
@@ -254,6 +378,8 @@ impl MapView {
             base: AtomicPtr::new(std::ptr::null_mut()),
             mapped: AtomicU64::new(0),
             published: AtomicU64::new(0),
+            #[cfg(test)]
+            ino: AtomicU64::new(0),
         }
     }
 
@@ -293,11 +419,17 @@ impl MapView {
         let rc = unsafe {
             libc::msync(base.add(aligned as usize).cast(), (end - aligned) as usize, libc::MS_SYNC)
         };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
         }
+        #[cfg(test)]
+        {
+            // SAFETY: as above, `[base, base + mapped)` is a live mapping. Bytes past `end` may be
+            // written meanwhile; the model copies whatever the page holds, as the flush did.
+            let map = unsafe { std::slice::from_raw_parts(base, mapped as usize) };
+            disk_model::flushed_range(self.ino.load(Ordering::Relaxed), map, start, end);
+        }
+        Ok(())
     }
 
     /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
@@ -334,6 +466,12 @@ fn page_size() -> u64 {
     // SAFETY: `sysconf` reads a system constant.
     *PAGE
         .get_or_init(|| u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the sync barriers (`flush_dirty` with a sync) run on this thread so far.
+    pub(crate) static SYNC_BARRIERS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Borrow `[start, start + len)` of a writable mapping mutably through its raw pointer, so only
@@ -670,6 +808,11 @@ impl MmapDataFile {
         };
         df.sync_view();
         df.advise_backing();
+        #[cfg(test)]
+        df.view.ino.store(
+            df.file.metadata().map(|meta| std::os::unix::fs::MetadataExt::ino(&meta)).unwrap_or(0),
+            Ordering::Relaxed,
+        );
         Ok(df)
     }
 
@@ -1289,6 +1432,13 @@ impl MmapDataFile {
                 if start < self.end {
                     map.flush_range(start as usize, (self.end - start) as usize)
                         .inspect_err(|_| self.poison())?;
+                    #[cfg(test)]
+                    disk_model::flushed_range(
+                        disk_model::ino_if_tracking(&self.file),
+                        map,
+                        start,
+                        self.end,
+                    );
                     self.flushed_end.store(self.end, Ordering::Relaxed);
                 }
                 self.sync_size_if_grown()?;
@@ -1305,6 +1455,10 @@ impl MmapDataFile {
     fn flush_dirty(&self, sync: bool) -> io::Result<()> {
         if self.read_only {
             return Ok(());
+        }
+        #[cfg(test)]
+        if sync {
+            SYNC_BARRIERS.with(|n| n.set(n.get() + 1));
         }
         // A prior failure poisoned this handle: return `Err` without retrying. A retried `msync`
         // after a writeback error can spuriously return success on Linux (errseq) while the dirty
@@ -1353,6 +1507,13 @@ impl MmapDataFile {
         let len = (self.end - start) as usize;
         if sync {
             map.flush_range(start as usize, len).inspect_err(|_| self.poison())?;
+            #[cfg(test)]
+            disk_model::flushed_range(
+                disk_model::ino_if_tracking(&self.file),
+                map,
+                start,
+                self.end,
+            );
             // The tail is now durable; the next append-mode flush can start from here.
             self.flushed_end.store(self.end, Ordering::Relaxed);
             // And within a durable file size: a growth since the last fsync is synced now.
@@ -1417,7 +1578,10 @@ impl MmapDataFile {
         if start >= end {
             return Ok(());
         }
-        map.flush_range(start as usize, (end - start) as usize).inspect_err(|_| self.poison())
+        map.flush_range(start as usize, (end - start) as usize).inspect_err(|_| self.poison())?;
+        #[cfg(test)]
+        disk_model::flushed_range(disk_model::ino_if_tracking(&self.file), map, start, end);
+        Ok(())
     }
 
     /// Full, slow disk sync: `msync` then `fsync`, additionally persisting the file's
@@ -1493,6 +1657,12 @@ impl MmapDataFile {
     /// Mark the file to be removed when this handle drops (instead of the flush+sync clean close).
     pub fn delete(mut self) {
         self.remove_on_drop = true;
+    }
+
+    /// True once the file is to be removed when this handle drops (see
+    /// [`Self::set_remove_on_drop`]).
+    pub(crate) fn removes_on_drop(&self) -> bool {
+        self.remove_on_drop
     }
 
     /// Like [`Self::delete`] but keeps the handle: the file is removed (not sealed) when this
@@ -1779,6 +1949,7 @@ mod tests {
             access: MmapAccess::Normal,
             derived: false,
             reserve: 0,
+            max_record_size: None,
         }
     }
 
@@ -1791,6 +1962,7 @@ mod tests {
             access: MmapAccess::Random,
             derived: false,
             reserve: 0,
+            max_record_size: None,
         }
     }
 
@@ -2862,6 +3034,7 @@ mod tests {
             access: MmapAccess::Normal,
             derived: false,
             reserve: 0,
+            max_record_size: None,
         };
         let mut df = MmapDataFile::open_with(&path, false, opts).expect("open");
         // Fits within the first mapping (<= max_map_size).

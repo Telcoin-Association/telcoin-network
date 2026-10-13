@@ -117,7 +117,7 @@ still held rows its slow disk writes had not reached. The per-read CRC stays.
 - **Detail:** its stats are `cfg(test)` only.
 - **Fix:** export sync latency, unsynced bytes, lock waits, compactions (duration, switch hold, abandons and causes) and latched failures through the node's metrics. Alert on latches and on repeated abandons.
 
-**M8. Today's default backend: `LayeredDatabase`'s write queue is unbounded** (`layered_db.rs:411`).
+**M8. [SKIPPED 2026-10-13 (user): tndb replaces the layered MDBX path.] Today's default backend: `LayeredDatabase`'s write queue is unbounded** (`layered_db.rs:411`).
 - **Detail:** beside the unpaced 256 KB stream, the bench process reached 39 GB resident.
 - **Fix:** bound the queue only if MDBX stays the default for a while; the layer goes away with tnlog.
 
@@ -134,30 +134,32 @@ still held rows its slow disk writes had not reached. The per-read CRC stays.
 - **Fix:** check kind = PUT, the table id, and `key == payload[HEAD..]`, a ~32-byte compare. A mismatch becomes `CorruptIndex`.
 
 ## Low
-- **L1. A rolled-back batch can come back after a power loss:** a concurrent msync or writeback may have flushed its page before the rollback zeroed it (`store.rs:525`). Fix: msync the zeroed range on rollback (a rare path), or latch.
-- **L2. A panic inside `rollback` (or in the publish/frontier step) leaves the writer half-reverted and not latched** (`store.rs:963-983`). Fix: latch first, and `catch_unwind` the rollback.
-- **L3. A poisoned index stops that table's writes, but the database carries on.** Fix: `stop` the writer when a rollback follows an I/O error or touches a poisoned index.
-- **L4. A dropped pack marked `remove_on_drop` still msyncs** (`pack.rs:396`). A close waits on a cancelled compaction's flush. Fix: skip the commit when `remove_on_drop` is set.
-- **L5. `install_gen` CRC-stamps every builder index page under the write lock** (`store.rs:613`). Fix: publish builder indexes after each background round.
-- **L6. Values over 16 MiB (`MAX_RECORD_SIZE`) are refused;** MDBX had no limit. A large `ConsensusCache` output could exceed it (state-sync logs and refetches). Fix: test and document the limit, or chunk.
-- **L7. Edge cases:**
+- **L1. [FIXED 2026-10-13: the rollback flushes its zeros; tests `test_tndb_rollback_flushes_the_zeroed_batch`, `test_tndb_power_loss_never_brings_back_a_rolled_back_batch`.] A rolled-back batch can come back after a power loss:** a concurrent msync or writeback may have flushed its page before the rollback zeroed it (`store.rs:525`). Fix: msync the zeroed range on rollback (a rare path), or latch.
+- **L2. [FIXED 2026-10-13: latch before the rollback, which runs under `catch_unwind`; an unwind latch over the publish; tests `test_tndb_panic_in_rollback_latches`, `test_tndb_panic_in_publish_latches`.] A panic inside `rollback` (or in the publish/frontier step) leaves the writer half-reverted and not latched** (`store.rs:963-983`). Fix: latch first, and `catch_unwind` the rollback.
+- **L3. [FIXED 2026-10-13: a rollback touching a poisoned index stops the writer; test `test_tndb_poisoned_index_latches`.] A poisoned index stops that table's writes, but the database carries on.** Fix: `stop` the writer when a rollback follows an I/O error or touches a poisoned index.
+- **L4. [FIXED 2026-10-13: `PackInner::drop` skips its commit for a file to be removed; test `dropping_a_pack_marked_for_removal_does_not_sync`.] A dropped pack marked `remove_on_drop` still msyncs** (`pack.rs:396`). A close waits on a cancelled compaction's flush. Fix: skip the commit when `remove_on_drop` is set.
+- **L5. [FIXED 2026-10-13: `Builder::sync` publishes the new indexes each round; test `test_tndb_compaction_stamps_index_pages_before_the_switch` (80 unpublished pages at the switch before, at most 8 after); no measurable switch-hold change at the churn bench's 2,048 rows, the saving grows with the index (about 1 µs per page).] `install_gen` CRC-stamps every builder index page under the write lock** (`store.rs:613`). Fix: publish builder indexes after each background round.
+- **L6. [FIXED 2026-10-13 (user: a larger cap for tndb's log): the record cap is per pack (`MmapFileOptions::max_record_size`), tndb's log opens with 1 GiB, other packs keep 16 MiB; tests `per_pack_record_cap`, `test_tndb_values_past_16_mib`.] Values over 16 MiB (`MAX_RECORD_SIZE`) are refused;** MDBX had no limit. A large `ConsensusCache` output could exceed it (state-sync logs and refetches). Fix: test and document the limit, or chunk.
+- **L7. [FIXED 2026-10-13: a `Sync` no-op waits for the last batch; `persist` reads its target when called and fails once the commit thread exits; tests `test_tndb_sync_no_op_waits_for_the_state_it_saw`, `test_tndb_persist_fails_once_the_commit_thread_stops`.] Edge cases:**
   - in Sync mode, a no-op write returns before the state it saw is durable;
   - `persist` first polled after the last handle dropped can hang (its stop branch is unreachable).
 
   Fix: capture the persist target eagerly, and fail pending waiters when the commit thread exits.
-- **L8. Thread-local `BUFS` never shrink;** each keeps the largest value it ever wrote. Fix: shrink past a few MiB.
+- **L8. [FIXED 2026-10-13: a buffer past 4 MiB is let go after use; test `test_tndb_encode_buffers_shrink_after_a_large_value`.] Thread-local `BUFS` never shrink;** each keeps the largest value it ever wrote. Fix: shrink past a few MiB.
 - **L9. [FIXED 2026-10-13: tndb deleted; tnlog owns `CommitMode`, `CompactionConfig`, its layout helpers (`tnlog/layout.rs`) and the compaction constants; the archive's sync-ticket code and two test helpers only tndb used went with it; bench columns moved to tnlog.] tnlog depends on tndb;** `pub mod tndb` ships about 6.4K lines. Fix (S4): move `CommitMode`, `CompactionConfig`, the layout helpers and the constants into tnlog; delete tndb.
-- **L10. No CI test lane runs the node on tnlog;** only the `--all-features` clippy pass compiles it. Fix: a nightly lane (DB-using crates plus e2e epoch and restart tests with `tn-storage/tnlog`), until it becomes the default.
-- **L11. Address-space reservation:** 16 GiB per log and 1 GiB per index (~62 GiB at rest, more during compaction), shared mappings, not commit-charged; falls back under `ulimit -v`. Fix: document; consider 4 GiB log reserves.
-- **L12. `has_dead` is assumed true at every open,** so a restart may cost one unneeded compaction. Optional: keep a dead-row count in `compacted`.
+- **L10. [DEFERRED 2026-10-13 (user): no CI lane until tndb nears becoming the default.] No CI test lane runs the node on tnlog;** only the `--all-features` clippy pass compiles it. Fix: a nightly lane (DB-using crates plus e2e epoch and restart tests with `tn-storage/tnlog`), until it becomes the default.
+- **L11. [DOCUMENTED 2026-10-13: the tndb README's Limits and choices; reservations unchanged.] Address-space reservation:** 16 GiB per log and 1 GiB per index (~62 GiB at rest, more during compaction), shared mappings, not commit-charged; falls back under `ulimit -v`. Fix: document; consider 4 GiB log reserves.
+- **L12. [WON'T FIX 2026-10-13: at most one compaction after a restart, and only past the threshold and twice the base; documented in the tndb README.] `has_dead` is assumed true at every open,** so a restart may cost one unneeded compaction. Optional: keep a dead-row count in `compacted`.
 - **L13. [FIXED 2026-10-13: `telcoin-network db tndb-stat` (`tndb::inspect` / `inspect_split`): read-only, refuses an open database via a shared lock; tests `test_tndb_inspect_*`, CLI `db_tndb_stat_*`.] No inspection tool** (MDBX has `mdbx_stat`). Fix: a `db tnlog-stat` subcommand; it also serves M7.
-- **L14. Cosmetic:**
+- **L14. [FIXED 2026-10-13: the `Core::lock` comment moved; `persist`'s stop branch is live (L7); `table_ksize` documented (one call per table per compaction, cached); the in-memory `base` is the written one (test `test_tndb_compaction_base_matches_the_written_one`).] Cosmetic:**
   - the `Core::lock` doc comment is attached to the wrong field;
   - `persist`'s dead branch;
   - `table_ksize` is a linear scan;
   - the `base` written to disk differs slightly from the in-memory one.
 
 ## Tests missing
+
+> **[2026-10-13] All covered:** the power-loss model (`archive::data_file::disk_model`, tests `test_tndb_power_loss_*` and `test_tndb_random_power_losses_against_model`); M1, M2, LM1, M3, LM2 with their fixes; L1–L4 and L6 with theirs; the multi-threaded stress test (`test_tndb_concurrent_stress`); `SplitDatabase` crash and partial failure (`test_tndb_split_crash_reopens_every_environment`, `test_tndb_split_txn_with_a_failing_environment`); log growth past the reservation (`test_tndb_log_grows_past_its_reservation`); the H2 migration (`migrate_test`).
 - **Power loss:** a model dropping unsynced bytes (H1), including crash → reopen → `persist` → drop the bytes from before the first crash.
 - **Generations and disk:**
   - a damaged newest generation with an older one present (M1);
@@ -223,7 +225,7 @@ the rest. M6 dropped. Original order, for reference:
 
 **Each fix:** a test that fails first; a mutation check for durability fixes; `workload_*` before and after for the performance items; e2e epoch and restart tests on a tnlog binary at the end. No git writes.
 
-**L15 (added 2026-10-12, after M4).** Under extreme churn the B+tree index file grows while a
+**L15 (added 2026-10-12, after M4). [DEFERRED 2026-10-13: needs a Linux measurement (copy pacing interacts with I/O stalls); noted in the tndb README.]** Under extreme churn the B+tree index file grows while a
 compaction's copy pins its snapshot: pages superseded meanwhile can't be reused (102 MB for 2,048
 rows on the Mac at ~280 MB/s of churn). Each switch replaces it with a fresh index, so it is bounded
 per compaction; production write rates make it negligible. Possible fix: copy unpaced when the live

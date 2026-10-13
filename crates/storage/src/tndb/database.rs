@@ -83,13 +83,26 @@ thread_local! {
     static BUFS: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// The most capacity an encode buffer keeps between uses: one that grew past it for a large
+/// value is let go, so a thread does not hold the largest value it ever wrote.
+const BUF_KEEP: usize = 4 << 20;
+
+/// Let `buf` go if a large value grew it past [`BUF_KEEP`].
+fn trim(buf: &mut Vec<u8>) {
+    if buf.capacity() > BUF_KEEP {
+        *buf = Vec::new();
+    }
+}
+
 /// Encode `key` into this thread's key buffer and run `f` on the bytes. `f` must not re-enter
 /// tndb's encoding on this thread.
 fn with_key<K: Serialize, R>(key: &K, f: impl FnOnce(&[u8]) -> eyre::Result<R>) -> eyre::Result<R> {
     BUFS.with_borrow_mut(|(buf, _)| {
         buf.clear();
         encode_key_into(buf, key)?;
-        f(buf)
+        let out = f(buf);
+        trim(buf);
+        out
     })
 }
 
@@ -104,8 +117,17 @@ fn with_key_value<K: Serialize, V: Serialize, R>(
         encode_key_into(kbuf, key)?;
         vbuf.clear();
         encode_into_buffer(vbuf, value)?;
-        f(kbuf, vbuf)
+        let out = f(kbuf, vbuf);
+        trim(kbuf);
+        trim(vbuf);
+        out
     })
+}
+
+/// Test-only: the capacities of this thread's encode buffers (key, value).
+#[cfg(test)]
+pub(super) fn buf_capacities() -> (usize, usize) {
+    BUFS.with_borrow(|(kbuf, vbuf)| (kbuf.capacity(), vbuf.capacity()))
 }
 
 impl TnDatabase {
@@ -189,7 +211,13 @@ fn table<T: Table>(core: &Core) -> eyre::Result<Arc<TableShared>> {
 /// only when the log holds more unsynced bytes than its cap (backpressure: writes nobody waits on
 /// cannot outrun the disk without bound). Either wait may run the sync itself.
 fn write(core: &Core, mode: CommitMode, ops: &[BatchOp<'_>]) -> eyre::Result<()> {
-    let Some(seq) = core.write(ops)? else { return Ok(()) };
+    let seq = match core.write(ops)? {
+        Some(seq) => seq,
+        // Nothing changed, but in `Sync` mode the state the write saw (an earlier batch, perhaps
+        // not yet durable) must be durable before it returns.
+        None if mode == CommitMode::Sync => core.durability.last_seq(),
+        None => return Ok(()),
+    };
     if mode == CommitMode::Sync || core.unsynced() > core.durability.max_unsynced() {
         super::commit::wait_durable(core, seq)?;
     }
@@ -488,9 +516,11 @@ impl Database for TnDatabase {
     fn persist<T: Table>(&self) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
         let durability = Arc::clone(&self.core.durability);
         let mode = self.mode;
+        // The writes so far, as of the call (not the first poll).
+        let target = durability.last_seq();
         async move {
             match mode {
-                CommitMode::Group => durability.persist().await,
+                CommitMode::Group => durability.persist(target).await,
                 CommitMode::Sync => durability.check(),
             }
         }

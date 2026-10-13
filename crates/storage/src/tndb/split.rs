@@ -277,12 +277,37 @@ mod test {
         const HINT: TableHint = TableHint::Epoch;
     }
 
+    /// A kad-hinted table.
+    #[derive(Debug)]
+    struct KadTable;
+    impl Table for KadTable {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "KadTable";
+        const HINT: TableHint = TableHint::Kad;
+    }
+
     fn open(path: &Path) -> SplitDatabase {
         let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
         let db = SplitDatabase::open_with(path, options).expect("open split");
         db.open_table::<TestTable>().expect("open table");
         db.open_table::<EpochTable>().expect("open table");
+        db.open_table::<KadTable>().expect("open table");
         db
+    }
+
+    /// Simulate a crash of every environment: their commit threads stop and their locks are
+    /// released, as a dead process's are, and nothing is synced or sealed on the way out.
+    fn crash(db: SplitDatabase) {
+        for env in &db.dbs {
+            env.release_locks_for_crash();
+        }
+        std::mem::forget(db);
+    }
+
+    fn block_on<F: std::future::Future>(f: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread().build().expect("runtime").block_on(f)
     }
 
     #[test]
@@ -351,5 +376,51 @@ mod test {
         let names = |env: &str| String::from_utf8_lossy(&manifest(env)).into_owned();
         assert!(names("cache").contains("TestTable") && !names("cache").contains("EpochTable"));
         assert!(names("epoch").contains("EpochTable") && !names("epoch").contains("TestTable"));
+    }
+
+    /// A crash and reopen of all three environments keeps every persisted row (a persist covers
+    /// its table's environment).
+    #[test]
+    fn test_tndb_split_crash_reopens_every_environment() {
+        let tmp = TempDir::with_prefix("tndb_split_crash").expect("temp dir");
+        let db = open(tmp.path());
+        for i in 0..50_u64 {
+            db.insert::<EpochTable>(&i, &format!("e{i}")).expect("insert");
+            db.insert::<KadTable>(&i, &format!("k{i}")).expect("insert");
+            db.insert::<TestTable>(&i, &format!("c{i}")).expect("insert");
+        }
+        block_on(db.persist::<EpochTable>()).expect("persist epoch");
+        block_on(db.persist::<KadTable>()).expect("persist kad");
+        block_on(db.persist::<TestTable>()).expect("persist cache");
+        crash(db);
+        let db = open(tmp.path());
+        assert_eq!(db.iter::<EpochTable>().count(), 50);
+        assert_eq!(db.iter::<KadTable>().count(), 50);
+        assert_eq!(db.iter::<TestTable>().count(), 50);
+        assert_eq!(db.get::<KadTable>(&7).expect("get"), Some("k7".to_string()));
+    }
+
+    /// A transaction over two environments commits each part in its own log: when one part
+    /// fails, the commit fails and that part is rolled back, while the other is committed (atomic
+    /// per environment, as documented) and the failed environment carries on.
+    #[test]
+    fn test_tndb_split_txn_with_a_failing_environment() {
+        let tmp = TempDir::with_prefix("tndb_split_partial").expect("temp dir");
+        let db = open(tmp.path());
+        db.dbs[CACHE].core().fail_next_batch();
+        let mut txn = db.write_txn().expect("txn");
+        txn.insert::<EpochTable>(&1, &"epoch".to_string()).expect("insert");
+        txn.insert::<TestTable>(&1, &"cache".to_string()).expect("insert");
+        assert!(txn.commit().is_err(), "the cache part failed");
+        assert_eq!(db.get::<EpochTable>(&1).expect("get"), Some("epoch".to_string()));
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), None, "rolled back");
+        db.insert::<TestTable>(&2, &"later".to_string()).expect("the cache carries on");
+        block_on(db.persist::<EpochTable>()).expect("persist");
+        block_on(db.persist::<TestTable>()).expect("persist");
+        crash(db);
+        let db = open(tmp.path());
+        assert_eq!(db.get::<EpochTable>(&1).expect("get"), Some("epoch".to_string()));
+        assert_eq!(db.get::<TestTable>(&1).expect("get"), None);
+        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("later".to_string()));
     }
 }

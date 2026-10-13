@@ -71,6 +71,9 @@ pub(super) struct Durability {
     wanted: AtomicU64,
     /// The commit thread is waiting with nothing to sync: the next write must wake it.
     idle: AtomicBool,
+    /// The commit thread has exited: a `persist` whose batches are not durable by then fails
+    /// rather than waiting for a sync no thread will run.
+    stopped: AtomicBool,
     /// Test-only: the commit thread's next sync fails.
     #[cfg(test)]
     pub(super) fail_next_sync: std::sync::atomic::AtomicBool,
@@ -102,6 +105,7 @@ impl Durability {
             wake: Condvar::new(),
             wanted: AtomicU64::new(0),
             idle: AtomicBool::new(false),
+            stopped: AtomicBool::new(false),
             #[cfg(test)]
             fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -116,7 +120,6 @@ impl Durability {
     }
 
     /// The number of the last batch written.
-    #[cfg(any(test, feature = "tndb"))]
     pub(super) fn last_seq(&self) -> u64 {
         self.seq.load(Ordering::Acquire)
     }
@@ -238,8 +241,9 @@ impl Durability {
 
     /// The durability barrier: resolves once every batch numbered before the call is durable, or
     /// fails once anything has failed.
-    pub(super) async fn persist(&self) -> eyre::Result<()> {
-        let target = self.seq.load(Ordering::Acquire);
+    /// Wait until every batch up to `target` (the last one written when the persist was asked
+    /// for) is durable, or fail once anything has failed or the commit thread has stopped short.
+    pub(super) async fn persist(&self, target: u64) -> eyre::Result<()> {
         let mut durable = self.durable.subscribe();
         if *durable.borrow() < target {
             self.want(target);
@@ -251,10 +255,21 @@ impl Durability {
                 self.check()?;
                 return Ok(());
             }
-            if durable.changed().await.is_err() {
-                eyre::bail!("tndb: the commit thread stopped");
+            if self.stopped.load(Ordering::Acquire) {
+                eyre::bail!("tndb: the commit thread stopped before the write was durable");
             }
+            // `durable` (a sender this future's `Arc` keeps alive) never closes: a stopping commit
+            // thread wakes it instead (see `stopped`).
+            let _ = durable.changed().await;
         }
+    }
+
+    /// The commit thread has exited: wake every waiter (see `stopped`).
+    fn mark_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+        self.durable.send_modify(|_| {});
+        let _now = self.durable_now.lock();
+        self.durable_changed.notify_all();
     }
 }
 
@@ -381,14 +396,24 @@ impl Drop for Committer {
     }
 }
 
-/// Latches a failure if the commit thread unwinds: no barrier then waits for it forever.
-struct PanicLatch<'a>(&'a Durability);
+/// Latches a failure (with the given cause) if dropped while unwinding: a panic in the step it
+/// covers leaves state no later write or barrier may build on.
+pub(super) struct UnwindLatch<'a>(pub(super) &'a Durability, pub(super) &'static str);
 
-impl Drop for PanicLatch<'_> {
+impl Drop for UnwindLatch<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.fail("the commit thread panicked".to_string());
+            self.0.fail(self.1.to_string());
         }
+    }
+}
+
+/// Marks the commit thread stopped when dropped (see `Durability::stopped`).
+struct StopMark<'a>(&'a Durability);
+
+impl Drop for StopMark<'_> {
+    fn drop(&mut self) {
+        self.0.mark_stopped();
     }
 }
 
@@ -397,7 +422,10 @@ impl Drop for PanicLatch<'_> {
 /// closing), then run a round.
 fn run(core: &Core) {
     let durability = &*core.durability;
-    let _latch = PanicLatch(durability);
+    // A panic latches: no barrier then waits for this thread forever.
+    let _latch = UnwindLatch(durability, "the commit thread panicked");
+    // However the thread exits, a persist still waiting on it is woken to fail.
+    let _stopped = StopMark(durability);
     // When the commit thread first saw writes not yet durable.
     let mut pending_since: Option<Instant> = None;
     loop {

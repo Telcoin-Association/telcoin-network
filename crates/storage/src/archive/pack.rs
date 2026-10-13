@@ -125,12 +125,14 @@ where
     /// [`Self::record_bytes`] through a lock-free [`MapView`], bounded by `limit` (see
     /// [`MapView::tail_within`]): CRC-check the record at `pos` and borrow its payload. Log
     /// records never change once appended, so a published record is safe to read with no lock.
+    /// `max` is the pack's record cap (see [`MmapFileOptions::max_record_size`]).
     pub(crate) fn record_bytes_within(
         view: &MapView,
         pos: u64,
         limit: u64,
+        max: u32,
     ) -> Result<&[u8], FetchError> {
-        checked_payload_in(view.tail_within(pos, limit))
+        checked_payload_in(view.tail_within(pos, limit), max)
     }
 
     /// The on-disk size of the record at `pos` (its frame: payload plus 8 bytes), CRC-checked.
@@ -358,6 +360,8 @@ where
     failed: Option<io::Error>,
     read_only: bool,
     uid_idx: u64, // Store for opening an iterator.
+    /// The largest record written or read (see [`MmapFileOptions::max_record_size`]).
+    max_record: u32,
     /// Test-only: when set, the next append fails as if the data write hit an io error of this
     /// kind.
     #[cfg(test)]
@@ -370,7 +374,8 @@ where
     V: Debug + Serialize + DeserializeOwned,
 {
     fn drop(&mut self) {
-        if !self.read_only {
+        // A file to be removed (an abandoned build) is discarded, not made durable.
+        if !self.read_only && !self.data_file.removes_on_drop() {
             let _ = self.commit();
         }
     }
@@ -389,6 +394,7 @@ where
         version: u16,
         opts: MmapFileOptions,
     ) -> Result<Self, OpenError> {
+        let max_record = opts.max_record_size.unwrap_or(MAX_RECORD_SIZE);
         let (data_file, header) =
             Self::open_data_file(path, uid_idx, read_only, compression, version, opts)
                 .map_err(OpenError::DataFileOpen)?;
@@ -400,6 +406,7 @@ where
             failed: None,
             read_only,
             uid_idx,
+            max_record,
             #[cfg(test)]
             fail_next_append: None,
             _value: PhantomData,
@@ -498,7 +505,8 @@ where
                 slot @ None => slot.insert(ZstdCtx::new()?),
             }),
         };
-        let result = frame_record(&mut self.data_file, zstd, &mut self.stage, payload);
+        let result =
+            frame_record(&mut self.data_file, zstd, &mut self.stage, payload, self.max_record);
         if result.is_err() {
             self.data_file.rewind_to(record_pos);
         }
@@ -687,7 +695,7 @@ where
     /// stored value bytes (before any decompression), borrowed straight from the mmap. Shared
     /// by [`Self::read_record_into`] and [`Self::record_bytes`].
     fn checked_payload(&self, position: u64) -> Result<&[u8], FetchError> {
-        checked_payload_in(self.data_file.tail(position))
+        checked_payload_in(self.data_file.tail(position), self.max_record)
     }
 
     /// Decode the record at `position`, decompressing first if the pack is compressed. The value
@@ -740,7 +748,7 @@ where
         // returns rather than physical EOF — otherwise a concurrent append that re-grows and
         // re-pads the file would feed the iterator trailing zeros (a 0-size record → CRC failure).
         let (dat_file, end) = self.data_file.try_clone()?;
-        PackIter::open(dat_file, self.uid_idx, end)
+        Ok(PackIter::open(dat_file, self.uid_idx, end)?.with_max_record(self.max_record))
     }
 }
 
@@ -750,13 +758,13 @@ where
 ///
 /// A record is `[len u32 | payload | crc u32]` with the CRC over the contiguous `[len | payload]`,
 /// so it is checked with one bounds-checked borrow and one CRC call over those bytes.
-fn checked_payload_in(tail: Option<&[u8]>) -> Result<&[u8], FetchError> {
+fn checked_payload_in(tail: Option<&[u8]>, max: u32) -> Result<&[u8], FetchError> {
     let Some(tail) = tail.filter(|tail| tail.len() >= 4) else {
         return Err(FetchError::IO(io::Error::other("Unable to get mmap slice.")));
     };
     let val_size = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]);
-    if val_size > MAX_RECORD_SIZE {
-        return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+    if val_size > max {
+        return Err(FetchError::RequestedSizeTooLarge(val_size, max));
     }
     let crc_at = 4 + val_size as usize;
     let Some(stored) = tail.get(crc_at..crc_at + 4) else {
@@ -840,6 +848,7 @@ fn write_payload<V: Serialize, W: Write>(
     mut out: W,
     stage: &mut Vec<u8>,
     payload: Payload<'_, V>,
+    max: u32,
 ) -> Result<(), AppendError> {
     let bytes = match payload {
         Payload::Value(value) => {
@@ -851,8 +860,8 @@ fn write_payload<V: Serialize, W: Write>(
         Payload::Raw(bytes) => bytes,
         Payload::RawParts(parts) => {
             let size: usize = parts.iter().map(|part| part.len()).sum();
-            if size > MAX_RECORD_SIZE as usize {
-                return Err(AppendError::RecordTooLarge { size, max: MAX_RECORD_SIZE });
+            if size > max as usize {
+                return Err(AppendError::RecordTooLarge { size, max });
             }
             for part in parts {
                 out.write_all(part).map_err(AppendError::WriteDataError)?;
@@ -860,8 +869,8 @@ fn write_payload<V: Serialize, W: Write>(
             return Ok(());
         }
     };
-    if bytes.len() > MAX_RECORD_SIZE as usize {
-        return Err(AppendError::RecordTooLarge { size: bytes.len(), max: MAX_RECORD_SIZE });
+    if bytes.len() > max as usize {
+        return Err(AppendError::RecordTooLarge { size: bytes.len(), max });
     }
     out.write_all(bytes).map_err(AppendError::WriteDataError)
 }
@@ -881,27 +890,28 @@ fn frame_record<V: Serialize>(
     zstd: Option<&mut ZstdCtx>,
     stage: &mut Vec<u8>,
     payload: Payload<'_, V>,
+    max: u32,
 ) -> Result<(), AppendError> {
     let record_pos = file.len();
     file.write_all(&[0; 4])?;
     let mut sink = RecordSink { file };
     match zstd {
-        None => write_payload(&mut sink, stage, payload)?,
+        None => write_payload(&mut sink, stage, payload, max)?,
         Some(ctx) => {
             // A record that failed part-way left its frame unfinished; start every record clean.
             ctx.0.reset(zstd::zstd_safe::ResetDirective::SessionOnly).map_err(zstd_error)?;
             let mut encoder = zstd::stream::write::Encoder::with_context(&mut sink, &mut ctx.0);
-            write_payload(&mut encoder, stage, payload)?;
+            write_payload(&mut encoder, stage, payload, max)?;
             encoder.finish()?;
         }
     }
     let RecordSink { file } = sink;
     // Pack data files append, so the payload is everything written past the prefix.
     let len = file.len() - record_pos - 4;
-    // Every read path refuses a framed record larger than `MAX_RECORD_SIZE` (and a payload past
-    // `u32::MAX` would silently truncate the size prefix), so such a record is refused here.
-    if len > MAX_RECORD_SIZE as u64 {
-        return Err(AppendError::RecordTooLarge { size: len as usize, max: MAX_RECORD_SIZE });
+    // Every read path refuses a framed record larger than the cap (and a payload past `u32::MAX`
+    // would silently truncate the size prefix), so such a record is refused here.
+    if len > max as u64 {
+        return Err(AppendError::RecordTooLarge { size: len as usize, max });
     }
     file.slice_mut(record_pos, 4)
         .ok_or_else(|| io::Error::other("record length prefix is not mapped"))?
@@ -1504,7 +1514,8 @@ mod tests {
         for size in [10_usize << 10, 200 << 10] {
             let value: Vec<u8> = (0..size).map(|i| i as u8).collect();
             let mut log = WriteLog::default();
-            write_payload(&mut log, &mut stage, Payload::Value(&value)).expect("write");
+            write_payload(&mut log, &mut stage, Payload::Value(&value), MAX_RECORD_SIZE)
+                .expect("write");
             assert_eq!(log.bytes, tn_types::encode(&value), "{size}-byte value: bytes unchanged");
             assert_eq!(log.writes, 1, "a {size}-byte value must reach the writer in one write");
         }
@@ -1530,7 +1541,7 @@ mod tests {
     fn streamed_write_failure_keeps_its_io_kind() {
         let value = TestRec { idx: 1, name: "value".to_string() };
         for payload in [Payload::Value(&value), Payload::<TestRec>::Raw(b"raw bytes")] {
-            match write_payload(DiskFullWriter, &mut Vec::new(), payload) {
+            match write_payload(DiskFullWriter, &mut Vec::new(), payload, MAX_RECORD_SIZE) {
                 Err(AppendError::WriteDataError(e)) => {
                     assert_eq!(e.kind(), io::ErrorKind::StorageFull, "got {e}")
                 }
@@ -2064,5 +2075,61 @@ mod tests {
         // A valid in-range request still works.
         let len = pack.file_len();
         assert!(pack.read_bytes(0, len).is_ok());
+    }
+
+    /// A pack to be removed when it drops (an abandoned build) does not sync on the way out: its
+    /// bytes are discarded, and a large unsynced one would make the drop (a close cancelling a
+    /// compaction) wait on a flush for nothing.
+    #[test]
+    fn dropping_a_pack_marked_for_removal_does_not_sync() {
+        use crate::archive::data_file::SYNC_BARRIERS;
+        let tmp = TempDir::with_prefix("pack_remove_on_drop").expect("temp dir");
+        let path = tmp.path().join("doomed");
+        let mut pack: Pack<Vec<u8>> =
+            Pack::open(&path, 0, false, PackCompression::None, 1).expect("open");
+        pack.append_raw(&vec![7_u8; 1 << 20]).expect("append");
+        pack.set_remove_on_drop();
+        let before = SYNC_BARRIERS.with(|n| n.get());
+        drop(pack);
+        assert_eq!(SYNC_BARRIERS.with(|n| n.get()), before, "no sync on the way out");
+        assert!(!path.exists(), "the file is removed");
+    }
+
+    /// A pack opened with a record cap other than [`MAX_RECORD_SIZE`] enforces it on append and
+    /// on every read path; a pack opened with the default cap refuses a larger record written
+    /// by another (reads past the cap fail, they never allocate for an absurd length).
+    #[test]
+    fn per_pack_record_cap() {
+        let tmp = TempDir::with_prefix("pack_record_cap").expect("temp dir");
+        let path = tmp.path().join("capped");
+        let opts = |max| MmapFileOptions { max_record_size: Some(max), ..Default::default() };
+        {
+            let mut small: Pack<Vec<u8>> =
+                Pack::open_with(&path, 0, false, PackCompression::None, 1, opts(1024))
+                    .expect("open");
+            let err = small.append_raw(&[1_u8; 2048]).expect_err("past the cap");
+            assert!(matches!(err, AppendError::RecordTooLarge { max: 1024, .. }), "{err:?}");
+            small.append_raw(&[2_u8; 512]).expect("under the cap");
+        }
+        let big_path = tmp.path().join("big");
+        let big = vec![3_u8; MAX_RECORD_SIZE as usize + 4096];
+        let pos = {
+            let mut pack: Pack<Vec<u8>> =
+                Pack::open_with(&big_path, 0, false, PackCompression::None, 1, opts(64 << 20))
+                    .expect("open");
+            let pos = pack.append_raw(&big).expect("under the larger cap");
+            assert_eq!(pack.record_bytes(pos).expect("read"), &big[..]);
+            let mut iter = pack.raw_iter().expect("iter");
+            assert_eq!(iter.next_raw().expect("a record").expect("read"), &big[..]);
+            pos
+        };
+        let default: Pack<Vec<u8>> = Pack::open(&big_path, 0, true, PackCompression::None, 1)
+            .expect("open with the default cap");
+        assert!(matches!(
+            default.record_bytes(pos),
+            Err(FetchError::RequestedSizeTooLarge(_, MAX_RECORD_SIZE))
+        ));
+        let mut iter = default.raw_iter().expect("iter");
+        assert!(matches!(iter.next_raw(), Some(Err(FetchError::RequestedSizeTooLarge(..)))));
     }
 }

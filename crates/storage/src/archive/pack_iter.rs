@@ -75,6 +75,8 @@ where
     end: u64,
     /// Absolute file offset of the next record to read, tracked so the scan can stop at `end`.
     pos: u64,
+    /// The largest record read (a longer one is refused, never allocated for).
+    max_record: u32,
 }
 
 impl<V, R> PackIter<V, R>
@@ -104,7 +106,15 @@ where
             // `load_header` consumed exactly the fixed-size header, so the first record starts
             // here.
             pos: DATA_HEADER_BYTES as u64,
+            max_record: MAX_RECORD_SIZE,
         })
+    }
+
+    /// Read records up to `max` bytes instead of [`MAX_RECORD_SIZE`] (a pack opened with a larger
+    /// cap, see [`MmapFileOptions::max_record_size`](crate::archive::data_file::MmapFileOptions)).
+    pub(crate) fn with_max_record(mut self, max: u32) -> Self {
+        self.max_record = max;
+        self
     }
 
     /// Return the version of the underlying data.
@@ -142,6 +152,7 @@ where
             self.compression,
             self.end,
             &mut self.pos,
+            self.max_record,
         ) {
             Ok(payload) => Some(Ok(payload)),
             Err(FetchError::NotFound) => None,
@@ -158,8 +169,10 @@ where
         compression: PackCompression,
         end: u64,
         pos: &mut u64,
+        max: u32,
     ) -> Result<V, FetchError> {
-        let payload = Self::read_frame(file, buffer, decompress_buffer, compression, end, pos)?;
+        let payload =
+            Self::read_frame(file, buffer, decompress_buffer, compression, end, pos, max)?;
         try_decode::<V>(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
     }
 
@@ -175,6 +188,7 @@ where
         compression: PackCompression,
         end: u64,
         pos: &mut u64,
+        max: u32,
     ) -> Result<&'b [u8], FetchError> {
         // At (or past) the logical data end: stop cleanly rather than decode trailing padding.
         if *pos >= end {
@@ -191,8 +205,8 @@ where
             return Err(FetchError::IO(err));
         }
         let val_size = u32::from_le_bytes(val_size_buf);
-        if val_size > MAX_RECORD_SIZE {
-            return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
+        if val_size > max {
+            return Err(FetchError::RequestedSizeTooLarge(val_size, max));
         }
         // On-disk frame: 4-byte size prefix + payload + 4-byte CRC. `checked_add` mirrors the
         // offset-arithmetic hardening in `MmapDataFile::write`; the `*pos >= end` guard above plus
@@ -245,6 +259,7 @@ where
             self.compression,
             self.end,
             &mut self.pos,
+            self.max_record,
         ) {
             Ok(val) => Some(Ok(val)),
             Err(err) => match err {
