@@ -5706,7 +5706,7 @@ mod tests {
             &[
                 "--max-concurrent-dns-lookups=1".into(),
                 "--upstream-connect-timeout=5s".into(),
-                "--upstream-request-timeout=5s".into(),
+                "--upstream-request-timeout=10s".into(),
             ],
         );
         let clients = UpstreamClients::new(&settings, lookup).expect("clients");
@@ -5867,6 +5867,83 @@ mod tests {
         let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 99)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         assert_eq!((worker_seen.hits(), query_seen.hits()), (1, 1));
+    }
+
+    /// A worker whose connection setup stalls (here its name never resolves)
+    /// fails each forward at `--upstream-connect-timeout`, which startup keeps
+    /// below `--upstream-request-timeout`. reqwest reports that as a connect
+    /// error, so passive health counts it and `/ready` turns `503` at
+    /// `--upstream-failure-threshold`, and the forwarding warning's cause
+    /// names the connect stage.
+    #[tokio::test]
+    async fn stalled_connection_setup_counts_against_the_worker() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let lookups = Arc::clone(&lookups);
+            lookup_fn(move |_host| {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                future::pending::<std::io::Result<Vec<SocketAddr>>>()
+            })
+        };
+        let settings = worker_settings(
+            "http",
+            worker,
+            worker,
+            &["--upstream-connect-timeout=200ms".into(), "--upstream-request-timeout=1s".into()],
+        );
+        let UpstreamClients { proxy, .. } =
+            UpstreamClients::new(&settings, lookup).expect("clients");
+        let state = test_state_with_client(
+            &[UpstreamWorker {
+                worker_id: 0,
+                rpc_url: named_url("worker.test", worker, "/"),
+                readiness_url: named_url("worker.test", worker, "/health/workers"),
+            }],
+            proxy,
+        );
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let threshold = test_thresholds().rpc_failure.expect("passive health on").get();
+        for id in 1..=u64::from(threshold) {
+            assert_eq!(ready_status(gateway).await, StatusCode::OK, "before submission {id}");
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "submission {id}");
+            assert_eq!(error_code_and_id(&text).1, serde_json::json!(id));
+        }
+        assert_eq!(
+            ready_status(gateway).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a stalled connection setup must count toward --upstream-failure-threshold"
+        );
+        assert_eq!(worker_seen.hits(), 0);
+        assert_eq!(lookups.load(Ordering::SeqCst), 1, "each forward waited on the one lookup");
+
+        // the first failure is logged with its whole cause chain and the
+        // upstream's origin, no path
+        let text = logs.contents();
+        let line = text
+            .lines()
+            .find(|line| line.contains("forwarding to upstream failed"))
+            .unwrap_or_else(|| panic!("no forwarding warning: {text}"));
+        assert!(
+            line.contains(&format!("upstream=http://worker.test:{} ", worker.port())),
+            "{line}"
+        );
+        assert!(
+            line.contains("cause=error sending request: client error (Connect): ")
+                && line.contains("timed out"),
+            "{line}"
+        );
     }
 
     /// A mock upstream that counts each request it receives and never answers

@@ -240,6 +240,10 @@ pub(crate) const REJECTED_ROUTE: &str = "rejected";
 /// [`crate::readiness::GatewayReadiness::record_rpc_failure`]); one that gets
 /// any response resets the count. A timeout after the request was sent does
 /// not count, since the method and params decide how long the worker takes.
+/// Startup keeps `--upstream-request-timeout` longer than
+/// `--upstream-connect-timeout`, so a connection setup that stalls (the name
+/// lookup, TCP or TLS) ends at the connect timeout, as a connect failure that
+/// counts, before the request deadline can end it as an ordinary timeout.
 ///
 /// Only a `POST` gets this far: [`PostOnly`] answers any other method before
 /// the body is read. `forwarding_started` is the request-deadline
@@ -561,10 +565,15 @@ pub(crate) async fn proxy(
             // worker that drops syns still counts. a timeout or failure after
             // the request was sent neither counts nor resets the count: the
             // client's method and params decide how long the worker takes
-            // (eth_sendRawTransactionSync waits up to 30 s for inclusion). a
-            // lookup the gateway's own resolver refused because every lookup
-            // slot was busy is a connect error too, but it says nothing about
-            // the worker, so it does not count either.
+            // (eth_sendRawTransactionSync waits up to 30 s for inclusion).
+            // the request deadline also runs during connection setup, and
+            // reqwest reports it the same way whether or not the request was
+            // sent, so a bare timeout cannot count; startup keeps that deadline
+            // longer than the connect timeout, which covers the name lookup,
+            // tcp and tls, so a stalled setup always ends as a connect error
+            // first. a lookup the gateway's own resolver refused because every
+            // lookup slot was busy is a connect error too, but it says nothing
+            // about the worker, so it does not count either.
             let connect_failed = source.is_connect() && !dns::is_saturated(&source);
             let result = if matches!(err, GatewayError::UpstreamTimeout) {
                 "timeout"

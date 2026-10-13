@@ -62,6 +62,7 @@ The body is read up to 64 KiB: a larger declared `Content-Length` is refused bef
 The poll measures the node's health listener, not the worker's RPC port, so the gateway also counts its own forwards to each worker.
 A forward that fails to connect, a connect timeout included, counts toward `--upstream-failure-threshold` (default 3), and a forward that gets any response, an HTTP error included, resets the count.
 A timeout or any other failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes (`eth_sendRawTransactionSync` waits up to 30 s for inclusion).
+The connect timeout covers the whole connection setup (the name lookup, TCP and TLS), and startup requires `--upstream-request-timeout` to be longer than `--upstream-connect-timeout`, so a setup that stalls always ends at the connect timeout and counts.
 A worker that accepts connections but stops answering is left to the poller.
 At the threshold the upstream is marked not-ready until the poller sees `--readiness-success-threshold` successful polls in a row again, and later requests go to the next ready upstream in configuration order.
 The request that saw the failure is answered with its own error (`502` or `504`) and is never retried on another upstream.
@@ -99,6 +100,7 @@ the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
 Startup also rejects a self-pointing upstream URL written as an IPv4-mapped IPv6 literal such as `[::ffff:127.0.0.1]`, an upstream list that names one worker id twice, and a zero `--readiness-poll-interval`, `--readiness-poll-timeout`, `--upstream-connect-timeout`, `--upstream-request-timeout` or `--header-read-timeout`, none of which has a disabled setting.
+It rejects an `--upstream-request-timeout` that is not longer than `--upstream-connect-timeout`: the request deadline includes connection setup, so it would end a stalled connect first, as a timeout that passive health cannot count.
 
 The gateway ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`: forwarded calls and readiness polls connect to the configured URLs directly.
 Neither follows an HTTP redirect: a readiness poll that gets a `3xx` counts as not ready, so only a `2xx` answer from the configured readiness URL can mark its worker ready.
@@ -135,7 +137,7 @@ Every flag has an environment-variable fallback.
 | `--readiness-success-threshold` | `WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD` | `2` | Successful polls in a row that turn a not-ready upstream ready, at startup too (at least 1). |
 | `--upstream-failure-threshold` | `WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD` | `3` | Worker forwards in a row that fail to connect, a connect timeout included, before the upstream is marked not-ready (`0` disables); a timeout or failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes, and a worker that accepts connections but stops answering is left to the poller; see [Passive health on the RPC path](#passive-health-on-the-rpc-path). |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
-| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
+| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline, connection setup included, so it must be longer than `--upstream-connect-timeout`; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
 | `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL; must not exceed `--upstream-request-timeout` (`0` = use `--upstream-request-timeout`). |
 | `--upstream-ca-cert` | `WORKER_GATEWAY_UPSTREAM_CA_CERT` | (none) | PEM file of extra CA certificates trusted for `https` upstreams, on top of the system roots; see [TLS to workers](#tls-to-workers). |
 | `--upstream-client-cert` | `WORKER_GATEWAY_UPSTREAM_CLIENT_CERT` | (none) | PEM client certificate chain presented to an `https` upstream that asks for one; requires `--upstream-client-key`. |
