@@ -1089,6 +1089,22 @@ fn effective_query_cap(
     }
 }
 
+/// The worker slots reads can never hold, which stay free for submissions:
+/// `max_upstream_inflight` less the effective query cap `max_inflight_queries`
+/// (as [`effective_query_cap`] left it), or `None` when the worker cap is
+/// unlimited. An unlimited query cap holds nothing back, and neither does one
+/// at or above the worker cap, as with a redirect at the defaults, where the
+/// reads kept on the worker may take every worker slot.
+pub(crate) fn submission_reserve(
+    max_upstream_inflight: usize,
+    max_inflight_queries: usize,
+) -> Option<usize> {
+    (max_upstream_inflight != 0).then(|| match max_inflight_queries {
+        0 => 0,
+        cap => max_upstream_inflight.saturating_sub(cap),
+    })
+}
+
 /// Whether a query cap of `cap` (`0` = unlimited) lets a saturated query route
 /// take every inbound connection, leaving none for submissions.
 fn query_cap_reaches_connections(cap: usize, max_connections: NonZeroUsize) -> bool {
@@ -2237,6 +2253,28 @@ mod tests {
         let redirect = "--redirect-queries=https://rpc.example.com/";
         assert_eq!(query_cap(&[redirect])?, 256);
         assert_eq!(query_cap(&[redirect, "--max-inflight-queries=0"])?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn submission_reserve_is_the_worker_cap_less_the_query_cap() -> eyre::Result<()> {
+        let reserve = |flags: &[&str]| -> eyre::Result<Option<usize>> {
+            let settings = cli_with_flags(flags).into_settings()?;
+            Ok(submission_reserve(settings.max_upstream_inflight, settings.max_inflight_queries))
+        };
+        // the defaults hold back a fifth of the 100 worker slots
+        assert_eq!(reserve(&[])?, Some(20));
+        assert_eq!(reserve(&["--max-upstream-inflight=5"])?, Some(1));
+        assert_eq!(reserve(&["--max-inflight-queries=50"])?, Some(50));
+        // a worker cap of 1 cannot spare a slot, and an unlimited one needs none
+        assert_eq!(reserve(&["--max-upstream-inflight=1"])?, Some(0));
+        assert_eq!(reserve(&["--max-upstream-inflight=0"])?, None);
+        // with a redirect the query cap is kept as given, so the reads kept on
+        // the worker may take every worker slot unless it is set lower
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        assert_eq!(reserve(&[redirect])?, Some(0));
+        assert_eq!(reserve(&[redirect, "--max-inflight-queries=0"])?, Some(0));
+        assert_eq!(reserve(&[redirect, "--max-inflight-queries=40"])?, Some(60));
         Ok(())
     }
 

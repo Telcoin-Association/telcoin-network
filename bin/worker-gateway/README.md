@@ -461,6 +461,7 @@ A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync`
   Without `--redirect-queries` that is every request, so reads and submissions share the cap.
   The gateway then lowers `--max-inflight-queries` at startup to at most `--max-upstream-inflight` less a fifth of it (80 with the defaults, and an unlimited query cap is lowered too), and logs a warning when it lowers a value you set.
   Unless the worker cap is 1, reads then never hold every worker slot: the fifth held back stays free for submissions.
+  The startup line `edge protections configured` logs that reserve as `submission_reserve`: the worker cap less the effective query cap, `0` when nothing is held back (with `--redirect-queries` at the defaults, for one), or `unlimited` with an unlimited worker cap.
   The worker cap bounds how much of the worker's shared RPC connection limit one gateway can hold; size it with [Sizing for N gateways](#sizing-for-n-gateways).
 - With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never answers frees each query slot after 10 s rather than 35 s.
   Requests to the worker keep `--upstream-request-timeout`.
