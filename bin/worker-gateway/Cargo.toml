@@ -74,6 +74,9 @@ jsonrpsee-types = { workspace = true }
 # `DebuggingRecorder` for the metric assertions (see `telemetry::test_utils`)
 metrics-util = { workspace = true }
 tempfile = { workspace = true }
+# `tokio::time::pause` for the paused-clock tests of the accept loop's timers;
+# no new crate
+tokio = { workspace = true, features = ["test-util"] }
 # test certificate authority, server and client certificates for the TLS
 # upstream tests, and the TLS mock upstream that serves them; both versions are
 # already in the lockfile, and `ring` keeps the build on reqwest's provider

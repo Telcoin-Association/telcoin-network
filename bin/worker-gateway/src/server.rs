@@ -3672,6 +3672,154 @@ mod tests {
         assert_eq!(read.expect("read"), 0, "expected EOF from the server");
     }
 
+    /// The accept loop for the probe-only `/health` router with PROXY protocol
+    /// read from the loopback peer, `header_read_timeout` for the header,
+    /// lifetime cap `cap` and drain deadline `graceful_timeout`, on a fresh
+    /// ephemeral port: the address, the shutdown `Notifier` and the loop's
+    /// handle.
+    async fn spawn_proxy_header_loop(
+        header_read_timeout: Duration,
+        cap: Duration,
+        graceful_timeout: Duration,
+    ) -> (SocketAddr, Notifier, JoinHandle<Result<(), TaskError>>) {
+        let trusted = Arc::new("127.0.0.1/32".parse::<TrustedProxies>().expect("trusted"));
+        let limits = ServerLimits {
+            header_read_timeout,
+            max_connection_duration: Some(cap),
+            proxy_protocol: Some(Arc::clone(&trusted)),
+            ..test_limits()
+        };
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let shutdown = Notifier::new();
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            probe_router(test_state(&[])),
+            limits,
+            trusted,
+            Arc::default(),
+            graceful_timeout,
+            shutdown.subscribe(),
+        ));
+        (addr, shutdown, accept)
+    }
+
+    /// How long the real-clock part of a PROXY header test waits for the
+    /// gateway to act on what the test just sent.
+    const SETTLE: Duration = Duration::from_millis(50);
+
+    /// Run a shutdown while two connections are halfway through their PROXY
+    /// header: one completes it after the notice and sends a request, the
+    /// other stalls. Returns how long after the connections opened the accept
+    /// loop's drain ended, having checked that the completed one was served
+    /// and that the drain waited for the stalled one.
+    ///
+    /// The clock is paused only once the test has no socket of its own left
+    /// to wait on. A paused clock jumps to the next pending timer whenever the
+    /// runtime parks, and waiting on a socket parks it, so pausing before the
+    /// exchange would fire the stalled header's timeout while the test's own
+    /// bytes were still in flight. After the pause, the first of the loop's
+    /// timers to run out fires at its exact deadline.
+    async fn drain_during_proxy_headers(header_read_timeout: Duration, cap: Duration) -> Duration {
+        // far longer than either bound, so only they can end the drain
+        const GRACE: Duration = Duration::from_secs(600);
+        let (addr, shutdown, accept) =
+            spawn_proxy_header_loop(header_read_timeout, cap, GRACE).await;
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
+        let mut stalled = TcpStream::connect(addr).await.expect("connect");
+        stalled.write_all(&header[..8]).await.expect("write");
+        let mut completing = TcpStream::connect(addr).await.expect("connect");
+        completing.write_all(&header[..8]).await.expect("write");
+        // the loop accepts both and starts reading their headers
+        tokio::time::sleep(SETTLE).await;
+
+        shutdown.notify();
+        tokio::time::sleep(SETTLE).await;
+        assert!(!accept.is_finished(), "the drain must wait for the header reads");
+
+        // a header completed after the notice is served, request and all
+        let request = b"GET /health HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n";
+        completing.write_all(&[&header[8..], &request[..]].concat()).await.expect("write");
+        let mut response = Vec::new();
+        completing.read_to_end(&mut response).await.expect("read");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(!accept.is_finished(), "the stalled header still holds the drain");
+
+        // the stalled one is closed by the first bound to run out, and the
+        // drain ends with it
+        tokio::time::pause();
+        let read = stalled.read(&mut [0_u8; 1]).await.expect("read");
+        assert_eq!(read, 0, "expected EOF from the server");
+        accept.await.expect("join").expect("accept loop");
+        let ended = started.elapsed();
+        tokio::time::resume();
+        ended
+    }
+
+    /// The drain takes a connection still reading its PROXY header into
+    /// account (its receiver is taken at accept) but never cuts the read: it
+    /// ends when the header read timeout does, or the lifetime cap if that
+    /// comes first. Both bound the read from accept, so with the clock paused
+    /// for the wait the drain ends at the bound to within the connect time.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_proxy_header_until_its_bound() {
+        let margin = Duration::from_millis(500);
+        let header_read = Duration::from_secs(5);
+        let ended = drain_during_proxy_headers(header_read, Duration::from_secs(30)).await;
+        assert!(ended >= header_read && ended < header_read + margin, "{ended:?}");
+        // a lifetime cap shorter than the header read timeout ends it sooner
+        // (startup validation rules that out; the loop does not rely on it)
+        let cap = Duration::from_secs(3);
+        let ended = drain_during_proxy_headers(Duration::from_secs(30), cap).await;
+        assert!(ended >= cap && ended < cap + margin, "{ended:?}");
+    }
+
+    /// The clock is paused once the half header has been read, as in
+    /// [`drain_during_proxy_headers`], so the cap fires at its exact deadline.
+    #[tokio::test]
+    async fn lifetime_cap_closes_a_connection_still_reading_its_proxy_header() {
+        const CAP_LINE: &str = "connection exceeded max lifetime; closing";
+        let mut metrics = CapturedMetrics::install();
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let cap = Duration::from_secs(5);
+        let (addr, _shutdown, _accept) =
+            spawn_proxy_header_loop(Duration::from_secs(60), cap, GRACEFUL_TIMEOUT).await;
+
+        let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
+        let mut stalled = TcpStream::connect(addr).await.expect("connect");
+        stalled.write_all(&header[..8]).await.expect("write");
+        tokio::time::sleep(SETTLE).await;
+        tokio::time::pause();
+        let read = stalled.read(&mut [0_u8; 1]).await.expect("read");
+        assert_eq!(read, 0, "expected EOF from the server");
+        let elapsed = started.elapsed();
+        assert!(elapsed >= cap && elapsed < cap + Duration::from_millis(500), "{elapsed:?}");
+
+        // the cap's own debug line, naming the peer only: no client is known
+        // before the header is read
+        let text = logs.contents();
+        let line = text.lines().find(|line| line.contains(CAP_LINE)).expect("the cap line");
+        assert!(line.contains("DEBUG"), "{line}");
+        assert!(line.contains("peer_addr=127.0.0.1:"), "{line}");
+        assert!(!line.contains("client_addr"), "{line}");
+        // the cap is not a header failure
+        assert!(!text.contains("PROXY protocol header from a peer"), "{text}");
+        let refused = metrics.value(
+            "tn_worker_gateway_connections_refused_total",
+            &[("reason", REFUSED_PROXY_HEADER)],
+        );
+        assert_eq!(refused, 0.0);
+    }
+
     /// Gateway state over `upstreams`, every one marked ready, using the
     /// production proxy client and passive health at `rpc_failure` failed
     /// forwards in a row.
