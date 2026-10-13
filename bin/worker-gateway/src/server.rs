@@ -64,7 +64,9 @@ use url::Url;
 
 use crate::{
     error::{error_response, GatewayError},
-    identity::{identify, read_proxy_header, ClientAddr, TrustedProxies},
+    identity::{
+        identify, read_proxy_header, ClientAddr, LocalConnection, ProxyHeader, TrustedProxies,
+    },
     proxy::{
         proxy, reject_non_post, AccessRecord, ForwardingStarted, QueryHeader,
         OVERSIZED_BODY_WARNINGS,
@@ -962,8 +964,10 @@ pub(crate) async fn serve(
 /// With `--proxy-protocol`, a connection from a trusted proxy is first read
 /// for its PROXY protocol v2 header, on the connection's own task (a slow
 /// front never stalls `accept()`) and within the header read timeout; the
-/// source address it names becomes the connection's `ConnectInfo`. A missing,
-/// late or malformed header closes the connection.
+/// source address it names becomes the connection's `ConnectInfo`. A `LOCAL`
+/// header keeps the front's address and marks the connection
+/// ([`LocalConnection`]) so its forwarding headers are ignored. A missing, late
+/// or malformed header closes the connection.
 ///
 /// The per-client cap counts a connection against its resolved client, the
 /// address the identity middleware starts from: the PROXY header's source, or
@@ -1088,11 +1092,11 @@ async fn accept_loop(
         let mut drain_signal = drain.subscribe();
         let connection = async move {
             let mut lifetime_cap = pin!(lifetime_cap);
-            let client_addr = match proxy_header_deadline {
+            let (client_addr, local) = match proxy_header_deadline {
                 Some(deadline) => {
-                    let source = tokio::select! {
+                    let header = tokio::select! {
                         biased;
-                        source = proxy_source(&mut stream, peer_addr, deadline) => source,
+                        header = proxy_header(&mut stream, peer_addr, deadline) => header,
                         () = lifetime_cap.as_mut() => {
                             debug!(
                                 target: "gateway::server",
@@ -1102,12 +1106,14 @@ async fn accept_loop(
                             None
                         }
                     };
-                    match source {
-                        Some(source) => source,
+                    match header {
+                        Some(ProxyHeader::Proxy(source)) => (source, false),
+                        // the front's own connection: no client to name
+                        Some(ProxyHeader::Local) => (peer_addr, true),
                         None => return,
                     }
                 }
-                None => peer_addr,
+                None => (peer_addr, false),
             };
             // Per-client cap, keyed on the resolved client and taken before
             // the connection is served: a client prefix already at its cap
@@ -1140,8 +1146,11 @@ async fn accept_loop(
             };
             // Hand the identity middleware the client's address
             // (`ConnectInfo`): the peer, or the source its PROXY header named.
-            // It resolves the client the rate limiter and the proxy use.
-            let service = TowerToHyperService::new(app.layer(Extension(ConnectInfo(client_addr))));
+            // It resolves the client the rate limiter and the proxy use, and
+            // believes no forwarding header on a `LOCAL` connection.
+            let app = app.layer(Extension(ConnectInfo(client_addr)));
+            let app = if local { app.layer(Extension(LocalConnection)) } else { app };
+            let service = TowerToHyperService::new(app);
             let mut connection =
                 pin!(connection_builder.serve_connection(TokioIo::new(stream), service));
             // `biased` so a connection that finishes in the same poll as the
@@ -1243,17 +1252,15 @@ async fn until_listener_closes(
 }
 
 /// Read the PROXY protocol v2 header a trusted front opens `stream` with,
-/// within `deadline`, and return the address the connection's requests come
-/// from: the source the header names, or `peer_addr` for a `LOCAL` header.
-/// `None` means the header was missing, late or malformed, and the connection
-/// is to be closed without a response.
-async fn proxy_source(
+/// within `deadline`. `None` means the header was missing, late or malformed,
+/// and the connection is to be closed without a response.
+async fn proxy_header(
     stream: &mut TcpStream,
     peer_addr: SocketAddr,
     deadline: Duration,
-) -> Option<SocketAddr> {
+) -> Option<ProxyHeader> {
     match tokio::time::timeout(deadline, read_proxy_header(stream)).await {
-        Ok(Ok(source)) => Some(source.unwrap_or(peer_addr)),
+        Ok(Ok(header)) => Some(header),
         Ok(Err(err)) => {
             debug!(
                 target: "gateway::server",
@@ -3402,6 +3409,40 @@ mod tests {
         let header = proxy_v2_header(socket("192.0.2.10:4711"), &[]);
         let response = raw_exchange(gateway, &header, forwarded).await;
         assert!(response.contains("6.6.6.6, 192.0.2.10|https"), "{response}");
+    }
+
+    #[tokio::test]
+    async fn local_proxy_header_ignores_forwarded_headers() {
+        let (worker, _worker) = forwarding_echo().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn_proxy_protocol(
+            state,
+            one_request_per_ip(),
+            "127.0.0.1/32",
+            Duration::from_secs(5),
+        )
+        .await;
+        let local = [&b"\r\n\r\n\0\r\nQUIT\n"[..], &[0x20, 0x00, 0x00, 0x00]].concat();
+        let forwarded =
+            |client: &str| format!("X-Forwarded-For: {client}\r\nX-Forwarded-Proto: https\r\n");
+
+        // a `PROXY` header naming the trusted front itself still lets it vouch
+        // for a client, which then has a bucket of its own
+        let header = proxy_v2_header(socket("127.0.0.1:4711"), &[]);
+        let response = raw_exchange(gateway, &header, &forwarded("6.6.6.6")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("6.6.6.6, 127.0.0.1|https"), "{response}");
+        // under `LOCAL` the same front vouches for no one: the request is the
+        // front's own, upstream and in the rate limiter
+        let response = raw_exchange(gateway, &local, &forwarded("7.7.7.7")).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("127.0.0.1|http"), "{response}");
+        assert!(!response.contains("7.7.7.7"), "{response}");
+        // so another forwarded address cannot pick a fresh bucket: the front's
+        // one token is spent
+        let response = raw_exchange(gateway, &local, &forwarded("8.8.8.8")).await;
+        assert!(response.starts_with("HTTP/1.1 429"), "{response}");
     }
 
     #[tokio::test]

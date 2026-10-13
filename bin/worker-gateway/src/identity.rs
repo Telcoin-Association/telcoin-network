@@ -29,7 +29,10 @@
 //! PROXY protocol v2 header ([`read_proxy_header`]), and the source address it
 //! names stands in for the peer: it becomes the connection's `ConnectInfo`, and
 //! the rule above then runs against it, so `X-Forwarded-For` is believed only
-//! when that source is itself a trusted proxy.
+//! when that source is itself a trusted proxy. A `LOCAL` header names no
+//! source: the connection is the front's own (a health check, say) and carries
+//! no forwarded client, so it keeps the front's address and its
+//! `X-Forwarded-For` and `X-Forwarded-Proto` are ignored ([`LocalConnection`]).
 
 use std::{
     fmt, io,
@@ -90,6 +93,24 @@ const PROXY_V2_TCP6_LEN: u16 = 36;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ClientAddr(pub(crate) IpAddr);
 
+/// Marks a connection that opened with a PROXY protocol `LOCAL` header: the
+/// front's own connection, which carries no forwarded client. The accept loop
+/// adds it to the connection's requests, and [`identify`] then attributes them
+/// to the front whatever forwarding headers they carry, so a client whose
+/// connection a front relays under `LOCAL` cannot choose its own rate-limit
+/// key.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct LocalConnection;
+
+/// What a PROXY protocol v2 header says about its connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProxyHeader {
+    /// A `PROXY` header: the front relays this client's connection.
+    Proxy(SocketAddr),
+    /// A `LOCAL` header: the front's own connection, with no client.
+    Local,
+}
+
 /// What the upstream hop is told about a request's client, resolved together
 /// with its [`ClientAddr`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -103,6 +124,13 @@ pub(crate) struct Forwarding {
 }
 
 impl Forwarding {
+    /// A request attributed to its peer, whatever forwarding headers it
+    /// carries.
+    fn from_peer(peer: IpAddr) -> Self {
+        let peer = peer.to_canonical();
+        Self { client: peer, peer, proto: DEFAULT_PROTO }
+    }
+
     /// The resolved client as the [`ClientAddr`] the identity middleware stores
     /// for the rate limiter, so a charge made after the body is read (a batch's
     /// calls beyond the first) keys on the same address as the edge layer.
@@ -185,7 +213,7 @@ impl TrustedProxies {
     pub(crate) fn resolve(&self, peer: IpAddr, headers: &HeaderMap) -> Forwarding {
         let peer = peer.to_canonical();
         if !self.contains(peer) {
-            return Forwarding { client: peer, peer, proto: DEFAULT_PROTO };
+            return Forwarding::from_peer(peer);
         }
         Forwarding {
             client: self.forwarded_client(headers).unwrap_or(peer),
@@ -276,7 +304,8 @@ impl std::error::Error for CidrError {}
 ///
 /// It is the outermost router layer, so it runs before the rate limiter. A
 /// request without `ConnectInfo` (never the case behind the accept loop) gets
-/// neither: the rate limiter then skips its per-IP bucket, as it did before.
+/// neither: the rate limiter then skips its per-IP bucket, as it did before. A
+/// request on a [`LocalConnection`] is attributed to its peer, the front.
 pub(crate) async fn identify(
     State(trusted): State<Arc<TrustedProxies>>,
     mut request: Request,
@@ -284,7 +313,11 @@ pub(crate) async fn identify(
 ) -> Response {
     let peer = request.extensions().get::<ConnectInfo<SocketAddr>>().map(|info| info.0.ip());
     if let Some(peer) = peer {
-        let forwarding = trusted.resolve(peer, request.headers());
+        let forwarding = if request.extensions().get::<LocalConnection>().is_some() {
+            Forwarding::from_peer(peer)
+        } else {
+            trusted.resolve(peer, request.headers())
+        };
         request.extensions_mut().insert(forwarding.client_addr());
         request.extensions_mut().insert(forwarding);
     }
@@ -292,9 +325,9 @@ pub(crate) async fn identify(
 }
 
 /// Read the PROXY protocol v2 header a trusted proxy sends ahead of a
-/// connection's first byte, returning the client address it carries, or `None`
-/// for a `LOCAL` header (the proxy's own connection, which keeps the proxy's
-/// address).
+/// connection's first byte, returning the client address it carries, or
+/// [`ProxyHeader::Local`] for a `LOCAL` header (the proxy's own connection,
+/// which keeps the proxy's address).
 ///
 /// Only the header's own bytes are read, never past the length it declares, so
 /// the HTTP request behind it stays in the stream; TLVs after the address
@@ -305,7 +338,7 @@ pub(crate) async fn identify(
 /// (a front sending one is misconfigured, and serving the connection as the
 /// front's own would merge its clients into the front's rate-limit key). The
 /// caller bounds the read with the header read timeout.
-pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<Option<SocketAddr>>
+pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<ProxyHeader>
 where
     R: AsyncRead + Unpin,
 {
@@ -320,20 +353,20 @@ where
     }
     let len = u16::from_be_bytes([len_high, len_low]);
     let (source, block_len) = match (version_command & 0x0f, family) {
-        (PROXY_V2_LOCAL, _) => (None, 0),
+        (PROXY_V2_LOCAL, _) => (ProxyHeader::Local, 0),
         (PROXY_V2_PROXY, PROXY_V2_TCP4) if len >= PROXY_V2_TCP4_LEN => {
             let source = Ipv4Addr::from(stream.read_u32().await?);
             let _destination = stream.read_u32().await?;
             let port = stream.read_u16().await?;
             let _destination_port = stream.read_u16().await?;
-            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP4_LEN)
+            (ProxyHeader::Proxy(SocketAddr::from((source, port))), PROXY_V2_TCP4_LEN)
         }
         (PROXY_V2_PROXY, PROXY_V2_TCP6) if len >= PROXY_V2_TCP6_LEN => {
             let source = Ipv6Addr::from(stream.read_u128().await?);
             let _destination = stream.read_u128().await?;
             let port = stream.read_u16().await?;
             let _destination_port = stream.read_u16().await?;
-            (Some(SocketAddr::from((source, port))), PROXY_V2_TCP6_LEN)
+            (ProxyHeader::Proxy(SocketAddr::from((source, port))), PROXY_V2_TCP6_LEN)
         }
         (PROXY_V2_PROXY, PROXY_V2_TCP4 | PROXY_V2_TCP6) => {
             return Err(invalid_proxy_header("PROXY protocol address block is too short"));
@@ -809,7 +842,7 @@ mod tests {
 
     /// Run the reader over `bytes`, returning its verdict and the bytes it left
     /// unread.
-    async fn read_header(bytes: &[u8]) -> (io::Result<Option<SocketAddr>>, Vec<u8>) {
+    async fn read_header(bytes: &[u8]) -> (io::Result<ProxyHeader>, Vec<u8>) {
         let mut reader = bytes;
         let verdict = read_proxy_header(&mut reader).await;
         (verdict, reader.to_vec())
@@ -826,7 +859,7 @@ mod tests {
         ] {
             let bytes = [proxy_v2_header(source, tlvs), request.to_vec()].concat();
             let (verdict, rest) = read_header(&bytes).await;
-            assert_eq!(verdict.expect("valid header"), Some(source));
+            assert_eq!(verdict.expect("valid header"), ProxyHeader::Proxy(source));
             assert_eq!(rest, request);
         }
     }
@@ -837,7 +870,7 @@ mod tests {
         for block in [&[][..], &[0_u8; 12][..]] {
             let bytes = [raw_header(0x20, 0x00, block), b"GET".to_vec()].concat();
             let (verdict, rest) = read_header(&bytes).await;
-            assert_eq!(verdict.expect("valid header"), None);
+            assert_eq!(verdict.expect("valid header"), ProxyHeader::Local);
             assert_eq!(rest, b"GET");
         }
     }

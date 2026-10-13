@@ -398,8 +398,11 @@ address is a single host):
   cannot add headers. Every connection from a listed peer must open with a
   binary PROXY protocol v2 header for TCP over IPv4 or IPv6, and the source
   address in it takes the peer's place. A `LOCAL` header (the balancer's own
-  health check) keeps the balancer's address. A missing or malformed header, a
-  header for another protocol, or one not complete within
+  health check) keeps the balancer's address, and the `X-Forwarded-For` and
+  `X-Forwarded-Proto` on that connection are ignored: a `LOCAL` connection
+  carries no forwarded client, so a balancer that sends `LOCAL` for relayed
+  traffic puts those clients under its own address. A missing or malformed
+  header, a header for another protocol, or one not complete within
   `--header-read-timeout` closes the connection without a response; a peer
   that is not listed is served as plain HTTP. The `X-Forwarded-For` rule then
   runs against the address from the header, so it applies only when that
