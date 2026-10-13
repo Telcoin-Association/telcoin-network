@@ -101,8 +101,8 @@ struct UpstreamReadiness {
     /// The run of consecutive poll results that drives transitions.
     streak: Mutex<PollStreak>,
     /// Forwards in a row that failed to connect (a connect timeout included);
-    /// reset by a forward that gets a response and when the upstream turns
-    /// ready.
+    /// reset by a forward that gets a response and, under `streak`, when the
+    /// upstream turns ready. The threshold decision reads it under `streak`.
     rpc_failures: AtomicU32,
 }
 
@@ -127,7 +127,16 @@ impl UpstreamReadiness {
     /// cause at info once, so a gateway that never becomes ready says why at
     /// the default level. Every other failed poll logs at debug.
     fn record_poll(&self, result: Result<(), NotReadyCause>, thresholds: ReadinessThresholds) {
-        let mut streak = self.streak();
+        self.apply_poll(&mut self.streak(), result, thresholds);
+    }
+
+    /// [`Self::record_poll`] with `streak` already locked.
+    fn apply_poll(
+        &self,
+        streak: &mut PollStreak,
+        result: Result<(), NotReadyCause>,
+        thresholds: ReadinessThresholds,
+    ) {
         match result {
             Ok(()) => {
                 streak.failures = 0;
@@ -183,6 +192,10 @@ impl UpstreamReadiness {
     /// On the `threshold`-th in a row the upstream is marked not-ready, and the
     /// poller must then see a fresh run of successful polls before it turns
     /// ready.
+    ///
+    /// The count is read again once `streak` is locked: a poll that turned the
+    /// upstream ready in between reset it, and that reset wins over a failure
+    /// counted before it.
     fn record_rpc_failure(&self, threshold: NonZeroU32) {
         let failures = self
             .rpc_failures
@@ -196,6 +209,9 @@ impl UpstreamReadiness {
             return;
         }
         let mut streak = self.streak();
+        if self.rpc_failures.load(Ordering::Relaxed) < threshold.get() {
+            return;
+        }
         streak.successes = 0;
         if self.ready.swap(false, Ordering::Relaxed) {
             crate::telemetry::set_upstream_ready(self.worker_id, &self.rpc_url, false);
@@ -989,6 +1005,45 @@ mod tests {
         // turning ready starts the failure count over
         readiness.record_rpc_failure(&rpc_url);
         assert!(readiness.any_ready());
+    }
+
+    #[test]
+    fn a_failure_counted_before_recovery_does_not_unpublish_it() {
+        let upstreams = [upstream_at(0, "127.0.0.1:1".parse().expect("addr"))];
+        let rpc_url = &upstreams[0].rpc_url;
+        let thresholds =
+            ReadinessThresholds { rpc_failure: NonZeroU32::new(2), ..thresholds(3, 2) };
+        let readiness = GatewayReadiness::new(&upstreams, thresholds);
+        let upstream = &readiness.upstreams[0];
+
+        // ready, marked not-ready from the rpc path, then one poll short of
+        // turning ready again
+        upstream.record_poll(Ok(()), thresholds);
+        upstream.record_poll(Ok(()), thresholds);
+        readiness.record_rpc_failure(rpc_url);
+        readiness.record_rpc_failure(rpc_url);
+        assert!(!readiness.any_ready(), "two failures in a row mark the upstream not-ready");
+        upstream.record_poll(Ok(()), thresholds);
+
+        // a failing forward counts itself while the final recovery poll holds
+        // the streak, and only then reaches the threshold decision
+        let mut streak = upstream.streak();
+        std::thread::scope(|scope| {
+            let late = scope.spawn(|| readiness.record_rpc_failure(rpc_url));
+            while upstream.rpc_failures.load(Ordering::SeqCst) < 3 {
+                std::thread::yield_now();
+            }
+            upstream.apply_poll(&mut streak, Ok(()), thresholds);
+            assert!(upstream.is_ready(), "the second success in a row turns it ready");
+            drop(streak);
+            late.join().expect("late failure");
+        });
+
+        assert_eq!(upstream.rpc_failures.load(Ordering::SeqCst), 0, "recovery reset the count");
+        assert!(
+            readiness.any_ready(),
+            "a failure counted before the recovery reset must not unpublish the upstream"
+        );
     }
 
     #[test]

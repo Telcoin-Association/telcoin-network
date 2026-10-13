@@ -200,7 +200,9 @@ pub(crate) struct Cli {
     /// `0`. The default outlasts the 30 s reth gives
     /// `eth_sendRawTransactionSync` to wait for its receipt
     /// (`--rpc.send-raw-transaction-sync-timeout`), so a slow Sync call gets
-    /// the worker's own answer rather than a gateway timeout.
+    /// the worker's own answer rather than a gateway timeout. It covers
+    /// connection setup as well, so it must be longer than
+    /// `--upstream-connect-timeout`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT",
@@ -709,6 +711,18 @@ impl Cli {
         ]
         .into_iter()
         .try_for_each(|(flag, value)| ensure_non_zero(flag, value))?;
+        // the request deadline covers connection setup too. one that is not
+        // longer than the connect timeout ends a stalled connect first, and
+        // reqwest reports that like a worker that is slow to answer, so passive
+        // health would never count it (see `proxy::proxy`)
+        eyre::ensure!(
+            self.upstream_request_timeout > self.upstream_connect_timeout,
+            "--upstream-request-timeout ({}) must be longer than --upstream-connect-timeout ({}): \
+             the request deadline includes connection setup, so a stalled connect would end as a \
+             request timeout and never count toward --upstream-failure-threshold",
+            humantime::format_duration(self.upstream_request_timeout),
+            humantime::format_duration(self.upstream_connect_timeout),
+        );
         let upstreams = self.resolve_upstreams()?;
         eyre::ensure!(!upstreams.is_empty(), "no upstream workers configured");
         ensure_unique_worker_ids(&upstreams)?;
@@ -1973,9 +1987,14 @@ mod tests {
                 Err(err) => format!("{err:?}"),
             };
             assert!(message.contains(flag), "{message}");
-            // the smallest non-zero value is still accepted
+            // the smallest non-zero value is still accepted, the request
+            // deadline with a connect timeout below it
             let tiny = format!("{flag}=1ms");
-            cli_with_flags(&[tiny.as_str()]).into_settings()?;
+            let mut flags = vec![tiny.as_str()];
+            if flag == "--upstream-request-timeout" {
+                flags.push("--upstream-connect-timeout=1us");
+            }
+            cli_with_flags(&flags).into_settings()?;
         }
         Ok(())
     }
@@ -2548,6 +2567,36 @@ mod tests {
 
         // without a redirect the flag is unused and not checked
         cli_with_flags(&["--upstream-request-timeout=5s"]).into_settings()?;
+        Ok(())
+    }
+
+    /// The request deadline covers connection setup, so one that is not longer
+    /// than the connect timeout ends a stalled connect first, as a timeout that
+    /// passive health cannot tell from a slow answer.
+    #[test]
+    fn request_timeout_not_above_connect_timeout_is_rejected_at_startup() -> eyre::Result<()> {
+        for request in ["100ms", "2s"] {
+            let flag = format!("--upstream-request-timeout={request}");
+            let err = cli_with_flags(&[flag.as_str(), "--upstream-connect-timeout=2s"])
+                .into_settings()
+                .expect_err("a request deadline that does not outlast the connect timeout");
+            let message = err.to_string();
+            assert!(
+                message.contains("--upstream-request-timeout")
+                    && message.contains("--upstream-connect-timeout"),
+                "{message}"
+            );
+            // the message names the flags and their values, never an upstream
+            assert!(!message.contains("10.0.0.7"), "{message}");
+        }
+
+        // the defaults, and a deadline just above the connect timeout, pass
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert!(settings.upstream_request_timeout > settings.upstream_connect_timeout);
+        let settings =
+            cli_with_flags(&["--upstream-request-timeout=2001ms", "--upstream-connect-timeout=2s"])
+                .into_settings()?;
+        assert_eq!(settings.upstream_request_timeout, Duration::from_millis(2001));
         Ok(())
     }
 
