@@ -12,7 +12,7 @@ use tn_types::gas_accumulator::WorkerBaseFee;
 pub(crate) trait EpochBundle {
     /// Simulate signed transactions while preserving all explicit bundle overrides.
     #[method(name = "callBundle")]
-    async fn call_bundle(&self, bundle: EthCallBundle) -> RpcResult<EthCallBundleResponse>;
+    async fn call_bundle(&self, request: EthCallBundle) -> RpcResult<EthCallBundleResponse>;
 }
 
 /// The existing reth bundle handler and this worker's live fee resolver.

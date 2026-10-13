@@ -31,7 +31,7 @@ pub(crate) trait EpochDebugSimulation {
     async fn trace_call(
         &self,
         request: TransactionRequest,
-        block: Option<BlockId>,
+        block_id: Option<BlockId>,
         opts: Option<GethDebugTracingCallOptions>,
     ) -> RpcResult<GethTrace>;
 

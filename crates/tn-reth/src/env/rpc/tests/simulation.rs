@@ -11,6 +11,7 @@ use alloy::{
     signers::SignerSync as _,
 };
 use futures::future::try_join_all;
+use jsonrpsee::core::params::ObjectParams;
 use reth_rpc_eth_types::builder::config::PendingBlockKind;
 use serde_json::{json, Value};
 
@@ -380,6 +381,92 @@ fn fee_probe_output(base_fee: u64, gas_price: u64) -> String {
     format!("0x{base_fee:064x}{gas_price:064x}")
 }
 
+/// Named simulation parameters retain reth's aliases and selected block's fee environment.
+#[tokio::test]
+async fn test_rpc_simulation_named_simulate_v1() -> eyre::Result<()> {
+    init_reth_defaults();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let (methods, _) = epoch_fee_methods(
+        70,
+        100,
+        remaining_rpc_args(true, PendingBlockKind::Full),
+        &task_manager,
+        &tmp_dir,
+    )?;
+    let (request, state) = fee_probe()?;
+    let methods = &methods;
+    let request = &request;
+    let state = &state;
+    try_join_all(["block_number", "blockNumber"].map(|name| async move {
+        try_join_all([("latest", 70), ("pending", 70), ("0x0", 100)].map(
+            |(block, fee)| async move {
+                let mut params = ObjectParams::new();
+                params.insert(
+                    "opts",
+                    json!({
+                        "blockStateCalls": [{"calls": [request], "stateOverrides": state}],
+                        "validation": true
+                    }),
+                )?;
+                params.insert(name, block)?;
+                let response: Value = methods.call("eth_simulateV1", params).await?;
+                assert_eq!(
+                    response.pointer("/0/calls/0/returnData"),
+                    Some(&json!(fee_probe_output(fee, fee + 5))),
+                    "{name}={block}: {response}"
+                );
+                Ok::<(), eyre::Report>(())
+            },
+        ))
+        .await?;
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
+    Ok(())
+}
+
+/// Named trace selectors preserve historical fees instead of silently tracing the latest block.
+#[tokio::test]
+async fn test_rpc_simulation_named_debug_trace_call() -> eyre::Result<()> {
+    init_reth_defaults();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let (methods, _) = epoch_fee_methods(
+        70,
+        100,
+        remaining_rpc_args(true, PendingBlockKind::Full),
+        &task_manager,
+        &tmp_dir,
+    )?;
+    let (request, state) = fee_probe()?;
+    let methods = &methods;
+    let request = &request;
+    let state = &state;
+    try_join_all(["block_id", "blockId"].map(|name| async move {
+        try_join_all([("latest", 70), ("pending", 70), ("0x0", 100)].map(
+            |(block, fee)| async move {
+                let mut params = ObjectParams::new();
+                params.insert("request", request)?;
+                params.insert(name, block)?;
+                params.insert("opts", json!({"tracer": "callTracer", "stateOverrides": state}))?;
+                let response: Value = methods.call("debug_traceCall", params).await?;
+                assert_eq!(
+                    response.pointer("/output"),
+                    Some(&json!(fee_probe_output(fee, fee + 5))),
+                    "{name}={block}: {response}"
+                );
+                assert!(response.get("error").is_none(), "{name}={block}: {response}");
+                Ok::<(), eyre::Report>(())
+            },
+        ))
+        .await?;
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
+    Ok(())
+}
+
 /// Historical selections and explicit overrides, including zero, retain their execution fees.
 #[tokio::test]
 async fn test_rpc_simulation_remaining_fee_environments() -> eyre::Result<()> {
@@ -709,6 +796,42 @@ fn bundle_probe_genesis(header_fee: u64) -> eyre::Result<alloy::genesis::Genesis
     genesis.alloc.entry(Address::repeat_byte(0x91)).or_default().code =
         Some("0x486000523a60205260406000f3".parse()?);
     Ok(genesis)
+}
+
+/// Named signed bundles decode reth's request parameter and preserve the state block's fees.
+#[tokio::test]
+async fn test_rpc_simulation_named_call_bundle() -> eyre::Result<()> {
+    init_reth_defaults();
+    let tmp_dir = TempDir::new()?;
+    let task_manager = TaskManager::default();
+    let (methods, _) = epoch_fee_methods_from_genesis(
+        70,
+        bundle_probe_genesis(100)?,
+        remaining_rpc_args(true, PendingBlockKind::Full),
+        &task_manager,
+        &tmp_dir,
+    )?;
+    let tx = signed_bundle_probe(BundleFeeStyle::Dynamic, 200)?;
+    let methods = &methods;
+    let tx = &tx;
+    try_join_all([("latest", 70), ("pending", 70), ("0x0", 100)].map(|(block, fee)| async move {
+        let mut params = ObjectParams::new();
+        params.insert(
+            "request",
+            json!({
+                "txs": [tx], "blockNumber": "0x2", "stateBlockNumber": block
+            }),
+        )?;
+        let response: Value = methods.call("eth_callBundle", params).await?;
+        assert_eq!(
+            response.pointer("/results/0/value"),
+            Some(&json!(fee_probe_output(fee, fee + 5))),
+            "stateBlockNumber={block}: {response}"
+        );
+        Ok::<(), eyre::Report>(())
+    }))
+    .await?;
+    Ok(())
 }
 
 /// Tip bundles validate signed legacy and EIP-1559 prices against the epoch, in both directions.

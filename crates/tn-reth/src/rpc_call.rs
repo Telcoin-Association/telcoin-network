@@ -75,8 +75,8 @@ pub(crate) trait EpochSimulation {
     #[method(name = "simulateV1")]
     async fn simulate_v1(
         &self,
-        payload: SimulatePayload,
-        block: Option<BlockId>,
+        opts: SimulatePayload,
+        block_number: Option<BlockId>,
     ) -> RpcResult<Vec<SimulatedBlock<RpcBlock<alloy::network::Ethereum>>>>;
 }
 
