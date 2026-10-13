@@ -19,6 +19,16 @@ use serde::{
 };
 use serde_json::{json, Value};
 
+/// Longest string `id` that an error response echoes, in bytes of its decoded
+/// UTF-8 text (after JSON escapes are resolved, not as written on the wire).
+///
+/// JSON-RPC ids are short correlation tokens (a counter, a UUID), so a longer
+/// string is not one a client needs back. Like an array, an object or a
+/// boolean, which the spec does not allow as an id, it echoes as `null`, so
+/// the id a reject path keeps is never larger than this, whatever the client
+/// sends.
+const MAX_ID_BYTES: usize = 256;
+
 /// JSON-RPC 2.0 error codes used by the gateway.
 ///
 /// The gateway-specific codes sit in the implementation-defined server-error
@@ -311,7 +321,9 @@ fn render(err: &GatewayError, id: RequestId) -> Response {
 /// The JSON-RPC request `id` echoed back on an error response.
 ///
 /// `null` is the "no id" case the spec mandates for a request whose id the
-/// server could not read: a batch, a malformed body, or an id-less call.
+/// server could not read: a batch, a malformed body, or an id-less call. The
+/// gateway also echoes `null` for an id outside the echo bound (see
+/// [`BoundedId`]).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RequestId(Value);
 
@@ -319,8 +331,9 @@ impl RequestId {
     /// The top-level `id` of a request the caller has already parsed.
     ///
     /// Now only a test helper: it is the reference `id` extraction that
-    /// [`Self::recover`] is checked against, since the screen no longer builds a
-    /// `Value` for the request to take an id from.
+    /// [`Self::recover`] is checked against for ids within the echo bound (see
+    /// [`BoundedId`]), since the screen no longer builds a `Value` for the
+    /// request to take an id from. It applies no bound of its own.
     #[cfg(test)]
     pub(crate) fn from_request(request: &Value) -> Self {
         Self(request.get("id").cloned().unwrap_or(Value::Null))
@@ -343,6 +356,15 @@ impl RequestId {
     /// into serde's ignored-value sink, which skips it in place. A multi-megabyte
     /// `params` therefore costs a scan of the bytes rather than a `Value` tree
     /// several times the size of the request.
+    ///
+    /// The `id` itself is kept only when it is `null`, a number serde_json can
+    /// represent, or a string of at most [`MAX_ID_BYTES`] bytes (see
+    /// [`BoundedId`]). An array, an object or a boolean is skipped in place like
+    /// any other member. A longer string is parsed but not kept: one with
+    /// escapes is decoded into the parser's scratch buffer, at most the size of
+    /// the body, and dropped. Each recovers as `null`, so an attacker-sized `id`
+    /// on a reject path costs at most one copy of its bytes, never a `Value`
+    /// tree.
     ///
     /// The whole body is still scanned, deliberately. JSON-RPC does not fix
     /// member order and clients routinely serialize `id` after a large
@@ -396,8 +418,9 @@ impl<'de> Visitor<'de> for ElementIdVisitor {
     }
 }
 
-/// Deserialization shim that materializes a request's `id` member and nothing
-/// else. See [`RequestId::recover`].
+/// Deserialization shim that reads a request's `id` member within the echo
+/// bound (see [`BoundedId`]) and skips every other member. See
+/// [`RequestId::recover`].
 struct IdMember(Value);
 
 impl<'de> Deserialize<'de> for IdMember {
@@ -424,18 +447,75 @@ impl<'de> Visitor<'de> for IdMemberVisitor {
         // Every non-`id` member deserializes into serde's ignored-value sink,
         // which skips it in place: a multi-megabyte `params` costs a scan of the
         // bytes rather than a `Value` tree several times the size of the input.
+        // The `id` goes through `BoundedId`, which never builds a tree either.
         // A repeated `id` keeps the last occurrence, which is how a full parse
         // into `Value` resolves a duplicated member.
         std::iter::from_fn(|| {
             members.next_key::<Cow<'_, str>>().transpose().map(|member| {
                 member.and_then(|member| match member.as_ref() {
-                    "id" => members.next_value::<Value>().map(Some),
+                    "id" => members.next_value::<BoundedId>().map(|id| Some(id.0)),
                     _ => members.next_value::<IgnoredAny>().map(|_| None),
                 })
             })
         })
         .try_fold(Value::Null, |id, member| member.map(|found| found.unwrap_or(id)))
         .map(IdMember)
+    }
+}
+
+/// A request `id` read within the bound an error response echoes: `null`, a
+/// number, or a string of at most [`MAX_ID_BYTES`] bytes. Anything else reads
+/// as `null`; an array or an object is drained into serde's ignored-value
+/// sink rather than built.
+struct BoundedId(Value);
+
+impl<'de> Deserialize<'de> for BoundedId {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(BoundedIdVisitor)
+    }
+}
+
+/// Visitor behind [`BoundedId`].
+struct BoundedIdVisitor;
+
+impl<'de> Visitor<'de> for BoundedIdVisitor {
+    type Value = BoundedId;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON value")
+    }
+
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(BoundedId(Value::Null))
+    }
+
+    /// A boolean is not a valid JSON-RPC id.
+    fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+        Ok(BoundedId(Value::Null))
+    }
+
+    fn visit_i64<E>(self, id: i64) -> Result<Self::Value, E> {
+        Ok(BoundedId(Value::from(id)))
+    }
+
+    fn visit_u64<E>(self, id: u64) -> Result<Self::Value, E> {
+        Ok(BoundedId(Value::from(id)))
+    }
+
+    fn visit_f64<E>(self, id: f64) -> Result<Self::Value, E> {
+        Ok(BoundedId(Value::from(id)))
+    }
+
+    fn visit_str<E>(self, id: &str) -> Result<Self::Value, E> {
+        Ok(BoundedId(if id.len() <= MAX_ID_BYTES { Value::from(id) } else { Value::Null }))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(self, elements: A) -> Result<Self::Value, A::Error> {
+        IgnoredAny.visit_seq(elements).map(|_| BoundedId(Value::Null))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
+        IgnoredAny.visit_map(members).map(|_| BoundedId(Value::Null))
     }
 }
 
@@ -496,12 +576,27 @@ mod tests {
         let element = |index| RequestId::recover_element(batch, index).0;
         assert_eq!(element(0), json!(1));
         assert_eq!(element(1), json!("tx-2"));
-        assert_eq!(element(2), json!([3]));
+        // a structured id is outside the echo bound (#1595), as for a single call
+        assert_eq!(element(2), Value::Null);
         // not an object, past the end, and not a batch at all
         assert_eq!(element(3), Value::Null);
         assert_eq!(element(4), Value::Null);
         assert_eq!(RequestId::recover_element(br#"{"id":1}"#, 0).0, Value::Null);
         assert_eq!(RequestId::recover_element(br#"[{"id":1}] trailing"#, 0).0, Value::Null);
+    }
+
+    /// A batch element's id goes through the same bound as a single call's:
+    /// a long string or a large array echoes `null`, and an element after one
+    /// still recovers its own id.
+    #[test]
+    fn oversized_element_id_echoes_null() {
+        let long = "a".repeat(MAX_ID_BYTES + 1);
+        let array = format!("[{}0]", "0,".repeat(64 * 1024));
+        let batch = format!(r#"[{{"id":"{long}"}},{{"id":{array}}},{{"id":"tx-3"}}]"#);
+        let element = |index| RequestId::recover_element(batch.as_bytes(), index).0;
+        assert_eq!(element(0), Value::Null);
+        assert_eq!(element(1), Value::Null);
+        assert_eq!(element(2), json!("tx-3"));
     }
 
     #[test]
@@ -528,7 +623,9 @@ mod tests {
         // The whole point of the shim is to cost less, not to answer
         // differently. This pins it against the full-`Value` parse it replaced,
         // over the shapes where a cheaper reader could plausibly drift:
-        // member order, duplicates, non-object bodies, and malformed input.
+        // member order, duplicates, number and string encodings, non-object
+        // bodies, and malformed input. Every id here is within the echo bound;
+        // ids outside it echo `null` by design and are pinned on their own.
         fn full_parse(request_body: &[u8]) -> Value {
             serde_json::from_slice::<Value>(request_body)
                 .ok()
@@ -536,17 +633,19 @@ mod tests {
                 .unwrap_or(Value::Null)
         }
 
-        let bodies: [&[u8]; 18] = [
+        let bodies: [&[u8]; 20] = [
             br#"{"jsonrpc":"2.0","method":"eth_chainId","id":7}"#,
             br#"{"id":7,"jsonrpc":"2.0","method":"eth_chainId"}"#,
             br#"{"method":"eth_sendRawTransaction","params":["0x00"],"id":"tx-1"}"#,
             br#"{"id":"abc"}"#,
+            br#"{"id":"esc\"aped\u00e9"}"#,
             br#"{"id":0}"#,
             br#"{"id":-1}"#,
             br#"{"id":1.5}"#,
+            br#"{"id":1e3}"#,
+            br#"{"id":18446744073709551615}"#,
+            br#"{"id":-9223372036854775808}"#,
             br#"{"id":null}"#,
-            br#"{"id":{"nested":[1,2,3]}}"#,
-            br#"{"id":[1,2]}"#,
             br#"{"id":1,"id":2}"#,
             br#"{"method":"eth_chainId"}"#,
             br#"{}"#,
@@ -569,18 +668,208 @@ mod tests {
     #[test]
     fn recovering_and_reusing_a_parse_agree() {
         // The two entry points must not drift: a reject path that reuses its own
-        // parse has to echo exactly what a re-parse of the body would echo.
+        // parse has to echo exactly what a re-parse of the body would echo, for
+        // every id within the echo bound.
         let bodies: [&[u8]; 5] = [
             br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x00"],"id":"tx-1"}"#,
             br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x00"],"id":0}"#,
             br#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x00"]}"#,
             br#"{"id":null}"#,
-            br#"{"id":{"nested":[1,2,3]}}"#,
+            br#"{"id":1.5}"#,
         ];
         bodies.iter().for_each(|body| {
             let parsed: Value = serde_json::from_slice(body).expect("body parses");
             assert_eq!(RequestId::recover(body), RequestId::from_request(&parsed), "{body:?}");
         });
+    }
+
+    #[test]
+    fn oversized_id_echoes_null() {
+        let body =
+            format!(r#"{{"jsonrpc":"2.0","method":"eth_chainId","id":"{}"}}"#, "a".repeat(300));
+        assert_eq!(recovered(body.as_bytes()), Value::Null);
+    }
+
+    #[test]
+    fn array_and_object_ids_echo_null() {
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":[0,0,0]}"#), Value::Null);
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":{"a":1}}"#), Value::Null);
+    }
+
+    #[test]
+    fn boolean_id_echoes_null() {
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":true}"#), Value::Null);
+    }
+
+    #[test]
+    fn string_id_at_the_limit_echoes_unchanged() {
+        let at_limit = "a".repeat(MAX_ID_BYTES);
+        let body = format!(r#"{{"method":"eth_chainId","id":"{at_limit}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), json!(at_limit));
+
+        let over_limit = "a".repeat(MAX_ID_BYTES + 1);
+        let body = format!(r#"{{"method":"eth_chainId","id":"{over_limit}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), Value::Null);
+    }
+
+    #[test]
+    fn deeply_nested_id_is_skipped_without_a_tree() {
+        // building this id as a `Value` hits serde_json's recursion limit and
+        // fails the whole recovery; skipping it in place reaches the repeated
+        // id after it, and the last id wins
+        let nested = format!("{}{}", "[".repeat(200), "]".repeat(200));
+        let body = format!(r#"{{"method":"eth_chainId","id":{nested},"id":5}}"#);
+        assert_eq!(recovered(body.as_bytes()), json!(5));
+    }
+
+    #[test]
+    fn string_id_bound_counts_decoded_utf8_bytes() {
+        // a two-byte character counts twice
+        let at_limit = "\u{e9}".repeat(MAX_ID_BYTES / 2);
+        let body = format!(r#"{{"id":"{at_limit}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), json!(at_limit));
+        let over_limit = "\u{e9}".repeat(MAX_ID_BYTES / 2 + 1);
+        let body = format!(r#"{{"id":"{over_limit}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), Value::Null);
+
+        // an escape counts as the byte it decodes to, not the six on the wire
+        let escaped = r"\u0041".repeat(MAX_ID_BYTES);
+        let body = format!(r#"{{"id":"{escaped}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), json!("A".repeat(MAX_ID_BYTES)));
+        let escaped = r"\u0041".repeat(MAX_ID_BYTES + 1);
+        let body = format!(r#"{{"id":"{escaped}"}}"#);
+        assert_eq!(recovered(body.as_bytes()), Value::Null);
+    }
+
+    #[test]
+    fn numeric_and_short_string_ids_echo_unchanged() {
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":1}"#), json!(1));
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":-5}"#), json!(-5));
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":1.5}"#), json!(1.5));
+        assert_eq!(recovered(br#"{"method":"eth_chainId","id":"abc"}"#), json!("abc"));
+    }
+
+    #[test]
+    fn oversized_id_after_large_params_echoes_null() {
+        // the id trails 900 KiB of params, so recovery scans the whole body to
+        // reach it and then has to skip it rather than build it
+        let params = "a".repeat(900 * 1024);
+        let id = format!("[{}0]", "0,".repeat(32 * 1024));
+        let body = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{params}"],"id":{id}}}"#
+        );
+        assert_eq!(recovered(body.as_bytes()), Value::Null);
+    }
+
+    /// A request of exactly `size` bytes whose `id` is an array of zeros
+    /// filling everything but the envelope.
+    fn array_id_body(size: usize) -> Vec<u8> {
+        let head = r#"{"jsonrpc":"2.0","method":"eth_chainId","id":["#;
+        let tail = "0]}";
+        let fill = size - head.len() - tail.len();
+        // each element is "0,"; an odd remainder becomes leading whitespace
+        let body = format!("{}{head}{}{tail}", " ".repeat(fill % 2), "0,".repeat(fill / 2));
+        body.into_bytes()
+    }
+
+    /// Peak RSS under the WG-02 load: 500 concurrent 1 MiB requests whose `id`
+    /// is an array, sent with the hop marker so every one takes a reject path
+    /// that recovers the id. Before the id was bounded, each request built a
+    /// `Value` about 34 times the size of its `id` while it was rejected.
+    /// The RSS bound alone depends on how many worker threads build an id at
+    /// once; on unfixed code the `id: null` assertion fails on any host, since
+    /// the hop-marker path echoed the whole array.
+    ///
+    /// It measures the whole process (client and server share it) and needs a
+    /// quiet machine, so it is run by hand:
+    /// `cargo nextest run -p tn-worker-gateway --run-ignored only --no-capture
+    /// -E 'test(peak_rss_stays_under_the_manifest_limit_with_oversized_ids)'`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "measures peak RSS of the test process; run by hand"]
+    async fn peak_rss_stays_under_the_manifest_limit_with_oversized_ids() {
+        use crate::{
+            proxy::HOP_HEADER,
+            readiness::{GatewayReadiness, ReadinessThresholds},
+            server::{inflight_slots, router, AppState, RouterLayers},
+        };
+        use axum::body::Bytes;
+        use std::{net::SocketAddr, num::NonZeroU32, sync::Arc, time::Duration};
+        use tokio::{net::TcpListener, task::JoinSet};
+
+        const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+        const REQUESTS: usize = 500;
+        // the reference manifest's memory limit (1Gi), in the kB `VmHWM` uses
+        const MANIFEST_LIMIT_KB: u64 = 1024 * 1024;
+
+        let thresholds = ReadinessThresholds {
+            failure: NonZeroU32::MIN,
+            success: NonZeroU32::MIN,
+            rpc_failure: None,
+        };
+        let state = AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[], thresholds)),
+            http: reqwest::Client::new(),
+            query_upstream: None,
+            query_header: None,
+            recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
+            max_batch_len: None,
+            query_request_timeout: None,
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
+            draining: Arc::default(),
+        };
+        let app = router(
+            state,
+            Duration::from_secs(60),
+            MAX_REQUEST_BYTES,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            // serves until the runtime shuts down at the end of the test; a
+            // serve failure shows up as failed requests below
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await;
+        });
+
+        let body = Bytes::from(array_id_body(MAX_REQUEST_BYTES));
+        assert_eq!(body.len(), MAX_REQUEST_BYTES);
+
+        let client = reqwest::Client::new();
+        let url = format!("http://{addr}/");
+        let mut requests = JoinSet::new();
+        (0..REQUESTS).for_each(|_| {
+            let request = client.post(&url).header(HOP_HEADER, "1").body(body.clone());
+            requests.spawn(async move {
+                let response = request.send().await.expect("send");
+                let status = response.status();
+                (status, response.text().await.expect("response body"))
+            });
+        });
+        while let Some(joined) = requests.join_next().await {
+            let (status, text) = joined.expect("request task");
+            assert_eq!(status, StatusCode::LOOP_DETECTED, "{text}");
+            let response: Value = serde_json::from_str(&text).expect("json error body");
+            assert_eq!(response["id"], Value::Null);
+        }
+
+        let status = std::fs::read_to_string("/proc/self/status").expect("read /proc/self/status");
+        let peak = status.lines().find(|line| line.starts_with("VmHWM:")).expect("VmHWM line");
+        println!("{peak}");
+        let peak_kb: u64 = peak
+            .split_whitespace()
+            .nth(1)
+            .and_then(|kb| kb.parse().ok())
+            .expect("VmHWM value in kB");
+        assert!(
+            peak_kb < MANIFEST_LIMIT_KB,
+            "peak RSS {peak_kb} kB is not under the 1Gi reference limit"
+        );
     }
 
     #[tokio::test]

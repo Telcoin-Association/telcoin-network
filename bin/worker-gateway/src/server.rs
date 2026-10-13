@@ -2987,6 +2987,79 @@ mod tests {
         assert_eq!(worker_seen.hits(), bodies.len());
     }
 
+    /// A 2 MiB array `id` is never echoed (#1595) on any path that recovers an
+    /// id from the body: the hop marker, a denied call, a too-long batch, the
+    /// screen on a single call and on a batch element, a mixed batch holding a
+    /// denied call, and the upstream-error envelope all answer `id: null`.
+    #[tokio::test]
+    async fn oversized_ids_echo_null_on_every_reject_path() {
+        let huge_id = format!("[{}0]", "0,".repeat(1024 * 1024));
+        let with_id = |method: &str, params: &str| {
+            format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":{huge_id}}}"#)
+        };
+        let too_long = format!(
+            "[{},{}]",
+            with_id("eth_chainId", "[]"),
+            (1..=DEFAULT_MAX_BATCH_LEN as u64)
+                .map(|id| call("eth_chainId", id))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        let bad_element = format!(
+            r#"[{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{SIGNED_TX}"],"id":1}},{}]"#,
+            with_id("eth_sendRawTransaction", r#"["0xdeadbeef"]"#)
+        );
+        let mixed = format!(
+            "[{},{},{}]",
+            call("eth_sendRawTransaction", 1),
+            with_id("eth_call", "[]"),
+            call("tn_getStuff", 3)
+        );
+        let cases = [
+            (Some("x-tn-gateway"), with_id("eth_chainId", "[]"), StatusCode::LOOP_DETECTED, -32004),
+            (None, with_id("tn_getStuff", "[]"), StatusCode::FORBIDDEN, -32011),
+            (None, too_long, StatusCode::PAYLOAD_TOO_LARGE, -32003),
+            (
+                None,
+                with_id("eth_sendRawTransaction", r#"["0xdeadbeef"]"#),
+                StatusCode::BAD_REQUEST,
+                -32007,
+            ),
+            (None, bad_element, StatusCode::BAD_REQUEST, -32007),
+            (None, mixed, StatusCode::FORBIDDEN, -32011),
+        ];
+        let large_router = |state| {
+            router(
+                state,
+                Duration::from_secs(5),
+                4 * MAX_REQUEST_BYTES,
+                NonZeroU32::new(MAX_INFLIGHT_REQUEST_BYTES),
+                RouterLayers::default(),
+                Arc::default(),
+            )
+        };
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(large_router(state)).await;
+        for (header, body, status, code) in cases {
+            let (got, text) = post_rpc(gateway, header, body).await;
+            assert_eq!((got, error_code_and_id(&text)), (status, (code, serde_json::Value::Null)));
+        }
+        assert_eq!(worker_seen.hits(), 0, "every case is refused before a forward");
+
+        let (plain, _plain) = answering_mock(StatusCode::BAD_GATEWAY, "text/plain", "down").await;
+        let state = redirect_state(plain, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(large_router(state)).await;
+        let (status, text) = post_rpc(gateway, None, with_id("eth_chainId", "[]")).await;
+        assert_eq!(
+            (status, error_code_and_id(&text)),
+            (StatusCode::BAD_GATEWAY, (-32012, serde_json::Value::Null))
+        );
+    }
+
     #[tokio::test]
     async fn redirect_leaves_routing_unchanged() {
         // the default list is configured, but a redirect turns the policy off

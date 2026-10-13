@@ -687,6 +687,7 @@ The error carries the HTTP status in the table below and a JSON-RPC error object
 A client library that treats every non-`2xx` status as a transport failure reports these as HTTP errors, so read the body whatever the status.
 The request `id` is echoed when it can be recovered from the body.
 It is `null` for a batch (see below), and always `null` on a `405`, `408`, `413`, `429`, the `503` for an exhausted byte budget (`-32010`) or the `400` for an unreadable body, which the gateway answers without recovering the id.
+An `id` that is an array, an object, a boolean or a string over 256 bytes is echoed as `null`.
 
 The exceptions are a request whose head hyper, the HTTP library underneath, cannot parse (below), a connection that does not finish its request head within `--header-read-timeout` (closed without a response), a connection over `--max-connections-per-ip`, which is closed before any request is read, and an exchange still running when the connection-lifetime grace or `--graceful-shutdown-timeout` ends (see [Connection handling](#connection-handling) and [Graceful shutdown](#graceful-shutdown)).
 Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
