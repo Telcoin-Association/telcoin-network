@@ -4,9 +4,10 @@
 
 `make test-sigkill` runs two abrupt restarts under transaction traffic: one shortly before
 epoch close and one halfway through the epoch. Both keep the validator down across the
-boundary and require bounded catch-up, active CVV mode, a matching execution block hash,
-and a transaction executed through the restarted validator. The kill primitive verifies
-SIGKILL (signal 9) directly.
+boundary and require bounded catch-up, active CVV mode, matching execution hashes at
+catch-up, and the recovery transaction on both chains at the same height. Both nodes must
+then advance beyond that transaction, and their latest shared block hash must match.
+The kill primitive verifies SIGKILL (signal 9) directly.
 
 The defaults are 30-second epochs, a 2-second late-kill offset, at least 45 seconds down,
 and a 180-second recovery deadline. To use fleet B's epoch duration and kill offset:
@@ -20,22 +21,44 @@ TN_SIGKILL_RECOVERY_SECS=1800 \
 make test-sigkill
 ```
 
-The 300-second downtime includes the 59 seconds before close and approximately four
-minutes after close. Restart waits for both that elapsed time and a peer crossing the
-boundary. These tests use four local validators and modest transaction traffic. A passing
-run does not establish the cause of the larger fleet's historical freeze in
+For the before-close case, the 300-second downtime includes 59 seconds before close and
+approximately four minutes after close. The mid-epoch case stays down for at least 600
+seconds to cross the boundary. Restart waits for both the configured minimum downtime
+and a peer crossing the boundary. These tests use four local validators and modest
+transaction traffic. A passing run does not establish the cause of the larger fleet's
+historical freeze in
 [issue #1510](https://github.com/Telcoin-Association/telcoin-network/issues/1510).
 
-The `SIGKILL recovery` workflow runs both scenarios in Durable and SafeNoSync by default.
-Its manual inputs select timing and either sync regime. Its negative control omits the
-restart and must reach the recovery timeout. The nightly Durable lane also runs both cases.
+The `SIGKILL recovery` workflow runs one scenario and sync regime per matrix job, covering
+both scenarios in Durable and SafeNoSync by default. Manual inputs select timing and either
+sync regime. Each job has a six-hour limit and uses the dedicated `sigkill` nextest profile
+with a five-hour per-case watchdog. The ordinary e2e timeout remains 2160 seconds.
+
+Before starting nodes, each case rejects timings whose bounded waits need at least the
+18000-second watchdog budget. The conservative requirement is
+`9 * epoch + downtime + 3 * recovery + 300` seconds, including RPC startup and capture
+overhead. Fleet B settings
+with 1800-second recovery need 16800 seconds and fit this profile. At 1200/59/300, the
+healthy before-close restart is approximately 3841 seconds after genesis; the mid-epoch
+restart is approximately 3600 seconds after genesis. Use `make test-sigkill`, or pass
+`--profile sigkill` when invoking nextest directly with fleet timing.
+
+Each matrix job verifies that omitting the restart fails at the recovery timeout and that
+mutating the transaction or subsequent block comparison reports chain divergence. The
+nightly Durable lane also runs both cases.
 Download the run's `sigkill-recovery-*` artifact before its 15-day retention expires.
 
 Each case's `test_logs/sigkill_*` directory contains separate node stdout/stderr for each
-start, `kill.json`, `boundary.json`, `restart.json`, `samples.csv`, metrics snapshots, and
-file inventories. The stdout filter enables `state-sync`, `consensus-chain`, and
+start, `kill.json`, `boundary.json`, `restart.json`, `samples.csv`, `agreement.jsonl`, metrics
+snapshots, and file inventories. Agreement records include the phase, height, and both
+hashes. The stdout filter enables `state-sync`, `consensus-chain`, and
 `tn::observer` debug messages. On a returned error, `retained-datadir.txt` names the local
-data directory. Failed CI runs archive that directory under `validation-logs/failed-data`.
+data directory. The crash guard sends SIGKILL and reaps every remaining node before
+retaining the directory, including failures before the crash or after restart. It never
+runs graceful shutdown handlers, preserving unsealed packs and in-flight import state
+at failure. Inventories continue past entries that disappear during sampling. Failed CI
+runs archive the directory under `validation-logs/failed-data`. Restart itself can sweep
+the original run-0 import directories; retained failure data describes the final run.
 
 For a fleet run, save the victim's Docker log and service journal before the kill and before
 teardown. Record the boundary block's timestamp and the actual remote kill/restart times.

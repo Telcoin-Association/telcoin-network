@@ -1,6 +1,7 @@
 //! Captured SIGKILL reproductions for issue #1510, with restart across an epoch boundary.
 
 mod process;
+mod timing;
 
 use alloy::providers::{Provider, ProviderBuilder};
 use std::{
@@ -17,7 +18,7 @@ use tn_types::{get_available_tcp_port, Address, NodeMode, MIN_PROTOCOL_BASE_FEE}
 use super::common::{
     address_from_word, current_epoch, epoch_seconds_remaining, get_block, get_block_number,
     get_key, get_latest_consensus_header_number, get_node_mode, get_tx_receipt_block,
-    scrape_metrics, send_tel, start_validator_with_args, wait_for_rpc, ProcessGuard,
+    scrape_metrics, send_tel, start_validator_with_args, wait_for_rpc,
 };
 
 /// Where to interrupt the validator relative to its measured epoch schedule.
@@ -56,6 +57,17 @@ impl Timing {
             "kill offset must be strictly inside the epoch"
         );
         eyre::ensure!(!timing.recovery.is_zero(), "recovery timeout must be positive");
+        let required = timing::required_secs(
+            timing.epoch.as_secs(),
+            timing.downtime.as_secs(),
+            timing.recovery.as_secs(),
+        )
+        .ok_or_else(|| eyre::eyre!("SIGKILL timing budget overflow"))?;
+        eyre::ensure!(
+            required < timing::TEST_TIMEOUT_SECS,
+            "SIGKILL settings need {required}s, exceeding the {}s watchdog budget; reduce timing inputs",
+            timing::TEST_TIMEOUT_SECS
+        );
         Ok(timing)
     }
 }
@@ -158,21 +170,27 @@ fn pool_full(error: &eyre::Report) -> bool {
 fn write_inventory(path: &Path, file: &mut File) -> std::io::Result<()> {
     std::fs::read_dir(path)?
         .try_for_each(|entry| {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            if kind.is_dir() {
-                write_inventory(&entry.path(), file)
-            } else if kind.is_file() {
-                let metadata = entry.metadata()?;
-                let modified = metadata
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)
-                    .map_err(std::io::Error::other)?
-                    .as_millis();
-                writeln!(file, "{modified}\t{}\t{}", metadata.len(), entry.path().display())
-            } else {
-                Ok(())
-            }
+            let entry_path =
+                entry.as_ref().map(|entry| entry.path()).unwrap_or_else(|_| path.into());
+            entry
+                .and_then(|entry| {
+                    let kind = entry.file_type()?;
+                    if kind.is_dir() {
+                        write_inventory(&entry_path, file)
+                    } else if kind.is_file() {
+                        let metadata = entry.metadata()?;
+                        let modified = metadata
+                            .modified()?
+                            .duration_since(UNIX_EPOCH)
+                            .map_err(std::io::Error::other)?
+                            .as_millis();
+                        writeln!(file, "{modified}\t{}\t{}", metadata.len(), entry_path.display())
+                    } else {
+                        Ok(())
+                    }
+                })
+                // Continue with siblings when a live import entry vanishes during the walk.
+                .or_else(|error| writeln!(file, "unavailable\t{}\t{error}", entry_path.display()))
         })
         // Import directories can disappear while they are sampled. Preserve that observation.
         .or_else(|error| writeln!(file, "unavailable\t{}\t{error}", path.display()))
@@ -224,7 +242,7 @@ fn start(
     )
 }
 
-/// Retain the failed node's data after the process guard has shut down the network.
+/// Retain the failed node's data after abrupt cleanup, without running shutdown handlers.
 async fn run_case(phase: KillPhase, test: &str) -> eyre::Result<()> {
     let _permit = super::common::acquire_test_permit();
     let timing = Timing::from_env()?;
@@ -257,7 +275,7 @@ async fn run_network(
         &[],
     )?;
     let endpoints = (0..4).map(|_| Endpoint::allocate()).collect::<eyre::Result<Vec<_>>>()?;
-    let mut guard = ProcessGuard::new(
+    let mut guard = process::CrashGuard::new(
         endpoints
             .iter()
             .enumerate()
@@ -304,7 +322,7 @@ async fn run_network(
     let pid = child.id();
     let killed_at = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
     let status = process::kill_and_reap(&mut child).inspect_err(|_| {
-        guard.replace(2, child);
+        let _ = guard.replace(2, child);
     })?;
     eyre::ensure!(status.signal() == Some(9), "expected SIGKILL, observed {status:?}");
     let down_since = Instant::now();
@@ -343,7 +361,7 @@ async fn run_network(
     .await?;
     let target_epoch = current_epoch(&peer_provider).await?.epoch_id;
     let target_height = get_block_number(&peer.rpc.0)?;
-    guard.replace(2, start(2, victim, data, test, 1));
+    guard.replace(2, start(2, victim, data, test, 1))?;
     std::fs::write(
         logs.join("restart.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -380,24 +398,65 @@ async fn run_network(
     .await;
     snapshot(logs, data, "recovery-result", &victim_provider, victim).await?;
     recovered?;
-    let expected = get_block(&peer.rpc.0, Some(target_height))?;
-    let actual = get_block(&victim.rpc.0, Some(target_height))?;
-    let expected_hash =
-        expected.get("hash").ok_or_else(|| eyre::eyre!("peer block has no hash"))?;
-    let actual_hash =
-        actual.get("hash").ok_or_else(|| eyre::eyre!("recovered block has no hash"))?;
-    eyre::ensure!(
-        actual_hash == expected_hash,
-        "recovered block hash differs from the committee's chain"
-    );
+    assert_same_block(logs, peer, victim, target_height, "restart-target")?;
+    let caught_up_height = get_block_number(&peer.rpc.0)?.min(get_block_number(&victim.rpc.0)?);
+    assert_same_block(logs, peer, victim, caught_up_height, "catch-up")?;
     let transaction = traffic.submit(&victim.rpc)?;
     wait_until(
         timing.recovery,
-        "transaction submitted through recovered validator executes",
-        || async { Ok(get_tx_receipt_block(&victim.rpc.0, &transaction).is_ok()) },
+        "post-restart transaction executes on both chains (possible divergence)",
+        || async {
+            Ok(get_tx_receipt_block(&victim.rpc.0, &transaction).is_ok()
+                && get_tx_receipt_block(&peer.rpc.0, &transaction).is_ok())
+        },
     )
     .await?;
+    let transaction_height = get_tx_receipt_block(&victim.rpc.0, &transaction)?;
+    eyre::ensure!(
+        get_tx_receipt_block(&peer.rpc.0, &transaction)? == transaction_height,
+        "chain divergence: post-restart transaction landed at different heights"
+    );
+    assert_same_block(logs, peer, victim, transaction_height, "transaction")?;
+    wait_until(timing.recovery, "both chains progress after the transaction", || async {
+        traffic.offer(&peer.rpc)?;
+        Ok(get_block_number(&peer.rpc.0)? > transaction_height
+            && get_block_number(&victim.rpc.0)? > transaction_height)
+    })
+    .await?;
+    let continued_height = get_block_number(&peer.rpc.0)?.min(get_block_number(&victim.rpc.0)?);
+    assert_same_block(logs, peer, victim, continued_height, "continued")?;
     snapshot(logs, data, "recovered", &victim_provider, victim).await
+}
+
+/// Compare and record a shared execution height, reporting divergence at the observed phase.
+fn assert_same_block(
+    logs: &Path,
+    peer: &Endpoint,
+    victim: &Endpoint,
+    height: u64,
+    phase: &str,
+) -> eyre::Result<()> {
+    let expected = get_block(&peer.rpc.0, Some(height))?;
+    let actual = get_block(&victim.rpc.0, Some(height))?;
+    let expected_hash = expected
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("peer block has no hash"))?;
+    let actual_hash = actual
+        .get("hash")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| eyre::eyre!("recovered block has no hash"))?;
+    let mut evidence =
+        OpenOptions::new().create(true).append(true).open(logs.join("agreement.jsonl"))?;
+    writeln!(
+        evidence,
+        "{}",
+        serde_json::json!({
+            "phase": phase, "height": height, "peer_hash": expected_hash, "victim_hash": actual_hash,
+        })
+    )?;
+    eyre::ensure!(actual_hash == expected_hash, "chain divergence at {phase} block {height}");
+    Ok(())
 }
 
 /// Exercise the late-kill window with the validator down across the committee's close.

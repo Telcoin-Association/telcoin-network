@@ -40,7 +40,6 @@ env:
   CARGO_PROFILE_DEV_DEBUG: 0
   CARGO_PROFILE_TEST_DEBUG: 0
   TN_TEST_MDBX_SYNC: durable
-  TN_SIGKILL_SYNC_MODE: ${{ inputs.sync_mode || 'both' }}
   TN_SIGKILL_EPOCH_SECS: ${{ inputs.epoch_secs || '30' }}
   TN_SIGKILL_BEFORE_CLOSE_SECS: ${{ inputs.before_close_secs || '2' }}
   TN_SIGKILL_DOWNTIME_SECS: ${{ inputs.downtime_secs || '45' }}
@@ -48,8 +47,18 @@ env:
 
 jobs:
   reproduce:
+    name: ${{ matrix.sync_mode }} / ${{ matrix.scenario }}
     runs-on: ubuntu-latest
-    timeout-minutes: 240
+    # One fleet-timed case per job: the five-hour test budget leaves an hour for the build.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        sync_mode: ${{ fromJSON(inputs.sync_mode == 'durable' && '["durable"]' || inputs.sync_mode == 'safe-no-sync' && '["safe-no-sync"]' || '["durable","safe-no-sync"]') }}
+        scenario: [before_epoch_close, mid_epoch]
+    env:
+      TN_TEST_MDBX_SYNC: ${{ matrix.sync_mode }}
+      SIGKILL_FILTER: test(sigkill::test_sigkill_${{ matrix.scenario }}_recovers)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -76,20 +85,32 @@ jobs:
           cargo +"$RUST_NIGHTLY" fmt --all -- --check
           cargo +"$RUST_NIGHTLY" clippy --locked --workspace --all-targets --all-features --no-deps -- -D warnings
 
-      - name: Build and run captured SIGKILL scenarios in both sync regimes
+      - name: Build and run the captured SIGKILL scenario
         run: |
           cargo fetch --locked
-          sync_modes="$TN_SIGKILL_SYNC_MODE"
-          if [ "$sync_modes" = both ]; then
-            sync_modes="durable safe-no-sync"
-          fi
-          for sync_mode in $sync_modes; do
-            TN_TEST_MDBX_SYNC="$sync_mode" make test-sigkill
-            mkdir -p "validation-logs/$sync_mode"
-            cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/$sync_mode/"
-          done
+          make test-sigkill
+          mkdir -p "validation-logs/$TN_TEST_MDBX_SYNC"
+          cp -R crates/e2e-tests/test_logs/sigkill* "validation-logs/$TN_TEST_MDBX_SYNC/"
 
-      - name: Confirm both recovery assertions detect an omitted restart
+      - name: Reject timing settings beyond the per-case watchdog budget
+        env:
+          TN_SIGKILL_EPOCH_SECS: "2000"
+          TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
+          TN_SIGKILL_DOWNTIME_SECS: "45"
+          TN_SIGKILL_RECOVERY_SECS: "180"
+        run: |
+          if timeout 60s env TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E "$SIGKILL_FILTER" > timing-budget.log 2>&1; then
+            echo "::error::Over-budget timing settings were accepted"
+            exit 1
+          fi
+          python3 -I - <<'PY'
+          from pathlib import Path
+          log = Path("timing-budget.log").read_text()
+          if "Error: SIGKILL settings need " not in log or "watchdog budget" not in log:
+              raise SystemExit("oversized timing must fail before nodes start")
+          PY
+
+      - name: Confirm recovery detects an omitted restart
         env:
           TN_SIGKILL_EPOCH_SECS: "10"
           TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
@@ -104,21 +125,59 @@ jobs:
           from pathlib import Path
           source = Path("crates/e2e-tests/tests/it/sigkill.rs")
           text = source.read_text()
-          restart = "guard.replace(2, start(2, victim, data, test, 1));"
+          restart = "guard.replace(2, start(2, victim, data, test, 1))?;"
           if text.count(restart) != 1:
               raise SystemExit("expected exactly one restart to mutate")
           source.write_text(text.replace(restart, "// Mutation: the killed validator is never restarted."))
           PY
-          if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --locked -p e2e-tests --test it --run-ignored all -E 'test(sigkill::test_sigkill_)' > mutation.log 2>&1; then
+          if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E "$SIGKILL_FILTER" > mutation.log 2>&1; then
             echo "::error::The recovery test passed without restarting the killed validator"
             exit 1
           fi
           python3 -I - <<'PY'
           from pathlib import Path
           expected = "timed out waiting for condition: restarted validator catches up and becomes active"
-          if Path("mutation.log").read_text().count("Error: " + expected) != 2:
-              raise SystemExit("both mutations must fail at the recovery assertion")
+          if Path("mutation.log").read_text().count("Error: " + expected) != 1:
+              raise SystemExit("mutation must fail at the recovery assertion")
           PY
+
+      - name: Confirm transaction and continued-chain comparisons detect divergence
+        env:
+          TN_SIGKILL_EPOCH_SECS: "10"
+          TN_SIGKILL_BEFORE_CLOSE_SECS: "2"
+          TN_SIGKILL_DOWNTIME_SECS: "15"
+          TN_SIGKILL_RECOVERY_SECS: "180"
+        run: |
+          sigkill_source=crates/e2e-tests/tests/it/sigkill.rs
+          sigkill_original="$(mktemp)"
+          cp "$sigkill_source" "$sigkill_original"
+          trap 'cp "$sigkill_original" "$sigkill_source"; rm -f "$sigkill_original"' EXIT
+          for phase in transaction continued; do
+            cp "$sigkill_original" "$sigkill_source"
+            MUTATION_PHASE="$phase" python3 -I - <<'PY'
+          import os
+          from pathlib import Path
+          source = Path("crates/e2e-tests/tests/it/sigkill.rs")
+          text = source.read_text()
+          comparison = "actual_hash == expected_hash"
+          if text.count(comparison) != 1:
+              raise SystemExit("expected exactly one chain comparison to mutate")
+          replacement = comparison + ' && phase != "' + os.environ["MUTATION_PHASE"] + '"'
+          source.write_text(text.replace(comparison, replacement))
+          PY
+            if TN_BIN_PATH="$PWD/target/e2e/telcoin-network" cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E "$SIGKILL_FILTER" > "chain-mutation-$phase.log" 2>&1; then
+              echo "::error::The recovery test passed with a divergent $phase block"
+              exit 1
+            fi
+            MUTATION_PHASE="$phase" python3 -I - <<'PY'
+          import os
+          from pathlib import Path
+          phase = os.environ["MUTATION_PHASE"]
+          expected = "Error: chain divergence at " + phase + " block "
+          if expected not in Path("chain-mutation-" + phase + ".log").read_text():
+              raise SystemExit("mutation must fail at the " + phase + " chain comparison")
+          PY
+          done
 
       - name: Assert committed source and lockfile restored
         run: git diff --exit-code
@@ -138,10 +197,12 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sigkill-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          name: sigkill-recovery-${{ matrix.sync_mode }}-${{ matrix.scenario }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             crates/e2e-tests/test_logs/sigkill*
             validation-logs
             mutation.log
+            timing-budget.log
+            chain-mutation-*.log
           if-no-files-found: warn
           retention-days: 15
