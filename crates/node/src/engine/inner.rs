@@ -41,7 +41,7 @@ pub(super) struct ExecutionNodeInner {
     /// Reth execution environment.
     pub(super) reth_env: RethEnv,
     /// Initialized execution components indexed by worker id.
-    /// Removed workers retain their pools with stopped RPC listeners until reactivation.
+    /// Removed workers retain their pools and listeners with transaction admission closed.
     pub(super) workers: Vec<WorkerComponents>,
 }
 
@@ -181,7 +181,7 @@ impl ExecutionNodeInner {
         let rpc_handle = self.reth_env.start_rpc(&server, worker_id).await?;
 
         // take ownership of worker components
-        let components = WorkerComponents::new(rpc_handle, server, transaction_pool, network);
+        let components = WorkerComponents::new(rpc_handle, transaction_pool, network);
         // Must call this function in accending worker_id order or will panic.
         if worker_id as usize != self.workers.len() {
             panic!("initialize_worker_components not called with sequencial worker ids!")
@@ -325,7 +325,7 @@ impl ExecutionNodeInner {
         self.reth_env.clone()
     }
 
-    /// Return a running worker's RPC handle, or an error if absent or stopped.
+    /// Return an active worker's RPC handle, or an error if absent or inactive.
     pub(super) fn worker_rpc_handle(&self, worker_id: &WorkerId) -> eyre::Result<&RpcServerHandle> {
         self.workers
             .get(usize::from(*worker_id))

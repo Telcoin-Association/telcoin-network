@@ -1376,13 +1376,33 @@ impl ConsensusChain {
     }
 
     /// Return true if we have a complete pack file for epoch_record.
+    ///
+    /// An empty or short pack for the record's epoch, or a record that ends before the pack's
+    /// first output, returns `false` silently, like a missing pack does.
     pub async fn is_epoch_complete(&self, epoch_record: &EpochRecord) -> bool {
-        match self.consensus_header_by_number(epoch_record.final_consensus.number).await {
-            Ok(result) => result.is_some(),
-            Err(e) => {
-                error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
-                false
-            }
+        let lookup = self.consensus_header_by_number(epoch_record.final_consensus.number).await;
+        Self::epoch_completeness(lookup).unwrap_or_else(|e| {
+            error!(target: "consensus-chain", epoch=?epoch_record.epoch, "DB error checking epoch completeness: {e}");
+            false
+        })
+    }
+
+    /// Classify the final-header lookup behind [`Self::is_epoch_complete`].
+    ///
+    /// A final number outside the pack's range means the epoch is not complete here, the same
+    /// answer as `Ok(None)`: [`PackError::ConsensusNumberTooHigh`] when the pack is empty or
+    /// shorter than the record, [`PackError::ConsensusNumberTooLow`] when the record ends before
+    /// the pack's first output (the dummy epoch-0 record). Any other error is a real read failure
+    /// and is returned unchanged.
+    fn epoch_completeness(
+        lookup: Result<Option<ConsensusHeader>, ConsensusChainError>,
+    ) -> Result<bool, ConsensusChainError> {
+        match lookup {
+            Ok(header) => Ok(header.is_some()),
+            Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooLow | PackError::ConsensusNumberTooHigh,
+            )) => Ok(false),
+            Err(e) => Err(e),
         }
     }
 
@@ -2670,6 +2690,311 @@ mod test {
             0,
             "meta-only pack: hint clamped to start_consensus_number - 1"
         );
+    }
+
+    /// An out-of-range final number means the pack is empty or short for that record, so the
+    /// completeness check answers "not complete", the same as a missing header; every other error
+    /// is still returned as a read failure.
+    #[test]
+    fn test_epoch_completeness_treats_range_misses_as_incomplete() {
+        use crate::consensus_pack::PackError;
+
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Ok(Some(ConsensusHeader::default()))),
+            Ok(true)
+        ));
+        assert!(matches!(ConsensusChain::epoch_completeness(Ok(None)), Ok(false)));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooHigh
+            ))),
+            Ok(false)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ConsensusNumberTooLow
+            ))),
+            Ok(false)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::PackError(
+                PackError::ReadOnly
+            ))),
+            Err(ConsensusChainError::PackError(PackError::ReadOnly))
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(Err(ConsensusChainError::CrcError)),
+            Err(ConsensusChainError::CrcError)
+        ));
+    }
+
+    /// A fresh node pre-opens an empty epoch-0 pack whose range starts at 1, so looking up an
+    /// epoch-0 record's final header misses the range: `TooHigh` for a real record and `TooLow`
+    /// for the dummy record (final number 0). Both mean "not held here", not a read failure.
+    #[tokio::test]
+    async fn test_is_epoch_complete_fresh_epoch0_pack() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_epoch_complete_fresh").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let consensus_chain =
+            ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone())
+                .await
+                .unwrap();
+
+        // a real epoch-0 record ends past the empty pack's range
+        let lookup = consensus_chain.consensus_header_by_number(5).await;
+        assert!(
+            matches!(
+                lookup,
+                Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh))
+            ),
+            "expected ConsensusNumberTooHigh, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        let record = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        assert!(!consensus_chain.is_epoch_complete(&record).await);
+
+        // the dummy epoch-0 record (final number 0) sits below the range
+        let dummy = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let lookup = consensus_chain.consensus_header_by_number(dummy.final_consensus.number).await;
+        assert!(
+            matches!(lookup, Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooLow))),
+            "expected ConsensusNumberTooLow, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        assert!(!consensus_chain.is_epoch_complete(&dummy).await);
+    }
+
+    /// The completeness check follows whichever pack holds the record's epoch: the current pack
+    /// while the epoch is live and the sealed pack after the boundary. A final number past the
+    /// pack's last output reads as incomplete in both, not as a read failure.
+    #[tokio::test]
+    async fn test_is_epoch_complete_tracks_saved_and_sealed_packs() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_epoch_complete_sealed").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        let mut short = record0.clone();
+        short.final_consensus = ConsensusNumHash::new(5, ConsensusHeaderDigest::default());
+
+        // live epoch: the current pack holds outputs 1..=3
+        assert!(consensus_chain.is_epoch_complete(&record0).await);
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(
+                consensus_chain.consensus_header_by_number(record0.final_consensus.number).await
+            ),
+            Ok(true)
+        ));
+        assert!(matches!(
+            ConsensusChain::epoch_completeness(consensus_chain.consensus_header_by_number(5).await),
+            Ok(false)
+        ));
+        assert!(!consensus_chain.is_epoch_complete(&short).await);
+
+        // seal epoch 0 without saving record0, so number 5 still maps to epoch 0 and the lookup
+        // reads the sealed pack
+        consensus_chain.persist_current().await.unwrap();
+        consensus_chain
+            .new_epoch(record0.clone(), committee.advance_epoch_for_test(1))
+            .await
+            .unwrap();
+
+        assert!(consensus_chain.is_epoch_complete(&record0).await);
+        assert_eq!(
+            consensus_chain.epochs().number_to_epoch(5),
+            0,
+            "number 5 must still map to the sealed epoch-0 pack"
+        );
+        let lookup = consensus_chain.consensus_header_by_number(5).await;
+        assert!(
+            matches!(
+                lookup,
+                Err(ConsensusChainError::PackError(PackError::ConsensusNumberTooHigh))
+            ),
+            "expected ConsensusNumberTooHigh from the sealed pack, got {lookup:?}"
+        );
+        assert!(matches!(ConsensusChain::epoch_completeness(lookup), Ok(false)));
+        assert!(!consensus_chain.is_epoch_complete(&short).await);
+    }
+
+    /// A power loss can leave the durable latest-consensus marker one output ahead of the pack
+    /// that recovery rebuilds at the next open. The clamp the node runs right after opening must
+    /// lower the marker to the pack tail after a real reopen. It is in-memory only, so a second
+    /// open must clamp again, and the next save must be accepted and leave a marker that the
+    /// following open agrees with.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_across_reopen() {
+        let temp_dir = TempDir::with_prefix("test_marker_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.clamp_latest_to_pack().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        for i in 0..k {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        consensus_chain.close().await;
+        // the marker for output k + 1 reached disk but the output itself did not
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 0, k + 1).expect("write hint");
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("first reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads the ahead marker");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 0);
+        assert_eq!(reopened.latest_consensus_number(), k, "marker clamped to the pack tail");
+        reopened.close().await;
+
+        // the clamp never reaches the slot files, so a second open must clamp again
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("second reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the slot files still hold k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 0);
+        assert_eq!(reopened.latest_consensus_number(), k, "clamp repeats on every open");
+        let next = make_test_output(&committee, (k % 4) as usize, chain.clone(), k + 1, parent);
+        reopened
+            .save_consensus_output(next)
+            .await
+            .expect("the output after the pack tail must be accepted");
+        reopened.persist_current().await.expect("persist");
+        reopened.close().await;
+        // slot1 still holds the k + 1 hint, so only the slot the save flipped to shows its marker
+        let mut slot2 =
+            std::fs::File::open(temp_dir.path().join("consensus_slot2")).expect("open slot2");
+        assert_eq!(
+            LatestConsensus::read_slot(&mut slot2).expect("read slot2"),
+            (0, k + 1),
+            "the save wrote its marker to consensus_slot2"
+        );
+
+        // both slots now hold k + 1, so the next open agrees with the pack before any clamp
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("third reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the clamp leaves k + 1");
+        let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
+        assert_eq!(latest.number, k + 1);
+        reopened.close().await;
+    }
+
+    /// The first save of a new epoch fsyncs the marker because the epoch changed, while the output
+    /// itself is only msynced at the next persist. After a power loss the marker names the new
+    /// epoch's first output and that pack holds only its epoch meta. The clamp after a real
+    /// reopen must keep the new epoch and lower the number to the previous epoch's last output,
+    /// and the first output of the new epoch must be accepted afterwards.
+    #[tokio::test]
+    async fn test_clamp_latest_to_pack_epoch_ahead_across_reopen() {
+        let temp_dir = TempDir::with_prefix("test_marker_epoch_ahead").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let committee1 = committee.advance_epoch_for_test(1);
+
+        let k = 5u64;
+        let mut parent = ConsensusHeader::default().digest();
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.clamp_latest_to_pack().await.unwrap();
+        consensus_chain.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        for i in 0..k {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.expect("persist");
+        let epoch0_record =
+            EpochRecord { final_consensus: ConsensusNumHash::new(k, parent), ..previous_epoch };
+        // opens and persists the epoch 1 pack with only its epoch meta
+        consensus_chain.new_epoch(epoch0_record, committee1.clone()).await.unwrap();
+        consensus_chain.close().await;
+        // the marker for epoch 1's first output reached disk but the output itself did not
+        ConsensusChain::write_latest_consensus_hint(temp_dir.path(), 1, k + 1).expect("write hint");
+
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("first reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads the ahead marker");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1, "marker keeps the new epoch");
+        assert_eq!(reopened.latest_consensus_number(), k, "marker clamped to the previous final");
+        // nothing is saved in epoch 1 yet, callers fall back to the last executed header
+        assert!(reopened.consensus_header_latest().await.unwrap().is_none());
+        reopened.close().await;
+
+        // the clamp never reaches the slot files, so a second open must clamp again
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("second reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the slot files still hold k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1);
+        assert_eq!(reopened.latest_consensus_number(), k, "clamp repeats on every open");
+        let next = make_test_output(&committee1, (k % 4) as usize, chain.clone(), k + 1, parent);
+        reopened
+            .save_consensus_output(next)
+            .await
+            .expect("the first output of the new epoch must be accepted");
+        assert_eq!(reopened.latest_consensus_number(), k + 1);
+        reopened.persist_current().await.expect("persist");
+        reopened.close().await;
+        // slot1 still holds the k + 1 hint, so only the slot the save flipped to shows its marker
+        let mut slot2 =
+            std::fs::File::open(temp_dir.path().join("consensus_slot2")).expect("open slot2");
+        assert_eq!(
+            LatestConsensus::read_slot(&mut slot2).expect("read slot2"),
+            (1, k + 1),
+            "the save wrote its marker to consensus_slot2"
+        );
+
+        // both slots now hold k + 1, so the next open agrees with the pack before any clamp
+        let reopened = ConsensusChain::new(temp_dir.path().to_owned(), committee.clone())
+            .expect("third reopen");
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the reopen reads k + 1");
+        reopened.clamp_latest_to_pack().await.unwrap();
+        assert_eq!(reopened.latest_consensus_epoch(), 1);
+        assert_eq!(reopened.latest_consensus_number(), k + 1, "the clamp leaves k + 1");
+        let latest = reopened.consensus_header_latest().await.unwrap().expect("latest header");
+        assert_eq!(latest.number, k + 1);
+        reopened.close().await;
     }
 
     #[tokio::test]
@@ -4153,6 +4478,66 @@ mod test {
             )
             .await
             .expect("exact full import of data we already hold must be Ok");
+    }
+
+    /// A process killed during an import leaves `import-{epoch}/{pid}.inproc` behind. When the
+    /// next process gets the same pid (pid 1 in a container), that sentinel would make every later
+    /// import of the epoch a silent no-op. Opening the chain must sweep stale import dirs, so the
+    /// epoch is no longer in flight and an import of it installs the pack.
+    #[tokio::test]
+    async fn test_new_clears_stale_import_dirs() {
+        let source_dir = TempDir::with_prefix("test_stale_import_src").expect("temp dir");
+        let target_dir = TempDir::with_prefix("test_stale_import_dst").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+
+        // a complete epoch 0 pack to import from
+        let source = ConsensusChain::new(source_dir.path().to_owned(), committee.clone()).unwrap();
+        source.new_epoch(previous_epoch.clone(), committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        for i in 0..5u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            source.save_consensus_output(output).await.unwrap();
+        }
+        source.persist_current().await.expect("persist");
+        let epoch_record = EpochRecord {
+            final_consensus: ConsensusNumHash::new(5, parent),
+            ..previous_epoch.clone()
+        };
+        source.epochs().save_record(epoch_record.clone()).await.expect("save record");
+
+        // the sentinel a killed import of epoch 0 leaves when this process had its pid
+        let import_dir = target_dir.path().join("import-0");
+        std::fs::create_dir_all(&import_dir).expect("create import dir");
+        std::fs::File::create(import_dir.join(format!("{}.inproc", std::process::id())))
+            .expect("create sentinel");
+
+        let target = ConsensusChain::new(target_dir.path().to_owned(), committee.clone()).unwrap();
+        assert!(!import_dir.exists(), "the open must remove the stale import dir");
+        assert!(
+            !target.already_streaming_epoch(0),
+            "a stale import sentinel must not survive open"
+        );
+        target.epochs().save_record(epoch_record.clone()).await.expect("save record");
+        assert!(!target.is_epoch_complete(&epoch_record).await);
+        use tokio::io::AsyncReadExt as _;
+        let (stream, len) = source.get_epoch_stream(0).await.expect("epoch stream");
+        target
+            .stream_import(stream.take(len), &epoch_record, &previous_epoch, Duration::from_secs(5))
+            .await
+            .expect("import");
+        assert!(target.is_epoch_complete(&epoch_record).await, "the import must install the pack");
+        source.close().await;
+        target.close().await;
     }
 
     #[tokio::test]

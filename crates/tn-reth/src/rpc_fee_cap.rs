@@ -5,10 +5,12 @@
 //! `TransactionOrigin::External`, so the validator check never runs for public RPC
 //! traffic (issue #1160). This module closes that gap at the RPC boundary:
 //! [`EthSubmitWithCap`] replaces the two raw submission methods with handlers that
-//! check worker membership and the cap before delegating to the reth implementations.
+//! check worker admission, worker membership, and the cap before delegating to the reth
+//! implementations. A removed worker keeps its listeners bound for later reactivation (#1505),
+//! but both submission methods return `worker is inactive` before decoding or pool access.
 //!
-//! A removed worker is rejected as soon as the epoch manager truncates its accumulator slot.
-//! This check runs before decoding and remains effective while RPC shutdown is draining.
+//! A removed worker is also rejected as soon as the epoch manager truncates its accumulator
+//! slot, before the worker lifecycle closes admission. This check also runs before decoding.
 //!
 //! The check reproduces the validator's arithmetic and is never laxer: the maximum
 //! fee is `max_fee_per_gas * gas_limit`, plus the blob fee bound for EIP-4844
@@ -29,6 +31,7 @@
 //! configuration, not a secret, and any funded account learns it the same way.
 //! The delegated path is otherwise unchanged.
 
+use crate::worker::WorkerRpcAdmission;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_eth_api::{
@@ -97,11 +100,11 @@ impl TxFeeCapWei {
 /// the handlers in place with `TransportRpcModules::add_or_replace_if_module_configured`.
 #[rpc(server, namespace = "eth")]
 pub(crate) trait CappedEthSubmit {
-    /// `eth_sendRawTransaction`: check worker membership and the fee cap, then delegate to reth.
+    /// `eth_sendRawTransaction`: check worker admission and the fee cap, then delegate to reth.
     #[method(name = "sendRawTransaction")]
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
 
-    /// `eth_sendRawTransactionSync`: check membership and the fee cap, then delegate to reth.
+    /// `eth_sendRawTransactionSync`: check worker admission and the fee cap, then delegate to reth.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,
@@ -109,21 +112,28 @@ pub(crate) trait CappedEthSubmit {
     ) -> RpcResult<alloy::rpc::types::TransactionReceipt>;
 }
 
-/// Worker-membership and fee-cap guard over reth's `EthApi` submission methods.
+/// Worker-admission and fee-cap guard over reth's `EthApi` submission methods.
 #[derive(Debug, Clone)]
 pub(crate) struct EthSubmitWithCap<Api> {
-    /// The reth `EthApi` this guard delegates to once both admission checks pass.
+    /// The reth `EthApi` this guard delegates to once every admission check passes.
     eth_api: Api,
     /// The configured cap.
     cap: TxFeeCapWei,
+    /// Committee admission shared with the worker lifecycle on all transports.
+    admission: WorkerRpcAdmission,
     /// The live worker slot shared with the epoch manager's accumulator.
     worker: WorkerBaseFee,
 }
 
 impl<Api> EthSubmitWithCap<Api> {
-    /// Create a guard from the built `EthApi`, parsed flag, and live worker handle.
-    pub(crate) const fn new(eth_api: Api, cap: TxFeeCapWei, worker: WorkerBaseFee) -> Self {
-        Self { eth_api, cap, worker }
+    /// Create a guard from the `EthApi`, fee cap, admission gate, and live worker handle.
+    pub(crate) const fn new(
+        eth_api: Api,
+        cap: TxFeeCapWei,
+        admission: WorkerRpcAdmission,
+        worker: WorkerBaseFee,
+    ) -> Self {
+        Self { eth_api, cap, admission, worker }
     }
 
     /// Reject a removed worker before decoding or inserting into its retained pool.
@@ -151,10 +161,11 @@ where
     jsonrpsee::types::ErrorObject<'static>: From<<Api as EthApiTypes>::Error>,
 {
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256> {
-        self.ensure_active_worker()?;
         // Keep reth's request-trace parity: operators grep this target on the
         // node's only submission path.
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransaction");
+        self.admission.ensure_active()?;
+        self.ensure_active_worker()?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction(&self.eth_api, bytes).await?)
     }
@@ -163,8 +174,9 @@ where
         &self,
         bytes: Bytes,
     ) -> RpcResult<alloy::rpc::types::TransactionReceipt> {
-        self.ensure_active_worker()?;
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransactionSync");
+        self.admission.ensure_active()?;
+        self.ensure_active_worker()?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction_sync(&self.eth_api, bytes).await?)
     }

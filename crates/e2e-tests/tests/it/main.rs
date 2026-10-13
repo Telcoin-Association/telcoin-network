@@ -13,6 +13,7 @@ mod genesis_tests;
 mod governance_safe_fork;
 mod metrics;
 mod restarts;
+mod rpc_namespaces;
 mod staking;
 mod state_export_import;
 mod sync;

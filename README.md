@@ -41,7 +41,8 @@ observer. To take a validator out of consensus, exit it on chain.
 telcoin-network --datadir DATADIR --bls-passphrase-source ask \
   keytool generate validator \
   --address 0xYOUR_EXECUTION_ADDRESS \
-  --external-primary-addr /ip4/YOUR_IP/udp/PORT/quic-v1
+  --external-primary-addr /ip4/YOUR_IP/udp/49590/quic-v1 \
+  --external-worker-addrs /ip4/YOUR_IP/udp/49594/quic-v1
 ```
 
 This generates a BLS keypair, network keys, proof-of-possession, and a `node-info.yaml` file in `DATADIR`.
@@ -55,16 +56,18 @@ Restore worker key entries using the expected Base58 key printed in the startup 
 configure a separate listen address for each worker.
 
 - `--address` is the execution layer address that receives fees
-- `--external-primary-addr` should be set to the node's public IP and port
+- `--external-primary-addr` and `--external-worker-addrs` should be set to the node's public IP and the UDP ports it listens on (49590 and 49594 by convention; the node has no default P2P ports)
+- without them, key generation records `127.0.0.1` with random ports, which only works for local testing
 
 #### 2. Export staking arguments
 
 ```bash
-telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml
+telcoin-network --bls-passphrase-source no-passphrase keytool export-staking-args --node-info DATADIR/node-info.yaml
 ```
 
 This reads the public `node-info.yaml` and outputs the BLS public key and proof-of-possession in the format required by `ConsensusRegistry.stake()`.
-No BLS private key or passphrase is needed.
+It never reads the BLS private key, but the binary still requires a passphrase source for every keytool command except `set-rpc`: with the default `env` source and no `TN_BLS_PASSPHRASE` it exits with "passphrase is required", so pass `--bls-passphrase-source no-passphrase`.
+`keytool` also writes log lines to stdout, so add the global `-q` flag when a script captures the `--json` or `--calldata` output.
 
 Output modes:
 
@@ -90,18 +93,19 @@ CONSENSUS_REGISTRY=0x07E17e17E17e17E17e17E17E17E17e17e17E17e1
 ```
 
 The `stake()` function is payable.
-Users must send the exact required stake amount as the transaction value.
-Query the current required stake amount:
+Users must send the exact stake amount of the current epoch's stake version as the transaction value.
+`getCurrentStakeConfig()` can return a version that only takes effect at the next epoch, so query the stake version, then that version's config:
 
 ```bash
-cast call $CONSENSUS_REGISTRY "getCurrentStakeConfig()(uint256,uint256,uint256,uint32)" --rpc-url RPC_URL
+STAKE_VERSION=$(cast call $CONSENSUS_REGISTRY "getCurrentStakeVersion()(uint8)" --rpc-url RPC_URL)
+cast call $CONSENSUS_REGISTRY "stakeConfig(uint8)(uint256,uint256,uint256,uint32)" $STAKE_VERSION --rpc-url RPC_URL
 ```
 
 The first value returned is `stakeAmount` (in wei). Use it as the `--value` in the stake transaction:
 
 ```bash
-CALLDATA=$(telcoin-network keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
-cast send $CONSENSUS_REGISTRY $CALLDATA --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
+CALLDATA=$(telcoin-network -q --bls-passphrase-source no-passphrase keytool export-staking-args --node-info DATADIR/node-info.yaml --calldata)
+cast send $CONSENSUS_REGISTRY "$CALLDATA" --value <STAKE_AMOUNT> --trezor --rpc-url RPC_URL
 ```
 
 Other signing options: `--ledger` for Ledger hardware wallets, `--interactive` to enter a private key securely at a prompt.

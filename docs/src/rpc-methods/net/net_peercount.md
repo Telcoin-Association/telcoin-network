@@ -1,5 +1,7 @@
 # net\_peerCount
 
+On Telcoin Network this is the number of peers connected to the node's worker network, not devp2p peers: Telcoin Network does not run devp2p. The node refreshes the count every 15 seconds, so a new or dropped connection can take up to 15 seconds to show, and the count reads `0x0` while the node is starting up, until the worker network is running.
+
 #### Parameters
 
 `None`

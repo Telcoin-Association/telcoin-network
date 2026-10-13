@@ -1,5 +1,7 @@
 # net\_listening
 
+On Telcoin Network this method always returns `true`, whether or not the node has any peers. Use [net\_peerCount](net_peercount.md) to see how many peers the node is connected to.
+
 #### Parameters
 
 `None`

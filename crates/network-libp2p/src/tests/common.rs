@@ -1,6 +1,6 @@
 //! Fixtures used in multiple tests.
 
-use crate::{PeerExchangeMap, TNMessage};
+use crate::{PeerExchangeMap, ServiceClass, TNMessage};
 use libp2p::Multiaddr;
 use rand::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -28,6 +28,14 @@ impl TNMessage for TestWorkerResponse {
 impl TNMessage for TestPrimaryRequest {
     fn peer_exchange_msg(&self) -> Option<PeerExchangeMap> {
         None
+    }
+
+    fn service_class(&self) -> ServiceClass {
+        match self {
+            Self::Vote { .. } => ServiceClass::Vote,
+            Self::MissingCertificates(_) => ServiceClass::CertificateSync,
+            Self::NewCertificate { .. } => ServiceClass::Other,
+        }
     }
 }
 impl TNMessage for TestPrimaryResponse {
@@ -68,6 +76,7 @@ pub(super) enum TestWorkerResponse {
 pub(super) enum TestPrimaryRequest {
     NewCertificate { certificate: Certificate },
     Vote { header: Header, parents: Vec<Certificate> },
+    MissingCertificates(Vec<HeaderDigest>),
 }
 
 /// Response to primary requests.

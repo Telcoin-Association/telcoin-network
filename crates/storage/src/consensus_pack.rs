@@ -1196,7 +1196,8 @@ impl ConsensusPack {
         rx.await.map_err(|_| PackError::ReceiveFailed)?
     }
 
-    /// Durably commit the data file and indexes to disk (an fsync), returning once complete.
+    /// Durably commit the data file written since the last persist (an msync; size extensions are
+    /// fsynced as they grow). Indexes are not synced: recovery rebuilds them from the data log.
     pub async fn persist(&self) -> Result<(), PackError> {
         let (tx, rx) = oneshot::channel();
         let _ = self.tx.send(PackMessage::Persist(tx)).await;
@@ -9515,6 +9516,166 @@ pub(crate) mod test {
             committed_len,
             "the rejected open must not truncate the occupied pack (outputs preserved)"
         );
+    }
+
+    /// An unclean stop while an epoch's first output is in flight can leave the position index
+    /// holding that output's lone entry while the data log ends at the epoch meta or inside the
+    /// output. Recovery rebuilds the index from the data log, so the lone entry must not survive
+    /// any of these shapes: the pack reports `start - 1` as its latest number, has no latest
+    /// header, and accepts the output again.
+    #[tokio::test]
+    async fn test_recover_drops_lone_index_entry_for_torn_first_output() {
+        use crate::{
+            archive::{
+                data_file::SENTINEL_LEN, pack::DataHeader, position_index::index::PositionIndex,
+            },
+            consensus_pack::IndexPositions,
+        };
+        use std::io::Write as _;
+
+        /// Where the data log ends relative to output 1 when the pack reopens.
+        #[derive(Debug, Clone, Copy)]
+        enum TornFirstOutput {
+            /// Cut back to the end of the epoch meta after a clean close.
+            CutToMeta,
+            /// Cut one byte short of the output's end after a clean close.
+            CutInsideOutput,
+            /// A power loss before the output's persist: the index entry reached disk and the
+            /// output's data did not.
+            PowerLoss,
+        }
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let output =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+
+        for case in [
+            TornFirstOutput::CutToMeta,
+            TornFirstOutput::CutInsideOutput,
+            TornFirstOutput::PowerLoss,
+        ] {
+            let temp_dir = TempDir::with_prefix("test_cp_lone_torn_entry").expect("temp dir");
+            let epoch_dir = temp_dir.path().join("epoch-0");
+            let data_path = epoch_dir.join(Inner::DATA_NAME);
+            // lengths come from the pack's logical end: while a pack is open the physical length
+            // is the mmap capacity
+            let (meta_end, output_end) = match case {
+                TornFirstOutput::CutToMeta | TornFirstOutput::CutInsideOutput => {
+                    let pack = ConsensusPack::open_append(
+                        temp_dir.path(),
+                        previous_epoch.clone(),
+                        committee.clone(),
+                    )
+                    .expect("open pack");
+                    pack.persist().await.expect("persist meta");
+                    let meta_end = pack.data_file_len().await.expect("meta end");
+                    pack.save_consensus_output(output.clone()).await.expect("save output");
+                    let output_end = pack.data_file_len().await.expect("output end");
+                    pack.persist().await.expect("persist output");
+                    pack.close().await;
+                    // a clean close trims the log to its logical end plus the clean-close sentinel
+                    let full_len = std::fs::metadata(&data_path).expect("metadata").len();
+                    assert_eq!(full_len, output_end + SENTINEL_LEN, "{case:?}: sealed log length");
+                    let cut_len = if matches!(case, TornFirstOutput::CutToMeta) {
+                        meta_end
+                    } else {
+                        full_len - SENTINEL_LEN - 1
+                    };
+                    let f = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&data_path)
+                        .expect("open data");
+                    f.set_len(cut_len).expect("truncate");
+                    (meta_end, output_end)
+                }
+                TornFirstOutput::PowerLoss => {
+                    let mut inner = Inner::open_append(
+                        temp_dir.path(),
+                        &previous_epoch,
+                        committee.clone(),
+                        PACK_VERSION,
+                    )
+                    .expect("open_append inner");
+                    inner.persist().expect("persist meta");
+                    let meta_end = inner.data.file_len();
+                    inner.save_consensus_output(&output).expect("save output");
+                    let output_end = inner.data.file_len();
+                    // the process dies before the output's persist and before any clean close
+                    std::mem::forget(inner);
+                    // writeback order is arbitrary, so the index page can reach disk while the
+                    // output's data pages do not
+                    let mut f = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&data_path)
+                        .expect("open data");
+                    f.seek(SeekFrom::Start(meta_end)).expect("seek");
+                    f.write_all(&vec![0u8; (output_end - meta_end) as usize])
+                        .expect("zero the output");
+                    (meta_end, output_end)
+                }
+            };
+
+            // the on-disk index holds exactly the lone entry for output 1. zero padding past an
+            // unsealed index decodes as zero entries, which never point past the meta.
+            let header =
+                DataHeader::load_header(&mut File::open(&data_path).expect("open data"), 0)
+                    .expect("data header");
+            let pdx_path =
+                epoch_dir.join(Inner::CONSENSUS_POS_NAME).join(Inner::CONSENSUS_POS_FILE);
+            let entries: Vec<_> = PositionIndex::<IndexPositions>::raw_entries(&pdx_path, &header)
+                .into_iter()
+                .filter(|p| p.consensus_header >= meta_end)
+                .map(|p| (p.consensus_header, p.output_start, p.output_end))
+                .collect();
+            assert_eq!(
+                entries,
+                vec![(meta_end, meta_end, output_end)],
+                "{case:?}: the lone index entry must be on disk before the reopen"
+            );
+
+            let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+                .unwrap_or_else(|e| panic!("{case:?}: the open must recover the pack: {e:?}"));
+            // epoch 0 starts at number 1, so a pack without outputs reports 0
+            assert_eq!(
+                pack.latest_consensus_number().await.expect("latest number"),
+                0,
+                "{case:?}: the lone torn index entry must be dropped"
+            );
+            let latest = pack.latest_consensus_header().await;
+            assert!(matches!(latest, Ok(None)), "{case:?}: expected Ok(None), got {latest:?}");
+            assert_eq!(
+                pack.data_file_len().await.expect("data len"),
+                meta_end,
+                "{case:?}: recovery must rewind the log to the meta"
+            );
+            pack.save_consensus_output(output.clone())
+                .await
+                .unwrap_or_else(|e| panic!("{case:?}: the dropped output must be accepted: {e:?}"));
+            pack.persist().await.expect("persist after recovery");
+            pack.close().await;
+
+            let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0)
+                .unwrap_or_else(|e| panic!("{case:?}: reopen after the save: {e:?}"));
+            assert_eq!(
+                pack.latest_consensus_number().await.expect("latest number"),
+                1,
+                "{case:?}: the saved output is the new tail"
+            );
+            let latest =
+                pack.latest_consensus_header().await.expect("read latest").expect("latest header");
+            assert_eq!(latest.number, 1, "{case:?}: latest header number");
+            assert_eq!(
+                pack.data_file_len().await.expect("data len"),
+                output_end,
+                "{case:?}: exactly one copy of output 1 follows the meta"
+            );
+            pack.close().await;
+        }
     }
 
     /// The header-only branch reinitializes the digest index lengths: the data file is rolled back

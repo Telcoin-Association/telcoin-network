@@ -147,6 +147,15 @@ impl<T> From<broadcast::error::SendError<T>> for TrySendError<T> {
     }
 }
 
+/// What [`TnSender::try_send_outcome`] did with a value that it accepted without an error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrySendOutcome {
+    /// The channel queued the value for a receiver.
+    Queued,
+    /// The channel had no subscribed receiver, so it dropped the value instead of queuing it.
+    Unsubscribed,
+}
+
 pub trait TnReceiver<T>: Send + Unpin {
     /// Receives the next value for this channel.
     /// Signature is desugared async fn recv(&mut self) -> Option<T> with Send added.
@@ -159,6 +168,7 @@ pub trait TnReceiver<T>: Send + Unpin {
     fn poll_recv(&mut self, cx: &mut Context<'_>) -> Poll<Option<T>>;
 }
 
+/// A clonable channel sender supporting bounded, nonblocking delivery with explicit outcomes.
 pub trait TnSender<T>: Unpin + Clone {
     /// Sends a value, waiting until there is capacity.
     /// Signature is desugared async fn send(&self, value: T) -> Result<(), SendError<T>> with Send
@@ -167,6 +177,16 @@ pub trait TnSender<T>: Unpin + Clone {
 
     /// Attempts to immediately send a message on this `Sender`
     fn try_send(&self, value: T) -> Result<(), TrySendError<T>>;
+
+    /// Attempts to immediately send a message like [`Self::try_send`], and reports whether the
+    /// channel queued it or dropped it because no receiver was subscribed.
+    ///
+    /// The default reports [`TrySendOutcome::Queued`] for every value that `try_send` accepts.
+    /// A sender that drops values while it has no subscriber overrides it, so that the caller
+    /// can count the drop instead of treating the value as delivered.
+    fn try_send_outcome(&self, value: T) -> Result<TrySendOutcome, TrySendError<T>> {
+        self.try_send(value).map(|()| TrySendOutcome::Queued)
+    }
 }
 
 impl<T: Send + Clone + 'static> TnSender<T> for broadcast::Sender<T> {
