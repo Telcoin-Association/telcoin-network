@@ -132,6 +132,9 @@ pub(crate) struct AppState {
     /// follow them there under `--redirect-queries`, or `None` when that
     /// routing is off (no redirect, or `--recent-submission-ttl 0`).
     pub(crate) recent_submissions: Option<Arc<RecentSubmissions>>,
+    /// Method-name prefixes refused before forwarding when `query_upstream` is
+    /// `None` (`--denied-method-prefixes`); empty allows every method.
+    pub(crate) denied_method_prefixes: Arc<[String]>,
     /// Maximum calls in one JSON-RPC batch (`--max-batch-len`), or `None` when
     /// unlimited.
     pub(crate) max_batch_len: Option<NonZeroUsize>,
@@ -1087,7 +1090,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{check_chain_ids, log_chain_id_check, ChainIdCheck, UpstreamClients},
-        cli::{Cli, Settings},
+        cli::{Cli, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
         config::UpstreamWorker,
         dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
@@ -1162,12 +1165,18 @@ mod tests {
             query_upstream: None,
             query_header: None,
             recent_submissions: None,
+            denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
         }
+    }
+
+    /// The shipped `--denied-method-prefixes` default, as the CLI resolves it.
+    fn default_denied() -> Arc<[String]> {
+        DEFAULT_DENIED_METHOD_PREFIXES.split(',').map(String::from).collect()
     }
 
     /// Serve `app` through the real accept loop (header timeout, nodelay,
@@ -2074,6 +2083,7 @@ mod tests {
                 Duration::from_secs(60),
                 RECENT_SUBMISSIONS_CAPACITY,
             ))),
+            denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
             submission_slots: inflight_slots(0),
@@ -2454,7 +2464,7 @@ mod tests {
         let bodies = [
             call("eth_chainId", 1),
             call("eth_getLogs", 2),
-            call("tn_info", 3),
+            call("net_version", 3),
             call("eth_sendRawTransaction", 4),
             call("eth_sendRawTransactionSync", 5),
             format!("[{},{}]", call("eth_sendRawTransaction", 6), call("eth_call", 7)),
@@ -2466,6 +2476,175 @@ mod tests {
         assert_eq!(worker_seen.hits(), bodies.len());
         assert_eq!(worker_seen.hop_marker(), bodies.len());
         assert_eq!(worker_seen.redirect_marker(), 0);
+    }
+
+    #[tokio::test]
+    async fn denied_prefixes_are_refused_before_forwarding() {
+        // the worker is ready, so a call that got past the policy would be
+        // answered `200 worker` instead of refused
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let methods = ["tn_getStuff", "debug_traceTransaction", "trace_block", "admin_peers"];
+        for (id, method) in (1u64..).zip(methods) {
+            let (status, text) = post_rpc(gateway, None, call(method, id)).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{method}");
+            assert_eq!(error_code_and_id(&text), (-32011, serde_json::json!(id)), "{method}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a denied call must never reach the worker");
+    }
+
+    #[tokio::test]
+    async fn eth_calls_are_forwarded_without_a_redirect() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let bodies = [
+            call("eth_blockNumber", 1),
+            call("eth_call", 2),
+            call("eth_getLogs", 3),
+            call("eth_sendRawTransaction", 4),
+            format!("[{},{}]", call("eth_chainId", 5), call("eth_getBalance", 6)),
+        ];
+        for body in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), bodies.len());
+    }
+
+    #[tokio::test]
+    async fn batch_with_a_denied_method_is_refused_whole() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let batch = format!("[{},{}]", call("eth_blockNumber", 1), call("tn_x", 2));
+        let (status, text) = post_rpc(gateway, None, batch).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        // one error object for the whole batch, not an array of per-call answers
+        let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
+        assert!(body.is_object(), "expected one error object: {text}");
+        assert_eq!(error_code_and_id(&text), (-32011, serde_json::Value::Null));
+        assert_eq!(worker_seen.hits(), 0, "no part of the batch may reach the worker");
+    }
+
+    #[tokio::test]
+    async fn unreadable_bodies_do_not_carry_a_denied_call_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let denied = call("tn_getStuff", 1);
+        // a single call behind a form feed is read as the worker reads it and
+        // refused by the policy with its own id; a batch the gateway cannot
+        // read to its end is refused whole as unreadable, which comes first
+        let invalid_batch = (StatusCode::BAD_REQUEST, -32600, serde_json::Value::Null);
+        for (body, expected) in [
+            (format!("\x0C{denied}"), (StatusCode::FORBIDDEN, -32011, serde_json::json!(1))),
+            (format!(r#"["\ud800",{denied}]"#), invalid_batch.clone()),
+            (format!(r#"[{denied},{{"\ud800":1}}]"#), invalid_batch.clone()),
+            (format!("[1e999,{denied}]"), invalid_batch.clone()),
+        ] {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            let (code, id) = error_code_and_id(&text);
+            assert_eq!((status, code, id), expected, "{body:?}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a denied call must never reach the worker");
+    }
+
+    /// The scan's two shortcuts, the single-call fast path and the skip of a
+    /// mixed batch's remaining elements, would hide a call from the method
+    /// policy, so a deny list in force turns both off: a denied call after a
+    /// batch's first elements have made it mixed, a single denied call naming
+    /// no method the scan routes, and a single call the scan cannot read are
+    /// all refused. With the list empty the same bodies reach the worker.
+    #[tokio::test]
+    async fn denied_calls_behind_the_scan_shortcuts_are_refused() {
+        let mixed = format!(
+            r#"[{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x00"],"id":1}},{},{}]"#,
+            call("eth_call", 2),
+            call("tn_getStuff", 3),
+        );
+        let unreadable = r#"{"jsonrpc":"2.0","method":"eth_call","params":[1e999],"id":5}"#;
+        let bodies = [
+            (mixed, serde_json::Value::Null),
+            (call("tn_getStuff", 4), serde_json::json!(4)),
+            (unreadable.to_string(), serde_json::json!(5)),
+        ];
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        for (body, id) in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(error_code_and_id(&text), (-32011, id.clone()), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a denied call must never reach the worker");
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let mut state = redirect_state(worker, None);
+        state.denied_method_prefixes = Arc::from([]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+        for (body, _) in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), bodies.len());
+    }
+
+    #[tokio::test]
+    async fn redirect_leaves_routing_unchanged() {
+        // the default list is configured, but a redirect turns the policy off
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let bodies = [
+            call("tn_x", 1),
+            call("debug_traceTransaction", 2),
+            format!("[{},{}]", call("eth_blockNumber", 3), call("tn_x", 4)),
+        ];
+        for body in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{body}");
+        }
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 5)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!((query_seen.hits(), worker_seen.hits()), (bodies.len(), 1));
+    }
+
+    #[tokio::test]
+    async fn empty_denied_list_allows_everything() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let mut state = redirect_state(worker, None);
+        state.denied_method_prefixes = Arc::from([]);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let bodies = [
+            call("tn_getStuff", 1),
+            call("debug_traceTransaction", 2),
+            call("trace_block", 3),
+            call("admin_peers", 4),
+            format!("[{},{}]", call("eth_blockNumber", 5), call("tn_x", 6)),
+        ];
+        for body in &bodies {
+            let (status, text) = post_rpc(gateway, None, body.clone()).await;
+            assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
+        }
+        assert_eq!(worker_seen.hits(), bodies.len());
     }
 
     /// The proxy client follows no redirect. A query upstream answering `307`

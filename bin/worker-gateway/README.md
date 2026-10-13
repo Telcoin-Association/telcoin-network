@@ -1,7 +1,7 @@
 # worker-gateway
 
 A reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
-It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
+It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*`) unchanged to a ready upstream worker, refuses the namespaces the [method policy](#method-policy) denies (`tn_*`, `debug_*`, `trace_*` and `admin_*` by default), gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
 With `--redirect-queries` it sends transaction submissions, and the few reads only the worker's pool can answer, to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
 "Unchanged" applies to the JSON-RPC body and content type of a `POST`, the only method the gateway forwards; the header contract is deliberately minimal (see Scope).
 
@@ -126,6 +126,7 @@ Every flag has an environment-variable fallback.
 | `--redirect-queries-header` | `WORKER_GATEWAY_REDIRECT_QUERIES_HEADER` | (none) | One `Name: value` header sent to the query URL only (redirected calls, the query probe and the startup chain-id check), never to a worker, and never logged; requires `--redirect-queries`; see [Query upstream header](#query-upstream-header). |
 | `--redirect-queries-header-file` | `WORKER_GATEWAY_REDIRECT_QUERIES_HEADER_FILE` | (none) | File holding the `--redirect-queries-header` line (trimmed), for a secret; requires `--redirect-queries`; not with `--redirect-queries-header`. |
 | `--recent-submission-ttl` | `WORKER_GATEWAY_RECENT_SUBMISSION_TTL` | `60s` | With `--redirect-queries`, how long lookups of a forwarded submission's hash go to the worker (`0` disables); see [Reads kept on the worker](#reads-kept-on-the-worker). |
+| `--denied-method-prefixes` | `WORKER_GATEWAY_DENIED_METHOD_PREFIXES` | `tn_,debug_,trace_,admin_` | Comma-separated method-name prefixes refused when `--redirect-queries` is unset (empty allows every method); see [Method policy](#method-policy). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--readiness-failure-threshold` | `WORKER_GATEWAY_READINESS_FAILURE_THRESHOLD` | `3` | Failed polls in a row that turn a ready upstream not-ready (at least 1); see [Readiness contract](#readiness-contract). |
@@ -501,7 +502,28 @@ The decode uses the same pooled wire format the worker's RPC accepts and never r
 - A submission with named params (`"params": {...}`) is not screened; the worker reads and validates those itself.
 - Only call objects are screened: a batch element written in positional form (a JSON array) counts as another call and is not screened.
 
-Mixed batches and every other method are forwarded unchanged and validated upstream: by the worker, or, with `--redirect-queries`, by the query URL for everything the worker does not serve.
+Mixed batches and every other method the [method policy](#method-policy) allows are forwarded unchanged and validated upstream: by the worker, or, with `--redirect-queries`, by the query URL for everything the worker does not serve.
+
+### Method policy
+
+Without `--redirect-queries` every call goes to the worker, so the gateway refuses the namespaces a validator should not serve to the public before forwarding.
+A call whose `method` starts with an entry of `--denied-method-prefixes` (default `tn_,debug_,trace_,admin_`) gets `403` / `-32011` "method not allowed through this gateway" with its request `id`, and never reaches the worker.
+The node says a validator should not expose the `tn` namespace publicly; `debug_`, `trace_` and `admin_` cover what an operator may have enabled on the worker for its own use.
+A batch that holds a refused call is refused whole, with one error object whose `id` is `null`, and no part of it is forwarded.
+The check runs after the length checks and before anything else is charged: a refused call costs only the one rate-limit token the gateway takes before reading the body, none of a batch's other tokens, and no in-flight slot.
+
+Matching is case-sensitive and anchored at the start of the name, as the worker matches method names: under `tn_`, neither `TN_info` nor `eth_tn_x` is refused, and the worker answers both as unknown methods.
+The gateway reads method names the way the worker's server does: leading whitespace, form feed included, is skipped, a name spelled with unicode escapes is unescaped before the match, and a batch element that is not an object does not hide the calls around it.
+A body that does not start with `{` or `[` once leading whitespace is skipped, or whose `method` is not a string, is forwarded, and the worker rejects it on its own.
+A batch the gateway cannot read to its end is refused as unreadable before the policy runs, with `400` / `-32600` (see [Batches](#batches)), because the worker would still run the calls around the element it cannot read.
+A single call that starts with `{` but that the gateway cannot read, such as one holding a number out of range (`1e400`) or an unpaired surrogate escape, is refused like a denied call rather than forwarded unchecked.
+The names are read in the same single pass over the body that counts, screens and routes it; with a deny list in force that pass reads every call, where it would otherwise skip a single call that names no submission or pool read, and the rest of a batch once the batch mixes submissions with other calls.
+
+Entries are separated by commas and surrounding whitespace is ignored.
+An empty value (`--denied-method-prefixes=` or an empty `WORKER_GATEWAY_DENIED_METHOD_PREFIXES`) allows every method.
+With `--redirect-queries` set the list is not applied: routing is unchanged, and the query URL decides what it serves.
+Startup logs the policy in force on the "edge protections configured" line (`method_policy`), and warns when the list is empty and no redirect is set.
+Refused calls are counted in `tn_worker_gateway_rejections_total` with reason `method_not_allowed`; they are logged at debug only, since the method is the client's choice rather than a fault the operator can fix.
 
 ## Query redirect
 
@@ -606,7 +628,7 @@ The check runs once; a query URL that changes chains later is not detected.
 - `GET /ready/any`: read availability, `200` when the gateway can serve any route, else `503`.
   It answers `200` when `/ready` would, or when `--redirect-queries` is set and the gateway's probes find the query URL up (see [Query redirect](#query-redirect)); without `--redirect-queries` it is exactly `/ready`.
   The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports and `queries` whether the query URL is up.
-- `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker, or, with `--redirect-queries`, to the query URL unless it is a submission or one of the [reads kept on the worker](#reads-kept-on-the-worker).
+- `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker unless the [method policy](#method-policy) refuses it, or, with `--redirect-queries`, to the query URL unless it is a submission or one of the [reads kept on the worker](#reads-kept-on-the-worker).
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
   On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
@@ -645,6 +667,7 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` |
 | In-flight cap reached (overloaded) | `503` | `-32009` |
 | In-flight request byte budget exhausted | `503` | `-32010` |
+| Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
 | Upstream answered an error status without a JSON body | the upstream's | `-32012` |
 
 An upstream error answer with a JSON body (`application/json` or any `+json`
@@ -737,7 +760,7 @@ then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
 by a line that names its call site (`site`) and the count it suppressed. The
 counters above still count every request, including the rejections that log
-nothing per request (`405`, `429`, `408`, `-32010` and an aborted body). The scrape also
+nothing per request (`405`, `429`, `408`, `-32010`, `-32011` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
@@ -749,7 +772,8 @@ The [production-readiness review](docs/production-readiness.md#operator-guidance
 ### Validators: always redirect queries
 
 Set `--redirect-queries` on every gateway in front of a validator.
-Without it, every read reaches the worker, including the `tn_*` calls the node says a validator should not serve publicly, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+Without it, reads reach the worker, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+The [method policy](#method-policy) refuses the `tn_*` calls the node says a validator should not serve publicly, but every other read still lands on the validator.
 Point it at an `https` public RPC for the same chain.
 
 ### Sizing for N gateways

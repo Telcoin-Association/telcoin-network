@@ -29,7 +29,9 @@
 //! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, plus the
 //! `--redirect-queries-header` header when one is configured (see
 //! [`QueryHeader`]; a worker never receives it), and has its response content
-//! type passed through only when it is JSON.
+//! type passed through only when it is JSON. Without `--redirect-queries`, a
+//! call whose method starts with a `--denied-method-prefixes` entry is refused
+//! before forwarding (see [`Scan::denied`]).
 //!
 //! Every request is classified, redirect or not: a submission counts against
 //! `--max-inflight-submissions` and everything else against
@@ -225,7 +227,9 @@ const MAX_CHAIN_ID_ANSWER_BYTES: usize = 64 * 1024;
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is neither made only of
 /// submissions nor one of the reads only the worker's pool can answer (see
-/// [`PoolRead`]), to the query upstream.
+/// [`PoolRead`]), to the query upstream. Without `--redirect-queries`, a
+/// request that calls a method `--denied-method-prefixes` denies is refused
+/// before it is charged or takes a slot (see [`Scan::denied`]).
 ///
 /// A worker forward that fails to connect, a connect timeout included, counts
 /// toward `--upstream-failure-threshold` (see
@@ -305,10 +309,16 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
 
+    // without a redirect every call would reach the worker, so the namespaces
+    // a validator should not serve publicly are refused; with one, the query
+    // upstream decides what it serves and the list is inert
+    let denied_prefixes: &[String] =
+        if state.query_upstream.is_none() { &state.denied_method_prefixes } else { &[] };
+
     // One pass over the body answers every question asked of it below: how
-    // many calls it carries, whether the transaction screen refuses it, and
-    // where it routes.
-    let scan = scan(body.as_ref(), state.max_batch_len);
+    // many calls it carries, whether the method policy or the transaction
+    // screen refuses it, and where it routes.
+    let scan = scan(body.as_ref(), state.max_batch_len, denied_prefixes);
 
     // A batch the scan could not read to its end has an unknown length: the
     // worker skips an element serde's typed readers refuse (an out-of-range
@@ -337,6 +347,16 @@ pub(crate) async fn proxy(
             );
         }
         return error_response(&GatewayError::BatchTooLong, b"");
+    }
+
+    // A call the method policy refuses is answered before the batch charge
+    // and before any slot, so it costs no more than the edge's first token. A
+    // single call gets its own id; a batch, refused whole, gets `null`. The
+    // method is the client's choice, not an operator fault, so this stays at
+    // debug; the rejection metric counts it by reason.
+    if let Some(id) = scan.denied {
+        debug!(target: "gateway::proxy", "refusing a denied method before forwarding");
+        return error_response_with_id(&GatewayError::MethodNotAllowed, id);
     }
 
     // The rate-limit layer charged one token before the body was read; a
@@ -1378,6 +1398,11 @@ struct Scan {
     /// A batch the pass could not read to its end for any reason but the
     /// length cap, so `len` is only a lower bound on its calls.
     unreadable_batch: bool,
+    /// The method policy's verdict (`--denied-method-prefixes`, in force only
+    /// without `--redirect-queries`): the id to answer
+    /// [`GatewayError::MethodNotAllowed`] with, a single call's own or `null`
+    /// for a batch, or `None` to go on.
+    denied: Option<RequestId>,
 }
 
 /// Read a request body once, counting its calls, classifying it for its
@@ -1424,6 +1449,20 @@ struct Scan {
 /// for the reads only the worker's pool can answer (see [`PoolRead`]); a
 /// batch never is, so it keeps the route its calls give it.
 ///
+/// Method policy: `denied_prefixes` is the `--denied-method-prefixes` list in
+/// force, empty with a redirect. A body is denied when any call in it, alone
+/// or anywhere in a batch, names a method that starts with one of the
+/// prefixes, matched case-sensitively from the first character as jsonrpsee
+/// matches names, after unicode escapes are decoded. A `method` that is not a
+/// string, and a batch element that is not an object, name nothing. With a
+/// list in force the pass reads every call: neither the single-call fast path
+/// nor the skip of a mixed batch's remaining elements is taken. A body that
+/// starts with `{` or `[` but that the pass cannot read (short of the length
+/// cap) is denied too: the worker's server decodes each batch element on its
+/// own and runs the calls around one it cannot decode, so an unreadable body
+/// is no proof that no denied call runs. A body that starts with anything
+/// else is refused unread by the worker's server, and is not denied.
+///
 /// Cost: one deserializer reads the body, and every member the gateway does
 /// not act on is skipped in place, so the cost is a scan of the bytes rather
 /// than a `Value` tree several times the size of the request. Keys are matched
@@ -1433,7 +1472,7 @@ struct Scan {
 /// with one more scan (see [`RequestId::recover`] and
 /// [`RequestId::recover_element`]), so a forwarded request never materializes
 /// its id, which is where all of a request's bulk can sit.
-fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
+fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>, denied_prefixes: &[String]) -> Scan {
     // the worker's server drops leading ascii whitespace, form feed included,
     // before it reads a body, where json allows only four whitespace bytes;
     // the scan reads the body the worker reads, so a prefix cannot hide a
@@ -1442,8 +1481,9 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
     let batch = is_batch(body);
     // fast path: a body that is not a batch and can name neither a
     // submission method nor a pool read is one call that routes as a query,
-    // and nothing is parsed
-    if !batch && !may_name_a_routed_method(body) {
+    // and nothing is parsed. The method policy needs every call's name, so a
+    // deny list in force turns the fast path off.
+    if !batch && denied_prefixes.is_empty() && !may_name_a_routed_method(body) {
         return Scan {
             len: 1,
             calls: Calls::Queries,
@@ -1451,14 +1491,17 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
             submitted: None,
             pool_read: None,
             unreadable_batch: false,
+            denied: None,
         };
     }
-    let mut state = ScanState::default();
+    let mut state = ScanState { denied_prefixes, ..ScanState::default() };
     let mut deserializer = body_deserializer(body);
-    let parsed = deserializer
-        .deserialize_any(ScanVisitor { state: &mut state, max_batch_len })
-        .and_then(|()| deserializer.end())
-        .is_ok();
+    // whether the visitor read the whole value is kept apart from the
+    // trailing-bytes check: only the first decides whether the method policy
+    // saw every call the worker could run
+    let read =
+        deserializer.deserialize_any(ScanVisitor { state: &mut state, max_batch_len }).is_ok();
+    let parsed = read && deserializer.end().is_ok();
     let unreadable_batch = batch && !parsed && !state.capped;
     let calls = match (state.submission, state.other) {
         (true, false) if parsed => Calls::Submissions,
@@ -1480,6 +1523,15 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
     // json value, like the verdict
     let submitted = state.submitted.filter(|_| calls == Calls::Submissions);
     let pool_read = state.pool_read.filter(|_| parsed);
+    // with a deny list in force, a body the worker's server would decode
+    // (one that starts with `{` or `[`) and that the pass could not read is
+    // denied as well; one cut short by the length cap is refused anyway. A
+    // single call answers with its own id, a batch with `null`.
+    let unread = !denied_prefixes.is_empty()
+        && !read
+        && !state.capped
+        && matches!(body.first(), Some(b'{' | b'['));
+    let denied = (state.denied || unread).then(|| RequestId::recover(body));
     Scan {
         len: if batch { state.len } else { 1 },
         calls,
@@ -1487,6 +1539,7 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
         submitted,
         pool_read,
         unreadable_batch,
+        denied,
     }
 }
 
@@ -1501,7 +1554,13 @@ fn body_deserializer(body: &[u8]) -> serde_json::Deserializer<SliceRead<'_>> {
 /// What a [`ScanVisitor`] pass has met so far. It lives outside the visitor
 /// so [`scan`] can still read it after an error ends the pass early.
 #[derive(Debug, Default)]
-struct ScanState {
+struct ScanState<'p> {
+    /// The method policy's prefixes, empty when no policy is in force (a
+    /// redirect, or an empty `--denied-method-prefixes`).
+    denied_prefixes: &'p [String],
+    /// A call read so far names a method that starts with one of
+    /// `denied_prefixes`.
+    denied: bool,
     /// Calls read so far: 1 for a single call, the elements read for a batch.
     len: usize,
     /// The length cap, not a reader, ended the pass.
@@ -1520,14 +1579,20 @@ struct ScanState {
     pool_read: Option<PoolRead>,
 }
 
-impl ScanState {
-    /// Record one call by its method.
-    fn record(&mut self, method: RpcMethod) {
-        if method.is_submission() {
+impl ScanState<'_> {
+    /// Record one call by its method, and whether the method policy denies
+    /// it.
+    fn record(&mut self, call: &Call<'_>) {
+        if call.method.is_submission() {
             self.submission = true;
         } else {
             self.other = true;
         }
+        let prefixes = self.denied_prefixes;
+        self.denied |= call
+            .name
+            .as_deref()
+            .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix.as_str())));
     }
 
     /// Record one batch element; one that is not an object counts as another
@@ -1536,7 +1601,7 @@ impl ScanState {
     fn record_element(&mut self, element: Element<'_>) {
         match element {
             Element::Call(call) => {
-                self.record(call.method);
+                self.record(&call);
                 if !self.other && self.rejection.is_none() {
                     self.rejection = call.screen().err().map(|err| (err, Some(self.len)));
                 }
@@ -1549,6 +1614,13 @@ impl ScanState {
     fn is_mixed(&self) -> bool {
         self.submission && self.other
     }
+
+    /// Whether the rest of a batch can be skipped unread: the calls read so
+    /// far settle its route (it is mixed), and no method policy needs the
+    /// names of the calls still to come.
+    fn can_skip_the_rest(&self) -> bool {
+        self.is_mixed() && self.denied_prefixes.is_empty()
+    }
 }
 
 /// Visitor behind [`scan`]: a single call or a batch of calls.
@@ -1557,14 +1629,14 @@ impl ScanState {
 /// (the batch is over the length cap); otherwise the body is not well-formed
 /// JSON or holds a value serde's typed readers refuse. [`scan`] reads what the
 /// state recorded either way.
-struct ScanVisitor<'s> {
+struct ScanVisitor<'s, 'p> {
     /// Where the pass records what it has met.
-    state: &'s mut ScanState,
+    state: &'s mut ScanState<'p>,
     /// The length cap a batch count stops one past, or `None` for no cap.
     max_batch_len: Option<NonZeroUsize>,
 }
 
-impl<'de> Visitor<'de> for ScanVisitor<'_> {
+impl<'de> Visitor<'de> for ScanVisitor<'_, '_> {
     type Value = ();
 
     fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1576,7 +1648,7 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
         let call = Call::read(members)?;
         self.state.len = 1;
-        self.state.record(call.method);
+        self.state.record(&call);
         match call.screen() {
             Ok(tx) => {
                 self.state.submitted = tx
@@ -1591,12 +1663,13 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
 
     /// A batch: counted and classified element by element. Once the batch is
     /// known to be mixed its route is settled, and the rest of it is only
-    /// counted, each element skipped in place. The count stops one past the
+    /// counted, each element skipped in place, unless a method policy is in
+    /// force, which reads every call's name. The count stops one past the
     /// length cap, which ends the scan.
     fn visit_seq<A: SeqAccess<'de>>(self, mut elements: A) -> Result<Self::Value, A::Error> {
         let Self { state, max_batch_len } = self;
         loop {
-            let read = if state.is_mixed() {
+            let read = if state.can_skip_the_rest() {
                 elements.next_element::<IgnoredAny>()?.is_some()
             } else {
                 elements
@@ -1620,6 +1693,11 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
 struct Call<'de> {
     /// The call's `method`.
     method: RpcMethod,
+    /// The call's `method` as the worker reads it, unicode escapes decoded,
+    /// when it is a string: borrowed from the body unless it is written with
+    /// escapes. Only the method policy reads the name (see
+    /// [`ScanState::record`]).
+    name: Option<Cow<'de, str>>,
     /// The first element of `params` when it has a shape the worker reads as
     /// bytes: the raw transaction, if the call is a submission, or the hash,
     /// if it is a lookup by hash.
@@ -1637,12 +1715,14 @@ impl<'de> Call<'de> {
     /// so such a call is an invalid request at either upstream; the choice
     /// only decides which one says so.
     fn read<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
-        let mut call = Self { method: RpcMethod::Other, raw_transaction: None, pending: false };
+        let mut call =
+            Self { method: RpcMethod::Other, name: None, raw_transaction: None, pending: false };
         while let Some(member) = members.next_key::<Member>()? {
             match member {
                 Member::Method => {
-                    call.method =
-                        RpcMethod::named(members.next_value::<MaybeStr<'de>>()?.0.as_deref());
+                    let name = members.next_value::<MaybeStr<'de>>()?.0;
+                    call.method = RpcMethod::named(name.as_deref());
+                    call.name = name;
                 }
                 Member::Params => {
                     let params = members.next_value::<LeadingParams<'de>>()?;
@@ -2150,6 +2230,20 @@ mod tests {
     /// [`body_deserializer`]).
     pub(super) fn count_parse() {
         PARSES.with(|parses| parses.set(parses.get() + 1));
+    }
+
+    /// [`super::scan`] with no method policy in force, as a gateway with
+    /// `--redirect-queries` or an empty `--denied-method-prefixes` reads a
+    /// body. The tests that count, route and screen bodies ask nothing of the
+    /// policy; the policy's own tests go through [`calls_denied_method`].
+    fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
+        super::scan(body, max_batch_len, &[])
+    }
+
+    /// Whether the method policy refuses a body under `prefixes`, from the one
+    /// pass that also counts, routes and screens it.
+    fn calls_denied_method(body: &[u8], prefixes: &[String]) -> bool {
+        super::scan(body, None, prefixes).denied.is_some()
     }
 
     /// The screen's verdict on a body, from the one pass that also routes it.
@@ -2818,6 +2912,7 @@ mod tests {
             query_upstream: Some(query_url),
             query_header: None,
             recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
             submission_slots: inflight_slots(0),
@@ -3436,6 +3531,113 @@ mod tests {
         ] {
             assert!(!submission_accepted(answer.as_bytes()), "{answer}");
         }
+    }
+
+    /// The shipped `--denied-method-prefixes` default, as the CLI resolves it.
+    fn default_denied() -> Vec<String> {
+        crate::cli::DEFAULT_DENIED_METHOD_PREFIXES.split(',').map(String::from).collect()
+    }
+
+    #[test]
+    fn prefix_match_is_case_sensitive_and_anchored() {
+        let prefixes = default_denied();
+        for method in ["tn_getStuff", "debug_traceTransaction", "trace_block", "admin_peers", "tn_"]
+        {
+            assert!(calls_denied_method(call(method).as_bytes(), &prefixes), "{method}");
+        }
+        for method in [
+            "TN_x",
+            "Tn_getStuff",
+            "DEBUG_traceTransaction",
+            "xtn_",
+            "eth_tn_x",
+            " tn_x",
+            "tn",
+            "eth_call",
+            "net_version",
+        ] {
+            assert!(!calls_denied_method(call(method).as_bytes(), &prefixes), "{method:?}");
+        }
+    }
+
+    /// The worker's server unescapes method names and runs every call object in
+    /// a batch around the elements it cannot read, so the scan has to as well.
+    #[test]
+    fn denied_call_is_found_behind_escapes_and_junk_elements() {
+        let prefixes = default_denied();
+        let denied = call("tn_getStuff");
+        let deep = format!("{}{}", "[".repeat(512), "]".repeat(512));
+        for body in [
+            r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
+            format!("[1,{denied}]"),
+            format!(r#"["tn_x",null,true,1.5,{{"method":7}},{denied}]"#),
+            format!("[{deep},{denied}]"),
+            format!(r#"[{{"params":{deep},"method":"eth_call"}},{denied}]"#),
+            format!("[{denied},{}]", call("eth_call")),
+            // the worker's server skips a leading form feed; serde_json does not
+            format!("\x0C{denied}"),
+            format!(" \x0C\n[{denied}]"),
+            // an element the worker answers as an invalid request does not
+            // hide the calls around it, wherever it sits
+            format!(r#"["\ud800",{denied}]"#),
+            format!(r#"[{denied},{{"\ud800":1}}]"#),
+            format!(r#"[{{"method":"\ud800"}},{denied}]"#),
+            format!("[{denied},1e999]"),
+            format!(r#"[{{"method":-1e400}},{denied}]"#),
+            format!("[{denied},{}]", "9".repeat(400)),
+        ] {
+            assert!(calls_denied_method(body.as_bytes(), &prefixes), "{body}");
+        }
+        // nothing the worker could run as a denied call is refused
+        for body in [
+            "not json, tn_getStuff".to_string(),
+            r#"{"method":["tn_x"],"id":1}"#.to_string(),
+            r#""tn_x""#.to_string(),
+            "[]".to_string(),
+            r#"{"jsonrpc":"2.0","method":"eth_call","params":["tn_x"],"id":1}"#.to_string(),
+            format!("[{deep}]"),
+            format!("[{},{}]", call("eth_call"), call("eth_blockNumber")),
+        ] {
+            assert!(!calls_denied_method(body.as_bytes(), &prefixes), "{body}");
+        }
+        assert!(!calls_denied_method(denied.as_bytes(), &[]), "an empty list denies nothing");
+    }
+
+    /// The method policy reads every call in the one pass that counts, routes
+    /// and screens a body: a deny list in force turns off the fast path for a
+    /// single call naming no routed method and the skip of a mixed batch's
+    /// remaining elements, each of which would otherwise hide a denied call,
+    /// and the body is still parsed once. A single call is refused with its
+    /// own id, a batch with `null`.
+    #[test]
+    fn deny_list_turns_off_both_scan_shortcuts() {
+        let prefixes = default_denied();
+        let submission =
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0x00"],"id":1}"#;
+        let mixed = format!("[{submission},{},{}]", call("eth_call"), call("tn_getStuff"));
+        let single = call("tn_getStuff");
+        let unreadable = r#"{"jsonrpc":"2.0","method":"eth_call","params":[1e999],"id":1}"#;
+        for body in [single.as_str(), unreadable] {
+            assert!(!may_name_a_routed_method(body.as_bytes()), "the fast path takes {body}");
+        }
+
+        for (body, id) in [
+            (mixed.as_str(), Value::Null),
+            (single.as_str(), serde_json::json!(1)),
+            (unreadable, serde_json::json!(1)),
+        ] {
+            PARSES.with(|parses| parses.set(0));
+            let denied = super::scan(body.as_bytes(), None, &prefixes);
+            assert_eq!(PARSES.with(Cell::get), 1, "one deserializer per body: {body}");
+            assert_eq!(denied.denied, Some(RequestId::from_id(id)), "{body}");
+
+            PARSES.with(|parses| parses.set(0));
+            let allowed = scan(body.as_bytes(), None);
+            assert!(PARSES.with(Cell::get) <= 1, "{body}");
+            assert_eq!(allowed.denied, None, "{body}");
+            assert_eq!((denied.len, denied.calls), (allowed.len, allowed.calls), "{body}");
+        }
+        assert_eq!(super::scan(mixed.as_bytes(), None, &prefixes).calls, Calls::MixedBatch);
     }
 
     /// `use_rustls_tls` exists only when a rustls feature is enabled on

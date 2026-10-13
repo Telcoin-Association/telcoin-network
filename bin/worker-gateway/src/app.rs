@@ -60,6 +60,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         query_upstream,
         query_header,
         recent_submission_ttl,
+        denied_method_prefixes,
         readiness_poll_interval,
         readiness_poll_timeout,
         readiness_failure_threshold,
@@ -133,6 +134,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
              --max-connections-per-ip; list only the fronts' own addresses"
         );
     }
+    // the method policy applies only without a redirect, and an empty list
+    // (an empty or unset-in-template env var included) turns it off; say which
+    let method_policy = if query_upstream.is_some() {
+        String::from("off (--redirect-queries is set)")
+    } else if denied_method_prefixes.is_empty() {
+        String::from("off (--denied-method-prefixes is empty)")
+    } else {
+        format!("deny {}", denied_method_prefixes.join(","))
+    };
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
@@ -151,6 +161,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         ?max_connection_duration,
         ?dns_cache_ttl,
         %max_concurrent_dns_lookups,
+        %method_policy,
         "edge protections configured"
     );
     if let Some(idle_heads) =
@@ -164,6 +175,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
              byte budget until the request deadline by sending only their headers, and every \
              other request body is then refused; raise --max-inflight-request-bytes, or lower \
              --max-request-bytes or --max-connections"
+        );
+    }
+    if query_upstream.is_none() && denied_method_prefixes.is_empty() {
+        warn!(
+            target: "gateway",
+            "method policy is off: --denied-method-prefixes is empty and --redirect-queries is \
+             unset, so every method, tn_* included, reaches the worker"
         );
     }
 
@@ -228,6 +246,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         query_upstream,
         query_header,
         recent_submissions,
+        denied_method_prefixes: denied_method_prefixes.into(),
         max_batch_len,
         query_request_timeout,
         submission_slots: inflight_slots(max_inflight_submissions),
@@ -764,6 +783,7 @@ mod tests {
             query_upstream: query,
             query_header,
             recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
             max_batch_len: None,
             query_request_timeout: None,
             submission_slots: inflight_slots(0),

@@ -54,6 +54,9 @@ mod code {
     /// The request did not fit in what is left of the gateway's in-flight
     /// request-byte budget (`--max-inflight-request-bytes`).
     pub(super) const INFLIGHT_BYTES_EXHAUSTED: i32 = -32010;
+    /// The request calls a method the gateway refuses to forward
+    /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
+    pub(super) const METHOD_NOT_ALLOWED: i32 = -32011;
     /// The upstream answered with an error status and a body that is not
     /// JSON (a worker's `429` text/plain, for example).
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
@@ -105,6 +108,9 @@ pub(crate) enum GatewayError {
     /// The request's body bytes did not fit in what is left of the in-flight
     /// request-byte budget, so it was refused before its body was read.
     InflightBytesExhausted,
+    /// The request calls a method whose name starts with a denied prefix
+    /// (`--denied-method-prefixes`, applied when `--redirect-queries` is unset).
+    MethodNotAllowed,
     /// The request body could not be read (e.g. the client aborted mid-body).
     /// Also answers a batch the gateway cannot read to its end, whose length,
     /// and so its cost, is unknown.
@@ -141,6 +147,7 @@ impl GatewayError {
                 StatusCode::BAD_REQUEST
             }
             Self::InflightBytesExhausted => StatusCode::SERVICE_UNAVAILABLE,
+            Self::MethodNotAllowed => StatusCode::FORBIDDEN,
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamError { status } => *status,
@@ -161,6 +168,7 @@ impl GatewayError {
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
+            Self::MethodNotAllowed => code::METHOD_NOT_ALLOWED,
             Self::UnreadableBody | Self::NonPostMethod => code::INVALID_REQUEST,
             Self::Overloaded => code::OVERLOADED,
             Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
@@ -204,6 +212,7 @@ impl GatewayError {
             Self::InflightBytesExhausted => {
                 "gateway is holding too many request bytes; retry shortly"
             }
+            Self::MethodNotAllowed => "method not allowed through this gateway",
             Self::UnreadableBody => "request body could not be read",
             Self::Overloaded => "gateway overloaded; retry later",
             Self::UpstreamError { status } => {
@@ -232,6 +241,7 @@ impl GatewayError {
             Self::InvalidTransaction => "invalid_transaction",
             Self::UnsupportedTransactionType(_) => "unsupported_transaction_type",
             Self::InflightBytesExhausted => "inflight_bytes_exhausted",
+            Self::MethodNotAllowed => "method_not_allowed",
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
             Self::UpstreamError { .. } => "upstream_error",
@@ -651,6 +661,7 @@ mod tests {
         assert_eq!(GatewayError::UnsupportedTransactionType(4).code(), -32008);
         assert_eq!(GatewayError::Overloaded.code(), -32009);
         assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
+        assert_eq!(GatewayError::MethodNotAllowed.code(), -32011);
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
         assert_eq!(GatewayError::NonPostMethod.code(), -32600);
     }
@@ -742,6 +753,7 @@ mod tests {
             "unsupported_transaction_type"
         );
         assert_eq!(GatewayError::InflightBytesExhausted.reason(), "inflight_bytes_exhausted");
+        assert_eq!(GatewayError::MethodNotAllowed.reason(), "method_not_allowed");
         assert_eq!(GatewayError::UnreadableBody.reason(), "unreadable_body");
         assert_eq!(GatewayError::Overloaded.reason(), "overloaded");
         assert_eq!(
@@ -808,5 +820,27 @@ mod tests {
         assert_eq!(err.code(), -32600);
         assert_eq!(err.message(), "only POST is accepted");
         assert_eq!(err.reason(), "method_not_post");
+    }
+
+    #[tokio::test]
+    async fn method_not_allowed_code_and_reason_are_stable() {
+        // code, status, message and reason are the client and metrics contract
+        // for a refused method; pin all four, end to end through the renderer
+        let err = GatewayError::MethodNotAllowed;
+        assert_eq!(err.code(), -32011);
+        assert_eq!(err.reason(), "method_not_allowed");
+
+        let response = error_response(&err, br#"{"jsonrpc":"2.0","method":"tn_x","id":"q-1"}"#);
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("body");
+        let body: Value = serde_json::from_slice(&bytes).expect("json");
+        assert_eq!(
+            body,
+            json!({
+                "jsonrpc": "2.0",
+                "error": { "code": -32011, "message": "method not allowed through this gateway" },
+                "id": "q-1",
+            })
+        );
     }
 }
