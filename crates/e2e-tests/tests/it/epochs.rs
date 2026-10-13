@@ -136,7 +136,7 @@ async fn test_epoch_boundary_inner(
         let mut result = provider.get_chain_id().await;
         while let Err(e) = result {
             debug!(target: "epoch-test", "provider error getting chain id: {e:?}");
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
             // make next request
             result = provider.get_chain_id().await;
@@ -779,7 +779,7 @@ async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
     // Guard ensures processes are killed on drop (normal return, error, or panic).
     let mut guard = ProcessGuard::new(procs);
 
-    test_epoch_sync_inner(
+    let epochs = test_epoch_sync_inner(
         &mut guard,
         2,
         &[("validator-3", Address::from_slice(&[0x33; 20]))],
@@ -788,7 +788,9 @@ async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
         test,
         &mut endpoints,
     )
-    .await
+    .await?;
+    guard.finish();
+    Ok(epochs)
 }
 
 #[ignore = "only run independently from all other it tests"]
@@ -824,10 +826,18 @@ async fn test_epoch_boundary() -> eyre::Result<()> {
     committee.push((NEW_VALIDATOR, new_validator.address()));
     let (procs, endpoints) = start_nodes(temp_path, &committee, "epoch_boundary", 1)?;
     // Guard ensures processes are killed on drop (normal return, error, or panic).
-    let _guard = ProcessGuard::new(procs);
+    let mut guard = ProcessGuard::new(procs);
 
-    test_epoch_boundary_inner(genesis, governance_wallet, temp_path, &mut new_validator, &endpoints)
-        .await
+    test_epoch_boundary_inner(
+        genesis,
+        governance_wallet,
+        temp_path,
+        &mut new_validator,
+        &endpoints,
+    )
+    .await?;
+    guard.finish();
+    Ok(())
 }
 
 /// Submit a governance update to `WorkerConfigs` and wait for its transaction to confirm.
@@ -1075,7 +1085,7 @@ async fn test_epoch_observer_forwards_to_second_worker() -> eyre::Result<()> {
         .await?
         .ok_or_else(|| eyre::eyre!("forwarded transaction receipt disappeared"))?;
     eyre::ensure!(receipt.status(), "forwarded transaction reverted");
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -1303,7 +1313,7 @@ async fn test_epoch_worker_count_changes_keep_nodes_running() -> eyre::Result<()
         })
     })?;
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
@@ -1540,7 +1550,7 @@ async fn test_epoch_subsecond_timestamps_across_fork() -> eyre::Result<()> {
     let commits = assert_consensus_commit_times(&headers)?;
     assert_blocks_match_consensus(&served[0], &commits)?;
 
-    guard.kill_all();
+    guard.finish();
     Ok(())
 }
 
