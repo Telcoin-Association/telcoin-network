@@ -50,13 +50,23 @@ const BATCH_TRANSACTIONS_BUCKETS: &[f64] =
 
 /// Buckets for `tn_executor_output_batches`, the batch count of one consensus output.
 ///
-/// The layout is sized for one full certificate from each authority of a 100-authority
-/// committee: 100 * [`tn_types::MAX_HEADER_NUM_OF_BATCHES`] (10) = 1,000 batches. These are the
+/// One output is one committed Bullshark sub-DAG, and a steady-state sub-DAG holds about two
+/// certificates per authority, not one. With `n` authorities, full connectivity and no skipped
+/// leader, each leader commit orders the leader, the `n` certificates of the round below it, and
+/// the `n - 1` non-leader certificates of the previous leader's round, which that leader did not
+/// cover: 1 + n + (n - 1) = 2n certificates. The consensus tests encode this: three leaders with
+/// n = 4 commit 5 + 8 + 8 = 21 certificates.
+///
+/// The layout is sized for a 50-authority committee at full headers: 50 authorities * 2
+/// certificates * [`tn_types::MAX_HEADER_NUM_OF_BATCHES`] (10) = 1,000 batches. These are the
 /// same bounds as before #1511, so this series keeps its `le` label set across the upgrade.
 ///
-/// A larger committee or a higher `MAX_HEADER_NUM_OF_BATCHES` puts samples in `+Inf` and needs a
-/// new layout. `_sum` and `_count` stay exact. `test_output_buckets_cover_sizing_committee` fails
-/// when `MAX_HEADER_NUM_OF_BATCHES` grows past this layout.
+/// A larger committee, a deeper sub-DAG after a skipped leader, or a higher
+/// `MAX_HEADER_NUM_OF_BATCHES` puts samples in `+Inf` and needs a new layout. The only hard bound
+/// on one output is the GC horizon, `committee.size() * MAX_GC_DEPTH * MAX_HEADER_NUM_OF_BATCHES`
+/// batches, which is too loose to size buckets from. `_sum` and `_count` stay exact.
+/// `test_output_buckets_cover_sizing_committee` fails when `MAX_HEADER_NUM_OF_BATCHES` grows past
+/// this layout.
 const OUTPUT_BATCHES_BUCKETS: &[f64] =
     &[1.0, 2.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1_000.0];
 
@@ -64,11 +74,10 @@ const OUTPUT_BATCHES_BUCKETS: &[f64] =
 ///
 /// An output sums the batches of every certificate in the committed sub-DAG. It can hold every
 /// batch that [`OUTPUT_BATCHES_BUCKETS`] covers, and each batch can hold up to
-/// `max_batch_gas(epoch) / 21_000` transactions. The top bucket is therefore at or above the
-/// committee size times the batches per certificate times the per-batch maximum:
-/// 1,000 * 1,428 = 1,428,000. An output whose batch count lands in a finite batches bucket also
-/// lands in a finite transactions bucket. `test_output_buckets_cover_sizing_committee` fails when
-/// that stops being true.
+/// `max_batch_gas(epoch) / 21_000` transactions. The top bucket is therefore at or above the top
+/// batches bucket times the per-batch maximum: 1,000 * 1,428 = 1,428,000. An output whose batch
+/// count lands in a finite batches bucket also lands in a finite transactions bucket.
+/// `test_output_buckets_cover_sizing_committee` fails when that stops being true.
 const OUTPUT_TRANSACTIONS_BUCKETS: &[f64] = &[
     1.0,
     2.0,
@@ -230,7 +239,12 @@ mod tests {
     const MIN_TRANSACTION_GAS: u64 = 21_000;
 
     /// Committee size that the executor output buckets are sized for.
-    const SIZING_COMMITTEE_SIZE: usize = 100;
+    const SIZING_COMMITTEE_SIZE: usize = 50;
+
+    /// Certificates that one steady-state consensus output commits per authority. A leader is
+    /// elected every two rounds and its sub-DAG orders the two rounds since the previous leader,
+    /// so about two per authority. The arithmetic is on [`OUTPUT_BATCHES_BUCKETS`].
+    const CERTIFICATES_PER_AUTHORITY_PER_OUTPUT: usize = 2;
 
     /// Epochs to check the batch gas cap at. A fork that raises the cap shows at the last epoch.
     const SIZING_EPOCHS: [Epoch; 2] = [0, Epoch::MAX];
@@ -309,15 +323,18 @@ mod tests {
         });
     }
 
-    /// The executor output layouts must cover the sizing committee: one full certificate per
-    /// authority for the batch count, and a full batch for each covered batch for the
+    /// The executor output layouts must cover the sizing committee: a steady-state sub-DAG of
+    /// full certificates for the batch count, and a full batch for each covered batch for the
     /// transaction count.
     #[test]
     fn test_output_buckets_cover_sizing_committee() {
-        let sizing_batches =
-            u32::try_from(SIZING_COMMITTEE_SIZE.saturating_mul(MAX_HEADER_NUM_OF_BATCHES))
-                .map(f64::from)
-                .expect("sizing batch count fits in u32");
+        let sizing_batches = u32::try_from(
+            SIZING_COMMITTEE_SIZE
+                .saturating_mul(CERTIFICATES_PER_AUTHORITY_PER_OUTPUT)
+                .saturating_mul(MAX_HEADER_NUM_OF_BATCHES),
+        )
+        .map(f64::from)
+        .expect("sizing batch count fits in u32");
         let top_batches = top_bucket(OUTPUT_BATCHES_BUCKETS);
         assert!(
             top_batches >= sizing_batches,
