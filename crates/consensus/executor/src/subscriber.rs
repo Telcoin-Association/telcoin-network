@@ -15,8 +15,8 @@ use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusOutput, ConsensusResult, Database, Epoch, Hash as _, Noticer, Round, TaskManager,
-    TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
+    ConsensusOutput, ConsensusResult, Database, Epoch, EpochRecord, Hash as _, Noticer, Round,
+    TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -36,6 +36,22 @@ const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
 /// older than this is a stale record (for example one loaded at restart) and must not promote a
 /// node that has not caught up.
 const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Only an output from this subscriber's still-open epoch can establish rejoin readiness.
+/// Future outputs are ignored by `handle_sync_output`, and finalized epochs must be replayed
+/// through their boundary even if their final headers are recent. The synthetic epoch-zero
+/// record has no final consensus block and does not mark that epoch as closed.
+fn rejoin_epoch_is_open(
+    current_epoch: Epoch,
+    output_epoch: Epoch,
+    latest_record: Option<&EpochRecord>,
+) -> bool {
+    output_epoch == current_epoch
+        && latest_record.is_none_or(|record| {
+            record.epoch < current_epoch
+                || (record.epoch == 0 && record.final_consensus.number == 0)
+        })
+}
 
 /// True when a catching-up CVV is close enough to the network head to rejoin consensus.
 ///
@@ -244,6 +260,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
+    /// Keep replaying finalized epochs even when their final headers still count as fresh.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing outputs so we don't miss them.
         let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
@@ -261,6 +278,15 @@ impl<DB: Database> Subscriber<DB> {
             let handled_epoch = output.sub_dag().leader_epoch();
             let handled_round = output.leader_round();
             self.handle_sync_output(output).await?;
+            // A recent header can belong to an epoch that has already closed. Activating there
+            // stops replay before its boundary, leaving this node proposing to peers in the next
+            // epoch until it is demoted again. Apply the output, but keep following consensus.
+            let latest_record = self.inner.consensus_chain.epochs().latest_record().await;
+            let epoch_is_open = rejoin_epoch_is_open(
+                self.inner.committee.epoch(),
+                handled_epoch,
+                latest_record.as_ref(),
+            );
             if let Some(last_consensus_header) =
                 self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
@@ -271,14 +297,16 @@ impl<DB: Database> Subscriber<DB> {
                 // away. a pre-fork commit time is whole seconds, and there this equals comparing
                 // whole seconds against the clock rounded down to the second
                 let newest_round = last_consensus_header.sub_dag.leader_round();
-                if rejoin_ready(
-                    handled_epoch,
-                    handled_round,
-                    last_consensus_header.sub_dag.leader_epoch(),
-                    newest_round,
-                    last_consensus_header.sub_dag.commit_timestamp_ms().elapsed(),
-                    rejoin_window,
-                ) {
+                if epoch_is_open
+                    && rejoin_ready(
+                        handled_epoch,
+                        handled_round,
+                        last_consensus_header.sub_dag.leader_epoch(),
+                        newest_round,
+                        last_consensus_header.sub_dag.commit_timestamp_ms().elapsed(),
+                        rejoin_window,
+                    )
+                {
                     // We are caught up enough so try to jump back into consensus
                     info!(
                         target: "subscriber",
@@ -1469,6 +1497,38 @@ mod rejoin_tests {
             !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window),
             "a node in an older epoch must not rejoin"
         );
+    }
+
+    /// An ignored future output cannot promote the subscriber still closing an older epoch,
+    /// even when that output matches the fresh network head exactly.
+    #[test]
+    fn no_rejoin_on_ignored_future_output() {
+        assert!(
+            !rejoin_epoch_is_open(EPOCH, EPOCH + 1, None),
+            "an ignored future output must not activate the subscriber in its older epoch"
+        );
+    }
+
+    /// A finalized record closes that epoch and older epochs, while genesis and the epoch after
+    /// the finalized tip remain eligible for the normal freshness and round-gap checks.
+    #[test]
+    fn rejoin_epoch_respects_finalized_tip() {
+        let finalized = EpochRecord {
+            epoch: EPOCH,
+            final_consensus: tn_types::ConsensusNumHash::new(1, Default::default()),
+            ..Default::default()
+        };
+        assert!(
+            !rejoin_epoch_is_open(EPOCH, EPOCH, Some(&finalized)),
+            "a fresh header from a finalized epoch must not stop catch-up"
+        );
+        let older = EPOCH.saturating_sub(1);
+        assert!(!rejoin_epoch_is_open(older, older, Some(&finalized)));
+        assert!(rejoin_epoch_is_open(EPOCH + 1, EPOCH + 1, Some(&finalized)));
+        assert!(rejoin_epoch_is_open(0, 0, None));
+        assert!(rejoin_epoch_is_open(0, 0, Some(&EpochRecord::default())));
+        let finalized_zero = EpochRecord { epoch: 0, ..finalized };
+        assert!(!rejoin_epoch_is_open(0, 0, Some(&finalized_zero)));
     }
 
     /// A handled output ahead of the newest known header has a gap of zero.
