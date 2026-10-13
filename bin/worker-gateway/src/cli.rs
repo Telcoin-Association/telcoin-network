@@ -8,6 +8,7 @@ use std::{
     time::Duration,
 };
 
+use axum::http::HeaderValue;
 use clap::Parser;
 use eyre::WrapErr as _;
 use reqwest::{Certificate, Identity};
@@ -19,6 +20,7 @@ use crate::{
     identity::TrustedProxies,
     proxy::{QueryHeader, UpstreamOrigin},
     ratelimit::{PrefixLen, PrefixPolicy, RateLimit},
+    server::CorsOrigins,
 };
 
 /// The `--denied-method-prefixes` default: the `tn` namespace, which the node
@@ -543,6 +545,15 @@ pub(crate) struct Cli {
     #[arg(long = "metrics", env = "WORKER_GATEWAY_METRICS_ADDR")]
     pub(crate) metrics_addr: Option<SocketAddr>,
 
+    /// Browser origins allowed to call the gateway cross-origin (CORS): a
+    /// comma-separated list of `http` or `https` origins written as
+    /// `scheme://host[:port]` with no path, or `*` alone for any origin. Unset
+    /// (the default) leaves CORS off and no CORS header is ever added. When
+    /// set, the gateway answers every preflight `OPTIONS` itself, never
+    /// forwarding it, and allows `POST` with a `Content-Type` header.
+    #[arg(long, env = "WORKER_GATEWAY_CORS_ALLOWED_ORIGINS")]
+    pub(crate) cors_allowed_origins: Option<String>,
+
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
@@ -652,6 +663,9 @@ pub(crate) struct Settings {
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
     /// metrics are disabled.
     pub(crate) metrics_addr: Option<SocketAddr>,
+    /// Origins allowed to call the gateway cross-origin, or `None` when CORS is
+    /// off.
+    pub(crate) cors_allowed_origins: Option<CorsOrigins>,
 }
 
 impl Cli {
@@ -832,6 +846,8 @@ impl Cli {
             humantime::format_duration(self.shutdown_delay),
             humantime::format_duration(MAX_SHUTDOWN_DELAY),
         );
+        let cors_allowed_origins =
+            self.cors_allowed_origins.as_deref().map(resolve_cors_origins).transpose()?;
         Ok(Settings {
             listen_addr: self.listen_addr,
             probe_addr: self.probe_addr,
@@ -874,6 +890,7 @@ impl Cli {
             shutdown_delay: self.shutdown_delay,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
+            cors_allowed_origins,
         })
     }
 
@@ -1028,6 +1045,65 @@ fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
                 .map_err(|err| eyre::eyre!("invalid --rate-limit-per-ip-v6-prefix: {err}"))
                 .map(|v6| PrefixPolicy::new(v4, v6))
         })
+}
+
+/// Validate `--cors-allowed-origins` into [`CorsOrigins`]: `*` alone allows any
+/// origin; otherwise every comma-separated entry, trimmed, must be an origin
+/// [`parse_cors_origin`] accepts. An empty entry, and a `*` beside other
+/// entries, are errors rather than silently dropped or widened: both are typos
+/// whose intent is unclear. Errors name the entry by its 1-based position, not
+/// its text, since an origin list can be long.
+fn resolve_cors_origins(value: &str) -> eyre::Result<CorsOrigins> {
+    let entries: Vec<&str> = value.split(',').map(str::trim).collect();
+    if entries == ["*"] {
+        return Ok(CorsOrigins::Any);
+    }
+    entries
+        .iter()
+        .zip(1..)
+        .map(|(entry, position)| {
+            eyre::ensure!(
+                !entry.is_empty(),
+                "invalid --cors-allowed-origins: entry {position} is empty"
+            );
+            eyre::ensure!(
+                *entry != "*",
+                "invalid --cors-allowed-origins: entry {position} is `*`, which must be the only \
+                 entry"
+            );
+            parse_cors_origin(entry).ok_or_else(|| {
+                eyre::eyre!(
+                    "invalid --cors-allowed-origins: entry {position} is not an http or https \
+                     origin of the form scheme://host[:port] with no path, query, fragment or \
+                     credentials"
+                )
+            })
+        })
+        .collect::<eyre::Result<Vec<_>>>()
+        .map(CorsOrigins::List)
+}
+
+/// Parse one `--cors-allowed-origins` entry into the `Origin` value a browser
+/// sends for it, or `None` when it is not an `http` or `https`
+/// `scheme://host[:port]`. The result is the origin's serialization (lowercase
+/// scheme and host, punycode, default port dropped), since the CORS layer
+/// compares it byte for byte with the request's `Origin`.
+fn parse_cors_origin(entry: &str) -> Option<HeaderValue> {
+    // the url parser turns a bare origin into one with path `/`, hiding a
+    // trailing slash, treats `\` like `/` for http and https, and silently
+    // drops tab, LF and CR, so anything past the authority (and userinfo), a
+    // backslash and any control character are rejected on the raw text
+    let (_, authority) = entry.split_once("://")?;
+    if authority.contains(['/', '\\', '?', '#', '@'])
+        || authority.chars().any(|c| c.is_ascii_control())
+    {
+        return None;
+    }
+    let url = Url::parse(entry).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    HeaderValue::from_str(&url.origin().ascii_serialization()).ok()
 }
 
 /// Reject a worker RPC or readiness URL whose scheme is neither `http` nor
@@ -2305,5 +2381,70 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn cors_origins_parse_to_the_form_browsers_send() -> eyre::Result<()> {
+        assert_eq!(cli_with_flags(&[]).into_settings()?.cors_allowed_origins, None);
+
+        let any = cli_with_flags(&["--cors-allowed-origins= * "]).into_settings()?;
+        assert_eq!(any.cors_allowed_origins, Some(CorsOrigins::Any));
+
+        // lowercase, punycode, no default port: what a browser puts in `Origin`
+        let list = cli_with_flags(&[
+            "--cors-allowed-origins=https://App.Example.com:443, http://127.0.0.1:3000,\
+             http://[::1]:8080,https://b\u{fc}cher.example",
+        ])
+        .into_settings()?;
+        let expected = [
+            "https://app.example.com",
+            "http://127.0.0.1:3000",
+            "http://[::1]:8080",
+            "https://xn--bcher-kva.example",
+        ];
+        assert_eq!(
+            list.cors_allowed_origins,
+            Some(CorsOrigins::List(expected.into_iter().map(HeaderValue::from_static).collect()))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_origin_is_rejected_at_startup() {
+        // each bad entry sits at the given 1-based position behind good ones
+        let good = "https://ok.example";
+        for (list, position) in [
+            ("https://bad.example/".to_string(), 1),
+            (format!("{good},https://bad.example/path"), 2),
+            (format!("{good},{good},https://bad.example?key=1"), 3),
+            (format!("{good},https://bad.example#frag"), 2),
+            (format!("{good},https://user:pw@bad.example"), 2),
+            (format!("{good},https://bad.example\\path"), 2),
+            (format!("{good},https://bad.example\\"), 2),
+            (format!("{good},https://\\bad.example"), 2),
+            (format!("{good},https://bad.ex\tample"), 2),
+            (format!("{good},ftp://bad.example"), 2),
+            (format!("{good},wss://bad.example"), 2),
+            (format!("{good},bad.example"), 2),
+            (format!("{good},bad.example:8080"), 2),
+            (format!("{good},null"), 2),
+            (format!("{good},https://"), 2),
+            (format!("{good},,{good}"), 2),
+            (format!("{good},"), 2),
+            (String::new(), 1),
+            (format!("{good},*"), 2),
+            (format!("*,{good}"), 1),
+        ] {
+            let flag = format!("--cors-allowed-origins={list}");
+            let message = match cli_with_flags(&[flag.as_str()]).into_settings() {
+                Ok(_) => panic!("`{list}` must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(&format!("entry {position} ")), "`{list}`: {message}");
+            // the error names the position, never the offending text
+            for text in ["bad.example", "ok.example", "user:pw"] {
+                assert!(!message.contains(text), "`{text}` leaked into: {message}");
+            }
+        }
     }
 }

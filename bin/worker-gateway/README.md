@@ -29,7 +29,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 - Header forwarding is minimal.
   Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)) and the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the `--redirect-queries-header` header when one is set; see [Query upstream header](#query-upstream-header)).
   The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
-  All other headers are dropped in both directions; in particular CORS is not terminated here, so browser dApps need CORS handled at the ingress (or a later PR).
+  All other headers are dropped in both directions.
+  With `--cors-allowed-origins` set the gateway adds CORS headers of its own (see [CORS](#cors)); without it, browser dApps on another origin need CORS handled at the ingress.
   Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
 - The request path and query string are not forwarded: a `POST` to any path but `/health`, `/ready` and `/ready/any` goes to the configured upstream base URL, since JSON-RPC carries its method in the body (see [Gateway endpoints](#gateway-endpoints)).
 
@@ -164,6 +165,7 @@ Every flag has an environment-variable fallback.
 | `--shutdown-delay` | `WORKER_GATEWAY_SHUTDOWN_DELAY` | `0s` | How long to keep serving after SIGTERM, with `/ready` and `/ready/any` reporting draining, before the listeners close (`0` disables; at most `60s`); see [Graceful shutdown](#graceful-shutdown). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
+| `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 
 Durations use `humantime` syntax (`5s`, `2m`, `500ms`).
@@ -199,6 +201,23 @@ worker-gateway \
 - **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback or private address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
   A domain name other than `localhost` counts as public, because the gateway does not resolve it.
   When the hop leaves a network you control, use `https` or a tunnel.
+
+### CORS
+
+CORS is off by default: the gateway adds no CORS header, so a browser dApp served from another origin cannot read its responses unless a front handles CORS.
+Set `--cors-allowed-origins` to let browsers call the gateway directly, either to a comma-separated list of origins (`--cors-allowed-origins https://app.example.com,http://localhost:3000`) or to `*` for any origin.
+Each origin is `http` or `https`, written as `scheme://host[:port]` with no path, query, fragment or credentials, the way a browser sends it in `Origin`; host case and a default port are normalised, so `https://App.example.com:443` means `https://app.example.com`.
+An invalid entry, an empty entry, and a `*` beside other entries all fail startup, and the error names the entry's position in the list rather than its text.
+
+With the flag set, the gateway answers every `OPTIONS` preflight itself, ahead of the `POST`-only rule, and never forwards it; without the flag an `OPTIONS` gets the same `405` as any other method but `POST` (see [Gateway endpoints](#gateway-endpoints)).
+The answer allows `POST` with a `Content-Type` header, and the browser may cache it for an hour (`Access-Control-Max-Age: 3600`); a page that sends any other request header, such as `Authorization`, fails its preflight.
+A request from an allowed origin gets `Access-Control-Allow-Origin` on its response (the origin itself, or `*` with the wildcard), gateway error responses included.
+Origins match exactly, so `https://app.example.com` does not allow `http://app.example.com`, `https://app.example.com:8443` or `https://www.app.example.com`.
+A request from any other origin is still served, like a request without `Origin`, but its response carries no `Access-Control-Allow-Origin`, so the browser withholds it from the page.
+A preflight from such an origin still lists the allowed method and header and the max age, which grant nothing without `Access-Control-Allow-Origin`.
+CORS protects users' browsers, not the gateway, and does not replace the edge protections.
+Preflights are answered ahead of the [rate limiter](#rate-limiting) and spend no token, and a `429` still carries the CORS header so the page can read it.
+`/health` and `/ready` sit behind the CORS layer like the proxied path; `/ready/any` and the `--probe-addr` listener do not, so they never carry a CORS header and answer an `OPTIONS` with `405`.
 
 ## Connection handling
 
@@ -633,6 +652,7 @@ The check runs once; a query URL that changes chains later is not detected.
   During the shutdown delay it is `503` with `"ready": false` and `"draining": true` added, like `/ready`.
 - `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker unless the [method policy](#method-policy) refuses it, or, with `--redirect-queries`, to the query URL unless it is a submission or one of the [reads kept on the worker](#reads-kept-on-the-worker).
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
+- `OPTIONS`, with `--cors-allowed-origins` set: a CORS preflight, answered by the gateway and never forwarded, on every path but `/ready/any` (see [CORS](#cors)).
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
   On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
 

@@ -25,8 +25,8 @@ use crate::{
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
     server::{
-        inflight_slots, serve, serve_probes, AppState, RecentSubmissions, ServerLimits,
-        RECENT_SUBMISSIONS_CAPACITY,
+        inflight_slots, serve, serve_probes, AppState, CorsOrigins, RecentSubmissions,
+        RouterLayers, ServerLimits, RECENT_SUBMISSIONS_CAPACITY,
     },
     telemetry::run_throttle_summaries,
 };
@@ -102,6 +102,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         shutdown_delay,
         graceful_shutdown_timeout,
         metrics_addr,
+        cors_allowed_origins,
     } = settings;
 
     info!(
@@ -113,6 +114,11 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
         redirect_queries_header = query_header.is_some(),
         ?recent_submission_ttl,
+        cors = match &cors_allowed_origins {
+            None => "off",
+            Some(CorsOrigins::Any) => "any origin",
+            Some(CorsOrigins::List(_)) => "listed origins",
+        },
         "starting worker gateway"
     );
 
@@ -351,7 +357,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             listen_addr,
             state,
             limits,
-            rate_limiters,
+            RouterLayers { rate_limiters, cors: cors_allowed_origins },
             trusted_proxies,
             graceful_shutdown_timeout,
             shutdown.subscribe(),
