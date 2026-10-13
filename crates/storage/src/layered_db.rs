@@ -1640,6 +1640,7 @@ mod test {
     /// awaited only after the insert is queued, which pins this order: if `persist` queued its
     /// barrier on first poll, the barrier would queue behind the faulted insert, see the latch, and
     /// this test would fail.
+    /// A barrier acknowledges earlier writes even when a later insert faults its physical commit.
     #[tokio::test]
     async fn test_barrier_covers_only_writes_queued_before_it() {
         let temp_dir = tempdir().expect("failed to create temp dir");
@@ -1652,7 +1653,7 @@ mod test {
         .expect("Cannot open database");
         raw.open_table::<TestTable>().expect("failed to open table!");
         // full_memory=true mirrors the epoch DB.
-        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), true);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         // The call alone puts the barrier on the runner queue; it is not polled yet.
