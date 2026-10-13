@@ -98,6 +98,11 @@ pub(crate) enum GatewayError {
     BatchTooLong,
     /// The request already carried the gateway's hop marker (forwarding loop).
     LoopDetected,
+    /// The request carried the query-redirect marker into a gateway that
+    /// itself redirects queries: a query some gateway already redirected,
+    /// because a `--redirect-queries` URL leads back to a redirecting gateway
+    /// or two redirecting gateways are chained.
+    RedirectLoopDetected,
     /// The request did not complete within the gateway's request deadline.
     RequestTimeout {
         /// Whether the gateway had started sending the request upstream when
@@ -150,7 +155,7 @@ impl GatewayError {
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
             Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
-            Self::LoopDetected => StatusCode::LOOP_DETECTED,
+            Self::LoopDetected | Self::RedirectLoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
@@ -172,7 +177,7 @@ impl GatewayError {
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
             Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
-            Self::LoopDetected => code::LOOP_DETECTED,
+            Self::LoopDetected | Self::RedirectLoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout { .. } => code::REQUEST_TIMEOUT,
             Self::RateLimited => code::RATE_LIMITED,
             Self::InvalidTransaction => code::INVALID_TRANSACTION,
@@ -198,6 +203,9 @@ impl GatewayError {
             Self::BatchTooLong => "batch too long",
             Self::LoopDetected => {
                 "proxy loop detected: request already passed through a worker gateway"
+            }
+            Self::RedirectLoopDetected => {
+                "redirect loop detected: request was already redirected by a worker gateway"
             }
             Self::RequestTimeout { forwarding_started: false } => {
                 "request did not complete within the gateway's deadline"
@@ -246,6 +254,7 @@ impl GatewayError {
             Self::RequestTooLarge => "request_too_large",
             Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
+            Self::RedirectLoopDetected => "redirect_loop_detected",
             Self::RequestTimeout { .. } => "request_timeout",
             Self::RateLimited => "rate_limited",
             Self::InvalidTransaction => "invalid_transaction",
@@ -909,6 +918,10 @@ mod tests {
             StatusCode::LOOP_DETECTED
         );
         assert_eq!(
+            error_response(&GatewayError::RedirectLoopDetected, b"{}").status(),
+            StatusCode::LOOP_DETECTED
+        );
+        assert_eq!(
             error_response(&GatewayError::RequestTimeout { forwarding_started: false }, b"{}")
                 .status(),
             StatusCode::REQUEST_TIMEOUT
@@ -1027,6 +1040,7 @@ mod tests {
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
         assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");
+        assert_eq!(GatewayError::RedirectLoopDetected.reason(), "redirect_loop_detected");
         assert_eq!(
             GatewayError::RequestTimeout { forwarding_started: false }.reason(),
             "request_timeout"

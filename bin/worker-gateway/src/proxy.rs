@@ -163,6 +163,14 @@ pub(crate) const HOP_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway"
 /// rejects an inbound request carrying this marker, which catches a
 /// `--redirect-queries` URL that leads back to a redirecting gateway (for
 /// example the deployment's own advertised endpoint) after one hop.
+///
+/// The marker says only that some gateway redirected the request, not which
+/// one, so it cannot tell a loop from a chain: a redirecting gateway must not
+/// sit behind another redirecting gateway. With A redirecting to B and B
+/// redirecting to C, every query through A gets `508` from B. A gateway
+/// without `--redirect-queries` may sit anywhere on the query path. The
+/// rejection counts under its own reason, `redirect_loop_detected`, apart
+/// from the hop marker's `loop_detected`.
 const REDIRECT_HEADER: HeaderName = HeaderName::from_static("x-tn-gateway-redirect");
 
 /// Throttle for the hop-marker loop warning.
@@ -312,9 +320,11 @@ pub(crate) async fn proxy(
 
     // a redirecting gateway that receives the redirect marker is being sent
     // reads that some gateway already redirected: its query upstream leads
-    // back to a redirecting gateway, and redirecting again would loop. a
-    // gateway without a redirect forwards such a request like any other, so a
-    // gateway can front the public rpc.
+    // back to a redirecting gateway, and redirecting again would loop. the
+    // marker cannot tell that loop from a chain of two redirecting gateways,
+    // which is refused the same way (see `REDIRECT_HEADER`). a gateway without
+    // a redirect forwards such a request like any other, so a gateway can
+    // front the public rpc.
     if state.query_upstream.is_some() && headers.contains_key(REDIRECT_HEADER) {
         if let Some(suppressed) = REDIRECT_LOOP_WARNINGS.admit() {
             warn!(
@@ -327,7 +337,7 @@ pub(crate) async fn proxy(
         if let Some(access) = &access {
             access.classify(&body, scan(&body, None, &[]).calls);
         }
-        return error_response(&GatewayError::LoopDetected, body.as_ref());
+        return error_response(&GatewayError::RedirectLoopDetected, body.as_ref());
     }
 
     // without a redirect every call would reach the worker, so the namespaces

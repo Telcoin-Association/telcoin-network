@@ -594,6 +594,9 @@ The public RPC accepts submissions too, so the client loses nothing, but a submi
 Routing happens after the [transaction screen](#transaction-screening), so an undecodable submission is still refused at the gateway.
 Calls sent to the query URL carry `X-TN-Gateway-Redirect: 1`, `X-Forwarded-For` and `X-Forwarded-Proto`, but not `X-TN-Gateway`, so a public RPC behind a gateway of its own does not reject them as a loop.
 A gateway with `--redirect-queries` set answers an inbound request carrying `X-TN-Gateway-Redirect` with `508` / `-32004`, which catches a query URL that leads back to a redirecting gateway; a gateway without the flag forwards such a request normally.
+The marker says only that some gateway redirected the request, so it cannot tell a loop from a chain: a redirecting gateway must not sit behind another redirecting gateway.
+With A redirecting to B and B redirecting to C, every query through A gets `508` from B; point A at C, or run B without the flag.
+The two markers count under their own reasons in `tn_worker_gateway_rejections_total`: `loop_detected` for `X-TN-Gateway`, `redirect_loop_detected` for `X-TN-Gateway-Redirect`.
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
@@ -712,7 +715,8 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | Upstream request timed out | `504` | `-32002` |
 | Request body too large | `413` | `-32003` |
 | Batch longer than `--max-batch-len` | `413` | `-32003` |
-| Proxy loop detected | `508` | `-32004` |
+| Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
+| Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`; reason `redirect_loop_detected`) | `508` | `-32004` |
 | Request deadline exceeded | `408` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |

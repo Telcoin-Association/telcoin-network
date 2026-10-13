@@ -2860,6 +2860,37 @@ mod tests {
         assert_eq!(worker_seen.hits(), 1);
     }
 
+    /// The redirect marker cannot tell a loop from a chain: a redirecting
+    /// gateway behind another one refuses every query the first redirects to
+    /// it, while a gateway without the flag on the same path forwards them.
+    #[tokio::test]
+    async fn chained_redirecting_gateways_answer_508_at_the_second() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let second = redirect_state(worker, Some(query));
+        second.readiness.set_ready(0, true);
+        let (second, _second) = spawn(test_router(second)).await;
+        let first = redirect_state(worker, Some(second));
+        first.readiness.set_ready(0, true);
+        let (first, _first) = spawn(test_router(first)).await;
+
+        let (status, text) = post_rpc(first, None, call("eth_call", 8)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
+        assert_eq!(error_code_and_id(&text), (-32004, serde_json::json!(8)));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
+
+        // a gateway without the flag in the middle forwards the query
+        let plain = redirect_state(query, None);
+        plain.readiness.set_ready(0, true);
+        let (plain, _plain) = spawn(test_router(plain)).await;
+        let behind_plain = redirect_state(worker, Some(plain));
+        behind_plain.readiness.set_ready(0, true);
+        let (behind_plain, _behind_plain) = spawn(test_router(behind_plain)).await;
+        let (status, text) = post_rpc(behind_plain, None, call("eth_call", 9)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 1));
+    }
+
     #[tokio::test]
     async fn hop_marker_is_still_rejected_with_the_redirect_on() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
@@ -4527,6 +4558,13 @@ mod tests {
         // a loop
         let (status, _) = post_rpc(gateway, Some("x-tn-gateway"), call("eth_chainId", 3)).await;
         assert_eq!(status, StatusCode::LOOP_DETECTED);
+        // a redirect loop, at a gateway that redirects
+        let (query, _query_seen, _query) = named_mock("query").await;
+        let (redirecting, _redirecting) =
+            spawn(test_router(redirect_state(worker, Some(query)))).await;
+        let (status, _) =
+            post_rpc(redirecting, Some("x-tn-gateway-redirect"), call("eth_chainId", 6)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
         // a screened transaction
         let junk =
             r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":4}"#;
@@ -4541,6 +4579,7 @@ mod tests {
             "request_timeout",
             "unreadable_body",
             "loop_detected",
+            "redirect_loop_detected",
             "invalid_transaction",
             "no_upstream_ready",
         ];
