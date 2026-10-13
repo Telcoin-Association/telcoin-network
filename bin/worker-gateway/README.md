@@ -303,11 +303,12 @@ never a bare reset.
 
 A batch costs one token per call, the first before its body is read and the rest once its calls are counted, in the same order and with the same refund; see [Batches](#batches).
 A third, optional bucket reserves rate for submissions.
-With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions.
-The per-IP limit still covers both classes and still refuses at the edge.
-The edge cannot tell the classes apart before the body is read, so a request the global bucket refuses is classified first: a query then gets the `429`, and a submission is charged to the submission bucket instead.
-A submission still spends a global token while one is left.
-A batch pays for its calls beyond the first from the global bucket whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not.
+With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions, and a submission flood over its own budget no longer spends the read budget.
+The edge cannot tell the classes apart before the body is read, so there it runs only the per-IP limit, which still covers both classes and still refuses an over-limit client before its body is read.
+Once the request is read and classified, its first call is charged to the global bucket for a query or to the submission bucket for a submission.
+A refusal there is a `429` and gives the per-IP token back, so a refused submission spends no global token and a refused query no submission token.
+A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
+A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal leaves the first call's tokens spent, as it does without the flag.
 With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
 Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
 Without the flag the edge check is unchanged.
@@ -521,7 +522,7 @@ A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls
   A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before it is screened or forwarded, whichever upstream it would go to.
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
-  The first token is taken before the body is read; the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
+  The first token is taken before the body is read (with `--rate-limit-submissions`, only its per-IP part, see [Rate limiting](#rate-limiting)); the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
   The K - 1 come from the per-IP bucket first, the same client's bucket the first token came from (behind a front listed in `--trusted-proxies`, the forwarded client's, see [Client identity behind a front](#client-identity-behind-a-front)), or the shared overflow bucket when the per-client table is full, so a client over its own limit spends none of the global budget on them; a global refusal refunds them, and each bucket is charged all or nothing.
   They come from the global bucket whatever the batch's class, with `--rate-limit-submissions` set too (see [Rate limiting](#rate-limiting)).
   A batch needs K tokens at once and a bucket never holds more than its burst, which is why the length cap stops at the smallest burst: a longer batch gets the final `413` rather than a `429` that no retry could satisfy.
