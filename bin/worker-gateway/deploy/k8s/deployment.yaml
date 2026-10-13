@@ -90,6 +90,14 @@ spec:
             # ends as soon as the last request does.
             - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
               value: "45s"
+            # Keep N x --max-upstream-inflight below the worker's
+            # --rpc.max-connections (500 by default): at the HPA's ceiling of
+            # 10 replicas, 49 each leaves 490 worker connections at most, so a
+            # fully scaled fleet never drives the worker into answering 429.
+            # Raise it when the worker's limit is raised; lower it for a higher
+            # replica ceiling (see README.md, "Sizing for N gateways").
+            - name: WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT
+              value: "49"
           ports:
             - name: rpc
               containerPort: 8545
