@@ -1652,7 +1652,7 @@ mod test {
         .expect("Cannot open database");
         raw.open_table::<TestTable>().expect("failed to open table!");
         // full_memory=true mirrors the epoch DB.
-        let db = LayeredDatabase::open(CommitFailDb(raw), true);
+        let db = LayeredDatabase::open(CommitFailDb::always(raw), true);
         db.open_table::<TestTable>().expect("failed to open table!");
 
         // The call alone puts the barrier on the runner queue; it is not polled yet.
