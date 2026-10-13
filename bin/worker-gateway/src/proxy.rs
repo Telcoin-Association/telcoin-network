@@ -539,6 +539,23 @@ pub(crate) async fn proxy(
                 }
                 return upstream_error_response(status, body.as_ref());
             }
+            // a redirect with a json body passes through as the upstream's own
+            // answer, but the gateway follows no redirect, so it is logged
+            // like the non-json one above (which covers every other `3xx`): a
+            // worker behind a front that answers `307`, say, is a
+            // misconfiguration no client can fix
+            if upstream.status().is_redirection() {
+                if let Some(suppressed) = UPSTREAM_ERROR_WARNINGS.get(route).admit() {
+                    warn!(
+                        target: "gateway::proxy",
+                        route = route.label(),
+                        upstream = %UpstreamOrigin(&upstream_url),
+                        status = upstream.status().as_u16(),
+                        suppressed,
+                        "upstream answered a redirect, which the gateway does not follow"
+                    );
+                }
+            }
             // a single submission the worker took is remembered, so that a
             // lookup of its hash follows it to the worker's pool (see
             // [`PoolRead`]). the worker answers a transaction it refused with a
@@ -1171,7 +1188,8 @@ impl UpstreamClientBuilder {
 /// to it) could otherwise bounce a read onto the private worker or any internal
 /// host the gateway can reach. A `3xx` from either upstream is passed through
 /// to the client like any other status, without its `Location` (only
-/// `Content-Type` is copied back), so the client cannot follow it either.
+/// `Content-Type` is copied back), so the client cannot follow it either, and
+/// [`proxy`] logs a warning for it, whatever its body.
 ///
 /// TLS, the connect timeout, the resolver and the no-proxy policy come from
 /// `builder`. reqwest builds a client over an empty native root store without

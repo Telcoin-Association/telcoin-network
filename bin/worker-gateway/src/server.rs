@@ -3210,6 +3210,73 @@ mod tests {
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
     }
 
+    /// A `3xx` with a JSON body passes through as the upstream's own answer,
+    /// without its `Location`, and is logged as a warning on either route,
+    /// naming the upstream by origin, like a `3xx` without one: the gateway
+    /// follows no redirect, so a worker behind a front that answers `307` must
+    /// not go unnoticed.
+    #[tokio::test]
+    async fn json_redirect_from_an_upstream_is_logged() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let answer = r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#;
+        let location = format!("http://{worker}/elsewhere");
+        let bouncer = Router::new().route(
+            "/",
+            post(move || async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [
+                        (header::LOCATION, location),
+                        (header::CONTENT_TYPE, "application/json".into()),
+                    ],
+                    answer,
+                )
+            }),
+        );
+        let (bouncer, _bouncer) = spawn(bouncer).await;
+        let client = Client::builder().redirect(Policy::none()).build().expect("client");
+        for (route, state) in [
+            ("worker", redirect_state(bouncer, None)),
+            ("query", redirect_state(worker, Some(bouncer))),
+        ] {
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+            let response = client
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_call", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{route}");
+            assert!(response.headers().get(header::LOCATION).is_none(), "{route}");
+            assert_eq!(response.text().await.expect("text"), answer, "{route}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a redirect must never be followed");
+
+        let logs = logs.contents();
+        for route in ["worker", "query"] {
+            let line = logs
+                .lines()
+                .find(|line| {
+                    line.contains("upstream answered a redirect")
+                        && line.contains(&format!("route=\"{route}\""))
+                })
+                .unwrap_or_else(|| panic!("no redirect warning for the {route} route: {logs}"));
+            assert!(line.contains(" WARN "), "{line}");
+            assert!(line.contains("status=307"), "{line}");
+            assert!(line.contains(&format!("upstream=http://{bouncer}")), "{line}");
+        }
+        assert!(!logs.contains("elsewhere"), "the Location must not be logged: {logs}");
+    }
+
     /// A per-IP limit of one request with no burst headroom (no refill lands
     /// inside a test), and no global limit.
     fn one_request_per_ip() -> Option<Arc<RateLimiters>> {

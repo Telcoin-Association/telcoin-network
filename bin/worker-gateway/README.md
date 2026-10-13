@@ -598,6 +598,7 @@ The marker says only that some gateway redirected the request, so it cannot tell
 With A redirecting to B and B redirecting to C, every query through A gets `508` from B; point A at C, or run B without the flag.
 The two markers count under their own reasons in `tn_worker_gateway_rejections_total`: `loop_detected` for `X-TN-Gateway`, `redirect_loop_detected` for `X-TN-Gateway-Redirect`.
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
+Every `3xx` logs a warning naming the upstream by origin, whatever its body: an upstream behind a front that redirects is a misconfiguration no client can fix.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
 `/ready` still means "this gateway can take submissions"; `/ready/any` reports whether it can serve any route (see [Gateway endpoints](#gateway-endpoints)).
@@ -824,7 +825,7 @@ Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
 ready upstream, an oversized body, a worker's answer to a submission that
 could not be read whole, and, per route, a forwarding failure or an
-upstream error answer) are throttled per call site, so neither clients nor a
+upstream error or redirect answer) are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
