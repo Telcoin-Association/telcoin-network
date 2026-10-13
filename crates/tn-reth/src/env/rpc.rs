@@ -242,9 +242,11 @@ impl RethEnv {
     /// accumulator slot, so fee defaults and quotes track worker-count changes
     /// without retaining a detached `BaseFeeContainer` clone (issue #1282).
     ///
-    /// `node_mode` reads live consensus participation state before every raw
-    /// transaction submission. Inactive validators refuse admission before pool
-    /// insertion; active validators and forwarding observers retain their handlers.
+    /// Worker admission comes from `network` and runs first on every raw transaction
+    /// submission: a worker removed from the committee answers `worker is inactive`
+    /// (#1505). `node_mode` then reads live consensus participation state. Inactive
+    /// validators refuse admission before pool insertion; active validators and
+    /// forwarding observers retain their handlers.
     ///
     /// Errors when the corrected fee-history method, the `--rpc.txfeecap` guard
     /// (`crate::rpc_fee_cap`), the epoch-fee gas-price quotes, or the corrected
@@ -257,6 +259,7 @@ impl RethEnv {
         node_mode: impl Fn() -> NodeMode + Send + Sync + 'static,
         other: impl Into<Methods>,
     ) -> eyre::Result<RpcServer> {
+        let admission = network.rpc_admission();
         let transaction_pool: EthTransactionPool<
             BlockchainProvider<TelcoinNode>,
             DiskFileBlobStore,
@@ -321,6 +324,7 @@ impl RethEnv {
         let fee_cap_guard = EthSubmitWithCap::new(
             eth_api.clone(),
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
+            admission,
             node_mode,
         );
         let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
@@ -682,6 +686,87 @@ mod tests {
             .expect_err("over-cap transaction is refused on the HTTP registration");
         assert!(err.to_string().contains("exceeds the configured cap"), "unexpected error: {err}");
         assert_eq!(pool.pool_size().pending, 0);
+    }
+
+    /// Every transport rejects both raw submission methods while its worker is inactive,
+    /// before fee-cap decoding or pool insertion, and reuses the same handlers on activation.
+    #[tokio::test]
+    async fn inactive_worker_submission_gate_covers_every_transport() -> eyre::Result<()> {
+        use crate::worker::WorkerRpcState;
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        init_reth_defaults();
+        let transports = [
+            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+            reth::args::RpcServerArgs { ws: true, ipcdisable: true, ..Default::default() },
+            reth::args::RpcServerArgs::default(),
+        ];
+        futures::stream::iter(transports)
+            .then(|rpc_args| async move {
+                let temp = TempDir::new()?;
+                let tasks = TaskManager::default();
+                let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+                let env = RethEnv::new_for_temp_chain_with_rpc_args(
+                    chain.clone(),
+                    temp.path(),
+                    &tasks,
+                    None,
+                    reth::args::RpcServerArgs { rpc_tx_fee_cap: 200_000, ..rpc_args },
+                )?;
+                let pool = env.init_txn_pool(BaseFeeContainer::default())?;
+                let network = WorkerNetwork::new_for_test(env.chainspec());
+                let admission = network.rpc_admission();
+                // An active validator isolates the worker-admission gate from the
+                // node-mode gate (#1514), so the expected message is the worker's.
+                let server = env.get_rpc_server(
+                    pool.clone(),
+                    network,
+                    GasAccumulator::new(1).worker_base_fee(0),
+                    || NodeMode::CvvActive,
+                    RpcModule::new(()),
+                )?;
+                let methods = server.methods_by(|name| name.starts_with("eth_send"));
+                let mut factory = TransactionFactory::new();
+                let transaction = factory.create_eip1559(
+                    chain,
+                    Some(21_000),
+                    7,
+                    Some(Address::ZERO),
+                    U256::from(100),
+                    Bytes::new(),
+                );
+                let raw = Bytes::from(transaction.encoded_2718());
+                admission.set_state(WorkerRpcState::Inactive);
+                let error = methods
+                    .call::<_, B256>("eth_sendRawTransaction", rpc_params![raw.clone()])
+                    .await
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("inactive worker accepted a valid transaction"))?;
+                assert!(error.to_string().contains("worker is inactive"), "{error}");
+                assert_eq!(pool.pool_size().pending, 0);
+                assert!(pool.get(transaction.hash()).is_none());
+                // Invalid bytes must reach admission first on the sync variant, too. This
+                // avoids waiting for a receipt if a mutation removes that method's gate.
+                let error = methods
+                    .call::<_, serde_json::Value>(
+                        "eth_sendRawTransactionSync",
+                        rpc_params![Bytes::new()],
+                    )
+                    .await
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("inactive sync submission was accepted"))?;
+                assert!(error.to_string().contains("worker is inactive"), "{error}");
+                assert_eq!(pool.pool_size().pending, 0);
+                admission.set_state(WorkerRpcState::Active);
+                let accepted: B256 =
+                    methods.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+                assert_eq!(accepted, *transaction.hash());
+                assert_eq!(pool.pool_size().pending, 1);
+                Ok::<_, eyre::Report>(())
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
     }
 
     /// Build the epoch-fee RPC fixture's chain with a reproducible genesis hash.

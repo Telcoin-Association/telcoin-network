@@ -302,6 +302,11 @@ mod tests {
         assert_eq!(readiness.borrow().primary, SwarmReadiness::TimedOut);
         tokio::time::advance(NETWORK_PROBE_INTERVAL).await;
         tokio::task::yield_now().await;
+        // `join` signals only its own notifier: the monitor stops when the manager drops. Track
+        // the queued monitor now and give `join` no grace, so the join cannot outlast the
+        // timeout whichever `until_exit` select branch wins.
+        node_tasks.update_tasks();
+        node_tasks.set_join_wait(0);
         let node_shutdown = ShutdownNotifier::default();
         node_shutdown.notify();
         tokio::time::timeout(Duration::from_secs(1), node_tasks.join(node_shutdown)).await??;

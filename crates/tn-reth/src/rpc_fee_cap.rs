@@ -5,8 +5,12 @@
 //! `TransactionOrigin::External`, so the validator check never runs for public RPC
 //! traffic (issue #1160). This module closes that gap at the RPC boundary:
 //! [`EthSubmitWithCap`] replaces the two raw submission methods with handlers that
-//! refuse inactive validators, check the cap, then delegate to reth. Node mode is
-//! read on every request, so demotion and rejoin require no RPC server restart.
+//! check worker admission and live node mode, then the cap, before delegating to the
+//! reth implementations. A removed worker keeps its listeners bound for later
+//! reactivation (#1505), but both submission methods return `worker is inactive`
+//! before decoding or pool access. An inactive validator returns `validator is
+//! inactive` the same way (#1514). Node mode is read on every request, so demotion
+//! and rejoin require no RPC server restart.
 //!
 //! The check reproduces the validator's arithmetic and is never laxer: the maximum
 //! fee is `max_fee_per_gas * gas_limit`, plus the blob fee bound for EIP-4844
@@ -27,6 +31,7 @@
 //! configuration, not a secret, and any funded account learns it the same way.
 //! The delegated path is otherwise unchanged.
 
+use crate::worker::WorkerRpcAdmission;
 use async_trait::async_trait;
 use jsonrpsee::{core::RpcResult, proc_macros::rpc};
 use reth_rpc_eth_api::{
@@ -38,19 +43,33 @@ use tn_types::{
     Bytes, Decodable2718 as _, NodeMode, PooledTransaction, TransactionTrait as _, B256, U256,
 };
 
+/// Whether a node in `mode` admits raw transaction submissions (issue #1514).
+///
+/// This is the single submission-admission predicate. RPC admission refuses every
+/// submission while it is false, and the `/health/workers` readiness report answers
+/// `accepting_transactions: false` for the same modes, so a worker gateway stops routing
+/// to a demoted validator instead of retrying refused submissions against it.
+/// Observers retain their submission path because their workers forward batches.
+pub fn node_mode_accepts_submissions(mode: NodeMode) -> bool {
+    match mode {
+        NodeMode::CvvActive | NodeMode::Observer => true,
+        NodeMode::CvvInactive => false,
+    }
+}
+
 /// Refuse submissions that an inactive validator cannot include (issue #1514).
 ///
 /// Internal errors are endpoint-local in the forwarder: it tries another validator
 /// without counting this refusal as a considered rejection of the transaction.
-/// Observers retain their submission path because their workers forward batches.
 pub(crate) fn ensure_can_submit(mode: NodeMode) -> RpcResult<()> {
-    match mode {
-        NodeMode::CvvActive | NodeMode::Observer => Ok(()),
-        NodeMode::CvvInactive => Err(jsonrpsee::types::ErrorObjectOwned::owned(
+    if node_mode_accepts_submissions(mode) {
+        Ok(())
+    } else {
+        Err(jsonrpsee::types::ErrorObjectOwned::owned(
             jsonrpsee::types::error::INTERNAL_ERROR_CODE,
             "validator is inactive; retry another endpoint",
             None::<()>,
-        )),
+        ))
     }
 }
 
@@ -110,11 +129,13 @@ impl TxFeeCapWei {
 /// the handlers in place with `TransportRpcModules::add_or_replace_if_module_configured`.
 #[rpc(server, namespace = "eth")]
 pub(crate) trait CappedEthSubmit {
-    /// `eth_sendRawTransaction`: check live node mode and the fee cap, then delegate to reth.
+    /// `eth_sendRawTransaction`: check worker admission, live node mode and the fee cap,
+    /// then delegate to reth.
     #[method(name = "sendRawTransaction")]
     async fn send_raw_transaction(&self, bytes: Bytes) -> RpcResult<B256>;
 
-    /// `eth_sendRawTransactionSync`: check live node mode and the fee cap, then delegate to reth.
+    /// `eth_sendRawTransactionSync`: check worker admission, live node mode and the fee
+    /// cap, then delegate to reth.
     #[method(name = "sendRawTransactionSync")]
     async fn send_raw_transaction_sync(
         &self,
@@ -122,21 +143,30 @@ pub(crate) trait CappedEthSubmit {
     ) -> RpcResult<alloy::rpc::types::TransactionReceipt>;
 }
 
-/// Live node-mode and fee-cap guards over reth's `EthApi` submission methods.
+/// Worker-admission, live node-mode and fee-cap guard over reth's `EthApi` submission
+/// methods.
 #[derive(Debug, Clone)]
 pub(crate) struct EthSubmitWithCap<Api, Mode> {
-    /// The reth `EthApi` this guard delegates to once both checks pass.
+    /// The reth `EthApi` this guard delegates to once all checks pass.
     eth_api: Api,
     /// The configured cap.
     cap: TxFeeCapWei,
+    /// Committee admission shared with the worker lifecycle on all transports.
+    admission: WorkerRpcAdmission,
     /// Reads the node's current consensus participation mode on every request.
     node_mode: Mode,
 }
 
 impl<Api, Mode> EthSubmitWithCap<Api, Mode> {
-    /// Create a guard from the built `EthApi`, parsed flag, and live mode reader.
-    pub(crate) const fn new(eth_api: Api, cap: TxFeeCapWei, node_mode: Mode) -> Self {
-        Self { eth_api, cap, node_mode }
+    /// Create a guard from the built `EthApi`, parsed flag, shared worker admission
+    /// gate, and live mode reader.
+    pub(crate) const fn new(
+        eth_api: Api,
+        cap: TxFeeCapWei,
+        admission: WorkerRpcAdmission,
+        node_mode: Mode,
+    ) -> Self {
+        Self { eth_api, cap, admission, node_mode }
     }
 }
 
@@ -157,6 +187,7 @@ where
         // Keep reth's request-trace parity: operators grep this target on the
         // node's only submission path.
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransaction");
+        self.admission.ensure_active()?;
         ensure_can_submit((self.node_mode)())?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction(&self.eth_api, bytes).await?)
@@ -167,6 +198,7 @@ where
         bytes: Bytes,
     ) -> RpcResult<alloy::rpc::types::TransactionReceipt> {
         tracing::trace!(target: "rpc::eth", ?bytes, "Serving eth_sendRawTransactionSync");
+        self.admission.ensure_active()?;
         ensure_can_submit((self.node_mode)())?;
         self.cap.enforce(&bytes)?;
         Ok(EthTransactions::send_raw_transaction_sync(&self.eth_api, bytes).await?)

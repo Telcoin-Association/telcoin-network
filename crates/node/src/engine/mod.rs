@@ -26,8 +26,8 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, NodeMode, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -206,9 +206,9 @@ impl std::fmt::Debug for TnBuilder {
 pub enum WorkerState {
     /// The worker has never been activated in this process.
     Uninitialized,
-    /// The pool is retained, but the worker's RPC listeners have been stopped.
+    /// The pool and listeners are retained, but transaction admission is closed.
     Stopped,
-    /// The worker's RPC listeners are running.
+    /// The worker's transaction admission is open.
     Running,
 }
 
@@ -312,7 +312,7 @@ impl ExecutionNode {
         !self.internal.read().await.workers.is_empty()
     }
 
-    /// Stop RPC listeners for initialized workers outside the current committee.
+    /// Close transaction admission for initialized workers outside the current committee.
     ///
     /// Their pools remain available for a later epoch that reactivates the worker ids.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
@@ -325,20 +325,17 @@ impl ExecutionNode {
             .for_each(WorkerComponents::deactivate);
     }
 
-    /// Refresh an initialized worker's fee and reopen its RPC listeners if stopped.
+    /// Refresh an initialized worker's fee and reopen admission on its retained RPC listeners.
     pub async fn restart_worker_rpc(&self, worker_id: WorkerId, base_fee: u64) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        let reth_env = guard.reth_env.clone();
         guard
             .workers
             .get_mut(usize::from(worker_id))
-            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))?
-            .restart_rpc(&reth_env, worker_id, base_fee)
-            .await
-            .map_err(Into::into)
+            .map(|worker| worker.reactivate(base_fee))
+            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))
     }
 
-    /// Return whether a worker needs initial construction, RPC restart, or task refresh.
+    /// Return whether a worker needs initial construction, reactivation, or task refresh.
     pub async fn worker_state(&self, worker_id: WorkerId) -> WorkerState {
         self.internal.read().await.workers.get(usize::from(worker_id)).map_or(
             WorkerState::Uninitialized,
@@ -368,13 +365,14 @@ impl ExecutionNode {
     /// Snapshot initialized workers and their current epoch's accepting state.
     ///
     /// Removed workers remain visible with a false accepting flag. Active workers accept only
-    /// after their RPC listeners bind and until consensus shuts down their epoch.
-    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+    /// after their RPC listeners bind, until consensus shuts down their epoch, and only while
+    /// the node's `mode` admits submissions (issue #1514).
+    pub(crate) async fn worker_readiness(&self, mode: NodeMode) -> Vec<WorkerReadiness> {
         let engine = self.internal.read().await;
         self.worker_readiness
             .read()
             .await
-            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()))
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()), mode)
     }
 
     /// Start the worker's batch builder for the epoch.

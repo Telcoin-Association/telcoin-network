@@ -68,6 +68,11 @@ pub struct PrimaryMetrics {
     pub(crate) max_consensus_output_bytes: Gauge,
     /// The most recent consensus output (in pack file encoded bytes) we have seen.
     pub(crate) consensus_output_bytes: Gauge,
+    /// Epoch records offered to a queued epoch pack request for a different epoch, and dropped.
+    ///
+    /// Every caller looks the record up by the request's epoch, so a non-zero value is a caller
+    /// bug.
+    pub(crate) epoch_pack_record_epoch_mismatch_total: Counter,
 }
 
 impl PrimaryMetrics {
