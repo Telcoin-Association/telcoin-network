@@ -166,7 +166,8 @@ pub trait TelcoinNetworkRpcExtApi {
     /// synchronously into a small cache it shares with state sync and peer epoch serving. The
     /// lookup runs off the async runtime and under a tight concurrency bound, but public callers
     /// can still churn that cache until storage opens and evicts packs without blocking; serve the
-    /// namespace from non-validating nodes instead.
+    /// namespace from non-validating nodes instead, and omit `tn` from the validator's
+    /// `--http.api`/`--ws.api`.
     #[method(name = "getBlockTimestampMillis")]
     async fn get_block_timestamp_millis(
         &self,

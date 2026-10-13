@@ -20,6 +20,7 @@ node lockfile at `5736cc30012c5ff25913898e318a74df308f13d9`: libp2p-tls 0.7.0,
 rustls 0.23.37, aws-lc-rs 1.16.2, aws-lc-sys 0.39.1 and rustls-webpki 0.103.10.
 The profile uses the same aws-lc, std and prefer-post-quantum rustls features as
 libp2p-tls. No historical ring measurement is used as a current-provider result.
+The harness pins follow the node's lockfile, so a reproduction from a later tree can resolve newer versions than these; its report's `versions` field says which.
 
 The [machine-readable profile](evidence/2026-09-24-macos-arm64.json) contains
 compiler details, dependency and source hashes, the binary hash, raw-sample

@@ -662,6 +662,7 @@ async fn test_worker_pool_base_fee_sourced_from_accumulator() -> eyre::Result<()
 #[tokio::test]
 async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
     use futures::{StreamExt as _, TryStreamExt as _};
+    use jsonrpsee::core::client::ClientT as _;
     use tn_node::engine::{ExecutionNode, TnBuilder, WorkerState};
     use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig};
 
@@ -788,19 +789,27 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         .await
         .is_err());
 
+    let client = engine
+        .worker_http_client(&1)
+        .await?
+        .ok_or_else(|| eyre::eyre!("worker one HTTP client missing"))?;
+    let assert_worker_inactive = || async {
+        let inactive = client
+            .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted an RPC submission"))?;
+        assert!(inactive.to_string().contains("worker is inactive"), "{inactive}");
+        eyre::Ok(())
+    };
     engine.deactivate_workers_above(1).await;
     assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
     assert!(!engine.is_worker_running(1).await);
     assert!(engine.is_worker_running(0).await);
-    tn_test_utils::wait_until(
-        Duration::from_secs(5),
-        "worker one RPC listener to close",
-        || async { Ok(tokio::net::TcpStream::connect(rpc_one).await.is_err()) },
-    )
-    .await?;
+    assert_worker_inactive().await?;
     assert_initialization_rejected(1, 2).await?;
     assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
-    assert!(tokio::net::TcpStream::connect(rpc_one).await.is_err());
+    assert_worker_inactive().await?;
     let restarted_fee = next_fee + 1;
     engine.restart_worker_rpc(1, restarted_fee).await?;
     assert_eq!(engine.worker_state(1).await, WorkerState::Running);
@@ -810,6 +819,7 @@ async fn test_multi_worker_components_across_epochs() -> eyre::Result<()> {
         .worker_http_local_address(&1)
         .await?
         .ok_or_else(|| eyre::eyre!("restarted worker RPC listener missing"))?;
+    assert_eq!(restarted_rpc, rpc_one);
     assert!(tokio::net::TcpStream::connect(restarted_rpc).await.is_ok());
     Ok(())
 }
