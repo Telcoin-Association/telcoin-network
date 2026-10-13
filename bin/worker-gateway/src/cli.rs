@@ -26,6 +26,11 @@ use crate::{
 /// `admin` namespaces, which an operator may enable on the worker for itself.
 pub(crate) const DEFAULT_DENIED_METHOD_PREFIXES: &str = "tn_,debug_,trace_,admin_";
 
+/// Longest `--shutdown-delay` accepted at startup. A longer delay holds a
+/// terminating gateway's listener open past any sensible termination grace
+/// period, so the orchestrator would kill it before the drain even starts.
+const MAX_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
+
 /// Stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -506,6 +511,22 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_PROXY_PROTOCOL")]
     pub(crate) proxy_protocol: bool,
 
+    /// How long to keep accepting and serving after SIGTERM while `/ready` and
+    /// `/ready/any` answer `503` with `"draining": true`, so fronts that probe
+    /// them (DNS health checks, external load balancers) stop routing here
+    /// before the listener closes; the probe listener (`--probe-addr`) keeps
+    /// answering through it too. The in-flight drain
+    /// (`--graceful-shutdown-timeout`) starts after it. At most `60s`. `0` (the
+    /// default) disables the delay: the listeners close as soon as SIGTERM
+    /// arrives.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_SHUTDOWN_DELAY",
+        default_value = "0s",
+        value_parser = humantime::parse_duration
+    )]
+    pub(crate) shutdown_delay: Duration,
+
     /// How long to drain in-flight requests on SIGTERM before forcing close.
     #[arg(
         long,
@@ -622,6 +643,10 @@ pub(crate) struct Settings {
     /// Whether a trusted proxy's connection opens with a PROXY protocol v2
     /// header naming the client.
     pub(crate) proxy_protocol: bool,
+    /// How long to keep serving, with `/ready` and `/ready/any` reporting
+    /// draining, between the shutdown notice and closing the listeners; zero
+    /// closes them at once.
+    pub(crate) shutdown_delay: Duration,
     /// Graceful-shutdown drain deadline.
     pub(crate) graceful_shutdown_timeout: Duration,
     /// Address to expose the Prometheus scrape endpoint on, or `None` when
@@ -799,6 +824,14 @@ impl Cli {
                  0 to disable the cap explicitly"
             );
         }
+
+        eyre::ensure!(
+            self.shutdown_delay <= MAX_SHUTDOWN_DELAY,
+            "--shutdown-delay ({}) is longer than the {} maximum; a terminating gateway would \
+             keep its listener open that long before draining",
+            humantime::format_duration(self.shutdown_delay),
+            humantime::format_duration(MAX_SHUTDOWN_DELAY),
+        );
         Ok(Settings {
             listen_addr: self.listen_addr,
             probe_addr: self.probe_addr,
@@ -838,6 +871,7 @@ impl Cli {
             rate_limit_submissions: resolve_rate_limit(self.rate_limit_submissions, 0),
             trusted_proxies,
             proxy_protocol: self.proxy_protocol,
+            shutdown_delay: self.shutdown_delay,
             graceful_shutdown_timeout: self.graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
         })
@@ -1380,6 +1414,23 @@ mod tests {
         assert_eq!(defaults.upstream_failure_threshold.map(NonZeroU32::get), Some(3));
         let off = cli_with_flags(&["--upstream-failure-threshold=0"]).into_settings()?;
         assert_eq!(off.upstream_failure_threshold, None);
+        Ok(())
+    }
+
+    #[test]
+    fn delay_over_a_minute_is_rejected_at_startup() -> eyre::Result<()> {
+        // off by default
+        assert_eq!(cli_with_flags(&[]).into_settings()?.shutdown_delay, Duration::ZERO);
+
+        // the boundary itself is accepted
+        let settings = cli_with_flags(&["--shutdown-delay=60s"]).into_settings()?;
+        assert_eq!(settings.shutdown_delay, Duration::from_secs(60));
+
+        let message = match cli_with_flags(&["--shutdown-delay=61s"]).into_settings() {
+            Ok(_) => panic!("a delay over a minute must be a startup error"),
+            Err(err) => err.to_string(),
+        };
+        assert!(message.contains("--shutdown-delay"), "the error must name the flag: {message}");
         Ok(())
     }
 

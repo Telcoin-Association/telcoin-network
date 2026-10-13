@@ -29,7 +29,10 @@ use std::{
     net::{IpAddr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     pin::pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
@@ -150,6 +153,10 @@ pub(crate) struct AppState {
     /// Cap on concurrent requests forwarded to a worker
     /// (`--max-upstream-inflight`); see [`inflight_slots`].
     pub(crate) upstream_slots: Arc<Semaphore>,
+    /// Set by both accept loops once the shutdown notice arrives, so `/ready`
+    /// and `/ready/any` answer `503` with `"draining": true` during
+    /// `--shutdown-delay` while the listeners still accept and serve.
+    pub(crate) draining: Arc<AtomicBool>,
 }
 
 /// The semaphore behind an in-flight cap of `cap` requests, where `0` means
@@ -213,6 +220,11 @@ pub(crate) struct ServerLimits {
     /// Cap on each connection's read buffer, in bytes; it also caps the size
     /// of a request head. Values below [`HTTP1_MIN_BUF_SIZE`] are raised to it.
     pub(crate) http1_max_buf_size: usize,
+    /// How long the listeners keep accepting and serving after the shutdown
+    /// notice, with `/ready` and `/ready/any` reporting draining, before they
+    /// close and the drain starts (`--shutdown-delay`); zero closes them at
+    /// once.
+    pub(crate) shutdown_delay: Duration,
 }
 
 /// Hashes of the submissions this gateway forwarded to a worker within the
@@ -302,20 +314,30 @@ impl RecentEntries {
 /// JSON body of the gateway's `/ready` response.
 #[derive(Debug, Serialize)]
 struct ReadyBody {
-    /// Whether at least one upstream worker is currently ready.
+    /// Whether at least one upstream worker is currently ready and the gateway
+    /// is not shutting down.
     ready: bool,
+    /// Whether the gateway is shutting down; serialized only when true, so the
+    /// body is unchanged while no shutdown is in progress.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    draining: bool,
 }
 
 /// JSON body of the gateway's `/ready/any` response.
 #[derive(Debug, Serialize)]
 struct ReadyAnyBody {
-    /// Whether the gateway can serve any route.
+    /// Whether the gateway can serve any route and is not shutting down.
     ready: bool,
-    /// Whether at least one upstream worker is ready (what `/ready` reports).
+    /// Whether at least one upstream worker is ready (what `/ready` reports
+    /// outside shutdown).
     submissions: bool,
     /// Whether the query upstream (`--redirect-queries`) is up by the
     /// poller's probes; always `false` without a redirect.
     queries: bool,
+    /// Whether the gateway is shutting down; serialized only when true, like
+    /// `/ready`'s.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    draining: bool,
 }
 
 /// The in-flight request-byte budget (`--max-inflight-request-bytes`): byte
@@ -639,39 +661,45 @@ async fn liveness() -> impl IntoResponse {
 }
 
 /// Readiness probe: `200` when at least one upstream worker is ready, else
-/// `503`.
+/// `503`. Once shutdown begins it is `503` with `"draining": true`, whatever
+/// the workers report, so fronts that probe it stop routing here during
+/// `--shutdown-delay` while the listener still serves.
 ///
 /// It means "this gateway can take submissions". With `--redirect-queries`
 /// set, reads other than the few kept on the worker keep working while it
 /// reports `503`, and the query upstream's state does not change it;
 /// [`ready_any`] reports that.
 async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
-    let ready = state.readiness.any_ready();
+    let draining = state.draining.load(Ordering::Relaxed);
+    let ready = !draining && state.readiness.any_ready();
     let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
-    (status, Json(ReadyBody { ready }))
+    (status, Json(ReadyBody { ready, draining }))
 }
 
 /// Read-availability probe: `200` when the gateway can serve any route, that
 /// is when `/ready` would, or when `--redirect-queries` is set and the query
 /// upstream is up by the poller's probes (see
 /// [`GatewayReadiness::query_ready`]); else `503`. Without a redirect it is
-/// exactly `/ready`.
+/// exactly `/ready`. Once shutdown begins it is `503` with `"draining": true`,
+/// like `/ready`, whatever the upstreams report.
 ///
 /// Every gateway in front of a validator polls the same worker, so a front
 /// that drops gateways on `/ready` drops all of them during a worker outage,
 /// and the reads they could still serve go down too. This probe keeps them in
 /// rotation while the query upstream answers.
 async fn ready_any(State(state): State<AppState>) -> impl IntoResponse {
-    let ready = state.readiness.any_route_ready();
+    let draining = state.draining.load(Ordering::Relaxed);
+    let ready = !draining && state.readiness.any_route_ready();
     let status = if ready { StatusCode::OK } else { StatusCode::SERVICE_UNAVAILABLE };
     let submissions = state.readiness.any_ready();
     let queries = state.readiness.query_ready();
-    (status, Json(ReadyAnyBody { ready, submissions, queries }))
+    (status, Json(ReadyAnyBody { ready, submissions, queries, draining }))
 }
 
-/// Bind `listen_addr` and serve until `shutdown` fires, then stop accepting and
-/// drain in-flight requests until they finish or `graceful_timeout` elapses,
-/// whichever comes first.
+/// Bind `listen_addr` and serve until `shutdown` fires. Then report draining
+/// on `/ready` and `/ready/any` while still accepting and serving for
+/// `limits.shutdown_delay`, stop accepting, and drain in-flight requests until
+/// they finish or `graceful_timeout` elapses, whichever comes first.
 pub(crate) async fn serve(
     listen_addr: SocketAddr,
     state: AppState,
@@ -685,6 +713,7 @@ pub(crate) async fn serve(
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "worker gateway listening");
 
+    let draining = Arc::clone(&state.draining);
     let app = router(
         state,
         limits.request_deadline,
@@ -693,13 +722,15 @@ pub(crate) async fn serve(
         rate_limiters,
         Arc::clone(&trusted_proxies),
     );
-    accept_loop(listener, app, limits, trusted_proxies, graceful_timeout, shutdown).await
+    accept_loop(listener, app, limits, trusted_proxies, draining, graceful_timeout, shutdown).await
 }
 
 /// Accept connections until `shutdown` fires, serving each on its own task
 /// with the configured header deadline, `TCP_NODELAY`, transport-stall
-/// deadline, lifetime cap, and global and per-client connection caps, then
-/// drain within `graceful_timeout`.
+/// deadline, lifetime cap, and global and per-client connection caps. On the
+/// notice, set `draining` (the flag `/ready` and `/ready/any` report) and keep
+/// accepting and serving for `limits.shutdown_delay`; then close the listener
+/// and drain within `graceful_timeout`.
 ///
 /// The two write-path guards close the response-side slow loris: the
 /// whole-request deadline stops covering a response once its head is produced,
@@ -735,6 +766,7 @@ async fn accept_loop(
     app: Router,
     limits: ServerLimits,
     trusted_proxies: Arc<TrustedProxies>,
+    draining: Arc<AtomicBool>,
     graceful_timeout: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
@@ -761,11 +793,20 @@ async fn accept_loop(
         .max_connections_per_ip
         .map(|max| Arc::new(ClientConnections::new(max, limits.client_prefix)));
 
+    // Draining is reported from the notice on, and the listener closes once
+    // the shutdown delay has run out (see [`until_listener_closes`]).
+    let stop_accepting =
+        until_listener_closes(&shutdown, &draining, limits.shutdown_delay, "client");
+    tokio::pin!(stop_accepting);
+
+    // Both selects are `biased` toward `stop_accepting`, so the notice is seen
+    // (and draining set) before another connection is accepted.
     loop {
         // Backpressure: once `max_connections` are open, leave new connections
         // in the OS accept backlog instead of accepting without bound.
         let permit = tokio::select! {
-            () = &shutdown => break,
+            biased;
+            () = &mut stop_accepting => break,
             permit = Arc::clone(&limiter).acquire_owned() => permit,
         };
         // The semaphore is never closed, so acquisition cannot fail; bail out
@@ -773,7 +814,8 @@ async fn accept_loop(
         let Ok(permit) = permit else { break };
 
         let accepted = tokio::select! {
-            () = &shutdown => break,
+            biased;
+            () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
         let Ok((mut stream, peer_addr)) = accepted.inspect_err(|err| {
@@ -819,10 +861,14 @@ async fn accept_loop(
             || Either::Left(future::pending::<()>()),
             |cap| Either::Right(tokio::time::sleep(cap)),
         );
-        // Taken at accept, so a shutdown that starts while a PROXY header is
-        // still arriving waits for this connection too. The future below owns
-        // it and drops it when the connection ends.
-        let mut draining = drain.subscribe();
+        // Taken at accept, so a drain that starts (after the shutdown delay)
+        // while a PROXY header is still arriving waits for this connection
+        // too. The drain does not cut the header read, which the header read
+        // timeout and the lifetime cap already bound; once the connection is
+        // built it sees the signal at once and closes after the exchange in
+        // flight. The future below owns the receiver and drops it when the
+        // connection ends.
+        let mut drain_signal = drain.subscribe();
         let connection = async move {
             let mut lifetime_cap = pin!(lifetime_cap);
             let client_addr = match proxy_header_deadline {
@@ -902,7 +948,7 @@ async fn accept_loop(
                 }
                 // an error means the accept loop has returned, which it only
                 // does after shutdown, so both outcomes mean "drain"
-                _ = draining.changed() => Some(graceful_timeout),
+                _ = drain_signal.changed() => Some(graceful_timeout),
             };
             // Take no further requests: hyper closes an idle connection at
             // once and lets the exchange in flight finish first. The grace
@@ -951,6 +997,33 @@ async fn accept_loop(
     Ok(())
 }
 
+/// Resolve when a listener should stop accepting: `shutdown_delay` after the
+/// shutdown notice. `draining` is set at the notice, so `/ready` and
+/// `/ready/any` answer `503` from then on, on either listener, while new
+/// connections are still accepted and served: fronts that probe them (DNS
+/// checks, external load balancers) stop routing here before the listener
+/// closes. Both accept loops race their `accept` against this, `biased` toward
+/// it, so the notice is seen (and draining set) before another connection is
+/// accepted, and none is accepted once it resolves.
+async fn until_listener_closes(
+    shutdown: &Noticer,
+    draining: &AtomicBool,
+    shutdown_delay: Duration,
+    listener: &'static str,
+) {
+    shutdown.await;
+    draining.store(true, Ordering::Relaxed);
+    if !shutdown_delay.is_zero() {
+        info!(
+            target: "gateway::server",
+            listener,
+            delay = ?shutdown_delay,
+            "shutdown signal received; reporting draining before closing the listener"
+        );
+        tokio::time::sleep(shutdown_delay).await;
+    }
+}
+
 /// Read the PROXY protocol v2 header a trusted front opens `stream` with,
 /// within `deadline`, and return the address the connection's requests come
 /// from: the source the header names, or `peer_addr` for a `LOCAL` header.
@@ -995,21 +1068,38 @@ fn probe_router(state: AppState) -> Router {
         .with_state(state)
 }
 
-/// Bind `probe_addr` and serve the probe-only router until `shutdown` fires.
+/// Bind `probe_addr` and serve the probe-only router until `shutdown` fires
+/// and `shutdown_delay` has run out (see [`probe_accept_loop`]).
 pub(crate) async fn serve_probes(
     probe_addr: SocketAddr,
     state: AppState,
     header_read_timeout: Duration,
+    shutdown_delay: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
     let listener = TcpListener::bind(probe_addr).await?;
     let local_addr = listener.local_addr()?;
     info!(target: "gateway::server", %local_addr, "probe listener listening");
-    probe_accept_loop(listener, probe_router(state), header_read_timeout, shutdown).await
+    let draining = Arc::clone(&state.draining);
+    probe_accept_loop(
+        listener,
+        probe_router(state),
+        header_read_timeout,
+        draining,
+        shutdown_delay,
+        shutdown,
+    )
+    .await
 }
 
-/// Accept probe connections until `shutdown` fires, serving each on its own
-/// task, then stop accepting and let in-flight probes finish.
+/// Accept probe connections until `shutdown` fires and `shutdown_delay` has
+/// run out, serving each on its own task, then stop accepting and let
+/// in-flight probes finish.
+///
+/// The shutdown delay applies here as on the client listener: on the notice
+/// `draining` is set and this listener keeps answering, so the probes that
+/// target it see `/ready` and `/ready/any` turn `503` before either listener
+/// closes; the two close together.
 ///
 /// There is deliberately no connection cap: a cap is the thing a flood
 /// exhausts, and this listener exists so the probes still answer when the
@@ -1024,6 +1114,8 @@ async fn probe_accept_loop(
     listener: TcpListener,
     app: Router,
     header_read_timeout: Duration,
+    draining: Arc<AtomicBool>,
+    shutdown_delay: Duration,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
     let mut connection_builder = hyper::server::conn::http1::Builder::new();
@@ -1033,10 +1125,13 @@ async fn probe_accept_loop(
         .keep_alive(false)
         .max_buf_size(8 * 1024);
     let graceful = GracefulShutdown::new();
+    let stop_accepting = until_listener_closes(&shutdown, &draining, shutdown_delay, "probe");
+    tokio::pin!(stop_accepting);
 
     loop {
         let accepted = tokio::select! {
-            () = &shutdown => break,
+            biased;
+            () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
         let Ok((stream, _)) = accepted.inspect_err(|err| {
@@ -1123,6 +1218,8 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt as _, AsyncWriteExt as _},
         net::TcpStream,
+        sync::Notify,
+        task::JoinHandle,
     };
     use tokio_rustls::{
         rustls::{
@@ -1131,6 +1228,9 @@ mod tests {
         },
         TlsAcceptor,
     };
+
+    /// Graceful drain timeout of the accept loops the helpers below spawn.
+    const GRACEFUL_TIMEOUT: Duration = Duration::from_secs(1);
 
     /// Generous limits so only the behavior under test can trip.
     fn test_limits() -> ServerLimits {
@@ -1146,6 +1246,7 @@ mod tests {
             proxy_protocol: None,
             max_inflight_request_bytes: None,
             http1_max_buf_size: HTTP1_MAX_BUF_SIZE,
+            shutdown_delay: Duration::ZERO,
         }
     }
 
@@ -1171,6 +1272,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            draining: Arc::default(),
         }
     }
 
@@ -1194,15 +1296,48 @@ mod tests {
         limits: ServerLimits,
         trusted: Arc<TrustedProxies>,
     ) -> (SocketAddr, Notifier) {
+        let (addr, shutdown, _accept) =
+            spawn_accept_loop(app, limits, trusted, Arc::default()).await;
+        (addr, shutdown)
+    }
+
+    /// [`spawn_with_limits`] with a shutdown delay, setting `draining` (pass
+    /// the flag of the state `app` was built from) on the notice. Notifying
+    /// the returned `Notifier` starts the shutdown; the returned handle
+    /// resolves when the accept loop's drain ends.
+    async fn spawn_draining(
+        app: Router,
+        limits: ServerLimits,
+        draining: Arc<AtomicBool>,
+        shutdown_delay: Duration,
+    ) -> (SocketAddr, Notifier, JoinHandle<Result<(), TaskError>>) {
+        let limits = ServerLimits { shutdown_delay, ..limits };
+        spawn_accept_loop(app, limits, Arc::default(), draining).await
+    }
+
+    /// Run the real accept loop for `app` on an ephemeral port with `trusted`
+    /// as its `--trusted-proxies` and `draining` as the flag it sets on the
+    /// notice, returning the address, the shutdown `Notifier` and the loop's
+    /// handle.
+    async fn spawn_accept_loop(
+        app: Router,
+        limits: ServerLimits,
+        trusted: Arc<TrustedProxies>,
+        draining: Arc<AtomicBool>,
+    ) -> (SocketAddr, Notifier, JoinHandle<Result<(), TaskError>>) {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
         let shutdown = Notifier::new();
-        let noticer = shutdown.subscribe();
-        tokio::spawn(async move {
-            let _ =
-                accept_loop(listener, app, limits, trusted, Duration::from_secs(1), noticer).await;
-        });
-        (addr, shutdown)
+        let accept = tokio::spawn(accept_loop(
+            listener,
+            app,
+            limits,
+            trusted,
+            draining,
+            GRACEFUL_TIMEOUT,
+            shutdown.subscribe(),
+        ));
+        (addr, shutdown, accept)
     }
 
     async fn spawn(app: Router) -> (SocketAddr, Notifier) {
@@ -1213,20 +1348,31 @@ mod tests {
     /// loop on a second ephemeral port, as `--probe-addr` does. The returned
     /// `Notifier` keeps the listener alive for the test's duration.
     async fn spawn_probes(state: AppState) -> (SocketAddr, Notifier) {
+        let shutdown = Notifier::new();
+        let addr = spawn_probes_until(state, Duration::ZERO, shutdown.subscribe()).await;
+        (addr, shutdown)
+    }
+
+    /// [`spawn_probes`] with a shutdown delay, stopping on `shutdown` (which
+    /// may also stop a client listener, as in `app::run`) and setting the
+    /// state's `draining` flag on the notice.
+    async fn spawn_probes_until(
+        state: AppState,
+        shutdown_delay: Duration,
+        shutdown: Noticer,
+    ) -> SocketAddr {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
         let addr = listener.local_addr().expect("local addr");
-        let shutdown = Notifier::new();
-        let noticer = shutdown.subscribe();
-        tokio::spawn(async move {
-            let _ = probe_accept_loop(
-                listener,
-                probe_router(state),
-                test_limits().header_read_timeout,
-                noticer,
-            )
-            .await;
-        });
-        (addr, shutdown)
+        let draining = Arc::clone(&state.draining);
+        tokio::spawn(probe_accept_loop(
+            listener,
+            probe_router(state),
+            test_limits().header_read_timeout,
+            draining,
+            shutdown_delay,
+            shutdown,
+        ));
+        addr
     }
 
     fn upstream(addr: SocketAddr) -> UpstreamWorker {
@@ -1875,6 +2021,7 @@ mod tests {
             test_router(state),
             test_limits(),
             Arc::default(),
+            Arc::default(),
             Duration::from_secs(30),
             shutdown.subscribe(),
         ));
@@ -2089,6 +2236,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            draining: Arc::default(),
         }
     }
 
@@ -7063,6 +7211,256 @@ mod tests {
             lines[2].contains(" INFO ") && lines[2].contains("could not compare the chain ids"),
             "{}",
             lines[2]
+        );
+    }
+
+    /// A mock upstream whose POST handler signals `received`, then holds the
+    /// request until `release` is notified and answers `"slow"`. Both are
+    /// `Notify` permits, so neither signal is lost to ordering.
+    async fn gated_mock() -> (SocketAddr, Arc<Notify>, Arc<Notify>, Notifier) {
+        let (received, release) = (Arc::new(Notify::new()), Arc::new(Notify::new()));
+        let (signal, gate) = (Arc::clone(&received), Arc::clone(&release));
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let (signal, gate) = (Arc::clone(&signal), Arc::clone(&gate));
+                async move {
+                    signal.notify_one();
+                    gate.notified().await;
+                    "slow"
+                }
+            }),
+        );
+        let (addr, shutdown) = spawn(mock).await;
+        (addr, received, release, shutdown)
+    }
+
+    /// GET `/ready` over a fresh connection, returning the status and the JSON
+    /// body.
+    async fn get_ready(gateway: SocketAddr) -> (StatusCode, serde_json::Value) {
+        get_probe(gateway, READY_PATH).await
+    }
+
+    /// Open fresh connections to `addr` until one is refused (or reset, when
+    /// the listener closes mid-handshake) and return how long after `since`
+    /// that was. A connection still accepted is dropped and retried; panics if
+    /// the listener is still open after 10s.
+    async fn first_refusal(addr: SocketAddr, since: Instant) -> Duration {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match TcpStream::connect(addr).await {
+                    Ok(stream) => drop(stream),
+                    Err(err) => {
+                        assert!(
+                            matches!(
+                                err.kind(),
+                                std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::ConnectionReset
+                            ),
+                            "{err}"
+                        );
+                        return since.elapsed();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the listener should close after the shutdown notice")
+    }
+
+    /// A gateway with one ready worker at `worker`, serving through the real
+    /// accept loop with `shutdown_delay`, and that loop's handle.
+    async fn draining_gateway(
+        worker: SocketAddr,
+        shutdown_delay: Duration,
+    ) -> (SocketAddr, Notifier, JoinHandle<Result<(), TaskError>>) {
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        let draining = Arc::clone(&state.draining);
+        spawn_draining(test_router(state), test_limits(), draining, shutdown_delay).await
+    }
+
+    /// Start a POST that the gated mock holds and return once it has reached
+    /// the mock.
+    async fn held_post(gateway: SocketAddr, received: &Notify) -> JoinHandle<(StatusCode, String)> {
+        let in_flight = tokio::spawn(post_rpc(gateway, None, call("eth_chainId", 1)));
+        tokio::time::timeout(Duration::from_secs(5), received.notified())
+            .await
+            .expect("the POST should reach the mock");
+        in_flight
+    }
+
+    /// Keep a POST held at the gated mock across the shutdown notice, wait for
+    /// the gateway's listener to refuse a new connection, then release the
+    /// POST and check that the drain ends before the graceful deadline and the
+    /// POST still completes. With a delay the POST is accepted during it;
+    /// without one the listener closes at the notice, so the POST is accepted
+    /// before the notice. Returns how long after the notice the listener
+    /// closed.
+    async fn listener_close_with_a_held_post(shutdown_delay: Duration) -> Duration {
+        let (worker, received, release, _worker) = gated_mock().await;
+        let (gateway, shutdown, accept) = draining_gateway(worker, shutdown_delay).await;
+
+        let notify = || {
+            let notice = Instant::now();
+            shutdown.notify();
+            notice
+        };
+        let (notice, in_flight) = if shutdown_delay.is_zero() {
+            let in_flight = held_post(gateway, &received).await;
+            (notify(), in_flight)
+        } else {
+            let notice = notify();
+            (notice, held_post(gateway, &received).await)
+        };
+
+        let closed_after = first_refusal(gateway, notice).await;
+        assert!(!in_flight.is_finished(), "the held POST must still be in flight");
+        assert!(!accept.is_finished(), "the drain must wait for the held POST");
+
+        release.notify_one();
+        tokio::time::timeout(GRACEFUL_TIMEOUT + Duration::from_millis(500), accept)
+            .await
+            .expect("the drain should end within the graceful timeout")
+            .expect("join")
+            .expect("accept loop result");
+        // the graceful deadline is armed when the listener closes, so it
+        // cannot fire before `shutdown_delay + GRACEFUL_TIMEOUT` after the
+        // notice; a drain that ended sooner waited for the held POST
+        assert!(
+            notice.elapsed() < shutdown_delay + GRACEFUL_TIMEOUT,
+            "the drain ended at the graceful deadline, not when the held POST finished"
+        );
+        let (status, text) = tokio::time::timeout(Duration::from_secs(5), in_flight)
+            .await
+            .expect("the in-flight POST should finish during the drain")
+            .expect("join");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "slow"));
+        closed_after
+    }
+
+    #[tokio::test]
+    async fn ready_reports_503_during_the_shutdown_delay_while_posts_succeed() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (gateway, shutdown, _accept) =
+            draining_gateway(worker, Duration::from_millis(500)).await;
+        assert_eq!(get_ready(gateway).await, (StatusCode::OK, serde_json::json!({"ready": true})));
+
+        shutdown.notify();
+
+        // every request below opens a new connection, so each one is accepted
+        // after the notice
+        assert_eq!(
+            get_ready(gateway).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({"ready": false, "draining": true})
+            )
+        );
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn after_the_delay_new_connections_are_refused_and_inflight_finish() {
+        // long enough for the POST started after the notice to be accepted
+        // before the listener closes
+        let shutdown_delay = Duration::from_secs(1);
+        let closed_after = listener_close_with_a_held_post(shutdown_delay).await;
+        // timers never fire early, so a listener closed before the delay ran
+        // out would show up here
+        assert!(
+            closed_after >= shutdown_delay,
+            "the listener closed {closed_after:?} after the notice, inside the {shutdown_delay:?} delay"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_delay_keeps_the_old_behaviour() {
+        // no shutdown in progress: the `/ready` body is the old one, with no
+        // `draining` key
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let (gateway, _shutdown, _accept) = draining_gateway(worker, Duration::ZERO).await;
+        let (status, body) = get_ready(gateway).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.to_string(), r#"{"ready":true}"#);
+
+        // the listener closes on the notice and the in-flight POST still
+        // finishes
+        listener_close_with_a_held_post(Duration::ZERO).await;
+    }
+
+    #[tokio::test]
+    async fn ready_any_reports_503_during_the_shutdown_delay_while_posts_succeed() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (gateway, shutdown, _accept) =
+            draining_gateway(worker, Duration::from_millis(500)).await;
+        assert_eq!(
+            get_probe(gateway, READY_ANY_PATH).await,
+            (
+                StatusCode::OK,
+                serde_json::json!({"ready": true, "submissions": true, "queries": false})
+            )
+        );
+
+        shutdown.notify();
+
+        // every request below opens a new connection, so each one is accepted
+        // after the notice; the worker is still ready, only draining turns
+        // the probe
+        assert_eq!(
+            get_probe(gateway, READY_ANY_PATH).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                serde_json::json!({
+                    "ready": false,
+                    "submissions": true,
+                    "queries": false,
+                    "draining": true,
+                })
+            )
+        );
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        assert_eq!(worker_seen.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn probe_listener_reports_draining_through_the_shutdown_delay() {
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let state = test_state(&[upstream(worker)]);
+        state.readiness.set_ready(0, true);
+        let shutdown_delay = Duration::from_secs(1);
+        let shutdown = Notifier::new();
+        let probes = spawn_probes_until(state, shutdown_delay, shutdown.subscribe()).await;
+        assert_eq!(get_probe(probes, READY_PATH).await.0, StatusCode::OK);
+
+        let notice = Instant::now();
+        shutdown.notify();
+
+        // the probe listener keeps answering through the delay, and both
+        // readiness probes report the drain on it
+        let draining = |status: StatusCode, body: serde_json::Value| {
+            status == StatusCode::SERVICE_UNAVAILABLE && body["draining"] == true
+        };
+        let (status, body) = get_probe(probes, READY_PATH).await;
+        assert!(draining(status, body.clone()), "{status} {body}");
+        let (status, body) = get_probe(probes, READY_ANY_PATH).await;
+        assert!(draining(status, body.clone()), "{status} {body}");
+        let health =
+            Client::new().get(format!("http://{probes}{HEALTH_PATH}")).send().await.expect("send");
+        assert_eq!(health.status(), StatusCode::OK);
+        assert!(notice.elapsed() < shutdown_delay, "the probes above must run inside the delay");
+
+        // then it closes, not before the delay ran out (timers never fire
+        // early)
+        let closed_after = first_refusal(probes, notice).await;
+        assert!(
+            closed_after >= shutdown_delay,
+            "the probe listener closed {closed_after:?} after the notice, inside the \
+             {shutdown_delay:?} delay"
         );
     }
 }

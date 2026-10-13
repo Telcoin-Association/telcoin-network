@@ -161,6 +161,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
 | `--trusted-proxies` | `WORKER_GATEWAY_TRUSTED_PROXIES` | (none) | Comma-separated CIDR ranges (a bare address is one host) of the fronts whose `X-Forwarded-For`, `X-Forwarded-Proto` and PROXY header the gateway believes; unset trusts none. See [Client identity behind a front](#client-identity-behind-a-front). |
 | `--proxy-protocol` | `WORKER_GATEWAY_PROXY_PROTOCOL` | `false` | Expect a PROXY protocol v2 header on every connection from a `--trusted-proxies` peer (the env value is `true` or `false`); requires `--trusted-proxies`. |
+| `--shutdown-delay` | `WORKER_GATEWAY_SHUTDOWN_DELAY` | `0s` | How long to keep serving after SIGTERM, with `/ready` and `/ready/any` reporting draining, before the listeners close (`0` disables; at most `60s`); see [Graceful shutdown](#graceful-shutdown). |
 | `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
@@ -624,10 +625,12 @@ The check runs once; a query URL that changes chains later is not detected.
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
 - `GET /ready`: readiness, `200` when at least one upstream is ready, else
-  `503` with `{"ready": false}`.
+  `503` with `{"ready": false}`; during the shutdown delay, `503` with
+  `{"ready": false, "draining": true}`.
 - `GET /ready/any`: read availability, `200` when the gateway can serve any route, else `503`.
   It answers `200` when `/ready` would, or when `--redirect-queries` is set and the gateway's probes find the query URL up (see [Query redirect](#query-redirect)); without `--redirect-queries` it is exactly `/ready`.
-  The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports and `queries` whether the query URL is up.
+  The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports outside shutdown and `queries` whether the query URL is up.
+  During the shutdown delay it is `503` with `"ready": false` and `"draining": true` added, like `/ready`.
 - `POST` to any other path: JSON-RPC, forwarded to a ready upstream worker unless the [method policy](#method-policy) refuses it, or, with `--redirect-queries`, to the query URL unless it is a submission or one of the [reads kept on the worker](#reads-kept-on-the-worker).
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
@@ -638,6 +641,7 @@ With `--probe-addr <addr>` set, they also answer on a listener of their own that
 Each connection to it serves one request, whose head must arrive within the header read deadline and be at most 8 KiB; a larger head gets `431`.
 A flood that holds every client connection then cannot make the probes time out, as it can on the client port, where a timed-out liveness probe gets a healthy pod restarted.
 Point orchestrator probes at it, and keep it reachable from the orchestrator only, since it has no connection cap.
+It keeps answering through the shutdown delay, so probes aimed at it see the draining `503`, and stops accepting when the client listener does (see [Graceful shutdown](#graceful-shutdown)).
 `--probe-addr` must not collide with `--listen-addr`; the gateway refuses to start if it does.
 
 ## Behaviour on failure
@@ -710,10 +714,22 @@ spec's standard "Invalid Request" code, used for both the unreadable-body
 
 ## Graceful shutdown
 
-On SIGTERM (or ctrl-c) the gateway stops accepting new connections and drains
-in-flight requests, up to `--graceful-shutdown-timeout`. Requests still running
-after the deadline are force-closed.
-The probe listener stops accepting at the same moment.
+On SIGTERM (or ctrl-c) the gateway shuts down in two phases.
+
+1. Shutdown delay (`--shutdown-delay`, off by default): the gateway keeps accepting and serving new connections, but `/ready` and `/ready/any` answer `503` with `"ready": false` and `"draining": true`.
+   Fronts that act on either probe (DNS health checks, external load balancers) see the `503` and stop routing new clients here before the listener closes, provided they act within the delay.
+   In Kubernetes the Service drops a terminating pod from its ready endpoints as soon as the pod is deleted, whatever its readiness probe says; there the delay covers the time that removal takes to reach kube-proxy and load balancers, as a `preStop` sleep would.
+   The readiness poller keeps running, so requests accepted during the delay are routed on live upstream readiness.
+2. Drain: the gateway stops accepting new connections and drains in-flight requests, up to `--graceful-shutdown-timeout`.
+   Each connection finishes the exchange in flight and closes; an idle one closes at once.
+   Requests still running after the deadline are force-closed.
+
+The probe listener (`--probe-addr`) follows the same phases: it keeps answering through the delay and stops accepting at the same moment as the client listener.
+With the delay at `0` the first phase is skipped: the listeners close as soon as the signal arrives, and a front that has not noticed yet sees refused connections.
+Set the delay to at least the time your fronts outside Kubernetes take to act on a failing `/ready` or `/ready/any` (health-check interval times unhealthy threshold, plus the record TTL for DNS).
+A request accepted just before the listener closes can run for the whole request deadline, `--upstream-request-timeout` plus `--header-read-timeout` (45s at the defaults), so the `30s` default drain can cut a slow `eth_sendRawTransactionSync` short; set the drain timeout to that deadline if those answers must survive a shutdown.
+Keep the delay plus the drain timeout plus about 1s inside the orchestrator's termination grace period.
+The reference manifest uses a 5s delay, a 45s drain and a 55s grace period; the 5s covers Kubernetes endpoint removal only (see `deploy/README.md`).
 
 ## Observability
 

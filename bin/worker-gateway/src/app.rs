@@ -5,11 +5,12 @@ use std::{
     future::Future,
     num::{NonZeroU32, NonZeroUsize},
     sync::Arc,
+    time::Duration,
 };
 
 use eyre::WrapErr as _;
 use reqwest::Client;
-use tn_types::{ShutdownNotifier, TaskError, TaskManager};
+use tn_types::{Noticer, ShutdownNotifier, TaskError, TaskManager};
 use tracing::{info, warn};
 use url::Url;
 
@@ -43,6 +44,13 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 /// readiness poller as critical tasks under a [`TaskManager`] and blocks on
 /// `join_until_exit`, which installs the SIGTERM/ctrl-c handler and drains the
 /// tasks on shutdown.
+///
+/// Shutdown runs in two phases. On the notice both listeners set `draining`,
+/// so `/ready` and `/ready/any` answer `503`, and keep accepting and serving
+/// for `--shutdown-delay` while the poller keeps routing on live readiness.
+/// Then the listeners close together, the poller stops, and the server drains
+/// in-flight requests within `--graceful-shutdown-timeout`; the task manager's
+/// join wait covers both phases.
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     ensure_root_store(&settings, native_root_count)?;
 
@@ -91,6 +99,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies,
         proxy_protocol,
         rate_limit_submissions,
+        shutdown_delay,
         graceful_shutdown_timeout,
         metrics_addr,
     } = settings;
@@ -186,11 +195,17 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     }
 
     let mut task_manager = TaskManager::new("worker-gateway");
-    // Let in-flight requests drain within the graceful deadline (plus a small
-    // margin) before the task manager reaps the server task.
+    // Let the server keep serving through the shutdown delay and then drain
+    // in-flight requests within the graceful deadline (plus a small margin)
+    // before the task manager reaps the server task.
     task_manager.set_join_wait(
-        u64::try_from(graceful_shutdown_timeout.as_millis().saturating_add(1_000))
-            .unwrap_or(u64::MAX),
+        u64::try_from(
+            shutdown_delay
+                .saturating_add(graceful_shutdown_timeout)
+                .as_millis()
+                .saturating_add(1_000),
+        )
+        .unwrap_or(u64::MAX),
     );
     let spawner = task_manager.get_spawner();
     let shutdown = ShutdownNotifier::new();
@@ -252,6 +267,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         submission_slots: inflight_slots(max_inflight_submissions),
         query_slots: inflight_slots(max_inflight_queries),
         upstream_slots: inflight_slots(max_upstream_inflight),
+        draining: Arc::default(),
     };
 
     // compare the query upstream's chain with the first worker's in the
@@ -263,12 +279,13 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 
     spawner.spawn_critical_task(
         "readiness-poller",
-        run_poller(
+        run_poller_until_listener_closes(
             readiness,
             readiness_client,
             query_probe,
             readiness_poll_interval,
             readiness_poll_timeout,
+            shutdown_delay,
             shutdown.subscribe(),
         ),
     );
@@ -293,6 +310,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         proxy_protocol: proxy_protocol.then(|| Arc::clone(&trusted_proxies)),
         max_inflight_request_bytes,
         http1_max_buf_size,
+        shutdown_delay,
     };
 
     // Sweep idle per-IP buckets while the gateway runs (only when a limiter is
@@ -311,11 +329,19 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         run_throttle_summaries(&WARNING_THROTTLES, shutdown.subscribe()),
     );
     // With `--probe-addr` set, the probes also get a listener of their own,
-    // outside the client connection cap and the rate limits.
+    // outside the client connection cap and the rate limits. It keeps
+    // answering through the shutdown delay, so the kubelet and any front
+    // probing it see the draining `503`, and closes with the client listener.
     if let Some(probe_addr) = probe_addr {
         spawner.spawn_critical_task(
             "probe-server",
-            serve_probes(probe_addr, state.clone(), header_read_timeout, shutdown.subscribe()),
+            serve_probes(
+                probe_addr,
+                state.clone(),
+                header_read_timeout,
+                shutdown_delay,
+                shutdown.subscribe(),
+            ),
         );
     }
 
@@ -543,21 +569,66 @@ pub(crate) fn log_chain_id_check(check: &ChainIdCheck, worker: &Url, query: &Url
     }
 }
 
+/// Run the readiness poller until the server's listener closes.
+///
+/// The server keeps accepting and routing submissions on this readiness view
+/// for `shutdown_delay` after the shutdown notice, so the poller keeps polling
+/// through the delay and stops when it ends. With no delay it stops at the
+/// notice, as the listener does.
+async fn run_poller_until_listener_closes(
+    readiness: Arc<GatewayReadiness>,
+    client: Client,
+    query_probe: Option<QueryProbe>,
+    poll_interval: Duration,
+    poll_timeout: Duration,
+    shutdown_delay: Duration,
+    shutdown: Noticer,
+) -> Result<(), TaskError> {
+    if shutdown_delay.is_zero() {
+        return run_poller(readiness, client, query_probe, poll_interval, poll_timeout, shutdown)
+            .await;
+    }
+    let listener_closed = ShutdownNotifier::new();
+    let poller = run_poller(
+        readiness,
+        client,
+        query_probe,
+        poll_interval,
+        poll_timeout,
+        listener_closed.subscribe(),
+    );
+    tokio::pin!(poller);
+    tokio::select! {
+        result = &mut poller => return result,
+        () = async {
+            shutdown.await;
+            tokio::time::sleep(shutdown_delay).await;
+        } => {}
+    }
+    listener_closed.notify();
+    poller.await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cli::Cli;
     use axum::{
         http::{HeaderMap, StatusCode},
-        routing::post,
-        Router,
+        routing::{get, post},
+        Json, Router,
     };
     use clap::Parser as _;
     use std::{
         net::SocketAddr,
+        sync::atomic::{AtomicBool, Ordering},
         time::{Duration, Instant},
     };
-    use tokio::{net::TcpListener, sync::Notify};
+    use tokio::{
+        net::TcpListener,
+        sync::{watch, Notify},
+        task::JoinHandle,
+    };
 
     fn settings(flags: &[&str]) -> Settings {
         let argv = std::iter::once("worker-gateway").chain(flags.iter().copied());
@@ -789,6 +860,7 @@ mod tests {
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
+            draining: Arc::default(),
         }
     }
 
@@ -857,5 +929,133 @@ mod tests {
             .expect("the check ends once shutdown fires")
             .expect("the task does not panic")
             .expect("the task succeeds");
+    }
+
+    const POLL_INTERVAL: Duration = Duration::from_millis(20);
+    const POLL_TIMEOUT: Duration = Duration::from_secs(1);
+
+    /// Serve a node readiness endpoint for worker 0 on an ephemeral port that
+    /// reports `accepting`. The returned receiver counts the not-ready answers
+    /// it has served.
+    async fn mock_node(accepting: Arc<AtomicBool>) -> (UpstreamWorker, watch::Receiver<usize>) {
+        let (not_ready_tx, not_ready_answers) = watch::channel(0_usize);
+        let app = Router::new().route(
+            "/health/workers",
+            get(move || {
+                let accepting = accepting.load(Ordering::Relaxed);
+                if !accepting {
+                    not_ready_tx.send_modify(|answers| *answers += 1);
+                }
+                let body = serde_json::json!({
+                    "version": 1,
+                    "workers": [{"worker_id": 0, "accepting_transactions": accepting}],
+                });
+                async move { Json(body) }
+            }),
+        );
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: Url::parse(&format!("http://{addr}/")).expect("rpc url"),
+            readiness_url: Url::parse(&format!("http://{addr}/health/workers"))
+                .expect("readiness url"),
+        };
+        (worker, not_ready_answers)
+    }
+
+    /// Readiness of `worker` that flips on a single poll result, so each
+    /// not-ready answer the mock serves is the one that marks it not ready.
+    fn readiness_flipping_at_once(worker: UpstreamWorker) -> Arc<GatewayReadiness> {
+        let thresholds = ReadinessThresholds {
+            failure: NonZeroU32::MIN,
+            success: NonZeroU32::MIN,
+            rpc_failure: None,
+        };
+        Arc::new(GatewayReadiness::new(&[worker], thresholds))
+    }
+
+    /// Start the poller on `readiness` and wait until it has marked the
+    /// (accepting) mock worker ready.
+    async fn start_poller(
+        readiness: &Arc<GatewayReadiness>,
+        shutdown_delay: Duration,
+        shutdown: Noticer,
+    ) -> JoinHandle<Result<(), TaskError>> {
+        let poller = tokio::spawn(run_poller_until_listener_closes(
+            Arc::clone(readiness),
+            Client::new(),
+            None,
+            POLL_INTERVAL,
+            POLL_TIMEOUT,
+            shutdown_delay,
+            shutdown,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !readiness.any_ready() {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+        })
+        .await
+        .expect("the poller should mark the mock worker ready");
+        poller
+    }
+
+    #[tokio::test]
+    async fn readiness_poller_keeps_polling_through_the_shutdown_delay() {
+        let shutdown_delay = Duration::from_secs(2);
+        let accepting = Arc::new(AtomicBool::new(true));
+        let (worker, mut not_ready_answers) = mock_node(Arc::clone(&accepting)).await;
+        let readiness = readiness_flipping_at_once(worker);
+        let shutdown = ShutdownNotifier::new();
+        let poller = start_poller(&readiness, shutdown_delay, shutdown.subscribe()).await;
+
+        let notice = Instant::now();
+        shutdown.notify();
+        accepting.store(false, Ordering::Relaxed);
+
+        // a poller that stopped at the notice sends no new probe and finishes
+        // at most the one in flight, so it gets at most one not-ready answer.
+        // each probe is sent after the previous answer was applied, so by the
+        // second not-ready answer the first one has been.
+        tokio::time::timeout(shutdown_delay, not_ready_answers.wait_for(|answers| *answers >= 2))
+            .await
+            .expect("the poller should keep polling during the shutdown delay")
+            .expect("mock node alive");
+        assert!(!readiness.any_ready(), "the worker went not-ready during the delay");
+        assert!(notice.elapsed() < shutdown_delay);
+        assert!(!poller.is_finished(), "the poller must run until the listener closes");
+
+        // the listener closes when the delay ends, and the poller stops then
+        tokio::time::timeout(shutdown_delay + Duration::from_secs(5), poller)
+            .await
+            .expect("the poller should stop when the delay ends")
+            .expect("join")
+            .expect("poller result");
+        // timers never fire early
+        assert!(notice.elapsed() >= shutdown_delay);
+    }
+
+    #[tokio::test]
+    async fn readiness_poller_stops_at_the_notice_without_a_delay() {
+        let accepting = Arc::new(AtomicBool::new(true));
+        let (worker, not_ready_answers) = mock_node(Arc::clone(&accepting)).await;
+        let readiness = readiness_flipping_at_once(worker);
+        let shutdown = ShutdownNotifier::new();
+        let poller = start_poller(&readiness, Duration::ZERO, shutdown.subscribe()).await;
+
+        shutdown.notify();
+        accepting.store(false, Ordering::Relaxed);
+
+        tokio::time::timeout(Duration::from_secs(5), poller)
+            .await
+            .expect("the poller should stop at the notice")
+            .expect("join")
+            .expect("poller result");
+        // no probe was sent after the notice: only one already in flight can
+        // have seen the worker go not-ready
+        let answers = *not_ready_answers.borrow();
+        assert!(answers <= 1, "{answers} not-ready answers after the notice");
     }
 }
