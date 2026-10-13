@@ -28,9 +28,9 @@ use tn_storage::{
     },
 };
 use tn_types::{
-    deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, ConsensusHeaderDigest,
-    ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch, EpochDigest, EpochRecord,
-    SealedHeader, TnReceiver,
+    deconstruct_nonce, Batch, BlockHash, BlockNumHash, BlsPublicKey, Certificate,
+    ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Database as TNDatabase, Epoch,
+    EpochDigest, EpochRecord, Header, SealedHeader, Table, TnReceiver, VoteInfo,
 };
 use tn_worker::{quorum_waiter::QuorumWaiterTrait, Worker};
 use tokio::sync::mpsc;
@@ -524,10 +524,13 @@ where
     /// ([`Self::clear_consensus_db_for_next_epoch`]). Without it the epoch N primary rebuilds its
     /// DAG and its parents from epoch N-1 certificates and proposes headers no peer will vote for.
     ///
-    /// A cheap no-op whenever the record is already present (the common case), including epoch 0
-    /// and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)` true).
-    /// Nothing is cleared on that path: a mid-epoch restart or a mode-change re-entry into epoch N
-    /// must keep epoch N's `Votes` and `LastProposed`, which guard against equivocation.
+    /// Nothing is re-derived whenever the record is already present (the common case), including
+    /// epoch 0 and the epoch 0 -> 1 boundary (the dummy epoch-0 record keeps `contains_epoch(0)`
+    /// true). That path clears the epoch tables only when they still hold a row of an epoch older
+    /// than N ([`stale_epoch_table_row`], one row peeked per table), which a kill between an
+    /// epoch's record write and its tables clear leaves behind. A mid-epoch restart or a
+    /// mode-change re-entry into epoch N finds only epoch N's rows and keeps them, including the
+    /// `Votes` and `LastProposed` that guard against equivocation.
     pub(super) async fn recover_previous_epoch_record(
         &mut self,
         current_epoch: Epoch,
@@ -540,6 +543,27 @@ where
         if self.consensus_chain.epochs().contains_epoch(previous_epoch).await {
             // Do not be fooled by the dummy epoch 0 record on the epoch 0 -> 1 transition.
             if previous_epoch != 0 || !self.consensus_chain.epochs().contains_dummy_epoch0().await {
+                // the record is present, but a kill between its write and the epoch tables clear
+                // that follows it leaves the tables holding an older epoch's rows. clearing them
+                // here deletes nothing epoch `current_epoch` needs:
+                // - every row of an epoch table is written by that epoch's primary, and the epoch
+                //   `current_epoch` primary is only built after this function returns. a row of an
+                //   older epoch therefore proves the clear that follows that epoch's record write
+                //   never finished, and that no row of epoch `current_epoch` exists to lose: the
+                //   `Votes` and `LastProposed` rows that guard against equivocation are all from
+                //   the older epoch, which no peer votes on or builds on again
+                // - a mid-epoch restart or a mode-change re-entry into epoch `current_epoch` finds
+                //   rows of `current_epoch` only, and keeps them
+                // - the clear is one transaction per table, so a kill inside it leaves the tables
+                //   after the kill point stale. `clear_consensus_db_for_next_epoch` clears the
+                //   tables whose rows carry their epoch last, so any such remainder is found here
+                // - a datadir that a binary without this check carried through either window and
+                //   then ran the epoch `current_epoch` primary on holds both epochs' rows. there
+                //   the first point does not hold, so the clear is skipped whenever `Votes` or
+                //   `LastProposed` holds a row of `current_epoch`: those guards stay, and the older
+                //   rows go at the next boundary as they always did
+                // - `OurNodeBatchesCache` is kept, as always
+                self.clear_stale_epoch_tables(current_epoch)?;
                 return Ok(());
             }
         }
@@ -614,6 +638,44 @@ where
             "re-derived epoch record written - clearing the previous epoch's consensus db tables",
         );
         self.clear_consensus_db_for_next_epoch()?;
+        Ok(())
+    }
+
+    /// Clear the epoch tables when [`stale_epoch_table_row`] finds a row of an epoch older than
+    /// `current_epoch` in them, unless [`current_epoch_guard_row`] finds a vote or a proposal of
+    /// `current_epoch` beside it, in which case nothing is cleared and the mix is logged as an
+    /// error.
+    ///
+    /// Called by [`Self::recover_previous_epoch_record`] when the previous epoch's record is
+    /// present; the comment at that call says why the clear is safe there and when it is skipped.
+    fn clear_stale_epoch_tables(&self, current_epoch: Epoch) -> eyre::Result<()> {
+        if let Some((table, stale_epoch)) = stale_epoch_table_row(&self.consensus_db, current_epoch)
+        {
+            if let Some(guard) = current_epoch_guard_row(&self.consensus_db, current_epoch) {
+                error!(
+                    target: "epoch-manager",
+                    table,
+                    stale_epoch,
+                    current_epoch,
+                    guard,
+                    "epoch record present and the consensus db tables hold rows of an older epoch \
+                     beside a vote or proposal of the current one (a binary without this check ran \
+                     the current epoch's primary over the older rows); keeping every table so the \
+                     current epoch's equivocation guards survive, the older rows go at the next \
+                     epoch boundary",
+                );
+                return Ok(());
+            }
+            warn!(
+                target: "epoch-manager",
+                table,
+                stale_epoch,
+                current_epoch,
+                "epoch record present but the consensus db tables still hold rows of an older epoch \
+                 (killed between the record write and the tables clear); clearing them",
+            );
+            self.clear_consensus_db_for_next_epoch()?;
+        }
         Ok(())
     }
 
@@ -911,15 +973,25 @@ where
     /// [`OurNodeBatchesCache`] is deliberately left intact: `orphan_batches`
     /// still reads it to recover our un-consensed batches and clears it itself
     /// once recovery is done. Clearing it here would drop those batches.
+    ///
+    /// The order is load-bearing. Each table is cleared in its own transaction, so a kill part-way
+    /// leaves the tables after the kill point uncleared. The tables whose rows carry no epoch go
+    /// first, so a clear killed part-way always leaves a row whose epoch [`stale_epoch_table_row`]
+    /// can read, and the next start finishes the clear. The digest indexes only ever have rows
+    /// while `Certificates` does. The two batch caches live in the cache sub-database, whose writer
+    /// is separate from the epoch database's, so their clear is not ordered with the others on
+    /// disk; a batch-cache row left by a kill inside the clear is the window the per-table clears
+    /// have always had, narrower now that the caches are cleared first.
     pub(super) fn clear_consensus_db_for_next_epoch(&self) -> eyre::Result<()> {
-        self.consensus_db.clear_table::<LastProposed>()?;
-        self.consensus_db.clear_table::<Votes>()?;
-        self.consensus_db.clear_table::<Certificates>()?;
+        // the tables whose rows carry no epoch first, see above
+        self.consensus_db.clear_table::<Payload>()?;
+        self.consensus_db.clear_table::<NodeBatchesCache>()?;
         self.consensus_db.clear_table::<CertificateDigestByRound>()?;
         self.consensus_db.clear_table::<CertificateDigestByOrigin>()?;
         self.consensus_db.clear_table::<ProposedCertificates>()?;
-        self.consensus_db.clear_table::<Payload>()?;
-        self.consensus_db.clear_table::<NodeBatchesCache>()?;
+        self.consensus_db.clear_table::<LastProposed>()?;
+        self.consensus_db.clear_table::<Votes>()?;
+        self.consensus_db.clear_table::<Certificates>()?;
         // Note do not clear OurNodeBatchesCache here- we need to keep those until we process the
         // orphans and clear then.
         Ok(())
@@ -1029,15 +1101,69 @@ fn boundary_consensus_digest(
     Ok(consensus_digest)
 }
 
+/// A row the epoch tables still hold from an epoch older than `current_epoch`, as the table's
+/// name and that epoch, from the first such row found in `Certificates`, `Votes`,
+/// `LastProposed` or `ProposedCertificates` (the epoch tables whose values carry their epoch).
+///
+/// Peeks at one row per table rather than scanning: on a datadir this binary wrote, every row of
+/// one of these tables is from the primary of a single epoch, so one row decides the table. On a
+/// datadir that a binary without this check carried through a window and then ran an epoch's
+/// primary on, the first row can hide older ones; that only skips the clear, and
+/// [`current_epoch_guard_row`] decides such a datadir anyway. Rows of `current_epoch` are not
+/// stale; they are what a mid-epoch restart or a mode-change re-entry finds.
+pub(super) fn stale_epoch_table_row<DB: TNDatabase>(
+    db: &DB,
+    current_epoch: Epoch,
+) -> Option<(&'static str, Epoch)> {
+    stale_first_row::<Certificates, _>(db, current_epoch, Certificate::epoch)
+        .or_else(|| stale_first_row::<Votes, _>(db, current_epoch, VoteInfo::epoch))
+        .or_else(|| stale_first_row::<LastProposed, _>(db, current_epoch, Header::epoch))
+        .or_else(|| {
+            stale_first_row::<ProposedCertificates, _>(db, current_epoch, Certificate::epoch)
+        })
+}
+
+/// `T`'s name and the epoch `epoch_of` reads from its first row, when that epoch is older than
+/// `current_epoch`.
+fn stale_first_row<T: Table, DB: TNDatabase>(
+    db: &DB,
+    current_epoch: Epoch,
+    epoch_of: fn(&T::Value) -> Epoch,
+) -> Option<(&'static str, Epoch)> {
+    let (_, value) = db.iter::<T>().next()?;
+    let epoch = epoch_of(&value);
+    (epoch < current_epoch).then_some((T::NAME, epoch))
+}
+
+/// The name of the guard table, `Votes` or `LastProposed`, that holds a row of `current_epoch`,
+/// if either does.
+///
+/// Those two tables are what keep this node from voting twice in a round or proposing two headers
+/// for one, so they are the rows a clear must never take from the epoch in progress. `Votes`
+/// holds at most one row per authority and `LastProposed` a single row, so every row of both is
+/// read.
+pub(super) fn current_epoch_guard_row<DB: TNDatabase>(
+    db: &DB,
+    current_epoch: Epoch,
+) -> Option<&'static str> {
+    if db.iter::<Votes>().any(|(_, vote)| vote.epoch() == current_epoch) {
+        return Some(Votes::NAME);
+    }
+    db.iter::<LastProposed>()
+        .any(|(_, header)| header.epoch() == current_epoch)
+        .then_some(LastProposed::NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rand::{rngs::StdRng, SeedableRng as _};
     use tn_reth::{test_utils::TransactionFactory, RethChainSpec};
+    use tn_storage::{DatabaseType, LAST_PROPOSAL_KEY};
     use tn_types::{
-        gas_accumulator::BaseFeeContainer, test_genesis, Address, BlsKeypair, Bytes,
-        Encodable2718 as _, ExecHeader, GenesisAccount, TaskManager, WorkerId, B256,
-        MIN_PROTOCOL_BASE_FEE, U256,
+        gas_accumulator::BaseFeeContainer, test_genesis, Address, AuthorityIdentifier, BlsKeypair,
+        Bytes, Encodable2718 as _, ExecHeader, GenesisAccount, HeaderBuilder, Signer as _,
+        TaskManager, VoteDigest, WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
 
     /// Re-pool a funded transaction and verify that exactly the expected pool receives it.
@@ -1408,5 +1534,179 @@ mod tests {
         // Second call hits the NotFound arm: must be a silent no-op, not an error.
         remove_tmp_export(&tmp_dir, 3).await;
         assert!(!tmp_dir.exists(), "missing temp dir must remain a no-op");
+    }
+
+    /// The author of every row the stale-table tests write.
+    fn row_author() -> AuthorityIdentifier {
+        AuthorityIdentifier::from_bytes([3; 32])
+    }
+
+    /// A round-1 header of `epoch` by [`row_author`].
+    fn header_of_epoch(epoch: Epoch) -> Header {
+        let keypair = BlsKeypair::generate(&mut StdRng::from_seed([7; 32]));
+        HeaderBuilder::default()
+            .author(row_author())
+            .round(1)
+            .epoch(epoch)
+            .seed_signature(keypair.sign(b"stale-epoch-tables"))
+            .build()
+    }
+
+    /// An unsigned certificate for a round-1 header of `epoch`.
+    fn certificate_of_epoch(epoch: Epoch) -> Certificate {
+        let mut certificate = Certificate::default();
+        certificate.update_header_for_test(header_of_epoch(epoch));
+        certificate
+    }
+
+    /// Writes one row of an epoch into a single epoch table.
+    type RowWriter = fn(&DatabaseType, Epoch);
+
+    /// The four epoch tables whose values carry their epoch, by name, each with a writer of one
+    /// row.
+    fn epoch_carrying_tables() -> [(&'static str, RowWriter); 4] {
+        [
+            (Certificates::NAME, |db, epoch| {
+                let certificate = certificate_of_epoch(epoch);
+                db.insert::<Certificates>(&certificate.header().digest(), &certificate)
+                    .expect("insert certificate");
+            }),
+            (Votes::NAME, |db, epoch| {
+                let vote = VoteInfo { epoch, round: 1, vote_digest: VoteDigest::default() };
+                db.insert::<Votes>(&row_author(), &vote).expect("insert vote");
+            }),
+            (LastProposed::NAME, |db, epoch| {
+                db.insert::<LastProposed>(&LAST_PROPOSAL_KEY, &header_of_epoch(epoch))
+                    .expect("insert last proposal");
+            }),
+            (ProposedCertificates::NAME, |db, epoch| {
+                let certificate = certificate_of_epoch(epoch);
+                db.insert::<ProposedCertificates>(&certificate.header().digest(), &certificate)
+                    .expect("insert proposed certificate");
+            }),
+        ]
+    }
+
+    /// Empty epoch tables hold nothing stale.
+    #[test]
+    fn stale_epoch_table_row_empty_tables_is_none() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tn_storage::open_db(tmp.path());
+        assert_eq!(stale_epoch_table_row(&db, 9), None);
+    }
+
+    /// Rows of the entered epoch are what a mid-epoch restart or a mode-change re-entry finds, and
+    /// are never stale.
+    #[test]
+    fn stale_epoch_table_row_keeps_current_epoch_rows() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tn_storage::open_db(tmp.path());
+        for (_, write) in epoch_carrying_tables() {
+            write(&db, 9);
+        }
+        assert_eq!(stale_epoch_table_row(&db, 9), None);
+    }
+
+    /// A single row of an older epoch is found in whichever of the four tables holds it, and
+    /// reported with that table's name.
+    #[test]
+    fn stale_epoch_table_row_finds_an_older_row_in_each_table() {
+        for (table, write) in epoch_carrying_tables() {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let db = tn_storage::open_db(tmp.path());
+            write(&db, 8);
+            assert_eq!(stale_epoch_table_row(&db, 9), Some((table, 8)), "stale row in {table}");
+        }
+    }
+
+    /// A row of an older epoch is found beside rows of the entered epoch in the other tables,
+    /// whichever table it is in.
+    #[test]
+    fn stale_epoch_table_row_finds_an_older_row_beside_current_rows() {
+        let tables = epoch_carrying_tables();
+        for (stale, write_stale) in tables {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let db = tn_storage::open_db(tmp.path());
+            for (table, write) in tables {
+                if table != stale {
+                    write(&db, 9);
+                }
+            }
+            write_stale(&db, 8);
+            assert_eq!(stale_epoch_table_row(&db, 9), Some((stale, 8)), "stale row in {stale}");
+        }
+    }
+
+    /// A tables clear killed once the tables whose rows carry no epoch are cleared still leaves a
+    /// stale row to find, which is what clearing those tables first buys.
+    #[test]
+    fn stale_epoch_table_row_survives_a_clear_killed_after_the_epochless_tables() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tn_storage::open_db(tmp.path());
+        for (_, write) in epoch_carrying_tables() {
+            write(&db, 8);
+        }
+        let digest = certificate_of_epoch(8).header().digest();
+        let batch = BlockHash::repeat_byte(1);
+        db.insert::<Payload>(&(batch, 0), &0).expect("insert payload");
+        db.insert::<NodeBatchesCache>(&batch, &Batch::default()).expect("insert batch");
+        db.insert::<CertificateDigestByRound>(&(1, row_author()), &digest)
+            .expect("insert digest by round");
+        db.insert::<CertificateDigestByOrigin>(&(row_author(), 1), &digest)
+            .expect("insert digest by origin");
+
+        // the epoch-less tables, in `clear_consensus_db_for_next_epoch`'s order
+        db.clear_table::<Payload>().expect("clear payload");
+        db.clear_table::<NodeBatchesCache>().expect("clear batches");
+        db.clear_table::<CertificateDigestByRound>().expect("clear digests by round");
+        db.clear_table::<CertificateDigestByOrigin>().expect("clear digests by origin");
+
+        assert_eq!(stale_epoch_table_row(&db, 9), Some((Certificates::NAME, 8)));
+    }
+
+    /// Older rows alone, or beside certificates of the entered epoch, leave no guard of the
+    /// entered epoch to keep: only `Votes` and `LastProposed` are guards.
+    #[test]
+    fn current_epoch_guard_row_ignores_older_rows_and_current_certificates() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let db = tn_storage::open_db(tmp.path());
+        assert_eq!(current_epoch_guard_row(&db, 9), None, "empty tables");
+        for (_, write) in epoch_carrying_tables() {
+            write(&db, 8);
+        }
+        assert_eq!(current_epoch_guard_row(&db, 9), None, "older rows only");
+        let certificate = certificate_of_epoch(9);
+        db.insert::<Certificates>(&certificate.header().digest(), &certificate)
+            .expect("insert certificate");
+        db.insert::<ProposedCertificates>(&certificate.header().digest(), &certificate)
+            .expect("insert proposed certificate");
+        assert_eq!(current_epoch_guard_row(&db, 9), None, "certificates of the entered epoch");
+    }
+
+    /// A vote or a proposal of the entered epoch beside older rows is the datadir a binary
+    /// without the stale-tables check carried through the window; each is reported by its table.
+    #[test]
+    fn current_epoch_guard_row_finds_a_current_vote_or_proposal_beside_older_rows() {
+        for (guard, write_guard) in epoch_carrying_tables()
+            .into_iter()
+            .filter(|(table, _)| *table == Votes::NAME || *table == LastProposed::NAME)
+        {
+            let tmp = tempfile::tempdir().expect("temp dir");
+            let db = tn_storage::open_db(tmp.path());
+            for (_, write) in epoch_carrying_tables() {
+                write(&db, 8);
+            }
+            // a second author's vote of the entered epoch sits beside the older one; the single
+            // `LastProposed` slot is overwritten
+            if guard == Votes::NAME {
+                let vote = VoteInfo { epoch: 9, round: 1, vote_digest: VoteDigest::default() };
+                db.insert::<Votes>(&AuthorityIdentifier::from_bytes([4; 32]), &vote)
+                    .expect("insert vote");
+            } else {
+                write_guard(&db, 9);
+            }
+            assert_eq!(stale_epoch_table_row(&db, 9), Some((Certificates::NAME, 8)));
+            assert_eq!(current_epoch_guard_row(&db, 9), Some(guard), "guard in {guard}");
+        }
     }
 }

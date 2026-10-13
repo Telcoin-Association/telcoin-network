@@ -223,7 +223,9 @@ where
         // (advancing the on-chain epoch to N) but write_epoch_record(N-1) never persisted the
         // record
         // - re-derive record N-1 locally from the executed closing block before opening the pack.
-        // A no-op unless the previous epoch's record is actually missing.
+        // Re-derives nothing unless the previous epoch's record is actually missing. With the
+        // record present it clears the epoch tables only when they still hold rows of an older
+        // epoch (killed between the record write and the tables clear).
         self.recover_previous_epoch_record(committee.epoch(), engine).await?;
 
         let prior_epoch_record = self.open_epoch_pack(committee.clone()).await?;
