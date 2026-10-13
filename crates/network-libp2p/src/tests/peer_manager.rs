@@ -1911,6 +1911,80 @@ async fn test_self_advertised_stale_record_ignored() {
 }
 
 #[tokio::test]
+async fn test_self_advertised_identical_record_rebinds_evicted_member() {
+    // A committee member whose record was evicted pushes the SAME record again over its own
+    // connection. The cache drops it as not newer, so only the re-bind from the cached record
+    // restores its identity (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([47; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut record = random_network_info();
+    record.timestamp = 1_000;
+    let source: PeerId = record.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(source, bls, record.clone());
+    assert_eq!(peer_manager.peer_to_bls(&source), Some(bls));
+
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&source), None);
+
+    // a relayed copy cannot bind the member's key to the relayer, nor restore the member
+    let relayer = PeerId::random();
+    peer_manager.add_self_advertised_peer(relayer, bls, record.clone());
+    assert_eq!(peer_manager.peer_to_bls(&relayer), None);
+    assert_eq!(peer_manager.peer_to_bls(&source), None);
+
+    peer_manager.add_self_advertised_peer(source, bls, record);
+    assert_eq!(peer_manager.peer_to_bls(&source), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&source));
+    assert_eq!(
+        peer_manager.known_peers.get(&bls).map(|info| info.timestamp),
+        Some(1_000),
+        "cached record unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_discovered_identical_record_rebinds_evicted_member() {
+    // Kad variant: a query result carrying the cached record again restores the evicted binding
+    // (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([53; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut record = random_network_info();
+    record.timestamp = 1_000;
+    let peer_id: PeerId = record.pubkey.clone().into();
+    peer_manager.add_discovered_peer(bls, record.clone());
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), None);
+
+    peer_manager.add_discovered_peer(bls, record);
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&peer_id));
+}
+
+#[tokio::test]
+async fn test_update_committees_rebinds_evicted_member() {
+    // A slot member evicted while its cached record stayed is bound and trusted again at the next
+    // committee update (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([59; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let record = random_network_info();
+    let peer_id: PeerId = record.pubkey.clone().into();
+    peer_manager.add_discovered_peer(bls, record);
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), None);
+
+    // the member rotates from the current slot into the previous slot
+    peer_manager.update_committees(HashSet::from([bls]), HashSet::new(), HashSet::new());
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&peer_id));
+}
+
+#[tokio::test]
 async fn test_operator_add_overwrites_newer_kad_record() {
     // Operator-provisioned paths deliberately bypass the staleness guard: `add_known_peer`
     // (the AddExplicitPeer handler) inserts unconditionally, so an operator can always repair a

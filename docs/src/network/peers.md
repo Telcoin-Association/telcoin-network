@@ -171,6 +171,13 @@ An entry survives only if it is pinned — an operator-provisioned trusted, boot
 Every committee rotation prunes the rest.
 Records restored from local persistence at startup are deliberately not pinned, and records learned from the DHT are cached only for keys already in a tracked committee slot, so neither path can grow the map without bound.
 
+The peer store protects committee records in the same way.
+Disconnected and banned pruning skip the record of every member of the previous, current, and next committees, because that record holds the binding from the member's peer id to its BLS key.
+Without the binding, this node no longer recognizes the member as a validator.
+Three committee sizes bound the exempt set, so the pruning caps still bound memory.
+If another path removes a member's record, the node restores it from the cached network record when a refreshed copy of that record is dropped as stale or identical, and again at every committee update.
+The restore does not change the cached record or its timestamp, and it binds a key only to the peer id that the cached record names, so a relayed copy cannot bind a member's key to the relayer.
+
 ## Metrics
 
 Every series below is exported under the `tn_network` prefix and carries a `network` label whose value is `primary` or `worker-{worker_id}`, so read each series per label — the primary and worker swarms are independent.

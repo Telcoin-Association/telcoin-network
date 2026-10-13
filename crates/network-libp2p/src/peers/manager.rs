@@ -1164,6 +1164,18 @@ impl PeerManager {
     ) {
         self.trigger_missing_authorities(&current);
         self.trigger_missing_authorities(&next);
+        // restore the record of any slot member that was evicted while its cached record stayed,
+        // so the membership pass below binds and trusts it again (issue #1649)
+        let evicted: HashSet<BlsPublicKey> = previous
+            .iter()
+            .chain(&current)
+            .chain(&next)
+            .filter(|bls_key| {
+                self.known_peers.contains_key(*bls_key) && !self.peers.has_confirmed_record(bls_key)
+            })
+            .copied()
+            .collect();
+        evicted.into_iter().for_each(|bls_key| self.upsert_cached(bls_key));
         // forgive manager-level temporary bans for any already-known members across all three slots
         self.forgive_temporarily_banned(&previous);
         self.forgive_temporarily_banned(&current);
@@ -1522,6 +1534,9 @@ impl PeerManager {
                 ?bls_key,
                 "dropping stale discovered peer record"
             );
+            // a query result has no connection source, so the dropped record's own network key
+            // stands in for it and must match the cached record
+            self.rebind_from_cache(bls_key, info.pubkey.into());
         } else {
             self.cache_known_peer_with_timestamp(bls_key, info, timestamp);
         }
@@ -1619,6 +1634,7 @@ impl PeerManager {
                     ?source,
                     "dropping stale self-advertised record for committee member"
                 );
+                self.rebind_from_cache(bls_key, source);
             }
             () if cacheable => self.cache_known_peer_with_timestamp(bls_key, info, timestamp),
             () if source == advertised
@@ -1697,6 +1713,47 @@ impl PeerManager {
                 });
                 !timestamp.supersedes(cached, observed)
             })
+    }
+
+    /// Restore the evicted `Confirmed` record of `bls_key` from its cached record when a refreshed
+    /// copy of that record is dropped as stale or identical (issue #1649).
+    ///
+    /// The cache path skips a dropped record, so without this a member whose record was evicted
+    /// keeps its `known_peers` entry but no `bls_by_peer_id` binding, and loses its validator
+    /// identity at this node until it signs a newer record. The binding is restored only when
+    /// `source` is unbound, the cached entry is a network-learned record (not a stub), and the
+    /// cached network key derives `source`. A sender can therefore only restore the binding the
+    /// cache already holds, never bind a key to another peer id. The cached record and its
+    /// timestamp are not changed, so freshness ordering is unchanged. Committee membership is
+    /// then applied as on the cache path.
+    fn rebind_from_cache(&mut self, bls_key: BlsPublicKey, source: PeerId) {
+        let restore = self.peers.bls_for_peer(&source).is_none()
+            && !self.stub_records.contains(&bls_key)
+            && self
+                .known_peers
+                .get(&bls_key)
+                .is_some_and(|info| PeerId::from(info.pubkey.clone()) == source);
+        if restore {
+            trace!(target: "peer-manager", ?bls_key, ?source, "re-binding peer from cached record");
+            self.upsert_cached(bls_key);
+            let unban_actions = self.peers.apply_membership_if_committee(bls_key);
+            self.apply_unban_actions(unban_actions);
+        }
+    }
+
+    /// Re-insert the `Confirmed` record of `bls_key` into the peer store from its `known_peers`
+    /// entry.
+    ///
+    /// Leaves `known_peers`, `stub_records` and `known_timestamps` unchanged. A no-op when nothing
+    /// is cached for `bls_key`.
+    fn upsert_cached(&mut self, bls_key: BlsPublicKey) {
+        let cached = self
+            .known_peers
+            .get(&bls_key)
+            .map(|info| (info.pubkey.clone(), info.multiaddrs.clone()));
+        cached.into_iter().for_each(|(pubkey, multiaddrs)| {
+            self.peers.upsert_peer(bls_key, pubkey, multiaddrs);
+        });
     }
 
     /// Validate the advertised endpoint, register the peer's network identity, cache its info, and
