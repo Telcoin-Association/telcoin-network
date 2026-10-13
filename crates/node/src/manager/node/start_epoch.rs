@@ -537,8 +537,8 @@ where
     /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
     /// engine's contiguous worker indexing, then bring up the epoch networks concurrently.
     /// Extra configured swarms stay idle until a future epoch activates their ids.
-    /// Workers removed from the committee stop their RPC listeners before the new epoch's workers
-    /// start.
+    /// Workers removed from the committee close transaction admission before the new epoch's
+    /// workers start.
     #[allow(clippy::too_many_arguments)]
     async fn spawn_worker_node_components(
         &mut self,
@@ -884,21 +884,24 @@ where
 
     /// Spawn a long-running task that dials a peer by [`BlsPublicKey`], retrying with backoff.
     ///
-    /// Dialing self is skipped. Startup callers use the node-lifetime spawner, so their retries
-    /// survive epoch turnover; per-epoch callers use the epoch spawner and are cancelled at its
-    /// boundary. Backoff doubles up to 120s. Only a successful dial or an already-connected peer
-    /// ends retries immediately; an in-flight dial may still fail and must keep being retried.
-    /// Dial outcome waits and established-peer probes each have a one-second bound, including
-    /// channel admission. A timed-out outcome wait does not cancel the swarm's transport dial.
-    /// The task only gives up once it has retried enough and another peer is established.
-    /// It will not abandon dialing while isolated, and task-manager shutdown cancels retries.
+    /// Dialing self and hubs maintained by their swarm is skipped. Startup callers use the
+    /// node-lifetime spawner, so their retries survive epoch turnover; per-epoch callers use
+    /// the epoch spawner and are cancelled at its boundary. Backoff doubles up to 120s. Only a
+    /// successful dial or an already-connected peer ends retries immediately; an in-flight dial
+    /// may still fail and must keep being retried. Dial outcome waits and established-peer
+    /// probes each have a one-second bound, including channel admission. A timed-out outcome
+    /// wait does not cancel the swarm's transport dial. The task only gives up once it has
+    /// retried enough and another peer is established. It will not abandon dialing while
+    /// isolated, and task-manager shutdown cancels retries.
     pub(super) fn dial_peer_bls<Req: TNMessage, Res: TNMessage>(
         &self,
         handle: NetworkHandle<Req, Res>,
         bls_pubkey: BlsPublicKey,
         task_spawner: TaskSpawner,
     ) {
-        if bls_pubkey == self.key_config.public_key() {
+        if bls_pubkey == self.key_config.public_key()
+            || self.trusted_peer_keys.contains(&bls_pubkey)
+        {
             // Don't try to dial ourselves.
             return;
         }
@@ -1231,40 +1234,14 @@ mod tests {
     use super::{
         check_committee_worker_count, node_mode_is_syncing, should_subscribe_batch_topic, NodeMode,
     };
+    use crate::manager::node::tests::reth_config_and_db;
+    #[cfg(not(feature = "adiri"))]
+    use crate::manager::node::tests::reth_config_and_db_with_rpc_port;
     use std::num::NonZeroUsize;
 
-    /// Write `committee` as the genesis committee file under `datadir` and open a reth database
-    /// there: the on-disk state an `EpochManager` is built from.
-    fn reth_config_and_db<P>(
-        config: &tn_config::Config,
-        committee: &tn_types::Committee,
-        datadir: &P,
-    ) -> eyre::Result<(tn_reth::RethConfig, tn_reth::RethDb)>
-    where
-        P: tn_config::TelcoinDirs + AsRef<std::path::Path>,
-    {
-        use tn_config::{Config, ConfigFmt, ConfigTrait as _};
-        use tn_reth::{rpc_server_args::RpcServerArgs, RethCommand, RethConfig, RethEnv};
-
-        tn_reth::init_reth_defaults();
-        Config::write_to_path(datadir.committee_path(), committee, ConfigFmt::YAML)?;
-        let node_config = RethConfig::new(
-            RethCommand {
-                rpc: RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
-                txpool: Default::default(),
-                db: Default::default(),
-            },
-            None,
-            datadir,
-            true,
-            std::sync::Arc::new(config.chain_spec()),
-        );
-        let reth_db = RethEnv::new_database(&node_config, datadir.as_ref().join("manager-db"))?;
-        Ok((node_config, reth_db))
-    }
-
     /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
-    /// two-to-one-to-two transitions, closing and reopening removed workers' RPC listeners.
+    /// two-to-one-to-two transitions. Removed workers close transaction admission and keep their
+    /// RPC listeners, so reactivation does not rebind, even with a partially received request.
     /// Removed workers hand their transactions to worker 0 and reactivate over empty pools.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
@@ -1295,6 +1272,7 @@ mod tests {
         use tn_types::{
             Address, BlsKeypair, Bytes, Committee, P2pNode, MIN_PROTOCOL_BASE_FEE, U256,
         };
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         /// The topic operation observed on one worker's network command channel.
         #[derive(Debug, PartialEq)]
@@ -1334,7 +1312,12 @@ mod tests {
             })
             .collect::<eyre::Result<Vec<_>>>()?;
         let datadir = temp.path().to_path_buf();
-        let (node_config, reth_db) = reth_config_and_db(&config, &committee, &datadir)?;
+        let (base_port_reservation, worker_port_reservation) = reserve_worker_rpc_ports()?;
+        let base_port = base_port_reservation.local_addr()?.port();
+        let (node_config, reth_db) =
+            reth_config_and_db_with_rpc_port(&config, &committee, &datadir, Some(base_port))?;
+        drop(base_port_reservation);
+        drop(worker_port_reservation);
         let chain = Arc::new(config.chain_spec());
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
@@ -1606,6 +1589,25 @@ mod tests {
         repeat_tasks.wait_for_task_shutdown().await;
         drop(repeat_tasks);
 
+        // Receiving 100 Continue proves that HTTP/1 has parsed the headers and is waiting
+        // for the body. Keep that connection busy until after the worker is reactivated.
+        let request_body = r#"{"jsonrpc":"2.0","id":1,"method":"eth_gasPrice","params":[]}"#;
+        let mut held_connection = tokio::net::TcpStream::connect(worker_one_address).await?;
+        held_connection
+            .write_all(
+                format!(
+                    "POST / HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nExpect: 100-continue\r\nConnection: close\r\n\r\n",
+                    request_body.len()
+                )
+                .as_bytes(),
+            )
+            .await?;
+        let mut interim = [0_u8; b"HTTP/1.1 100 Continue\r\n\r\n".len()];
+        tokio::time::timeout(Duration::from_secs(5), held_connection.read_exact(&mut interim))
+            .await??;
+        assert_eq!(&interim, b"HTTP/1.1 100 Continue\r\n\r\n");
+
         accumulator.set_num_workers(1);
         let mut shrink_tasks = TaskManager::default();
         let shrunk = manager
@@ -1635,14 +1637,18 @@ mod tests {
         assert!(engine.worker_http_client(&1).await.is_err());
         assert!(engine.is_worker_initialized(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+        // The relay drains the retired pool off the engine lock, so epoch entry did not wait.
         let active_pool = engine.get_worker_transaction_pool(&DEFAULT_WORKER_ID).await?;
-        assert!(retained_pool.get(&pending_hash).is_none());
-        assert!(retained_pool.get(&parked_hash).is_none());
-        assert!(active_pool.get(&pending_hash).is_some());
-        assert!(active_pool.get(&parked_hash).is_some());
+        wait_until(Duration::from_secs(5), "retired pool handed to worker 0", || async {
+            Ok(active_pool.get(&pending_hash).is_some()
+                && active_pool.get(&parked_hash).is_some()
+                && retained_pool.get(&pending_hash).is_none()
+                && retained_pool.get(&parked_hash).is_none())
+        })
+        .await?;
         assert_eq!(active_pool.pool_size().basefee, 1);
 
-        // Model a request admitted after reth's non-blocking RPC stop and the initial drain.
+        // Model a submission that passed the admission gate before it closed.
         let late = recover_raw_transaction(&factory.create_eip1559_encoded(
             chain.clone(),
             None,
@@ -1657,10 +1663,12 @@ mod tests {
             Ok(active_pool.get(&late_hash).is_some() && retained_pool.get(&late_hash).is_none())
         })
         .await?;
-        wait_until(Duration::from_secs(5), "removed worker RPC listener to close", || async {
-            Ok(tokio::net::TcpStream::connect(worker_one_address).await.is_err())
-        })
-        .await?;
+        let inactive = client
+            .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
+            .await
+            .err()
+            .ok_or_else(|| eyre!("removed worker accepted an RPC submission"))?;
+        assert!(inactive.to_string().contains("worker is inactive"), "{inactive}");
 
         // Repeated deactivation and mode updates must not make the removed worker ready.
         engine.deactivate_workers_above(1).await;
@@ -1706,6 +1714,7 @@ mod tests {
             ]
         );
         assert!(engine.is_worker_initialized(1).await);
+        assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(engine.worker_state(1).await, WorkerState::Running);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
@@ -1761,6 +1770,11 @@ mod tests {
                 .and_then(|fees| fees.last()),
             Some(&serde_json::Value::String(format!("0x{:x}", 100_000_004)))
         );
+        held_connection.write_all(request_body.as_bytes()).await?;
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), held_connection.read_to_end(&mut response))
+            .await??;
+        assert!(String::from_utf8(response)?.contains(&format!("0x{:x}", 100_000_004)));
         regrow_config.shutdown().notify();
         assert_eq!(
             engine.worker_readiness().await,
@@ -1774,6 +1788,26 @@ mod tests {
         next_tasks.abort_all_tasks();
         next_tasks.wait_for_task_shutdown().await;
         Ok(())
+    }
+
+    /// Reserve both fixed worker HTTP ports without assuming either port is free.
+    /// Retry only address collisions when reserving worker 1's derived port.
+    #[cfg(not(feature = "adiri"))]
+    fn reserve_worker_rpc_ports() -> std::io::Result<(std::net::TcpListener, std::net::TcpListener)>
+    {
+        let base = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+        let worker_port = base.local_addr()?.port().checked_sub(200).ok_or_else(|| {
+            std::io::Error::other("ephemeral HTTP port is below the worker port offset")
+        })?;
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, worker_port))
+            .map(|worker| (base, worker))
+            .or_else(|error| {
+                if error.kind() == std::io::ErrorKind::AddrInUse {
+                    reserve_worker_rpc_ports()
+                } else {
+                    Err(error)
+                }
+            })
     }
 
     /// Every epoch after 0 floors its first commit on the timestamp of the previous epoch's
