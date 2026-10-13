@@ -3,7 +3,7 @@
 use std::{
     collections::BTreeSet,
     fs,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
     time::Duration,
@@ -737,8 +737,9 @@ impl Cli {
                 target: "gateway",
                 worker_id,
                 upstream = %UpstreamOrigin(url),
-                "worker upstream uses plain http to a host that is not a loopback or private \
-                 address; submissions, reads and readiness cross the network unencrypted"
+                "worker upstream uses plain http to a host that is not a loopback, private, \
+                 CGNAT or link-local address; submissions, reads and readiness cross the network \
+                 unencrypted"
             );
         });
         self.probe_addr
@@ -1370,13 +1371,15 @@ fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
 /// The last check is an error rather than a warning because reads sent to a
 /// worker's node land on the validator, which is the load the redirect exists
 /// to remove. It compares host and port whatever the scheme, so an `https` URL
-/// on a worker's `http` socket is caught too, and an IPv4-mapped IPv6 literal
-/// matches the IPv4 address it names. A URL on a worker's host but another
-/// port is accepted with a warning, since that port may serve a separate node
-/// on the validator's machine. Plain `http` to a host that is not a loopback
-/// or private address literal is accepted with a warning: the reads and their
-/// answers then cross the network unencrypted. Messages name the URL by origin
-/// only, since a hosted RPC URL can carry an API key in its path.
+/// on a worker's `http` socket is caught too, an IPv4-mapped IPv6 literal
+/// matches the IPv4 address it names, and `localhost` either loopback address
+/// (see [`same_host`]). A URL on a worker's host but another port is accepted
+/// with a warning, since that port may serve a separate node on the
+/// validator's machine. Plain `http` to a host that is not an address literal
+/// unroutable from the internet (see [`plaintext_to_public_host`]) is accepted
+/// with a warning: the reads and their answers then cross the network
+/// unencrypted. Messages name the URL by origin only, since a hosted RPC URL
+/// can carry an API key in its path.
 fn ensure_query_upstream(
     listen_addr: SocketAddr,
     url: &Url,
@@ -1424,15 +1427,16 @@ fn ensure_query_upstream(
         warn!(
             target: "gateway",
             upstream = %UpstreamOrigin(url),
-            "--redirect-queries uses plain http to a host that is not a loopback or private \
-             address; reads and their answers cross the network unencrypted"
+            "--redirect-queries uses plain http to a host that is not a loopback, private, \
+             CGNAT or link-local address; reads and their answers cross the network unencrypted"
         );
     }
     Ok(())
 }
 
 /// The worker RPC and readiness URLs that use plain `http` to a host that is
-/// not a loopback or private address literal, each with its worker id.
+/// not an address literal unroutable from the internet (see
+/// [`plaintext_to_public_host`]), each with its worker id.
 ///
 /// Such a hop may cross a network the operator does not control, where an
 /// on-path attacker can drop submissions behind their computable hash and
@@ -1453,24 +1457,34 @@ fn same_host_and_port(a: &Url, b: &Url) -> bool {
     a.port_or_known_default() == b.port_or_known_default() && same_host(a, b)
 }
 
-/// Whether two URLs name the same host. An IPv4-mapped IPv6 literal
-/// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names, and `localhost`
-/// matches the IPv4 loopback address (see [`url_host_ip`]); other domain names
-/// match only as written.
+/// Whether two URLs name the same host. Hosts that name addresses (see
+/// [`url_host_ips`]) match when they share one, so an IPv4-mapped IPv6 literal
+/// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names and `localhost`
+/// matches either loopback address; other domain names match only as written.
 fn same_host(a: &Url, b: &Url) -> bool {
-    match (url_host_ip(a), url_host_ip(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => a.host() == b.host(),
-    }
+    url_host_ips(a)
+        .zip(url_host_ips(b))
+        .map_or_else(|| a.host() == b.host(), |(a, b)| a.iter().any(|ip| b.contains(ip)))
 }
 
-/// Whether `url` is plain `http` to anything but a loopback or private address
-/// literal. A domain name (other than `localhost`) counts as public, since it
-/// cannot be checked without resolving it.
+/// Whether `url` is plain `http` to anything but an address literal that is
+/// not routable from the internet: loopback, private (RFC 1918 and IPv6
+/// unique local), shared (the `100.64.0.0/10` carrier-grade NAT range) or link
+/// local (`169.254.0.0/16`, `fe80::/10`). A domain name (other than
+/// `localhost`) counts as public, since it cannot be checked without resolving
+/// it.
 fn plaintext_to_public_host(url: &Url) -> bool {
-    let local = url_host_ip(url).is_some_and(|ip| match ip {
-        IpAddr::V4(ip) => ip.is_loopback() || ip.is_private(),
-        IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local(),
+    let local = url_host_ips(url).is_some_and(|ips| {
+        ips.iter().all(|ip| match ip {
+            IpAddr::V4(ip) => {
+                let [first, second, ..] = ip.octets();
+                let shared = first == 100 && (second & 0b1100_0000) == 64;
+                ip.is_loopback() || ip.is_private() || shared || ip.is_link_local()
+            }
+            IpAddr::V6(ip) => {
+                ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+            }
+        })
     });
     url.scheme() == "http" && !local
 }
@@ -1480,22 +1494,32 @@ fn plaintext_to_public_host(url: &Url) -> bool {
 /// forwarding to it would loop. The default listen port (`8545`) matches the
 /// worker's default RPC port, so a single-host setup left on defaults hits
 /// this. The runtime hop-header guard (see [`crate::proxy`]) catches the
-/// loops this startup check cannot see, e.g. a VIP that fronts the gateways.
+/// loops this startup check cannot see, e.g. a VIP that fronts the gateways,
+/// or a URL naming one of this host's other addresses.
 ///
-/// An IPv4-mapped IPv6 address (`[::ffff:127.0.0.1]`) is compared as the IPv4
-/// address it names, on either side (the URL's through [`url_host_ip`]), since
-/// a dual-stack socket reaches the same listener through both spellings.
+/// The URL hits the gateway when any address its host names (see
+/// [`url_host_ips`]; `localhost` names both loopbacks) reaches the listener:
+/// the listen address itself, an unspecified address (which connects to this
+/// host) of a family the listener takes, or a loopback address when the
+/// listener is unspecified and takes its family. An unspecified IPv6 listener
+/// takes both families (tokio leaves `IPV6_V6ONLY` unset, so `[::]` binds
+/// dual-stack on a default Linux host), as [`ensure_probe_addr`] assumes; an
+/// unspecified IPv4 listener takes only IPv4. An IPv4-mapped IPv6 address
+/// (`[::ffff:127.0.0.1]`) is compared as the IPv4 address it names, on either
+/// side, since a dual-stack socket reaches the same listener through both
+/// spellings.
 fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
     let same_port = url.port_or_known_default() == Some(listen_addr.port());
     let listen_ip = listen_addr.ip().to_canonical();
-    let hits_gateway = url_host_ip(url)
-        .map(|ip| {
+    let hits_gateway = url_host_ips(url).is_some_and(|ips| {
+        ips.into_iter().any(|ip| {
             let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
+            let takes_family = listen_ip.is_unspecified() && (listen_ip.is_ipv6() || ip.is_ipv4());
             ip == listen_ip
-                || (same_family && ip.is_unspecified())
-                || (same_family && ip.is_loopback() && listen_ip.is_unspecified())
+                || (ip.is_unspecified() && (same_family || takes_family))
+                || (ip.is_loopback() && takes_family)
         })
-        .unwrap_or(false);
+    });
     eyre::ensure!(
         !(same_port && hits_gateway),
         "upstream URL `{}` points at the gateway's own listen address ({listen_addr}), \
@@ -1528,17 +1552,18 @@ fn ensure_probe_addr(listen_addr: SocketAddr, probe_addr: SocketAddr) -> eyre::R
     Ok(())
 }
 
-/// The upstream host as an IP when it names one (`localhost` counts; other
-/// domain names cannot be checked without resolving them). An IPv4-mapped IPv6
-/// literal is returned as the IPv4 address it names, so every caller compares
-/// and classifies it the same way.
-fn url_host_ip(url: &Url) -> Option<IpAddr> {
+/// The addresses the upstream host names without a lookup: an IP literal, or
+/// `localhost`, which names both loopback addresses (a client may connect to
+/// either). `None` for any other domain name, which cannot be checked without
+/// resolving it. An IPv4-mapped IPv6 literal is returned as the IPv4 address it
+/// names, so every caller compares and classifies it the same way.
+fn url_host_ips(url: &Url) -> Option<Vec<IpAddr>> {
     url.host().and_then(|host| match host {
-        url::Host::Domain(name) => {
-            name.eq_ignore_ascii_case("localhost").then_some(IpAddr::V4(Ipv4Addr::LOCALHOST))
-        }
-        url::Host::Ipv4(ip) => Some(IpAddr::V4(ip)),
-        url::Host::Ipv6(ip) => Some(IpAddr::V6(ip).to_canonical()),
+        url::Host::Domain(name) => name
+            .eq_ignore_ascii_case("localhost")
+            .then(|| vec![IpAddr::V4(Ipv4Addr::LOCALHOST), IpAddr::V6(Ipv6Addr::LOCALHOST)]),
+        url::Host::Ipv4(ip) => Some(vec![IpAddr::V4(ip)]),
+        url::Host::Ipv6(ip) => Some(vec![IpAddr::V6(ip).to_canonical()]),
     })
 }
 
@@ -2058,6 +2083,93 @@ mod tests {
             ])
             .into_settings()?;
         }
+        Ok(())
+    }
+
+    /// The self check holds across address families: `[::]` binds
+    /// dual-stack, so it takes IPv4 loopback connections too; `localhost`
+    /// names both loopbacks; a mapped literal is the IPv4 address it names.
+    /// An IPv4 listener does not take IPv6 connections, so `[::1]` on its port
+    /// is another socket.
+    #[test]
+    fn self_url_is_rejected_across_address_families() -> eyre::Result<()> {
+        let ready = "http://10.0.0.7:8551/health/workers";
+        let settings = |listen: &str, rpc: &str, redirect: Option<&str>| {
+            let mut argv = vec![
+                "worker-gateway".to_string(),
+                format!("--listen-addr={listen}"),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={ready}"),
+            ];
+            argv.extend(redirect.map(|url| format!("--redirect-queries={url}")));
+            Cli::parse_from(argv).into_settings()
+        };
+        for (listen, url) in [
+            ("[::]:8545", "http://127.0.0.1:8545/"),
+            ("[::]:8545", "http://127.0.0.2:8545/"),
+            ("[::]:8545", "http://[::ffff:127.0.0.1]:8545/"),
+            ("[::]:8545", "http://0.0.0.0:8545/"),
+            ("[::]:8545", "http://[::1]:8545/"),
+            ("[::]:8545", "http://localhost:8545/"),
+            ("0.0.0.0:8545", "http://[::ffff:127.0.0.1]:8545/"),
+            ("0.0.0.0:8545", "http://localhost:8545/"),
+            ("[::1]:8545", "http://localhost:8545/"),
+            ("127.0.0.1:8545", "http://localhost:8545/"),
+        ] {
+            let message = match settings(listen, url, None) {
+                Ok(_) => panic!("{url} is the gateway on {listen}"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("own listen address"), "{message}");
+            let message = match settings(listen, "http://10.0.0.7:8545", Some(url)) {
+                Ok(_) => panic!("a redirect to {url} is the gateway on {listen}"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("own listen address"), "{message}");
+        }
+        // another socket: IPv6 beside an IPv4 listener, another loopback
+        // family beside a specific one, or another port
+        for (listen, url) in [
+            ("0.0.0.0:8545", "http://[::1]:8545/"),
+            ("0.0.0.0:8545", "http://[::]:8545/"),
+            ("127.0.0.1:8545", "http://[::1]:8545/"),
+            ("[::1]:8545", "http://127.0.0.1:8545/"),
+            ("[::]:8545", "http://127.0.0.1:8544/"),
+        ] {
+            settings(listen, url, None)?;
+            settings(listen, "http://10.0.0.7:8545", Some(url))?;
+        }
+        Ok(())
+    }
+
+    /// `localhost` names both loopbacks, so a redirect to it is a worker on
+    /// either one, and the other way round.
+    #[test]
+    fn localhost_redirect_matches_a_worker_on_either_loopback() -> eyre::Result<()> {
+        let flags = |rpc: &str, redirect: &str| {
+            Cli::parse_from([
+                "worker-gateway".to_string(),
+                "--listen-addr=10.0.0.5:8545".to_string(),
+                format!("--upstream-rpc-url={rpc}"),
+                format!("--upstream-readiness-url={rpc}health/workers"),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .into_settings()
+        };
+        for (rpc, redirect) in [
+            ("http://[::1]:9545/", "http://localhost:9545/"),
+            ("http://127.0.0.1:9545/", "http://localhost:9545/"),
+            ("http://localhost:9545/", "http://[::1]:9545/"),
+            ("http://localhost:9545/", "http://[::ffff:127.0.0.1]:9545/"),
+        ] {
+            let message = match flags(rpc, redirect) {
+                Ok(_) => panic!("{redirect} is the worker at {rpc}"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("worker 0's RPC host and port"), "{message}");
+        }
+        // another loopback address is another host to the check
+        flags("http://[::1]:9545/", "http://127.0.0.2:9545/")?;
         Ok(())
     }
 
@@ -2831,6 +2943,43 @@ mod tests {
         ] {
             assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
         }
+        Ok(())
+    }
+
+    /// Carrier-grade NAT (`100.64.0.0/10`) and link-local addresses are not
+    /// routable from the internet either, so a plain `http` hop to one draws
+    /// no warning; the addresses just outside each range still do.
+    #[test]
+    fn plaintext_warning_spares_cgnat_and_link_local_hosts() -> eyre::Result<()> {
+        for (url, warns) in [
+            // 100.64.0.0/10
+            ("http://100.64.0.1:8545/", false),
+            ("http://100.100.1.2:8545/", false),
+            ("http://100.127.255.254:8545/", false),
+            ("http://[::ffff:100.64.0.1]:8545/", false),
+            ("http://100.63.255.255:8545/", true),
+            ("http://100.128.0.1:8545/", true),
+            // 169.254.0.0/16
+            ("http://169.254.0.1:8545/", false),
+            ("http://169.254.255.254:8545/", false),
+            ("http://169.253.255.255:8545/", true),
+            ("http://169.255.0.1:8545/", true),
+            // fe80::/10
+            ("http://[fe80::1]:8545/", false),
+            ("http://[febf:ffff::1]:8545/", false),
+            ("http://[fe7f::1]:8545/", true),
+            ("http://[fec0::1]:8545/", true),
+        ] {
+            assert_eq!(plaintext_to_public_host(&Url::parse(url)?), warns, "{url}");
+        }
+        // and at startup, for a worker URL
+        let (settings, logs) = into_settings_logged(cli_with(
+            None,
+            Some("http://100.64.0.7:8545"),
+            Some("http://[fe80::7]:8551/health/workers"),
+        ));
+        settings?;
+        assert!(!logs.contains("worker upstream uses plain http"), "{logs}");
         Ok(())
     }
 

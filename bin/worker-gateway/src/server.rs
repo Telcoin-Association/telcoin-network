@@ -2345,9 +2345,10 @@ mod tests {
     struct Seen {
         /// Requests received.
         hits: Arc<AtomicUsize>,
-        /// Requests carrying `X-TN-Gateway`.
+        /// `X-TN-Gateway` values received: one per request that carries the
+        /// marker once, so a duplicated marker shows.
         hop_marker: Arc<AtomicUsize>,
-        /// Requests carrying `X-TN-Gateway-Redirect`.
+        /// `X-TN-Gateway-Redirect` values received, counted the same way.
         redirect_marker: Arc<AtomicUsize>,
         /// Requests carrying the client's identity (`X-Forwarded-For`,
         /// `X-Forwarded-Proto`) and the gateway's user agent.
@@ -2413,12 +2414,11 @@ mod tests {
                         headers.get(name).and_then(|v| v.to_str().ok()).unwrap_or("").to_string()
                     };
                     counters.hits.fetch_add(1, Ordering::SeqCst);
-                    if headers.contains_key("x-tn-gateway") {
-                        counters.hop_marker.fetch_add(1, Ordering::SeqCst);
-                    }
-                    if headers.contains_key("x-tn-gateway-redirect") {
-                        counters.redirect_marker.fetch_add(1, Ordering::SeqCst);
-                    }
+                    let markers = |name: &str| headers.get_all(name).iter().count();
+                    counters.hop_marker.fetch_add(markers("x-tn-gateway"), Ordering::SeqCst);
+                    counters
+                        .redirect_marker
+                        .fetch_add(markers("x-tn-gateway-redirect"), Ordering::SeqCst);
                     if get("x-forwarded-for") == "127.0.0.1"
                         && get("x-forwarded-proto") == "http"
                         && get("user-agent").starts_with("tn-worker-gateway/")
@@ -2709,6 +2709,78 @@ mod tests {
         assert_eq!(query_seen.hits(), 3);
     }
 
+    /// A call with more than one `method` member never reaches the worker on
+    /// the strength of either name: with the redirect, alone it goes to the
+    /// query upstream like any body the gateway cannot read, and a batch
+    /// holding one is refused whole, with or without the redirect.
+    #[tokio::test]
+    async fn duplicated_method_never_routes_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let duplicates = [
+            r#"{"jsonrpc":"2.0","method":"eth_call","method":"eth_sendRawTransaction","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","method":"eth_call","params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":"eth_call","m\u0065thod":"eth_sendRawTransactionSync","params":[],"id":1}"#,
+        ];
+        let submission = call("eth_sendRawTransaction", 2);
+        for redirect in [Some(query), None] {
+            let state = redirect_state(worker, redirect);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+            for duplicate in duplicates {
+                if redirect.is_some() {
+                    let (status, text) = post_rpc(gateway, None, duplicate.to_string()).await;
+                    assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{duplicate}");
+                }
+                for body in [format!("[{duplicate}]"), format!("[{submission},{duplicate}]")] {
+                    let (status, text) = post_rpc(gateway, None, body.clone()).await;
+                    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+                    assert_eq!(
+                        error_code_and_id(&text),
+                        (-32600, serde_json::Value::Null),
+                        "{body}"
+                    );
+                }
+            }
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, duplicates.len()));
+    }
+
+    /// A `method` that is an object or an array names no method, so the call
+    /// routes like one the gateway cannot read: to the query upstream, never
+    /// to the worker, however a submission's name sits inside it. In a batch
+    /// it is another call, so a batch beside a submission is mixed.
+    #[tokio::test]
+    async fn container_valued_method_never_routes_to_the_worker() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let state = redirect_state(worker, Some(query));
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let containers = [
+            r#"{"jsonrpc":"2.0","method":["eth_sendRawTransaction"],"params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":[["eth_sendRawTransactionSync"]],"params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":{"method":"eth_sendRawTransaction"},"params":[],"id":1}"#,
+            r#"{"jsonrpc":"2.0","method":{},"params":["0xdeadbeef"],"id":1}"#,
+        ];
+        let submission = call("eth_sendRawTransaction", 2);
+        let mut sent = 0;
+        for container in containers {
+            for body in [
+                container.to_string(),
+                format!("[{container}]"),
+                format!("[{submission},{container}]"),
+                format!("[{container},{submission}]"),
+            ] {
+                let (status, text) = post_rpc(gateway, None, body.clone()).await;
+                assert_eq!((status, text.as_str()), (StatusCode::OK, "query"), "{body}");
+                sent += 1;
+            }
+        }
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, sent));
+    }
+
     #[tokio::test]
     async fn worker_down_serves_queries_and_refuses_submissions() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
@@ -2831,6 +2903,37 @@ mod tests {
         assert_eq!(worker_seen.hits(), 1);
     }
 
+    /// The redirect marker cannot tell a loop from a chain: a redirecting
+    /// gateway behind another one refuses every query the first redirects to
+    /// it, while a gateway without the flag on the same path forwards them.
+    #[tokio::test]
+    async fn chained_redirecting_gateways_answer_508_at_the_second() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
+        let second = redirect_state(worker, Some(query));
+        second.readiness.set_ready(0, true);
+        let (second, _second) = spawn(test_router(second)).await;
+        let first = redirect_state(worker, Some(second));
+        first.readiness.set_ready(0, true);
+        let (first, _first) = spawn(test_router(first)).await;
+
+        let (status, text) = post_rpc(first, None, call("eth_call", 8)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
+        assert_eq!(error_code_and_id(&text), (-32004, serde_json::json!(8)));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 0));
+
+        // a gateway without the flag in the middle forwards the query
+        let plain = redirect_state(query, None);
+        plain.readiness.set_ready(0, true);
+        let (plain, _plain) = spawn(test_router(plain)).await;
+        let behind_plain = redirect_state(worker, Some(plain));
+        behind_plain.readiness.set_ready(0, true);
+        let (behind_plain, _behind_plain) = spawn(test_router(behind_plain)).await;
+        let (status, text) = post_rpc(behind_plain, None, call("eth_call", 9)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "query"));
+        assert_eq!((worker_seen.hits(), query_seen.hits()), (0, 1));
+    }
+
     #[tokio::test]
     async fn hop_marker_is_still_rejected_with_the_redirect_on() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
@@ -2866,9 +2969,17 @@ mod tests {
             let (status, text) = post_rpc(gateway, None, body.clone()).await;
             assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"), "{body}");
         }
-        assert_eq!(worker_seen.hits(), bodies.len());
-        assert_eq!(worker_seen.hop_marker(), bodies.len());
-        assert_eq!(worker_seen.redirect_marker(), 0);
+        // a request some redirecting gateway sent on (this one fronting the
+        // public rpc, say) is forwarded too, and the client's marker is not
+        let (status, text) =
+            post_rpc(gateway, Some("x-tn-gateway-redirect"), call("eth_call", 8)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+        // each forward carries exactly one hop marker and no redirect marker
+        let forwards = bodies.len() + 1;
+        assert_eq!(
+            (worker_seen.hits(), worker_seen.hop_marker(), worker_seen.redirect_marker()),
+            (forwards, forwards, 0)
+        );
     }
 
     #[tokio::test]
@@ -3148,6 +3259,73 @@ mod tests {
             assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(1)));
         }
         assert_eq!(worker_seen.hits(), 0, "a redirect must never reach the worker");
+    }
+
+    /// A `3xx` with a JSON body passes through as the upstream's own answer,
+    /// without its `Location`, and is logged as a warning on either route,
+    /// naming the upstream by origin, like a `3xx` without one: the gateway
+    /// follows no redirect, so a worker behind a front that answers `307` must
+    /// not go unnoticed.
+    #[tokio::test]
+    async fn json_redirect_from_an_upstream_is_logged() {
+        let logs = CapturedLogs::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(logs.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let answer = r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#;
+        let location = format!("http://{worker}/elsewhere");
+        let bouncer = Router::new().route(
+            "/",
+            post(move || async move {
+                (
+                    StatusCode::TEMPORARY_REDIRECT,
+                    [
+                        (header::LOCATION, location),
+                        (header::CONTENT_TYPE, "application/json".into()),
+                    ],
+                    answer,
+                )
+            }),
+        );
+        let (bouncer, _bouncer) = spawn(bouncer).await;
+        let client = Client::builder().redirect(Policy::none()).build().expect("client");
+        for (route, state) in [
+            ("worker", redirect_state(bouncer, None)),
+            ("query", redirect_state(worker, Some(bouncer))),
+        ] {
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+            let response = client
+                .post(format!("http://{gateway}/"))
+                .body(call("eth_call", 1))
+                .send()
+                .await
+                .expect("send");
+            assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{route}");
+            assert!(response.headers().get(header::LOCATION).is_none(), "{route}");
+            assert_eq!(response.text().await.expect("text"), answer, "{route}");
+        }
+        assert_eq!(worker_seen.hits(), 0, "a redirect must never be followed");
+
+        let logs = logs.contents();
+        for route in ["worker", "query"] {
+            let line = logs
+                .lines()
+                .find(|line| {
+                    line.contains("upstream answered a redirect")
+                        && line.contains(&format!("route=\"{route}\""))
+                })
+                .unwrap_or_else(|| panic!("no redirect warning for the {route} route: {logs}"));
+            assert!(line.contains(" WARN "), "{line}");
+            assert!(line.contains("status=307"), "{line}");
+            assert!(line.contains(&format!("upstream=http://{bouncer}")), "{line}");
+        }
+        assert!(!logs.contains("elsewhere"), "the Location must not be logged: {logs}");
     }
 
     /// A per-IP limit of one request with no burst headroom (no refill lands
@@ -4572,6 +4750,13 @@ mod tests {
         // a loop
         let (status, _) = post_rpc(gateway, Some("x-tn-gateway"), call("eth_chainId", 3)).await;
         assert_eq!(status, StatusCode::LOOP_DETECTED);
+        // a redirect loop, at a gateway that redirects
+        let (query, _query_seen, _query) = named_mock("query").await;
+        let (redirecting, _redirecting) =
+            spawn(test_router(redirect_state(worker, Some(query)))).await;
+        let (status, _) =
+            post_rpc(redirecting, Some("x-tn-gateway-redirect"), call("eth_chainId", 6)).await;
+        assert_eq!(status, StatusCode::LOOP_DETECTED);
         // a screened transaction
         let junk =
             r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["0xdeadbeef"],"id":4}"#;
@@ -4586,6 +4771,7 @@ mod tests {
             "request_timeout",
             "unreadable_body",
             "loop_detected",
+            "redirect_loop_detected",
             "invalid_transaction",
             "no_upstream_ready",
         ];

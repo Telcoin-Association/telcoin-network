@@ -99,6 +99,7 @@ port so the gateway is a drop-in edge for clients; on a single host that means
 the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
+The check holds across address families: a gateway listening on `[::]` takes IPv4 connections too, so `127.0.0.1` on its port is the gateway, and `localhost` counts as both `127.0.0.1` and `[::1]`.
 Startup also rejects a self-pointing upstream URL written as an IPv4-mapped IPv6 literal such as `[::ffff:127.0.0.1]`, an upstream list that names one worker id twice, and a zero `--readiness-poll-interval`, `--readiness-poll-timeout`, `--upstream-connect-timeout`, `--upstream-request-timeout` or `--header-read-timeout`, none of which has a disabled setting.
 It rejects an `--upstream-request-timeout` that is not longer than `--upstream-connect-timeout`: the request deadline includes connection setup, so it would end a stalled connect first, as a timeout that passive health cannot count.
 
@@ -203,7 +204,7 @@ worker-gateway \
   The error names the flag, and the path of a file that cannot be read or parsed, but never quotes a file's content.
 - **Fail closed.** A worker whose certificate does not chain to a trusted root or does not name the URL's host, or whose terminator refuses the client certificate, fails the handshake.
   Its readiness poll then fails, so it is not ready: `/ready` answers `503` and submissions get `503` / `-32000`, and a forward sent before the next poll notices gets `502` / `-32001`.
-- **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback or private address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
+- **Plaintext warning.** A worker RPC or readiness URL that is plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address logs a warning at startup with the worker id and the URL's origin, like the `--redirect-queries` warning.
   A domain name other than `localhost` counts as public, because the gateway does not resolve it.
   When the hop leaves a network you control, use `https` or a tunnel.
 
@@ -540,6 +541,7 @@ Every element counts towards the cap and the tokens whatever its shape: an eleme
 The gateway reads a body as the worker's JSON-RPC server does, leading whitespace included, so no prefix can hide a batch from the count.
 A batch the gateway cannot read to its end is refused whole with `400` / `-32600` and a `null` id, before it is charged or forwarded, so a batch's length is never unknown.
 That covers bytes after the batch and a truncated batch, which the worker refuses whole anyway, and an element holding a value the gateway's JSON reader refuses although it is valid JSON, such as a number out of range (`1e400`) or an unpaired surrogate escape (`"\udc00"`), which the worker would skip while running the rest of the batch.
+An element with more than one `method` member ends the read too: the worker refuses that element as an invalid request, and the gateway refuses the batch whole rather than route it by either name.
 
 ### Transaction screening
 
@@ -581,13 +583,13 @@ Refused calls are counted in `tn_worker_gateway_rejections_total` with reason `m
 On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and only the reads that must see its pool.
 With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and so do the [reads kept on the worker](#reads-kept-on-the-worker); every other call goes to the URL, typically a public RPC.
 Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
-Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or a single call with bytes after it.
+Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, a single call with more than one `method` member, or a single call with bytes after it.
 A batch the gateway cannot read to its end is refused rather than routed (see [Batches](#batches)).
 
 The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
-The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names.
-A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback or private address.
+The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and `localhost` as both loopback addresses.
+A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address.
 A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
 A batch goes to the worker only when every element is a submission.
@@ -598,7 +600,11 @@ The public RPC accepts submissions too, so the client loses nothing, but a submi
 Routing happens after the [transaction screen](#transaction-screening), so an undecodable submission is still refused at the gateway.
 Calls sent to the query URL carry `X-TN-Gateway-Redirect: 1`, `X-Forwarded-For` and `X-Forwarded-Proto`, but not `X-TN-Gateway`, so a public RPC behind a gateway of its own does not reject them as a loop.
 A gateway with `--redirect-queries` set answers an inbound request carrying `X-TN-Gateway-Redirect` with `508` / `-32004`, which catches a query URL that leads back to a redirecting gateway; a gateway without the flag forwards such a request normally.
+The marker says only that some gateway redirected the request, so it cannot tell a loop from a chain: a redirecting gateway must not sit behind another redirecting gateway.
+With A redirecting to B and B redirecting to C, every query through A gets `508` from B; point A at C, or run B without the flag.
+The two markers count under their own reasons in `tn_worker_gateway_rejections_total`: `loop_detected` for `X-TN-Gateway`, `redirect_loop_detected` for `X-TN-Gateway-Redirect`.
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
+Every `3xx` logs a warning naming the upstream by origin, whatever its body: an upstream behind a front that redirects is a misconfiguration no client can fix.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
 `/ready` still means "this gateway can take submissions"; `/ready/any` reports whether it can serve any route (see [Gateway endpoints](#gateway-endpoints)).
@@ -719,7 +725,8 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | Upstream request timed out | `504` | `-32002` |
 | Request body too large | `413` | `-32003` |
 | Batch longer than `--max-batch-len` | `413` | `-32003` |
-| Proxy loop detected | `508` | `-32004` |
+| Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
+| Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`; reason `redirect_loop_detected`) | `508` | `-32004` |
 | Request deadline exceeded | `408` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
@@ -827,7 +834,7 @@ Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
 ready upstream, an oversized body, a worker's answer to a submission that
 could not be read whole, and, per route, a forwarding failure or an
-upstream error answer) are throttled per call site, so neither clients nor a
+upstream error or redirect answer) are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s

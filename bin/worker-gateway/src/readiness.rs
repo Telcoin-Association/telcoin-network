@@ -588,8 +588,7 @@ fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
             .workers
             .iter()
             .find(|worker| worker.worker_id == worker_id)
-            .map(|worker| worker.accepting_transactions)
-            .unwrap_or(false),
+            .is_some_and(|worker| worker.accepting_transactions),
     )
 }
 
