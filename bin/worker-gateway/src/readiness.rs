@@ -43,14 +43,17 @@ use std::{
     time::Duration,
 };
 
-use reqwest::{header::CONTENT_TYPE, Client, StatusCode};
+use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use tn_types::{Noticer, TaskError};
 use tokio::time::{interval, timeout, MissedTickBehavior};
 use tracing::{debug, info, warn};
 use url::Url;
 
-use crate::{config::UpstreamWorker, proxy::UpstreamOrigin};
+use crate::{
+    config::UpstreamWorker,
+    proxy::{chain_id_request, QueryHeader, Route, UpstreamOrigin},
+};
 
 /// Readiness envelope version the gateway targets. Newer versions still parse,
 /// because unknown fields are ignored (see [`NodeReadiness`]); this is only used
@@ -61,15 +64,6 @@ const READINESS_VERSION: u32 = 1;
 /// few dozen bytes per worker; a larger body is a failed poll, so a broken or
 /// hostile health endpoint cannot grow the gateway's memory.
 const MAX_READINESS_BODY_BYTES: usize = 64 * 1024;
-
-/// The call the poller sends the query upstream: any node answers it cheaply
-/// and without side effects.
-const QUERY_PROBE_CALL: &str = r#"{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}"#;
-
-/// The marker header every query-route request carries (the proxy's
-/// `REDIRECT_HEADER`), so the probe reaches the query upstream the way a
-/// redirected read does.
-const QUERY_PROBE_MARKER: &str = "x-tn-gateway-redirect";
 
 /// Largest probe reply the poller reads. An `eth_chainId` answer is a few dozen
 /// bytes; the cap keeps a misbehaving query upstream from making the poller
@@ -384,6 +378,9 @@ pub(crate) struct QueryProbe {
     /// travels like a redirected read: same connection pool, user agent and
     /// redirect policy.
     pub(crate) client: Client,
+    /// The `--redirect-queries-header` header, sent with every probe like
+    /// with every redirected read, or `None`. Its `Debug` is redacted.
+    pub(crate) query_header: Option<QueryHeader>,
 }
 
 /// Poll every upstream's readiness endpoint, and probe the query upstream when
@@ -453,7 +450,8 @@ async fn poll_query_upstream(
     poll_timeout: Duration,
 ) {
     let upstream = UpstreamOrigin(&probe.url);
-    let ready = match timeout(poll_timeout, fetch_query_ready(&probe.client, &probe.url)).await {
+    let probe_call = fetch_query_ready(&probe.client, &probe.url, probe.query_header.as_ref());
+    let ready = match timeout(poll_timeout, probe_call).await {
         Ok(Ok(ready)) => {
             if !ready {
                 debug!(
@@ -483,17 +481,20 @@ async fn poll_query_upstream(
     readiness.record_query_probe(ready, &probe.url);
 }
 
-/// Send the probe call and report whether the reply is a `2xx` whose JSON body
-/// has a `result` member. A reply longer than [`MAX_QUERY_PROBE_REPLY_BYTES`]
-/// counts as down and is not read further.
-async fn fetch_query_ready(client: &Client, url: &Url) -> reqwest::Result<bool> {
-    let mut response = client
-        .post(url.clone())
-        .header(CONTENT_TYPE, "application/json")
-        .header(QUERY_PROBE_MARKER, "1")
-        .body(QUERY_PROBE_CALL)
-        .send()
-        .await?;
+/// Send the probe call, an `eth_chainId` that any node answers cheaply and
+/// without side effects, and report whether the reply is a `2xx` whose JSON
+/// body has a `result` member. A reply longer than
+/// [`MAX_QUERY_PROBE_REPLY_BYTES`] counts as down and is not read further.
+///
+/// The call is stamped like a redirected read (see [`chain_id_request`]): the
+/// query-route marker and, when one is configured, `query_header`, so an
+/// upstream that requires the key does not read as down.
+async fn fetch_query_ready(
+    client: &Client,
+    url: &Url,
+    query_header: Option<&QueryHeader>,
+) -> reqwest::Result<bool> {
+    let mut response = chain_id_request(client, Route::Query, url, query_header).send().await?;
     if !response.status().is_success() {
         return Ok(false);
     }
@@ -1252,6 +1253,7 @@ mod tests {
         let probe = QueryProbe {
             url: Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url"),
             client: client.clone(),
+            query_header: None,
         };
         let readiness = GatewayReadiness::new(&[], thresholds(1, 1));
         let poll_timeout = Duration::from_secs(2);
@@ -1270,6 +1272,7 @@ mod tests {
         let unreachable = QueryProbe {
             url: Url::parse("http://user:s3cr3t@127.0.0.1:1/k3y?token=t0k3n").expect("url"),
             client,
+            query_header: None,
         };
         poll_query_upstream(&unreachable, &readiness, poll_timeout).await;
         assert!(!readiness.query_ready());
@@ -1291,5 +1294,51 @@ mod tests {
         for secret in ["s3cr3t", "k3y", "t0k3n"] {
             assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
         }
+    }
+
+    /// The probe carries `--redirect-queries-header` like a redirected read, so
+    /// a query upstream that refuses calls without the key is probed as up.
+    #[tokio::test]
+    async fn query_probe_sends_the_query_header() {
+        const API_KEY: &str = "s3cr3t-k3y-1609";
+        // answers only a call carrying the key exactly once, with the
+        // query-route marker, and refuses anything else with a `401`
+        let mock = axum::Router::new().fallback(|headers: axum::http::HeaderMap| async move {
+            let keys: Vec<&[u8]> =
+                headers.get_all("x-api-key").iter().map(|value| value.as_bytes()).collect();
+            let marked = headers.get("x-tn-gateway-redirect").is_some_and(|value| value == "1");
+            if keys == [API_KEY.as_bytes()] && marked && headers.get("x-tn-gateway").is_none() {
+                (axum::http::StatusCode::OK, r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#)
+            } else {
+                (axum::http::StatusCode::UNAUTHORIZED, "unauthorized")
+            }
+        });
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move { axum::serve(listener, mock).await });
+
+        let client = crate::proxy::proxy_client(
+            Client::builder().connect_timeout(Duration::from_secs(1)),
+            Duration::from_secs(2),
+        )
+        .expect("client");
+        let url = Url::parse(&format!("http://{addr}/")).expect("url");
+        let poll_timeout = Duration::from_secs(2);
+
+        // without the header the upstream refuses the probe: down
+        let unkeyed = QueryProbe { url: url.clone(), client: client.clone(), query_header: None };
+        let readiness = GatewayReadiness::new(&[], thresholds(1, 1));
+        poll_query_upstream(&unkeyed, &readiness, poll_timeout).await;
+        assert!(!readiness.query_ready(), "a probe without the key must be refused");
+
+        // with it the probe is answered: up
+        let header = QueryHeader::parse(&format!("X-Api-Key: {API_KEY}")).expect("valid header");
+        let keyed = QueryProbe { url, client, query_header: Some(header) };
+        poll_query_upstream(&keyed, &readiness, poll_timeout).await;
+        assert!(readiness.query_ready(), "the probe must carry the configured header");
+        assert!(
+            !format!("{keyed:?}").contains(API_KEY),
+            "the probe's debug output must be redacted"
+        );
     }
 }

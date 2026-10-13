@@ -26,8 +26,10 @@
 //! `pending` tag, and a lookup of a submission this gateway forwarded recently
 //! (see [`scan`] and [`PoolRead`]). Every other call goes to the query
 //! upstream, which is not readiness-gated, never falls back to the worker,
-//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, and has
-//! its response content type passed through only when it is JSON.
+//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, plus the
+//! `--redirect-queries-header` header when one is configured (see
+//! [`QueryHeader`]; a worker never receives it), and has its response content
+//! type passed through only when it is JSON.
 //!
 //! Every request is classified, redirect or not: a submission counts against
 //! `--max-inflight-submissions` and everything else against
@@ -62,7 +64,7 @@ use axum::{
     Extension, RequestExt as _,
 };
 use futures::{Stream, StreamExt as _};
-use reqwest::{redirect::Policy, Client, ClientBuilder};
+use reqwest::{redirect::Policy, Client, ClientBuilder, RequestBuilder};
 use serde::{
     de::{self, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
@@ -211,6 +213,14 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
     &UPSTREAM_ERROR_WARNINGS.worker,
     &UPSTREAM_ERROR_WARNINGS.query,
 ];
+
+/// The JSON-RPC call [`chain_id_request`] builds: the startup chain-id check
+/// and the readiness probe of the query upstream both send it.
+const CHAIN_ID_CALL: &str = r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1}"#;
+
+/// The largest `eth_chainId` answer [`fetch_chain_id`] reads; a real one is
+/// under a hundred bytes.
+const MAX_CHAIN_ID_ANSWER_BYTES: usize = 64 * 1024;
 
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
 /// `--redirect-queries` is set and the request is neither made only of
@@ -718,9 +728,10 @@ pub(crate) fn reject_non_post(method: &Method) -> Response {
 /// upstream's response with its body still unread (see [`relay`]).
 ///
 /// The `route` picks the marker header: [`HOP_HEADER`] toward a worker,
-/// [`REDIRECT_HEADER`] toward the query upstream, never both. `forwarding`
-/// supplies `X-Forwarded-For` and `X-Forwarded-Proto`; the client's own values
-/// of those headers are not copied.
+/// [`REDIRECT_HEADER`] toward the query upstream, never both; the configured
+/// [`QueryHeader`] goes to the query upstream only (see [`stamp_route`]).
+/// `forwarding` supplies `X-Forwarded-For` and `X-Forwarded-Proto`; the
+/// client's own values of those headers are not copied.
 /// The query route also gets its own deadline (`--query-request-timeout`) in
 /// place of the client's, so a stalled query upstream frees its slots sooner;
 /// the worker route keeps the client's `--upstream-request-timeout`.
@@ -741,16 +752,9 @@ async fn forward(
         .get(header::CONTENT_TYPE)
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
-    let marker = match route {
-        Route::Worker => HOP_HEADER,
-        Route::Query => REDIRECT_HEADER,
-    };
 
-    let request = state
-        .http
-        .post(upstream_url)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(marker, HeaderValue::from_static("1"))
+    let request = state.http.post(upstream_url).header(header::CONTENT_TYPE, content_type);
+    let request = stamp_route(request, route, state.query_header.as_ref())
         .header(X_FORWARDED_FOR, forwarding.x_forwarded_for())
         .header(X_FORWARDED_PROTO, forwarding.x_forwarded_proto())
         .body(body);
@@ -928,6 +932,104 @@ where
     }
 }
 
+/// Stamp the marker for `route` on a request bound upstream and, toward the
+/// query upstream only, the configured [`QueryHeader`]: a worker never
+/// receives it.
+///
+/// It is the one place the header is set: a forward ([`forward`]), the startup
+/// chain-id check and the readiness probe ([`chain_id_request`]) all pass
+/// through it.
+fn stamp_route(
+    request: RequestBuilder,
+    route: Route,
+    query_header: Option<&QueryHeader>,
+) -> RequestBuilder {
+    match route {
+        Route::Worker => request.header(HOP_HEADER, HeaderValue::from_static("1")),
+        Route::Query => {
+            let request = request.header(REDIRECT_HEADER, HeaderValue::from_static("1"));
+            match query_header {
+                Some(query_header) => {
+                    request.header(query_header.name.clone(), query_header.value.clone())
+                }
+                None => request,
+            }
+        }
+    }
+}
+
+/// One `eth_chainId` call to `url`, stamped for `route` like a forwarded call
+/// (see [`stamp_route`]): toward the query upstream it carries the configured
+/// `query_header`, toward a worker never.
+///
+/// Both requests the gateway makes on its own start here: the startup
+/// chain-id check ([`fetch_chain_id`]) and the readiness poller's probe of the
+/// query upstream ([`crate::readiness::QueryProbe`]), so the probe reaches an
+/// upstream that requires the header the way a redirected read does.
+pub(crate) fn chain_id_request(
+    client: &Client,
+    route: Route,
+    url: &Url,
+    query_header: Option<&QueryHeader>,
+) -> RequestBuilder {
+    let request = client
+        .post(url.clone())
+        .header(header::CONTENT_TYPE, HeaderValue::from_static("application/json"))
+        .body(CHAIN_ID_CALL);
+    stamp_route(request, route, query_header)
+}
+
+/// Ask an upstream for its chain id with one `eth_chainId` call, stamped for
+/// `route` like a forwarded call (see [`stamp_route`]): the query upstream gets
+/// the configured `query_header` and a worker never does.
+///
+/// Send it through the proxy client so `--upstream-request-timeout` bounds the
+/// whole exchange, answer included; the answer is read up to
+/// [`MAX_CHAIN_ID_ANSWER_BYTES`]. The error is a reason that is safe to log: it
+/// never carries the URL, the answer or the header.
+pub(crate) async fn fetch_chain_id(
+    client: &Client,
+    route: Route,
+    url: &Url,
+    query_header: Option<&QueryHeader>,
+) -> Result<u64, String> {
+    // reqwest's `Display` appends the request url, which can carry a credential
+    let transport = |err: reqwest::Error| ErrorChain(&err.without_url()).to_string();
+    let mut response =
+        chain_id_request(client, route, url, query_header).send().await.map_err(transport)?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("answered HTTP {status}"));
+    }
+    let mut answer = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(transport)? {
+        if answer.len().saturating_add(chunk.len()) > MAX_CHAIN_ID_ANSWER_BYTES {
+            return Err(format!("the answer exceeds {MAX_CHAIN_ID_ANSWER_BYTES} bytes"));
+        }
+        answer.extend_from_slice(&chunk);
+    }
+    parse_chain_id(&answer)
+        .ok_or_else(|| String::from("the answer is not a JSON-RPC result holding a hex chain id"))
+}
+
+/// The chain id in an `eth_chainId` answer: a `result` holding a `0x`-prefixed
+/// hex quantity that fits a `u64`.
+fn parse_chain_id(answer: &[u8]) -> Option<u64> {
+    /// The one member of the answer that matters.
+    #[derive(serde::Deserialize)]
+    struct ChainIdAnswer {
+        /// The chain id as a hex quantity.
+        result: String,
+    }
+    let answer: ChainIdAnswer = serde_json::from_slice(answer).ok()?;
+    let hex = answer.result.strip_prefix("0x")?;
+    // `from_str_radix` also takes a leading `+`, which a quantity never has
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    u64::from_str_radix(hex, 16).ok()
+}
+
 /// Start a client for the upstream hop with the settings every upstream client
 /// shares: rustls, trusting the platform's native root store plus every
 /// `--upstream-ca-cert` certificate, the `--upstream-client-cert` identity when
@@ -1083,6 +1185,60 @@ impl fmt::Display for UpstreamOrigin<'_> {
     }
 }
 
+/// A header sent on every request to the query upstream and never to a worker
+/// (`--redirect-queries-header`), such as a public RPC's API key.
+///
+/// Every redirected read leaves from the gateway's address, so a public RPC
+/// that meters by address would charge all of this gateway's clients to one
+/// quota; a key lets it meter the gateway instead. The value is marked
+/// sensitive and `Debug` prints only `<redacted>`, so neither [`AppState`] nor
+/// the resolved settings can leak it through a debug print.
+#[derive(Clone)]
+pub(crate) struct QueryHeader {
+    /// The header name.
+    name: HeaderName,
+    /// The header value, marked sensitive.
+    value: HeaderValue,
+}
+
+impl QueryHeader {
+    /// Parse one `Name: value` line, trimming whitespace around the line, the
+    /// name and the value.
+    ///
+    /// Errors name the problem but never echo any part of the line, which can
+    /// hold a credential even when it is malformed.
+    pub(crate) fn parse(line: &str) -> eyre::Result<Self> {
+        let (name, value) = line
+            .trim()
+            .split_once(':')
+            .ok_or_else(|| eyre::eyre!("expected one `Name: value` line, found no `:`"))?;
+        let name = HeaderName::from_bytes(name.trim().as_bytes())
+            .map_err(|_| eyre::eyre!("the header name is not a valid HTTP header name"))?;
+        let value = value.trim();
+        eyre::ensure!(!value.is_empty(), "the header value is empty");
+        let mut value = HeaderValue::from_str(value).map_err(|_| {
+            eyre::eyre!(
+                "the header value is not a valid HTTP header value (one line, no control \
+                 characters)"
+            )
+        })?;
+        value.set_sensitive(true);
+        Ok(Self { name, value })
+    }
+
+    /// The header's name and value, for tests.
+    #[cfg(test)]
+    pub(crate) fn parts(&self) -> (&HeaderName, &HeaderValue) {
+        (&self.name, &self.value)
+    }
+}
+
+impl fmt::Debug for QueryHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 /// Renders an error followed by every [`std::error::Error::source`] beneath it,
 /// joined with `": "`.
 ///
@@ -1105,7 +1261,7 @@ impl fmt::Display for ErrorChain<'_> {
 
 /// Which upstream a request goes to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Route {
+pub(crate) enum Route {
     /// The first ready worker: every call without `--redirect-queries`, and
     /// with it only submissions and the reads only its pool can answer.
     Worker,
@@ -2660,6 +2816,7 @@ mod tests {
             )
             .expect("client"),
             query_upstream: Some(query_url),
+            query_header: None,
             recent_submissions: None,
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
@@ -3302,5 +3459,23 @@ mod tests {
             Duration::from_secs(1),
         );
         assert!(proxy.is_ok(), "{proxy:?}");
+    }
+
+    #[test]
+    fn chain_id_answers_parse_only_as_hex_quantities() {
+        for (answer, expected) in [
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x7e1"}"#, Some(2017)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x1"}"#, Some(1)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0xffffffffffffffff"}"#, Some(u64::MAX)),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x10000000000000000"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x+1"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"0x"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":"7e1"}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"result":2017}"#, None),
+            (r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32601,"message":"no"}}"#, None),
+            ("not json", None),
+        ] {
+            assert_eq!(parse_chain_id(answer.as_bytes()), expected, "{answer}");
+        }
     }
 }
