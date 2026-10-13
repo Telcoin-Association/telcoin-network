@@ -3715,6 +3715,11 @@ mod tests {
         }
     }
 
+    /// The issue's scenario: a submission is answered while stalled reads hold
+    /// every query slot. It passes on a gateway without class caps too, since
+    /// four stalled reads never fill the connection cap;
+    /// `submissions_succeed_while_stalled_reads_exceed_the_connection_cap` is
+    /// the test that proves the isolation.
     #[tokio::test]
     async fn submissions_succeed_while_query_route_is_saturated() {
         let saturated = saturated_query_route(4).await;
