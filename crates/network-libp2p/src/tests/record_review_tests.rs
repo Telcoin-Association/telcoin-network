@@ -10,6 +10,8 @@ async fn shed_record_response_remains_retryable() -> eyre::Result<()> {
     let mut network = peer1.network;
     let peer = *peer2.network.swarm.local_peer_id();
     let key = peer2.config.key_config().primary_public_key();
+    // The store admits only owned keys, so the responder must be a committee member.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([key])?;
     (0..crate::peers::MAX_PUT_RECORDS_PER_WINDOW).for_each(|_| {
         assert!(matches!(
             network.swarm.behaviour_mut().peer_manager.put_record_rate_limited(peer),
@@ -117,6 +119,9 @@ async fn persisted_record_does_not_prime_verification_cache() -> eyre::Result<()
         create_test_types::<TestWorkerRequest, TestWorkerResponse>();
     let mut network = peer1.network;
     let mut record = peer2.network.get_peer_record();
+    let key = peer2.config.key_config().primary_public_key();
+    // The store admits only owned keys, so the publisher must be a committee member.
+    network.swarm.behaviour_mut().kademlia.store_mut().retain_committees([key])?;
     let mut invalid = peer2.network.node_record.clone();
     invalid.info.timestamp = invalid.info.timestamp.saturating_add(1);
     record.value = encode(&invalid);
