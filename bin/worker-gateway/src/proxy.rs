@@ -479,7 +479,7 @@ pub(crate) async fn proxy(
     // while the worker is slow they cannot take every worker slot and leave
     // submissions a `503`. without a redirect every read is a worker forward,
     // and the lowered query cap already keeps a fifth free for submissions.
-    let _pool_read_slot =
+    let pool_read_slot =
         if route == Route::Worker && class == Class::Query && state.query_upstream.is_some() {
             match Arc::clone(&state.pool_read_slots).try_acquire_owned() {
                 Ok(permit) => Some(permit),
@@ -500,7 +500,7 @@ pub(crate) async fn proxy(
     // failing fast like the class caps above. unlike the class slot, this one
     // is released at the response head: the worker frees its own permit once
     // it has built the response, before the body is written.
-    let _upstream_slot = match route {
+    let upstream_slot = match route {
         Route::Worker => match telemetry::InFlightSlot::upstream(&state.upstream_slots) {
             Some(slot) => Some(slot),
             None => {
@@ -523,6 +523,11 @@ pub(crate) async fn proxy(
 
     match forward(&state, route, &headers, body.clone(), upstream_url.clone(), forwarding).await {
         Ok(upstream) => {
+            // the worker has answered with its head, so it no longer holds a
+            // connection permit for this request: free its slots here, before
+            // a submission's answer is read whole below or any body is relayed
+            drop(upstream_slot);
+            drop(pool_read_slot);
             // the upstream has answered: what is left only passes that answer
             // on, so the request deadline no longer cuts it (see
             // [`ForwardingStarted`])
@@ -559,8 +564,8 @@ pub(crate) async fn proxy(
             // 2xx as well, carrying a json-rpc `error`, so only a json-rpc
             // `result` counts: the answer is read whole to tell, and only on
             // this path. it is read here, while the in-flight guard, the class
-            // slot and the byte reservation are still held; they drop when
-            // this returns
+            // slot and the byte reservation are still held (the worker slot no
+            // longer is); they drop when this returns
             let remember = recent
                 .zip(scan.submitted)
                 .filter(|_| route == Route::Worker && upstream.status().is_success());

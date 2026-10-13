@@ -4410,6 +4410,80 @@ mod tests {
         assert_eq!(metrics.value(duration, &[]), 1.0, "one duration sample, at the body's end");
     }
 
+    /// The worker slot is released at the response head on the buffered path
+    /// too: a worker that sends the head of a submission's answer and then
+    /// stalls holds no `--max-upstream-inflight` slot while the gateway waits
+    /// for the rest, though the request is still in flight and keeps its
+    /// class slot.
+    #[tokio::test]
+    async fn worker_slot_is_released_at_the_head_of_a_buffered_answer() {
+        let mut metrics = CapturedMetrics::install();
+        // a worker that sends the head and the start of an accepting answer,
+        // then holds the rest until released
+        let entered = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (seen, held) = (Arc::clone(&entered), Arc::clone(&release));
+        let mock = Router::new().route(
+            "/",
+            post(move || {
+                let (seen, held) = (Arc::clone(&seen), Arc::clone(&held));
+                async move {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    let (start, rest) = ACCEPTED.split_at(20);
+                    let head = futures::stream::once(async move {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from_static(start.as_bytes()))
+                    });
+                    let tail = futures::stream::once(async move {
+                        held.notified().await;
+                        Ok(axum::body::Bytes::from_static(rest.as_bytes()))
+                    });
+                    (
+                        [(header::CONTENT_TYPE, "application/json")],
+                        axum::body::Body::from_stream(futures::StreamExt::chain(head, tail)),
+                    )
+                }
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let (query, _query_seen, _query) = named_mock("query").await;
+        let mut state = redirect_state(worker, Some(query));
+        state.upstream_slots = inflight_slots(1);
+        state.readiness.set_ready(0, true);
+        let upstream_slots = Arc::clone(&state.upstream_slots);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let answer = tokio::spawn(post_rpc(gateway, None, submission(1)));
+        let upstream = "tn_worker_gateway_upstream_inflight";
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while entered.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the submission should reach the worker");
+        // the head is in, the rest of the answer is not; the wait stays well
+        // inside the proxy client's 5 s deadline, which would free the slot
+        // by failing the request
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while metrics.value(upstream, &[]) > 0.5 || upstream_slots.available_permits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the worker slot must be released at the response head");
+        assert!(!answer.is_finished(), "the answer is still being read whole");
+        assert_eq!(metrics.value("tn_worker_gateway_inflight_requests", &[]), 1.0);
+        let class = [("route", "submission")];
+        assert_eq!(metrics.value("tn_worker_gateway_route_inflight", &class), 1.0);
+
+        release.notify_one();
+        let (status, text) = tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .expect("the answer completes once released")
+            .expect("client task");
+        assert_eq!((status, text.as_str()), (StatusCode::OK, ACCEPTED));
+    }
+
     /// Send a request head promising a 100-byte body, and the first bytes of
     /// that body, on a raw connection; then stall or stop sending as `then`
     /// says, and return everything the gateway answers before it closes.
