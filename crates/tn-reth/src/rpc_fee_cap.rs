@@ -60,6 +60,18 @@ impl TxFeeCapWei {
         }
     }
 
+    /// Check a transaction the caller already decoded against the cap.
+    ///
+    /// For callers that decode the bytes themselves (the `--sanitize-txs` precheck), so a
+    /// submission is decoded once. A cap of zero skips the check, as in [`Self::enforce`].
+    pub(crate) fn enforce_decoded(&self, tx: &PooledTransaction) -> Result<(), EthApiError> {
+        let Self(cap_wei) = *self;
+        if cap_wei == 0 {
+            return Ok(());
+        }
+        Self::check_cap(tx, cap_wei)
+    }
+
     /// Compare the transaction's maximum fee against the cap.
     ///
     /// Reproduces reth's validator check (`EthTransactionValidator`) and is never
