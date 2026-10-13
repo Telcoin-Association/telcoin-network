@@ -1411,10 +1411,7 @@ fn same_host_and_port(a: &Url, b: &Url) -> bool {
 /// matches the IPv4 loopback address (see [`url_host_ip`]); other domain names
 /// match only as written.
 fn same_host(a: &Url, b: &Url) -> bool {
-    match (url_host_ip(a), url_host_ip(b)) {
-        (Some(a), Some(b)) => a == b,
-        _ => a.host() == b.host(),
-    }
+    url_host_ip(a).zip(url_host_ip(b)).map_or_else(|| a.host() == b.host(), |(a, b)| a == b)
 }
 
 /// Whether `url` is plain `http` to anything but a loopback or private address
@@ -1441,14 +1438,12 @@ fn plaintext_to_public_host(url: &Url) -> bool {
 fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
     let same_port = url.port_or_known_default() == Some(listen_addr.port());
     let listen_ip = listen_addr.ip().to_canonical();
-    let hits_gateway = url_host_ip(url)
-        .map(|ip| {
-            let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
-            ip == listen_ip
-                || (same_family && ip.is_unspecified())
-                || (same_family && ip.is_loopback() && listen_ip.is_unspecified())
-        })
-        .unwrap_or(false);
+    let hits_gateway = url_host_ip(url).is_some_and(|ip| {
+        let same_family = ip.is_ipv4() == listen_ip.is_ipv4();
+        ip == listen_ip
+            || (same_family && ip.is_unspecified())
+            || (same_family && ip.is_loopback() && listen_ip.is_unspecified())
+    });
     eyre::ensure!(
         !(same_port && hits_gateway),
         "upstream URL `{}` points at the gateway's own listen address ({listen_addr}), \
