@@ -5,14 +5,14 @@
 #
 # Usage: etc/storage-baseline-bench.sh <empty dir on the disk under test> [report file]
 #   QUICK=1 ...             one pass with only the columns the backend decision needs (Split
-#                           tnlog, tnlog/tndb group, production MDBX); skips the reference columns
+#                           tndb, tndb group, production MDBX); skips the reference columns
 #                           that sync every write, which dominate the run time on a disk whose
 #                           fsync flushes its cache (most Linux setups), and runs 3 compaction-cost
 #                           pairs of 300 rounds. About 20-30 minutes on a laptop NVMe.
 #   ROUNDS=1 ...            runs each workload once instead of three times (default 3; 1 if QUICK)
 #   ONLY="workload_mixed"   runs only the named workloads (space separated)
 #
-# Needs this checkout's tn-storage with the tnlog work (an uncommitted tree can be copied over
+# Needs this checkout's tn-storage with the tndb work (an uncommitted tree can be copied over
 # with `rsync -a --exclude target <repo>/ <host>:<repo>/`), a Rust toolchain, and a few GB free in
 # the bench directory. The benches create their databases under TMPDIR, set here to that
 # directory: on Linux /tmp is often tmpfs (RAM), where every sync is free, so tmpfs is refused.
@@ -42,8 +42,8 @@ if [ "$os" = "Linux" ]; then
         exit 1
     fi
 fi
-if [ ! -d "$repo/crates/storage/src/tnlog" ]; then
-    echo "error: $repo has no crates/storage/src/tnlog; copy over the tree with the tnlog work" >&2
+if [ ! -d "$repo/crates/storage/src/tndb" ]; then
+    echo "error: $repo has no crates/storage/src/tndb; copy over the tree with the tndb work" >&2
     exit 1
 fi
 
@@ -61,7 +61,7 @@ fi
 bin="$repo/$(grep -o 'target/release/deps/tn_storage-[0-9a-f]*' "$build_log" | head -1)"
 rm -f "$build_log"
 if ! "$bin" --list --ignored 2>/dev/null | grep -q 'workload_mixed_compaction'; then
-    echo "error: $bin lacks the baseline workloads; is this the tree with the tnlog work?" >&2
+    echo "error: $bin lacks the baseline workloads; is this the tree with the tndb work?" >&2
     exit 1
 fi
 
@@ -121,16 +121,15 @@ rm -f "$probe"
 quick_columns() {
     case "$1" in
         workload_consensus_rounds)
-            echo "MemDb,TnDb-group,TnLog-group,Split<TnLog-group>,Layered<MDBX-prod>" ;;
+            echo "MemDb,TnDb-group,Split<TnDb-group>,Layered<MDBX-prod>" ;;
         workload_batch_cache)
-            echo "MemDb,TnDb-group,TnLog-group,Split<TnLog-group>,Layered-cache<MDBX-prod>" ;;
+            echo "MemDb,TnDb-group,Split<TnDb-group>,Layered-cache<MDBX-prod>" ;;
         workload_mixed)
-            # Not tndb-group: beside the unpaced stream it collapses (~45 s a round on Linux).
-            echo "Split-nocompact,Split<TnLog-group>,Composite<MDBX-prod>" ;;
+            echo "Split-nocompact,Split<TnDb-group>,Composite<MDBX-prod>" ;;
         workload_compaction)
-            echo "TnDb-group,TnLog-group-nocompact,TnLog-group" ;;
+            echo "TnDb-group-nocompact,TnDb-group" ;;
         workload_startup_reload)
-            echo "TnDb-group,Split<TnLog-group>,Layered<MDBX-prod>" ;;
+            echo "Split<TnDb-group>,Layered<MDBX-prod>" ;;
         *) echo "" ;;
     esac
 }

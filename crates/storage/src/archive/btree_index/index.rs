@@ -66,7 +66,7 @@ use crate::archive::{
 /// only, so the mapping never moves while the file stays within it; a file that outgrows it is
 /// re-reserved at double the size (the one case in which the mapping moves). 1 GiB rather than
 /// tens of GiB: on macOS the per-commit `msync` cost measurably grew with a 64 GiB reservation
-/// (tndb one-write-plus-sync +5–8%), and was flat at 1 GiB.
+/// (+5–8% on a one-write-plus-sync bench), and was flat at 1 GiB.
 pub(crate) const BTX_MAP_RESERVE: u64 = 1 << 30;
 
 /// Map a read failure encountered on the write path into an append error.
@@ -474,8 +474,8 @@ impl BtreeIndex {
         self.header.data_file_length
     }
 
-    /// Set the owner's value (any `u64` the owner keeps with the index; tndb keeps its dead-put
-    /// count); persisted with the header on the next [`Index::sync`].
+    /// Set the owner's value (any `u64` the owner keeps with the index); persisted with the header
+    /// on the next [`Index::sync`].
     pub fn set_owner_value(&mut self, value: u64) {
         if self.header.owner_value != value {
             self.header.owner_value = value;

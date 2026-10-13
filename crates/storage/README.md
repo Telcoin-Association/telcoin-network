@@ -175,12 +175,15 @@ feature, else redb) splits the workload into `epoch` / `kad` / `cache` sub-datab
 hint. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`certificate_store`,
 `payload_store`, `proposer_store`, `vote_digest_store`) wrap the trait for primary/worker state.
 
-**`tndb`** (`TnDatabase`) is a third `Database` backend built on this crate's own pack files and
-B+tree index (lock-free snapshot reads, crash recovery by replaying its logs, physical clears). It
-is benchmarked against MDBX but not yet used by `open_db`. See [`src/tndb/README.md`](src/tndb/README.md).
-**`tnlog`** (`TnLogDatabase`, work in progress) is the same idea with every table in one shared log
-(one sync per commit, transactions atomic across tables), built beside `tndb` to compare them. See
-[`src/tnlog/README.md`](src/tnlog/README.md).
+**`tndb`** (`TnDatabase`) is a third `Database` backend built on this crate's own pack files
+and B+tree index: every table of a database in one shared, CRC-framed log (one sync per commit,
+transactions atomic across tables), lock-free snapshot reads, crash recovery by replaying the log,
+and compaction into a new generation. The `tndb` feature makes it the `DatabaseType`
+(`SplitDatabase`: one log per `epoch` / `kad` / `cache` environment, as `open_db` splits MDBX), and
+the first open moves an existing MDBX consensus DB into it; MDBX stays the default. It replaced
+an earlier per-table engine of the same name, whose separate files cost a sync per table per
+commit (this engine was called `tnlog` while the two were compared). See
+[`src/tndb/README.md`](src/tndb/README.md).
 
 ### On-disk layout
 

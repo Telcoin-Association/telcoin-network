@@ -1,697 +1,376 @@
-# `tndb` — the pack-file key/value database
+# tndb: one shared log for all tables
 
-`tndb` is a `Database` (the `tn-types` key/value trait used by the node's consensus stores) built
-on this crate's own storage primitives instead of MDBX or redb:
+`tndb` is a `tn_types::Database` whose tables share **one log** per database. Each table keeps its
+own B+tree index of positions in that log. It replaced an earlier per-table engine of the same
+name (removed; in git history), which the table below contrasts it with. This engine was called
+`tnlog` while the two were compared; the measurements against the per-table engine
+further down are kept as the record of that choice. Cleared, removed and overwritten bytes stay
+in the log until a background compaction rewrites it (see Compaction).
 
-- each **table** is an append-only **data log** (an `archive::pack::Pack`, the write-ahead log and
-  the source of truth),
-- plus a copy-on-write **B+tree index** over it ([`archive::btree_index`](../archive/btree_index/README.md))
-  mapping each key to its record's position,
-- read through published, immutable **snapshots** with **no lock**: readers never block writers,
-  and writers never block readers.
-
-On top of that it adds crash recovery (rebuild the index by replaying the log to the last commit),
-physical clears (a cleared table's data leaves the disk), background compaction (overwritten and
-removed records leave the disk too), and two key modes (store the key, or derive it from the
-value).
-
-> **Status.** tndb is not yet the node's production database: `open_db` still builds
-> `CompositeDatabase<MdbxDatabase>`. tndb is complete enough to be benchmarked against MDBX through
-> the same `Database` trait (raw and behind `LayeredDatabase`; see [Benchmarks](#benchmarks)), and
-> is the intended replacement.
-
-| file | contents |
-|---|---|
-| `mod.rs` | module root; re-exports `TnDatabase` and `CompactionConfig` |
-| `database.rs` | the typed layer: `TnDatabase`, `TnDbTx`, `TnDbTxMut`, the `Database` impl, key modes |
-| `table.rs` | one table (`TnTable`): logs, index, snapshots, commits, recovery, generations, clear |
-| `table/compact.rs` | compaction: the background rewrite into the next generation, and its catch-up |
-| `layout.rs` | the on-disk layout: the `meta` file, generation, spare and compaction directories, `fsync` helpers |
-
----
-
-## Contents
-
-1. [Quick start](#quick-start)
-2. [Architecture](#architecture)
-3. [On-disk layout](#on-disk-layout)
-4. [Key modes](#key-modes)
-5. [Reads, writes and transactions](#reads-writes-and-transactions)
-6. [Commits and durability](#commits-and-durability)
-7. [Commit modes: sync and group](#commit-modes-sync-and-group)
-8. [Crash recovery](#crash-recovery)
-9. [Clearing a table: generations and spares](#clearing-a-table-generations-and-spares)
-10. [Compaction](#compaction)
-11. [Concurrency and memory safety](#concurrency-and-memory-safety)
-12. [API reference](#api-reference)
-13. [Limitations and future work](#limitations-and-future-work)
-14. [Tests](#tests)
-15. [Benchmarks](#benchmarks)
-
----
-
-## Quick start
-
-```rust
-use tn_storage::tndb::TnDatabase;
-use tn_types::{Database as _, DbTxMut as _};
-
-// `Votes` and `Certificates` stand for any `Table` types.
-let db = TnDatabase::open("/path/to/tndb")?;
-
-// A keyed table: every row's key is stored in its log (the default).
-db.open_table::<Votes>()?;
-
-// A derived-key table: the log stores only values; on a rebuild each key is recomputed from its
-// value. Every row's key must equal `key_of(&value)`.
-db.open_table_with_key::<Certificates>(|cert| cert.digest())?;
-
-db.insert::<Votes>(&author, &vote)?;            // autocommit: durable and visible on return
-let vote = db.get::<Votes>(&author)?;
-
-let mut txn = db.write_txn()?;                  // several writes, one commit per table
-txn.insert::<Certificates>(&digest, &cert)?;
-txn.remove::<Votes>(&old_author)?;
-txn.commit()?;                                  // durable, then visible to readers
-
-for (k, v) in db.iter::<Certificates>() { /* lazy, key-ordered, lock-free */ }
-db.clear_table::<Votes>()?;                     // empty, and the data is deleted from disk
-```
-
-Wrapping it in the in-memory layer works as with any backend:
-`LayeredDatabase::open(TnDatabase::open(path)?, true)`. Open any derived-key table with
-`open_table_with_key` on the `TnDatabase` *before* the wrapper opens it; the wrapper's later
-`open_table` keeps the table as opened.
-
----
-
-## Architecture
-
-```text
-TnDatabase (database.rs)                    typed layer: encode keys/values, route by table name
-  │  ArcSwap<HashMap<&str, TableStore>>     table map, read lock-free (read-copy-update on open)
-  ▼
-TnTable (table.rs)                          one table; a cheap Clone handle over Arc<Inner>
-  ├─ Mutex<Writer>                          the single writer: current generation's files
-  │    ├─ data log      Pack<Vec<u8>>       puts, removals + commit records (the WAL, source of truth)
-  │    ├─ BtreeIndex                         key → data-log position (copy-on-write, derived)
-  │    ├─ spare thread                       the next generation, prepared in the background
-  │    └─ compaction thread                  the live rows, rewritten into the next generation
-  └─ ArcSwap<Published>                      what readers see: an IndexSnapshot + the log's MapView
-```
-
-- **Encoding.** Keys go through `encode_key` (binary-sortable, so byte order is key order) and
-  values through `encode` (BCS). A table's key size is the encoded key length
-  (`encode_key(key).len()`), fixed per table: `size_of::<T::Key>()` would be wrong (for example
-  `AuthorityIdentifier` is an `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
-- **No allocation per op.** Writes encode into the table's reusable `EncodeBufs` (behind a
-  per-table mutex that only another writer of the same table could contend). Point reads encode
-  their key into a per-thread buffer and decode straight from the mapped log.
-- **Snapshot isolation.** A write changes the table's working state at once, but readers see it only
-  after the next flush (commit) publishes a new `Published` snapshot. A write transaction's own
-  `get` reads the working state.
-
----
-
-## On-disk layout
-
-```text
-<root>/                                 TnDatabase::open(root)
-  <TableName>/                          one directory per table (Table::NAME)
-    LOCK                                flock'd by the table's one open writer
-    meta                                key mode + encoded key size (16 bytes, CRC'd)
-    gen-<N>/                            the current generation (exactly one after a clean open)
-      data                              data log (Pack, uncompressed) ── + clean-close seal
-      btx/index.btx                     B+tree index (derived; created at the first insert)
-    spare-<N+1>-<pid>-<id>/             the next generation, prepared in the background
-    compact-<N+1>-<pid>-<id>/           a compaction's new generation, being built
-```
-
-### `meta`
-
-Written atomically (temp file, `fsync`, rename, directory `fsync`) when the table is created, and
-once more when its first row fixes the key size.
-
-| bytes | field |
-|---|---|
-| `0..8` | magic `b"TNDBMETA"` |
-| `8` | format version (`1`) |
-| `9` | key mode: `0` keyed, `1` derived |
-| `10..12` | encoded key size, `u16` LE (`0` until the first insert) |
-| `12..16` | CRC32 (LE) of bytes `0..12` |
-
-A corrupt `meta` fails the open. A table with generation data but no `meta` also fails the open.
-
-### Data log records
-
-Every record sits in the pack's frame `[u32 len LE | payload | u32 crc32 LE]` (the CRC covers
-`len ‖ payload`) after the pack's 28-byte header. A payload starts with a tag byte:
-
-| payload | meaning |
-|---|---|
-| `1 ‖ key ‖ value` | a put in a **keyed** table (`key` is exactly the table's key size) |
-| `1 ‖ value` | a put in a **derived-key** table (a derived table never stores an empty value) |
-| `2 ‖ key` | a **removal** (both modes): every earlier put of `key` is gone |
-| *empty* | a **commit record**: every put and removal before it (since the previous commit) is committed |
-
-Any other tag, or a removal that is not exactly one key long, is a malformed record (recovery fails
-closed). Overwrites append a new put; the index points at the newest. Reads find the value at
-`payload[1 + key_size..]` (keyed) or `payload[1..]` (derived). A removal is logged only when the key
-was present (a miss costs nothing).
-
-Puts and removals share the one log, so a commit syncs one file, and recovery needs no ordering
-between logs: the records are CRC-framed and replay stops at the first bad frame, so a commit
-record counts only when every record before it read back intact. (Format version 1, a pre-release
-layout, kept removals in a second log that had to be synced before the commit record; `meta`
-version 2 marks the one-log format, and a version-1 table is refused.)
-
-### Files and options
-
-| file | mapping | initial size | notes |
-|---|---|---|---|
-| `data` | 1 GiB reserved range (never moves while open) | 1 MiB, geometric growth | lock-free readers read it in place |
-| `btx/index.btx` | 1 GiB reserved range | 2 pages | see the btree_index README |
-
----
-
-## Key modes
-
-| | keyed (default) | derived-key |
+| | per-table engine (removed) | tndb (shared log) |
 |---|---|---|
-| open with | `Database::open_table::<T>()` | `TnDatabase::open_table_with_key::<T>(key_of)` |
-| data record | `key ‖ value` | `value` |
-| rebuild gets keys from | the record | `encode_key(key_of(&decode(value)))` |
-| use when | any table | the key is a function of the value (e.g. a digest of it) |
-
-- **The mode is fixed when the table is created** (in `meta`). Opening it in the other mode is an
-  error.
-- **`key_of` must hold for every row:** the key passed to `insert` must equal `key_of(&value)`, or a
-  rebuild would file the row under a different key. A rebuild is not the only reader of `key_of`:
-  every compaction derives the keys of the rows written while it ran, so a violation re-keys rows
-  at an ordinary switch, not only after a crash. Debug builds check it on every insert
-  (`debug_assert`); release builds do not, to keep the hot path free.
-- **Opens are idempotent.** Re-opening an open table keeps it. `open_table` after
-  `open_table_with_key` keeps the derived table (so a wrapper such as `LayeredDatabase` can open
-  it again); `open_table_with_key` on a table already open as keyed is an error. Opens are
-  serialized, so a table is never opened twice.
-
----
-
-## Reads, writes and transactions
-
-| `Database` method | behaviour |
-|---|---|
-| `get`, `contains_key` | published snapshot, lock-free; `get` decodes straight from the mapped log; a damaged index is an error, never "absent" |
-| `iter`, `reverse_iter`, `skip_to` | lazy `DBIter` owning a snapshot and a B+tree cursor; holds no lock, so the table can be written (and committed) during a scan; the scan keeps its starting snapshot. `DBIter` cannot carry an error, so a scan ended by damage logs `tracing::error!` before it stops |
-| `record_prior_to`, `last_record` | a single seek in the snapshot (an error ends it the same way, logged) |
-| `is_empty` | snapshot key count (an absent table reads as not empty) |
-| `insert`, `remove` | **autocommit**: write, then commit (durable) and publish before returning |
-| `clear_table` | switch to an empty generation (durable on return), then publish |
-| `read_txn` → `TnDbTx` | reads go straight to the published snapshots (`multi_get` uses the trait default) |
-| `write_txn` → `TnDbTxMut` | see below |
-| `persist` | `CommitMode::Sync`: nothing to wait for (every commit is durable when it returns). `CommitMode::Group`: waits until every earlier write, in any table, is committed; an error once any write or commit has failed |
-| `sync_persist` | trait default (no-op): writes are readable as soon as they return, in both modes |
-| `compact` | starts a background compaction of every table with dead records (see [Compaction](#compaction)); returns at once |
-
-Every op that returns a `Result` on a table that was never opened is an **error** ("table … is not
-open"), as with MDBX: a write is never silently dropped. Each `insert` and `remove` is all or
-nothing: if its index step fails, its log record is taken back out, so a later commit cannot make
-durable a write the caller saw fail.
-
-**Write transactions are loose**, as in `MemDatabase`:
-
-- writes apply to each table's working state immediately;
-- the transaction's own `get` sees them;
-- `commit` commits (durably) and publishes each table it wrote, one table after another;
-- there is **no rollback**: a dropped transaction's writes stay in the working state and are
-  committed by the table's next commit, or by a clean close;
-- a table has one working state, so concurrent write transactions on the same table see, and
-  commit, each other's writes;
-- there is **no cross-table atomicity**: a crash during `commit` of a multi-table transaction can
-  keep one table's part and not another's.
-
----
-
-## Commits and durability
-
-A commit (`TnTable::flush`, run by `commit` and by every autocommit op) is skipped when the table
-has nothing uncommitted; otherwise:
-
-1. Append the **commit record** (an empty record) to the data log.
-2. `msync` the **data log** (plus a one-time `fsync` after a growth, so the new size is durable):
-   one sync, however many puts and removals the commit covers.
-3. Stamp the log's **commit marker** (best-effort, unsynced; a floor recovery uses, below), and
-   record the covered log length in the index header (in memory).
-4. If a compaction's thread has finished, switch to its generation (see [Compaction](#compaction)).
-5. Publish a new snapshot to readers, then start the automatic compaction if it is due.
-
-The B+tree index is **not** synced on commit; it is derived, synced at a clean close, and rebuilt
-after a crash.
-
-**Platform note.** tndb's commits are `msync`, and every other sync (directory entries, `meta`,
-growth sizes, the writable-reopen sentinel, the clean-close seal) is a plain `fsync(2)` (the
-`archive::data_file::fsync_file` / `fdatasync_file` helpers, which `layout::sync_file` / `sync_dir`
-use). On Linux those are exactly `File::sync_all` / `sync_data`. On macOS std's versions would be
-`F_FULLFSYNC`, a flush of the whole drive's write cache that stalls every other write on the drive
-for 10–20 ms, and tndb's commits don't issue one either. So on macOS tndb (like MDBX's `Durable`
-mode with `write_map`) is not a full power-loss barrier, and its numbers there understate the
-production (Linux) sync cost.
-
-**A clean close** commits anything uncommitted through the ordinary commit, for example a dropped
-transaction's writes. A close that cannot commit leaves the index marked stale, so the next open
-rebuilds and drops the uncommitted records. Otherwise the close records the final log length in the
-index header, syncs the index, and seals both files, and the next open needs no rebuild.
-
----
-
-## Commit modes: sync and group
-
-`TnDatabase::open_with(root, TnDbOptions { commit, compaction })` picks how writes are committed.
-
-- **`CommitMode::Sync`** (the default): each autocommit op, and each transaction's commit, commits
-  its tables before it returns (above). `persist` has nothing to wait for. Simple, and the lowest
-  latency for one writer, but every write waits on the disk on the caller's thread: on a tokio
-  worker, that blocks the runtime for each sync.
-- **`CommitMode::Group`** (`tndb/commit.rs`): built for production's async callers. A write
-  applies to its table and is **published at once** (readable from any thread on return), without
-  a sync, and is numbered from a database-wide sequence. One `tndb-commit` thread commits every
-  table written since its last round: one commit per table per round, however many writes landed
-  (a round's worth of votes costs one sync, not N). `persist` is the durability barrier: it
-  resolves once every write numbered before the call is committed, **in every table** (a
-  whole-database, FIFO barrier), and fails from the first failed write or commit on (a latch,
-  never cleared), as the externalization points (#975) require.
-
-How the committer keeps writers off the disk, and keeps the WAL invariants (`TnTable::group_commit`):
-
-1. Under the table's lock: append the commit record (the puts and removals it covers all sit before
-   it in the one log); switch to a finished compaction; capture the log's unsynced range.
-2. Unlocked: `msync` it, and `fsync` once if it grew (`MmapDataFile::sync_ticket`; the sync runs
-   through the mapping's shared view, so writers keep appending past it).
-3. Under the lock: record the synced end and the commit marker; start a compaction if one is due;
-   reap compactions a clear cancelled.
-
-Each table costs the committer one sync and two lock acquisitions per round.
-
-A writer holds the lock only for its append and index update, never across a sync.
-
-**A new generation during an unlocked sync.** While step 2 runs, a clear (or a compaction's switch
-made by `compact_table_now`) can install a new generation. The captured range therefore keeps its
-generation's files open (mapped) until its sync is done, and its outcome is recorded only while
-that generation is still current: the retired generation's rows are superseded (a clear is
-durable when it returns) or already durable in the new one (a switch syncs it before its rename),
-so its sync, failed or not, is moot, and the new generation's watermark and commit marker move
-only with its own syncs. (`MmapDataFile::complete_sync` also ignores a range taken from another
-file.) `test_tndb_group_clear_during_the_unlocked_sync` pauses the committer at its sync.
-
-**The durable watermark.** A round reads its target number *before* it takes the dirty tables, and
-a writer marks its table dirty *before* it takes its number, so every write numbered at or below
-the target is in that round (or an earlier one). The watermark advances to the target, held back
-by any table still pending. A table written by an **open write transaction** is left uncommitted
-until the transaction ends (it is held back, in every later round, until then), so a transaction
-is never durable in part in that table. A write committed early (numbered after the target, but in
-a table the round took) triggers one more round whenever that can move the watermark (a held
-table's first pending write is not what stops it), so the watermark reaches it without waiting for
-a later write. A write is numbered *before* it is published: a reader that sees it and then writes
-takes a later number, so a `persist` covering the reader's write covers the one it read.
-
-**Failures.** The first failed commit is latched: every later `persist` fails, and the watermark
-never moves again (it may not pass a failed table's writes, whatever other tables commit; a
-`persist` also re-checks the latch after reading the watermark). A write that fails because its
-table can no longer commit (its writer stopped, or a log failed) is latched too, even though it
-was never published for the committer to find and its caller may ignore the error; a caller's own
-error (a key of the wrong size, a table never opened) is only returned. A committer (or a table's
-commit) that panics latches the failure, so no `persist` waits forever.
-
-**Transactions in group mode** apply their writes at once (the transaction's own `get` sees them)
-and publish them when the transaction ends, by `commit` or by a drop (as `LayeredDatabase`'s
-dropped transactions do: kept and committed, no rollback). A bare write to a table with an open
-transaction is published at once but committed with the transaction. Atomicity is per table: a
-transaction spanning tables can, after a crash mid-round, be durable in one and not yet in another
-(as in sync mode, which commits its tables one by one). A transaction left open holds its tables
-back, and with them every `persist`, until it ends.
-
-**Clears** stay synchronous (a generation switch, durable on return), then are published; a
-transaction's `clear_table` is durable at once too.
-
-**`compact_table_now`** (tooling and tests) runs the sync-mode commit on the caller's thread,
-which commits whatever its table holds, an open transaction's writes included; production
-compacts through the automatic trigger and `Database::compact`, which leave the switch to the
-committer.
-
-**Crash semantics** match a write-behind layer's: a write is readable before it is durable, and a
-crash keeps every write made before the last successful `persist` (and possibly some after it),
-always whole transactions in each table (each table's committed state is a prefix of its writes,
-ending at a transaction boundary).
-
-**Compaction** in group mode is started at commit rounds, and the committer also asks every table
-to compact at start and daily (what `LayeredDatabase`'s writer did for the wrapped database).
-
-Why group mode rather than a wrapper: `CompositeDatabase` exists to split MDBX's single-writer
-environments (and their memory modes), which tndb's per-table files and writers do not need.
-`LayeredDatabase`'s write queue makes every `persist` wait behind every queued commit (each bare
-write is its own commit, and a transaction commits only once every overlapping one ends), and its
-memory layer doubles RAM and makes startup reload every row; without the queue it would block
-callers on every sync, as `Sync` mode does. Group commit gives non-blocking writes and a barrier of
-about one sync, with no copy of the data.
-
----
-
-## Crash recovery
-
-### When the index is rebuilt (at open, writable)
-
-Any of:
-
-- the data log or index was not closed cleanly (`opened_unclean()`, no clean-close seal);
-- the index fails to open or has a bad header or geometry (an `IO` error is surfaced instead);
-- the index's recorded `data_file_length` differs from the data log's length (the index lags);
-- the data log has records but there is no index.
-
-### What the rebuild does (`Writer::recover`, `replay`)
-
-1. **Validate and replay in memory, changing nothing.** The data log is read through a cloned file
-   handle (`PackIter::next_raw`, CRC-checked payloads; never through the shared mapping).
-   - Each put and each removal becomes *pending*; at each commit record the pending records apply
-     in log order: a put makes its key live (`key → position`, newest wins), a removal drops it (a
-     put of the same key after the removal survives). A put's key comes from the record (keyed) or
-     `key_fn(value)` (derived); a removal carries its key.
-   - Records after the last commit record are an **uncommitted transaction**: they are discarded.
-     Log pages can reach disk through OS writeback before their commit, so without commit records
-     a crash could apply half a transaction.
-2. **Fail closed.** Any of these makes the open fail, with nothing changed:
-   - a tear (bad frame) in a log that was **sealed** by a clean close: a sealed log must replay
-     whole (it may end in uncommitted records, from a close that could not commit; those are
-     dropped);
-   - in an **unclean** log, a stop *below* the log's commit marker: that is damage to committed
-     data, not a crash tail;
-   - a malformed record (an unknown tag; a put shorter than its key; a removal that is not one key
-     long; a key of the wrong size), or a key function failure.
-3. **Only then** cut an unclean log back to its last committed record (`rewind_to`), rebuild the
-   index with `rebuild_from` (sorted, so a sequential build), record the covered length, sync the
-   index, and `mark_consistent()` both files, so the next clean close seals them.
-
-A failed recovery changes no log byte, so retrying reaches the same verdict. The replay holds the
-live `key → position` map in memory: about (key size + 8 + map overhead) per live row, e.g. around
-100 MB transiently for ~1.3M rows.
-
-### What survives a crash
-
-Every commit that returned (`commit`, or an autocommit op) survives, including its removals, and no
-part of an uncommitted transaction does. A clear survives once it returns. Each table commits
-separately (see transactions above).
-
----
-
-## Clearing a table: generations and spares
-
-A table's files live in a **generation** directory, `gen-<N>`. Clearing the table moves it to a new,
-empty generation, and the old one's files are deleted. Stale data therefore leaves the disk, rather
-than lingering as garbage in a log.
-
-**Spares.** Creating files is the expensive part of a clear (file creation, preallocation, syncs).
-So after every open and every clear, a background thread (`tndb-spare`) prepares the **next**
-generation in a uniquely named `spare-<N+1>-<pid>-<id>/` directory. Its empty logs (and an empty
-index, once the key size is known) are created and synced there. A spare is never mistaken for a
-generation, because only `gen-*` directories are generations.
-
-**`clear`** (under the writer lock):
-
-1. Take the prepared spare (waiting for it if it is still being prepared). Rename it to
-   `gen-<N+1>` and `fsync` the table directory. **This is the clear**: from here a crash reopens the
-   table empty. If no spare is available, the generation is created in place, with full syncs.
-2. Switch the writer to the new generation, and publish an empty snapshot at the next commit.
-3. **Retire** the old generation. Its files are marked delete-on-drop (no seal) and moved into that
-   generation's keepalive, which its snapshots hold.
-4. Start the next spare. Before preparing it, that thread deletes the old `gen-<N>` directory
-   (unlinking it; the space returns when the last mapping closes).
-5. When the last snapshot of the old generation drops, its files are closed (unmapped) on a
-   short-lived `tndb-reap` thread, off the path of whoever dropped it.
-
-**Open** removes any leftover `spare-*` and `compact-*`, uses the newest `gen-*`, and deletes older
-ones. More than one generation exists only after a crash during a clear or a compaction's switch;
-the newest is current (a clear or a switch renames a complete generation into place, and a partly
-created one opens as empty). A newest generation that does not open is an **error**: it is never
-deleted and an older generation is never brought back in its place, since that would erase
-committed data or resurrect cleared data. A new table starts at `gen-0`. Deleting older generations
-and leftovers is best-effort (logged).
-
-**A failed clear** that may have changed which generation the next open picks (the rename into
-place succeeded but its directory sync failed, or a fallback creation failed part-way) **stops the
-writer**: later writes and commits fail until a restart, instead of committing to a generation the
-restart would discard.
-
-**Close** waits for a spare still being prepared, then discards it, so no background thread writes
-into a closed table's directory.
-
----
-
-## Compaction
-
-Overwrites and removes leave dead records in the data log (the old puts, and the removal records)
-until the table is cleared. Compaction rewrites a table's live rows into its next generation in the
-background and switches to it; the old generation, dead records and all, is then deleted.
-
-**When.**
-
-- **Automatically**, at a commit, once the data log is at least `CompactionConfig::auto_min_bytes`
-  (default 64 MiB) and at least half the generation's puts are dead (`dead ≥ live`). `dead` counts
-  overwrites and successful removes since the generation started; a clean close keeps it in the
-  index header (`owner_value`) and a crash rebuild recounts it. The check is O(1).
-- **On request**: `Database::compact()` starts one for every table with dead puts and a log of at
-  least 1 MiB, and returns at once (`LayeredDatabase` calls it at startup and daily).
-- **Now**: `TnDatabase::compact_table_now::<T>()` compacts regardless and waits (tooling, tests).
-
-`TnDatabase::open_with_compaction(root, config)` sets the trigger and pace; `auto_min_bytes: None`
-turns the automatic trigger off.
-
-**How** (`table/compact.rs`):
-
-1. **Copy** (a `tndb-compact` thread, no lock). From the last published snapshot, walk the index in
-   key order and append each live row's record, byte for byte, to a new data log in
-   `compact-<N+1>-<pid>-<id>/`, indexing it in a new B+tree. Dead records are never reached. Key
-   order fills the new tree densely (append splits) and makes a scan of the new log sequential. The
-   snapshot is released once copied, so it pins no index pages during the catch-up; the old
-   generation's keepalive is held for the whole run.
-2. **Catch-up** (same thread, no lock). Commits keep landing in the old generation. At each publish
-   the writer tells the thread how far the old log is committed, and the thread replays its
-   committed tail through its lock-free view, in log order: a put is copied (byte for byte, and
-   indexed), a removal drops the key and is logged in the new data log, so the new generation
-   replays on its own. Rounds repeat until one has at most 1 MiB to replay (at most 8).
-3. **Sync** the new log and the directory. That bulk sync can take a while for
-   a large table, so one more catch-up round then replays what was committed during it, followed
-   by a (small) sync of that.
-4. **Switch** (the writer, at the first commit after the thread finishes, between that commit and
-   its publish): replay the last tail (all of it committed by then), commit and sync it, check the
-   new generation holds exactly the table's rows, rename the directory to `gen-<N+1>` and `fsync`
-   the table directory. The old generation is retired as in a clear (its keepalive holds it for live
-   snapshots; its directory is deleted on a `tndb-reap` thread), and the publish moves readers to
-   the new one.
-
-**Pacing.** The copy pauses between 1 MiB batches to hold `CompactionConfig::bytes_per_sec`
-(default 64 MiB/s; 0 is unpaced), leaving the disk to commits. A pacing sleep checks for a
-cancellation every 10 ms. The catch-up is not paced: each round replays what the writer committed
-during the last, so it adds no more I/O than the writer's own, and a catch-up paced below the
-writer's rate would fall further behind every round and never finish (a group-mode writer easily
-outruns 64 MiB/s).
-
-**Cost.** Readers are unaffected: they keep their snapshot and move to the new generation at the
-next publish. The writer is delayed only by the switch: a replay of what was committed during the
-thread's final small sync, an `msync`, a rename and a directory `fsync`. On the hot path,
-compaction adds a counter per write and a few O(1) checks per commit.
-
-**Disk space.** A compaction starts only when the filesystem has room for the new generation beside
-the old one: at least the data log's length (the most its live rows can take) plus 128 MiB (the new
-log's growth preallocation). Otherwise it is skipped and logged; a failed probe does not block it.
-
-**Failures.** A compaction that fails (an I/O error, a failed CRC, a row-count mismatch at the
-switch, no room, no thread) is dropped, its files deleted, and the table carries on in its old
-generation. It is logged as an error when it read damaged committed data, else as a warning. The
-automatic trigger then backs off (1 minute, doubling to 1 hour, reset by the next successful
-switch), so a lasting cause does not restart a full compaction at every commit; requested and
-immediate compactions are not held back.
-
-**Crash safety.** Before the rename, a compaction is a `compact-*` directory, never a generation:
-the next open deletes it, and the table is as it was. After the rename, the new generation is the
-newest and holds every committed row (as the old one does), so the next open uses it (rebuilding it
-from its own logs if unclean) and deletes the old one. A switch that fails after its rename (the
-directory sync) stops the writer, as a failed clear does.
-
-**Interplay.**
-
-- A **clear** cancels a running compaction: its thread stops at its next check and deletes its
-  directory, and is reaped (in the background) at a later commit, or joined at close. A compaction
-  that had already finished is discarded at once, its copy deleted in the background.
-- A **clean close** switches to a compaction that has finished, and stops one that has not.
-- **Disk:** while a compaction runs, the table holds both generations (the old one whole, the new
-  one's live rows).
-
----
-
-## Concurrency and memory safety
-
-- **Readers** load the table map and the table's current `Published` through `ArcSwap` (a
-  per-thread slot, no shared refcount write, no lock). A point read is one index descent plus a
-  slice of the mapped log.
-- **Writers** serialize per table on the writer mutex; different tables are written in parallel.
-- **One writer per table directory.** An open takes an exclusive `flock` on `<table>/LOCK` for the
-  writer's life, so a second open of the table (another `TnDatabase` in this process, a reopen while
-  an iterator from a dropped instance keeps the old writer alive, or another process) fails instead
-  of becoming a second writer on the same logs. A crash releases it with the process.
-- **Mappings outlive their readers.** A `MapView` does not own its mapping, so a file must stay
-  open while any reader can reach it. Snapshots and scans hold `Arc`s that guarantee this:
-  - the current generation's files live in the table's `Writer`, which a `TableScan` keeps alive;
-  - a retired (cleared or compacted away) generation's files live in its `GenAlive` keepalive,
-    which its snapshots, and a compaction thread reading it, hold.
-
-  Neither file is ever truncated or unmapped under a live reader: lock-free readers cannot be
-  counted, so the design never needs to count them.
-- **The index never reuses a page a live snapshot can reach** (see the btree_index README).
-- **Background threads** are a spare preparer per table (joined on clear and on close), a
-  compactor while one runs (joined at the switch; cancelled by a clear; joined at close), and
-  short-lived reapers (detached; they only close already-unlinked files or delete a retired
-  generation's directory).
-
----
-
-## API reference
-
-| item | description |
-|---|---|
-| `TnDatabase::open(root)` | open or create a database rooted at `root` (tables are opened separately) |
-| `TnDatabase::open_with_compaction(root, config)` | the same, with a `CompactionConfig` (trigger and pace) |
-| `TnDatabase::open_with(root, TnDbOptions { compaction, commit })` | the same, choosing the `CommitMode` (`Sync` or `Group`; see [Commit modes](#commit-modes-sync-and-group)) |
-| `TnDatabase::compact_table_now::<T>()` | compact table `T` now and wait for the switch |
-| `Database::compact()` | start a background compaction of every table with dead records |
-| `Database::open_table::<T>()` | open (or create) table `T` as keyed; idempotent |
-| `TnDatabase::open_table_with_key::<T>(key_of)` | open (or create) table `T` as derived-key |
-| `Database` / `DbTx` / `DbTxMut` | the full trait surface (see [Reads, writes and transactions](#reads-writes-and-transactions)) |
-| `TnDbTx`, `TnDbTxMut` | the transaction types |
-
-Crate-internal building blocks (`table.rs`, `table/compact.rs`, `layout.rs`): `TnTable`
-(`open_with(dir, key_fn, config)`, `insert`, `remove`, `clear`, `flush`, `get_with`,
-`get_working_with`, `contains`, `is_empty`, `scan`, `first_with`, `compact`, `compact_now`,
-`finish_compaction`), `TableScan`, `ScanKind`, `KeyFn`, `Compaction`, `Builder`, `replay_delta`,
-`TableMeta`, `KeyMode`, `gen_dir`, `spare_dir`, `compact_dir`, `list_gens`, `remove_meta_tmp`, `remove_spares`,
-`sync_file`, `sync_dir`.
-
----
-
-## Limitations and future work
-
-- **A switch waits for a commit.** A finished compaction of a table that is not written again
-  switches at its next commit or clean close.
-- **Cross-table atomicity.** Each table commits separately (see transactions).
-- **Recovery memory.** The replay builds the live key map in memory (a streaming or two-pass rebuild
-  would bound it).
-- **Regrowth after a clear.** The new generation's data log starts at 1 MiB and grows geometrically,
-  with one size `fsync` per growth (about 7 for a 100 MB table). Preallocating the spare to the
-  previous size was tried and rejected: the spare and the current generation would both hold that
-  reservation (up to 2 × 128 MiB per table).
-- **Production wiring.** `open_db` still builds the MDBX composite; moving the node to tndb (and
-  choosing which tables are derived-key) is separate work.
-
----
-
-## Tests
-
-`cargo test -p tn-storage tndb` (release: add `--release`; the debug run also exercises the debug-only
-key check):
-
-- **`database.rs`:**
-  - the shared `Database` suite;
-  - reopen after a clean close (no rebuild; point reads, scans and seeks right after the reopen);
-  - a corrupt index header is rebuilt;
-  - crash rebuild of committed puts, overwrites and removes, with uncommitted writes discarded;
-  - a derived-key table: crash rebuild, and the log holds values only;
-  - key mode fixed at creation, and idempotent opens;
-  - the debug key check (`#[should_panic]`);
-  - clear deletes the old generation while a pre-clear scan keeps reading it;
-  - torn log tails (puts, and a run of removals) cut back to the last commit; a generation holds
-    one log (no removal log through writes, removes and a clear); a meta of another format version
-    is refused with its own error (`layout.rs`);
-  - fail-closed corruption, in a sealed log and below the commit marker;
-  - randomized crash recovery against a model (puts, removes, clears, commits, crashes, clean
-    closes);
-  - `LayeredDatabase` over tndb after a crash;
-  - ops on a table that isn't open are errors; a damaged index makes `contains_key` an error;
-  - a second open of the same table is refused until the first closes;
-  - a close that cannot commit drops its uncommitted writes and the table still opens;
-  - `Database::compact` starts a compaction a later commit switches to; `compact_table_now`;
-  - group commit: the shared suite; a write is readable at once and durable after `persist`
-    (through a crash); `persist` covers every table; a failed commit latches every later
-    `persist`; an open transaction holds its table back (a crash keeps none of it); a dropped
-    transaction is published and committed; removals and puts made during the committer's
-    unlocked sync are committed whole by the next round; a write numbered during a round waits for a later round
-    (gated rounds); a write committed early still reaches the watermark; concurrent writers keep
-    their persisted writes; compaction; and a randomized crash model (after a crash the table is
-    exactly one of the states since the last `persist`); a clear while the committer syncs
-    outside the lock (paused before either sync: the old generation stays mapped, the new one's
-    watermarks move only with its own syncs, nothing is poisoned); after a failed commit the
-    watermark never passes the failed writes; a write failing on a stopped table latches (a
-    caller's error does not); a panicking committer, or table commit, fails `persist` rather than
-    hanging; a clear-cancelled compaction is reaped at a group commit; the watermark reaches a
-    held table's first pending write without its transaction ending. Mutation checks: ignoring open transactions, ignoring held-back tables, reading
-    the target after taking the dirty set, dropping the extra round (or its held-table clause),
-    not holding the synced generation open, applying a sync to a new generation, advancing the
-    watermark after a failure, not latching a stopped table, no panic latch, and no reap each
-    fail at least one of them.
-- **`table.rs`:**
-  - byte-level table operations and scans;
-  - snapshots under concurrent commits, and page reuse;
-  - crash mid-clear after the new generation is complete; an unopenable newest generation fails the
-    open and nothing is deleted;
-  - a clear failing after its rename stops the writer, and a reopen sees the clear;
-  - a put or remove whose index step fails leaves no log record (checked through a crash rebuild);
-  - one commit's puts and removals replay in log order; an unknown tag, or a removal that is not
-    one key long, fails the rebuild closed and changes nothing;
-  - a clear activates the prepared spare (with its index ready once the key size is known);
-  - a leftover spare is removed on open;
-  - compaction keeps exactly the live rows, with commits landing during its copy, during its
-    catch-up, after its last round and uncommitted at the switch (a test gate pauses the thread);
-    the log shrinks; the result survives a crash and a clean reopen;
-  - a snapshot taken before the switch keeps reading the old generation;
-  - a crash before the switch leaves the table as it was, and the open deletes the compaction;
-  - a clear cancels a running compaction; a derived-key table compacts;
-  - the automatic trigger, a requested compaction needing dead puts, and pacing (of the copy only:
-    `test_tntable_compaction_catch_up_is_not_paced`);
-  - a switch failing after its rename stops the writer, and the reopen has every row;
-  - randomized compactions, clears, commits, crashes and clean reopens against a model;
-  - a failed automatic compaction backs off instead of restarting at every commit;
-  - what is committed during the thread's bulk sync is caught up by the thread, not the switch;
-  - a compaction that finished before a clear is discarded at once;
-  - the dead count survives a clean reopen; a compaction needs disk room; a close interrupts a
-    paced compaction's sleep;
-  - readers on other threads keep consistent values and scans across automatic switches.
-- **`layout.rs`:** `meta` round trip and corruption, generation listing.
-
-Crash simulation leaks the database (`std::mem::forget`), so no file is sealed and no index synced,
-as after a killed process; it first releases the tables' locks (`release_locks_for_crash`, test
-only), as a dead process's are.
-
----
-
-## Benchmarks
-
-All are `#[ignore]`d; run them with `--ignored --nocapture --test-threads 1`, in `--release`.
-
-| bench | what it compares |
-|---|---|
-| `workload_consensus_rounds` | production-shaped consensus rounds (N = 10, 50): raw tndb, `Layered<TnDb>`, `Layered<MDBX-prod>`, MemDb |
-| `workload_batch_cache` | single batch inserts with concurrent `multi_get` readers, on the cache-mode layer |
-| `workload_startup_reload` | reopen 8 hours into an epoch (1.33M rows): clean reopen and crash reopen (rebuild) |
-| `workload_compaction` | a long-lived table under churn, tndb with compaction off and on (raw and layered), MDBX for scale: disk use and step latency |
-| `db_backend_comparison` | per-operation battery (`db_bench.rs`): tndb, MDBX (test and production configuration), MemDb |
-| `kv_concurrent_read_bench` | concurrent point reads, tndb vs MemDb vs MDBX |
-| `pack_vs_mdbx_bench` | raw pack-file KV (digest and B+tree index), tndb, MemDb, MDBX |
+| files | one log + one index per table | one log + one index per table |
+| a commit syncs | each written table's log | the one log, once, however many tables |
+| commit thread vs writers | takes each table's lock twice per round | takes no lock a writer takes |
+| transactions | applied at once; atomic per table | buffered until commit; atomic across tables |
+| clear | a new generation (durable on return; data leaves the disk) | a CLEAR record (bytes leave at the next compaction) |
+| compaction | per table | the whole log, one new generation |
+| recovery | per table | one replay of the log, at database open |
+
+## Layout
 
 ```text
-cargo test --release -p tn-storage workload_ -- --ignored --nocapture --test-threads 1
+<root>/LOCK                        flock: one open writer per database (held until the core drops)
+<root>/tables                      the manifest: table id -> name, key size (manifest.rs)
+<root>/gen-<N>/log                 the shared log (a CRC-framed pack)
+<root>/gen-<N>/idx-<id>/index.btx  table <id>'s B+tree index (derived; rebuilt from the log)
+<root>/gen-<N>/compacted           the log's length when compaction made this generation
+<root>/compact-<N+1>-<pid>-<n>/    a compaction's new generation, being built
 ```
 
-Interpreting results on macOS: commits there do not flush the drive's cache (see the platform
-note), so durable latencies understate Linux's. The first write to each page of a data log's
-preallocated growth faults that page in from disk on APFS, which keeps large single inserts (the
-256 KB batch-cache row) behind MDBX there, since MDBX grows sparsely; Linux's `fallocate` leaves
-unwritten extents that should fault without a read (not yet measured). A bench must not sleep
-before a timed region: an idle CPU slows the region that follows by up to about 2×. Compare
-backends on Linux for production numbers.
+The newest `gen-<N>` is the current generation. An open deletes any `compact-*` (an unfinished
+compaction is never a generation), refuses a generation with no log, and deletes older generations
+only once the newest has replayed: after a crash right after a switch the older one is the only
+other copy (no automatic fallback to it, since the newest may hold acked batches). A new
+database's `gen-0` is built in a `compact-0-*` directory and renamed into place, so no failure or
+crash leaves a generation without a log.
+
+**Manifest.** It lists table ids (`u16`, never reused), names and key sizes. It is rewritten
+atomically (tmp, `fsync`, rename, directory `fsync`) when a table is first opened, or when its first
+row fixes its key size. Both happen before the log holds any record of that table, so a record whose
+table id is missing from the manifest is damage. A table's index is created when its key size is
+fixed. An index directory the manifest doesn't know is deleted at open.
+
+## Records (`record.rs`)
+
+```text
+byte 0     kind (bits 0-6: PUT 1, REMOVE 2, CLEAR 3) | BATCH_END (bit 7)
+bytes 1-2  table id (u16 LE)
+PUT        key (the table's key size) ‖ value
+REMOVE     key
+CLEAR      (nothing)
+```
+
+**Batches.** A batch is a bare write, or a whole transaction. It is a run of consecutive records,
+and only the last one carries `BATCH_END`.
+
+**No commit records.** Replay applies a batch only once its flagged record reads back intact, so
+every batch end is a commit point. A torn tail drops the incomplete batch.
+
+**Fail-closed records.** An unknown kind or table id, or a record of the wrong length, fails the
+open. Every PUT stores its key: recovery runs at database open, before any key function could be
+known, so there is no derived-key mode.
+
+## Writes: one write lock (`store.rs`)
+
+Every write takes the database's one write lock and, under it:
+1. appends its batch;
+2. applies it to the touched tables' indexes;
+3. publishes each touched table's snapshot;
+4. numbers the batch;
+5. stores the log's **frontier** as one value: the generation, the log's end, and the batch number.
+
+So the log holds only whole batches between writes, and no snapshot ever sees part of a batch.
+
+**A batch that fails is taken back exactly.** The log is rewound to the batch's start (nothing else
+can have appended since), and each touched index is reverted to its last publish
+(`BtreeIndex::revert_to_published`). Under the lock, that last publish is its state before the
+batch. A batch that panics is taken back the same way, and also latches the failure. A batch that
+can't be taken back stops the writer.
+
+**Removals.** A removal of a key that isn't present writes nothing. A batch that changes nothing
+isn't numbered.
+
+**Lock order.** The registry lock (table registration, key-size fixes, and each manifest rewrite) is
+taken only before the write lock, never while holding it. The commit thread holds neither.
+
+## Reads
+
+Readers take no lock. Each table's `Published` snapshot holds its index snapshot, the log's
+`MapView`, and its own byte **limit**: the log's length at the publish. Reads check against
+`min(limit, mapped)`, so no shared atomic is written per write.
+
+**Index damage is an error, never a wrong answer.** A read (a get, a scan, or a compaction's
+copy) checks that the record an index entry points at is a put of that table and that key
+(`record::put_value`), so a damaged position is `CorruptIndex`, not another row's value; a scan
+ends there (logged), and a compaction abandons rather than copy it. A removal whose key the index
+cannot read fails the batch (nothing written) rather than counting the key absent, which would
+leave the row in place.
+
+A scan holds the database core, so its files stay open while the scan lives, even after every
+handle has dropped. The database's `LOCK` is the core's last field, so it is released only once the
+files have closed.
+
+## Durability (`commit.rs`)
+
+**Each round.** A sync round loads the frontier, `msync`s the log up to its end through the
+generation's view, and `fsync`s a long-lived duplicate descriptor if the log grew. Then every batch
+numbered up to the frontier's number is durable. No round takes the write lock.
+
+**One sync in flight.** One round runs at a time (the core's sync lock), shared by every writer
+waiting. That matters on Linux, where two overlapping syncs of one file could otherwise ack data a
+failed writeback lost. The commit marker is stamped lazily by the next writer, under the write
+lock.
+
+**Modes:**
+- **`CommitMode::Sync`:** each write, or transaction commit, waits until it is durable before it
+  returns. The first writer waiting runs the round itself, with no thread hand-off; the others wait
+  for it, and one whose batch it didn't cover leads the next. A write is readable before its writer
+  returns, as in group mode.
+- **`CommitMode::Group`:** writes return at once, and `persist` (async) waits for the round
+  covering every earlier batch. The `tndb-commit` thread syncs **on demand**: at once when a
+  `persist` waits, otherwise once the unsynced writes are 2 ms old or 4 MiB large (`SYNC_DELAY`,
+  `SYNC_BYTES`). A write wakes the thread only when it's idle. Eager syncing (a round per write)
+  cost a write-heavy workload most of its throughput on this Mac: each round re-cleans the log's
+  tail page, which the next append must fault back in.
+
+**Backpressure.** In group mode a log holds at most 64 MiB unsynced (`MAX_UNSYNCED`). A write that
+leaves more waits for a sync before it returns, running it itself if no round is running. So writes
+nobody waits on (the batch caches are never persisted) can't outrun the disk without bound.
+
+**Failures latch.** The first failure (a failed sync, a writer that stopped, a panic) is latched.
+Every later write and `persist` fails, the watermark never moves again, and the log is never sealed
+as clean, so the next open recovers it.
+
+## Transactions
+
+A `TnDbTxMut` encodes its writes into one byte arena (no allocation per write), per table and in
+order, noting whether the table was cleared first. Its own `get` sees them (each key's last write);
+nobody else does until it commits. Commit, or drop as with `LayeredDatabase`, sorts each table's
+writes by key, keeps each key's last, and writes them as one batch, **atomic across tables** and in
+key order (so a bulk transaction's rows scan sequentially). A batch therefore names each key at most
+once per table, its clear first, which lets the write path decide each removal from the index
+alone. Production
+transactions only write and then commit (`CertificateStore::delete` reads through its own
+transaction), so buffering changes nothing they rely on.
+
+## Recovery (open)
+
+**When the log is replayed.** If the log is unclean, it is replayed once and every index is
+rebuilt. If the log is clean but an index is stale (unclean, missing, or covering another length),
+only that table's index is rebuilt; the replay still reads the whole log.
+
+**How the replay works.** It reads through a cloned handle. Batches apply in log order: PUT
+inserts, REMOVE removes, CLEAR empties that table. Records after the last whole batch are dropped.
+
+**Fail-closed rules:**
+- a sealed log must replay whole;
+- an unclean log may end in a tear, but not below its commit marker;
+- a failed replay changes nothing.
+
+Only then is the log cut back, each index rebuilt and synced, and both files marked consistent.
+
+## Tests (`test.rs`)
+
+**Coverage:**
+- the shared `Database` suite in both modes;
+- a clean reopen;
+- a crash rebuild of interleaved tables;
+- cross-table transaction atomicity (a torn flagged record drops the whole batch);
+- buffered transaction visibility, and a dropped transaction being written;
+- a CLEAR inside a batch;
+- a failed batch taken back (injected index allocation failure; also checked after a later write
+  publishes);
+- a panicking batch taken back and latched;
+- group `persist` and its FIFO across tables;
+- concurrent `Sync` writers;
+- unknown table and kind failing closed;
+- a scan outliving every handle;
+- a second open refused;
+- a failed sync latching;
+- durability only after the sync (a gate pauses the round);
+- `Sync` writers syncing themselves with the commit thread stopped;
+- group syncs on demand (2,000 unpersisted writes made durable within the delay by a few syncs);
+- a `persist` not waiting out the delay;
+- a stale index rebuilding alone, with an orphan index deleted;
+- a randomized crash model over two tables;
+- `revert_to_published` (randomized, in `btree_index`);
+- the manifest and the record format;
+- group mode's cap on unsynced bytes (the commit thread stopped);
+- `SplitDatabase`: the shared suite, and routing by hint (each table's manifest entry lands in its
+  environment's database);
+- compaction: rows kept exactly with writes at each step (three tables, randomized, three
+  compactions, clean reopen); space returned and `base` recorded; the trigger (append-only, twice
+  the base, kept across a reopen); the first rows of a table unfixed at the snapshot; a table
+  opened and a table cleared during one; a scan across the switch; the switch holding the
+  registry; the switch's tail cap; a crash after the switch; copied rows as whole batches; a
+  leftover `compact-*` deleted and a generation without a log refused; a close cancelling; the
+  failures before the rename (abandoned) and after it (the writer stopped); a sync round paused
+  across the switch; the disk filling during the copy; an emptied log compacting at once (also
+  after a reopen); writeback as the copy goes; and compactions inside the randomized crash model;
+- hardening: a failed open keeping the older generation; an interrupted creation reopening; a
+  removal through a damaged index failing; a misindexed row read as `CorruptIndex`.
+
+**Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
+revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
+round, an eager commit thread, a `persist` that doesn't ask for a round, and a write that never
+wakes an idle commit thread. Accepting writes after a latch is still refused, by the poisoned log.
+For compaction: skipping the last catch-up, copied rows without the batch-end flag, a catch-up
+that ignores CLEAR, installing before the rename, `base` not read at open, no empty indexes,
+caching an unfixed key size, no cap on the switch's tail, a switch without the registry lock,
+ignoring `has_dead`, and no latch after the rename.
+
+## Compaction (`compact.rs`)
+
+**Trigger.** The log compacts automatically (`CompactionConfig`; by default at 64 MiB, the copy
+paced at 64 MiB/s) when it is at least `auto_min_bytes` long, at least twice `base` (its length
+right after the last compaction, kept in the generation's `compacted` file; 0 if none), and may
+hold a dead row (`has_dead`: set by an overwrite, an effective removal or a clear of a non-empty
+table; assumed at open unless the log is empty). In steady state that is "dead ≥ live", with no
+accounting per write; a log that only grows never compacts. A batch that leaves every table
+empty, in a log of at least 1 MiB with a dead row, also asks for one at once (automatic
+compaction on), whatever the threshold. The epoch tables are all cleared at every epoch's end,
+so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms.
+`Database::compact` asks for one at once (a log of at least 1 MiB). A failed compaction backs
+the trigger off (60 s, doubling to 1 h).
+
+**Steps.** One `tndb-compact` thread per database:
+1. **Snapshot**, under the write lock: every table's last publish and the log's end `E`, one
+   point between two batches.
+2. **Copy**, no lock, paced: each table's rows in key order, each its own batch (the stored put
+   record with its batch-end flag set). Each snapshot is dropped once copied. Every MiB the copy
+   or a catch-up appends is handed to writeback at once (Linux: `sync_file_range(WRITE)`, which
+   neither waits nor flushes the drive's cache), so the new log never piles up unflushed: on
+   Linux a pile of dirty pages throttles every thread that writes, the database's writers
+   included. The round syncs stay the durability points.
+3. **Catch-up**, no lock, unpaced, in rounds (each synced) until one had at most 1 MiB, at most
+   8 rounds (a writer faster than the catch-up is then caught up by the switch's last try). A round writes the **net effect** of the old log's batches since the last one: a
+   clear of each table it cleared (if the new log holds rows of it), then each touched key's last
+   write, in key order: a live row copied as its own batch, or a removal of a row the new log
+   holds. What was written and made dead during the compaction is not copied, so the new log
+   stays about the size of the live rows. Key sizes come from the snapshot or, for a table whose
+   key size was fixed since, the live table (an unfixed one is never cached).
+4. **Switch**, under the registry lock (no table registered, nor its key size fixed, meanwhile)
+   and then the write lock: an empty index for each table with a key size and no rows, a last
+   round, `compacted` written (temp file, sync, rename, directory sync); then under the write
+   lock the last few batches (if more than 4 MiB landed meanwhile, it lets go of both locks and
+   tries again; the third and last try takes up to 64 MiB under the write lock, so writers wait
+   once and a compaction finishes at any sustained write rate), a row-count check against every table, a sync, the rename into
+   place, a directory sync, and the install: the writer moves to the new log, indexes, view and
+   frontier, and publishes every table. The install does no I/O and cannot fail.
+
+**Failures.** Before the rename, a failure (or a panic, or less than 256 MiB free, checked once
+per MiB of the copy, before each round and before the switch, or more than 64 MiB landing before
+the last switch try) abandons the
+compaction: its files are deleted after the locks are
+released, and the database carries on in its generation. After the rename, a failure (the
+directory sync) or a panic stops the writer, latched: which generation the next open picks is
+unknown. A compaction needs the generation's size plus 128 MiB free to start. A close cancels a
+running compaction (checked each MiB of the copy, during pacing sleeps, between rounds and
+before each sync).
+
+**Durability across the switch.** The new log is synced before the rename, and the root
+directory before the new frontier is stored, so no round acks a batch while the next open might
+still pick the old generation. A sync round already running on the old generation keeps it
+mapped (`GenSync`'s `GenAlive`) and acks only batches durable in both. Old snapshots and scans
+keep the old generation's files (retired into its `GenAlive`, deleted on close) until they drop.
+
+**Cost to other logs.** A compaction's writes and flushes queue on the disk ahead of other logs'
+syncs. Under the worst case measured (`workload_mixed`: 256 KB batches written to the cache log as
+fast as it takes them, about 400 MB/s), the epoch log's sync p99 rises from about 170 µs to
+0.4–0.8 ms while the cache log compacts, most of all under the catch-up rounds' flushes. Neither
+preallocating the new log, flushing it in 1 MiB pieces, nor utility I/O priority helped the
+consensus measure. Compacting less often did: `SplitDatabase` compacts the cache log
+automatically only from 256 MiB (`CACHE_AUTO_MIN_BYTES`, four times the default), and the epoch
+log only from 2 GiB (`EPOCH_AUTO_MIN_BYTES`, a safety net: it resets at each epoch's end, above),
+so consensus writes see no compaction of their own log mid-epoch.
+`workload_mixed_compaction` judges it on interleaved pairs (1000 rounds each, compaction on and
+off, order rotated), since vote p99 varies about 30% run to run here and short runs hide the
+effect:
+
+| cache log compacts from | vote durable p99, on / off (median of 6 pairs) | ms per round | compactions per run |
+|---|---|---|---|
+| 64 MiB | 1.26 (1.10–1.33) | 1.07 | 11–12 |
+| 256 MiB | 1.06–1.09 (0.90–1.18) | 1.01–1.03 | 4–5 |
+
+At a realistic batch rate (1 MB at 25/s, 3 pairs of 12,000 rounds on macOS), with the epoch log
+compacting only at the epoch end: the cache log compacts 5 times a run, the switch holding its
+write lock 0.3–0.6 ms on average (at most 1.4 ms), and the ratios are 1.01 (vote p99) and 1.01
+(ms per round). Linux, before the epoch-end reset and the writeback: 9–10 compactions per
+29-second run across the epoch and cache logs, the switch holding the lock 15–35 ms (outliers
+to 232 ms), ordinary write-lock holds up to ~0.5 s while a compaction ran (1.3–2.3 ms without),
+vote p99 ratios 1.23–1.70. Linux after both (4 pairs of 6,000 rounds): the cache log compacts 6–7
+times a run, the switch holding its lock 7–10 ms on average (at most 26 ms: two or three drive
+flushes, the new log's and the directory's, which block only that log's writers); the epoch log's
+longest write-lock hold is the same with compaction on as off (4–26 ms); vote p99 1.04 (pairs
+0.98–1.18), ms per round 1.04.
+
+## Production shape: one log per environment (`split.rs`)
+
+**Why one log isn't enough.** One write lock serializes every append, so a large value holds up
+every table while it is copied. On this Mac, a 256 KB append holds the lock about 0.5 ms, much of it
+faulting fresh pages. In the `workload_mixed` bench, a stream of 256 KB batches pushed consensus
+rounds (N=50) from 3.3 to 55 ms.
+
+**`SplitDatabase`** opens three `TnDatabase`s under one root (`epoch/`, `kad/`, `cache/`). It
+routes each table by its `TableHint`, as `open_db` splits MDBX, so the batch caches never share a
+write lock with consensus. It's a thin router with no layer in between: `CompositeDatabase` would
+also wrap each database in a `LayeredDatabase`, whose in-memory layer and writer thread cost tndb
+3-4x its durability latency.
+- A write transaction opens one tndb transaction per environment it writes. Each part commits as
+  one batch in its own log, so it is atomic per environment, not across them.
+- `persist` covers the table's environment, as with MDBX today: every production barrier is on
+  consensus tables.
+
+**Gate** (`workload_bench`, 3 runs, this Mac). On consensus alone, Split matches one log (both
+2.9-3.0 ms per round at N=50; vote durable p50 0.33 ms, against the per-table engine's 0.97 ms, both in group commit). Beside the
+batch writer:
+
+| N=50 consensus beside | | per-table, group | tndb-group (one log) | Split |
+|---|---|---|---|---|
+| 256 KB batches, unpaced | ms per round | 5.0 | 54.7 | **3.3** |
+| | vote durable p50 / p99 | 2.3 / 18.5 ms | 3.8 / 49.3 ms | **0.38 / 2.2 ms** |
+| | own header durable p50 | 2.4 ms | 1.7 ms | **0.17 ms** |
+| | batch MB/s | 389 | 331 | **396** |
+| 1 MB batches at 25/s | ms per round | 4.0 | 3.05 | **2.99** |
+| | vote durable p50 / p99 | 1.0 / 4.3 ms | 0.34 / 2.1 ms | **0.33 / 1.9 ms** |
+
+## Against production today
+
+`workload_mixed`'s `Composite<MDBX-prod>` column is `open_db`'s `CompositeDatabase<MdbxDatabase>`
+(production geometry, `Durable` sync), beside `SplitDatabase` (median of 3 runs, N=50, this Mac).
+The bench now runs it beside the paced stream only: beside the unpaced one, its cache layer's
+unbounded write queue reached 39 GB resident.
+
+| | Split | Composite MDBX |
+|---|---|---|
+| beside 256 KB batches as fast as taken: ms per round | **3.22** | 123.2 |
+| vote durable p50 / p99 | **0.38 / 2.15 ms** | 63.8 / 231.5 ms |
+| peak memory of that run | | 39 GB resident (its cache layer's unbounded queue) |
+| beside 1 MB batches at 25/s: ms per round | **2.98** | 57.7 |
+| vote durable p50 / p99 | **0.33 / 1.74 ms** | 42.7 / 74.8 ms |
+| own header durable p50 | **0.13 ms** | 52.3 ms |
+| vote write call p50 / p99 | 73 µs / 1.14 ms | **1 / 94 µs** |
+
+What production's layer still does better: a write returns from memory (tndb's take the
+environment's write lock), and reads of the epoch and kad tables come from memory (batch-cache
+`multi_get` runs at 55–65% of its rate; tndb checks each record's CRC on read). After a crash
+tndb replays its logs (about 0.8 s for a 229 MB log); MDBX recovers at once. Its disk use stays
+smaller (it reuses freed pages).
+
+**On Linux** (i7-1360P laptop, NVMe ext4 with FUA: a synchronous 4 KB write takes 1.74 ms; partial
+baseline run, 2026-10-12), every durable ack pays a drive-cache flush, and the gap to production
+widens:
+
+| N=50 | Split | Composite / layered MDBX |
+|---|---|---|
+| consensus alone: ms per round | **7.4** | 1127 |
+| vote durable p50 / p99 | **4.3 / 7.9 ms** | 871 ms / 2.2 s |
+| beside 1 MB batches at 25/s: ms per round | **8.4** | 1677 |
+| vote durable p50 / p99 | **4.7 / 10.0 ms** | 1.09 s / 4.97 s |
+
+A vote's durability there is about two sync rounds (~2.2 ms each). Beside 256 KB batches as fast as
+taken (~300 MB/s), Split degrades to 68 ms per round (vote p50 35 ms): each `fsync` flushes the whole
+drive cache, so separate logs share the flush cost on one drive.
+
+The node opens tndb with the `tn-storage/tndb` feature (`DatabaseType = SplitDatabase`, at
+`<consensus db>/tndb`); MDBX stays the default. On its first tndb open, a node that ran on MDBX
+has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates)
+and kad tables copied over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done
+(`tndb/mdbx-migrated`); a crash before the marker reruns the copy. The batch caches start empty,
+and the MDBX directories are left in place.
+
+## Not yet
+
+- **Write lock:** CRC computed outside it, and log growth kept off it, if the lock shows in
+  measurements.

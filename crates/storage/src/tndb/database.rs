@@ -1,472 +1,393 @@
-//! A [`Database`] backed by per-table [`TnTable`]s: each table owns an append-only value log plus a
-//! copy-on-write B+tree index, read lock-free from a published snapshot, and the store maps a table
-//! name to that table's `TnTable` handle (a cheap `Clone`).
-//!
-//! This module is the typed layer, modeled on [`crate::mem_db`]: keys are encoded with `encode_key`
-//! (binary-sortable) and values with `encode` (bcs); each op hands the encoded bytes to the table
-//! and decodes the reply.  Encodes reuse buffers rather than allocating per op: writes use their
-//! table's `EncodeBufs`, point reads a per-thread key buffer.  The index's fixed key length is
-//! `encode_key(key).len()` — `size_of::<T::Key>()` is unreliable (e.g. `AuthorityIdentifier` is
-//! `Arc<[u8; 32]>`, 8 bytes in memory but 32 encoded).
-//!
-//! Scans are lazy: each `DBIter` owns a published snapshot of its table and a B+tree cursor,
-//! decoding every row straight from the index leaf and the log.
-//!
-//! Each table is keyed (its log stores every row's key, the default: [`Database::open_table`]) or
-//! derived-key (its log stores only values, and a key function recomputes the keys on a rebuild:
-//! [`TnDatabase::open_table_with_key`]), fixed when the table is created. A table not closed
-//! cleanly rebuilds its index from its log on open, keeping every committed write; clearing a
-//! table deletes its data from disk, and compaction drops overwritten and removed records (see
-//! `table.rs`). Transactions commit per table: a write transaction over several tables commits
-//! each in turn, so a crash can keep one table's part and not another's.
+//! [`TnDatabase`]: the `Database` trait over the shared log, with buffered write transactions.
 
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    hash::BuildHasherDefault,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{cell::RefCell, collections::BTreeMap, ops::Range, path::Path, sync::Arc};
 
-use arc_swap::ArcSwap;
-use parking_lot::Mutex;
 use serde::Serialize;
 use tn_types::{
-    decode, decode_key, encode_into_buffer, encode_key, encode_key_into, try_decode, DBIter,
-    Database, DbTx, DbTxMut, Table,
+    decode, decode_key, encode_into_buffer, encode_key, encode_key_into, DBIter, Database, DbTx,
+    DbTxMut, Table,
 };
 
 use super::{
-    commit::{Committer, GroupCommit},
-    table::{CompactionConfig, KeyFn, ScanKind, TnTable},
+    commit::{Committer, Durability},
+    compact::Compactor,
+    store::{BatchOp, Core, ScanKind, TableShared},
+    TableId,
 };
-use crate::archive::fxhasher::FxHasher;
 
-/// Reusable encode buffers for a table's writes, so an insert or remove encodes without allocating.
-/// The value buffer keeps the capacity of the largest value the table has written.
-#[derive(Debug, Default)]
-struct EncodeBufs {
-    key: Vec<u8>,
-    value: Vec<u8>,
+/// When a write is committed (made durable).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum CommitMode {
+    /// Each write (an autocommit op, or a transaction's commit) waits for the sync covering it
+    /// before it returns; [`Database::persist`] only reports a failed sync.
+    #[default]
+    Sync,
+    /// Writes return without waiting, readable at once; the commit thread syncs the log on
+    /// demand or after a short delay (see the README's Durability section), and
+    /// [`Database::persist`] waits for the sync covering every earlier write. Callers never wait
+    /// on the disk unless they ask to.
+    Group,
 }
 
-/// A table's handle plus its write buffers. A write holds its table's buffer lock and then takes
-/// the table's write lock; the buffer lock is only ever contended by another write to the same
-/// table, which would wait on that table's write lock anyway. `Clone` (sharing both) so a new
-/// snapshot of the table map can carry the existing tables.
+/// When and how fast the log compacts (see the README's Compaction section).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactionConfig {
+    /// Compact automatically once the log is at least this many bytes, at least twice its length
+    /// right after the last compaction, and may hold a dead row (or at once when a batch leaves
+    /// every table empty); `None` compacts only on request ([`tn_types::Database::compact`]).
+    pub auto_min_bytes: Option<u64>,
+    /// The pace of a compaction's copy, in bytes per second (0: unpaced). The catch-up after it
+    /// is never paced.
+    pub bytes_per_sec: u64,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self { auto_min_bytes: Some(64 << 20), bytes_per_sec: 64 << 20 }
+    }
+}
+
+/// How a [`TnDatabase`] commits.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TnDbOptions {
+    /// When writes are durable: `Sync`, each write (or transaction commit) waits for the commit
+    /// thread's sync covering it before it returns; `Group`, writes return at once and
+    /// [`Database::persist`] waits. Both share one sync per round among every writer waiting.
+    pub commit: CommitMode,
+    /// When the log compacts automatically, and how fast a compaction copies (see the
+    /// compaction docs in the README).
+    pub compaction: CompactionConfig,
+}
+
+/// A [`Database`] whose tables share one log (see the module docs). A cheap `Clone` handle; the
+/// commit thread stops (after a last sync) when the last handle drops, and the files close when
+/// the last handle, transaction and scan are gone.
 #[derive(Clone, Debug)]
-pub(crate) struct TableStore {
-    pub(crate) table: TnTable,
-    bufs: Arc<Mutex<EncodeBufs>>,
-    /// Opened as a derived-key table (see [`TnDatabase::open_table_with_key`]).
-    derived: bool,
+pub struct TnDatabase {
+    /// Held for its `Drop`: the last handle's drop stops the compaction thread (cancelling a
+    /// running compaction) before the commit thread's last sync. Declared first, so it drops
+    /// first.
+    #[cfg_attr(not(test), allow(dead_code))]
+    compactor: Arc<Compactor>,
+    core: Arc<Core>,
+    /// Held for its `Drop`: the last handle's drop stops the commit thread after a last sync.
+    #[cfg_attr(not(test), allow(dead_code))]
+    committer: Arc<Committer>,
+    mode: CommitMode,
 }
-
-/// The open tables by name.
-pub(crate) type Tables = HashMap<&'static str, TableStore, BuildHasherDefault<FxHasher>>;
-
-/// The table map, read through immutable snapshots: tables are opened at startup and looked up on
-/// every op, so a lookup must not write shared memory. `ArcSwap::load` borrows the current snapshot
-/// through a per-thread slot (no shared refcount, no lock), and `open_table` publishes a new
-/// snapshot (read-copy-update).
-pub(crate) type StoreType = ArcSwap<Tables>;
 
 thread_local! {
-    /// Key buffer for point reads. Per thread, so concurrent readers of a table never contend on a
-    /// shared buffer.
-    static READ_KEY: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    /// Encode buffers for point reads and bare writes: per thread, so nothing is shared or
+    /// allocated per op.
+    static BUFS: RefCell<(Vec<u8>, Vec<u8>)> = const { RefCell::new((Vec::new(), Vec::new())) };
 }
 
-/// Encode `key` into this thread's read-key buffer and run `f` on the bytes. `f` must not re-enter
-/// tndb on this thread (the buffer is borrowed for its duration).
-fn with_read_key<K: Serialize, R>(
-    key: &K,
-    f: impl FnOnce(&[u8]) -> eyre::Result<R>,
-) -> eyre::Result<R> {
-    READ_KEY.with_borrow_mut(|buf| {
+/// Encode `key` into this thread's key buffer and run `f` on the bytes. `f` must not re-enter
+/// tndb's encoding on this thread.
+fn with_key<K: Serialize, R>(key: &K, f: impl FnOnce(&[u8]) -> eyre::Result<R>) -> eyre::Result<R> {
+    BUFS.with_borrow_mut(|(buf, _)| {
         buf.clear();
         encode_key_into(buf, key)?;
         f(buf)
     })
 }
 
-// ---- shared table operations (used by both the `Database` and the txn impls) ----
-//
-// Each op borrows its table from the current snapshot of the table map (see `StoreType`), so a
-// lookup writes no shared memory. The snapshot is held for the op, including across a blocking
-// table op; that only occupies one of the thread's `ArcSwap` slots (scans own their table state).
-//
-// NOTE: reads (`get`, `contains_key`, iterators, ...) see a table's last published (committed)
-// state and take no lock: an autocommit write publishes when it returns, a write transaction's
-// writes publish at `commit`, and only that transaction's own `get` sees them earlier. An iterator
-// owns the snapshot it started on, so writing (and committing) its table while iterating, from any
-// thread, neither blocks nor changes what the iterator yields.
-
-/// Run `f` on the named table, borrowed from the current snapshot of the table map, or return
-/// `None` if no such table is open.
-fn with_table<R>(store: &StoreType, name: &str, f: impl FnOnce(&TableStore) -> R) -> Option<R> {
-    store.load().get(name).map(f)
-}
-
-/// Run `f` on table `T`; a table that was never opened is an error (as with MDBX), never a silent
-/// no-op that would drop a write or pass for an empty table.
-fn with_open_table<T: Table, R>(
-    store: &StoreType,
-    f: impl FnOnce(&TableStore) -> eyre::Result<R>,
+/// Encode `key` and `value` into this thread's buffers and run `f` on the bytes.
+fn with_key_value<K: Serialize, V: Serialize, R>(
+    key: &K,
+    value: &V,
+    f: impl FnOnce(&[u8], &[u8]) -> eyre::Result<R>,
 ) -> eyre::Result<R> {
-    with_table(store, T::NAME, f)
-        .unwrap_or_else(|| Err(eyre::eyre!("tndb: table {} is not open", T::NAME)))
-}
-
-/// Look up a key: read its value bytes from the table, then decode.
-fn get<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-    with_open_table::<T, _>(store, |entry| {
-        // Decode `T::Value` straight from the log's mmap (no intermediate `Vec`).
-        with_read_key(key, |key| entry.table.get_with(key, |bytes| decode::<T::Value>(bytes)))
+    BUFS.with_borrow_mut(|(kbuf, vbuf)| {
+        kbuf.clear();
+        encode_key_into(kbuf, key)?;
+        vbuf.clear();
+        encode_into_buffer(vbuf, value)?;
+        f(kbuf, vbuf)
     })
 }
 
-/// Insert `key → value` (no durability flush; callers flush explicitly). With `publish` (group
-/// commit), the write is published at once and numbered from that sequence.
-fn insert<T: Table>(
-    store: &StoreType,
-    key: &T::Key,
-    value: &T::Value,
-    publish: Option<&GroupCommit>,
-) -> eyre::Result<()> {
-    with_open_table::<T, _>(store, |entry| {
-        let mut bufs = entry.bufs.lock();
-        let EncodeBufs { key: key_buf, value: value_buf } = &mut *bufs;
-        key_buf.clear();
-        encode_key_into(key_buf, key)?;
-        value_buf.clear();
-        encode_into_buffer(value_buf, value)?;
-        match publish {
-            Some(group) => entry.table.insert_published(key_buf, value_buf, group, T::NAME),
-            None => entry.table.insert(key_buf, value_buf),
+impl TnDatabase {
+    /// Open (creating if absent) the database at `path`, in [`CommitMode::Sync`].
+    pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
+        Self::open_with(path, TnDbOptions::default())
+    }
+
+    /// Open (creating if absent) the database at `path`, committing as `options` say.
+    pub fn open_with<P: AsRef<Path>>(path: P, options: TnDbOptions) -> eyre::Result<Self> {
+        let durability = Durability::new();
+        let core = Arc::new(Core::open(path.as_ref(), durability, options.compaction)?);
+        let committer = Arc::new(Committer::start(Arc::clone(&core))?);
+        let rate = options.compaction.bytes_per_sec;
+        let compactor = Arc::new(Compactor::start(Arc::clone(&core), rate)?);
+        Ok(Self { compactor, core, committer, mode: options.commit })
+    }
+
+    fn table<T: Table>(&self) -> eyre::Result<Arc<TableShared>> {
+        table::<T>(&self.core)
+    }
+
+    /// Write `ops` as one batch and, in `Sync` mode, wait until it is durable.
+    fn write(&self, ops: &[BatchOp<'_>]) -> eyre::Result<()> {
+        write(&self.core, self.mode, ops)
+    }
+
+    /// Block until every write so far is durable, running the sync here if none is in flight: for
+    /// a caller with no async runtime to await [`Database::persist`] on (e.g. a migration at open).
+    #[cfg(any(test, feature = "tndb"))]
+    pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
+        super::commit::wait_durable(&self.core, self.core.durability.last_seq())
+    }
+
+    /// Test-only, for a simulated crash (a leaked handle): stop the commit thread at once and
+    /// release the database's lock, as a dead process's are.
+    #[cfg(test)]
+    pub(crate) fn release_locks_for_crash(&self) {
+        self.compactor.stop();
+        self.committer.abort_for_crash();
+        self.core.release_lock_for_crash();
+    }
+
+    /// Test-only: stop the commit thread for good (a database left without it).
+    #[cfg(test)]
+    pub(super) fn stop_commit_thread(&self) {
+        self.committer.abort_for_crash();
+    }
+
+    /// Test-only: the core.
+    #[cfg(test)]
+    pub(super) fn core(&self) -> &Arc<Core> {
+        &self.core
+    }
+
+    /// Test-only: compact now, whatever the log's size, and wait for it: whether it switched, or
+    /// why it was abandoned.
+    #[cfg(test)]
+    pub(super) fn compact_now(&self) -> Result<bool, String> {
+        self.core.compact.compact_now()
+    }
+}
+
+/// Table `T`, which must be open.
+fn table<T: Table>(core: &Core) -> eyre::Result<Arc<TableShared>> {
+    core.table(T::NAME).ok_or_else(|| eyre::eyre!("tndb: table {} is not open", T::NAME))
+}
+
+/// Write `ops` as one batch and wait until it is durable in `Sync` mode, or, in `Group` mode,
+/// only when the log holds more unsynced bytes than its cap (backpressure: writes nobody waits on
+/// cannot outrun the disk without bound). Either wait may run the sync itself.
+fn write(core: &Core, mode: CommitMode, ops: &[BatchOp<'_>]) -> eyre::Result<()> {
+    let Some(seq) = core.write(ops)? else { return Ok(()) };
+    if mode == CommitMode::Sync || core.unsynced() > core.durability.max_unsynced() {
+        super::commit::wait_durable(core, seq)?;
+    }
+    Ok(())
+}
+
+/// A lazy, key-ordered [`DBIter`] over table `T`'s published snapshot.
+fn scan<T: Table>(core: &Arc<Core>, kind: ScanKind) -> DBIter<'static, T> {
+    match core.table(T::NAME) {
+        Some(table) => {
+            let mut scan = table.scan(kind, Arc::clone(core));
+            Box::new(std::iter::from_fn(move || {
+                scan.next_with(|key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
+            }))
         }
-    })
-}
-
-/// Remove a key: the table logs the removal (a record in its data log) and drops the key from its
-/// index. The removed row's bytes stay in the log until a clear or a compaction.
-fn remove<T: Table>(
-    store: &StoreType,
-    key: &T::Key,
-    publish: Option<&GroupCommit>,
-) -> eyre::Result<bool> {
-    with_open_table::<T, _>(store, |entry| {
-        let mut bufs = entry.bufs.lock();
-        bufs.key.clear();
-        encode_key_into(&mut bufs.key, key)?;
-        match publish {
-            Some(group) => entry.table.remove_published(&bufs.key, group, T::NAME),
-            None => entry.table.remove(&bufs.key),
-        }
-    })
-}
-
-/// Reset a table to empty: it switches to a new, empty generation and deletes the old one's files
-/// (see `table.rs`).
-fn clear_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    with_open_table::<T, _>(store, |entry| entry.table.clear())
-}
-
-/// Commit a table's writes (durably, at a commit record in its log), then publish them to readers.
-fn flush_table<T: Table>(store: &StoreType) -> eyre::Result<()> {
-    with_open_table::<T, _>(store, |entry| entry.table.flush())
-}
-
-/// True if the table contains `key` (a damaged index is an error, not "absent").
-fn contains_key<T: Table>(store: &StoreType, key: &T::Key) -> eyre::Result<bool> {
-    with_open_table::<T, _>(store, |entry| with_read_key(key, |key| entry.table.contains(key)))
-}
-
-/// True if the table is open and empty (an absent or unreadable table reads as not empty).
-fn is_empty<T: Table>(store: &StoreType) -> bool {
-    with_table(store, T::NAME, |entry| entry.table.is_empty().unwrap_or(false)).unwrap_or(false)
-}
-
-/// A lazy, key-ordered [`DBIter`] over the table's published snapshot (holding no lock).
-fn scan<T: Table>(store: &StoreType, kind: ScanKind) -> DBIter<'static, T> {
-    match with_table(store, T::NAME, |entry| entry.table.scan(kind)) {
-        Some(mut scan) => Box::new(std::iter::from_fn(move || {
-            scan.next_with(|key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
-        })),
         None => Box::new(std::iter::empty()),
     }
 }
 
-/// The single `(key, value)` a one-shot scan lands on (its first item), found by a direct seek.
-fn first_of<T: Table>(store: &StoreType, kind: ScanKind) -> Option<(T::Key, T::Value)> {
-    with_table(store, T::NAME, |entry| {
-        entry
-            .table
-            .first_with(kind, |key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
-    })
-    .flatten()
+/// The single `(key, value)` a one-shot scan of table `T` lands on.
+fn first_of<T: Table>(core: &Core, kind: ScanKind) -> Option<(T::Key, T::Value)> {
+    core.table(T::NAME)?
+        .first_with(kind, |key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
 }
 
-/// When a write is committed (made durable).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum CommitMode {
-    /// Each write (an autocommit op, or a transaction's commit) syncs its table's logs before it
-    /// returns; [`Database::persist`] has nothing to wait for.
-    #[default]
-    Sync,
-    /// Writes return without a sync, readable at once; a background thread commits each written
-    /// table once per round, and [`Database::persist`] waits for the round covering every earlier
-    /// write (see `tndb::commit`). Callers never wait on the disk unless they ask to.
-    Group,
+fn get<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<Option<T::Value>> {
+    let table = table::<T>(core)?;
+    with_key(key, |key| table.get_with(key, |bytes| decode::<T::Value>(bytes)))
 }
 
-/// How a [`TnDatabase`] commits and compacts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct TnDbOptions {
-    /// When and how fast tables compact.
-    pub compaction: CompactionConfig,
-    /// When writes are committed.
-    pub commit: CommitMode,
+fn contains_key<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<bool> {
+    let table = table::<T>(core)?;
+    with_key(key, |key| table.contains(key))
 }
 
-/// A group-commit database's shared state and committer (stopped when the last handle drops).
-#[derive(Clone, Debug)]
-struct Group {
-    commit: Arc<GroupCommit>,
-    /// Held for its `Drop`: the last handle's drop stops the committer after a final round.
-    #[cfg_attr(not(test), allow(dead_code))]
-    committer: Arc<Mutex<Committer>>,
-}
-
-/// A [`Database`] backed by per-table [`TnTable`]s.
-#[derive(Clone, Debug)]
-pub struct TnDatabase {
-    store: Arc<StoreType>,
-    base: PathBuf,
-    /// How the tables compact.
-    compaction: CompactionConfig,
-    /// Set in [`CommitMode::Group`].
-    group: Option<Group>,
-    /// Serializes table opens, so one table is never opened twice.
-    open_lock: Arc<Mutex<()>>,
-}
-
-impl TnDatabase {
-    /// Open (creating the directory if needed) a tndb rooted at `path`.  Call
-    /// [`Database::open_table`] (or [`Self::open_table_with_key`]) for each table before use.
-    pub fn open<P: AsRef<Path>>(path: P) -> eyre::Result<Self> {
-        Self::open_with_compaction(path, CompactionConfig::default())
-    }
-
-    /// [`Self::open`], with the tables compacting as `compaction` says.
-    pub fn open_with_compaction<P: AsRef<Path>>(
-        path: P,
-        compaction: CompactionConfig,
-    ) -> eyre::Result<Self> {
-        Self::open_with(path, TnDbOptions { compaction, ..Default::default() })
-    }
-
-    /// [`Self::open`], committing and compacting as `options` say.
-    pub fn open_with<P: AsRef<Path>>(path: P, options: TnDbOptions) -> eyre::Result<Self> {
-        let base = path.as_ref().to_path_buf();
-        std::fs::create_dir_all(&base)?;
-        let store = Arc::new(ArcSwap::from_pointee(Tables::default()));
-        let group = match options.commit {
-            CommitMode::Sync => None,
-            CommitMode::Group => {
-                let commit = GroupCommit::new();
-                let committer = Committer::start(Arc::clone(&commit), Arc::clone(&store))?;
-                Some(Group { commit, committer: Arc::new(Mutex::new(committer)) })
-            }
-        };
-        Ok(Self { store, base, compaction: options.compaction, group, open_lock: Arc::default() })
-    }
-
-    /// The group-commit state, in [`CommitMode::Group`].
-    fn group_commit(&self) -> Option<&GroupCommit> {
-        self.group.as_ref().map(|group| &*group.commit)
-    }
-
-    /// Compact table `T` now, whatever its garbage, and wait for it: its log is rewritten without
-    /// the removed and overwritten records. Blocks the caller for the whole copy; the table stays
-    /// readable and writable meanwhile. For tooling and tests: tables compact on their own (see
-    /// [`CompactionConfig`]) and on [`Database::compact`]. In [`CommitMode::Group`] it commits the
-    /// table on the caller's thread, the sync-mode way, including any open transaction's writes to
-    /// it.
-    pub fn compact_table_now<T: Table>(&self) -> eyre::Result<()> {
-        with_open_table::<T, _>(&self.store, |entry| entry.table.compact_now())
-    }
-
-    /// Open table `T` as a derived-key table: its log stores only values, and `key_of` recomputes
-    /// a row's key from its value when the index is rebuilt (e.g. a digest-keyed table hashes the
-    /// value). Every row's key must be `key_of` of its value; debug builds check each insert.
-    ///
-    /// The mode is fixed when the table is created: opening a derived-key table with
-    /// [`Database::open_table`], or a keyed one with this, is an error. Opening an already-open
-    /// table keeps it, so this can run before a wrapper (e.g. `LayeredDatabase`) opens the table
-    /// again.
-    pub fn open_table_with_key<T: Table>(
-        &self,
-        key_of: impl Fn(&T::Value) -> T::Key + Send + Sync + 'static,
-    ) -> eyre::Result<()> {
-        let key_fn: KeyFn = Arc::new(move |bytes: &[u8]| {
-            let value = try_decode::<T::Value>(bytes)?;
-            Ok(encode_key(&key_of(&value)))
-        });
-        self.open_table_in::<T>(Some(key_fn))
-    }
-
-    /// Open table `T` (keyed, or derived-key with `key_fn`) unless it is already open. An open
-    /// table is kept as it is for a plain [`Database::open_table`] (e.g. from a wrapper, after
-    /// [`Self::open_table_with_key`]); asking for derived keys on a table open as keyed is an
-    /// error.
-    fn open_table_in<T: Table>(&self, key_fn: Option<KeyFn>) -> eyre::Result<()> {
-        let derived = key_fn.is_some();
-        let _opening = self.open_lock.lock();
-        if let Some(open_derived) = with_table(&self.store, T::NAME, |entry| entry.derived) {
-            if derived && !open_derived {
-                eyre::bail!("tndb: table {} is already open as a keyed table", T::NAME);
-            }
-            return Ok(());
-        }
-        let entry = TableStore {
-            table: TnTable::open_with(self.base.join(T::NAME), key_fn, self.compaction)?,
-            bufs: Default::default(),
-            derived,
-        };
-        self.store.rcu(|tables| {
-            let mut tables = Tables::clone(tables);
-            tables.insert(T::NAME, entry.clone());
-            tables
-        });
-        Ok(())
-    }
-
-    /// True if table `T` rebuilt its index from its logs when it was opened.
-    #[cfg(test)]
-    fn rebuilt_on_open<T: Table>(&self) -> bool {
-        with_table(&self.store, T::NAME, |entry| entry.table.rebuilt_on_open()).unwrap_or(false)
-    }
-
-    /// Test-only: make table `T`'s next commit fail before it writes anything.
-    #[cfg(test)]
-    fn fail_next_flush_for_test<T: Table>(&self) {
-        with_table(&self.store, T::NAME, |entry| entry.table.fail_next_flush());
-    }
-
-    /// Test-only: make table `T`'s next clear stop its writer (after the rename).
-    #[cfg(test)]
-    fn fail_next_clear_sync_for_test<T: Table>(&self) {
-        with_table(&self.store, T::NAME, |entry| entry.table.fail_next_clear_sync());
-    }
-
-    /// Test-only, for a simulated crash (a leaked handle): release every open table's lock, as a
-    /// crashed process would, so the tables can be reopened.
-    #[cfg(test)]
-    pub(crate) fn release_locks_for_crash(&self) {
-        if let Some(group) = &self.group {
-            group.committer.lock().abort_for_crash();
-        }
-        for entry in self.store.load().values() {
-            entry.table.release_lock_for_crash();
-        }
-    }
-}
-
-/// Read-only transaction: reads go straight to the shared store (like [`crate::mem_db`]).
-#[derive(Clone, Debug)]
+/// A read transaction: reads the tables' published snapshots.
+#[derive(Debug)]
 pub struct TnDbTx {
-    store: Arc<StoreType>,
+    core: Arc<Core>,
 }
 
 impl DbTx for TnDbTx {
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        get::<T>(&self.store, key)
+        get::<T>(&self.core, key)
     }
 }
 
-/// Read-write transaction: writes apply to each table's working state at once and become readable
-/// (and durable) at [`DbTxMut::commit`]; the transaction's own [`DbTx::get`] sees them before
-/// that. Loose, like [`crate::mem_db`]: there is no rollback, and a table has one working state, so
-/// concurrent write transactions on a table see (and a commit publishes) each other's writes.
+/// A write transaction's changes to one table: cleared first (if `cleared`), then its writes in
+/// order (a later write of a key replaces an earlier one).
+#[derive(Debug)]
+struct TxTable {
+    shared: Arc<TableShared>,
+    cleared: bool,
+    writes: Vec<TxWrite>,
+}
+
+/// One write of a transaction: its key and value (`None`: a removal) as ranges of the
+/// transaction's byte arena.
+#[derive(Clone, Debug)]
+struct TxWrite {
+    key: Range<usize>,
+    value: Option<Range<usize>>,
+}
+
+/// A write transaction, buffered: its writes stay in memory (its own `get` sees them) and are
+/// written as one batch when it commits, or when it is dropped (as `LayeredDatabase`'s dropped
+/// transactions are: kept, never rolled back). A batch is atomic across tables: after a crash,
+/// all of it is there or none. Other readers and transactions see none of it until then.
 ///
-/// In [`CommitMode::Group`] the commit publishes without a sync and hands the tables to the
-/// committer, which leaves each table uncommitted while a transaction that wrote it is open (so a
-/// transaction is never durable in part in a table). A transaction dropped without a commit ends
-/// the same way (as `LayeredDatabase`'s does): its writes are kept, published and committed.
+/// Every key and value is encoded into one byte arena (no allocation per write); at commit each
+/// table's writes are sorted by key, so they land in key order, and only a key's last write is
+/// kept.
 #[derive(Debug)]
 pub struct TnDbTxMut {
-    store: Arc<StoreType>,
-    /// The tables this transaction wrote, so `commit` flushes and publishes only those.
-    written: Vec<&'static str>,
-    /// Set in [`CommitMode::Group`].
-    group: Option<Arc<GroupCommit>>,
+    core: Arc<Core>,
+    mode: CommitMode,
+    tables: BTreeMap<TableId, TxTable>,
+    bytes: Vec<u8>,
+    /// Written (or failed to write): nothing more to do on drop.
+    done: bool,
 }
 
 impl TnDbTxMut {
-    fn wrote(&mut self, name: &'static str) {
-        if !self.written.contains(&name) {
-            self.written.push(name);
-            if self.group.is_some() {
-                with_table(&self.store, name, |entry| entry.table.txn_begin());
-            }
+    fn table_mut(&mut self, shared: Arc<TableShared>) -> &mut TxTable {
+        self.tables.entry(shared.id).or_insert_with(|| TxTable {
+            shared,
+            cleared: false,
+            writes: Vec::new(),
+        })
+    }
+
+    /// The last write of `key` to table `id` in this transaction: `Some(Some(value))` a put,
+    /// `Some(None)` a removal (or the table was cleared since), `None` untouched.
+    fn last_write(&self, id: TableId, key: &[u8]) -> Option<Option<&[u8]>> {
+        let tx = self.tables.get(&id)?;
+        match tx.writes.iter().rev().find(|write| &self.bytes[write.key.clone()] == key) {
+            Some(write) => Some(write.value.clone().map(|value| &self.bytes[value])),
+            None if tx.cleared => Some(None),
+            None => None,
         }
     }
 
-    /// Group commit: end the transaction in every table it wrote (publish, hand to the committer).
-    fn end_group(&mut self) {
-        let Some(group) = self.group.take() else { return };
-        for name in std::mem::take(&mut self.written) {
-            with_table(&self.store, name, |entry| entry.table.txn_end(&group, name));
+    /// Write the buffered changes as one batch (fixing each new table's key size first, outside
+    /// the write lock) and, in `Sync` mode, wait until it is durable.
+    fn finish(&mut self) -> eyre::Result<()> {
+        self.done = true;
+        let tables = std::mem::take(&mut self.tables);
+        let bytes = std::mem::take(&mut self.bytes);
+        let mut ops = Vec::new();
+        for (&id, tx) in &tables {
+            // The last write of each key, in key order.
+            let mut order: Vec<usize> = (0..tx.writes.len()).collect();
+            order.sort_by(|&a, &b| {
+                bytes[tx.writes[a].key.clone()]
+                    .cmp(&bytes[tx.writes[b].key.clone()])
+                    .then(a.cmp(&b))
+            });
+            let mut last: Vec<&TxWrite> = Vec::with_capacity(order.len());
+            for i in order {
+                let write = &tx.writes[i];
+                match last.last_mut() {
+                    Some(prev) if bytes[prev.key.clone()] == bytes[write.key.clone()] => {
+                        *prev = write
+                    }
+                    _ => last.push(write),
+                }
+            }
+            if let Some(put) = last.iter().find(|write| write.value.is_some()) {
+                self.core.ensure_ksize(&tx.shared, put.key.len())?;
+            }
+            if tx.cleared {
+                ops.push(BatchOp::Clear(id));
+            }
+            for write in last {
+                let key = &bytes[write.key.clone()];
+                ops.push(match &write.value {
+                    Some(value) => BatchOp::Put(id, key, &bytes[value.clone()]),
+                    None => BatchOp::Remove(id, key),
+                });
+            }
         }
+        write(&self.core, self.mode, &ops)
     }
 }
 
 impl Drop for TnDbTxMut {
     fn drop(&mut self) {
-        self.end_group();
+        if !self.done {
+            if let Err(e) = self.finish() {
+                tracing::error!(target: "tndb", "a dropped write transaction failed to write: {e:#}");
+            }
+        }
     }
 }
 
 impl DbTx for TnDbTxMut {
-    /// Reads the table's working state, so this transaction's own uncommitted writes are visible.
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        with_open_table::<T, _>(&self.store, |entry| {
-            with_read_key(key, |key| {
-                entry.table.get_working_with(key, |bytes| decode::<T::Value>(bytes))
-            })
-        })
+        let table = table::<T>(&self.core)?;
+        let encoded = encode_key(key);
+        match self.last_write(table.id, &encoded) {
+            Some(Some(value)) => Ok(Some(decode::<T::Value>(value))),
+            Some(None) => Ok(None),
+            None => table.get_with(&encoded, |bytes| decode::<T::Value>(bytes)),
+        }
     }
 }
 
 impl DbTxMut for TnDbTxMut {
     fn insert<T: Table>(&mut self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        self.wrote(T::NAME);
-        insert::<T>(&self.store, key, value, None)
+        let shared = table::<T>(&self.core)?;
+        let start = self.bytes.len();
+        encode_key_into(&mut self.bytes, key)?;
+        let key_end = self.bytes.len();
+        let fixed = shared.ksize();
+        if fixed != 0 && key_end - start != fixed as usize {
+            self.bytes.truncate(start);
+            eyre::bail!(
+                "tndb: a {}-byte key in table {} of {fixed}-byte keys",
+                key_end - start,
+                T::NAME
+            );
+        }
+        if let Err(e) = encode_into_buffer(&mut self.bytes, value) {
+            self.bytes.truncate(start);
+            return Err(e.into());
+        }
+        let write = TxWrite { key: start..key_end, value: Some(key_end..self.bytes.len()) };
+        self.table_mut(shared).writes.push(write);
+        Ok(())
     }
 
     fn remove<T: Table>(&mut self, key: &T::Key) -> eyre::Result<()> {
-        self.wrote(T::NAME);
-        remove::<T>(&self.store, key, None).map(drop)
+        let shared = table::<T>(&self.core)?;
+        let start = self.bytes.len();
+        encode_key_into(&mut self.bytes, key)?;
+        let write = TxWrite { key: start..self.bytes.len(), value: None };
+        self.table_mut(shared).writes.push(write);
+        Ok(())
     }
 
     fn clear_table<T: Table>(&mut self) -> eyre::Result<()> {
-        self.wrote(T::NAME);
-        clear_table::<T>(&self.store)
+        let shared = table::<T>(&self.core)?;
+        let tx = self.table_mut(shared);
+        tx.cleared = true;
+        tx.writes.clear();
+        Ok(())
     }
 
     fn commit(mut self) -> eyre::Result<()> {
-        if self.group.is_some() {
-            self.end_group();
-            return Ok(());
-        }
-        // Durably flush the log of each table this transaction wrote, then publish its writes.
-        for name in std::mem::take(&mut self.written) {
-            if let Some(result) = with_table(&self.store, name, |entry| entry.table.flush()) {
-                result?;
-            }
-        }
-        Ok(())
+        self.finish()
     }
 }
 
@@ -481,1637 +402,92 @@ impl Database for TnDatabase {
     where
         Self: 'txn;
 
-    /// Open table `T` as a keyed table (its log stores each row's key), unless it is already
-    /// open. A derived-key table must be opened with [`TnDatabase::open_table_with_key`] first.
     fn open_table<T: Table>(&self) -> eyre::Result<()> {
-        self.open_table_in::<T>(None)
+        self.core.open_table(T::NAME).map(drop)
     }
 
     fn read_txn(&self) -> eyre::Result<Self::TX<'_>> {
-        Ok(TnDbTx { store: self.store.clone() })
+        Ok(TnDbTx { core: Arc::clone(&self.core) })
     }
 
     fn write_txn(&self) -> eyre::Result<Self::TXMut<'_>> {
         Ok(TnDbTxMut {
-            store: self.store.clone(),
-            written: Vec::new(),
-            group: self.group.as_ref().map(|group| Arc::clone(&group.commit)),
+            core: Arc::clone(&self.core),
+            mode: self.mode,
+            tables: BTreeMap::new(),
+            bytes: Vec::new(),
+            done: false,
         })
     }
 
     fn contains_key<T: Table>(&self, key: &T::Key) -> eyre::Result<bool> {
-        contains_key::<T>(&self.store, key)
+        contains_key::<T>(&self.core, key)
     }
 
     fn get<T: Table>(&self, key: &T::Key) -> eyre::Result<Option<T::Value>> {
-        get::<T>(&self.store, key)
+        get::<T>(&self.core, key)
     }
 
     fn insert<T: Table>(&self, key: &T::Key, value: &T::Value) -> eyre::Result<()> {
-        // Bare insert is autocommitting per the trait contract (in group mode, by the committer).
-        match self.group_commit() {
-            Some(group) => insert::<T>(&self.store, key, value, Some(group)),
-            None => {
-                insert::<T>(&self.store, key, value, None)?;
-                flush_table::<T>(&self.store)
-            }
-        }
+        let table = self.table::<T>()?;
+        with_key_value(key, value, |key, value| {
+            self.core.ensure_ksize(&table, key.len())?;
+            self.write(&[BatchOp::Put(table.id, key, value)])
+        })
     }
 
     fn remove<T: Table>(&self, key: &T::Key) -> eyre::Result<()> {
-        match self.group_commit() {
-            Some(group) => remove::<T>(&self.store, key, Some(group)).map(drop),
-            None => {
-                remove::<T>(&self.store, key, None)?;
-                flush_table::<T>(&self.store)
-            }
-        }
+        let table = self.table::<T>()?;
+        with_key(key, |key| self.write(&[BatchOp::Remove(table.id, key)]))
     }
 
     fn clear_table<T: Table>(&self) -> eyre::Result<()> {
-        match self.group_commit() {
-            Some(group) => with_open_table::<T, _>(&self.store, |entry| {
-                entry.table.clear_published(group, T::NAME)
-            }),
-            None => {
-                clear_table::<T>(&self.store)?;
-                flush_table::<T>(&self.store)
-            }
-        }
+        let table = self.table::<T>()?;
+        self.write(&[BatchOp::Clear(table.id)])
     }
 
+    /// True if the table is open and empty (an absent table reads as not empty).
     fn is_empty<T: Table>(&self) -> bool {
-        is_empty::<T>(&self.store)
+        self.core.table(T::NAME).is_some_and(|table| table.len() == 0)
     }
 
     fn iter<T: Table>(&self) -> DBIter<'_, T> {
-        scan::<T>(&self.store, ScanKind::Forward)
+        scan::<T>(&self.core, ScanKind::Forward)
     }
 
     fn skip_to<T: Table>(&self, key: &T::Key) -> eyre::Result<DBIter<'_, T>> {
-        Ok(scan::<T>(&self.store, ScanKind::From(encode_key(key))))
+        Ok(scan::<T>(&self.core, ScanKind::From(encode_key(key))))
     }
 
     fn reverse_iter<T: Table>(&self) -> DBIter<'_, T> {
-        scan::<T>(&self.store, ScanKind::Reverse)
+        scan::<T>(&self.core, ScanKind::Reverse)
     }
 
     fn record_prior_to<T: Table>(&self, key: &T::Key) -> Option<(T::Key, T::Value)> {
-        // The greatest entry strictly less than `key`.
-        first_of::<T>(&self.store, ScanKind::RevFrom(encode_key(key)))
+        first_of::<T>(&self.core, ScanKind::RevFrom(encode_key(key)))
     }
 
     fn last_record<T: Table>(&self) -> Option<(T::Key, T::Value)> {
-        first_of::<T>(&self.store, ScanKind::Reverse)
+        first_of::<T>(&self.core, ScanKind::Reverse)
     }
 
-    /// In [`CommitMode::Group`], wait until every write made before the call (in any table) is
-    /// committed; an error once any write or commit has failed. In [`CommitMode::Sync`] every
-    /// write is already durable when it returns.
+    /// Wait until every write made before the call (in any table) is durable; an error once any
+    /// write or sync has failed. In [`CommitMode::Sync`] every write was durable when it returned.
     fn persist<T: Table>(&self) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
-        let group = self.group.as_ref().map(|group| Arc::clone(&group.commit));
+        let durability = Arc::clone(&self.core.durability);
+        let mode = self.mode;
         async move {
-            match group {
-                Some(group) => group.persist().await,
-                None => Ok(()),
+            match mode {
+                CommitMode::Group => durability.persist().await,
+                CommitMode::Sync => durability.check(),
             }
         }
     }
 
-    /// Start compacting, in the background, every table holding dead (overwritten or removed)
-    /// records whose log is at least 1 MiB; each switches to its compacted log at a later commit.
-    /// Returns at once.
+    /// Ask the compaction thread to compact the log now (in the background), unless it is
+    /// under 1 MiB.
     fn compact(&self) -> eyre::Result<()> {
-        for entry in self.store.load().values() {
-            entry.table.compact();
-        }
+        self.core.compact.request();
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use tempfile::TempDir;
-    use tn_types::{Database as _, DbTx as _, DbTxMut as _};
-
-    use super::TnDatabase;
-    use crate::test::*;
-
-    /// Open a fresh tndb in a temp dir with the shared `TestTable` opened.  The `TempDir` is
-    /// returned so the caller keeps it alive for the duration of the test.
-    fn open_db() -> (TnDatabase, TempDir) {
-        let tmp = TempDir::with_prefix("tndb").expect("temp dir");
-        let db = TnDatabase::open(tmp.path()).expect("open tndb");
-        db.open_table::<TestTable>().expect("tndb open table to succeed");
-        (db, tmp)
-    }
-
-    #[test]
-    fn test_tndb_contains_key() {
-        let (db, _tmp) = open_db();
-        test_contains_key(db);
-    }
-
-    #[test]
-    fn test_tndb_get() {
-        let (db, _tmp) = open_db();
-        test_get(db);
-    }
-
-    #[test]
-    fn test_tndb_multi_get() {
-        let (db, _tmp) = open_db();
-        test_multi_get(db);
-    }
-
-    #[test]
-    fn test_tndb_skip() {
-        let (db, _tmp) = open_db();
-        test_skip(db);
-    }
-
-    #[test]
-    fn test_tndb_skip_to_previous_simple() {
-        let (db, _tmp) = open_db();
-        test_skip_to_previous_simple(db);
-    }
-
-    #[test]
-    fn test_tndb_iter_skip_to_previous_gap() {
-        let (db, _tmp) = open_db();
-        test_iter_skip_to_previous_gap(db);
-    }
-
-    #[test]
-    fn test_tndb_remove() {
-        let (db, _tmp) = open_db();
-        test_remove(db);
-    }
-
-    #[test]
-    fn test_tndb_iter() {
-        let (db, _tmp) = open_db();
-        test_iter(db);
-    }
-
-    #[test]
-    fn test_tndb_iter_reverse() {
-        let (db, _tmp) = open_db();
-        test_iter_reverse(db);
-    }
-
-    #[test]
-    fn test_tndb_clear() {
-        let (db, _tmp) = open_db();
-        test_clear(db);
-    }
-
-    #[test]
-    fn test_tndb_is_empty() {
-        let (db, _tmp) = open_db();
-        test_is_empty(db);
-    }
-
-    #[test]
-    fn test_tndb_multi_insert() {
-        let (db, _tmp) = open_db();
-        test_multi_insert(db);
-    }
-
-    #[test]
-    fn test_tndb_multi_remove() {
-        let (db, _tmp) = open_db();
-        test_multi_remove(db);
-    }
-
-    /// Writes reuse their table's encode buffers: a short value written after a long one (directly
-    /// and through a write txn) must read back exactly, with no stale tail from the longer encode.
-    #[test]
-    fn test_tndb_reused_buffers_keep_no_stale_bytes() {
-        use tn_types::DbTxMut as _;
-
-        let (db, _tmp) = open_db();
-        let long = "x".repeat(4096);
-        db.insert::<TestTable>(&1, &long).expect("insert long");
-        db.insert::<TestTable>(&2, &"short".to_string()).expect("insert short");
-        let mut txn = db.write_txn().expect("write txn");
-        txn.insert::<TestTable>(&3, &long).expect("txn insert long");
-        txn.insert::<TestTable>(&1, &"s".to_string()).expect("txn overwrite short");
-        txn.commit().expect("commit");
-
-        assert_eq!(db.get::<TestTable>(&1).expect("get 1"), Some("s".to_string()));
-        assert_eq!(db.get::<TestTable>(&2).expect("get 2"), Some("short".to_string()));
-        assert_eq!(db.get::<TestTable>(&3).expect("get 3"), Some(long));
-
-        db.remove::<TestTable>(&2).expect("remove");
-        assert!(!db.contains_key::<TestTable>(&2).expect("contains 2"));
-        assert!(db.contains_key::<TestTable>(&1).expect("contains 1"));
-    }
-
-    /// Dropping the database releases every table (the snapshot map holds the only handles), so
-    /// each table's log is sealed by a clean close, and a reopen reads the data back.
-    #[test]
-    fn test_tndb_reopen_after_drop() {
-        use crate::archive::pack::{Pack, PackCompression};
-
-        let tmp = TempDir::with_prefix("tndb_reopen").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open tndb");
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..100u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-            }
-        }
-        {
-            let log = Pack::<Vec<u8>>::open(
-                tmp.path().join("TestTable").join("gen-0").join("data"),
-                0,
-                true,
-                PackCompression::None,
-                1,
-            )
-            .expect("open the table log read-only");
-            assert!(!log.opened_unclean(), "dropping the database must close (seal) its tables");
-        }
-        let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(!db.rebuilt_on_open::<TestTable>(), "a clean close needs no rebuild");
-        // Readable at once, before any insert: point reads, scans in both directions, seeks.
-        for i in 0..100u64 {
-            assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")));
-        }
-        assert!(!db.is_empty::<TestTable>());
-        let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
-        assert_eq!(keys, (0..100).collect::<Vec<_>>(), "a full ascending scan after reopen");
-        assert_eq!(db.reverse_iter::<TestTable>().next().map(|(k, _)| k), Some(99));
-        assert_eq!(db.last_record::<TestTable>(), Some((99, "v99".to_string())));
-        assert_eq!(db.record_prior_to::<TestTable>(&50).map(|(k, _)| k), Some(49));
-        // And writable: the reopened index takes new rows alongside the old ones.
-        db.insert::<TestTable>(&1_000, &"new".to_string()).expect("insert after reopen");
-        assert_eq!(db.get::<TestTable>(&1_000).expect("get"), Some("new".to_string()));
-        assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("v7".to_string()));
-        assert_eq!(db.iter::<TestTable>().count(), 101);
-    }
-
-    /// A full-memory `LayeredDatabase` over a reopened tndb loads every row into its memory layer
-    /// at `open_table` (its reads never reach the disk layer), so the rows must be readable from
-    /// tndb right after the reopen.
-    #[test]
-    fn test_tndb_layered_reopen_loads_rows() {
-        use crate::layered_db::LayeredDatabase;
-
-        let tmp = TempDir::with_prefix("tndb_layered_reopen").expect("temp dir");
-        {
-            let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("open tndb"), true);
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..500u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-            }
-            // Dropping the last handle joins the background writer, so every insert is on disk.
-        }
-        let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("reopen tndb"), true);
-        db.open_table::<TestTable>().expect("reopen table");
-        assert_eq!(db.iter::<TestTable>().count(), 500, "every row loaded into the memory layer");
-        assert_eq!(db.get::<TestTable>(&321).expect("get"), Some("v321".to_string()));
-    }
-
-    /// The index is derived data: a corrupt index header is discarded and the index rebuilt from
-    /// the logs.
-    #[test]
-    fn test_tndb_reopen_corrupt_index_header_rebuilds() {
-        let tmp = TempDir::with_prefix("tndb_corrupt_btx").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open tndb");
-            db.open_table::<TestTable>().expect("open table");
-            db.insert::<TestTable>(&1, &"one".to_string()).expect("insert");
-        }
-        let index = tmp.path().join("TestTable").join("gen-0").join("btx").join("index.btx");
-        let mut bytes = std::fs::read(&index).expect("read index");
-        bytes[30] ^= 0xFF; // inside the header's root-page field, under its CRC
-        std::fs::write(&index, bytes).expect("write index");
-
-        let db = TnDatabase::open(tmp.path()).expect("reopen tndb");
-        db.open_table::<TestTable>().expect("a corrupt index is rebuilt, not fatal");
-        assert!(db.rebuilt_on_open::<TestTable>());
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
-    }
-
-    /// A second table for the cross-table tests.
-    #[derive(Debug)]
-    struct OtherTable;
-    impl tn_types::Table for OtherTable {
-        type Key = u64;
-        type Value = String;
-
-        const NAME: &'static str = "OtherTable";
-        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
-    }
-
-    /// Committing a write txn while another table is being scanned does not wait for the scan.
-    #[test]
-    fn test_tndb_commit_ignores_unrelated_scans() {
-        use std::{sync::mpsc, time::Duration};
-        use tn_types::DbTxMut as _;
-
-        let (db, _tmp) = open_db();
-        db.open_table::<OtherTable>().expect("open other table");
-        for i in 0..10u64 {
-            db.insert::<TestTable>(&i, &i.to_string()).expect("insert");
-        }
-        let mut scan = db.iter::<TestTable>();
-        assert!(scan.next().is_some());
-
-        // Commit on another thread, so a regression fails the test instead of hanging it.
-        let (done_tx, done_rx) = mpsc::channel();
-        let writer = db.clone();
-        let commit = std::thread::spawn(move || {
-            let mut txn = writer.write_txn().expect("write txn");
-            txn.insert::<OtherTable>(&1, &"x".to_string()).expect("txn insert");
-            done_tx.send(txn.commit().is_ok()).expect("report commit");
-        });
-        let committed = done_rx.recv_timeout(Duration::from_secs(10));
-        drop(scan);
-        commit.join().expect("commit thread");
-        assert_eq!(committed, Ok(true), "the commit must not wait on an unrelated table's scan");
-    }
-
-    /// A write transaction's writes are readable by others only after its commit, while its own
-    /// `get` sees them at once; an autocommit write is readable when it returns.
-    #[test]
-    fn test_tndb_writes_visible_at_commit() {
-        use tn_types::{DbTx as _, DbTxMut as _};
-
-        let (db, _tmp) = open_db();
-        db.insert::<TestTable>(&1, &"one".to_string()).expect("autocommit insert");
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
-
-        let mut txn = db.write_txn().expect("write txn");
-        txn.insert::<TestTable>(&2, &"two".to_string()).expect("txn insert");
-        txn.remove::<TestTable>(&1).expect("txn remove");
-        assert_eq!(txn.get::<TestTable>(&2).expect("txn get"), Some("two".to_string()));
-        assert_eq!(txn.get::<TestTable>(&1).expect("txn get"), None);
-        assert_eq!(db.get::<TestTable>(&2).expect("get"), None, "uncommitted");
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()), "uncommitted");
-        assert!(!db.contains_key::<TestTable>(&2).expect("contains"));
-        let read = db.read_txn().expect("read txn");
-        assert_eq!(read.get::<TestTable>(&2).expect("read txn get"), None);
-
-        txn.commit().expect("commit");
-        assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("two".to_string()));
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), None);
-        assert_eq!(read.get::<TestTable>(&2).expect("read txn get"), Some("two".to_string()));
-    }
-
-    /// An iterator takes no lock: the same thread can write (and commit) its table mid-iteration,
-    /// and the iterator keeps yielding the state it started on.
-    #[test]
-    fn test_tndb_write_while_iterating_same_table() {
-        let (db, _tmp) = open_db();
-        for i in 0..10u64 {
-            db.insert::<TestTable>(&i, &i.to_string()).expect("insert");
-        }
-        let mut iter = db.iter::<TestTable>();
-        assert_eq!(iter.next(), Some((0, "0".to_string())));
-        for i in 0..10u64 {
-            db.insert::<TestTable>(&i, &"x".to_string()).expect("overwrite while iterating");
-        }
-        db.remove::<TestTable>(&5).expect("remove while iterating");
-        assert_eq!(
-            iter.collect::<Vec<_>>(),
-            (1..10u64).map(|i| (i, i.to_string())).collect::<Vec<_>>()
-        );
-        assert_eq!(db.get::<TestTable>(&3).expect("get"), Some("x".to_string()));
-        assert_eq!(db.iter::<TestTable>().count(), 9);
-    }
-
-    #[test]
-    fn test_tndb_dbsimpbench() {
-        let (db, _tmp) = open_db();
-        db_simp_bench(db, "TnDb");
-    }
-
-    // ---- recovery ----
-
-    /// A derived-key table: its value is `"{key}:{tag}"`, so the key is derived from the value.
-    #[derive(Debug)]
-    struct DerivedTable;
-    impl tn_types::Table for DerivedTable {
-        type Key = u64;
-        type Value = String;
-
-        const NAME: &'static str = "DerivedTable";
-        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
-    }
-
-    // Takes `&String` to be a key function of a `String`-valued table (`Fn(&T::Value) -> T::Key`).
-    #[allow(clippy::ptr_arg)]
-    fn derived_key(value: &String) -> u64 {
-        value.split(':').next().and_then(|k| k.parse().ok()).expect("a derived-table value")
-    }
-
-    /// Simulate a crash: the database's tables are never dropped, so no file is sealed and no
-    /// index is synced (their mappings stay, as a crashed process's page cache would); their locks
-    /// are released, as a crashed process's are.
-    fn crash(db: TnDatabase) {
-        db.release_locks_for_crash();
-        std::mem::forget(db);
-    }
-
-    /// A write transaction abandoned by the crash.
-    fn crash_txn(txn: super::TnDbTxMut) {
-        std::mem::forget(txn);
-    }
-
-    fn gen_path(base: &std::path::Path, table: &str, generation: u64) -> std::path::PathBuf {
-        base.join(table).join(format!("gen-{generation}"))
-    }
-
-    /// The end offset of each whole record of the pack log at `path` (header excluded), read
-    /// through the log's raw iterator up to its first bad frame.
-    fn record_ends(path: &std::path::Path) -> Vec<u64> {
-        use crate::archive::pack_iter::PackIter;
-        let len = std::fs::metadata(path).expect("log").len();
-        let file = std::fs::File::open(path).expect("open log");
-        let mut iter = PackIter::<Vec<u8>, _>::open(file, 0, len).expect("log header");
-        let mut ends = Vec::new();
-        while let Some(Ok(_)) = iter.next_raw() {
-            ends.push(iter.logical_position());
-        }
-        ends
-    }
-
-    fn truncate(path: &std::path::Path, len: u64) {
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .expect("open")
-            .set_len(len)
-            .expect("truncate");
-    }
-
-    /// Every row of `T` (by `get` over `0..keys` and by a full scan) matches `model`, as do the
-    /// seeks.
-    fn assert_matches<T>(db: &TnDatabase, model: &BTreeMap<u64, String>, keys: u64)
-    where
-        T: tn_types::Table<Key = u64, Value = String>,
-    {
-        for k in 0..keys {
-            assert_eq!(db.get::<T>(&k).expect("get"), model.get(&k).cloned(), "key {k}");
-        }
-        let rows: BTreeMap<u64, String> = db.iter::<T>().collect();
-        assert_eq!(&rows, model, "scan");
-        assert_eq!(db.last_record::<T>(), model.last_key_value().map(|(k, v)| (*k, v.clone())));
-        let mid = keys / 2;
-        assert_eq!(
-            db.record_prior_to::<T>(&mid),
-            model.range(..mid).next_back().map(|(k, v)| (*k, v.clone()))
-        );
-    }
-
-    use std::collections::BTreeMap;
-
-    /// A crash keeps every committed write (puts, overwrites, removes, a put after a remove) and
-    /// no part of an uncommitted transaction; the next clean close needs no rebuild.
-    #[test]
-    fn test_tndb_crash_rebuilds_committed_writes() {
-        let tmp = TempDir::with_prefix("tndb_crash").expect("temp dir");
-        let mut model = BTreeMap::new();
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..50u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-                model.insert(i, format!("v{i}"));
-            }
-            for i in 10..20u64 {
-                db.insert::<TestTable>(&i, &format!("w{i}")).expect("overwrite");
-                model.insert(i, format!("w{i}"));
-            }
-            for i in 0..5u64 {
-                db.remove::<TestTable>(&i).expect("remove");
-                model.remove(&i);
-            }
-            db.insert::<TestTable>(&2, &"again".to_string()).expect("insert after remove");
-            model.insert(2, "again".to_string());
-            // Written but never committed: none of it may survive.
-            let mut txn = db.write_txn().expect("txn");
-            txn.insert::<TestTable>(&100, &"uncommitted".to_string()).expect("insert");
-            txn.remove::<TestTable>(&30).expect("remove");
-            txn.insert::<TestTable>(&11, &"uncommitted".to_string()).expect("overwrite");
-            crash_txn(txn);
-            crash(db);
-        }
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(db.rebuilt_on_open::<TestTable>(), "an unclean close rebuilds");
-        assert_matches::<TestTable>(&db, &model, 110);
-
-        db.insert::<TestTable>(&60, &"after".to_string()).expect("insert after recovery");
-        model.insert(60, "after".to_string());
-        drop(db);
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(!db.rebuilt_on_open::<TestTable>(), "a recovered table closes cleanly");
-        assert_matches::<TestTable>(&db, &model, 110);
-    }
-
-    /// A derived-key table stores only values and rebuilds its keys from them.
-    #[test]
-    fn test_tndb_derived_key_table_crash_rebuild() {
-        let tmp = TempDir::with_prefix("tndb_derived").expect("temp dir");
-        let mut model = BTreeMap::new();
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table_with_key::<DerivedTable>(derived_key).expect("open table");
-            for i in 0..40u64 {
-                let value = format!("{i}:a");
-                db.insert::<DerivedTable>(&i, &value).expect("insert");
-                model.insert(i, value);
-            }
-            for i in 5..15u64 {
-                let value = format!("{i}:b");
-                db.insert::<DerivedTable>(&i, &value).expect("overwrite");
-                model.insert(i, value);
-            }
-            for i in 20..25u64 {
-                db.remove::<DerivedTable>(&i).expect("remove");
-                model.remove(&i);
-            }
-            crash(db);
-        }
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table_with_key::<DerivedTable>(derived_key).expect("reopen table");
-        assert!(db.rebuilt_on_open::<DerivedTable>());
-        assert_matches::<DerivedTable>(&db, &model, 50);
-
-        // The log holds values only (after each record's tag byte): an 8-byte key per put would
-        // make it longer.
-        let data = gen_path(tmp.path(), "DerivedTable", 0).join("data");
-        let ends = record_ends(&data);
-        let first_put = ends[0] - crate::archive::pack::DATA_HEADER_BYTES as u64;
-        assert_eq!(first_put, 4 + 1 + "0:a".len() as u64 + 1 + 4, "frame of [PUT | value] only");
-    }
-
-    /// A table's key mode is fixed when it is created; re-opening an open table keeps it.
-    #[test]
-    fn test_tndb_key_mode_fixed_and_opens_idempotent() {
-        let tmp = TempDir::with_prefix("tndb_mode").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("keyed");
-            db.open_table::<TestTable>().expect("re-open keeps the table");
-            assert!(db.open_table_with_key::<TestTable>(derived_key).is_err(), "other mode");
-            db.open_table_with_key::<DerivedTable>(derived_key).expect("derived");
-            db.open_table::<DerivedTable>().expect("a wrapper's later open keeps it derived");
-            db.insert::<DerivedTable>(&7, &"7:x".to_string()).expect("insert");
-        }
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        assert!(db.open_table_with_key::<TestTable>(derived_key).is_err(), "keyed table");
-        assert!(db.open_table::<DerivedTable>().is_err(), "derived table opened keyed");
-        db.open_table_with_key::<DerivedTable>(derived_key).expect("derived table");
-        assert_eq!(db.get::<DerivedTable>(&7).expect("get"), Some("7:x".to_string()));
-    }
-
-    /// Debug builds check that a derived-key table's key is the key derived from its value.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "derived from its value")]
-    fn test_tndb_derived_key_mismatch_panics_in_debug() {
-        let (db, _tmp) = open_db();
-        db.open_table_with_key::<DerivedTable>(derived_key).expect("derived");
-        let _ = db.insert::<DerivedTable>(&5, &"6:wrong".to_string());
-    }
-
-    /// Clearing a table deletes its data from disk at once, while a scan started before the clear
-    /// keeps reading the rows it started on.
-    #[test]
-    fn test_tndb_clear_reclaims_disk_and_keeps_snapshots() {
-        let tmp = TempDir::with_prefix("tndb_clear").expect("temp dir");
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        db.open_table::<TestTable>().expect("open table");
-        let big = "x".repeat(1024);
-        let mut txn = db.write_txn().expect("txn");
-        for i in 0..2_000u64 {
-            txn.insert::<TestTable>(&i, &format!("{i}{big}")).expect("insert");
-        }
-        txn.commit().expect("commit");
-
-        let mut scan = db.iter::<TestTable>();
-        assert_eq!(scan.next().map(|(k, _)| k), Some(0));
-        db.clear_table::<TestTable>().expect("clear");
-        assert!(gen_path(tmp.path(), "TestTable", 1).exists());
-        // The old generation is deleted in the background, right after the clear.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while gen_path(tmp.path(), "TestTable", 0).exists() {
-            assert!(std::time::Instant::now() < deadline, "the old generation is deleted");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(db.is_empty::<TestTable>());
-        assert_eq!(db.get::<TestTable>(&5).expect("get"), None);
-
-        // The scan's snapshot still maps the deleted files.
-        let rest: Vec<u64> = scan
-            .by_ref()
-            .map(|(k, v)| {
-                assert_eq!(v, format!("{k}{big}"));
-                k
-            })
-            .collect();
-        assert_eq!(rest, (1..2_000).collect::<Vec<_>>());
-        drop(scan);
-
-        db.insert::<TestTable>(&9, &"new".to_string()).expect("insert after clear");
-        drop(db);
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(!db.rebuilt_on_open::<TestTable>());
-        assert_eq!(db.iter::<TestTable>().collect::<Vec<_>>(), vec![(9, "new".to_string())]);
-    }
-
-    /// A torn tail in the data log (a crash mid-write) is cut back to the last commit.
-    #[test]
-    fn test_tndb_torn_data_tail_cut_to_last_commit() {
-        let tmp = TempDir::with_prefix("tndb_torn_data").expect("temp dir");
-        let model: BTreeMap<u64, String> = (0..20u64).map(|i| (i, format!("v{i}"))).collect();
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            for (k, v) in &model {
-                db.insert::<TestTable>(k, v).expect("insert");
-            }
-            let mut txn = db.write_txn().expect("txn");
-            for i in 20..25u64 {
-                txn.insert::<TestTable>(&i, &format!("v{i}")).expect("uncommitted");
-            }
-            crash_txn(txn);
-            crash(db);
-        }
-        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
-        let ends = record_ends(&data);
-        // Tear the 23rd put (the 3rd uncommitted one) halfway.
-        let tear = ends[ends.len() - 3] + 5;
-        truncate(&data, tear);
-
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(db.rebuilt_on_open::<TestTable>());
-        assert_matches::<TestTable>(&db, &model, 30);
-        db.insert::<TestTable>(&99, &"next".to_string()).expect("write after the cut");
-        let mut model = model;
-        model.insert(99, "next".to_string());
-        drop(db);
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert!(!db.rebuilt_on_open::<TestTable>());
-        assert_matches::<TestTable>(&db, &model, 100);
-    }
-
-    /// A tear inside a run of removal records keeps the committed removals and drops the
-    /// uncommitted ones: removals sit in the data log, committed by the commit record after them.
-    #[test]
-    fn test_tndb_torn_removal_tail() {
-        let tmp = TempDir::with_prefix("tndb_torn_removed").expect("temp dir");
-        let mut model: BTreeMap<u64, String> = (0..20u64).map(|i| (i, format!("v{i}"))).collect();
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            for (k, v) in &model {
-                db.insert::<TestTable>(k, v).expect("insert");
-            }
-            for i in 0..4u64 {
-                db.remove::<TestTable>(&i).expect("committed remove");
-                model.remove(&i);
-            }
-            let mut txn = db.write_txn().expect("txn");
-            for i in 10..13u64 {
-                txn.remove::<TestTable>(&i).expect("uncommitted remove");
-            }
-            crash_txn(txn);
-            crash(db);
-        }
-        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
-        let ends = record_ends(&data);
-        // 20 puts and 4 removals, each with its commit record, then 3 uncommitted removals.
-        assert_eq!(ends.len(), 2 * 24 + 3);
-        truncate(&data, ends[ends.len() - 2] + 3); // tear the last removal
-
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("reopen table");
-        assert_matches::<TestTable>(&db, &model, 25);
-    }
-
-    /// A generation holds one log: removals are records in it, so no removal log is ever created
-    /// (a commit with removals syncs one file), through writes, removes and a clear.
-    #[test]
-    fn test_tndb_generation_has_one_log() {
-        fn names(dir: &std::path::Path, found: &mut Vec<String>) {
-            for entry in std::fs::read_dir(dir).expect("read dir").flatten() {
-                found.push(entry.file_name().to_string_lossy().into_owned());
-                if entry.file_type().expect("file type").is_dir() {
-                    names(&entry.path(), found);
-                }
-            }
-        }
-        let tmp = TempDir::with_prefix("tndb_one_log").expect("temp dir");
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        db.open_table::<TestTable>().expect("open table");
-        for i in 0..5u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-        }
-        db.remove::<TestTable>(&1).expect("remove");
-        db.clear_table::<TestTable>().expect("clear");
-        db.insert::<TestTable>(&9, &"v9".to_string()).expect("insert");
-        db.remove::<TestTable>(&9).expect("remove");
-        drop(db);
-        let mut found = Vec::new();
-        names(&tmp.path().join("TestTable"), &mut found);
-        assert!(found.iter().any(|name| name == "data"), "{found:?}");
-        assert!(!found.iter().any(|name| name == "removed"), "{found:?}");
-    }
-
-    /// A cleanly closed log must replay whole: corruption inside it fails the open, changes no
-    /// byte, and fails the same way again.
-    #[test]
-    fn test_tndb_sealed_log_corruption_fails_closed() {
-        let tmp = TempDir::with_prefix("tndb_sealed_corrupt").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..10u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-            }
-        }
-        let gen0 = gen_path(tmp.path(), "TestTable", 0);
-        let data = gen0.join("data");
-        let mut bytes = std::fs::read(&data).expect("read");
-        let first_payload = crate::archive::pack::DATA_HEADER_BYTES + 4;
-        bytes[first_payload + 2] ^= 0xFF;
-        std::fs::write(&data, &bytes).expect("write");
-        std::fs::remove_dir_all(gen0.join("btx")).expect("drop the index to force a rebuild");
-
-        for attempt in 0..2 {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            assert!(db.open_table::<TestTable>().is_err(), "attempt {attempt} must fail closed");
-            drop(db);
-            assert_eq!(std::fs::read(&data).expect("read"), bytes, "the log is unchanged");
-        }
-    }
-
-    /// In an unclean log, damage below the commit marker is corruption of committed data, not a
-    /// crash tail: the open fails rather than cutting committed records.
-    #[test]
-    fn test_tndb_tear_below_commit_marker_fails_closed() {
-        let tmp = TempDir::with_prefix("tndb_below_marker").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..10u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-            }
-            crash(db);
-        }
-        let data = gen_path(tmp.path(), "TestTable", 0).join("data");
-        let mut bytes = std::fs::read(&data).expect("read");
-        bytes[crate::archive::pack::DATA_HEADER_BYTES + 6] ^= 0xFF; // the first record
-        std::fs::write(&data, &bytes).expect("write");
-
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        assert!(db.open_table::<TestTable>().is_err(), "committed data is damaged");
-        drop(db);
-        assert_eq!(std::fs::read(&data).expect("read"), bytes, "the log is unchanged");
-    }
-
-    /// Random puts, removes, clears and commits, with crashes and clean closes between them:
-    /// after every reopen the table holds exactly the committed state.
-    #[test]
-    fn test_tndb_randomized_crash_recovery() {
-        const KEYS: u64 = 64;
-        let tmp = TempDir::with_prefix("tndb_random_crash").expect("temp dir");
-        let mut x: u64 = 0x2545_F491_4F6C_DD1D;
-        let mut rand = move |n: u64| {
-            x ^= x << 13;
-            x ^= x >> 7;
-            x ^= x << 17;
-            x % n
-        };
-        let mut committed: BTreeMap<u64, String> = BTreeMap::new();
-        for cycle in 0..12u64 {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            assert_matches::<TestTable>(&db, &committed, KEYS);
-            let mut pending = committed.clone();
-            let mut txn = db.write_txn().expect("txn");
-            for step in 0..150u64 {
-                let k = rand(KEYS);
-                match rand(20) {
-                    0..=9 => {
-                        let v = format!("{cycle}:{step}");
-                        txn.insert::<TestTable>(&k, &v).expect("insert");
-                        pending.insert(k, v);
-                    }
-                    10..=15 => {
-                        txn.remove::<TestTable>(&k).expect("remove");
-                        pending.remove(&k);
-                    }
-                    16 => {
-                        // Durable at once; the writes before it are gone with the old generation.
-                        txn.clear_table::<TestTable>().expect("clear");
-                        committed.clear();
-                        pending.clear();
-                    }
-                    _ => {
-                        txn.commit().expect("commit");
-                        committed = pending.clone();
-                        txn = db.write_txn().expect("txn");
-                    }
-                }
-            }
-            if cycle % 3 == 2 {
-                // A clean close commits the open writes.
-                drop(txn);
-                drop(db);
-                committed = pending;
-            } else {
-                crash_txn(txn);
-                crash(db);
-            }
-        }
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        db.open_table::<TestTable>().expect("open table");
-        assert_matches::<TestTable>(&db, &committed, KEYS);
-    }
-
-    /// A `LayeredDatabase` over a crashed tndb loads the rebuilt rows.
-    #[test]
-    fn test_tndb_layered_crash_reopen_loads_rows() {
-        use crate::layered_db::LayeredDatabase;
-
-        let tmp = TempDir::with_prefix("tndb_layered_crash").expect("temp dir");
-        let rt = tokio::runtime::Runtime::new().expect("runtime");
-        {
-            let tn = TnDatabase::open(tmp.path()).expect("open");
-            let db = LayeredDatabase::open(tn.clone(), true);
-            db.open_table::<TestTable>().expect("open table");
-            for i in 0..300u64 {
-                db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-            }
-            rt.block_on(db.persist::<TestTable>()).expect("persist");
-            std::mem::forget(db);
-            crash(tn);
-        }
-        let db = LayeredDatabase::open(TnDatabase::open(tmp.path()).expect("reopen"), true);
-        db.open_table::<TestTable>().expect("reopen table");
-        assert_eq!(db.iter::<TestTable>().count(), 300);
-        assert_eq!(db.get::<TestTable>(&123).expect("get"), Some("v123".to_string()));
-    }
-
-    // ---- review fixes ----
-
-    /// Ops on a table that was never opened are errors (as with MDBX), never a silent no-op that
-    /// drops the write.
-    #[test]
-    fn test_tndb_ops_on_unopened_table_error() {
-        let tmp = TempDir::with_prefix("tndb_unopened").expect("temp dir");
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        assert!(db.insert::<TestTable>(&1, &"x".to_string()).is_err());
-        assert!(db.remove::<TestTable>(&1).is_err());
-        assert!(db.clear_table::<TestTable>().is_err());
-        assert!(db.get::<TestTable>(&1).is_err());
-        assert!(db.contains_key::<TestTable>(&1).is_err());
-        let mut txn = db.write_txn().expect("txn");
-        assert!(txn.insert::<TestTable>(&1, &"x".to_string()).is_err());
-        assert!(txn.get::<TestTable>(&1).is_err());
-    }
-
-    /// A lookup that hits a damaged index page is an error, not "absent".
-    #[test]
-    fn test_tndb_contains_key_reports_corruption() {
-        let tmp = TempDir::with_prefix("tndb_corrupt_contains").expect("temp dir");
-        let db = TnDatabase::open(tmp.path()).expect("open");
-        db.open_table::<TestTable>().expect("open table");
-        for i in 0..10u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-        }
-        // Zero every node page's CRC trailer through the file (the index is mapped shared), so
-        // whichever page the published tree's root is reads as damaged.
-        let index = gen_path(tmp.path(), "TestTable", 0).join("btx").join("index.btx");
-        let pages = std::fs::metadata(&index).expect("index").len() / 4096;
-        use std::os::unix::fs::FileExt as _;
-        let file = std::fs::OpenOptions::new().write(true).open(&index).expect("open index");
-        for page in 1..pages {
-            file.write_all_at(&[0; 4], page * 4096 + 4092).expect("zero the CRC");
-        }
-
-        assert!(db.contains_key::<TestTable>(&3).is_err(), "corruption is not absence");
-        assert!(db.get::<TestTable>(&3).is_err());
-    }
-
-    /// A table directory is opened by one writer at a time: a second database on the same path
-    /// cannot open the table until the first closes it.
-    #[test]
-    fn test_tndb_table_open_twice_is_refused() {
-        let tmp = TempDir::with_prefix("tndb_lock").expect("temp dir");
-        let first = TnDatabase::open(tmp.path()).expect("open");
-        first.open_table::<TestTable>().expect("open table");
-        let second = TnDatabase::open(tmp.path()).expect("open");
-        assert!(second.open_table::<TestTable>().is_err(), "the table is locked");
-        drop(first);
-        second.open_table::<TestTable>().expect("free once the first closes");
-    }
-
-    /// A close that cannot commit leaves its uncommitted writes out, and the table still opens.
-    #[test]
-    fn test_tndb_close_without_commit_reopens() {
-        let tmp = TempDir::with_prefix("tndb_close_fail").expect("temp dir");
-        {
-            let db = TnDatabase::open(tmp.path()).expect("open");
-            db.open_table::<TestTable>().expect("open table");
-            db.insert::<TestTable>(&1, &"committed".to_string()).expect("insert");
-            let mut txn = db.write_txn().expect("txn");
-            txn.insert::<TestTable>(&2, &"pending".to_string()).expect("insert");
-            txn.remove::<TestTable>(&1).expect("remove");
-            drop(txn);
-            db.fail_next_flush_for_test::<TestTable>();
-        }
-        let db = TnDatabase::open(tmp.path()).expect("reopen");
-        db.open_table::<TestTable>().expect("the table opens");
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("committed".to_string()));
-        assert_eq!(db.get::<TestTable>(&2).expect("get"), None);
-    }
-
-    /// `Database::compact` starts a background compaction of each table holding dead records,
-    /// which a later commit switches to; `compact_table_now` compacts and waits. The rows read the
-    /// same throughout.
-    #[test]
-    fn test_tndb_requested_and_immediate_compaction() {
-        use std::time::{Duration, Instant};
-
-        use super::super::{layout::list_gens, CompactionConfig};
-
-        let tmp = TempDir::with_prefix("tndb_compact").expect("temp dir");
-        let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
-        let db = TnDatabase::open_with_compaction(tmp.path(), config).expect("open tndb");
-        db.open_table::<TestTable>().expect("open table");
-        let big = "x".repeat(1_000);
-        for i in 0..1_500u64 {
-            db.insert::<TestTable>(&i, &big).expect("insert");
-        }
-        for i in 0..100u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("overwrite");
-        }
-        let table_dir = tmp.path().join("TestTable");
-        assert_eq!(list_gens(&table_dir).expect("list"), vec![0]);
-
-        db.compact().expect("compact");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while list_gens(&table_dir).expect("list").last() != Some(&1) {
-            assert!(Instant::now() < deadline, "a commit switched to the compacted generation");
-            db.insert::<TestTable>(&9_999, &"tick".to_string()).expect("commit");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        db.compact_table_now::<TestTable>().expect("compact now");
-        assert_eq!(list_gens(&table_dir).expect("list").last(), Some(&2));
-
-        for i in 0..100u64 {
-            assert_eq!(db.get::<TestTable>(&i).expect("get"), Some(format!("v{i}")));
-        }
-        for i in 100..1_500u64 {
-            assert_eq!(db.get::<TestTable>(&i).expect("get").as_ref(), Some(&big));
-        }
-        assert_eq!(db.iter::<TestTable>().count(), 1_501);
-    }
-
-    // ---- group commit ----
-
-    fn group_options() -> super::TnDbOptions {
-        super::TnDbOptions {
-            compaction: super::CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 },
-            commit: super::CommitMode::Group,
-        }
-    }
-
-    /// A group-commit database at `path` with `TestTable` and `OtherTable` open.
-    fn open_group(path: &std::path::Path) -> TnDatabase {
-        let db = TnDatabase::open_with(path, group_options()).expect("open tndb");
-        db.open_table::<TestTable>().expect("open table");
-        db.open_table::<OtherTable>().expect("open table");
-        db
-    }
-
-    fn block_on<F: std::future::Future>(f: F) -> F::Output {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_time()
-            .build()
-            .expect("runtime")
-            .block_on(f)
-    }
-
-    /// True if `persist` is still waiting after `wait`.
-    fn persist_pending(db: &TnDatabase, wait: std::time::Duration) -> bool {
-        block_on(async { tokio::time::timeout(wait, db.persist::<TestTable>()).await }).is_err()
-    }
-
-    /// The shared `Database` suite, on a group-commit database: every write is readable on return.
-    #[test]
-    fn test_tndb_group_shared_suite() {
-        let run = |test: fn(TnDatabase)| {
-            let tmp = TempDir::with_prefix("tndb_group_suite").expect("temp dir");
-            test(open_group(tmp.path()));
-        };
-        run(test_contains_key);
-        run(test_get);
-        run(test_multi_get);
-        run(test_skip);
-        run(test_skip_to_previous_simple);
-        run(test_iter_skip_to_previous_gap);
-        run(test_remove);
-        run(test_iter);
-        run(test_iter_reverse);
-        run(test_clear);
-        run(test_is_empty);
-        run(test_multi_insert);
-        run(test_multi_remove);
-    }
-
-    /// A group-commit write is readable at once, and durable once `persist` returns: it survives a
-    /// crash right after.
-    #[test]
-    fn test_tndb_group_write_durable_after_persist() {
-        let tmp = TempDir::with_prefix("tndb_group_durable").expect("temp dir");
-        let db = open_group(tmp.path());
-        for i in 0..100u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-        }
-        db.remove::<TestTable>(&7).expect("remove");
-        assert_eq!(db.get::<TestTable>(&5).expect("get"), Some("v5".to_string()), "readable");
-        block_on(db.persist::<TestTable>()).expect("persist");
-        crash(db);
-
-        let db = open_group(tmp.path());
-        assert_eq!(db.iter::<TestTable>().count(), 99);
-        assert_eq!(db.get::<TestTable>(&7).expect("get"), None);
-        assert_eq!(db.get::<TestTable>(&99).expect("get"), Some("v99".to_string()));
-    }
-
-    /// `persist` is a whole-database barrier: waiting on one table covers the writes made earlier
-    /// to every other table.
-    #[test]
-    fn test_tndb_group_persist_covers_every_table() {
-        let tmp = TempDir::with_prefix("tndb_group_fifo").expect("temp dir");
-        let db = open_group(tmp.path());
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        db.insert::<OtherTable>(&2, &"b".to_string()).expect("insert");
-        block_on(db.persist::<OtherTable>()).expect("persist");
-        crash(db);
-
-        let db = open_group(tmp.path());
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("a".to_string()));
-        assert_eq!(db.get::<OtherTable>(&2).expect("get"), Some("b".to_string()));
-    }
-
-    /// A failed commit fails `persist`, and every later one too (a latch), whatever table.
-    #[test]
-    fn test_tndb_group_failed_commit_latches_persist() {
-        let tmp = TempDir::with_prefix("tndb_group_latch").expect("temp dir");
-        let db = open_group(tmp.path());
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        block_on(db.persist::<TestTable>()).expect("persist");
-
-        db.fail_next_flush_for_test::<TestTable>();
-        db.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
-        assert!(block_on(db.persist::<TestTable>()).is_err(), "the failed commit surfaces");
-        db.insert::<OtherTable>(&3, &"c".to_string()).expect("another table's write");
-        assert!(block_on(db.persist::<OtherTable>()).is_err(), "and stays latched");
-    }
-
-    /// A table written by an open transaction is not committed until the transaction ends, so
-    /// `persist` waits for it, and a crash with it open keeps none of it.
-    #[test]
-    fn test_tndb_group_open_txn_holds_back_durability() {
-        let tmp = TempDir::with_prefix("tndb_group_txn").expect("temp dir");
-        let db = open_group(tmp.path());
-        let mut txn = db.write_txn().expect("txn");
-        txn.insert::<TestTable>(&1, &"t1".to_string()).expect("txn insert");
-        db.insert::<TestTable>(&2, &"bare".to_string()).expect("a bare write rides along");
-        assert!(persist_pending(&db, std::time::Duration::from_millis(200)), "waits for the txn");
-        txn.insert::<TestTable>(&3, &"t3".to_string()).expect("txn insert");
-        txn.commit().expect("commit");
-        block_on(db.persist::<TestTable>()).expect("persist");
-
-        let mut open = db.write_txn().expect("txn");
-        open.insert::<TestTable>(&4, &"t4".to_string()).expect("txn insert");
-        open.remove::<TestTable>(&1).expect("txn remove");
-        // A bare write wakes the committer, which must still leave the table alone.
-        db.insert::<TestTable>(&5, &"bare".to_string()).expect("bare insert");
-        assert!(persist_pending(&db, std::time::Duration::from_millis(200)), "held back");
-        crash_txn(open);
-        crash(db);
-
-        let db = open_group(tmp.path());
-        let rows: Vec<_> = db.iter::<TestTable>().collect();
-        assert_eq!(
-            rows,
-            vec![(1, "t1".to_string()), (2, "bare".to_string()), (3, "t3".to_string())],
-            "the committed txn whole, the open one not at all"
-        );
-    }
-
-    /// A write numbered after a committer round read its target waits for a later round:
-    /// `persist` never counts a write the committer has not committed, even when that write's table
-    /// was not in the round.
-    #[test]
-    fn test_tndb_group_write_during_a_round_waits_for_the_next() {
-        let tmp = TempDir::with_prefix("tndb_group_round").expect("temp dir");
-        let db = open_group(tmp.path());
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        let (arrived, release) = group.gate_next_round(super::super::commit::GatePoint::AfterTake);
-        db.insert::<TestTable>(&0, &"zero".to_string()).expect("insert"); // starts a round
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round 1 paused");
-        db.insert::<OtherTable>(&1, &"one".to_string()).expect("insert during round 1");
-        let (arrived2, release2) =
-            group.gate_next_round(super::super::commit::GatePoint::AfterTake);
-        drop(release); // round 1 commits TestTable only
-        arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("round 2 paused");
-        assert!(
-            persist_pending(&db, std::time::Duration::from_millis(200)),
-            "the write to OtherTable is not committed yet"
-        );
-        drop(release2);
-        block_on(db.persist::<OtherTable>()).expect("persist");
-        crash(db);
-        let db = open_group(tmp.path());
-        assert_eq!(db.get::<OtherTable>(&1).expect("get"), Some("one".to_string()));
-        assert_eq!(db.get::<TestTable>(&0).expect("get"), Some("zero".to_string()));
-    }
-
-    /// A write numbered after a round read its target, but before it took the dirty tables, is
-    /// committed by that round; the watermark then still reaches it (one more round), so `persist`
-    /// returns rather than waiting for some later write.
-    #[test]
-    fn test_tndb_group_write_committed_early_still_reaches_durable() {
-        let tmp = TempDir::with_prefix("tndb_group_liveness").expect("temp dir");
-        let db = open_group(tmp.path());
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        let (arrived, release) = group.gate_next_round(super::super::commit::GatePoint::BeforeTake);
-        db.insert::<TestTable>(&0, &"zero".to_string()).expect("insert"); // starts a round
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round paused");
-        db.insert::<OtherTable>(&1, &"one".to_string()).expect("insert after the target");
-        drop(release); // the round takes both tables and commits both
-        let persisted = block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), db.persist::<OtherTable>())
-                .await
-        });
-        assert!(matches!(persisted, Ok(Ok(()))), "persist returns without another write");
-    }
-
-    /// A transaction dropped without a commit ends like a commit: its writes are kept, published
-    /// and committed (as `LayeredDatabase`'s are).
-    #[test]
-    fn test_tndb_group_dropped_txn_is_published_and_committed() {
-        let tmp = TempDir::with_prefix("tndb_group_drop").expect("temp dir");
-        let db = open_group(tmp.path());
-        {
-            let mut txn = db.write_txn().expect("txn");
-            txn.insert::<TestTable>(&1, &"one".to_string()).expect("txn insert");
-        }
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()), "published");
-        block_on(db.persist::<TestTable>()).expect("persist");
-        crash(db);
-        let db = open_group(tmp.path());
-        assert_eq!(db.get::<TestTable>(&1).expect("get"), Some("one".to_string()));
-    }
-
-    /// Removals and puts made while the committer syncs outside the lock (a bare removal, and a
-    /// transaction mixing both) land past the range it syncs and are committed whole by the next
-    /// round: after a persist and a crash every one is there.
-    #[test]
-    fn test_tndb_group_removals_during_the_unlocked_sync() {
-        let tmp = TempDir::with_prefix("tndb_group_removals").expect("temp dir");
-        let db = open_group(tmp.path());
-        for i in 0..10u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-        }
-        block_on(db.persist::<TestTable>()).expect("persist");
-
-        let (arrived, release) =
-            super::with_table(&db.store, "TestTable", |entry| entry.table.gate_next_group_commit())
-                .expect("table");
-        db.remove::<TestTable>(&1).expect("remove"); // starts a round, which pauses at its sync
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
-        db.remove::<TestTable>(&3).expect("remove during the sync");
-        let mut txn = db.write_txn().expect("txn");
-        txn.remove::<TestTable>(&2).expect("txn remove");
-        txn.insert::<TestTable>(&20, &"v20".to_string()).expect("txn insert");
-        txn.commit().expect("commit");
-        drop(release);
-        block_on(db.persist::<TestTable>()).expect("persist");
-        crash(db);
-
-        let db = open_group(tmp.path());
-        let keys: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
-        assert_eq!(keys, vec![0, 4, 5, 6, 7, 8, 9, 20]);
-    }
-
-    /// A clear (a new generation) while the committer syncs the old generation outside the lock:
-    /// the committer keeps the old generation's files mapped until its sync is done, never applies
-    /// the old sync to the new generation (whose synced watermark moves only with its own syncs),
-    /// and the table is not poisoned: the next persist succeeds and the new rows survive a crash.
-    #[test]
-    fn test_tndb_group_clear_during_the_unlocked_sync() {
-        use super::super::commit::GatePoint;
-        let tmp = TempDir::with_prefix("tndb_group_clear_sync").expect("temp dir");
-        let db = open_group(tmp.path());
-        for i in 0..50u64 {
-            db.insert::<TestTable>(&i, &format!("old-{i}")).expect("insert");
-        }
-        block_on(db.persist::<TestTable>()).expect("persist");
-        let table =
-            super::with_table(&db.store, "TestTable", |entry| entry.table.clone()).expect("table");
-        let old_data = table.log_view();
-
-        let (arrived, release) = table.gate_next_group_commit();
-        db.remove::<TestTable>(&0).expect("remove"); // starts a round, which pauses at its sync
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("committer paused");
-        db.clear_table::<TestTable>().expect("clear");
-        for i in 0..5u64 {
-            db.insert::<TestTable>(&i, &format!("new-{i}")).expect("insert");
-        }
-        db.remove::<TestTable>(&4).expect("remove");
-        // The old generation's last snapshot is gone; only the committer can keep it mapped.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        while !old_data.is_unmapped() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(!old_data.is_unmapped(), "the committer keeps the generation it syncs mapped");
-        let before = table.log_sync_state();
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        let (arrived2, release2) = group.gate_next_round(GatePoint::BeforeTake);
-        drop(release);
-        arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("next round");
-        assert_eq!(table.log_sync_state(), before, "the old sync moved the new watermark");
-        drop(release2);
-        block_on(db.persist::<TestTable>()).expect("persist: nothing poisoned");
-        crash(db);
-
-        let db = open_group(tmp.path());
-        let rows: Vec<(u64, String)> = db.iter::<TestTable>().collect();
-        let expected: Vec<(u64, String)> = (0..4u64).map(|i| (i, format!("new-{i}"))).collect();
-        assert_eq!(rows, expected);
-    }
-
-    /// After a failed commit the durable watermark stays below the failed table's writes, even
-    /// while other tables keep committing, so no persist can find them covered.
-    #[test]
-    fn test_tndb_group_failed_commit_holds_the_watermark() {
-        let tmp = TempDir::with_prefix("tndb_group_hold").expect("temp dir");
-        let db = open_group(tmp.path());
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        block_on(db.persist::<TestTable>()).expect("persist");
-
-        db.fail_next_flush_for_test::<TestTable>();
-        db.insert::<TestTable>(&2, &"b".to_string()).expect("insert");
-        let failed = group.seq.load(std::sync::atomic::Ordering::Acquire);
-        assert!(block_on(db.persist::<TestTable>()).is_err(), "the failed commit surfaces");
-        db.insert::<OtherTable>(&3, &"c".to_string()).expect("another table's write");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(300);
-        while group.durable_for_test() < failed && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        assert!(group.durable_for_test() < failed, "the watermark passed a failed write");
-    }
-
-    /// A write that fails because its table stopped is latched even with nothing pending for the
-    /// committer to find (here a clear failing after its rename, its error ignored by the
-    /// caller): the next persist fails, as after a failed commit. A caller's own error (a table
-    /// never opened) is not a failure of the database.
-    #[test]
-    fn test_tndb_group_broken_table_latches_persist() {
-        #[derive(Debug)]
-        struct NeverOpened;
-        impl tn_types::Table for NeverOpened {
-            type Key = u64;
-            type Value = String;
-
-            const NAME: &'static str = "NeverOpened";
-            const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
-        }
-
-        let tmp = TempDir::with_prefix("tndb_group_broken").expect("temp dir");
-        let db = open_group(tmp.path());
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        assert!(db.insert::<NeverOpened>(&1, &"x".to_string()).is_err(), "not opened");
-        block_on(db.persist::<TestTable>()).expect("a caller's error is not latched");
-
-        db.fail_next_clear_sync_for_test::<TestTable>();
-        let _ = db.clear_table::<TestTable>(); // ignored, as some production writes are
-        assert!(block_on(db.persist::<OtherTable>()).is_err(), "the stopped table is latched");
-    }
-
-    /// A committer that panics latches the failure: persist fails instead of waiting forever.
-    #[test]
-    fn test_tndb_group_committer_panic_fails_persist() {
-        let tmp = TempDir::with_prefix("tndb_group_panic").expect("temp dir");
-        let db = open_group(tmp.path());
-        db.group.as_ref().expect("group mode").commit.panic_next_round();
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        let persisted = block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), db.persist::<TestTable>()).await
-        });
-        assert!(matches!(persisted, Ok(Err(_))), "persist fails, not hangs: {persisted:?}");
-    }
-
-    /// A compaction cancelled by a clear is reaped at a later group commit, as at a sync-mode
-    /// commit, rather than kept until the next compaction starts or the table closes.
-    #[test]
-    fn test_tndb_group_reaps_cancelled_compactions() {
-        let tmp = TempDir::with_prefix("tndb_group_reap").expect("temp dir");
-        let db = open_group(tmp.path());
-        for i in 0..200u64 {
-            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
-        }
-        block_on(db.persist::<TestTable>()).expect("persist");
-        let table =
-            super::with_table(&db.store, "TestTable", |entry| entry.table.clone()).expect("table");
-        let gate = table.start_compaction_gated(); // waits after its copy
-        db.clear_table::<TestTable>().expect("clear"); // cancels it, still running
-        assert_eq!(table.compaction_state().cancelled, 1);
-        drop(gate); // it stops at its next check
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        let mut i = 0u64;
-        while table.compaction_state().cancelled > 0 && std::time::Instant::now() < deadline {
-            db.insert::<TestTable>(&i, &"x".to_string()).expect("insert"); // a group commit
-            block_on(db.persist::<TestTable>()).expect("persist");
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            i += 1;
-        }
-        assert_eq!(table.compaction_state().cancelled, 0, "reaped at a group commit");
-    }
-
-    /// A round's watermark held back by a table with an open transaction moves on, without that
-    /// transaction ending, to every write numbered before that table's first pending one: one more
-    /// round reads a target past the writes it committed beyond its own.
-    #[test]
-    fn test_tndb_group_watermark_reaches_a_held_tables_first_write() {
-        use super::super::commit::GatePoint;
-        let tmp = TempDir::with_prefix("tndb_group_again").expect("temp dir");
-        let db = open_group(tmp.path());
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        let mut txn = db.write_txn().expect("txn");
-        txn.insert::<TestTable>(&1, &"t".to_string()).expect("txn insert"); // TestTable held
-
-        let (arrived, release) = group.gate_next_round(GatePoint::BeforeTake);
-        db.insert::<OtherTable>(&1, &"a".to_string()).expect("insert"); // starts a round
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round paused");
-        db.insert::<OtherTable>(&2, &"b".to_string()).expect("after the round's target");
-        let rt = tokio::runtime::Builder::new_current_thread().enable_time().build().expect("rt");
-        let mut persist = Box::pin(db.persist::<OtherTable>()); // covers both OtherTable writes
-        let first = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_millis(1), &mut persist).await
-        });
-        assert!(first.is_err(), "not durable yet");
-        db.insert::<TestTable>(&2, &"bare".to_string()).expect("held back by the txn");
-        drop(release);
-        let persisted = rt.block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(2), persist).await
-        });
-        assert!(matches!(persisted, Ok(Ok(()))), "durable without the txn ending: {persisted:?}");
-        drop(txn);
-    }
-
-    /// A table's commit that panics (holding its writer lock) latches the failure: persist fails
-    /// instead of waiting forever.
-    #[test]
-    fn test_tndb_group_table_commit_panic_fails_persist() {
-        let tmp = TempDir::with_prefix("tndb_group_table_panic").expect("temp dir");
-        let db = open_group(tmp.path());
-        super::with_table(&db.store, "TestTable", |entry| entry.table.panic_next_group_commit())
-            .expect("table");
-        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
-        let persisted = block_on(async {
-            tokio::time::timeout(std::time::Duration::from_secs(5), db.persist::<TestTable>()).await
-        });
-        assert!(matches!(persisted, Ok(Err(_))), "persist fails, not hangs: {persisted:?}");
-    }
-
-    /// Writers on several threads, each persisting now and then: after a crash every write made
-    /// before a thread's last successful persist is there.
-    #[test]
-    fn test_tndb_group_concurrent_writers_keep_persisted_writes() {
-        let tmp = TempDir::with_prefix("tndb_group_threads").expect("temp dir");
-        let db = open_group(tmp.path());
-        std::thread::scope(|s| {
-            for t in 0..4u64 {
-                let db = db.clone();
-                s.spawn(move || {
-                    for i in 0..400u64 {
-                        let key = t * 1_000 + i;
-                        if t % 2 == 0 {
-                            db.insert::<TestTable>(&key, &format!("{key}")).expect("insert");
-                        } else {
-                            db.insert::<OtherTable>(&key, &format!("{key}")).expect("insert");
-                        }
-                        if i % 50 == 49 {
-                            block_on(db.persist::<TestTable>()).expect("persist");
-                        }
-                    }
-                });
-            }
-        });
-        crash(db);
-        let db = open_group(tmp.path());
-        assert_eq!(db.iter::<TestTable>().count(), 800);
-        assert_eq!(db.iter::<OtherTable>().count(), 800);
-    }
-
-    /// Random bare writes, transactions (committed or dropped), clears, persists and crashes: after
-    /// a crash the table is exactly one of the states it passed through since the last persist
-    /// (a transaction is never half there), and never older than that persist.
-    #[test]
-    fn test_tndb_group_random_crashes_against_model() {
-        use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
-
-        let tmp = TempDir::with_prefix("tndb_group_random").expect("temp dir");
-        let mut rng = StdRng::seed_from_u64(0x06C0_4417);
-        let mut db = open_group(tmp.path());
-        let mut model: BTreeMap<u64, String> = BTreeMap::new();
-        // Every state since the last persist, the persisted one first.
-        let mut states = vec![model.clone()];
-        for step in 0..600 {
-            match rng.random_range(0..100) {
-                0..40 => {
-                    let k = rng.random_range(0..64);
-                    let v = format!("s{step}");
-                    db.insert::<TestTable>(&k, &v).expect("insert");
-                    model.insert(k, v);
-                    states.push(model.clone());
-                }
-                40..55 => {
-                    let k = rng.random_range(0..64);
-                    db.remove::<TestTable>(&k).expect("remove");
-                    model.remove(&k);
-                    states.push(model.clone());
-                }
-                55..70 => {
-                    let mut txn = db.write_txn().expect("txn");
-                    for _ in 0..rng.random_range(1..5) {
-                        let k = rng.random_range(0..64);
-                        if rng.random_bool(0.3) {
-                            txn.remove::<TestTable>(&k).expect("txn remove");
-                            model.remove(&k);
-                        } else {
-                            let v = format!("t{step}");
-                            txn.insert::<TestTable>(&k, &v).expect("txn insert");
-                            model.insert(k, v);
-                        }
-                    }
-                    if rng.random_bool(0.8) {
-                        txn.commit().expect("commit");
-                    } // else dropped: ends the same way
-                    states.push(model.clone());
-                }
-                70..72 => {
-                    db.clear_table::<TestTable>().expect("clear");
-                    model.clear();
-                    states.push(model.clone());
-                }
-                72..90 => {
-                    block_on(db.persist::<TestTable>()).expect("persist");
-                    states = vec![model.clone()];
-                }
-                _ => {
-                    crash(db);
-                    db = open_group(tmp.path());
-                    let found: BTreeMap<u64, String> = db.iter::<TestTable>().collect();
-                    assert!(
-                        states.contains(&found),
-                        "step {step}: the reopened table is not a state since the last persist"
-                    );
-                    model = found;
-                    states = vec![model.clone()];
-                }
-            }
-        }
-    }
-
-    /// The automatic compaction starts, and switches in, while writes never stop (writers on
-    /// several threads keep a table busy through every committer round), and the rows survive a
-    /// crash.
-    #[test]
-    fn test_tndb_group_compacts_under_continuous_writes() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        let tmp = TempDir::with_prefix("tndb_group_busy_compact").expect("temp dir");
-        let options = super::TnDbOptions {
-            compaction: super::CompactionConfig {
-                auto_min_bytes: Some(256 << 10),
-                bytes_per_sec: 0,
-            },
-            commit: super::CommitMode::Group,
-        };
-        let db = TnDatabase::open_with(tmp.path(), options).expect("open tndb");
-        db.open_table::<TestTable>().expect("open table");
-        let table_dir = tmp.path().join("TestTable");
-        let stop = AtomicBool::new(false);
-        let compacted = std::thread::scope(|s| {
-            for t in 0..3u64 {
-                let (db, stop) = (db.clone(), &stop);
-                s.spawn(move || {
-                    let value = "x".repeat(200);
-                    let mut i = 0u64;
-                    while !stop.load(Ordering::Relaxed) {
-                        // A sliding window per writer: insert the next key, remove an old one.
-                        let key = t * 1_000_000 + i;
-                        db.insert::<TestTable>(&key, &format!("{i}{value}")).expect("insert");
-                        if i >= 100 {
-                            db.remove::<TestTable>(&(key - 100)).expect("remove");
-                        }
-                        i += 1;
-                    }
-                });
-            }
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-            let compacted = loop {
-                if super::super::layout::list_gens(&table_dir).expect("list").last() > Some(&0) {
-                    break true;
-                }
-                if std::time::Instant::now() > deadline {
-                    break false;
-                }
-                std::thread::sleep(std::time::Duration::from_millis(5));
-            };
-            stop.store(true, Ordering::Relaxed);
-            compacted
-        });
-        assert!(compacted, "a compaction switched in while the writers ran");
-        block_on(db.persist::<TestTable>()).expect("persist");
-        let rows: Vec<_> = db.iter::<TestTable>().collect();
-        assert_eq!(rows.len(), 300, "each writer's window");
-        crash(db);
-        let options = super::TnDbOptions { commit: super::CommitMode::Group, ..Default::default() };
-        let db = TnDatabase::open_with(tmp.path(), options).expect("reopen");
-        db.open_table::<TestTable>().expect("open table");
-        assert_eq!(db.iter::<TestTable>().collect::<Vec<_>>(), rows);
-    }
-
-    /// A finished compaction switches in at the next commit record even when that round does not
-    /// end idle (a write lands while it syncs): it does not wait for a quiet round.
-    #[test]
-    fn test_tndb_group_compaction_switches_in_a_busy_round() {
-        let tmp = TempDir::with_prefix("tndb_group_busy_switch").expect("temp dir");
-        let db = open_group(tmp.path());
-        for round in 0..3u64 {
-            for i in 0..200u64 {
-                db.insert::<TestTable>(&i, &format!("{round}-{i}")).expect("insert");
-            }
-        }
-        block_on(db.persist::<TestTable>()).expect("persist");
-        let table =
-            super::with_table(&db.store, "TestTable", |entry| entry.table.clone()).expect("table");
-        drop(table.start_compaction_gated()); // runs to completion
-        table.wait_compaction_thread();
-
-        let (arrived, release) = table.gate_next_group_commit();
-        db.insert::<TestTable>(&1_000, &"a".to_string()).expect("insert"); // starts a round
-        arrived.recv_timeout(std::time::Duration::from_secs(10)).expect("round at its commit");
-        db.insert::<TestTable>(&1_001, &"b".to_string()).expect("a write during the sync");
-        let group = std::sync::Arc::clone(&db.group.as_ref().expect("group mode").commit);
-        let (arrived2, release2) =
-            group.gate_next_round(super::super::commit::GatePoint::BeforeTake);
-        drop(release);
-        arrived2.recv_timeout(std::time::Duration::from_secs(10)).expect("next round");
-        assert_eq!(
-            super::super::layout::list_gens(&tmp.path().join("TestTable")).expect("list").last(),
-            Some(&1),
-            "the busy round switched to the compacted generation"
-        );
-        drop(release2);
-        block_on(db.persist::<TestTable>()).expect("persist");
-        let rows: Vec<_> = db.iter::<TestTable>().collect();
-        assert_eq!(rows.len(), 202);
-        crash(db);
-        let db = open_group(tmp.path());
-        assert_eq!(db.iter::<TestTable>().collect::<Vec<_>>(), rows);
-    }
-
-    /// Compaction works in group mode: the switch happens at a commit, and the rows survive a
-    /// crash after the next persist.
-    #[test]
-    fn test_tndb_group_compaction() {
-        let tmp = TempDir::with_prefix("tndb_group_compact").expect("temp dir");
-        let db = open_group(tmp.path());
-        for round in 0..3u64 {
-            for i in 0..300u64 {
-                db.insert::<TestTable>(&i, &format!("{round}-{i}")).expect("insert");
-            }
-        }
-        block_on(db.persist::<TestTable>()).expect("persist");
-        db.compact_table_now::<TestTable>().expect("compact");
-        db.insert::<TestTable>(&1_000, &"after".to_string()).expect("insert");
-        block_on(db.persist::<TestTable>()).expect("persist");
-        crash(db);
-        let db = open_group(tmp.path());
-        assert_eq!(db.iter::<TestTable>().count(), 301);
-        assert_eq!(db.get::<TestTable>(&5).expect("get"), Some("2-5".to_string()));
     }
 }

@@ -50,14 +50,18 @@
 //!   full-memory layer loading every row.
 //! - `workload_compaction`: a long-lived table under churn (a sliding window of single inserts and
 //!   removes, plus overwrites), tndb with its compaction off and on: what compaction saves on disk
-//!   and what it costs the writer (step latency, including the switch at a commit).
+//!   and what it costs the writer (step latency, including the switch).
+//! - `workload_mixed` / `workload_mixed_compaction`: consensus beside a batch stream in the same
+//!   database, and what compaction costs consensus there (interleaved pairs).
 //!
 //! ## Columns
 //!
-//! `MemDb` (no disk; the floor), `TnDb`, `MDBX-prod` (production `Durable` sync and geometry; not
-//! in the consensus workload, see the caveats) and each of the two disk backends behind a
-//! `LayeredDatabase`: full-memory (`Layered<_>`, the epoch
-//! layer) or cache-mode (`Layered-cache<_>`, the batch cache), as production configures them.
+//! `MemDb` (no disk; the floor); tndb: `TnDb` (each write durable when it returns),
+//! `TnDb-group` (group commit) and `Split<TnDb-group>` (one log per production environment, as
+//! the `tndb` feature opens it); `MDBX-prod` (production `Durable` sync and geometry; not in the
+//! consensus workload, see the caveats); and MDBX behind a `LayeredDatabase`: full-memory
+//! (`Layered<_>`, the epoch layer) or cache-mode (`Layered-cache<_>`, the batch cache), as
+//! production configures them. `TN_BENCH_COLUMNS` (comma separated) runs only the named columns.
 //!
 //! ## Caveats
 //!
@@ -99,66 +103,22 @@ use crate::{
 use crate::{
     layered_db::LayeredDatabase,
     mem_db::MemDatabase,
-    tndb::{group_stats, CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
-    tnlog::{stats as tnlog_stats, SplitDatabase, TnLogDatabase, TnLogOptions},
+    tndb::{
+        stats as tndb_stats, CommitMode, CompactionConfig, SplitDatabase, TnDatabase, TnDbOptions,
+    },
     ROUNDS_TO_KEEP,
 };
 
-/// Open tndb at `dir` in group-commit mode (writes return at once; `persist` waits for the
-/// committer), compacting as `compaction` says.
-fn open_tndb_group(dir: &Path, compaction: CompactionConfig) -> TnDatabase {
-    TnDatabase::open_with(dir, TnDbOptions { compaction, commit: CommitMode::Group })
-        .expect("open tndb")
+/// Open tndb (one shared log) at `dir`, committing as `commit` says.
+fn open_tndb(dir: &Path, commit: CommitMode) -> TnDatabase {
+    TnDatabase::open_with(dir, TnDbOptions { commit, ..Default::default() }).expect("open tndb")
 }
 
-/// Run the `TnDb-group` column at `dir`, then print what its committer did: rounds, and the
-/// syncs per round (data log and removal log) with their average time (see `tndb::group_stats`).
-fn group_column<W: Workload>(
-    rt: &Runtime,
-    w: &mut W,
-    dir: &Path,
-    compaction: CompactionConfig,
-) -> Column {
-    let _ = group_stats::take();
-    let col = column(rt, w, "TnDb-group".to_string(), open_tndb_group(dir, compaction), Some(dir));
-    let s = group_stats::take();
-    let rounds = s.rounds.max(1) as f64;
-    let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
-    let round_ns = s.round_ns.max(1) as f64;
-    println!(
-        "  TnDb-group committer: {} rounds (avg {:.0} us); per round {:.2} syncs (avg {:.0} us); \
-         of round time: syncs {:.0}%, lock waits {:.0}% ({:.1}/round, avg {:.1} us), locked steps \
-         {:.0}% ({:.1}/round, avg {:.1} us)",
-        s.rounds,
-        avg_us(s.round_ns, s.rounds),
-        s.data_syncs as f64 / rounds,
-        avg_us(s.data_sync_ns, s.data_syncs),
-        100.0 * s.data_sync_ns as f64 / round_ns,
-        100.0 * s.lock_wait_ns as f64 / round_ns,
-        s.lock_waits as f64 / rounds,
-        avg_us(s.lock_wait_ns, s.lock_waits),
-        100.0 * s.lock_hold_ns as f64 / round_ns,
-        s.lock_holds as f64 / rounds,
-        avg_us(s.lock_hold_ns, s.lock_holds),
-    );
-    col
-}
-
-/// Open tnlog (one shared log) at `dir`, committing as `commit` says.
-fn open_tnlog(dir: &Path, commit: CommitMode) -> TnLogDatabase {
-    TnLogDatabase::open_with(dir, TnLogOptions { commit, ..Default::default() })
-        .expect("open tnlog")
-}
-
-/// Open tnlog as production would run it: a [`SplitDatabase`], one shared log per production
+/// Open tndb as production would run it: a [`SplitDatabase`], one shared log per production
 /// environment (epoch, kad, cache) as `open_db` splits MDBX, with no layer in between, so the batch
 /// caches never share a write lock with consensus.
-fn open_split_tnlog(
-    root: &Path,
-    commit: CommitMode,
-    compaction: CompactionConfig,
-) -> SplitDatabase {
-    SplitDatabase::open_with(root, TnLogOptions { commit, compaction }).expect("open split tnlog")
+fn open_split_tndb(root: &Path, commit: CommitMode, compaction: CompactionConfig) -> SplitDatabase {
+    SplitDatabase::open_with(root, TnDbOptions { commit, compaction }).expect("open split tndb")
 }
 
 /// The node's consensus DB as production opens it today: `open_db`'s
@@ -177,31 +137,31 @@ fn open_composite_mdbx_prod(root: &Path) -> CompositeDatabase<MdbxDatabase> {
     )
 }
 
-/// Run a tnlog column at `dir`, then print its commit thread's syncs and its write lock's waits
-/// and holds (see `tnlog::stats`).
-fn tnlog_column<W: Workload>(
+/// Run a tndb column at `dir`, then print its commit thread's syncs and its write lock's waits
+/// and holds (see `tndb::stats`).
+fn tndb_column<W: Workload>(
     rt: &Runtime,
     w: &mut W,
     dir: &Path,
     commit: CommitMode,
     name: &str,
 ) -> Column {
-    tnlog_stats_column(rt, w, name, open_tnlog(dir, commit), dir)
+    tndb_stats_column(rt, w, name, open_tndb(dir, commit), dir)
 }
 
-/// [`column`] for a tnlog-backed `db` at `dir`, then print what its logs' sync rounds and write
+/// [`column`] for a tndb-backed `db` at `dir`, then print what its logs' sync rounds and write
 /// locks did (summed over every log it has).
-fn tnlog_stats_column<W: Workload, DB: Database>(
+fn tndb_stats_column<W: Workload, DB: Database>(
     rt: &Runtime,
     w: &mut W,
     name: &str,
     db: DB,
     dir: &Path,
 ) -> Column {
-    let _ = tnlog_stats::take();
-    let _ = tnlog_stats::take_logs();
+    let _ = tndb_stats::take();
+    let _ = tndb_stats::take_logs();
     let col = column(rt, w, name.to_string(), db, Some(dir));
-    let s = tnlog_stats::take();
+    let s = tndb_stats::take();
     let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
     println!(
         "  {name}: {} syncs (avg {:.0} us); write lock: {} waits (avg {:.1} us), holds avg {:.1} \
@@ -229,7 +189,7 @@ fn tnlog_stats_column<W: Workload, DB: Database>(
     if s.cancelled > 0 {
         println!("  {name}: {} compactions cancelled by a close", s.cancelled);
     }
-    for log in tnlog_stats::take_logs() {
+    for log in tndb_stats::take_logs() {
         println!(
             "    [{}] {} syncs (avg {:.0} us); write-lock hold max {:.1} ms; {} compactions \
              (switch hold avg {:.1} ms, max {:.1} ms); {} abandoned, {} cancelled",
@@ -483,8 +443,8 @@ impl Cell {
 /// One report column: a backend name and its cells, one per row.
 type Column = (String, Vec<Cell>);
 
-/// The reference column: shown for scale, left out of the coloring (the comparison is tndb
-/// against MDBX).
+/// The reference column: shown for scale, left out of the coloring (the comparison is among the
+/// disk backends).
 const REFERENCE: &str = "MemDb";
 
 const GREEN: &str = "\x1b[32m";
@@ -631,25 +591,17 @@ fn run_backends<W: Workload>(
     layer: Layer,
     raw_mdbx: bool,
 ) -> Vec<Column> {
-    let full_memory = layer == Layer::FullMemory;
-    let layered = if full_memory { "Layered" } else { "Layered-cache" };
     let mut cols = vec![column(rt, w, "MemDb".to_string(), MemDatabase::new(), None)];
-
-    let dir = base.join("tndb");
-    let db = TnDatabase::open(&dir).expect("open tndb");
-    cols.push(column(rt, w, "TnDb".to_string(), db, Some(&dir)));
-    cols.push(group_column(rt, w, &base.join("tndb_group"), CompactionConfig::default()));
-    cols.push(tnlog_column(rt, w, &base.join("tnlog"), CommitMode::Sync, "TnLog"));
-    cols.push(tnlog_column(rt, w, &base.join("tnlog_group"), CommitMode::Group, "TnLog-group"));
-    let root = base.join("split_tnlog");
-    let db = open_split_tnlog(&root, CommitMode::Group, CompactionConfig::default());
-    cols.push(tnlog_stats_column(rt, w, "Split<TnLog-group>", db, &root));
-    let dir = base.join("tndb_layered");
-    let db = LayeredDatabase::open(TnDatabase::open(&dir).expect("open tndb"), full_memory);
-    cols.push(column(rt, w, format!("{layered}<TnDb>"), db, Some(&dir)));
+    cols.push(tndb_column(rt, w, &base.join("tndb"), CommitMode::Sync, "TnDb"));
+    cols.push(tndb_column(rt, w, &base.join("tndb_group"), CommitMode::Group, "TnDb-group"));
+    let root = base.join("split_tndb");
+    let db = open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
+    cols.push(tndb_stats_column(rt, w, "Split<TnDb-group>", db, &root));
 
     #[cfg(feature = "reth-libmdbx")]
     {
+        let full_memory = layer == Layer::FullMemory;
+        let layered = if full_memory { "Layered" } else { "Layered-cache" };
         // The production geometry of the environment that layer mode stands for.
         let (tables, max_size, growth) = match layer {
             Layer::FullMemory => (8, PROD_EPOCH_MAX, PROD_GROWTH),
@@ -938,8 +890,8 @@ fn workload_consensus_rounds() {
 const MIXED_WINDOW: u64 = 64;
 
 /// Consensus rounds while a batch writer streams large batches into the batch cache of the same
-/// database, as on a production node: in tnlog every table shares one log and one write lock, so
-/// a large batch append can hold up a vote; tndb has a writer per table.
+/// database, as on a production node: the tables of one tndb log share its write lock, so a large
+/// batch append can hold up a vote unless the batch cache has a log of its own (`SplitDatabase`).
 struct MixedRounds {
     consensus: ConsensusRounds,
     /// Each batch's size.
@@ -1000,8 +952,8 @@ impl Workload for MixedRounds {
 
 /// Consensus rounds (N=50) while a batch writer streams large batches into the same database:
 /// 256 KB batches as fast as the database takes them (the worst case), and 1 MB batches at 25 a
-/// second (a busy node). Group mode only: tndb (a writer per table) against tnlog (one shared
-/// write lock).
+/// second (a busy node). Group mode only: one shared log (`TnDb-group`) against one log per
+/// environment (`Split`), with its compaction off and on.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test --release -p tn-storage workload_mixed -- --ignored --nocapture --test-threads 1`.
@@ -1017,23 +969,20 @@ fn workload_mixed() {
             rate,
         };
         // No in-memory column: an unpaced batch writer would fill RAM.
-        let mut cols = vec![
-            group_column(&rt, &mut w, &tmp.path().join("tndb_group"), CompactionConfig::default()),
-            tnlog_column(
-                &rt,
-                &mut w,
-                &tmp.path().join("tnlog_group"),
-                CommitMode::Group,
-                "TnLog-group",
-            ),
-        ];
+        let mut cols = vec![tndb_column(
+            &rt,
+            &mut w,
+            &tmp.path().join("tndb_group"),
+            CommitMode::Group,
+            "TnDb-group",
+        )];
         let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
-        let root = tmp.path().join("split_tnlog_nocompact");
-        let db = open_split_tnlog(&root, CommitMode::Group, off);
-        cols.push(tnlog_stats_column(&rt, &mut w, "Split-nocompact", db, &root));
-        let root = tmp.path().join("split_tnlog");
-        let db = open_split_tnlog(&root, CommitMode::Group, CompactionConfig::default());
-        cols.push(tnlog_stats_column(&rt, &mut w, "Split<TnLog-group>", db, &root));
+        let root = tmp.path().join("split_tndb_nocompact");
+        let db = open_split_tndb(&root, CommitMode::Group, off);
+        cols.push(tndb_stats_column(&rt, &mut w, "Split-nocompact", db, &root));
+        let root = tmp.path().join("split_tndb");
+        let db = open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
+        cols.push(tndb_stats_column(&rt, &mut w, "Split<TnDb-group>", db, &root));
         // Production today, for scale: beside the paced stream only. Its cache layer queues
         // writes unbounded, and beside the unpaced one that queue held 39 GB (resident; an
         // 86 GB footprint) on a Mac, enough to take a smaller machine down.
@@ -1106,8 +1055,8 @@ fn workload_mixed_compaction() {
             };
             let root = tmp.path().join("split");
             let name = if on { "Split" } else { "Split-nocompact" };
-            let db = open_split_tnlog(&root, CommitMode::Group, config);
-            let col = tnlog_stats_column(&rt, &mut w, name, db, &root);
+            let db = open_split_tndb(&root, CommitMode::Group, config);
+            let col = tndb_stats_column(&rt, &mut w, name, db, &root);
             measured[usize::from(on)] =
                 (value(&col, "vote durable p99 us"), value(&col, "ms / round"));
         }
@@ -1440,49 +1389,30 @@ fn reload<DB: Database>(
 fn workload_startup_reload() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut cols = Vec::new();
-    cols.extend(reload(
-        "TnDb",
-        &tmp.path().join("tndb"),
-        |dir| TnDatabase::open(dir).expect("open tndb"),
-        // A leaked handle with its table locks released, as after a crashed process.
-        Some(|db: TnDatabase| {
-            db.release_locks_for_crash();
-            std::mem::forget(db);
-        }),
-    ));
-    // Group commit: the raw column only (no layer goes over it).
-    let [group, _] = reload(
-        "TnDb-group",
-        &tmp.path().join("tndb_group"),
-        |dir| open_tndb_group(dir, CompactionConfig::default()),
-        Some(|db: TnDatabase| {
-            db.release_locks_for_crash();
-            std::mem::forget(db);
-        }),
-    );
-    cols.push(group);
-    let crash_tnlog = |db: TnLogDatabase| {
+    // A leaked handle with its lock released, as after a crashed process. The raw columns only
+    // (no layer goes over tndb).
+    let crash_tndb = |db: TnDatabase| {
         db.release_locks_for_crash();
         std::mem::forget(db);
     };
-    let [tnlog, _] = reload(
-        "TnLog",
-        &tmp.path().join("tnlog"),
-        |dir| open_tnlog(dir, CommitMode::Sync),
-        Some(crash_tnlog),
+    let [tndb, _] = reload(
+        "TnDb",
+        &tmp.path().join("tndb"),
+        |dir| open_tndb(dir, CommitMode::Sync),
+        Some(crash_tndb),
     );
-    cols.push(tnlog);
-    let [tnlog_group, _] = reload(
-        "TnLog-group",
-        &tmp.path().join("tnlog_group"),
-        |dir| open_tnlog(dir, CommitMode::Group),
-        Some(crash_tnlog),
+    cols.push(tndb);
+    let [tndb_group, _] = reload(
+        "TnDb-group",
+        &tmp.path().join("tndb_group"),
+        |dir| open_tndb(dir, CommitMode::Group),
+        Some(crash_tndb),
     );
-    cols.push(tnlog_group);
+    cols.push(tndb_group);
     let [composite, _] = reload(
-        "Split<TnLog-group>",
-        &tmp.path().join("split_tnlog"),
-        |dir| open_split_tnlog(dir, CommitMode::Group, CompactionConfig::default()),
+        "Split<TnDb-group>",
+        &tmp.path().join("split_tndb"),
+        |dir| open_split_tndb(dir, CommitMode::Group, CompactionConfig::default()),
         None,
     );
     cols.push(composite);
@@ -1558,17 +1488,14 @@ fn print_files(dir: &Path) {
 /// A long-lived table under churn: single (autocommit) inserts, removes and overwrites.
 struct ChurnWorkload;
 
-/// The compactions a tndb table (or a tnlog database) has switched to: its generation number (the
-/// workload never clears), or `None` for another backend.
+/// The compactions a tndb database has switched to: its generation number (the workload never
+/// clears), or `None` for another backend.
 fn compactions_in(dir: &Path) -> Option<usize> {
-    let max_gen = |dir: &Path| {
-        std::fs::read_dir(dir)
-            .ok()?
-            .flatten()
-            .filter_map(|entry| entry.file_name().to_str()?.strip_prefix("gen-")?.parse().ok())
-            .max()
-    };
-    max_gen(&dir.join(Churn::NAME)).or_else(|| max_gen(dir))
+    std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str()?.strip_prefix("gen-")?.parse().ok())
+        .max()
 }
 
 impl Workload for ChurnWorkload {
@@ -1641,9 +1568,9 @@ impl Workload for ChurnWorkload {
     }
 }
 
-/// A long-lived table under churn, tndb with its compaction off and on (default config: at 64 MiB
-/// of log and half its puts dead, copied at 64 MiB/s), raw and behind the cache-mode layer, with
-/// MDBX (which reuses freed pages) for scale.
+/// A long-lived table under churn, tndb (group commit) with its compaction off and on (default
+/// config: from 64 MiB of log once it has doubled since the last compaction, copied at 64 MiB/s),
+/// with MDBX (which reuses freed pages), raw and behind the cache-mode layer, for scale.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
 /// `cargo test --release -p tn-storage workload_compaction -- --ignored --nocapture
@@ -1655,34 +1582,19 @@ fn workload_compaction() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut w = ChurnWorkload;
     let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
-    let on = CompactionConfig::default();
-    let tndb = |name: &str, config| {
-        let dir = tmp.path().join(name);
-        (TnDatabase::open_with_compaction(&dir, config).expect("open tndb"), dir)
-    };
     let mut cols = Vec::new();
-    for (name, config) in [("TnDb-nocompact", off), ("TnDb", on)] {
-        let (db, dir) = tndb(name, config);
-        cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
-    }
-    cols.push(group_column(&rt, &mut w, &tmp.path().join("TnDb-group"), on));
-    let dir = tmp.path().join("TnLog-group-nocompact");
+    let dir = tmp.path().join("TnDb-group-nocompact");
     let db =
-        TnLogDatabase::open_with(&dir, TnLogOptions { commit: CommitMode::Group, compaction: off })
-            .expect("open tnlog");
-    cols.push(tnlog_stats_column(&rt, &mut w, "TnLog-group-nocompact", db, &dir));
-    cols.push(tnlog_column(
+        TnDatabase::open_with(&dir, TnDbOptions { commit: CommitMode::Group, compaction: off })
+            .expect("open tndb");
+    cols.push(tndb_stats_column(&rt, &mut w, "TnDb-group-nocompact", db, &dir));
+    cols.push(tndb_column(
         &rt,
         &mut w,
-        &tmp.path().join("TnLog-group"),
+        &tmp.path().join("TnDb-group"),
         CommitMode::Group,
-        "TnLog-group",
+        "TnDb-group",
     ));
-    for (name, config) in [("Layered-cache<TnDb-nocompact>", off), ("Layered-cache<TnDb>", on)] {
-        let (db, dir) = tndb(name, config);
-        let db = LayeredDatabase::open(db, false);
-        cols.push(column(&rt, &mut w, name.to_string(), db, Some(&dir)));
-    }
     #[cfg(feature = "reth-libmdbx")]
     {
         let dir = tmp.path().join("mdbx_prod");
@@ -1709,9 +1621,10 @@ fn workload_compaction() {
     );
 }
 
-/// How this machine's file system overlaps the `msync`s of different files (what a committer
-/// round syncing several tables at once could gain): `k` files, each with ~100 B appended per
-/// iteration, synced one after another, then on `k` threads at once; p50 per iteration of 300.
+/// How this machine's file system overlaps the `msync`s of different files (what syncing several
+/// logs at once could gain, e.g. a `SplitDatabase`'s): `k` files, each with ~100 B appended per
+/// iteration and committed (an `msync` of the new bytes) one after another, then on `k` threads
+/// at once; p50 per iteration of 300.
 ///
 /// On-demand probe (kept out of the default suite). Run with:
 /// `cargo test --release -p tn-storage msync_concurrency_probe -- --ignored --nocapture`.
@@ -1750,44 +1663,37 @@ fn msync_concurrency_probe() {
         let mut parallel = Vec::with_capacity(ITERATIONS);
         for _ in 0..ITERATIONS {
             for (times, at_once) in [(&mut serial, false), (&mut parallel, true)] {
-                let tickets: Vec<_> = packs
-                    .iter_mut()
-                    .map(|pack| {
-                        pack.append_raw(&record).expect("append");
-                        pack.sync_ticket().expect("ticket")
-                    })
-                    .collect();
-                let outcomes: Vec<_> = if at_once {
+                for pack in &mut packs {
+                    pack.append_raw(&record).expect("append");
+                }
+                if at_once {
                     // Timed from the threads' common release to the last one's end, so the
                     // threads' start-up is not counted.
                     let release = std::sync::Barrier::new(k);
                     let timed: Vec<_> = std::thread::scope(|s| {
-                        let handles: Vec<_> = tickets
-                            .iter()
-                            .map(|ticket| {
+                        let handles: Vec<_> = packs
+                            .iter_mut()
+                            .map(|pack| {
                                 let release = &release;
                                 s.spawn(move || {
                                     release.wait();
                                     let start = Instant::now();
-                                    let outcome = ticket.sync();
-                                    (start, Instant::now(), outcome)
+                                    pack.commit().expect("sync");
+                                    (start, Instant::now())
                                 })
                             })
                             .collect();
                         handles.into_iter().map(|h| h.join().expect("sync thread")).collect()
                     });
-                    let first = timed.iter().map(|(start, ..)| *start).min().expect("k > 0");
-                    let last = timed.iter().map(|(_, end, _)| *end).max().expect("k > 0");
+                    let first = timed.iter().map(|(start, _)| *start).min().expect("k > 0");
+                    let last = timed.iter().map(|(_, end)| *end).max().expect("k > 0");
                     times.push(last - first);
-                    timed.into_iter().map(|(.., outcome)| outcome).collect()
                 } else {
                     let start = Instant::now();
-                    let outcomes = tickets.iter().map(|ticket| ticket.sync()).collect();
+                    for pack in &packs {
+                        pack.commit().expect("sync");
+                    }
                     times.push(start.elapsed());
-                    outcomes
-                };
-                for ((pack, ticket), outcome) in packs.iter_mut().zip(&tickets).zip(&outcomes) {
-                    pack.complete_sync(ticket, outcome).expect("synced");
                 }
             }
         }

@@ -62,20 +62,20 @@ pub(super) fn parse(
     ksize: impl Fn(TableId) -> Option<u16>,
 ) -> eyre::Result<Record<'_>> {
     let Some((head, body)) = payload.split_at_checked(HEAD) else {
-        bail!("tnlog: a record shorter than its head");
+        bail!("tndb: a record shorter than its head");
     };
     let (kind, end) = (head[0] & KIND_MASK, head[0] & BATCH_END != 0);
     let table = u16::from_le_bytes([head[1], head[2]]);
-    let Some(ksize) = ksize(table) else { bail!("tnlog: a record of unknown table {table}") };
+    let Some(ksize) = ksize(table) else { bail!("tndb: a record of unknown table {table}") };
     let ksize = ksize as usize;
     let op = match kind {
         KIND_PUT if ksize > 0 && body.len() >= ksize => Op::Put(&body[..ksize]),
         KIND_REMOVE if ksize > 0 && body.len() == ksize => Op::Remove(body),
         KIND_CLEAR if body.is_empty() => Op::Clear,
         KIND_PUT | KIND_REMOVE | KIND_CLEAR => {
-            bail!("tnlog: a malformed record of kind {kind} for table {table}")
+            bail!("tndb: a malformed record of kind {kind} for table {table}")
         }
-        other => bail!("tnlog: a record of unknown kind {other}"),
+        other => bail!("tndb: a record of unknown kind {other}"),
     };
     Ok(Record { table, op, end })
 }
@@ -106,7 +106,7 @@ mod test {
 
     /// `put_value` returns the value only for the indexed table's put of the asked key.
     #[test]
-    fn test_tnlog_record_put_value_checks_the_row() {
+    fn test_tndb_record_put_value_checks_the_row() {
         let mut put = head(KIND_PUT, 2, true).to_vec();
         put.extend_from_slice(b"keyXvalue");
         assert_eq!(put_value(&put, 2, b"keyX").expect("the row"), b"value");
@@ -122,7 +122,7 @@ mod test {
     }
 
     #[test]
-    fn test_tnlog_record_parse() {
+    fn test_tndb_record_parse() {
         let ksize = |table| (table < 3).then_some(4);
         let mut put = head(KIND_PUT, 2, true).to_vec();
         put.extend_from_slice(b"keyXvalue");

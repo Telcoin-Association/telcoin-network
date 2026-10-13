@@ -19,8 +19,9 @@
 //! - `pack-hdx` — the memory-mapped (`msync`) pack KV: append-only data log keyed by the mmap
 //!   `HdxIndex`.
 //! - `pack-btree` — the same log keyed by `BtreeIndex`.
-//! - `tndb` — the pack-file-backed [`Database`](crate::tndb::TnDatabase): an append-log of values
-//!   keyed by a `BtreeIndex`, driven through the typed table API.
+//! - `tndb` / `tndb-group` — the pack-file-backed [`Database`](crate::tndb::TnDatabase): one shared
+//!   append-log of records, each table keyed by a `BtreeIndex`, driven through the typed table API
+//!   (`tndb` waits for the sync per write, `tndb-group` at a `persist`).
 //! - `mem` — the in-memory [`MemDatabase`](crate::mem_db::MemDatabase) baseline: a sorted
 //!   `BTreeMap`, no disk.
 //! - `mdbx-durable` — MDBX with real fsync-on-commit (`SyncMode::Durable`, chosen by the bench at
@@ -73,8 +74,7 @@ use crate::{
         pack::{Pack, PackCompression},
     },
     mem_db::MemDatabase,
-    tndb::TnDatabase,
-    tnlog::{TnLogDatabase, TnLogOptions},
+    tndb::{CommitMode, TnDatabase, TnDbOptions},
 };
 
 #[cfg(feature = "reth-libmdbx")]
@@ -289,124 +289,20 @@ impl Table for KvTable {
     const HINT: TableHint = TableHint::Epoch;
 }
 
-// ---- tndb KV: the pack-file-backed `Database` (append-log values + sorted B+tree index) ----
-
-struct TnKv {
-    db: TnDatabase,
-}
-
-impl TnKv {
-    fn open(dir: &Path) -> Self {
-        let db = TnDatabase::open(dir).expect("open tndb");
-        db.open_table::<KvTable>().expect("open table");
-        Self { db }
-    }
-}
-
-impl KvStore for TnKv {
-    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
-        let mut txn = self.db.write_txn().expect("write_txn");
-        for (k, v) in items {
-            txn.insert::<KvTable>(k, v).expect("insert");
-        }
-        txn.commit().expect("commit"); // durably syncs the value log + the index
-    }
-
-    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
-        for (k, v) in items {
-            let mut txn = self.db.write_txn().expect("write_txn");
-            txn.insert::<KvTable>(k, v).expect("insert");
-            txn.commit().expect("commit");
-        }
-    }
-
-    fn read_rand(&mut self, keys: &[B256]) -> usize {
-        let txn = self.db.read_txn().expect("read_txn");
-        let mut hits = 0;
-        for k in keys {
-            if txn.get::<KvTable>(k).expect("get").is_some() {
-                hits += 1;
-            }
-        }
-        hits
-    }
-}
-
-impl SortedKvStore for TnKv {
-    fn scan_all(&mut self) -> usize {
-        // The B+tree index yields keys in order; `iter` fetches each value from the log.
-        self.db.iter::<KvTable>().count()
-    }
-
-    fn range_scan(&mut self, lo: B256, hi: B256) -> usize {
-        // `skip_to` seeks to the first key >= lo; take while below hi for a `[lo, hi)` scan.
-        self.db.skip_to::<KvTable>(&lo).expect("skip_to").take_while(|(k, _)| *k < hi).count()
-    }
-}
-
-// ---- tndb in group-commit mode: writes return at once, `persist` is the durability barrier ----
-
-struct TnGroupKv {
-    db: TnDatabase,
-    rt: tokio::runtime::Runtime,
-}
-
-impl TnGroupKv {
-    fn open(dir: &Path) -> Self {
-        let options = crate::tndb::TnDbOptions {
-            commit: crate::tndb::CommitMode::Group,
-            ..Default::default()
-        };
-        let db = TnDatabase::open_with(dir, options).expect("open tndb");
-        db.open_table::<KvTable>().expect("open table");
-        let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
-        Self { db, rt }
-    }
-
-    /// The durability barrier.
-    fn persist(&self) {
-        self.rt.block_on(self.db.persist::<KvTable>()).expect("persist");
-    }
-}
-
-impl KvStore for TnGroupKv {
-    fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
-        let mut txn = self.db.write_txn().expect("write_txn");
-        for (k, v) in items {
-            txn.insert::<KvTable>(k, v).expect("insert");
-        }
-        txn.commit().expect("commit");
-        self.persist();
-    }
-
-    fn write_each_durable(&mut self, items: &[(B256, ByteVec)]) {
-        for (k, v) in items {
-            self.db.insert::<KvTable>(k, v).expect("insert");
-            self.persist();
-        }
-    }
-
-    fn read_rand(&mut self, keys: &[B256]) -> usize {
-        let txn = self.db.read_txn().expect("read_txn");
-        keys.iter().filter(|k| txn.get::<KvTable>(k).expect("get").is_some()).count()
-    }
-}
-
-// ---- tnlog (one shared log): `Sync` waits for the commit thread per write, `Group` for persist
+// ---- tndb (one shared log): `Sync` waits for the commit thread per write, `Group` for persist
 // ----
 
-struct TnLogKv {
-    db: TnLogDatabase,
+struct TnDbKv {
+    db: TnDatabase,
     rt: tokio::runtime::Runtime,
     group: bool,
 }
 
-impl TnLogKv {
+impl TnDbKv {
     fn open_with(dir: &Path, group: bool) -> Self {
-        let commit =
-            if group { crate::tndb::CommitMode::Group } else { crate::tndb::CommitMode::Sync };
-        let db = TnLogDatabase::open_with(dir, TnLogOptions { commit, ..Default::default() })
-            .expect("open tnlog");
+        let commit = if group { CommitMode::Group } else { CommitMode::Sync };
+        let db = TnDatabase::open_with(dir, TnDbOptions { commit, ..Default::default() })
+            .expect("open tndb");
         db.open_table::<KvTable>().expect("open table");
         let rt = tokio::runtime::Builder::new_current_thread().build().expect("runtime");
         Self { db, rt, group }
@@ -428,7 +324,7 @@ impl TnLogKv {
     }
 }
 
-impl KvStore for TnLogKv {
+impl KvStore for TnDbKv {
     fn write_bulk(&mut self, items: &[(B256, ByteVec)]) {
         let mut txn = self.db.write_txn().expect("write_txn");
         for (k, v) in items {
@@ -451,7 +347,7 @@ impl KvStore for TnLogKv {
     }
 }
 
-impl SortedKvStore for TnLogKv {
+impl SortedKvStore for TnDbKv {
     fn scan_all(&mut self) -> usize {
         self.db.iter::<KvTable>().count()
     }
@@ -733,13 +629,9 @@ fn pack_vs_mdbx_bench() {
     println!("  running pack-btree ...");
     cols.push(("pack-btree", column(PackBtreeKv::open)));
     println!("  running tndb ...");
-    cols.push(("tndb", column(TnKv::open)));
+    cols.push(("tndb", column(TnDbKv::open)));
     println!("  running tndb-group ...");
-    cols.push(("tndb-group", column(TnGroupKv::open)));
-    println!("  running tnlog ...");
-    cols.push(("tnlog", column(TnLogKv::open)));
-    println!("  running tnlog-group ...");
-    cols.push(("tnlog-group", column(TnLogKv::open_group)));
+    cols.push(("tndb-group", column(TnDbKv::open_group)));
     println!("  running mem ...");
     cols.push(("mem", column(MemKv::open)));
 
@@ -752,7 +644,7 @@ fn pack_vs_mdbx_bench() {
     }
 
     let legend = format!(
-        "legend: pack-hdx = mmap append-log + hash digest index; pack-btree = same log + sorted B+tree index (both msync barrier; the log is the WAL so the index is not synced). tndb = the pack-file Database (append-log + B+tree index) via the typed table API — its commit syncs BOTH the log and the index. mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync. write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier msyncs the data log vs MDBX's single env commit."
+        "legend: pack-hdx = mmap append-log + hash digest index; pack-btree = same log + sorted B+tree index (both msync barrier; the log is the WAL so the index is not synced). tndb = the pack-file Database (one shared append-log + a B+tree index per table) via the typed table API — its commit syncs the log only (the indexes are rebuilt from it after a crash). mdbx-durable = fsync-on-commit, mdbx-nosync = SafeNoSync. write_bulk = {N_BULK} inserts + ONE barrier; write_each_dur = {N_EACH} inserts, a barrier EACH; read_rand = {N_READ} random point-gets. NOTE: a pack barrier msyncs the data log vs MDBX's single env commit."
     );
     print_table(
         "=== pack-file KV vs MDBX — point ops (ms; lower is better) ===",
@@ -771,8 +663,7 @@ fn pack_vs_mdbx_bench() {
     let sorted_rows = sorted_row_labels();
     let mut sorted_cols: Vec<(&str, Vec<Duration>)> = vec![
         ("pack-btree", column_sorted(PackBtreeKv::open, lo, hi)),
-        ("tndb", column_sorted(TnKv::open, lo, hi)),
-        ("tnlog", column_sorted(TnLogKv::open, lo, hi)),
+        ("tndb", column_sorted(TnDbKv::open, lo, hi)),
         ("mem", column_sorted(MemKv::open, lo, hi)),
     ];
     #[cfg(feature = "reth-libmdbx")]

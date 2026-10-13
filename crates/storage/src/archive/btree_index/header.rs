@@ -41,8 +41,8 @@ pub(crate) struct BtreeHeader {
     /// Not maintained (see the module docs); kept for the on-disk layout.
     pub(crate) last_leaf: u32,
     pub(crate) data_file_length: u64,
-    /// A value the owner keeps with the index (tndb: the generation's dead puts), durable with the
-    /// header; 0 in a file that never set it.
+    /// A value the owner keeps with the index, durable with the header; 0 in a file that never set
+    /// it.
     pub(crate) owner_value: u64,
 }
 

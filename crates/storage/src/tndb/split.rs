@@ -1,4 +1,4 @@
-//! [`SplitDatabase`]: one tnlog database (one shared log, write lock and commit thread) per
+//! [`SplitDatabase`]: one tndb database (one shared log, write lock and commit thread) per
 //! production environment, as `open_db` splits MDBX, routed by each table's [`TableHint`] with no
 //! layer in between. The batch caches (`Cache`) then never share a write lock with consensus
 //! (`Epoch`): a large batch append holds up only other cache writes.
@@ -15,18 +15,18 @@ use std::path::Path;
 
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table, TableHint};
 
-use super::database::{CompactionConfig, TnLogDatabase, TnLogOptions, TnLogTxMut};
+use super::database::{CompactionConfig, TnDatabase, TnDbOptions, TnDbTxMut};
 
 /// The least log the cache environment compacts automatically at (a larger configured threshold
 /// is kept). The batch caches churn at the batch write rate: at the default 64 MiB, a heavy batch
 /// stream keeps their log compacting most of the time, and each compaction's flushes queue ahead
-/// of the epoch log's syncs (see the tnlog README, "Cost to other logs"). Four times the default
+/// of the epoch log's syncs (see the tndb README, "Cost to other logs"). Four times the default
 /// makes those compactions four times rarer, for up to that much more cache log on disk.
 pub const CACHE_AUTO_MIN_BYTES: u64 = 256 << 20;
 
 /// The least log the epoch environment compacts automatically at mid-epoch: a safety net only.
 /// The epoch tables are all cleared at every epoch's end, which compacts the log at once (nothing
-/// live to copy; see the tnlog README's Compaction section), so consensus writes see no
+/// live to copy; see the tndb README's Compaction section), so consensus writes see no
 /// compaction stalls mid-epoch.
 pub const EPOCH_AUTO_MIN_BYTES: u64 = 2 << 30;
 
@@ -38,17 +38,14 @@ const CACHE: usize = 2;
 /// The options for environment `env`: `options`, with the cache's automatic threshold raised to
 /// at least [`CACHE_AUTO_MIN_BYTES`] and the epoch's to at least [`EPOCH_AUTO_MIN_BYTES`]
 /// (automatic compaction left off if it is off).
-fn env_options(options: TnLogOptions, env: usize) -> TnLogOptions {
+fn env_options(options: TnDbOptions, env: usize) -> TnDbOptions {
     let floor = match env {
         CACHE => CACHE_AUTO_MIN_BYTES,
         EPOCH => EPOCH_AUTO_MIN_BYTES,
         _ => return options,
     };
     let auto_min_bytes = options.compaction.auto_min_bytes.map(|min| min.max(floor));
-    TnLogOptions {
-        compaction: CompactionConfig { auto_min_bytes, ..options.compaction },
-        ..options
-    }
+    TnDbOptions { compaction: CompactionConfig { auto_min_bytes, ..options.compaction }, ..options }
 }
 
 fn env(hint: TableHint) -> usize {
@@ -59,30 +56,30 @@ fn env(hint: TableHint) -> usize {
     }
 }
 
-/// Three tnlog databases (epoch, kad, cache) behind one `Database`, each table in its hint's.
+/// Three tndb databases (epoch, kad, cache) behind one `Database`, each table in its hint's.
 #[derive(Clone, Debug)]
 pub struct SplitDatabase {
-    dbs: [TnLogDatabase; 3],
+    dbs: [TnDatabase; 3],
 }
 
 impl SplitDatabase {
     /// Open (creating if absent) the three databases under `root` (`epoch/`, `kad/`, `cache/`),
     /// committing and compacting as `options` say (the cache compacting automatically at no less
     /// than [`CACHE_AUTO_MIN_BYTES`]).
-    pub fn open_with<P: AsRef<Path>>(root: P, options: TnLogOptions) -> eyre::Result<Self> {
+    pub fn open_with<P: AsRef<Path>>(root: P, options: TnDbOptions) -> eyre::Result<Self> {
         let root = root.as_ref();
         Ok(Self {
             dbs: [
-                TnLogDatabase::open_with(root.join("epoch"), env_options(options, EPOCH))?,
-                TnLogDatabase::open_with(root.join("kad"), env_options(options, KAD))?,
-                TnLogDatabase::open_with(root.join("cache"), env_options(options, CACHE))?,
+                TnDatabase::open_with(root.join("epoch"), env_options(options, EPOCH))?,
+                TnDatabase::open_with(root.join("kad"), env_options(options, KAD))?,
+                TnDatabase::open_with(root.join("cache"), env_options(options, CACHE))?,
             ],
         })
     }
 
     /// Block until every write so far, in every environment, is durable (see
-    /// [`TnLogDatabase::wait_durable_blocking`]).
-    #[cfg(any(test, feature = "tnlog"))]
+    /// [`TnDatabase::wait_durable_blocking`]).
+    #[cfg(any(test, feature = "tndb"))]
     pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
         for db in &self.dbs {
             db.wait_durable_blocking()?;
@@ -90,7 +87,7 @@ impl SplitDatabase {
         Ok(())
     }
 
-    fn db<T: Table>(&self) -> &TnLogDatabase {
+    fn db<T: Table>(&self) -> &TnDatabase {
         &self.dbs[env(T::HINT)]
     }
 }
@@ -107,16 +104,16 @@ impl DbTx for SplitTx {
     }
 }
 
-/// A write transaction: one buffered tnlog transaction per environment it writes, each committed
+/// A write transaction: one buffered tndb transaction per environment it writes, each committed
 /// (or, dropped, written) as one batch in its environment.
 #[derive(Debug)]
 pub struct SplitTxMut {
     db: SplitDatabase,
-    txns: [Option<TnLogTxMut>; 3],
+    txns: [Option<TnDbTxMut>; 3],
 }
 
 impl SplitTxMut {
-    fn txn<T: Table>(&mut self) -> eyre::Result<&mut TnLogTxMut> {
+    fn txn<T: Table>(&mut self) -> eyre::Result<&mut TnDbTxMut> {
         let env = env(T::HINT);
         if self.txns[env].is_none() {
             self.txns[env] = Some(self.db.dbs[env].write_txn()?);
@@ -260,7 +257,7 @@ mod test {
     }
 
     fn open(path: &Path) -> SplitDatabase {
-        let options = TnLogOptions { commit: CommitMode::Group, ..Default::default() };
+        let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
         let db = SplitDatabase::open_with(path, options).expect("open split");
         db.open_table::<TestTable>().expect("open table");
         db.open_table::<EpochTable>().expect("open table");
@@ -268,9 +265,9 @@ mod test {
     }
 
     #[test]
-    fn test_tnlog_split_shared_suite() {
+    fn test_tndb_split_shared_suite() {
         let run = |test: fn(SplitDatabase)| {
-            let tmp = TempDir::with_prefix("tnlog_split_suite").expect("temp dir");
+            let tmp = TempDir::with_prefix("tndb_split_suite").expect("temp dir");
             test(open(tmp.path()));
         };
         run(test_contains_key);
@@ -292,12 +289,12 @@ mod test {
     /// epoch environment's to [`EPOCH_AUTO_MIN_BYTES`] (a larger one kept, an off one left off);
     /// kad keeps the configured one.
     #[test]
-    fn test_tnlog_split_cache_compacts_less_often() {
-        let with = |auto_min_bytes| TnLogOptions {
+    fn test_tndb_split_cache_compacts_less_often() {
+        let with = |auto_min_bytes| TnDbOptions {
             commit: CommitMode::Group,
             compaction: CompactionConfig { auto_min_bytes, bytes_per_sec: 7 },
         };
-        let auto = |options: TnLogOptions, env| env_options(options, env).compaction;
+        let auto = |options: TnDbOptions, env| env_options(options, env).compaction;
         let default = with(Some(64 << 20));
         assert_eq!(auto(default, KAD), default.compaction);
         assert_eq!(
@@ -317,8 +314,8 @@ mod test {
     /// Each table lives in its hint's database; a transaction over both environments writes its
     /// part in each, and its own reads see both.
     #[test]
-    fn test_tnlog_split_routes_by_hint() {
-        let tmp = TempDir::with_prefix("tnlog_split_route").expect("temp dir");
+    fn test_tndb_split_routes_by_hint() {
+        let tmp = TempDir::with_prefix("tndb_split_route").expect("temp dir");
         let db = open(tmp.path());
         let mut txn = db.write_txn().expect("txn");
         txn.insert::<TestTable>(&1, &"cache".to_string()).expect("insert");

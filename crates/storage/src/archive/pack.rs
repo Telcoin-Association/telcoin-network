@@ -16,7 +16,7 @@ use crate::archive::{
 
 use super::{
     crc::{add_crc32, crc32},
-    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions, SyncTicket},
+    data_file::{DataFileReader, MapView, MmapDataFile, MmapFileOptions},
 };
 use std::{
     fmt::Debug,
@@ -122,15 +122,9 @@ where
         self.inner.data_file.view()
     }
 
-    /// [`Self::record_bytes`] through a lock-free [`MapView`]: CRC-check the record at `pos` within
-    /// the view's published bytes and borrow its payload. Log records never change once appended,
-    /// so a published record is safe to read with no lock.
-    pub(crate) fn record_bytes_in(view: &MapView, pos: u64) -> Result<&[u8], FetchError> {
-        checked_payload_in(view.tail(pos))
-    }
-
-    /// [`Self::record_bytes_in`] bounded by `limit` rather than the view's published length (see
-    /// [`MapView::tail_within`]).
+    /// [`Self::record_bytes`] through a lock-free [`MapView`], bounded by `limit` (see
+    /// [`MapView::tail_within`]): CRC-check the record at `pos` and borrow its payload. Log
+    /// records never change once appended, so a published record is safe to read with no lock.
     pub(crate) fn record_bytes_within(
         view: &MapView,
         pos: u64,
@@ -292,13 +286,6 @@ where
         self.inner.data_file.committed_end()
     }
 
-    /// A [`SyncTicket`] for the appended bytes not yet synced (see [`MmapDataFile::sync_ticket`]):
-    /// [`Self::commit`] split so the slow sync can run outside the owner's lock.
-    pub(crate) fn sync_ticket(&self) -> Result<SyncTicket, CommitError> {
-        self.inner.failed_cause().map_err(CommitError::Failed)?;
-        self.inner.data_file.sync_ticket().map_err(CommitError::DataFileSync)
-    }
-
     /// Poison the data file: a sync of it failed elsewhere (see [`Self::note_synced`]), so its
     /// state on disk is unknown. It refuses every later append and barrier, and is never sealed
     /// as clean (the next open recovers it).
@@ -327,25 +314,10 @@ where
         self.inner.failed.is_some() || self.inner.data_file.is_poisoned()
     }
 
-    /// Test-only: the data file's synced watermark (see [`MmapDataFile::synced_end`]).
-    #[cfg(test)]
-    pub(crate) fn synced_end(&self) -> u64 {
-        self.inner.data_file.synced_end()
-    }
-
-    /// Stamp the tail commit marker at `committed`, an end a [`SyncTicket`] synced (see
-    /// [`MmapDataFile::stamp_commit_marker_at`]).
+    /// Stamp the tail commit marker at `committed`, an end a sync made outside this pack covered
+    /// (see [`Self::note_synced`] and [`MmapDataFile::stamp_commit_marker_at`]).
     pub(crate) fn stamp_commit_marker_at(&mut self, committed: u64) {
         self.inner.data_file.stamp_commit_marker_at(committed);
-    }
-
-    /// Record a [`SyncTicket`]'s outcome (see [`MmapDataFile::complete_sync`]).
-    pub(crate) fn complete_sync(
-        &mut self,
-        ticket: &SyncTicket,
-        outcome: &std::io::Result<()>,
-    ) -> Result<(), CommitError> {
-        self.inner.data_file.complete_sync(ticket, outcome).map_err(CommitError::DataFileSync)
     }
 
     /// Stamp the tail commit marker (`committed_end == file_len()`) — a best-effort, no-extra-sync
@@ -550,7 +522,7 @@ where
 
     /// Raw-bytes sibling of [`Self::append`]: append already-serialized `value` bytes as one record
     /// (no codec re-encode), sharing the same read-only guard, failed-state guard, and
-    /// poison classification. Used by the byte-oriented `tndb` value log.
+    /// poison classification. Used by `tndb`'s byte-oriented shared log.
     fn append_raw(&mut self, value: &[u8]) -> Result<u64, AppendError> {
         if self.read_only {
             return Err(AppendError::ReadOnly);

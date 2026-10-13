@@ -1,158 +1,56 @@
-//! The on-disk layout of a tndb table directory:
-//!
-//! ```text
-//! <table>/LOCK             held (flock) by the table's one open writer
-//! <table>/meta             the key mode (keyed | derived) and the encoded key size
-//! <table>/gen-<N>/data     the log: puts [PUT | key | value] (derived: [PUT | value]),
-//!                          removals [REMOVE | key], and an empty record at each commit
-//! <table>/gen-<N>/btx/     the B-tree index over the current generation (rebuildable)
-//! <table>/spare-<N+1>-<id>/ the next generation, prepared empty in the background
-//! <table>/compact-<N+1>-<id>/ a compaction's new generation, being built in the background
-//! ```
-//!
-//! A table's data lives in one generation directory. Clearing the table starts a new, empty
-//! generation and deletes the old one, so cleared data leaves the disk (once no reader still maps
-//! it). The new generation is a spare prepared ahead of time, so a clear only renames it into
-//! place; a spare is never a generation (only `gen-<N>` directories are), and a leftover one is
-//! deleted on open. A compaction builds the next generation in a `compact-*` directory and renames
-//! it into place when done; a leftover one is deleted on open too. `meta` is per table, outside
-//! the generations: its key mode is fixed when the table is created, and its key size once the
-//! first row is written.
+// SPDX-License-Identifier: MIT or Apache-2.0
+
+//! The database directory's files and the helpers that manage them (see the README's Layout):
+//! `<root>/LOCK` (held by the one open handle), `<root>/tables` (the manifest), the generations
+//! `<root>/gen-<N>/` (the newest is current), and a compaction's `<root>/compact-<N>-<pid>-<n>/`
+//! while it is built (never a generation; deleted at open if left behind).
 
 use std::{
-    fs,
-    io::{self, Write as _},
+    fs, io,
     os::fd::AsRawFd as _,
     path::{Path, PathBuf},
 };
 
 use eyre::{bail, WrapErr as _};
 
-use crate::archive::{crc::crc32, data_file::fsync_file};
+use crate::archive::data_file::fsync_file;
 
 /// `fsync(2)` an open file or directory: its contents, and for a directory its entries. A plain
 /// `fsync` on every platform, never macOS's `F_FULLFSYNC` (see [`fsync_file`]).
-pub(crate) fn sync_file(file: &fs::File) -> io::Result<()> {
+pub(super) fn sync_file(file: &fs::File) -> io::Result<()> {
     fsync_file(file)
 }
 
 /// [`sync_file`] a directory, making its entries (created, renamed or removed) durable.
-pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(super) fn sync_dir(dir: &Path) -> io::Result<()> {
     sync_file(&fs::File::open(dir)?)
 }
 
-/// How a table's rows are keyed in its log, fixed when the table is created.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum KeyMode {
-    /// Each data record stores its key before the value.
-    Keyed,
-    /// Data records store only the value; the key is derived from it (on rebuild) by the
-    /// table's key function.
-    Derived,
-}
-
-/// A table's `meta` file: the key mode and the encoded key size (0 until the first row).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TableMeta {
-    pub(crate) mode: KeyMode,
-    pub(crate) ksize: u16,
-}
-
-const META_FILE: &str = "meta";
-const META_TMP: &str = "meta.tmp";
-const META_MAGIC: &[u8; 8] = b"TNDBMETA";
-/// The on-disk format: 2 (one tagged data log per generation). Version 1, a pre-release layout
-/// with a separate removal log, is not read (no table of it was ever in production).
-const META_VERSION: u8 = 2;
-/// magic (8) | version (1) | mode (1) | ksize (2, LE) | crc32 of the preceding 12 bytes (4, LE).
-const META_LEN: usize = 16;
-
-impl TableMeta {
-    fn to_bytes(self) -> [u8; META_LEN] {
-        let mut bytes = [0_u8; META_LEN];
-        bytes[..8].copy_from_slice(META_MAGIC);
-        bytes[8] = META_VERSION;
-        bytes[9] = match self.mode {
-            KeyMode::Keyed => 0,
-            KeyMode::Derived => 1,
-        };
-        bytes[10..12].copy_from_slice(&self.ksize.to_le_bytes());
-        let crc = crc32(&bytes[..12]);
-        bytes[12..].copy_from_slice(&crc.to_le_bytes());
-        bytes
-    }
-
-    fn from_bytes(bytes: &[u8]) -> eyre::Result<Self> {
-        if bytes.len() != META_LEN
-            || &bytes[..8] != META_MAGIC
-            || crc32(&bytes[..12]).to_le_bytes() != bytes[12..16]
-        {
-            bail!("tndb: table meta file is corrupt");
-        }
-        if bytes[8] != META_VERSION {
-            bail!(
-                "tndb: the table's on-disk format is version {}, this build reads version \
-                 {META_VERSION} (version 1 was a pre-release layout; delete the table)",
-                bytes[8]
-            );
-        }
-        let mode = match bytes[9] {
-            0 => KeyMode::Keyed,
-            1 => KeyMode::Derived,
-            other => bail!("tndb: table meta file has an unknown key mode {other}"),
-        };
-        Ok(Self { mode, ksize: u16::from_le_bytes([bytes[10], bytes[11]]) })
-    }
-
-    /// Read the table's meta file, or `None` if the table has none yet.
-    pub(crate) fn read(table: &Path) -> eyre::Result<Option<Self>> {
-        match fs::read(table.join(META_FILE)) {
-            Ok(bytes) => Self::from_bytes(&bytes).map(Some),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).wrap_err("tndb: read table meta"),
-        }
-    }
-
-    /// Durably replace the table's meta file: write a temporary file, sync it, rename it over
-    /// `meta`, then sync the directory. A crash leaves the old file or the new one, never a mix.
-    pub(crate) fn write(self, table: &Path) -> eyre::Result<()> {
-        let tmp = table.join(META_TMP);
-        {
-            let mut file = fs::File::create(&tmp)?;
-            file.write_all(&self.to_bytes())?;
-            sync_file(&file)?;
-        }
-        fs::rename(&tmp, table.join(META_FILE))?;
-        sync_dir(table)?;
-        Ok(())
-    }
-}
-
-/// Lock table directory `table` for one writer: an exclusive, non-blocking `flock` on
-/// `<table>/LOCK`, held until the returned file is dropped (a crash releases it with the process).
-/// A second open of the table, from this process or another, fails instead of becoming a second
-/// writer on the same logs.
-pub(crate) fn lock_table(table: &Path) -> eyre::Result<fs::File> {
+/// Lock the database directory `root` for one handle: an exclusive, non-blocking `flock` on
+/// `<root>/LOCK`, held until the returned file is dropped (a crash releases it with the process).
+/// A second open, from this process or another, fails instead of becoming a second writer on the
+/// same log.
+pub(super) fn lock_dir(root: &Path) -> eyre::Result<fs::File> {
     let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
-        .open(table.join("LOCK"))
-        .wrap_err("tndb: open the table lock file")?;
+        .open(root.join("LOCK"))
+        .wrap_err("tndb: open the database lock file")?;
     // SAFETY: `flock` on a valid, open file descriptor borrowed for the call.
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let e = io::Error::last_os_error();
         if e.kind() == io::ErrorKind::WouldBlock {
-            bail!("tndb: table {} is already open (its LOCK is held)", table.display());
+            bail!("tndb: database {} is already open (its LOCK is held)", root.display());
         }
-        return Err(e).wrap_err("tndb: lock the table");
+        return Err(e).wrap_err("tndb: lock the database");
     }
     Ok(file)
 }
 
 /// Bytes available to this process on the filesystem holding `dir` (`statvfs`: free blocks
 /// available to unprivileged users times the fragment size).
-pub(crate) fn available_bytes(dir: &Path) -> io::Result<u64> {
+pub(super) fn available_bytes(dir: &Path) -> io::Result<u64> {
     use std::os::unix::ffi::OsStrExt as _;
 
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).map_err(io::Error::other)?;
@@ -170,7 +68,7 @@ pub(crate) fn available_bytes(dir: &Path) -> io::Result<u64> {
 /// Delete a retired generation's directory on a short-lived thread named `thread` (its files are
 /// unlinked now; their space returns once no mapping of them is left), or here if no thread can be
 /// started. A failure leaves it for the next open to remove.
-pub(crate) fn remove_in_background(dir: PathBuf, thread: &str) {
+pub(super) fn remove_in_background(dir: PathBuf, thread: &str) {
     let remove = |dir: &Path| {
         if let Err(e) = fs::remove_dir_all(dir) {
             tracing::warn!(target: "tndb", "remove retired generation {}: {e}", dir.display());
@@ -187,62 +85,41 @@ pub(crate) fn remove_in_background(dir: PathBuf, thread: &str) {
 /// Drop `value` (a retired generation's files: closing them unmaps them, and may delete them) on
 /// a short-lived thread named `thread`, off the path of whoever let go of it last; if no thread
 /// can be started, here.
-pub(crate) fn drop_in_background<T: Send + 'static>(value: T, thread: &str) {
+pub(super) fn drop_in_background<T: Send + 'static>(value: T, thread: &str) {
     let _ = std::thread::Builder::new().name(thread.to_string()).spawn(move || drop(value));
 }
 
 /// The directory of generation `n`.
-pub(crate) fn gen_dir(table: &Path, n: u64) -> PathBuf {
-    table.join(format!("gen-{n}"))
+pub(super) fn gen_dir(root: &Path, n: u64) -> PathBuf {
+    root.join(format!("gen-{n}"))
 }
 
-/// A fresh directory to prepare a spare for generation `n` in. Unique (by process and a
-/// per-process counter), so no two preparations ever share files, and the files of a spare that
-/// became a generation never share a path with a later spare.
-pub(crate) fn spare_dir(table: &Path, n: u64) -> PathBuf {
-    scratch_dir(table, "spare", n)
-}
-
-/// A fresh directory to build a compaction's generation `n` in (unique, as [`spare_dir`]).
-pub(crate) fn compact_dir(table: &Path, n: u64) -> PathBuf {
-    scratch_dir(table, "compact", n)
-}
-
-fn scratch_dir(table: &Path, kind: &str, n: u64) -> PathBuf {
+/// A fresh directory to build generation `n` in (a compaction's, or a new database's first).
+/// Unique (by process and a per-process counter), so no two builds ever share files.
+pub(super) fn compact_dir(root: &Path, n: u64) -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    table.join(format!("{kind}-{n}-{}-{id}", std::process::id()))
+    root.join(format!("compact-{n}-{}-{id}", std::process::id()))
 }
 
-/// Delete every spare and unfinished compaction in `table` (left by a close or a crash).
-/// Best-effort: neither is ever read, so one that cannot be deleted now (logged) is only garbage
-/// for a later open to remove.
-pub(crate) fn remove_spares(table: &Path) -> eyre::Result<()> {
-    for entry in fs::read_dir(table)? {
+/// Delete every unfinished build in `root` (left by a close or a crash). Best-effort: a build is
+/// never read, so one that cannot be deleted now (logged) is only garbage for a later open.
+pub(super) fn remove_unfinished(root: &Path) -> eyre::Result<()> {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
-        let name = entry.file_name();
-        if name
-            .to_str()
-            .is_some_and(|name| name.starts_with("spare-") || name.starts_with("compact-"))
-        {
+        if entry.file_name().to_str().is_some_and(|name| name.starts_with("compact-")) {
             if let Err(e) = fs::remove_dir_all(entry.path()) {
-                tracing::warn!(target: "tndb", "remove spare {}: {e}", entry.path().display());
+                tracing::warn!(target: "tndb", "remove {}: {e}", entry.path().display());
             }
         }
     }
     Ok(())
 }
 
-/// Remove a leftover `meta.tmp` (a meta write interrupted before its rename). Only for an open,
-/// under the table's lock: a live writer may be between writing the temporary file and renaming it.
-pub(crate) fn remove_meta_tmp(table: &Path) {
-    let _ = fs::remove_file(table.join(META_TMP));
-}
-
-/// The generation numbers present in `table`, ascending.
-pub(crate) fn list_gens(table: &Path) -> eyre::Result<Vec<u64>> {
+/// The generation numbers present in `root`, ascending.
+pub(super) fn list_gens(root: &Path) -> eyre::Result<Vec<u64>> {
     let mut gens = Vec::new();
-    for entry in fs::read_dir(table)? {
+    for entry in fs::read_dir(root)? {
         let entry = entry?;
         let name = entry.file_name();
         if let Some(n) =
@@ -261,36 +138,6 @@ mod test {
 
     use super::*;
 
-    /// A meta of another format version (1 is the pre-release layout with a separate removal log)
-    /// is refused with its own error, not read as corrupt.
-    #[test]
-    fn test_tndb_meta_other_version_refused() {
-        let meta = TableMeta { mode: KeyMode::Keyed, ksize: 8 };
-        let mut bytes = meta.to_bytes();
-        assert_eq!(TableMeta::from_bytes(&bytes).expect("current version"), meta);
-        bytes[8] = 1;
-        let crc = crc32(&bytes[..12]);
-        bytes[12..].copy_from_slice(&crc.to_le_bytes());
-        let err = TableMeta::from_bytes(&bytes).expect_err("version 1");
-        assert!(format!("{err}").contains("version 1"), "{err}");
-        assert!(!format!("{err}").contains("corrupt"), "{err}");
-    }
-
-    #[test]
-    fn test_tndb_meta_roundtrip_and_corruption() {
-        let tmp = TempDir::with_prefix("tndb_meta").expect("temp dir");
-        assert_eq!(TableMeta::read(tmp.path()).expect("read"), None, "no meta yet");
-        let meta = TableMeta { mode: KeyMode::Derived, ksize: 40 };
-        meta.write(tmp.path()).expect("write");
-        assert_eq!(TableMeta::read(tmp.path()).expect("read"), Some(meta));
-
-        let path = tmp.path().join(META_FILE);
-        let mut bytes = fs::read(&path).expect("read meta");
-        bytes[10] ^= 1; // the key size, under the CRC
-        fs::write(&path, bytes).expect("write meta");
-        assert!(TableMeta::read(tmp.path()).is_err(), "a corrupt meta file is an error");
-    }
-
     #[test]
     fn test_tndb_list_gens_sorted() {
         let tmp = TempDir::with_prefix("tndb_gens").expect("temp dir");
@@ -298,10 +145,10 @@ mod test {
             fs::create_dir(gen_dir(tmp.path(), n)).expect("mkdir");
         }
         fs::create_dir(tmp.path().join("gen-x")).expect("mkdir");
-        fs::write(tmp.path().join(META_TMP), b"partial").expect("tmp");
+        fs::create_dir(compact_dir(tmp.path(), 11)).expect("mkdir");
         assert_eq!(list_gens(tmp.path()).expect("list"), vec![0, 2, 10]);
-        assert!(tmp.path().join(META_TMP).exists(), "listing changes nothing");
-        remove_meta_tmp(tmp.path());
-        assert!(!tmp.path().join(META_TMP).exists(), "a leftover meta.tmp is removed at open");
+        remove_unfinished(tmp.path()).expect("remove");
+        assert_eq!(list_gens(tmp.path()).expect("list"), vec![0, 2, 10], "generations kept");
+        assert_eq!(fs::read_dir(tmp.path()).expect("read").count(), 4, "the build is gone");
     }
 }

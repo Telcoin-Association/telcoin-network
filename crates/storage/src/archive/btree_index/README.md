@@ -20,7 +20,7 @@ cannot be trusted (see [Crash consistency](#crash-consistency-and-the-owners-con
 | `header.rs` | the page-0 header (`BtreeHeader`) |
 | `iter.rs` | sorted iteration: the detached `BtreeCursor`, `BtreeIter`, and the `PageSource` trait |
 
-Users: `tndb::table` (each tndb table's index), the `pack-btree` column of
+Users: `tndb` (each table's index, in `tndb::store`), the `pack-btree` column of
 `pack_kv_bench::pack_vs_mdbx_bench`, and `archive::index_bench`.
 
 ---
@@ -50,7 +50,7 @@ Users: `tndb::table` (each tndb table's index), the `pack-btree` column of
   is a leaf or an internal node. Pages are addressed by `u32` page number.
 - **Fixed-size keys.** The key length `ksize` (1 to 2032 bytes) is chosen when the index is created
   and recorded in the header. Keys compare lexicographically as byte strings, so a caller that wants
-  numeric order must encode big-endian (tndb's `encode_key` does).
+  numeric order must encode big-endian (`tn_types::encode_key`, which tndb uses, does).
 - **Fixed-size values:** a little-endian `u64`, by convention a record position in the data log.
 - **Memory-mapped, no page cache of its own.** The file is mapped once (in a 1 GiB reserved range,
   so the mapping does not move as it grows) and worked on in place; the OS page cache is the cache.
@@ -127,7 +127,7 @@ height-3 tree holds on the order of 10⁵–10⁶ keys depending on fill.
 | 50 | 4 | `first_leaf` | not maintained (layout only) |
 | 54 | 4 | `last_leaf` | not maintained (layout only) |
 | 58 | 8 | `data_file_length` | the data log length this index covers (set by the owner) |
-| 66 | 8 | `owner_value` | any value the owner keeps with the index (tndb: dead puts); 0 if never set |
+| 66 | 8 | `owner_value` | any value the owner keeps with the index; 0 if never set |
 | 74 | … | — | zero |
 | 4092 | 4 | CRC32 | over bytes `0..4092` (always a real CRC: the header is the commit marker) |
 
@@ -275,7 +275,7 @@ index that was not sealed is never trusted (next section).
 `set_data_file_length(len)` records, in memory, the data log length the index covers; it becomes
 durable with the header at the next `sync()`. Owners compare it with the log's length on open to
 detect an index that lags its log. `set_owner_value(v)` does the same for one `u64` the owner keeps
-with the index (tndb keeps its dead-put count there); it reads 0 until first set.
+with the index; it reads 0 until first set.
 
 `set_remove_on_drop()` deletes the file when the handle drops, skipping the sync (used to discard a
 cleared or abandoned index).
@@ -331,21 +331,22 @@ this contract with the owner:
 4. **Also rebuild** when the index fails to open, or when `data_file_length()` differs from the log's
    length (the index lags the log).
 
-`tndb::table::TnTable::open` / `Writer::recover` is the reference implementation of this contract.
+`tndb::store`'s `Core::open` / `recover` is the reference implementation of this contract.
 
 ---
 
 ## Concurrency rules
 
-- **One writer.** All mutation takes `&mut BtreeIndex`; owners serialize writers (tndb holds a
-  per-table writer mutex).
+- **One writer.** All mutation takes `&mut BtreeIndex`; owners serialize writers (tndb holds one
+  write lock per database).
 - **Lock-free readers via snapshots.** An `IndexSnapshot` is `Clone + Send + Sync` and reads
   published, immutable, CRC-stamped pages through the shared `MapView` with no lock and no shared
   write. Readers never block the writer, and the writer never blocks readers.
 - **The owner keeps the file open while snapshots live.** A `MapView` does not own the mapping
   (`data_file::MapView`). A mapping replaced on a rare reservation overflow is retired, not
   unmapped, until the file closes; dropping the `BtreeIndex` while a snapshot is in use is a bug.
-  (tndb keeps a cleared generation's files alive through its snapshots for exactly this reason.)
+  (tndb keeps a retired generation's files alive through its snapshots, `GenAlive`, for exactly
+  this reason.)
 - **`reset_empty` / `rebuild_from` refuse to run while any snapshot is alive** (they truncate the
   file); in practice they run at open, before anything is published.
 - A `BtreeIter` borrows the index (`&BtreeIndex`), so the tree cannot change under it.
@@ -375,7 +376,7 @@ Public (`pub`) unless marked crate-internal.
 | `publish(&mut) -> IndexSnapshot` *(crate)* | publish the working tree for lock-free readers |
 | `IndexSnapshot::{load, len}` + `PageSource` *(crate)* | snapshot reads and cursor source |
 | `iter::BtreeCursor` *(crate)* | the detached cursor (`new`, `next`) |
-| `BTX_MAP_RESERVE` *(crate)* | the 1 GiB mapping reservation (also used by tndb's data logs) |
+| `BTX_MAP_RESERVE` *(crate)* | the 1 GiB mapping reservation |
 
 ---
 

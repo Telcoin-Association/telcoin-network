@@ -1,4 +1,4 @@
-//! tnlog's tests: the shared `Database` suite in both commit modes, recovery, transaction
+//! tndb's tests: the shared `Database` suite in both commit modes, recovery, transaction
 //! atomicity, batch rollback, and durability.
 
 use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tn_types::{Database as _, DbTx as _, DbTxMut as _};
 
 use super::{
-    database::{CommitMode, CompactionConfig, TnLogDatabase, TnLogOptions},
+    database::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
     record::{self, KIND_PUT},
 };
 use crate::test::*;
@@ -23,13 +23,13 @@ impl tn_types::Table for OtherTable {
     const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
 }
 
-fn options(commit: CommitMode) -> TnLogOptions {
-    TnLogOptions { commit, ..Default::default() }
+fn options(commit: CommitMode) -> TnDbOptions {
+    TnDbOptions { commit, ..Default::default() }
 }
 
 /// The database at `path`, both test tables open.
-fn open(path: &Path, commit: CommitMode) -> TnLogDatabase {
-    let db = TnLogDatabase::open_with(path, options(commit)).expect("open tnlog");
+fn open(path: &Path, commit: CommitMode) -> TnDatabase {
+    let db = TnDatabase::open_with(path, options(commit)).expect("open tndb");
     db.open_table::<TestTable>().expect("open table");
     db.open_table::<OtherTable>().expect("open table");
     db
@@ -37,7 +37,7 @@ fn open(path: &Path, commit: CommitMode) -> TnLogDatabase {
 
 /// Simulate a crash: stop the commit thread and release the lock, as a dead process's are, and
 /// leak the handle so nothing is synced or sealed on the way out.
-fn crash(db: TnLogDatabase) {
+fn crash(db: TnDatabase) {
     db.release_locks_for_crash();
     std::mem::forget(db);
 }
@@ -50,7 +50,7 @@ fn block_on<F: std::future::Future>(f: F) -> F::Output {
         .block_on(f)
 }
 
-fn rows<T: tn_types::Table<Key = u64, Value = String>>(db: &TnLogDatabase) -> Vec<(u64, String)> {
+fn rows<T: tn_types::Table<Key = u64, Value = String>>(db: &TnDatabase) -> Vec<(u64, String)> {
     db.iter::<T>().collect()
 }
 
@@ -109,10 +109,10 @@ fn truncate(path: &Path, len: u64) {
 }
 
 #[test]
-fn test_tnlog_shared_suite() {
+fn test_tndb_shared_suite() {
     for commit in [CommitMode::Sync, CommitMode::Group] {
-        let run = |test: fn(TnLogDatabase)| {
-            let tmp = TempDir::with_prefix("tnlog_suite").expect("temp dir");
+        let run = |test: fn(TnDatabase)| {
+            let tmp = TempDir::with_prefix("tndb_suite").expect("temp dir");
             test(open(tmp.path(), commit));
         };
         run(test_contains_key);
@@ -133,8 +133,8 @@ fn test_tnlog_shared_suite() {
 
 /// A clean close keeps every row of every table, and the reopen needs no rebuild.
 #[test]
-fn test_tnlog_clean_reopen() {
-    let tmp = TempDir::with_prefix("tnlog_reopen").expect("temp dir");
+fn test_tndb_clean_reopen() {
+    let tmp = TempDir::with_prefix("tndb_reopen").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         for i in 0..50u64 {
@@ -154,8 +154,8 @@ fn test_tnlog_clean_reopen() {
 /// Interleaved writes to several tables, then a crash: the reopen rebuilds every table from the
 /// one log, keeping every write made before the crash in `Sync` mode (each durable on return).
 #[test]
-fn test_tnlog_crash_rebuilds_interleaved_tables() {
-    let tmp = TempDir::with_prefix("tnlog_crash").expect("temp dir");
+fn test_tndb_crash_rebuilds_interleaved_tables() {
+    let tmp = TempDir::with_prefix("tndb_crash").expect("temp dir");
     let mut test = BTreeMap::new();
     let mut other = BTreeMap::new();
     {
@@ -182,8 +182,8 @@ fn test_tnlog_crash_rebuilds_interleaved_tables() {
 /// A transaction is atomic across tables: a batch whose flagged last record is torn by the crash
 /// is dropped whole (from both tables), and the batch before it is kept whole.
 #[test]
-fn test_tnlog_txn_atomic_across_tables() {
-    let tmp = TempDir::with_prefix("tnlog_txn_atomic").expect("temp dir");
+fn test_tndb_txn_atomic_across_tables() {
+    let tmp = TempDir::with_prefix("tndb_txn_atomic").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         let mut txn = db.write_txn().expect("txn");
@@ -209,8 +209,8 @@ fn test_tnlog_txn_atomic_across_tables() {
 /// A write transaction's own reads see its writes (and its clear); nobody else does until it
 /// commits; a dropped transaction is written like a committed one.
 #[test]
-fn test_tnlog_txn_buffered() {
-    let tmp = TempDir::with_prefix("tnlog_txn_buffered").expect("temp dir");
+fn test_tndb_txn_buffered() {
+    let tmp = TempDir::with_prefix("tndb_txn_buffered").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     db.insert::<TestTable>(&1, &"old".to_string()).expect("insert");
     db.insert::<TestTable>(&2, &"two".to_string()).expect("insert");
@@ -234,8 +234,8 @@ fn test_tnlog_txn_buffered() {
 /// A clear between puts in one batch: the puts before it are gone, those after it stay, through
 /// a crash rebuild.
 #[test]
-fn test_tnlog_clear_inside_a_batch() {
-    let tmp = TempDir::with_prefix("tnlog_clear_batch").expect("temp dir");
+fn test_tndb_clear_inside_a_batch() {
+    let tmp = TempDir::with_prefix("tndb_clear_batch").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         db.insert::<TestTable>(&1, &"before".to_string()).expect("insert");
@@ -254,8 +254,8 @@ fn test_tnlog_clear_inside_a_batch() {
 /// touched index reverted, so nothing of it is readable or survives a crash, and later writes
 /// work.
 #[test]
-fn test_tnlog_failed_batch_is_taken_back() {
-    let tmp = TempDir::with_prefix("tnlog_rollback").expect("temp dir");
+fn test_tndb_failed_batch_is_taken_back() {
+    let tmp = TempDir::with_prefix("tndb_rollback").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         for i in 0..20u64 {
@@ -290,8 +290,8 @@ fn test_tnlog_failed_batch_is_taken_back() {
 /// Group mode: a write is readable at once and durable after `persist` (it survives a crash);
 /// `persist` on one table covers every table's earlier writes.
 #[test]
-fn test_tnlog_group_persist() {
-    let tmp = TempDir::with_prefix("tnlog_group").expect("temp dir");
+fn test_tndb_group_persist() {
+    let tmp = TempDir::with_prefix("tndb_group").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Group);
         for i in 0..100u64 {
@@ -310,8 +310,8 @@ fn test_tnlog_group_persist() {
 /// Writers on several threads in `Sync` mode: every write returned is durable (it survives a
 /// crash), and concurrent writers share syncs.
 #[test]
-fn test_tnlog_concurrent_sync_writers() {
-    let tmp = TempDir::with_prefix("tnlog_threads").expect("temp dir");
+fn test_tndb_concurrent_sync_writers() {
+    let tmp = TempDir::with_prefix("tndb_threads").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         std::thread::scope(|s| {
@@ -339,9 +339,9 @@ fn test_tnlog_concurrent_sync_writers() {
 /// A record of a table the manifest does not have, or of an unknown kind, fails the open closed
 /// and changes nothing.
 #[test]
-fn test_tnlog_unknown_record_fails_closed() {
+fn test_tndb_unknown_record_fails_closed() {
     for bad in [record::head(KIND_PUT, 9, true).to_vec(), vec![0x7e, 0, 0]] {
-        let tmp = TempDir::with_prefix("tnlog_bad_record").expect("temp dir");
+        let tmp = TempDir::with_prefix("tndb_bad_record").expect("temp dir");
         {
             let db = open(tmp.path(), CommitMode::Sync);
             db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
@@ -349,7 +349,7 @@ fn test_tnlog_unknown_record_fails_closed() {
         }
         append_unsealed(&log_path(tmp.path()), &bad);
         let len = std::fs::metadata(log_path(tmp.path())).expect("log").len();
-        assert!(TnLogDatabase::open(tmp.path()).is_err(), "{bad:?} fails the open");
+        assert!(TnDatabase::open(tmp.path()).is_err(), "{bad:?} fails the open");
         assert_eq!(std::fs::metadata(log_path(tmp.path())).expect("log").len(), len);
     }
 }
@@ -357,8 +357,8 @@ fn test_tnlog_unknown_record_fails_closed() {
 /// A scan that outlives every database handle keeps reading its snapshot (it holds the core, so
 /// the files stay open), and the database closes cleanly once the scan is gone.
 #[test]
-fn test_tnlog_scan_outlives_the_handles() {
-    let tmp = TempDir::with_prefix("tnlog_scan").expect("temp dir");
+fn test_tndb_scan_outlives_the_handles() {
+    let tmp = TempDir::with_prefix("tndb_scan").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Sync);
     for i in 0..100u64 {
         db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
@@ -370,7 +370,7 @@ fn test_tnlog_scan_outlives_the_handles() {
     drop(db);
     let count = std::iter::from_fn(|| scan.next_with(|_, _| ())).count();
     assert_eq!(count, 100);
-    assert!(TnLogDatabase::open(tmp.path()).is_err(), "still open while the scan lives");
+    assert!(TnDatabase::open(tmp.path()).is_err(), "still open while the scan lives");
     drop(scan);
     let db = open(tmp.path(), CommitMode::Sync);
     assert_eq!(rows::<TestTable>(&db).len(), 100);
@@ -378,18 +378,18 @@ fn test_tnlog_scan_outlives_the_handles() {
 
 /// A second open of a database is refused while the first holds it.
 #[test]
-fn test_tnlog_second_open_refused() {
-    let tmp = TempDir::with_prefix("tnlog_lock").expect("temp dir");
+fn test_tndb_second_open_refused() {
+    let tmp = TempDir::with_prefix("tndb_lock").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Sync);
-    assert!(TnLogDatabase::open(tmp.path()).is_err());
+    assert!(TnDatabase::open(tmp.path()).is_err());
     drop(db);
-    TnLogDatabase::open(tmp.path()).expect("reopen after close");
+    TnDatabase::open(tmp.path()).expect("reopen after close");
 }
 
 /// `persist` (group mode) returns within the time a sync takes, not a timeout.
 #[test]
-fn test_tnlog_group_persist_is_prompt() {
-    let tmp = TempDir::with_prefix("tnlog_prompt").expect("temp dir");
+fn test_tndb_group_persist_is_prompt() {
+    let tmp = TempDir::with_prefix("tndb_prompt").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
     let persisted = block_on(async {
@@ -401,8 +401,8 @@ fn test_tnlog_group_persist_is_prompt() {
 /// A failed sync latches: `persist` fails, and so does every later write and `persist` (the
 /// watermark never moves again).
 #[test]
-fn test_tnlog_failed_sync_latches() {
-    let tmp = TempDir::with_prefix("tnlog_latch").expect("temp dir");
+fn test_tndb_failed_sync_latches() {
+    let tmp = TempDir::with_prefix("tndb_latch").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
     block_on(db.persist::<TestTable>()).expect("persist");
@@ -416,8 +416,8 @@ fn test_tnlog_failed_sync_latches() {
 /// A batch that panics part-way is taken back (nothing of it is readable or survives a crash)
 /// and latches the database.
 #[test]
-fn test_tnlog_panicking_batch_is_taken_back() {
-    let tmp = TempDir::with_prefix("tnlog_panic").expect("temp dir");
+fn test_tndb_panicking_batch_is_taken_back() {
+    let tmp = TempDir::with_prefix("tndb_panic").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
@@ -441,8 +441,8 @@ fn test_tnlog_panicking_batch_is_taken_back() {
 /// On a cleanly closed log, a missing (stale) index is rebuilt alone: the other tables' indexes
 /// are trusted as they are. An index directory the manifest does not know is deleted.
 #[test]
-fn test_tnlog_stale_index_rebuilds_alone() {
-    let tmp = TempDir::with_prefix("tnlog_stale").expect("temp dir");
+fn test_tndb_stale_index_rebuilds_alone() {
+    let tmp = TempDir::with_prefix("tndb_stale").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         for i in 0..30u64 {
@@ -472,11 +472,11 @@ fn test_tnlog_stale_index_rebuilds_alone() {
 /// through together since the last persist (a transaction is never half there, in either table),
 /// and never older than that persist.
 #[test]
-fn test_tnlog_random_crashes_against_model() {
+fn test_tndb_random_crashes_against_model() {
     use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 
     type Model = (BTreeMap<u64, String>, BTreeMap<u64, String>);
-    let tmp = TempDir::with_prefix("tnlog_random").expect("temp dir");
+    let tmp = TempDir::with_prefix("tndb_random").expect("temp dir");
     let mut rng = StdRng::seed_from_u64(0x7E10_6001);
     let mut db = open(tmp.path(), CommitMode::Group);
     let mut model: Model = Default::default();
@@ -563,8 +563,8 @@ fn test_tnlog_random_crashes_against_model() {
 /// A batch becomes durable only once the commit thread's sync covering it has finished: while
 /// that sync is paused, the watermark stays below the batch and `persist` waits.
 #[test]
-fn test_tnlog_durable_only_after_the_sync() {
-    let tmp = TempDir::with_prefix("tnlog_durable_after").expect("temp dir");
+fn test_tndb_durable_only_after_the_sync() {
+    let tmp = TempDir::with_prefix("tndb_durable_after").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
     block_on(db.persist::<TestTable>()).expect("persist");
@@ -584,8 +584,8 @@ fn test_tnlog_durable_only_after_the_sync() {
 /// In `Sync` mode a writer does not need the commit thread: the first writer waiting syncs the log
 /// itself (and later waiters share its sync), so writes complete with the commit thread stopped.
 #[test]
-fn test_tnlog_sync_writers_sync_themselves() {
-    let tmp = TempDir::with_prefix("tnlog_leader").expect("temp dir");
+fn test_tndb_sync_writers_sync_themselves() {
+    let tmp = TempDir::with_prefix("tndb_leader").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Sync);
         db.stop_commit_thread();
@@ -615,8 +615,8 @@ fn test_tnlog_sync_writers_sync_themselves() {
 /// Group mode syncs on demand: a burst of writes nobody waits on is made durable within a short
 /// delay, by a few syncs rather than one per write.
 #[test]
-fn test_tnlog_group_syncs_on_demand() {
-    let tmp = TempDir::with_prefix("tnlog_demand").expect("temp dir");
+fn test_tndb_group_syncs_on_demand() {
+    let tmp = TempDir::with_prefix("tndb_demand").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     let durability = &db.core().durability;
     let before = durability.syncs.load(std::sync::atomic::Ordering::Relaxed);
@@ -635,8 +635,8 @@ fn test_tnlog_group_syncs_on_demand() {
 
 /// A `persist` syncs at once, without waiting out the delay that writes nobody waits on get.
 #[test]
-fn test_tnlog_persist_does_not_wait_for_the_delay() {
-    let tmp = TempDir::with_prefix("tnlog_persist_now").expect("temp dir");
+fn test_tndb_persist_does_not_wait_for_the_delay() {
+    let tmp = TempDir::with_prefix("tndb_persist_now").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     db.core().durability.delay_ms.store(60_000, std::sync::atomic::Ordering::Relaxed);
     for i in 0..10u64 {
@@ -652,8 +652,8 @@ fn test_tnlog_persist_does_not_wait_for_the_delay() {
 /// cap, a writer waits for (or runs) a sync before returning, so unsynced data stays bounded even
 /// when writes outrun the commit thread (here, stopped).
 #[test]
-fn test_tnlog_group_unsynced_bytes_are_capped() {
-    let tmp = TempDir::with_prefix("tnlog_backpressure").expect("temp dir");
+fn test_tndb_group_unsynced_bytes_are_capped() {
+    let tmp = TempDir::with_prefix("tndb_backpressure").expect("temp dir");
     let db = open(tmp.path(), CommitMode::Group);
     let cap = 1 << 20;
     db.core().durability.max_unsynced.store(cap, std::sync::atomic::Ordering::Relaxed);
@@ -687,8 +687,8 @@ fn manual() -> CompactionConfig {
 }
 
 /// The database at `path`, both test tables open, compacting as `compaction` says.
-fn open_compacting(path: &Path, commit: CommitMode, compaction: CompactionConfig) -> TnLogDatabase {
-    let db = TnLogDatabase::open_with(path, TnLogOptions { commit, compaction }).expect("open");
+fn open_compacting(path: &Path, commit: CommitMode, compaction: CompactionConfig) -> TnDatabase {
+    let db = TnDatabase::open_with(path, TnDbOptions { commit, compaction }).expect("open");
     db.open_table::<TestTable>().expect("open table");
     db.open_table::<OtherTable>().expect("open table");
     db
@@ -708,7 +708,7 @@ fn compact_dirs(root: &Path) -> usize {
 fn wait_only_gen(root: &Path, gen: u64) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     loop {
-        let gens = crate::tndb::layout::list_gens(root).expect("list gens");
+        let gens = super::layout::list_gens(root).expect("list gens");
         if gens == [gen] {
             return;
         }
@@ -718,13 +718,13 @@ fn wait_only_gen(root: &Path, gen: u64) {
 }
 
 /// The log's length (its end, after the last batch).
-fn log_len(db: &TnLogDatabase) -> u64 {
+fn log_len(db: &TnDatabase) -> u64 {
     db.core().writer.lock().log_len()
 }
 
 type Tables3 = [BTreeMap<u64, String>; 3];
 
-fn insert_into(db: &TnLogDatabase, table: usize, k: u64, v: &String) {
+fn insert_into(db: &TnDatabase, table: usize, k: u64, v: &String) {
     match table {
         0 => db.insert::<TestTable>(&k, v),
         1 => db.insert::<OtherTable>(&k, v),
@@ -733,7 +733,7 @@ fn insert_into(db: &TnLogDatabase, table: usize, k: u64, v: &String) {
     .expect("insert");
 }
 
-fn all_rows(db: &TnLogDatabase) -> Tables3 {
+fn all_rows(db: &TnDatabase) -> Tables3 {
     [
         db.iter::<TestTable>().collect(),
         db.iter::<OtherTable>().collect(),
@@ -744,7 +744,7 @@ fn all_rows(db: &TnLogDatabase) -> Tables3 {
 /// `ops` random writes over the three tables (puts, overwrites, removes, transactions across
 /// tables, a rare clear), applied to `model` too.
 fn churn(
-    db: &TnLogDatabase,
+    db: &TnDatabase,
     model: &mut Tables3,
     rng: &mut rand::rngs::StdRng,
     ops: usize,
@@ -816,9 +816,9 @@ fn next_checkpoint(arrivals: &std::sync::mpsc::Receiver<u32>) -> u32 {
 /// the copy, after its catch-up round, and holding the registry lock before the switch), and the
 /// compacted generation reopens clean (no index rebuilt).
 #[test]
-fn test_tnlog_compaction_preserves_rows() {
+fn test_tndb_compaction_preserves_rows() {
     use rand::SeedableRng as _;
-    let tmp = TempDir::with_prefix("tnlog_compact_rows").expect("temp dir");
+    let tmp = TempDir::with_prefix("tndb_compact_rows").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     db.open_table::<ThirdTable>().expect("open table");
     let mut rng = rand::rngs::StdRng::seed_from_u64(0xC0_4AC7);
@@ -862,8 +862,8 @@ fn test_tnlog_compaction_preserves_rows() {
 /// A compaction gives back what removals and overwrites left dead, deletes the old generation,
 /// and records the new log's length as the base the trigger doubles from.
 #[test]
-fn test_tnlog_compaction_returns_space() {
-    let tmp = TempDir::with_prefix("tnlog_compact_space").expect("temp dir");
+fn test_tndb_compaction_returns_space() {
+    let tmp = TempDir::with_prefix("tndb_compact_space").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(4096);
     for i in 0..2_000_u64 {
@@ -897,8 +897,8 @@ fn test_tnlog_compaction_returns_space() {
 /// it is past the configured size and twice its last compacted length (the base), which a reopen
 /// keeps.
 #[test]
-fn test_tnlog_compaction_trigger() {
-    let tmp = TempDir::with_prefix("tnlog_compact_trigger").expect("temp dir");
+fn test_tndb_compaction_trigger() {
+    let tmp = TempDir::with_prefix("tndb_compact_trigger").expect("temp dir");
     let config = CompactionConfig { auto_min_bytes: Some(1 << 20), bytes_per_sec: 0 };
     let db = open_compacting(tmp.path(), CommitMode::Group, config);
     let value = "v".repeat(4096);
@@ -943,8 +943,8 @@ fn test_tnlog_compaction_trigger() {
 /// still unfixed: the key size comes from the live table, and an unfixed one is never cached, so
 /// the compaction keeps the rows.
 #[test]
-fn test_tnlog_compaction_first_rows_of_an_unfixed_table() {
-    let tmp = TempDir::with_prefix("tnlog_compact_unfixed").expect("temp dir");
+fn test_tndb_compaction_first_rows_of_an_unfixed_table() {
+    let tmp = TempDir::with_prefix("tndb_compact_unfixed").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..50_u64 {
         db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
@@ -979,8 +979,8 @@ fn test_tnlog_compaction_first_rows_of_an_unfixed_table() {
 /// Each copied row is a whole batch: rows written inside a transaction (their records not its
 /// last) survive a crash right after the compaction, with nothing written since.
 #[test]
-fn test_tnlog_compaction_copied_rows_are_whole_batches() {
-    let tmp = TempDir::with_prefix("tnlog_compact_batches").expect("temp dir");
+fn test_tndb_compaction_copied_rows_are_whole_batches() {
+    let tmp = TempDir::with_prefix("tndb_compact_batches").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let mut txn = db.write_txn().expect("txn");
     for i in 1..=3_u64 {
@@ -999,8 +999,8 @@ fn test_tnlog_compaction_copied_rows_are_whole_batches() {
 /// A table registered (and its rows written) during a compaction, and a clear during one, are
 /// carried into the compacted generation.
 #[test]
-fn test_tnlog_compaction_table_opened_and_cleared_during() {
-    let tmp = TempDir::with_prefix("tnlog_compact_during").expect("temp dir");
+fn test_tndb_compaction_table_opened_and_cleared_during() {
+    let tmp = TempDir::with_prefix("tndb_compact_during").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..50_u64 {
         db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
@@ -1022,7 +1022,7 @@ fn test_tnlog_compaction_table_opened_and_cleared_during() {
     });
     assert_eq!(switched, Ok(true));
     let expect_test: Vec<u64> = (100..105).collect();
-    let keys = |db: &TnLogDatabase| db.iter::<TestTable>().map(|(k, _)| k).collect::<Vec<_>>();
+    let keys = |db: &TnDatabase| db.iter::<TestTable>().map(|(k, _)| k).collect::<Vec<_>>();
     assert_eq!(keys(&db), expect_test, "only the rows written after the clear");
     assert_eq!(db.iter::<ThirdTable>().count(), 7);
     drop(db);
@@ -1035,8 +1035,8 @@ fn test_tnlog_compaction_table_opened_and_cleared_during() {
 
 /// A scan started before a switch reads its snapshot whole across it.
 #[test]
-fn test_tnlog_compaction_scan_across_the_switch() {
-    let tmp = TempDir::with_prefix("tnlog_compact_scan").expect("temp dir");
+fn test_tndb_compaction_scan_across_the_switch() {
+    let tmp = TempDir::with_prefix("tndb_compact_scan").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..100_u64 {
         db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
@@ -1056,8 +1056,8 @@ fn test_tnlog_compaction_scan_across_the_switch() {
 /// The switch holds the registry lock: a table's key size cannot be fixed (its index created in
 /// the generation being retired) until the switch is done.
 #[test]
-fn test_tnlog_compaction_switch_holds_the_registry() {
-    let tmp = TempDir::with_prefix("tnlog_compact_registry").expect("temp dir");
+fn test_tndb_compaction_switch_holds_the_registry() {
+    let tmp = TempDir::with_prefix("tndb_compact_registry").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..20_u64 {
         db.insert::<TestTable>(&i, &format!("t{i}")).expect("insert");
@@ -1087,8 +1087,8 @@ fn test_tnlog_compaction_switch_holds_the_registry() {
 /// When more than the switch's cap lands while it waits for the write lock, it lets go, catches
 /// up in the background, and switches on its next try, with every row kept.
 #[test]
-fn test_tnlog_compaction_switch_tail_is_bounded() {
-    let tmp = TempDir::with_prefix("tnlog_compact_tail").expect("temp dir");
+fn test_tndb_compaction_switch_tail_is_bounded() {
+    let tmp = TempDir::with_prefix("tndb_compact_tail").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(64 << 10);
     for i in 0..10_u64 {
@@ -1118,8 +1118,8 @@ fn test_tnlog_compaction_switch_tail_is_bounded() {
 /// A crash after a switch: the compacted generation is current, and every write made durable
 /// (before or after the switch) is there.
 #[test]
-fn test_tnlog_compaction_crash_after_the_switch() {
-    let tmp = TempDir::with_prefix("tnlog_compact_crash").expect("temp dir");
+fn test_tndb_compaction_crash_after_the_switch() {
+    let tmp = TempDir::with_prefix("tndb_compact_crash").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..100_u64 {
         db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
@@ -1143,8 +1143,8 @@ fn test_tnlog_compaction_crash_after_the_switch() {
 
 /// An open deletes an unfinished compaction's directory (it is never a generation).
 #[test]
-fn test_tnlog_compaction_leftover_is_deleted_at_open() {
-    let tmp = TempDir::with_prefix("tnlog_compact_leftover").expect("temp dir");
+fn test_tndb_compaction_leftover_is_deleted_at_open() {
+    let tmp = TempDir::with_prefix("tndb_compact_leftover").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Sync, manual());
     db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
     drop(db);
@@ -1158,18 +1158,18 @@ fn test_tnlog_compaction_leftover_is_deleted_at_open() {
 
 /// A generation directory without a log is refused, not opened as an empty database.
 #[test]
-fn test_tnlog_generation_without_a_log_is_refused() {
-    let tmp = TempDir::with_prefix("tnlog_gen_no_log").expect("temp dir");
+fn test_tndb_generation_without_a_log_is_refused() {
+    let tmp = TempDir::with_prefix("tndb_gen_no_log").expect("temp dir");
     drop(open_compacting(tmp.path(), CommitMode::Sync, manual()));
     std::fs::create_dir(tmp.path().join("gen-1")).expect("mkdir");
-    let err = TnLogDatabase::open(tmp.path()).expect_err("a generation with no log");
+    let err = TnDatabase::open(tmp.path()).expect_err("a generation with no log");
     assert!(format!("{err:#}").contains("has no log"), "{err:#}");
 }
 
 /// Closing the database cancels a running compaction promptly, and leaves nothing of it.
 #[test]
-fn test_tnlog_compaction_close_cancels() {
-    let tmp = TempDir::with_prefix("tnlog_compact_close").expect("temp dir");
+fn test_tndb_compaction_close_cancels() {
+    let tmp = TempDir::with_prefix("tndb_compact_close").expect("temp dir");
     let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 20 };
     let db = open_compacting(tmp.path(), CommitMode::Group, config);
     let value = "v".repeat(4096);
@@ -1187,7 +1187,7 @@ fn test_tnlog_compaction_close_cancels() {
     assert!(closing.elapsed() < Duration::from_secs(2), "closed in {:?}", closing.elapsed());
     assert_eq!(compact_dirs(tmp.path()), 0, "the cancelled compaction left nothing");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
-    assert_eq!(crate::tndb::layout::list_gens(tmp.path()).expect("gens"), [0]);
+    assert_eq!(super::layout::list_gens(tmp.path()).expect("gens"), [0]);
     assert_eq!(db.iter::<TestTable>().count(), 2_048);
 }
 
@@ -1195,9 +1195,9 @@ fn test_tnlog_compaction_close_cancels() {
 /// panic, a row count that does not match) is abandoned: its files are deleted, the database
 /// carries on in its generation, and a later compaction still runs.
 #[test]
-fn test_tnlog_compaction_failures_before_the_rename_abandon() {
+fn test_tndb_compaction_failures_before_the_rename_abandon() {
     use std::sync::atomic::Ordering::Relaxed;
-    let tmp = TempDir::with_prefix("tnlog_compact_fail").expect("temp dir");
+    let tmp = TempDir::with_prefix("tndb_compact_fail").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..100_u64 {
         db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
@@ -1207,7 +1207,7 @@ fn test_tnlog_compaction_failures_before_the_rename_abandon() {
         let err = result.expect_err(why);
         assert!(err.contains(why), "{err}");
         assert_eq!(compact_dirs(tmp.path()), 0, "{why}: nothing left");
-        assert_eq!(crate::tndb::layout::list_gens(tmp.path()).expect("gens"), [0]);
+        assert_eq!(super::layout::list_gens(tmp.path()).expect("gens"), [0]);
     };
     hooks.fail_next.store(true, Relaxed);
     abandoned(db.compact_now(), "injected");
@@ -1241,10 +1241,10 @@ fn test_tnlog_compaction_failures_before_the_rename_abandon() {
 /// A switch that fails after its rename (its directory sync, or a panic) stops the writer:
 /// which generation the next open picks is unknown. Either one holds every row.
 #[test]
-fn test_tnlog_compaction_failure_after_the_rename_stops_the_writer() {
+fn test_tndb_compaction_failure_after_the_rename_stops_the_writer() {
     use std::sync::atomic::Ordering::Relaxed;
     for panic in [false, true] {
-        let tmp = TempDir::with_prefix("tnlog_compact_after").expect("temp dir");
+        let tmp = TempDir::with_prefix("tndb_compact_after").expect("temp dir");
         let db = open_compacting(tmp.path(), CommitMode::Group, manual());
         for i in 0..100_u64 {
             db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
@@ -1268,8 +1268,8 @@ fn test_tnlog_compaction_failure_after_the_rename_stops_the_writer() {
 /// middle: the round finishes on the retired generation, latches nothing, and the persist
 /// resolves; later writes in the new generation are made durable as usual.
 #[test]
-fn test_tnlog_compaction_sync_round_across_the_switch() {
-    let tmp = TempDir::with_prefix("tnlog_compact_round").expect("temp dir");
+fn test_tndb_compaction_sync_round_across_the_switch() {
+    let tmp = TempDir::with_prefix("tndb_compact_round").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..50_u64 {
         db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
@@ -1297,8 +1297,8 @@ fn test_tnlog_compaction_sync_round_across_the_switch() {
 /// round) no longer makes the compaction give up: once the rounds run out it goes to the switch,
 /// which takes the rest under the write lock, and every row is kept.
 #[test]
-fn test_tnlog_compaction_completes_when_the_catch_up_never_converges() {
-    let tmp = TempDir::with_prefix("tnlog_compact_outrun_rounds").expect("temp dir");
+fn test_tndb_compaction_completes_when_the_catch_up_never_converges() {
+    let tmp = TempDir::with_prefix("tndb_compact_outrun_rounds").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(64 << 10);
     for i in 0..10_u64 {
@@ -1330,8 +1330,8 @@ fn test_tnlog_compaction_completes_when_the_catch_up_never_converges() {
 /// compaction give up: the last try takes the tail under the write lock (a bounded stall), and
 /// every row is kept.
 #[test]
-fn test_tnlog_compaction_last_switch_takes_a_large_tail() {
-    let tmp = TempDir::with_prefix("tnlog_compact_outrun_switch").expect("temp dir");
+fn test_tndb_compaction_last_switch_takes_a_large_tail() {
+    let tmp = TempDir::with_prefix("tndb_compact_outrun_switch").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(64 << 10);
     for i in 0..10_u64 {
@@ -1367,8 +1367,8 @@ fn test_tnlog_compaction_last_switch_takes_a_large_tail() {
 /// tables), the log compacts at once, whatever its growth threshold: nothing is live, so the
 /// compaction is a near-free reset that returns the disk. Clearing only some tables does not.
 #[test]
-fn test_tnlog_compaction_when_every_table_is_emptied() {
-    let tmp = TempDir::with_prefix("tnlog_compact_emptied").expect("temp dir");
+fn test_tndb_compaction_when_every_table_is_emptied() {
+    let tmp = TempDir::with_prefix("tndb_compact_emptied").expect("temp dir");
     let config = CompactionConfig { auto_min_bytes: Some(1 << 40), bytes_per_sec: 0 };
     let db = open_compacting(tmp.path(), CommitMode::Group, config);
     let value = "v".repeat(64 << 10);
@@ -1387,8 +1387,8 @@ fn test_tnlog_compaction_when_every_table_is_emptied() {
 
 /// With compaction off, emptying every table compacts nothing.
 #[test]
-fn test_tnlog_no_compaction_when_emptied_with_compaction_off() {
-    let tmp = TempDir::with_prefix("tnlog_compact_emptied_off").expect("temp dir");
+fn test_tndb_no_compaction_when_emptied_with_compaction_off() {
+    let tmp = TempDir::with_prefix("tndb_compact_emptied_off").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(64 << 10);
     for i in 0..20_u64 {
@@ -1404,9 +1404,9 @@ fn test_tnlog_no_compaction_when_emptied_with_compaction_off() {
 /// up unflushed (on Linux, dirty pages throttle every writer); its round syncs stay the durability
 /// points. The counter shows the calls; whether pages were written back is not observable here.
 #[test]
-fn test_tnlog_compaction_writes_back_as_it_goes() {
+fn test_tndb_compaction_writes_back_as_it_goes() {
     use std::sync::atomic::Ordering::Relaxed;
-    let tmp = TempDir::with_prefix("tnlog_compact_writeback").expect("temp dir");
+    let tmp = TempDir::with_prefix("tndb_compact_writeback").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     let value = "v".repeat(64 << 10);
     for i in 0..48_u64 {
@@ -1421,8 +1421,8 @@ fn test_tnlog_compaction_writes_back_as_it_goes() {
 /// A close (or a crash) between emptying every table and the compaction that follows loses no
 /// reset: the next open notes the emptied log, and its first batch asks for the compaction.
 #[test]
-fn test_tnlog_compaction_after_reopening_an_emptied_log() {
-    let tmp = TempDir::with_prefix("tnlog_compact_emptied_reopen").expect("temp dir");
+fn test_tndb_compaction_after_reopening_an_emptied_log() {
+    let tmp = TempDir::with_prefix("tndb_compact_emptied_reopen").expect("temp dir");
     let value = "v".repeat(64 << 10);
     {
         // Compaction off: the clears leave the log as it is.
@@ -1446,9 +1446,9 @@ fn test_tnlog_compaction_after_reopening_an_emptied_log() {
 /// a switch (the rename done, the old generation not yet deleted), the old one is the only other
 /// copy if the newest fails to replay. No fallback to it: the newest may hold acked batches.
 #[test]
-fn test_tnlog_failed_open_keeps_the_older_generation() {
-    let tmp = TempDir::with_prefix("tnlog_keep_old_gen").expect("temp dir");
-    let saved = TempDir::with_prefix("tnlog_keep_old_gen_saved").expect("temp dir");
+fn test_tndb_failed_open_keeps_the_older_generation() {
+    let tmp = TempDir::with_prefix("tndb_keep_old_gen").expect("temp dir");
+    let saved = TempDir::with_prefix("tndb_keep_old_gen_saved").expect("temp dir");
     let root = tmp.path();
     {
         let db = open_compacting(root, CommitMode::Sync, manual());
@@ -1475,15 +1475,15 @@ fn test_tnlog_failed_open_keeps_the_older_generation() {
     // The newest fails to replay: the open fails, and the older generation is still there.
     copy_dir(saved.path(), &root.join("gen-0"));
     append_unsealed(&root.join("gen-1").join("log"), &record::head(KIND_PUT, 9, true));
-    assert!(TnLogDatabase::open(root).is_err(), "the damaged newest generation fails the open");
+    assert!(TnDatabase::open(root).is_err(), "the damaged newest generation fails the open");
     assert!(root.join("gen-0").join("log").exists(), "the older generation is kept");
 }
 
 /// The free-space guard also runs during the copy, the longest phase (once per MiB): a disk that
 /// fills meanwhile abandons the compaction before its copy ends, not after it.
 #[test]
-fn test_tnlog_compaction_copy_gives_way_to_a_full_disk() {
-    let tmp = TempDir::with_prefix("tnlog_compact_copy_room").expect("temp dir");
+fn test_tndb_compaction_copy_gives_way_to_a_full_disk() {
+    let tmp = TempDir::with_prefix("tndb_compact_copy_room").expect("temp dir");
     // Paced at 1 MiB/s: the 4 MiB copy takes about 4 s.
     let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 20 };
     let db = open_compacting(tmp.path(), CommitMode::Group, config);
@@ -1536,8 +1536,8 @@ fn damage_index_below_the_root(gen: &Path) {
 /// A removal whose key the index cannot read (a damaged page) fails: counted as "absent", it
 /// would write nothing, and the row would silently survive its removal.
 #[test]
-fn test_tnlog_remove_through_a_damaged_index_fails() {
-    let tmp = TempDir::with_prefix("tnlog_remove_damaged").expect("temp dir");
+fn test_tndb_remove_through_a_damaged_index_fails() {
+    let tmp = TempDir::with_prefix("tndb_remove_damaged").expect("temp dir");
     {
         let db = open(tmp.path(), CommitMode::Group);
         for i in 0..2_000_u64 {
@@ -1555,16 +1555,16 @@ fn test_tnlog_remove_through_a_damaged_index_fails() {
 /// exists but before its log does leaves no log-less generation, which every later open would
 /// refuse; the next open creates the database afresh.
 #[test]
-fn test_tnlog_interrupted_creation_reopens() {
-    let tmp = TempDir::with_prefix("tnlog_gen0_build").expect("temp dir");
+fn test_tndb_interrupted_creation_reopens() {
+    let tmp = TempDir::with_prefix("tndb_gen0_build").expect("temp dir");
     super::store::FAIL_GEN0_BUILD.with(|fail| fail.set(true));
-    assert!(TnLogDatabase::open(tmp.path()).is_err(), "the injected failure");
+    assert!(TnDatabase::open(tmp.path()).is_err(), "the injected failure");
     // A crash part way would also leave its build directory: the next open deletes it.
     std::fs::create_dir(tmp.path().join("compact-0-1-1")).expect("a leftover build");
     let db = open(tmp.path(), CommitMode::Sync);
     db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
     drop(db);
-    assert_eq!(crate::tndb::layout::list_gens(tmp.path()).expect("gens"), [0]);
+    assert_eq!(super::layout::list_gens(tmp.path()).expect("gens"), [0]);
     assert_eq!(compact_dirs(tmp.path()), 0, "no build left behind");
     let db = open(tmp.path(), CommitMode::Sync);
     assert_eq!(rows::<TestTable>(&db), [(1, "a".to_string())]);
@@ -1574,8 +1574,8 @@ fn test_tnlog_interrupted_creation_reopens() {
 /// entry that lands on another row's record is `CorruptIndex`, never that row's value, and a
 /// compaction abandons rather than copy the mismatch.
 #[test]
-fn test_tnlog_misindexed_row_is_corrupt_not_another_value() {
-    let tmp = TempDir::with_prefix("tnlog_misindexed").expect("temp dir");
+fn test_tndb_misindexed_row_is_corrupt_not_another_value() {
+    let tmp = TempDir::with_prefix("tndb_misindexed").expect("temp dir");
     let db = open_compacting(tmp.path(), CommitMode::Group, manual());
     for i in 0..10_u64 {
         db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");

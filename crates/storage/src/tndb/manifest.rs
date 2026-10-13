@@ -7,7 +7,7 @@
 //! not is damage.
 //!
 //! ```text
-//! magic "TNLOGTBL" (8) | version (1) | count (u16 LE)
+//! magic "TNDBTABL" (8) | version (1) | count (u16 LE)
 //!   count x [ id (u16 LE) | key size (u16 LE, 0 = not yet fixed) | name length (u8) | name ]
 //! crc32 (u32 LE) of everything before it
 //! ```
@@ -21,12 +21,12 @@ use crate::{
         crc::crc32,
         data_file::{fsync_directory, fsync_file},
     },
-    tnlog::TableId,
+    tndb::TableId,
 };
 
 const FILE: &str = "tables";
 const TMP: &str = "tables.tmp";
-const MAGIC: &[u8; 8] = b"TNLOGTBL";
+const MAGIC: &[u8; 8] = b"TNDBTABL";
 const VERSION: u8 = 1;
 
 /// One table of the database.
@@ -54,12 +54,12 @@ impl Manifest {
     /// Add table `name` (key size not yet fixed) under the next unused id, and return the id.
     pub(super) fn add(&mut self, name: &str) -> eyre::Result<TableId> {
         if name.len() > u8::MAX as usize {
-            bail!("tnlog: table name {name} is longer than {} bytes", u8::MAX);
+            bail!("tndb: table name {name} is longer than {} bytes", u8::MAX);
         }
         let id = match self.tables.iter().map(|entry| entry.id).max() {
             None => 0,
             Some(last) => {
-                last.checked_add(1).ok_or_else(|| eyre::eyre!("tnlog: no table id is left"))?
+                last.checked_add(1).ok_or_else(|| eyre::eyre!("tndb: no table id is left"))?
             }
         };
         self.tables.push(Entry { id, name: name.to_string(), ksize: 0 });
@@ -90,7 +90,7 @@ impl Manifest {
     }
 
     fn from_bytes(bytes: &[u8]) -> eyre::Result<Self> {
-        let corrupt = || eyre::eyre!("tnlog: the table manifest is corrupt");
+        let corrupt = || eyre::eyre!("tndb: the table manifest is corrupt");
         let (body, crc) =
             bytes.split_at_checked(bytes.len().saturating_sub(4)).ok_or_else(corrupt)?;
         if body.len() < 11 || &body[..8] != MAGIC || crc32(body).to_le_bytes() != crc {
@@ -98,7 +98,7 @@ impl Manifest {
         }
         if body[8] != VERSION {
             bail!(
-                "tnlog: the table manifest has format version {}, this build reads {VERSION}",
+                "tndb: the table manifest has format version {}, this build reads {VERSION}",
                 body[8]
             );
         }
@@ -128,7 +128,7 @@ impl Manifest {
         match fs::read(root.join(FILE)) {
             Ok(bytes) => Self::from_bytes(&bytes).map(Some),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e).wrap_err("tnlog: read the table manifest"),
+            Err(e) => Err(e).wrap_err("tndb: read the table manifest"),
         }
     }
 
@@ -159,8 +159,8 @@ mod test {
     use super::*;
 
     #[test]
-    fn test_tnlog_manifest_roundtrip_and_corruption() {
-        let tmp = TempDir::with_prefix("tnlog_manifest").expect("temp dir");
+    fn test_tndb_manifest_roundtrip_and_corruption() {
+        let tmp = TempDir::with_prefix("tndb_manifest").expect("temp dir");
         assert_eq!(Manifest::read(tmp.path()).expect("read"), None, "no manifest yet");
         let mut manifest = Manifest::default();
         assert_eq!(manifest.add("Votes").expect("add"), 0);

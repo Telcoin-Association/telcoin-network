@@ -39,9 +39,9 @@
 //!   over `SafeNoSync`; on Linux (production) `msync(MS_SYNC)` takes the filesystem's fsync path
 //!   and costs more, for tndb and MDBX alike. The MDBX page size follows the OS page size: 16 KiB
 //!   on Apple Silicon, 4 KiB on x86_64.
-//! - A tndb commit msyncs the value log of each table it wrote, then publishes the writes: real
-//!   durability in every build. Its `persist` is the trait's ready no-op, so raw tndb pays that
-//!   sync in `small_commits` as well as `durable_commits`.
+//! - A tndb write (in `CommitMode::Sync`, as opened here) waits for the sync of its one shared log
+//!   covering it before it returns: real durability in every build. Its `persist` only reports a
+//!   failed sync, so raw tndb pays that sync in `small_commits` as well as `durable_commits`.
 
 use std::{
     path::Path,

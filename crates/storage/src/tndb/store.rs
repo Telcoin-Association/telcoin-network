@@ -45,8 +45,10 @@ use crate::{
         pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
     },
     tndb::{
-        layout::{compact_dir, drop_in_background, gen_dir, list_gens, lock_table, remove_spares},
-        CompactionConfig,
+        database::CompactionConfig,
+        layout::{
+            compact_dir, drop_in_background, gen_dir, list_gens, lock_dir, remove_unfinished,
+        },
     },
 };
 
@@ -115,7 +117,7 @@ impl Drop for GenAlive {
     /// off the path of whichever writer, reader or sync round let go of it last.
     fn drop(&mut self) {
         if let Some(retired) = self.retired.get_mut().take() {
-            drop_in_background(retired, "tnlog-reap");
+            drop_in_background(retired, "tndb-reap");
         }
     }
 }
@@ -243,7 +245,7 @@ impl TableShared {
 /// Log a scan or seek ended by an error: `DBIter` cannot carry it, but a damaged table must not
 /// pass for a shorter one in silence.
 fn scan_error(table: &str, e: &FetchError) {
-    tracing::error!(target: "tnlog", "scan of table {table} ended by an error: {e}");
+    tracing::error!(target: "tndb", "scan of table {table} ended by an error: {e}");
 }
 
 /// A lazy, key-ordered scan of a published snapshot.
@@ -401,7 +403,7 @@ pub(super) struct NewGen {
 impl Writer {
     pub(super) fn check(&self) -> eyre::Result<()> {
         if let Some(cause) = &self.failed {
-            bail!("tnlog: the writer stopped ({cause}); restart to recover");
+            bail!("tndb: the writer stopped ({cause}); restart to recover");
         }
         if self.durability.is_failed() {
             // A failed sync leaves the log's state on disk unknown: never seal it as clean.
@@ -445,12 +447,12 @@ impl Writer {
             let table = self
                 .tables
                 .get(&id)
-                .ok_or_else(|| eyre::eyre!("tnlog: table {id} is not in the database"))?;
+                .ok_or_else(|| eyre::eyre!("tndb: table {id} is not in the database"))?;
             match op {
                 BatchOp::Put(_, key, _) => {
                     if table.ksize == 0 || key.len() != table.ksize as usize {
                         bail!(
-                            "tnlog: a {}-byte key in table {} of {}-byte keys",
+                            "tndb: a {}-byte key in table {} of {}-byte keys",
                             key.len(),
                             table.shared.name,
                             table.ksize
@@ -462,7 +464,7 @@ impl Writer {
                     let held = match &table.idx {
                         Some(idx) if !cleared.contains(&id) => {
                             idx.contains(key).wrap_err_with(|| {
-                                format!("tnlog: remove from table {}", table.shared.name)
+                                format!("tndb: remove from table {}", table.shared.name)
                             })?
                         }
                         _ => false,
@@ -552,7 +554,7 @@ impl Writer {
     }
 
     pub(super) fn stop(&mut self, cause: String) {
-        tracing::error!(target: "tnlog", "{cause}; writes stop until a restart");
+        tracing::error!(target: "tndb", "{cause}; writes stop until a restart");
         self.durability.fail(cause.clone());
         self.failed.get_or_insert(cause);
     }
@@ -725,10 +727,10 @@ impl Core {
         config: CompactionConfig,
     ) -> eyre::Result<Self> {
         fs::create_dir_all(root)?;
-        let lock = lock_table(root)?;
+        let lock = lock_dir(root)?;
         Manifest::remove_tmp(root);
         // An unfinished compaction is never a generation.
-        remove_spares(root)?;
+        remove_unfinished(root)?;
         let manifest = Manifest::read(root)?.unwrap_or_default();
         let (gen, mut log, older) = open_current_gen(root)?;
         let gen_path = gen_dir(root, gen);
@@ -776,7 +778,7 @@ impl Core {
         // is no longer the only other copy.
         for old in older {
             if let Err(e) = fs::remove_dir_all(gen_dir(root, old)) {
-                tracing::warn!(target: "tnlog", "remove old generation {old}: {e}");
+                tracing::warn!(target: "tndb", "remove old generation {old}: {e}");
             }
         }
 
@@ -948,9 +950,9 @@ impl Core {
             return check_ksize(table, fixed, ksize);
         }
         let ksize16 = u16::try_from(ksize)
-            .map_err(|_| eyre::eyre!("tnlog: a {ksize}-byte key is too long"))?;
+            .map_err(|_| eyre::eyre!("tndb: a {ksize}-byte key is too long"))?;
         if ksize16 == 0 {
-            bail!("tnlog: table {} has an empty key", table.name);
+            bail!("tndb: table {} has an empty key", table.name);
         }
         let mut manifest = self.registry.lock();
         let fixed = table.ksize();
@@ -1072,7 +1074,7 @@ impl Core {
 
 fn check_ksize(table: &TableShared, fixed: u16, ksize: usize) -> eyre::Result<()> {
     if ksize != fixed as usize {
-        bail!("tnlog: a {ksize}-byte key in table {} of {fixed}-byte keys", table.name);
+        bail!("tndb: a {ksize}-byte key in table {} of {fixed}-byte keys", table.name);
     }
     Ok(())
 }
@@ -1123,7 +1125,7 @@ fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
     let Some(&current) = gens.last() else {
         // Built aside and renamed into place, so a failure (or a crash) part way leaves no
         // log-less generation 0, which every later open would refuse; a leftover build is
-        // deleted by the next open (`remove_spares`).
+        // deleted by the next open (`remove_unfinished`).
         let build = compact_dir(root, 0);
         if let Err(e) = build_gen0(&build) {
             let _ = fs::remove_dir_all(&build);
@@ -1131,16 +1133,16 @@ fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
         }
         let dir = gen_dir(root, 0);
         fs::rename(&build, &dir)
-            .wrap_err_with(|| format!("tnlog: rename {} into place", build.display()))?;
+            .wrap_err_with(|| format!("tndb: rename {} into place", build.display()))?;
         crate::archive::data_file::fsync_directory(root)?;
         return Ok((0, open_log(&dir)?, Vec::new()));
     };
     let dir = gen_dir(root, current);
     if !dir.join("log").exists() {
-        bail!("tnlog: generation {current} of {} has no log", root.display());
+        bail!("tndb: generation {current} of {} has no log", root.display());
     }
     let log = open_log(&dir)
-        .wrap_err_with(|| format!("tnlog: open generation {current} of {}", root.display()))?;
+        .wrap_err_with(|| format!("tndb: open generation {current} of {}", root.display()))?;
     let older = gens.into_iter().filter(|&n| n < current).collect();
     Ok((current, log, older))
 }
@@ -1148,10 +1150,10 @@ fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
 /// Build an empty first generation in `dir`: its log, committed and closed, and the directory
 /// synced.
 fn build_gen0(dir: &Path) -> eyre::Result<()> {
-    fs::create_dir(dir).wrap_err_with(|| format!("tnlog: create {}", dir.display()))?;
+    fs::create_dir(dir).wrap_err_with(|| format!("tndb: create {}", dir.display()))?;
     #[cfg(test)]
     if FAIL_GEN0_BUILD.with(|fail| fail.replace(false)) {
-        bail!("tnlog: injected failure building generation 0");
+        bail!("tndb: injected failure building generation 0");
     }
     let log = open_log(dir)?;
     log.commit()?;
@@ -1216,7 +1218,7 @@ fn replay(
             Some(Ok(payload)) => payload,
         };
         let record = record::parse(payload, |id| ksizes.get(&id).copied())
-            .wrap_err_with(|| format!("tnlog: the record at {start}"))?;
+            .wrap_err_with(|| format!("tndb: the record at {start}"))?;
         if rows.contains_key(&record.table) {
             pending.push((
                 record.table,
@@ -1244,10 +1246,10 @@ fn replay(
         }
     }
     if torn && !log.opened_unclean() {
-        bail!("tnlog: the log was closed cleanly but does not replay to its end (corrupt)");
+        bail!("tndb: the log was closed cleanly but does not replay to its end (corrupt)");
     }
     if log.opened_unclean() && log.committed_end().is_some_and(|committed| end < committed) {
-        bail!("tnlog: the log's whole batches end at {end}, below its commit marker");
+        bail!("tndb: the log's whole batches end at {end}, below its commit marker");
     }
     Ok((rows, end))
 }

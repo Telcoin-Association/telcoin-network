@@ -1,21 +1,24 @@
-//! Group commit: writes return without a disk sync, and one background thread commits them.
+//! Durability: the commit thread and the barriers that wait for it.
 //!
-//! In [`CommitMode::Group`](super::CommitMode) a write applies to its table and is published at
-//! once (readable from any thread on return), numbered from a database-wide sequence. A
-//! `tndb-commit` thread ([`Committer`]) then commits every table written since its last round:
-//! one sync per table per round, however many writes landed, with the sync itself outside the
-//! table's writer lock (see `TnTable::group_commit`), so writers never wait on the disk.
+//! A sync takes no lock a writer takes. Each batch ends at a commit point (its flagged last
+//! record), and each write stores the log's frontier (generation, end, batch number) as one
+//! value when its batch is whole. A sync round ([`sync_round`]) loads the frontier, `msync`s the
+//! log up to its end through the generation's view (and `fsync`s a duplicate descriptor if the
+//! log grew), and then every batch numbered up to the frontier's is durable. One round runs at a
+//! time (the core's sync lock), however many writers are waiting for it.
 //!
-//! [`GroupCommit::persist`] is the durability barrier: it resolves once every write numbered
-//! before the call is committed, in every table (a whole-database, FIFO barrier), and fails from
-//! the first failed write or commit on (a latch never cleared). A table written by an open write
-//! transaction is left uncommitted until the transaction ends, so a transaction never becomes
-//! durable in part in a table, and the barrier waits for it.
+//! Who syncs: in `CommitMode::Sync` the first writer waiting runs the round itself
+//! ([`wait_durable`]; the others wait for it, and one of them leads the next round if the first
+//! did not cover them), so a write costs no thread hand-off. In `CommitMode::Group` the commit
+//! thread syncs **on demand**: at once when a [`Durability::persist`] waits; otherwise once the
+//! unsynced writes are [`SYNC_DELAY`] old or [`SYNC_BYTES`] large, so a burst nobody waits on is
+//! made durable by a few syncs, not one per write. The first failure (a failed sync, a writer that
+//! stopped, a panic) is latched: every later barrier and write fails, and the watermark never moves
+//! again.
 
 use std::{
-    collections::{BTreeMap, BTreeSet},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{fence, AtomicBool, AtomicU64, Ordering},
         Arc,
     },
     thread::JoinHandle,
@@ -24,223 +27,197 @@ use std::{
 
 use parking_lot::{Condvar, Mutex};
 
-use super::database::StoreType;
+use super::store::Core;
+use crate::archive::data_file::fsync_file;
 
-/// How often the committer asks every table to compact (see `Database::compact`).
-const COMPACT_EVERY: Duration = Duration::from_secs(24 * 60 * 60);
+/// The longest a write nobody waits on stays unsynced in `CommitMode::Group` (the data a crash can
+/// lose that no `persist` was told is durable).
+const SYNC_DELAY: Duration = Duration::from_millis(2);
 
-/// Test-only: what the committers did (every database's, process-wide), for the benches.
-#[cfg(test)]
-pub(crate) mod stats {
-    use std::{
-        sync::atomic::{AtomicU64, Ordering},
-        time::Duration,
-    };
+/// Unsynced bytes at which the commit thread syncs without waiting out [`SYNC_DELAY`].
+const SYNC_BYTES: u64 = 4 << 20;
 
-    pub(crate) static ROUNDS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static ROUND_NS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static DATA_SYNCS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static DATA_SYNC_NS: AtomicU64 = AtomicU64::new(0);
-    /// The committer's writer-lock acquisitions (waits) and its locked steps (holds).
-    pub(crate) static LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static LOCK_HOLDS: AtomicU64 = AtomicU64::new(0);
-    pub(crate) static LOCK_HOLD_NS: AtomicU64 = AtomicU64::new(0);
+/// The most unsynced bytes a log holds in `CommitMode::Group` before a writer waits for a sync
+/// (backpressure): writes nobody waits on cannot outrun the disk without bound.
+const MAX_UNSYNCED: u64 = 64 << 20;
 
-    /// Count one event of `count` taking `took` (added to `ns`).
-    pub(crate) fn add(count: &AtomicU64, ns: &AtomicU64, took: Duration) {
-        count.fetch_add(1, Ordering::Relaxed);
-        ns.fetch_add(took.as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    /// Committer rounds and the syncs they ran, since the last take.
-    #[derive(Clone, Copy, Debug, Default)]
-    pub(crate) struct GroupStats {
-        pub(crate) rounds: u64,
-        pub(crate) round_ns: u64,
-        pub(crate) data_syncs: u64,
-        pub(crate) data_sync_ns: u64,
-        pub(crate) lock_waits: u64,
-        pub(crate) lock_wait_ns: u64,
-        pub(crate) lock_holds: u64,
-        pub(crate) lock_hold_ns: u64,
-    }
-
-    /// The counts since the last take, resetting them.
-    pub(crate) fn take() -> GroupStats {
-        let take = |c: &AtomicU64| c.swap(0, Ordering::Relaxed);
-        GroupStats {
-            rounds: take(&ROUNDS),
-            round_ns: take(&ROUND_NS),
-            data_syncs: take(&DATA_SYNCS),
-            data_sync_ns: take(&DATA_SYNC_NS),
-            lock_waits: take(&LOCK_WAITS),
-            lock_wait_ns: take(&LOCK_WAIT_NS),
-            lock_holds: take(&LOCK_HOLDS),
-            lock_hold_ns: take(&LOCK_HOLD_NS),
-        }
-    }
-}
-
-/// Whether the committer keeps running.
+/// Whether the commit thread keeps running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Run {
     Go,
-    /// Commit what is pending once more, then stop (the database closed).
+    /// Sync what is pending once more, then stop (the database closed).
     Finish,
-    /// Stop at once, committing nothing (a test's simulated crash).
+    /// Stop at once, syncing nothing (a test's simulated crash).
     Abort,
 }
 
-/// Tables written since the committer's last look, and whether it keeps running.
+/// The database's durability state, shared by its handles, its writer and its commit thread.
 #[derive(Debug)]
-struct Work {
-    dirty: BTreeSet<&'static str>,
-    run: Run,
-}
-
-/// Group-commit state shared by a database's handles, its write transactions and its committer.
-#[derive(Debug)]
-pub(crate) struct GroupCommit {
-    /// The last sequence number given to a write (see `TnTable::publish_pending`).
-    pub(crate) seq: AtomicU64,
-    /// Every write numbered at or below this is committed.
+pub(super) struct Durability {
+    /// The last batch numbered.
+    seq: AtomicU64,
+    /// Every batch numbered at or below this is durable.
     durable: tokio::sync::watch::Sender<u64>,
-    /// The first failure, if any: every later barrier reports it (never cleared).
+    /// The same watermark, for blocking waiters.
+    durable_now: Mutex<u64>,
+    durable_changed: Condvar,
+    /// The first failure, if any (never cleared).
     failed: Mutex<Option<String>>,
-    work: Mutex<Work>,
+    run: Mutex<Run>,
     wake: Condvar,
-    /// Test-only: the committer's next round stops at a point, reports it, and waits to be
-    /// released (see [`Self::gate_next_round`]).
+    /// The highest batch number a `persist` waits for.
+    wanted: AtomicU64,
+    /// The commit thread is waiting with nothing to sync: the next write must wake it.
+    idle: AtomicBool,
+    /// Test-only: the commit thread's next sync fails.
     #[cfg(test)]
-    round_gate: Mutex<Option<RoundGate>>,
-    /// Test-only: the committer's next round panics.
+    pub(super) fail_next_sync: std::sync::atomic::AtomicBool,
+    /// Test-only: the syncs of this database's log so far.
     #[cfg(test)]
-    panic_next_round: std::sync::atomic::AtomicBool,
+    pub(super) syncs: AtomicU64,
+    /// Test-only: a delay to use instead of [`SYNC_DELAY`], in milliseconds (0: the default).
+    #[cfg(test)]
+    pub(super) delay_ms: AtomicU64,
+    /// Test-only: a cap to use instead of [`MAX_UNSYNCED`], in bytes (0: the default).
+    #[cfg(test)]
+    pub(super) max_unsynced: AtomicU64,
+    /// Test-only: the commit thread's next sync stops before it starts, reports it on the first
+    /// channel and waits for a message (or the sender's drop) on the second.
+    #[cfg(test)]
+    sync_gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
 }
 
-/// Test-only: where a committer round stops (see [`GroupCommit::gate_next_round`]).
-#[cfg(test)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum GatePoint {
-    /// After reading its target number, before taking the dirty tables.
-    BeforeTake,
-    /// After taking the dirty tables.
-    AfterTake,
-}
-
-#[cfg(test)]
-type RoundGate = (GatePoint, std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
-
-impl GroupCommit {
-    pub(crate) fn new() -> Arc<Self> {
+impl Durability {
+    pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
             seq: AtomicU64::new(0),
             durable: tokio::sync::watch::Sender::new(0),
+            durable_now: Mutex::new(0),
+            durable_changed: Condvar::new(),
             failed: Mutex::new(None),
-            work: Mutex::new(Work { dirty: BTreeSet::new(), run: Run::Go }),
+            run: Mutex::new(Run::Go),
             wake: Condvar::new(),
+            wanted: AtomicU64::new(0),
+            idle: AtomicBool::new(false),
             #[cfg(test)]
-            round_gate: Mutex::new(None),
+            fail_next_sync: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
-            panic_next_round: std::sync::atomic::AtomicBool::new(false),
+            syncs: AtomicU64::new(0),
+            #[cfg(test)]
+            delay_ms: AtomicU64::new(0),
+            #[cfg(test)]
+            max_unsynced: AtomicU64::new(0),
+            #[cfg(test)]
+            sync_gate: Mutex::new(None),
         })
     }
 
-    /// Test-only: the committer's next round stops at `point`, reports it on the first channel,
-    /// and waits for a message (or the sender's drop) on the second.
-    #[cfg(test)]
-    pub(crate) fn gate_next_round(
-        &self,
-        point: GatePoint,
-    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
-        let (arrived, arrivals) = std::sync::mpsc::channel();
-        let (release, released) = std::sync::mpsc::channel();
-        *self.round_gate.lock() = Some((point, arrived, released));
-        (arrivals, release)
+    /// The number of the last batch written.
+    #[cfg(any(test, feature = "tndb"))]
+    pub(super) fn last_seq(&self) -> u64 {
+        self.seq.load(Ordering::Acquire)
     }
 
-    /// Test-only: stop here if the next round's gate is at `point` (see [`Self::gate_next_round`]).
-    #[cfg(test)]
-    fn gate(&self, point: GatePoint) {
-        // Taken first, so the gate's lock is not held while waiting at it.
-        let gate = {
-            let mut slot = self.round_gate.lock();
-            match slot.as_ref() {
-                Some((at, ..)) if *at == point => slot.take(),
-                _ => None,
-            }
-        };
-        if let Some((_, arrived, release)) = gate {
-            let _ = arrived.send(());
-            let _ = release.recv_timeout(Duration::from_secs(30));
+    /// Record the number of the batch just written (under the write lock, before it is
+    /// published).
+    pub(super) fn set_seq(&self, seq: u64) {
+        self.seq.store(seq, Ordering::Release);
+    }
+
+    /// A batch moved the frontier: wake the commit thread if it is idle (it starts the delay
+    /// before syncing), or if `pending` unsynced bytes reached [`SYNC_BYTES`].
+    pub(super) fn wrote(&self, pending: u64) {
+        // Pairs with the commit thread's fence between setting `idle` and re-reading the
+        // frontier: one of the two sees the other's store.
+        fence(Ordering::SeqCst);
+        if self.idle.load(Ordering::SeqCst) || pending >= SYNC_BYTES {
+            self.wake();
         }
     }
 
-    /// Test-only: make the committer's next round panic.
-    #[cfg(test)]
-    pub(crate) fn panic_next_round(&self) {
-        self.panic_next_round.store(true, Ordering::Relaxed);
-    }
-
-    /// Test-only: the durable watermark.
-    #[cfg(test)]
-    pub(crate) fn durable_for_test(&self) -> u64 {
-        *self.durable.borrow()
-    }
-
-    /// Table `name` has writes to commit. Called under the table's writer lock, before the
-    /// write's sequence number is taken (see `TnTable::publish_pending`).
-    pub(crate) fn mark_dirty(&self, name: &'static str) {
-        self.work.lock().dirty.insert(name);
+    fn wake(&self) {
+        let _run = self.run.lock();
         self.wake.notify_one();
     }
 
-    /// Latch `cause` (the first failure wins, and only it is logged) and wake every barrier
-    /// waiting.
-    pub(crate) fn fail(&self, cause: String) {
+    /// How long writes nobody waits on stay unsynced ([`SYNC_DELAY`]; a test may override it).
+    fn delay(&self) -> Duration {
+        #[cfg(test)]
+        if let ms @ 1.. = self.delay_ms.load(Ordering::Relaxed) {
+            return Duration::from_millis(ms);
+        }
+        SYNC_DELAY
+    }
+
+    /// The unsynced bytes past which a group-mode writer waits for a sync ([`MAX_UNSYNCED`]; a
+    /// test may override it).
+    pub(super) fn max_unsynced(&self) -> u64 {
+        #[cfg(test)]
+        if let cap @ 1.. = self.max_unsynced.load(Ordering::Relaxed) {
+            return cap;
+        }
+        MAX_UNSYNCED
+    }
+
+    /// A `persist` waits for batch `seq`: the commit thread syncs at once.
+    fn want(&self, seq: u64) {
+        self.wanted.fetch_max(seq, Ordering::AcqRel);
+        self.wake();
+    }
+
+    /// Wake every writer blocked in [`wait_durable`] (a round ended).
+    fn notify_waiters(&self) {
+        let _now = self.durable_now.lock();
+        self.durable_changed.notify_all();
+    }
+
+    /// Latch `cause` (the first failure wins, and only it is logged) and wake every waiter.
+    pub(super) fn fail(&self, cause: String) {
         {
             let mut failed = self.failed.lock();
             if failed.is_some() {
                 return;
             }
-            tracing::error!(target: "tndb", "group commit failed: {cause}; every later persist fails");
+            tracing::error!(target: "tndb", "durability failed: {cause}; every later write and persist fails");
             *failed = Some(cause);
         }
         self.durable.send_modify(|_| {});
+        let _now = self.durable_now.lock();
+        self.durable_changed.notify_all();
     }
 
-    fn is_failed(&self) -> bool {
+    pub(super) fn is_failed(&self) -> bool {
         self.failed.lock().is_some()
     }
 
-    fn check(&self) -> eyre::Result<()> {
+    pub(super) fn check(&self) -> eyre::Result<()> {
         match &*self.failed.lock() {
-            Some(cause) => eyre::bail!("tndb: a write or commit failed ({cause})"),
+            Some(cause) => eyre::bail!("tndb: a write or sync failed ({cause})"),
             None => Ok(()),
         }
     }
 
-    /// The durability barrier: resolves once every write numbered before the call is committed
-    /// (in every table), or fails once any write or commit has failed.
-    pub(crate) async fn persist(&self) -> eyre::Result<()> {
-        let target = self.seq.load(Ordering::Acquire);
-        let mut durable = self.durable.subscribe();
-        loop {
-            self.check()?;
-            if *durable.borrow_and_update() >= target {
-                // Checked again: a failure latched between the check above and this read wins.
-                self.check()?;
-                return Ok(());
-            }
-            if durable.changed().await.is_err() {
-                eyre::bail!("tndb: the committer stopped");
-            }
-        }
+    /// Test-only: pause the commit thread's next sync (see `sync_gate`).
+    #[cfg(test)]
+    pub(super) fn gate_next_sync(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrivals) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.sync_gate.lock() = Some((arrived, released));
+        (arrivals, release)
     }
 
-    /// Advance the durable watermark to `durable` (it never moves back).
+    /// The durable watermark.
+    pub(super) fn durable(&self) -> u64 {
+        *self.durable_now.lock()
+    }
+
+    /// Advance the watermark to `durable` (never back, and never after a failure).
     fn advance(&self, durable: u64) {
+        if self.is_failed() {
+            return;
+        }
         self.durable.send_if_modified(|current| {
             let advanced = durable > *current;
             if advanced {
@@ -248,41 +225,147 @@ impl GroupCommit {
             }
             advanced
         });
+        let mut now = self.durable_now.lock();
+        if durable > *now {
+            *now = durable;
+            self.durable_changed.notify_all();
+        }
+    }
+
+    /// The durability barrier: resolves once every batch numbered before the call is durable, or
+    /// fails once anything has failed.
+    pub(super) async fn persist(&self) -> eyre::Result<()> {
+        let target = self.seq.load(Ordering::Acquire);
+        let mut durable = self.durable.subscribe();
+        if *durable.borrow() < target {
+            self.want(target);
+        }
+        loop {
+            self.check()?;
+            if *durable.borrow_and_update() >= target {
+                // A failure latched between the check above and this read wins.
+                self.check()?;
+                return Ok(());
+            }
+            if durable.changed().await.is_err() {
+                eyre::bail!("tndb: the commit thread stopped");
+            }
+        }
+    }
+}
+
+/// Block until batch `seq` is durable, or fail once anything has failed. The first writer waiting
+/// leads: it runs the sync round itself while the others wait for it; one whose batch the round
+/// did not cover (it landed after the round read the frontier) leads the next.
+pub(super) fn wait_durable(core: &Core, seq: u64) -> eyre::Result<()> {
+    let durability = &*core.durability;
+    loop {
+        let lead = {
+            let mut now = durability.durable_now.lock();
+            loop {
+                durability.check()?;
+                if *now >= seq {
+                    return Ok(());
+                }
+                if let Some(lead) = core.sync_lock.try_lock() {
+                    break lead;
+                }
+                durability.durable_changed.wait(&mut now);
+            }
+        };
+        sync_round(core);
+        drop(lead);
+        durability.notify_waiters();
+    }
+}
+
+/// Sync the log up to the current frontier and advance the watermark (or latch the failure). The
+/// caller holds the core's sync lock, so one round runs at a time.
+fn sync_round(core: &Core) {
+    let durability = &*core.durability;
+    if durability.is_failed() {
+        return;
+    }
+    let frontier = core.frontier.load_full();
+    if frontier.seq <= durability.durable() {
+        return;
+    }
+    #[cfg(test)]
+    {
+        let gate = durability.sync_gate.lock().take();
+        if let Some((arrived, release)) = gate {
+            let _ = arrived.send(());
+            let _ = release.recv_timeout(std::time::Duration::from_secs(30));
+        }
+    }
+    #[cfg(test)]
+    let started = std::time::Instant::now();
+    let sync = &frontier.sync;
+    let start = sync.synced.load(Ordering::Acquire);
+    let outcome = (|| -> std::io::Result<()> {
+        #[cfg(test)]
+        if durability.fail_next_sync.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::other("injected sync failure"));
+        }
+        if frontier.end > start {
+            sync.view.msync(start, frontier.end)?;
+        }
+        // The writer stores the growth count before the frontier, so read after it, it covers
+        // every growth below the frontier's end.
+        let growths = sync.growths.load(Ordering::Acquire);
+        if growths != sync.size_synced.load(Ordering::Relaxed) {
+            fsync_file(&sync.file)?;
+            sync.size_synced.store(growths, Ordering::Relaxed);
+        }
+        Ok(())
+    })();
+    #[cfg(test)]
+    {
+        super::stats::add(&super::stats::SYNCS, &super::stats::SYNC_NS, started.elapsed());
+        super::stats::log(core.stat_slot).sync(started.elapsed());
+        durability.syncs.fetch_add(1, Ordering::Relaxed);
+    }
+    match outcome {
+        Ok(()) => {
+            sync.synced.fetch_max(frontier.end, Ordering::AcqRel);
+            durability.advance(frontier.seq);
+        }
+        Err(e) => durability.fail(format!("sync the log: {e}")),
     }
 }
 
 /// The `tndb-commit` thread, stopped (after a last round) when dropped.
 #[derive(Debug)]
-pub(crate) struct Committer {
-    group: Arc<GroupCommit>,
-    handle: Option<JoinHandle<()>>,
+pub(super) struct Committer {
+    durability: Arc<Durability>,
+    handle: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Committer {
-    pub(crate) fn start(group: Arc<GroupCommit>, store: Arc<StoreType>) -> eyre::Result<Self> {
-        let thread_group = Arc::clone(&group);
+    pub(super) fn start(core: Arc<Core>) -> eyre::Result<Self> {
+        let durability = Arc::clone(&core.durability);
         let handle = std::thread::Builder::new()
             .name("tndb-commit".to_string())
-            .spawn(move || run(&thread_group, &store))?;
-        Ok(Self { group, handle: Some(handle) })
+            .spawn(move || run(&core))?;
+        Ok(Self { durability, handle: Mutex::new(Some(handle)) })
     }
 
-    fn stop(&mut self, how: Run) {
+    fn stop(&self, how: Run) {
         {
-            let mut work = self.group.work.lock();
-            if work.run == Run::Go {
-                work.run = how;
+            let mut run = self.durability.run.lock();
+            if *run == Run::Go {
+                *run = how;
             }
+            self.durability.wake.notify_one();
         }
-        self.group.wake.notify_one();
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self.handle.lock().take() {
             let _ = handle.join();
         }
     }
 
-    /// Test-only, for a simulated crash: stop at once, committing nothing more.
+    /// Test-only, for a simulated crash: stop at once, syncing nothing more.
     #[cfg(test)]
-    pub(crate) fn abort_for_crash(&mut self) {
+    pub(super) fn abort_for_crash(&self) {
         self.stop(Run::Abort);
     }
 }
@@ -293,111 +376,76 @@ impl Drop for Committer {
     }
 }
 
-/// Latches a failure if the committer thread unwinds: no barrier then waits for it forever.
-struct PanicLatch<'a>(&'a GroupCommit);
+/// Latches a failure if the commit thread unwinds: no barrier then waits for it forever.
+struct PanicLatch<'a>(&'a Durability);
 
 impl Drop for PanicLatch<'_> {
     fn drop(&mut self) {
         if std::thread::panicking() {
-            self.0.fail("the committer thread panicked".to_string());
+            self.0.fail("the commit thread panicked".to_string());
         }
     }
 }
 
-/// The committer: wait for written tables, commit each (one sync per table per round), then
-/// advance the durable watermark to the round's starting sequence number, held back by any table
-/// still pending (an open transaction, or writes published during its sync). A held-back table
-/// stays in every later round until it commits, so the watermark never passes it.
-fn run(group: &GroupCommit, store: &StoreType) {
-    let _latch = PanicLatch(group);
-    let compact_all = || {
-        for entry in store.load().values() {
-            entry.table.compact();
-        }
-    };
-    compact_all();
-    let mut last_compact = Instant::now();
-    let mut held: BTreeMap<&'static str, u64> = BTreeMap::new();
-    // Run another round at once, without a dirty table: see the end of the loop.
-    let mut again = false;
+/// The commit thread (`CommitMode::Group`'s syncs): wait until a sync is due (a `persist` waits,
+/// or the unsynced writes are [`SYNC_DELAY`] old or [`SYNC_BYTES`] large, or the database is
+/// closing), then run a round.
+fn run(core: &Core) {
+    let durability = &*core.durability;
+    let _latch = PanicLatch(durability);
+    // When the commit thread first saw writes not yet durable.
+    let mut pending_since: Option<Instant> = None;
     loop {
         {
-            let mut work = group.work.lock();
-            while work.dirty.is_empty() && work.run == Run::Go && !again {
-                let wait = COMPACT_EVERY.saturating_sub(last_compact.elapsed());
-                if group.wake.wait_for(&mut work, wait).timed_out() {
+            let mut run = durability.run.lock();
+            loop {
+                if *run == Run::Abort {
+                    return;
+                }
+                if durability.is_failed() {
+                    // Nothing more becomes durable: wait to be stopped.
+                    if *run == Run::Go {
+                        durability.wake.wait(&mut run);
+                        continue;
+                    }
+                    return;
+                }
+                let durable = durability.durable();
+                let frontier = core.frontier.load();
+                if frontier.seq <= durable {
+                    pending_since = None;
+                    if *run == Run::Finish {
+                        return;
+                    }
+                    // Idle until a write: announce it, then look again (a write that stored its
+                    // frontier before seeing `idle` is seen here; see `Durability::wrote`).
+                    durability.idle.store(true, Ordering::SeqCst);
+                    fence(Ordering::SeqCst);
+                    if core.frontier.load().seq <= durability.durable() {
+                        durability.wake.wait(&mut run);
+                    }
+                    durability.idle.store(false, Ordering::SeqCst);
+                    continue;
+                }
+                let since = *pending_since.get_or_insert_with(Instant::now);
+                let wanted = durability.wanted.load(Ordering::Acquire) > durable;
+                let pending =
+                    frontier.end.saturating_sub(frontier.sync.synced.load(Ordering::Acquire));
+                let delay = durability.delay();
+                if wanted
+                    || pending >= SYNC_BYTES
+                    || since.elapsed() >= delay
+                    || *run == Run::Finish
+                {
                     break;
                 }
+                let _ = durability.wake.wait_for(&mut run, delay.saturating_sub(since.elapsed()));
             }
         }
-        // The target number is read before the dirty tables are taken: a writer marks its table
-        // dirty before it takes its number, so every write numbered at or below the target has
-        // its table in this round's set (or was in an earlier round's).
-        let target = group.seq.load(Ordering::Acquire);
-        #[cfg(test)]
-        group.gate(GatePoint::BeforeTake);
-        let (names, run) = {
-            let mut work = group.work.lock();
-            (std::mem::take(&mut work.dirty), work.run)
-        };
-        if run == Run::Abort {
-            return;
-        }
-        #[cfg(test)]
-        group.gate(GatePoint::AfterTake);
-        #[cfg(test)]
-        if group.panic_next_round.swap(false, Ordering::Relaxed) {
-            panic!("injected committer panic");
-        }
-        if last_compact.elapsed() >= COMPACT_EVERY {
-            compact_all();
-            last_compact = Instant::now();
-        }
-        #[cfg(test)]
-        let round_started = Instant::now();
-        let tables = store.load();
-        let mut todo = names;
-        todo.extend(held.keys().copied());
-        for name in todo {
-            let Some(entry) = tables.get(name) else {
-                held.remove(name);
-                continue;
-            };
-            match entry.table.group_commit() {
-                Ok(Some(first)) => {
-                    held.insert(name, first);
-                }
-                Ok(None) => {
-                    held.remove(name);
-                }
-                Err(e) => {
-                    held.remove(name);
-                    group.fail(format!("table {name}: {e:#}"));
-                }
-            }
-        }
-        #[cfg(test)]
-        stats::add(&stats::ROUNDS, &stats::ROUND_NS, round_started.elapsed());
-        let durable = held.values().map(|first| first - 1).fold(target, u64::min);
-        if group.is_failed() {
-            // Every later barrier fails, and the watermark never moves again: it may not pass a
-            // write whose commit failed (the failed table is no longer held back).
-            if run == Run::Finish {
-                return;
-            }
-            again = false;
-            continue;
-        }
-        group.advance(durable);
-        if run == Run::Finish {
-            return;
-        }
-        // A write numbered after the target, whose table this round took and committed, has no
-        // dirty mark left to start a round, yet the watermark stopped at the target. One more round
-        // reads a target covering it (and commits nothing it need not), when that can move the
-        // watermark: not when a held table's first pending write is what stops it (that table is
-        // marked dirty again when its transaction ends or its writes land).
-        again = group.seq.load(Ordering::Acquire) > durable
-            && held.values().all(|&first| durable < first - 1);
+        pending_since = None;
+        let round = core.sync_lock.lock();
+        sync_round(core);
+        drop(round);
+        durability.notify_waiters();
     }
 }

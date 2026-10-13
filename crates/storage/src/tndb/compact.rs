@@ -1,6 +1,6 @@
 //! Compaction: rewrite the log's live rows into a new generation, in the background.
 //!
-//! The `tnlog-compact` thread ([`Compactor`]) builds the next generation in a `compact-*`
+//! The `tndb-compact` thread ([`Compactor`]) builds the next generation in a `compact-*`
 //! directory:
 //! 1. **snapshot**, under the write lock: every table's last publish and the log's end `E`, one
 //!    point between two batches;
@@ -52,21 +52,52 @@ use parking_lot::{Condvar, Mutex};
 
 use super::{
     commit::Durability,
+    layout::{available_bytes, compact_dir, gen_dir, remove_in_background, sync_dir, sync_file},
     record::{self, Op, BATCH_END, KIND_CLEAR, KIND_REMOVE},
     store::{idx_dir, open_log, Core, GenAlive, GenSync, Log, NewGen, ScanKind, SnapTable},
     TableId,
 };
-use crate::{
-    archive::{btree_index::BtreeIndex, crc::crc32, data_file::MapView, pack::DataHeader},
-    tndb::{
-        is_corruption,
-        layout::{
-            available_bytes, compact_dir, gen_dir, remove_in_background, sync_dir, sync_file,
-        },
-        AUTO_BACKOFF_MAX, AUTO_BACKOFF_MIN, BATCH_BYTES, CATCHUP_BYTES, DISK_HEADROOM,
-        MAX_CATCHUP_ROUNDS, PACE_SLICE, REQUESTED_MIN_BYTES,
-    },
+use crate::archive::{
+    btree_index::BtreeIndex, crc::crc32, data_file::MapView, error::fetch::FetchError,
+    pack::DataHeader,
 };
+
+/// A requested compaction ([`tn_types::Database::compact`]) skips a log smaller than this.
+const REQUESTED_MIN_BYTES: u64 = 1 << 20;
+
+/// Bytes copied between pacing (cancellation and free-space) checks, and between the starts of
+/// a new log's writeback.
+const BATCH_BYTES: u64 = 1 << 20;
+
+/// The background catch-up stops once a round has had at most this many bytes to replay, leaving
+/// what accumulates after it to the switch.
+const CATCHUP_BYTES: u64 = 1 << 20;
+
+/// Most background catch-up rounds before going on to the switch regardless.
+const MAX_CATCHUP_ROUNDS: usize = 8;
+
+/// The longest a pacing sleep goes without checking for a cancellation.
+const PACE_SLICE: Duration = Duration::from_millis(10);
+
+/// Room a compaction needs beyond the current generation's size (the most its live rows can
+/// take): the new log's growth preallocation, at most this much past its data.
+const DISK_HEADROOM: u64 = 128 << 20;
+
+/// After a failed automatic compaction, the automatic trigger waits this long before trying again,
+/// doubling with each further failure up to [`AUTO_BACKOFF_MAX`].
+const AUTO_BACKOFF_MIN: Duration = Duration::from_secs(60);
+const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
+
+/// True when `e` comes from reading damaged committed data (a failed CRC, a corrupt record or
+/// index), rather than from the environment.
+fn is_corruption(e: &eyre::Report) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<FetchError>(),
+            Some(FetchError::CrcFailed | FetchError::CorruptIndex(_))
+        )
+    })
+}
 
 /// The most the switch replays under the write lock: past it, the switch lets go of its locks
 /// and runs another background round first, so writers wait for a small tail only.
@@ -102,12 +133,12 @@ pub(super) fn read_base(gen_path: &Path) -> u64 {
             u64::from_le_bytes(bytes[..8].try_into().expect("8 bytes"))
         }
         Ok(_) => {
-            tracing::warn!(target: "tnlog", "{} is corrupt; compacting from 0", path.display());
+            tracing::warn!(target: "tndb", "{} is corrupt; compacting from 0", path.display());
             0
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
         Err(e) => {
-            tracing::warn!(target: "tnlog", "read {}: {e}; compacting from 0", path.display());
+            tracing::warn!(target: "tndb", "read {}: {e}; compacting from 0", path.display());
             0
         }
     }
@@ -240,7 +271,7 @@ impl CompactShared {
 
     fn check_cancel(&self) -> eyre::Result<()> {
         if self.cancel.load(Ordering::Relaxed) {
-            bail!("tnlog: compaction cancelled");
+            bail!("tndb: compaction cancelled");
         }
         Ok(())
     }
@@ -310,7 +341,7 @@ fn free_bytes(core: &Core) -> Option<u64> {
 fn check_room(core: &Core) -> eyre::Result<()> {
     match free_bytes(core) {
         Some(free) if free < MIN_FREE => {
-            bail!("tnlog: compaction abandoned: {free} bytes free, below {MIN_FREE}")
+            bail!("tndb: compaction abandoned: {free} bytes free, below {MIN_FREE}")
         }
         _ => Ok(()),
     }
@@ -389,7 +420,7 @@ struct Builder {
 
 impl Builder {
     fn new(dir: PathBuf) -> eyre::Result<Self> {
-        fs::create_dir(&dir).wrap_err_with(|| format!("tnlog: create {}", dir.display()))?;
+        fs::create_dir(&dir).wrap_err_with(|| format!("tndb: create {}", dir.display()))?;
         let log = match open_log(&dir) {
             Ok(log) => log,
             Err(e) => {
@@ -605,7 +636,7 @@ fn catch_up(
     while pos < to {
         let payload = Log::record_bytes_within(view, pos, to)?;
         let record = record::parse(payload, |id| ksizes.get(id))
-            .wrap_err_with(|| format!("tnlog: compaction: the record at {pos}"))?;
+            .wrap_err_with(|| format!("tndb: compaction: the record at {pos}"))?;
         let id = record.table;
         match record.op {
             Op::Put(key) => {
@@ -657,7 +688,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let gate = shared.test.gate.lock().take();
     #[cfg(test)]
     if shared.test.fail_next.swap(false, Ordering::Relaxed) {
-        bail!("tnlog: injected compaction failure");
+        bail!("tndb: injected compaction failure");
     }
     #[cfg(test)]
     let min =
@@ -669,7 +700,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let mut skip_a_row = shared.test.skip_a_row.swap(false, Ordering::Relaxed);
     let needed = dir_bytes(&snap.gen_dir) + DISK_HEADROOM;
     if let Some(free) = free_bytes(core).filter(|&free| free < needed) {
-        bail!("tnlog: compaction skipped: {free} bytes free, {needed} needed");
+        bail!("tndb: compaction skipped: {free} bytes free, {needed} needed");
     }
     // Keeps the old generation's files open (and so its view valid) until this returns.
     let _alive = Arc::clone(&snap.alive);
@@ -761,7 +792,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         for (id, rows) in writer.table_rows() {
             if out.rows(id) != rows {
                 bail!(
-                    "tnlog: compaction: table {id} has {} rows compacted, {rows} live",
+                    "tndb: compaction: table {id} has {} rows compacted, {rows} live",
                     out.rows(id)
                 );
             }
@@ -779,9 +810,9 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         let dir = gen_dir(&core.root, gen);
         #[cfg(test)]
         if shared.test.fail_rename.swap(false, Ordering::Relaxed) {
-            bail!("tnlog: compaction: injected rename failure");
+            bail!("tndb: compaction: injected rename failure");
         }
-        fs::rename(&out.dir, &dir).wrap_err("tnlog: compaction: rename into place")?;
+        fs::rename(&out.dir, &dir).wrap_err("tndb: compaction: rename into place")?;
         let (log, idxs, has_dead) = out.finish();
         // From here the next open may pick the new generation: a failure stops the writer.
         let _latch = SwitchLatch(&core.durability);
@@ -800,7 +831,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         if let Err(e) = root_synced {
             let cause = format!("sync the compacted generation {gen}: {e}");
             writer.stop(cause.clone());
-            bail!("tnlog: {cause}");
+            bail!("tndb: {cause}");
         }
         let old_dir = writer.install_gen(NewGen {
             gen,
@@ -821,16 +852,16 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         let _ = held;
         drop(writer);
         drop(registry);
-        remove_in_background(old_dir, "tnlog-reap");
+        remove_in_background(old_dir, "tndb-reap");
         return Ok(true);
     }
     bail!(
-        "tnlog: compaction abandoned: the writer outran {SWITCH_TRIES} switches (the last over \
+        "tndb: compaction abandoned: the writer outran {SWITCH_TRIES} switches (the last over \
          {STALL_TAIL_MAX} bytes)"
     )
 }
 
-/// The `tnlog-compact` thread: waits for a request (the automatic trigger, or
+/// The `tndb-compact` thread: waits for a request (the automatic trigger, or
 /// [`tn_types::Database::compact`]), then compacts. Stopped (cancelling a running compaction)
 /// and joined when dropped.
 #[derive(Debug)]
@@ -843,7 +874,7 @@ impl Compactor {
     pub(super) fn start(core: Arc<Core>, rate: u64) -> eyre::Result<Self> {
         let thread_core = Arc::clone(&core);
         let handle = std::thread::Builder::new()
-            .name("tnlog-compact".to_string())
+            .name("tndb-compact".to_string())
             .spawn(move || run(&thread_core, rate))?;
         Ok(Self { core, handle: Mutex::new(Some(handle)) })
     }
@@ -889,16 +920,16 @@ fn run(core: &Core, rate: u64) {
             Ok(Ok(switched)) => Ok(switched),
             Ok(Err(e)) => {
                 if shared.cancel.load(Ordering::Relaxed) {
-                    tracing::debug!(target: "tnlog", "compaction cancelled: {e:#}");
+                    tracing::debug!(target: "tndb", "compaction cancelled: {e:#}");
                 } else if is_corruption(&e) {
-                    tracing::error!(target: "tnlog", "compaction abandoned: {e:#}");
+                    tracing::error!(target: "tndb", "compaction abandoned: {e:#}");
                 } else {
-                    tracing::warn!(target: "tnlog", "compaction abandoned: {e:#}");
+                    tracing::warn!(target: "tndb", "compaction abandoned: {e:#}");
                 }
                 Err(format!("{e:#}"))
             }
             Err(_) => {
-                tracing::error!(target: "tnlog", "the compaction thread panicked; abandoned");
+                tracing::error!(target: "tndb", "the compaction thread panicked; abandoned");
                 Err("panicked".to_string())
             }
         };

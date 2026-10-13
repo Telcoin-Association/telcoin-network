@@ -52,7 +52,6 @@ pub mod redb;
 mod workload_bench;
 
 pub mod tndb;
-pub mod tnlog;
 
 pub use tn_types::error::StoreError;
 
@@ -141,30 +140,30 @@ pub mod tables {
     );
 }
 
-// mdbx is the default; redb replaces it when set, and tnlog replaces both (so priority is
-// tnlog -> redb -> mdbx)
+// mdbx is the default; redb replaces it when set, and tndb replaces both (so priority is
+// tndb -> redb -> mdbx)
 /// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tnlog")))]
+#[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tndb")))]
 pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
 /// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "redb", not(feature = "tnlog")))]
+#[cfg(all(feature = "redb", not(feature = "tndb")))]
 pub type DatabaseType = CompositeDatabase<ReDB>;
-/// The configured database backend: tnlog, one shared log per environment, when the `tnlog`
+/// The configured database backend: tndb, one shared log per environment, when the `tndb`
 /// feature is on.
-#[cfg(feature = "tnlog")]
-pub type DatabaseType = tnlog::SplitDatabase;
+#[cfg(feature = "tndb")]
+pub type DatabaseType = tndb::SplitDatabase;
 
 /// Open the configured DB with the required tables.
 /// This will return a concrete type for the currently configured Database.
 #[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
 pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the redb or tnlog
+    // Open the right DB based on feature flags.  The default is MDBX unless the redb or tndb
     // flag is set.
-    #[cfg(feature = "tnlog")]
-    return _open_tnlog(store_path);
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tnlog")))]
+    #[cfg(feature = "tndb")]
+    return _open_tndb(store_path);
+    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb"), not(feature = "tndb")))]
     return _open_mdbx(store_path);
-    #[cfg(all(feature = "redb", not(feature = "tnlog")))]
+    #[cfg(all(feature = "redb", not(feature = "tndb")))]
     return _open_redb(store_path);
     panic!("No DB configured!")
 }
@@ -208,8 +207,8 @@ fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
 enum MdbxEnv {
     Epoch,
     Kad,
-    /// Opened only by `_open_mdbx` (unused when the `tnlog` feature picks the backend).
-    #[cfg_attr(feature = "tnlog", allow(dead_code))]
+    /// Opened only by `_open_mdbx` (unused when the `tndb` feature picks the backend).
+    #[cfg_attr(feature = "tndb", allow(dead_code))]
     Cache,
 }
 
@@ -240,30 +239,30 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
     MdbxDatabase::open(store_path.join(dir), tables, max_size, growth)
 }
 
-/// The file in the tnlog root saying the MDBX tables were copied in (see [`migrate_from_mdbx`]).
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tnlog")))]
+/// The file in the tndb root saying the MDBX tables were copied in (see [`migrate_from_mdbx`]).
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
 const MDBX_MIGRATED: &str = "mdbx-migrated";
 
-/// Copy the node's epoch and kad tables from MDBX (the backend before tnlog, under `store_path`)
-/// into `db`, the tnlog one, the first time the node opens tnlog. Returns the rows copied.
+/// Copy the node's epoch and kad tables from MDBX (the backend before tndb, under `store_path`)
+/// into `db`, the tndb one, the first time the node opens tndb. Returns the rows copied.
 ///
 /// The epoch tables hold the node's anti-equivocation records for the current epoch (its last
 /// proposal, its votes, its proposed certificates): a node switching backends mid-epoch must not
 /// forget them, or it could sign a conflicting header in a round it already voted in. The kad
 /// tables hold its peer records. The batch caches are not copied (they refill).
 ///
-/// The copy is made durable before a marker file in `tnlog_root` records that it is done; until
+/// The copy is made durable before a marker file in `tndb_root` records that it is done; until
 /// then every open runs it again (MDBX is not written meanwhile, so copying it again only rewrites
 /// the same rows). The MDBX directories are left in place.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tnlog")))]
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
 pub(crate) fn migrate_from_mdbx(
     store_path: &std::path::Path,
-    tnlog_root: &std::path::Path,
-    db: &tnlog::SplitDatabase,
+    tndb_root: &std::path::Path,
+    db: &tndb::SplitDatabase,
 ) -> eyre::Result<usize> {
     use std::io::Write as _;
 
-    let marker = tnlog_root.join(MDBX_MIGRATED);
+    let marker = tndb_root.join(MDBX_MIGRATED);
     if marker.exists() {
         return Ok(0);
     }
@@ -288,23 +287,23 @@ pub(crate) fn migrate_from_mdbx(
         copied += copy_table::<KadWorkerProviderRecords, _>(&src, db)?;
     }
     db.wait_durable_blocking()?;
-    let tmp = tnlog_root.join(format!("{MDBX_MIGRATED}.tmp"));
+    let tmp = tndb_root.join(format!("{MDBX_MIGRATED}.tmp"));
     {
         let mut file = std::fs::File::create(&tmp)?;
         writeln!(file, "copied {copied} rows from MDBX")?;
         archive::data_file::fsync_file(&file)?;
     }
     std::fs::rename(&tmp, &marker)?;
-    archive::data_file::fsync_directory(tnlog_root)?;
+    archive::data_file::fsync_directory(tndb_root)?;
     if copied > 0 {
-        tracing::info!(target: "tn::storage", "copied {copied} rows of the consensus DB from MDBX to tnlog");
+        tracing::info!(target: "tn::storage", "copied {copied} rows of the consensus DB from MDBX to tndb");
     }
     Ok(copied)
 }
 
 /// Copy every row of table `T` from `src` into `dst`, in transactions of at most 10,000 rows (the
 /// whole copy is made durable, and marked done, by the caller). Returns the rows copied.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tnlog")))]
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
 fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     src: &MdbxDatabase,
     dst: &D,
@@ -326,19 +325,19 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     Ok(rows)
 }
 
-/// Open or reopen all the storage of the node backed by tnlog: one shared log per environment
-/// ([`tnlog::SplitDatabase`]) under `<store_path>/tnlog` (never sharing files with MDBX's `epoch`,
+/// Open or reopen all the storage of the node backed by tndb: one shared log per environment
+/// ([`tndb::SplitDatabase`]) under `<store_path>/tndb` (never sharing files with MDBX's `epoch`,
 /// `kad` and `cache` directories), in group commit (a write returns at once; `persist` waits for
 /// the sync covering it), compacting in the background. A node that ran on MDBX has its epoch and
 /// kad tables copied over on the first open ([`migrate_from_mdbx`]).
-#[cfg(feature = "tnlog")]
-fn _open_tnlog<P: AsRef<std::path::Path> + Send>(store_path: P) -> tnlog::SplitDatabase {
+#[cfg(feature = "tndb")]
+fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDatabase {
     use tn_types::Database as _;
 
     let store_path = store_path.as_ref();
-    let root = store_path.join("tnlog");
-    let options = tnlog::TnLogOptions { commit: tndb::CommitMode::Group, ..Default::default() };
-    let db = tnlog::SplitDatabase::open_with(&root, options).expect("Cannot open database (tnlog)");
+    let root = store_path.join("tndb");
+    let options = tndb::TnDbOptions { commit: tndb::CommitMode::Group, ..Default::default() };
+    let db = tndb::SplitDatabase::open_with(&root, options).expect("Cannot open database (tndb)");
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -400,15 +399,14 @@ mod migrate_test {
     use super::{
         migrate_from_mdbx,
         tables::*,
-        tndb::CommitMode,
-        tnlog::{SplitDatabase, TnLogOptions},
+        tndb::{CommitMode, SplitDatabase, TnDbOptions},
         MDBX_MIGRATED,
     };
 
-    /// tnlog opened as `_open_tnlog` opens it (its tables open), without the migration.
+    /// tndb opened as `_open_tndb` opens it (its tables open), without the migration.
     fn open_split(root: &std::path::Path) -> SplitDatabase {
-        let options = TnLogOptions { commit: CommitMode::Group, ..Default::default() };
-        let db = SplitDatabase::open_with(root, options).expect("open tnlog");
+        let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
+        let db = SplitDatabase::open_with(root, options).expect("open tndb");
         db.open_table::<Votes>().expect("open table");
         db.open_table::<Payload>().expect("open table");
         db.open_table::<KadRecords>().expect("open table");
@@ -416,7 +414,7 @@ mod migrate_test {
         db
     }
 
-    /// A node switching from MDBX to tnlog keeps its epoch tables (its votes: anti-equivocation
+    /// A node switching from MDBX to tndb keeps its epoch tables (its votes: anti-equivocation
     /// records) and its kad tables, but not the batch caches; the copy runs once.
     #[test]
     fn test_migrate_from_mdbx_keeps_epoch_and_kad_tables() {
@@ -434,7 +432,7 @@ mod migrate_test {
                 .expect("batch");
             mdbx.sync_persist();
         }
-        let root = store.join("tnlog");
+        let root = store.join("tndb");
         let db = open_split(&root);
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 3, "rows copied");
         assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote.clone()));
@@ -460,7 +458,7 @@ mod migrate_test {
     #[test]
     fn test_migrate_from_mdbx_on_a_fresh_node() {
         let tmp = TempDir::with_prefix("migrate_fresh").expect("temp dir");
-        let root = tmp.path().join("tnlog");
+        let root = tmp.path().join("tndb");
         let db = open_split(&root);
         assert_eq!(migrate_from_mdbx(tmp.path(), &root, &db).expect("migrate"), 0);
         assert!(root.join(MDBX_MIGRATED).exists(), "the marker");

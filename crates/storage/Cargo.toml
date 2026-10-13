@@ -63,9 +63,9 @@ tokio = { workspace = true, features = [ "macros", "rt", "time", "test-util", "i
 
 [features]
 redb = []
-# The node's consensus DB on tnlog (`tnlog::SplitDatabase`: one shared log per environment)
+# The node's consensus DB on tndb (`tndb::SplitDatabase`: one shared log per environment)
 # instead of MDBX. It takes priority over `redb` and the default MDBX.
-tnlog = []
+tndb = []
 reth-libmdbx = ["dep:reth-libmdbx", "dep:page_size"]
 default = ["reth-libmdbx"]
 # Re-exports tn-types' test hooks: `make build-e2e-bin` enables `tn-storage/test-utils` on the
