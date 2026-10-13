@@ -1,12 +1,13 @@
 # worker-gateway
 
-A stateless reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
+A reverse proxy that fronts a Telcoin Network worker's JSON-RPC endpoint.
 It forwards JSON-RPC calls (`eth_*` / `net_*` / `web3_*` / `tn_*`) unchanged to a ready upstream worker, gates traffic on a polled per-worker readiness signal, and exposes its own liveness and readiness endpoints so an orchestrator can route around it.
-With `--redirect-queries` it sends only transaction submissions to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
+With `--redirect-queries` it sends transaction submissions, and the few reads only the worker's pool can answer, to the worker and every other call to a public RPC (see [Query redirect](#query-redirect)); a validator's gateways should always run that way (see [Operator guidance](#operator-guidance)).
 "Unchanged" applies to the request method, JSON-RPC body, and content type; the header contract is deliberately minimal (see Scope).
 
-Because every instance is stateless and identical, the gateway can be scaled
-horizontally: any replica can serve any request. This is PR4 of the epic
+Every instance is identical and any replica can serve any request, so the gateway can be scaled horizontally.
+Each replica keeps its own bounded set of recent submission hashes, which only steers where a lookup goes (see [Reads kept on the worker](#reads-kept-on-the-worker)).
+This is PR4 of the epic
 (issue #712): it adds observability and deployment (a Prometheus `/metrics`
 endpoint, a container image, and reference Kubernetes manifests including an
 autoscaler keyed on the in-flight-request gauge) on top of the PR2 proxy core
@@ -22,7 +23,7 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   clients at a worker's WS endpoint behind your own ingress.
 - Static upstream configuration (no hot reload, no dynamic discovery).
 - Calls for the worker go to the first ready worker in configuration order; there is no load balancing across workers.
-  With `--redirect-queries`, only `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the worker and every other call goes to the query URL (see [Query redirect](#query-redirect)).
+  With `--redirect-queries`, only `eth_sendRawTransaction`, `eth_sendRawTransactionSync` and the [reads kept on the worker](#reads-kept-on-the-worker) go to the worker, and every other call goes to the query URL (see [Query redirect](#query-redirect)).
 - TLS termination for clients and auth/API keys are out of scope; run the gateway behind your own ingress/mTLS.
   The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
 - Header forwarding is minimal. Upstream gets the request method, body, and
@@ -128,7 +129,8 @@ Every flag has an environment-variable fallback.
 | `--upstream-rpc-url` | `WORKER_GATEWAY_UPSTREAM_RPC_URL` | (none) | Inline upstream JSON-RPC URL. |
 | `--upstream-readiness-url` | `WORKER_GATEWAY_UPSTREAM_READINESS_URL` | (none) | Inline upstream readiness URL. |
 | `--worker-id` | `WORKER_GATEWAY_WORKER_ID` | `0` | Inline upstream worker id. |
-| `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions; see [Query redirect](#query-redirect). |
+| `--redirect-queries` | `WORKER_GATEWAY_REDIRECT_QUERIES` | (none) | JSON-RPC endpoint (`http` or `https`) for every call except transaction submissions and the reads kept on the worker; see [Query redirect](#query-redirect). |
+| `--recent-submission-ttl` | `WORKER_GATEWAY_RECENT_SUBMISSION_TTL` | `60s` | With `--redirect-queries`, how long lookups of a forwarded submission's hash go to the worker (`0` disables); see [Reads kept on the worker](#reads-kept-on-the-worker). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
 | `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
 | `--readiness-failure-threshold` | `WORKER_GATEWAY_READINESS_FAILURE_THRESHOLD` | `3` | Failed polls in a row that turn a ready upstream not-ready (at least 1); see [Readiness contract](#readiness-contract). |
@@ -216,7 +218,9 @@ and the upstream response headers, so a request body trickled in below the
 size limit cannot hold a slot indefinitely.
 The probe listener (`--probe-addr`) has no connection cap: it applies the header read deadline, serves one request per connection and refuses a request head over 8 KiB; see [Gateway endpoints](#gateway-endpoints).
 
-Upstream response bodies are streamed through, never buffered whole, so
+Upstream response bodies are streamed through, never buffered whole (except
+the short, capped answer to a submission whose hash is remembered; see
+[Reads kept on the worker](#reads-kept-on-the-worker)), so
 response size does not translate into gateway memory. A stalled *upstream* is
 bounded by the upstream request timeout; a stalled or slow-reading *client*
 (the response-side slow loris: that timeout is only observed while the body
@@ -265,7 +269,7 @@ With `--rate-limit-submissions` set (requests per second, burst twice the rate),
 The per-IP limit still covers both classes and still refuses at the edge.
 The edge cannot tell the classes apart before the body is read, so a request the global bucket refuses is classified first: a query then gets the `429`, and a submission is charged to the submission bucket instead.
 A submission still spends a global token while one is left.
-With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways (see [Sizing for N gateways](#sizing-for-n-gateways)).
+With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
 Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
 Without the flag the edge check is unchanged.
 
@@ -484,12 +488,12 @@ The decode uses the same pooled wire format the worker's RPC accepts and never r
 - A submission with named params (`"params": {...}`) is not screened; the worker reads and validates those itself.
 - Only call objects are screened: a batch element written in positional form (a JSON array) counts as another call and is not screened.
 
-Mixed batches and every other method are forwarded unchanged and validated upstream: by the worker, or, with `--redirect-queries`, by the query URL for everything that is not a submission.
+Mixed batches and every other method are forwarded unchanged and validated upstream: by the worker, or, with `--redirect-queries`, by the query URL for everything the worker does not serve.
 
 ## Query redirect
 
-On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and nothing else.
-With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and every other call goes to the URL, typically a public RPC.
+On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and only the reads that must see its pool.
+With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and so do the [reads kept on the worker](#reads-kept-on-the-worker); every other call goes to the URL, typically a public RPC.
 Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
 Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or a single call with bytes after it.
 A batch the gateway cannot read to its end is refused rather than routed (see [Batches](#batches)).
@@ -516,7 +520,7 @@ A `2xx` reply whose JSON body has a `result` member counts as up; anything else,
 Like a worker's readiness, the probed state changes only on a run of `--readiness-success-threshold` answered probes or `--readiness-failure-threshold` failed ones in a row.
 A query URL that accepts reads and never answers holds each one for `--query-request-timeout`, and reads beyond `--max-inflight-queries` get `503` / `-32009` at once; submissions have their own slots and keep reaching the worker (see [Per-route capacity](#per-route-capacity)).
 
-| Worker | Query URL | `/ready` | `/ready/any` | Submissions | Other calls |
+| Worker | Query URL | `/ready` | `/ready/any` | Submissions and reads kept on the worker | Other calls |
 | --- | --- | --- | --- | --- | --- |
 | up | up | `200` | `200` | worker | query URL |
 | down | up | `503` | `200` | `503` / `-32000` | query URL |
@@ -528,6 +532,36 @@ Reads answered by the query URL come from a node that has not seen this validato
 
 The reverse topology, a gateway that sends submissions to a validator's worker and every other call to an observer's RPC, can be expressed with the same two settings, but it is not a supported deployment yet.
 
+### Reads kept on the worker
+
+The query URL answers from a node that has not seen this validator's transaction pool, because the worker's pool does not gossip its transactions (`propagate: false` in `crates/tn-reth/src/txn_pool.rs`).
+A client that sends several transactions in a row and asks that node for its next nonce in between gets the nonce from before its own submissions, and reuses it.
+So with `--redirect-queries` set, two kinds of read go to the worker instead of the query URL:
+
+- `eth_getTransactionCount` whose second parameter is the string `"pending"`.
+- `eth_getTransactionByHash` and `eth_getTransactionReceipt` whose first parameter is the hash of a submission this gateway forwarded to the worker within `--recent-submission-ttl` (default `60s`).
+
+The rule is exact:
+
+- Only a single call counts.
+  A batch keeps the classification above: it goes to the worker only when every element is a submission, so a batch holding one of these reads goes, whole, to the query URL.
+- Method names and the `"pending"` tag match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
+  A block parameter given any other way, such as `{"blockNumber": "pending"}`, or left out (which means `latest`) sends the nonce read to the query URL.
+- Every other read at `pending`, such as `eth_call`, `eth_getBalance` and `eth_estimateGas`, still goes to the query URL and can lag the worker's pool.
+- A hash is remembered only for a single `eth_sendRawTransaction` that passed the [transaction screen](#transaction-screening) and that the worker accepted: a `2xx` answer carrying a JSON-RPC `result`.
+  The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's short answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
+  An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost: the client gets `502` / `-32001`, and the forward counts as `body_failed` (see [Behaviour on failure](#behaviour-on-failure)).
+  A submission inside a batch, an `eth_sendRawTransactionSync` (which returns the receipt itself), and a submission the worker rejected, with an HTTP error status or a JSON-RPC `error`, are not remembered.
+- The gateway remembers at most 10,000 hashes and forgets the oldest first, so a flood of submissions can push a hash out early, and its lookups then go to the query URL.
+- Each gateway remembers only the submissions it forwarded itself, so a lookup that a load balancer sends to another gateway goes to the query URL.
+- With more than one upstream worker, each worker has its own pool and these reads go to whichever worker is first ready when they arrive: after a failover, or when a preferred worker comes back, a read can reach a worker that did not take the submission, and it gets the answer the query URL would give.
+- `--recent-submission-ttl 0` turns the hash routing off; nonce reads at `pending` still go to the worker.
+
+These reads are gated on worker readiness like submissions: with no worker ready they get `503` / `-32000` and are not sent to the query URL, which could only give the stale answer.
+They count on `tn_worker_gateway_routed_requests_total{route="worker"}`, and the per-IP and global rate limits bound what they cost the validator.
+They are reads for [Per-route capacity](#per-route-capacity): each holds a `--max-inflight-queries` slot, and a `--max-upstream-inflight` slot like a submission, so while a stalled query URL holds every query slot they are refused with `503` / `-32009` as well.
+That bound assumes the worker runs with its default `--rpc.pending-block none`, where a nonce read at `pending` is a state lookup plus a pool lookup; with `full`, the worker may build a pending block from its pool to answer one, which costs more than a submission.
+
 ## Gateway endpoints
 
 - `GET /health`: liveness, always `200 OK` while the process runs.
@@ -537,7 +571,8 @@ The reverse topology, a gateway that sends submissions to a validator's worker a
   It answers `200` when `/ready` would, or when `--redirect-queries` is set and the gateway's probes find the query URL up (see [Query redirect](#query-redirect)); without `--redirect-queries` it is exactly `/ready`.
   The body is `{"ready": bool, "submissions": bool, "queries": bool}`, where `submissions` is what `/ready` reports and `queries` whether the query URL is up.
 - everything else (i.e. `POST /`): forwarded to a ready upstream worker, or,
-  with `--redirect-queries`, to the query URL unless it is a submission.
+  with `--redirect-queries`, to the query URL unless it is a submission or one
+  of the [reads kept on the worker](#reads-kept-on-the-worker).
 
 The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
@@ -584,6 +619,7 @@ the client gets the upstream's status with a truncated body (a chunked
 response without its final chunk), and the gateway logs the failure at debug
 and counts it as `result="body_failed"` in
 `tn_worker_gateway_routed_requests_total`.
+The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32001`, and the forward counts as `body_failed` only, without a `forwarded`.
 
 The gateway's own codes sit in the JSON-RPC server-error range
 (`-32000..=-32099`), which upstream servers also use for their errors;
@@ -617,7 +653,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | End-to-end proxied-request latency, up to the end of the response body. |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`, and a worker's answer to a submission that was lost while the gateway read it whole, without one (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls (an element that is not a call object counts as another call). |
 | `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
@@ -629,7 +665,8 @@ are excluded from these series, so they reflect real client load only.
 
 Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
-ready upstream, an oversized body, and, per route, a forwarding failure or an
+ready upstream, an oversized body, a worker's answer to a submission that
+could not be read whole, and, per route, a forwarding failure or an
 upstream error answer) are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
@@ -657,20 +694,21 @@ Every limit is per process, so the worker sees the sum over all gateways.
 
 - **Rate.** The worker receives up to N × `--rate-limit-global` calls per second, where N is the largest number of gateways that can run at once: the HPA's `maxReplicas` if you install it (10 in the reference manifest).
   Size `--rate-limit-global` as the worker's budget divided by that N.
-  With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives only submissions, up to N × `--rate-limit-submissions` requests per second; size that flag the same way.
+  With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives submissions, up to N × `--rate-limit-submissions` requests per second, plus the [reads kept on the worker](#reads-kept-on-the-worker), which count against `--rate-limit-global` like every other read; size that flag the same way.
   With `--rate-limit-submissions` set and no redirect, the worker receives both budgets, so keep N × (`--rate-limit-global` + `--rate-limit-submissions`) within the worker's budget.
 - **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
   Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`.
   The reference manifest does not on its own: its HPA allows 10 replicas, and 10 × 100 (the default cap) is 1000, above the worker's 500.
   Lower the cap to 49 or less (10 × 49 = 490), lower `maxReplicas`, or raise the worker's `--rpc.max-connections` above N × the cap.
-  With `--redirect-queries` only submissions reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s (reth's `--rpc.send-raw-transaction-sync-timeout`, inside the gateway's 35 s `--upstream-request-timeout`); a gateway whose cap is full answers `503` / `-32009` itself instead of letting the worker refuse submissions from every gateway.
+  With `--redirect-queries` only submissions and the [reads kept on the worker](#reads-kept-on-the-worker) reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s (reth's `--rpc.send-raw-transaction-sync-timeout`, inside the gateway's 35 s `--upstream-request-timeout`); a gateway whose cap is full answers `503` / `-32009` itself instead of letting the worker refuse submissions from every gateway.
 - **Memory.** Peak request memory per gateway is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 
 ### Split routing
 
 With `--redirect-queries`, reads are answered by a node that has not seen this validator's transaction pool.
 
-- `eth_getTransactionCount(.., "pending")`, `eth_getTransactionByHash` and receipts right after a submission can lag, so clients that send several transactions in a row should track their own nonces.
+- Nonce reads at `pending`, and lookups of a submission made through the same gateway, go to the worker (see [Reads kept on the worker](#reads-kept-on-the-worker)).
+  Other reads at `pending`, every read inside a batch, and a lookup that reaches another gateway or arrives after `--recent-submission-ttl` can still lag, so clients that send several transactions in a row should track their own nonces where they can.
 - Fee quotes come from the public node and can lag an epoch boundary.
 - A submission inside a mixed batch goes to the public RPC with the rest of the batch and enters the network there.
 - Every redirected read reaches the public RPC from the gateway's address, so its per-IP limits apply to all of the gateway's clients together; agree limits with its operator before advertising the endpoint.

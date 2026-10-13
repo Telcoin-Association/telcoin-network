@@ -6,7 +6,8 @@
 //! the gateway's own `/ready` endpoint reflects whether any upstream is ready.
 //!
 //! Readiness governs the worker route only. With `--redirect-queries` set,
-//! non-submission calls go to the query upstream whatever this state says.
+//! every call but a submission or one of the few reads kept on the worker
+//! goes to the query upstream whatever this state says.
 //! The poller also sends that upstream one `eth_chainId` call per cycle,
 //! alongside the worker polls and under the same thresholds, but only so
 //! `/ready/any` can report whether reads can be served: there is one

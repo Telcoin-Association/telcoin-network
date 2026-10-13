@@ -17,7 +17,10 @@ use crate::{
     proxy::{client_builder, proxy_client, UpstreamOrigin, WARNING_THROTTLES},
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
-    server::{inflight_slots, serve, serve_probes, AppState, ServerLimits},
+    server::{
+        inflight_slots, serve, serve_probes, AppState, RecentSubmissions, ServerLimits,
+        RECENT_SUBMISSIONS_CAPACITY,
+    },
     telemetry::run_throttle_summaries,
 };
 
@@ -49,6 +52,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         probe_addr,
         upstreams,
         query_upstream,
+        recent_submission_ttl,
         readiness_poll_interval,
         readiness_poll_timeout,
         readiness_failure_threshold,
@@ -89,6 +93,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         redirect_queries = %query_upstream
             .as_ref()
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
+        ?recent_submission_ttl,
         "starting worker gateway"
     );
 
@@ -199,10 +204,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     // travels like a redirected read, through the same DNS cache and lookup cap.
     let query_probe =
         query_upstream.clone().map(|url| QueryProbe { url, client: proxy_client.clone() });
+    // submissions are remembered only for the redirect's hash routing
+    let recent_submissions = recent_submission_ttl
+        .filter(|_| query_upstream.is_some())
+        .map(|ttl| Arc::new(RecentSubmissions::new(ttl, RECENT_SUBMISSIONS_CAPACITY)));
     let state = AppState {
         readiness: Arc::clone(&readiness),
         http: proxy_client,
         query_upstream,
+        recent_submissions,
         max_batch_len,
         query_request_timeout,
         submission_slots: inflight_slots(max_inflight_submissions),

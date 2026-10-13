@@ -12,16 +12,20 @@
 //! client and then the trusted proxy that vouched for it, and
 //! `X-Forwarded-Proto` is `http` unless a trusted proxy reported `https` (see
 //! [`crate::identity`]). The upstream response body is streamed through, never
-//! buffered whole. When no upstream is ready, or the upstream cannot be reached
-//! / times out, the client receives a well-formed JSON-RPC error instead (see
-//! [`crate::error`]). So does a client whose upstream answers an error status
-//! without a JSON body (a worker's `429` text/plain, say): it keeps the
-//! upstream's status, with a JSON-RPC error in place of the body.
+//! buffered whole, except the small answer to a submission whose hash the
+//! gateway would remember (see [`submission_accepted`]). When no upstream is
+//! ready, or the upstream cannot be reached / times out, the client receives a
+//! well-formed JSON-RPC error instead (see [`crate::error`]). So does a client
+//! whose upstream answers an error status without a JSON body (a worker's
+//! `429` text/plain, say): it keeps the upstream's status, with a JSON-RPC
+//! error in place of the body.
 //!
-//! With `--redirect-queries` set, only transaction submissions go to the
-//! worker; every other call goes to the query upstream (see [`scan`]),
-//! which is not readiness-gated, never falls back to the worker, and gets the
-//! `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
+//! With `--redirect-queries` set, transaction submissions go to the worker,
+//! and so do the few single reads only its pool can answer: a nonce at the
+//! `pending` tag, and a lookup of a submission this gateway forwarded recently
+//! (see [`scan`] and [`PoolRead`]). Every other call goes to the query
+//! upstream, which is not readiness-gated, never falls back to the worker, and
+//! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`.
 //!
 //! Every request is classified, redirect or not: a submission counts against
 //! `--max-inflight-submissions` and everything else against
@@ -48,7 +52,7 @@ use axum::{
         rejection::{BytesRejection, FailedToBufferBody},
         FromRequest as _, Request, State,
     },
-    http::{header, HeaderMap, HeaderName, HeaderValue, Method},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
     response::Response,
     Extension, RequestExt as _,
 };
@@ -59,7 +63,7 @@ use serde::{
     Deserialize, Deserializer,
 };
 use serde_json::de::SliceRead;
-use tn_types::{Decodable2718, PooledTransaction, Typed2718};
+use tn_types::{Decodable2718, PooledTransaction, Typed2718, B256};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -71,7 +75,7 @@ use crate::{
     },
     identity::{Forwarding, X_FORWARDED_FOR, X_FORWARDED_PROTO},
     ratelimit::{RateLimiters, SubmissionBudget},
-    server::AppState,
+    server::{AppState, RecentSubmissions},
     telemetry::{self, Throttle},
 };
 
@@ -102,13 +106,37 @@ const SEND_RAW_TRANSACTION: &str = "eth_sendRawTransaction";
 /// The raw-transaction submission that waits for the receipt.
 const SEND_RAW_TRANSACTION_SYNC: &str = "eth_sendRawTransactionSync";
 
-/// The JSON-RPC methods that submit a transaction, and so the only calls a
-/// gateway with `--redirect-queries` sends to the worker. They are exactly the
+/// The JSON-RPC methods that submit a transaction, and so the calls a gateway
+/// with `--redirect-queries` always sends to the worker. They are exactly the
 /// two methods the node's fee-cap guard replaces
 /// (`crates/tn-reth/src/env/rpc.rs`), matched exactly and case-sensitively, as
 /// jsonrpsee matches method names. Both contain [`SEND_RAW_TRANSACTION`], so
 /// its substring test is a fast path for either.
 const SUBMISSION_METHODS: [&str; 2] = [SEND_RAW_TRANSACTION, SEND_RAW_TRANSACTION_SYNC];
+
+/// The nonce read a gateway with `--redirect-queries` keeps on the worker when
+/// its block parameter is [`PENDING_TAG`] (see [`PoolRead`]).
+const GET_TRANSACTION_COUNT: &str = "eth_getTransactionCount";
+
+/// The lookups by hash a gateway with `--redirect-queries` keeps on the worker
+/// for a submission it forwarded recently (see [`PoolRead`]).
+const LOOKUPS_BY_HASH: [&str; 2] = ["eth_getTransactionByHash", "eth_getTransactionReceipt"];
+
+/// The prefix [`GET_TRANSACTION_COUNT`] and both [`LOOKUPS_BY_HASH`] share, so
+/// its substring test is a fast path for all three.
+const POOL_READ_PREFIX: &str = "eth_getTransaction";
+
+/// The block tag that asks for the chain state plus the node's pool.
+const PENDING_TAG: &str = "pending";
+
+/// Bytes beyond the request's own length that the proxy reads of a worker's
+/// answer to a submission whose hash it would remember (see
+/// [`submission_accepted`]). The answer is a transaction hash or a short error
+/// object plus the request's `id` echoed back, and the id is the client's to
+/// make as long as the request cap allows, so a fixed cap would turn a valid
+/// submission with a long id into an error. A healthy worker stays far below
+/// the request's length plus this.
+pub(crate) const SUBMISSION_ANSWER_SLACK: usize = 4 * 1024;
 
 /// The proxy client's `User-Agent`, so the operator of a query upstream can
 /// tell gateway traffic apart.
@@ -149,6 +177,10 @@ static NO_UPSTREAM_WARNINGS: Throttle = Throttle::new("no_upstream");
 /// Throttle for the oversized-body warning.
 pub(crate) static OVERSIZED_BODY_WARNINGS: Throttle = Throttle::new("oversized_body");
 
+/// Throttle for the warning on a worker's answer to a submission that could
+/// not be read whole (see [`relay_submission_answer`]).
+static SUBMISSION_ANSWER_WARNINGS: Throttle = Throttle::new("submission_answer");
+
 /// Throttles for the forwarding-failure warning, one per route, so a failing
 /// query upstream cannot hide a failing worker.
 static FORWARD_FAILURE_WARNINGS: PerRoute =
@@ -160,7 +192,7 @@ static UPSTREAM_ERROR_WARNINGS: PerRoute =
 
 /// Every per-request warning throttle, summarized by
 /// [`telemetry::run_throttle_summaries`].
-pub(crate) static WARNING_THROTTLES: [&Throttle; 11] = [
+pub(crate) static WARNING_THROTTLES: [&Throttle; 12] = [
     &HOP_LOOP_WARNINGS,
     &REDIRECT_LOOP_WARNINGS,
     &UNREADABLE_BATCH_WARNINGS,
@@ -168,6 +200,7 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 11] = [
     &SCREEN_WARNINGS,
     &NO_UPSTREAM_WARNINGS,
     &OVERSIZED_BODY_WARNINGS,
+    &SUBMISSION_ANSWER_WARNINGS,
     &FORWARD_FAILURE_WARNINGS.worker,
     &FORWARD_FAILURE_WARNINGS.query,
     &UPSTREAM_ERROR_WARNINGS.worker,
@@ -175,8 +208,9 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 11] = [
 ];
 
 /// Forward a JSON-RPC request to the first ready upstream worker or, when
-/// `--redirect-queries` is set and the request is not made only of
-/// submissions, to the query upstream.
+/// `--redirect-queries` is set and the request is neither made only of
+/// submissions nor one of the reads only the worker's pool can answer (see
+/// [`PoolRead`]), to the query upstream.
 ///
 /// A worker forward that fails to connect, a connect timeout included, counts
 /// toward `--upstream-failure-threshold` (see
@@ -301,7 +335,9 @@ pub(crate) async fn proxy(
     // of nothing but submissions: reject a payload the worker would also
     // reject (undecodable, or a type the network does not accept) before
     // paying for an upstream round-trip. The scan recovers the refused call's
-    // request id itself on the paths that reject.
+    // request id itself on the paths that reject, and hands back the hash of a
+    // single `eth_sendRawTransaction` it decoded (`scan.submitted`), so nothing
+    // decodes it twice.
     if let Some((err, id)) = scan.rejection {
         if let Some(suppressed) = SCREEN_WARNINGS.admit() {
             warn!(
@@ -344,11 +380,13 @@ pub(crate) async fn proxy(
         return error_response(&GatewayError::Overloaded, body.as_ref());
     };
 
-    // with a redirect configured, every call but a submission goes to the
-    // query upstream, with no readiness gate and no fallback to the worker: a
-    // fallback would put the read load on the validator exactly when the
-    // public rpc is struggling.
-    let query_upstream = state.query_upstream.as_ref().filter(|_| is_query(scan.calls));
+    // with a redirect configured, every call but a submission or a read only
+    // the worker's pool can answer goes to the query upstream, with no
+    // readiness gate and no fallback to the worker: a fallback would put the
+    // read load on the validator exactly when the public rpc is struggling.
+    let recent = state.recent_submissions.as_deref();
+    let query_upstream =
+        state.query_upstream.as_ref().filter(|_| is_query(scan.calls, scan.pool_read, recent));
     let (route, upstream_url) = match query_upstream {
         Some(query_upstream) => (Route::Query, query_upstream.clone()),
         None => match state.readiness.first_ready_rpc_url() {
@@ -410,6 +448,27 @@ pub(crate) async fn proxy(
                 }
                 return upstream_error_response(status, body.as_ref());
             }
+            // a single submission the worker took is remembered, so that a
+            // lookup of its hash follows it to the worker's pool (see
+            // [`PoolRead`]). the worker answers a transaction it refused with a
+            // 2xx as well, carrying a json-rpc `error`, so only a json-rpc
+            // `result` counts: the answer is read whole to tell, and only on
+            // this path. it is read here, while the in-flight guard, the class
+            // slot and the byte reservation are still held; they drop when
+            // this returns
+            let remember = recent
+                .zip(scan.submitted)
+                .filter(|_| route == Route::Worker && upstream.status().is_success());
+            if let Some((recent, hash)) = remember {
+                return relay_submission_answer(
+                    upstream,
+                    &upstream_url,
+                    body.as_ref(),
+                    recent,
+                    hash,
+                )
+                .await;
+            }
             telemetry::record_forwarded();
             telemetry::record_routed(route.label(), "forwarded");
             relay(upstream, route, upstream_url, in_flight, class_slot)
@@ -460,12 +519,116 @@ pub(crate) async fn proxy(
 }
 
 /// Whether a request goes to the query upstream rather than the worker,
-/// counting a mixed batch on the way (see [`scan`]).
-fn is_query(calls: Calls) -> bool {
+/// counting a mixed batch on the way: anything but submissions (see
+/// [`scan`]) and the reads only the worker's pool can answer (see
+/// [`PoolRead`]).
+fn is_query(calls: Calls, pool_read: Option<PoolRead>, recent: Option<&RecentSubmissions>) -> bool {
     if calls == Calls::MixedBatch {
         telemetry::record_mixed_batch();
     }
-    calls.route() == Route::Query
+    calls.route() == Route::Query && !pool_read.is_some_and(|read| read.stays_on_worker(recent))
+}
+
+/// Whether a worker's answer to one submission is a JSON-RPC success: an
+/// object with a non-null `result` member and no `error` member (a `null`
+/// `error` counts as none). Anything else, an answer that is not JSON
+/// included, means the worker did not take the transaction.
+fn submission_accepted(answer: &[u8]) -> bool {
+    /// The two members that tell a JSON-RPC success from an error; every other
+    /// member is skipped in place.
+    #[derive(serde::Deserialize)]
+    struct Answer {
+        result: Option<IgnoredAny>,
+        error: Option<IgnoredAny>,
+    }
+
+    // a derived struct also deserializes from a json array, taking its
+    // members in order, so an answer that is not an object is refused first
+    answer.trim_ascii_start().starts_with(b"{")
+        && serde_json::from_slice::<Answer>(answer)
+            .is_ok_and(|answer| answer.result.is_some() && answer.error.is_none())
+}
+
+/// Pass on a worker's `2xx` answer to a single `eth_sendRawTransaction`,
+/// remembering the transaction's `hash` in `recent` when the answer is a
+/// JSON-RPC success (see [`submission_accepted`]).
+///
+/// The answer is read whole, at most the request's length plus
+/// [`SUBMISSION_ANSWER_SLACK`], and passed on unchanged with the worker's
+/// status and content type. An answer that cannot be read within the cap
+/// (longer than it, a body that fails, or one that runs past the request
+/// timeout) is lost: the client gets `502` / `-32001`, and the forward counts
+/// once, as `routed_requests_total{route="worker", result="body_failed"}`,
+/// never as `forwarded`.
+async fn relay_submission_answer(
+    upstream: reqwest::Response,
+    upstream_url: &Url,
+    request_body: &[u8],
+    recent: &RecentSubmissions,
+    hash: B256,
+) -> Response {
+    let status = upstream.status();
+    let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let cap = request_body.len().saturating_add(SUBMISSION_ANSWER_SLACK);
+    match read_answer(upstream, cap).await {
+        Ok(answer) => {
+            if submission_accepted(&answer) {
+                recent.record(hash);
+            }
+            telemetry::record_forwarded();
+            telemetry::record_routed(Route::Worker.label(), "forwarded");
+            upstream_response(status, content_type, Body::from(answer))
+        }
+        Err(lost) => {
+            telemetry::record_routed(Route::Worker.label(), "body_failed");
+            if let Some(suppressed) = SUBMISSION_ANSWER_WARNINGS.admit() {
+                warn!(
+                    target: "gateway::proxy",
+                    route = Route::Worker.label(),
+                    upstream = %UpstreamOrigin(upstream_url),
+                    cause = %lost,
+                    suppressed,
+                    "reading the worker's answer to a submission failed"
+                );
+            }
+            error_response(&GatewayError::UpstreamUnreachable, request_body)
+        }
+    }
+}
+
+/// Read an upstream's answer whole, giving up once it runs past `cap` bytes.
+/// The read runs under the proxy client's request timeout, so an upstream
+/// that stalls mid-answer fails it instead of holding it.
+async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Bytes, AnswerLost> {
+    let mut answer = Vec::new();
+    while let Some(chunk) =
+        upstream.chunk().await.map_err(|err| AnswerLost::Failed(err.without_url()))?
+    {
+        // `answer` never holds more than `cap`, so this cannot underflow
+        if chunk.len() > cap - answer.len() {
+            return Err(AnswerLost::TooLong);
+        }
+        answer.extend_from_slice(&chunk);
+    }
+    Ok(answer.into())
+}
+
+/// Why [`read_answer`] could not read an answer whole.
+enum AnswerLost {
+    /// The answer ran past the cap.
+    TooLong,
+    /// The body failed or ran past the request timeout. The error carries no
+    /// url, so it can be logged.
+    Failed(reqwest::Error),
+}
+
+impl fmt::Display for AnswerLost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TooLong => f.write_str("answer longer than the read cap"),
+            Self::Failed(err) => ErrorChain(err).fmt(f),
+        }
+    }
 }
 
 /// Buffer the request body into one allocation.
@@ -635,9 +798,20 @@ fn relay(
         _in_flight: in_flight,
         _class_slot: class_slot,
     };
-    let mut response = Response::new(Body::from_stream(body));
+    upstream_response(status, upstream_content_type, Body::from_stream(body))
+}
+
+/// The response passed on for an upstream's answer: its status and content
+/// type around `body`, and no other upstream header (a `3xx`'s `Location`
+/// included; see [`proxy_client`]).
+fn upstream_response(
+    status: StatusCode,
+    content_type: Option<HeaderValue>,
+    body: Body,
+) -> Response {
+    let mut response = Response::new(body);
     *response.status_mut() = status;
-    if let Some(content_type) = upstream_content_type {
+    if let Some(content_type) = content_type {
         response.headers_mut().insert(header::CONTENT_TYPE, content_type);
     }
     response
@@ -818,9 +992,9 @@ impl fmt::Display for ErrorChain<'_> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Route {
     /// The first ready worker: every call without `--redirect-queries`, and
-    /// only submissions with it.
+    /// with it only submissions and the reads only its pool can answer.
     Worker,
-    /// The `--redirect-queries` endpoint: every call that is not a submission.
+    /// The `--redirect-queries` endpoint: every other call.
     Query,
 }
 
@@ -921,6 +1095,15 @@ struct Scan {
     /// The screen's verdict: the error and the request id to answer it with,
     /// or `None` to forward the body.
     rejection: Option<(GatewayError, RequestId)>,
+    /// The hash of a single `eth_sendRawTransaction` whose transaction the
+    /// screen decoded and passed, which the proxy remembers once the worker
+    /// takes it (see [`RecentSubmissions`]). A submission in a batch and an
+    /// `eth_sendRawTransactionSync`, which answers with the receipt, have
+    /// none.
+    submitted: Option<B256>,
+    /// A single call only the worker's pool can answer, which a gateway with
+    /// `--redirect-queries` may keep on the worker (see [`PoolRead`]).
+    pool_read: Option<PoolRead>,
     /// A batch the pass could not read to its end for any reason but the
     /// length cap, so `len` is only a lower bound on its calls.
     unreadable_batch: bool,
@@ -963,7 +1146,12 @@ struct Scan {
 /// Every other request is forwarded unchanged: other methods, a mixed batch,
 /// a submission whose params are named or structurally off (the worker
 /// answers with its own parameter error), and a single call that is not
-/// exactly one JSON value.
+/// exactly one JSON value. A single `eth_sendRawTransaction` the screen passes
+/// hands back its transaction's hash.
+///
+/// Pool reads: a single call that is exactly one JSON value is also checked
+/// for the reads only the worker's pool can answer (see [`PoolRead`]); a
+/// batch never is, so it keeps the route its calls give it.
 ///
 /// Cost: one deserializer reads the body, and every member the gateway does
 /// not act on is skipped in place, so the cost is a scan of the bytes rather
@@ -981,10 +1169,18 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
     // batch from the count or a call from the screen
     let body = body.trim_ascii_start();
     let batch = is_batch(body);
-    // fast path: a body that is not a batch and cannot name a submission
-    // method is one call and holds no submission, and nothing is parsed
-    if !batch && !may_name_a_submission(body) {
-        return Scan { len: 1, calls: Calls::Queries, rejection: None, unreadable_batch: false };
+    // fast path: a body that is not a batch and can name neither a
+    // submission method nor a pool read is one call that routes as a query,
+    // and nothing is parsed
+    if !batch && !may_name_a_routed_method(body) {
+        return Scan {
+            len: 1,
+            calls: Calls::Queries,
+            rejection: None,
+            submitted: None,
+            pool_read: None,
+            unreadable_batch: false,
+        };
     }
     let mut state = ScanState::default();
     let mut deserializer = body_deserializer(body);
@@ -1009,7 +1205,18 @@ fn scan(body: &[u8], max_batch_len: Option<NonZeroUsize>) -> Scan {
             );
             (err, id)
         });
-    Scan { len: if batch { state.len } else { 1 }, calls, rejection, unreadable_batch }
+    // a single call's hash and pool read stand only when it is exactly one
+    // json value, like the verdict
+    let submitted = state.submitted.filter(|_| calls == Calls::Submissions);
+    let pool_read = state.pool_read.filter(|_| parsed);
+    Scan {
+        len: if batch { state.len } else { 1 },
+        calls,
+        rejection,
+        submitted,
+        pool_read,
+        unreadable_batch,
+    }
 }
 
 /// The deserializer a request body is read with. [`scan`] is its only caller,
@@ -1036,6 +1243,10 @@ struct ScanState {
     /// The screen's verdict on the first submission it refuses, with the
     /// refused call's index when it is a batch element.
     rejection: Option<(GatewayError, Option<usize>)>,
+    /// The hash of a single `eth_sendRawTransaction` the screen passed.
+    submitted: Option<B256>,
+    /// A single call only the worker's pool can answer.
+    pool_read: Option<PoolRead>,
 }
 
 impl ScanState {
@@ -1056,7 +1267,7 @@ impl ScanState {
             Element::Call(call) => {
                 self.record(call.method);
                 if !self.other && self.rejection.is_none() {
-                    self.rejection = call.screen().map(|err| (err, Some(self.len)));
+                    self.rejection = call.screen().err().map(|err| (err, Some(self.len)));
                 }
             }
             Element::Other => self.other = true,
@@ -1089,12 +1300,21 @@ impl<'de> Visitor<'de> for ScanVisitor<'_> {
         formatter.write_str("a JSON-RPC request object or batch")
     }
 
-    /// A single call: classified, and screened when it is a submission.
+    /// A single call: classified, screened when it is a submission, and
+    /// checked for a pool read.
     fn visit_map<A: MapAccess<'de>>(self, members: A) -> Result<Self::Value, A::Error> {
         let call = Call::read(members)?;
         self.state.len = 1;
         self.state.record(call.method);
-        self.state.rejection = call.screen().map(|err| (err, None));
+        match call.screen() {
+            Ok(tx) => {
+                self.state.submitted = tx
+                    .filter(|_| call.method == RpcMethod::Submission { sync: false })
+                    .map(|tx| *tx.hash());
+            }
+            Err(err) => self.state.rejection = Some((err, None)),
+        }
+        self.state.pool_read = call.pool_read();
         Ok(())
     }
 
@@ -1130,27 +1350,33 @@ struct Call<'de> {
     /// The call's `method`.
     method: RpcMethod,
     /// The first element of `params` when it has a shape the worker reads as
-    /// bytes: the raw transaction, if the call is a submission.
+    /// bytes: the raw transaction, if the call is a submission, or the hash,
+    /// if it is a lookup by hash.
     raw_transaction: Option<RawTransaction<'de>>,
+    /// The second element of `params` is the string [`PENDING_TAG`].
+    pending: bool,
 }
 
 impl<'de> Call<'de> {
-    /// Read a call object's `method` and first `params` element, skipping
-    /// every other member in place.
+    /// Read a call object's `method` and first two `params` elements,
+    /// skipping every other member in place.
     ///
     /// A repeated member keeps its last occurrence, as a `Value` parse does.
     /// jsonrpsee's derived request type rejects a duplicated member outright,
     /// so such a call is an invalid request at either upstream; the choice
     /// only decides which one says so.
     fn read<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
-        let mut call = Self { method: RpcMethod::Other, raw_transaction: None };
+        let mut call = Self { method: RpcMethod::Other, raw_transaction: None, pending: false };
         while let Some(member) = members.next_key::<Member>()? {
             match member {
                 Member::Method => {
                     call.method =
                         RpcMethod::named(members.next_value::<MaybeStr<'de>>()?.0.as_deref());
                 }
-                Member::Params => call.raw_transaction = members.next_value::<FirstParam<'de>>()?.0,
+                Member::Params => {
+                    let params = members.next_value::<LeadingParams<'de>>()?;
+                    (call.raw_transaction, call.pending) = (params.first, params.pending);
+                }
                 Member::Other => {
                     members.next_value::<IgnoredAny>()?;
                 }
@@ -1159,40 +1385,99 @@ impl<'de> Call<'de> {
         Ok(call)
     }
 
-    /// The screen's verdict on this call: `None` unless it is a submission
-    /// whose raw transaction the worker would refuse.
-    fn screen(&self) -> Option<GatewayError> {
+    /// The screen's verdict on this call: the error the worker would refuse
+    /// it with, or the decoded transaction of a submission that passes, or
+    /// `None` when there is nothing to screen (another method, or params
+    /// without a raw transaction).
+    fn screen(&self) -> Result<Option<PooledTransaction>, GatewayError> {
         if !self.method.is_submission() {
-            return None;
+            return Ok(None);
         }
-        self.raw_transaction.as_ref().and_then(screen_transaction)
+        self.raw_transaction.as_ref().map(screen_transaction).transpose()
+    }
+
+    /// The read only the worker's pool can answer that this call is, if any
+    /// (see [`PoolRead`]). Only a string is read as a hash; a hash that does
+    /// not parse is no lookup of a remembered submission.
+    fn pool_read(&self) -> Option<PoolRead> {
+        match (self.method, &self.raw_transaction) {
+            (RpcMethod::TransactionCount, _) => self.pending.then_some(PoolRead::PendingNonce),
+            (RpcMethod::LookupByHash, Some(RawTransaction::Hex(hash))) => {
+                hash.parse().ok().map(PoolRead::Lookup)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// A single read that only the worker's pool can answer, and that a gateway
+/// with `--redirect-queries` therefore keeps on the worker.
+///
+/// The query upstream has not seen the worker's pool, whose transactions are
+/// not gossiped (`propagate: false` in `crates/tn-reth/src/txn_pool.rs`), so
+/// it answers these from the state before a client's own submissions, and a
+/// client that sends transactions back to back reuses a nonce. Every other
+/// read at `pending` (`eth_call`, `eth_getBalance`, `eth_estimateGas`) stays
+/// on the query upstream. So does a batch: [`scan`] reads a pool read from a
+/// single call only, so a batch keeps the route its calls give it. Method
+/// names and the tag match exactly and case-sensitively.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolRead {
+    /// [`GET_TRANSACTION_COUNT`] whose block parameter is the string
+    /// [`PENDING_TAG`].
+    PendingNonce,
+    /// One of [`LOOKUPS_BY_HASH`] for this hash.
+    Lookup(B256),
+}
+
+impl PoolRead {
+    /// Whether the read stays on the worker: a pending nonce read always, a
+    /// lookup only for the hash of a submission this gateway forwarded
+    /// recently (`recent`; `None` turns that half off).
+    fn stays_on_worker(self, recent: Option<&RecentSubmissions>) -> bool {
+        match self {
+            Self::PendingNonce => true,
+            Self::Lookup(hash) => recent.is_some_and(|recent| recent.contains(&hash)),
+        }
     }
 }
 
 /// A call's `method`, reduced to what the gateway acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RpcMethod {
-    /// One of [`SUBMISSION_METHODS`].
-    Submission,
+    /// One of [`SUBMISSION_METHODS`]; `sync` for
+    /// `eth_sendRawTransactionSync`, which answers with the receipt rather
+    /// than the hash.
+    Submission {
+        /// The method is `eth_sendRawTransactionSync`.
+        sync: bool,
+    },
+    /// [`GET_TRANSACTION_COUNT`].
+    TransactionCount,
+    /// One of [`LOOKUPS_BY_HASH`].
+    LookupByHash,
     /// Any other method, or a `method` that is not a string.
     Other,
 }
 
 impl RpcMethod {
     /// The method a `method` member names, matched against
-    /// [`SUBMISSION_METHODS`] exactly and case-sensitively, as jsonrpsee
-    /// matches method names.
+    /// [`SUBMISSION_METHODS`] and the pool reads exactly and case-sensitively,
+    /// as jsonrpsee matches method names.
     fn named(name: Option<&str>) -> Self {
-        if name.is_some_and(|name| SUBMISSION_METHODS.contains(&name)) {
-            Self::Submission
-        } else {
-            Self::Other
+        match name {
+            Some(name) if SUBMISSION_METHODS.contains(&name) => {
+                Self::Submission { sync: name == SEND_RAW_TRANSACTION_SYNC }
+            }
+            Some(GET_TRANSACTION_COUNT) => Self::TransactionCount,
+            Some(name) if LOOKUPS_BY_HASH.contains(&name) => Self::LookupByHash,
+            _ => Self::Other,
         }
     }
 
     /// Whether the method is one of [`SUBMISSION_METHODS`].
     fn is_submission(self) -> bool {
-        self == Self::Submission
+        matches!(self, Self::Submission { .. })
     }
 }
 
@@ -1254,27 +1539,36 @@ impl<'de> Deserialize<'de> for Element<'de> {
 }
 
 /// A `params` member reduced to its first element when that element holds a
-/// raw transaction.
+/// raw transaction (or a hash, for a lookup by hash), and whether its second
+/// element is the string [`PENDING_TAG`] (for a nonce read).
 ///
 /// The remaining elements are drained through the ignored-value sink, so a
 /// `params` array of any length costs a scan rather than an allocation per
-/// element. Named params (an object) and any other shape have no first
-/// element and leave the call to the upstream.
-struct FirstParam<'de>(Option<RawTransaction<'de>>);
+/// element. Named params (an object) and any other shape have no positional
+/// elements and leave the call to the upstream.
+struct LeadingParams<'de> {
+    /// The first element, when it holds a raw transaction.
+    first: Option<RawTransaction<'de>>,
+    /// The second element is [`PENDING_TAG`].
+    pending: bool,
+}
 
-impl<'de> Lenient<'de> for FirstParam<'de> {
+impl<'de> Lenient<'de> for LeadingParams<'de> {
     fn other() -> Self {
-        Self(None)
+        Self { first: None, pending: false }
     }
 
     fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
-        let first = elements.next_element::<MaybeRawTransaction<'de>>()?.and_then(|first| first.0);
+        let Some(MaybeRawTransaction(first)) = elements.next_element()? else {
+            return Ok(Self::other());
+        };
+        let pending = elements.next_element::<PendingTag>()?.is_some_and(|tag| tag.0);
         while elements.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(Self(first))
+        Ok(Self { first, pending })
     }
 }
 
-impl<'de> Deserialize<'de> for FirstParam<'de> {
+impl<'de> Deserialize<'de> for LeadingParams<'de> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(LenientVisitor(PhantomData))
     }
@@ -1353,6 +1647,26 @@ impl Lenient<'_> for MaybeByte {
 }
 
 impl<'de> Deserialize<'de> for MaybeByte {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(LenientVisitor(PhantomData))
+    }
+}
+
+/// Whether a value is the string [`PENDING_TAG`], compared where it lies and
+/// never copied; any other shape is consumed and discarded.
+struct PendingTag(bool);
+
+impl Lenient<'_> for PendingTag {
+    fn other() -> Self {
+        Self(false)
+    }
+
+    fn string(value: &str) -> Self {
+        Self(value == PENDING_TAG)
+    }
+}
+
+impl<'de> Deserialize<'de> for PendingTag {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         deserializer.deserialize_any(LenientVisitor(PhantomData))
     }
@@ -1485,8 +1799,8 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
     }
 }
 
-/// The screen's verdict on one raw transaction: `None` to forward it, or the
-/// error to refuse it with.
+/// The screen's verdict on one raw transaction: the decoded transaction, to
+/// forward it, or the error to refuse it with.
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
@@ -1494,17 +1808,16 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 /// the worker would issue anyway. From here the payload is unambiguously a
 /// raw transaction, so a decode failure is a real rejection rather than a
 /// reason to forward.
-fn screen_transaction(raw: &RawTransaction<'_>) -> Option<GatewayError> {
-    raw.bytes().map_or(Some(GatewayError::InvalidTransaction), |raw| {
-        let mut buf = raw.as_ref();
-        match PooledTransaction::decode_2718(&mut buf) {
-            Err(_) => Some(GatewayError::InvalidTransaction),
-            Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
-                Some(GatewayError::UnsupportedTransactionType(tx.ty()))
-            }
-            Ok(_) => None,
+fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, GatewayError> {
+    let raw = raw.bytes().ok_or(GatewayError::InvalidTransaction)?;
+    let mut buf = raw.as_ref();
+    match PooledTransaction::decode_2718(&mut buf) {
+        Err(_) => Err(GatewayError::InvalidTransaction),
+        Ok(tx) if !tn_types::batch_allowlisted_tx_type(&tx) => {
+            Err(GatewayError::UnsupportedTransactionType(tx.ty()))
         }
-    })
+        Ok(tx) => Ok(tx),
+    }
 }
 
 /// Whether `body`, its leading whitespace already dropped, is a JSON array.
@@ -1512,19 +1825,22 @@ fn is_batch(body: &[u8]) -> bool {
     body.first() == Some(&b'[')
 }
 
-/// Whether `body` can name a submission method: it mentions the
-/// raw-transaction method (both submission methods contain it), or it holds a
-/// unicode escape, which can spell any name. No other JSON escape decodes to a
-/// letter or `_`.
+/// Whether `body` can name a method the scan acts on: it mentions the
+/// raw-transaction method (both submission methods contain it) or
+/// [`POOL_READ_PREFIX`] (every pool read contains it), or it holds a unicode
+/// escape, which can spell any name. No other JSON escape decodes to a letter
+/// or `_`.
 ///
 /// The body need not be valid UTF-8: the worker's server skips an invalid
 /// byte inside a member it does not read and runs the call, so each valid
-/// stretch of the body is searched in place. Both needles are ASCII, so a
+/// stretch of the body is searched in place. Every needle is ASCII, so a
 /// match never spans an invalid byte.
-fn may_name_a_submission(body: &[u8]) -> bool {
+fn may_name_a_routed_method(body: &[u8]) -> bool {
     body.utf8_chunks().any(|chunk| {
         let text = chunk.valid();
-        text.contains(SEND_RAW_TRANSACTION) || text.contains("\\u")
+        text.contains(SEND_RAW_TRANSACTION)
+            || text.contains(POOL_READ_PREFIX)
+            || text.contains("\\u")
     })
 }
 
@@ -1573,6 +1889,13 @@ mod tests {
     /// How a body routes, from the one pass that also screens it.
     fn classify(body: &[u8]) -> Calls {
         scan(body, None).calls
+    }
+
+    /// Whether a gateway with `--redirect-queries` keeps a body on the worker
+    /// as a read only its pool can answer, from the one pass that also routes
+    /// and screens it.
+    fn is_pool_read(body: &[u8], recent: Option<&RecentSubmissions>) -> bool {
+        scan(body, None).pool_read.is_some_and(|read| read.stays_on_worker(recent))
     }
 
     /// The canonical EIP-155 example transaction (a signed legacy transfer): a
@@ -1834,6 +2157,25 @@ mod tests {
     #[test]
     fn valid_legacy_transaction_is_forwarded() {
         assert!(screen_err(&send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).is_none());
+    }
+
+    /// The forward verdict on a valid submission carries its transaction hash,
+    /// which the proxy remembers once the worker takes it; nothing else does.
+    #[test]
+    fn valid_submission_hands_back_its_hash() {
+        let raw = decode_hex(EIP155_LEGACY_TX).expect("fixture hex");
+        let single = send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"));
+        assert_eq!(scan(&single, None).submitted, Some(tn_types::keccak256(raw)));
+        let sync = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransactionSync","params":["{EIP155_LEGACY_TX}"],"id":1}}"#
+        );
+        assert_eq!(scan(sync.as_bytes(), None).submitted, None);
+        // a submission inside a batch is screened but not remembered
+        let mut batch = b"[".to_vec();
+        batch.extend_from_slice(&single);
+        batch.push(b']');
+        let batch = scan(&batch, None);
+        assert_eq!((batch.calls, batch.submitted), (Calls::Submissions, None));
     }
 
     #[test]
@@ -2203,6 +2545,7 @@ mod tests {
             )
             .expect("client"),
             query_upstream: Some(query_url),
+            recent_submissions: None,
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
             query_request_timeout: None,
             submission_slots: inflight_slots(0),
@@ -2397,7 +2740,7 @@ mod tests {
             for body in [format!("[{submission},{other}]"), format!("[{other},{submission}]")] {
                 let calls = classify(body.as_bytes());
                 assert_eq!(calls, Calls::MixedBatch, "{body}");
-                assert!(is_query(calls), "{body}");
+                assert!(is_query(calls, None, None), "{body}");
             }
         }
     }
@@ -2724,6 +3067,102 @@ mod tests {
         assert_eq!(classify(last_read.as_bytes()), Calls::Queries);
         let batch = format!("[{last_read},{}]", call("eth_sendRawTransaction"));
         assert_eq!(classify(batch.as_bytes()), Calls::MixedBatch);
+    }
+
+    /// A JSON-RPC call to `method` with the given params.
+    fn call_with(method: &str, params: &str) -> String {
+        format!(r#"{{"jsonrpc":"2.0","method":"{method}","params":{params},"id":1}}"#)
+    }
+
+    /// The test address every nonce read below asks about.
+    const ADDRESS: &str = "0x3535353535353535353535353535353535353535";
+
+    #[test]
+    fn only_a_single_pending_nonce_read_is_a_pool_read() {
+        for (params, pool_read) in [
+            (format!(r#"["{ADDRESS}","pending"]"#), true),
+            (format!(r#"["{ADDRESS}","pending","extra"]"#), true),
+            (format!(r#"["{ADDRESS}","latest"]"#), false),
+            (format!(r#"["{ADDRESS}","Pending"]"#), false),
+            (format!(r#"["{ADDRESS}","0x10"]"#), false),
+            (format!(r#"["{ADDRESS}"]"#), false),
+            (format!(r#"["{ADDRESS}",{{"blockNumber":"pending"}}]"#), false),
+            (r#"{"address":"pending"}"#.to_string(), false),
+            ("null".to_string(), false),
+        ] {
+            let body = call_with("eth_getTransactionCount", &params);
+            assert_eq!(is_pool_read(body.as_bytes(), None), pool_read, "{body}");
+        }
+        let pending = call_with("eth_getTransactionCount", &format!(r#"["{ADDRESS}","pending"]"#));
+        // a batch keeps the route `classify` gives it
+        assert!(!is_pool_read(format!("[{pending}]").as_bytes(), None));
+        assert!(!is_pool_read(format!("{pending} trailing").as_bytes(), None));
+        // every other read at the pending tag stays on the query upstream
+        for method in ["eth_call", "eth_getBalance", "eth_estimateGas", "eth_gettransactioncount"] {
+            let body = call_with(method, &format!(r#"["{ADDRESS}","pending"]"#));
+            assert!(!is_pool_read(body.as_bytes(), None), "{method}");
+        }
+    }
+
+    #[test]
+    fn only_a_remembered_hash_lookup_is_a_pool_read() {
+        let remembered = B256::repeat_byte(0x11);
+        let recent = RecentSubmissions::new(Duration::from_secs(60), 16);
+        recent.record(remembered);
+        for method in LOOKUPS_BY_HASH {
+            let hit = call_with(method, &format!(r#"["{remembered}"]"#));
+            assert!(is_pool_read(hit.as_bytes(), Some(&recent)), "{method}");
+            // the same lookup with the hash routing off
+            assert!(!is_pool_read(hit.as_bytes(), None), "{method}");
+            for params in [
+                format!(r#"["{}"]"#, B256::repeat_byte(0x22)),
+                r#"["0x1234"]"#.to_string(),
+                "[]".to_string(),
+                "[17]".to_string(),
+            ] {
+                let miss = call_with(method, &params);
+                assert!(!is_pool_read(miss.as_bytes(), Some(&recent)), "{miss}");
+            }
+        }
+    }
+
+    #[test]
+    fn an_answer_with_a_result_is_an_accepted_submission() {
+        let hash = B256::repeat_byte(0x11);
+        for answer in [
+            format!(r#"{{"jsonrpc":"2.0","result":"{hash}","id":1}}"#),
+            // member order and surrounding whitespace do not matter
+            format!(" \n{{\"id\":\"abc\",\"result\":\"{hash}\",\"jsonrpc\":\"2.0\"}}\n"),
+            // a null error is no error
+            format!(r#"{{"jsonrpc":"2.0","result":"{hash}","error":null,"id":1}}"#),
+        ] {
+            assert!(submission_accepted(answer.as_bytes()), "{answer}");
+        }
+    }
+
+    #[test]
+    fn an_answer_without_a_lone_result_is_not_an_accepted_submission() {
+        let error = r#"{"code":-32003,"message":"insufficient funds"}"#;
+        for answer in [
+            // an error, as jsonrpsee answers a refused transaction with a 200
+            format!(r#"{{"jsonrpc":"2.0","error":{error},"id":1}}"#),
+            // a null result
+            r#"{"jsonrpc":"2.0","result":null,"id":1}"#.to_string(),
+            // both members
+            format!(r#"{{"jsonrpc":"2.0","result":"0x01","error":{error},"id":1}}"#),
+            // neither member
+            r#"{"jsonrpc":"2.0","id":1}"#.to_string(),
+            // not json
+            "worker".to_string(),
+            String::new(),
+            r#"{"jsonrpc":"2.0","result":"0x01""#.to_string(),
+            // a json array, a batch answer included, even one whose elements
+            // would fill the two members in order
+            r#"[{"jsonrpc":"2.0","result":"0x01","id":1}]"#.to_string(),
+            r#"["0x01",null]"#.to_string(),
+        ] {
+            assert!(!submission_accepted(answer.as_bytes()), "{answer}");
+        }
     }
 
     /// `use_rustls_tls` exists only when a rustls feature is enabled on
