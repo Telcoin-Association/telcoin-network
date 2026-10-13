@@ -3901,6 +3901,11 @@ mod tests {
         }
     }
 
+    /// The issue's scenario: a submission is answered while stalled reads hold
+    /// every query slot. It passes on a gateway without class caps too, since
+    /// four stalled reads never fill the connection cap;
+    /// `submissions_succeed_while_stalled_reads_exceed_the_connection_cap` is
+    /// the test that proves the isolation.
     #[tokio::test]
     async fn submissions_succeed_while_query_route_is_saturated() {
         let saturated = saturated_query_route(4).await;
@@ -4279,6 +4284,31 @@ mod tests {
         let (status, text) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
         assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(error_code_and_id(&text), (-32006, serde_json::json!(3)));
+        assert_eq!(worker_seen.hits(), 2);
+    }
+
+    /// The reverse of the test above: submissions over their own budget are
+    /// refused, with their ids, without spending the global token a read
+    /// still gets.
+    #[tokio::test]
+    async fn submission_flood_spends_no_read_budget() {
+        let (gateway, worker_seen, _servers) =
+            one_token_gateway(Some(RateLimit::new(nz(1), nz(1)))).await;
+
+        // the first submission spends the submission bucket's only token
+        let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 1)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
+
+        // the rest of the flood is refused once classified, so the id is echoed
+        for id in 2..=4 {
+            let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", id)).await;
+            assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+            assert_eq!(error_code_and_id(&text), (-32006, serde_json::json!(id)));
+        }
+
+        // the global bucket still holds its token for a read
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 5)).await;
+        assert_eq!((status, text.as_str()), (StatusCode::OK, "worker"));
         assert_eq!(worker_seen.hits(), 2);
     }
 

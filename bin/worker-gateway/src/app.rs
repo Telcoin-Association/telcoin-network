@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::{
-    cli::Settings,
+    cli::{submission_reserve, Settings},
     config::UpstreamWorker,
     dns::{LookupHost, SystemLookup},
     proxy::{
@@ -164,6 +164,14 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     // The sampled access log keys clients by the same prefix as the per-IP
     // limiter, or `None` when `--access-log-sample` is `0`.
     let access_log = AccessLog::new(access_log_sample, rate_limit_prefix);
+    // the worker slots reads can never take, so the operator sees what
+    // submissions are guaranteed, not just `--max-inflight-submissions`:
+    // without a redirect every read may take one, with one only the reads kept
+    // on the worker, up to their share
+    let worker_bound_reads =
+        if query_upstream.is_some() { max_worker_pool_reads } else { max_inflight_queries };
+    let reserve = submission_reserve(max_upstream_inflight, worker_bound_reads)
+        .map_or_else(|| String::from("unlimited"), |slots| slots.to_string());
     info!(
         target: "gateway",
         rate_limiting = rate_limiters.is_some(),
@@ -178,6 +186,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         max_upstream_inflight,
         // the reads kept on the worker take their share only with a redirect
         max_worker_pool_reads = ?query_upstream.as_ref().map(|_| max_worker_pool_reads),
+        submission_reserve = %reserve,
         max_inflight_request_bytes = max_inflight_request_bytes.map_or(0, NonZeroU32::get),
         http1_max_buf_size,
         ?tcp_user_timeout,

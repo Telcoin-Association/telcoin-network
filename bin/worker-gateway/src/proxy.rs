@@ -261,8 +261,9 @@ pub(crate) const REJECTED_ROUTE: &str = "rejected";
 /// request is sent upstream and again once the upstream has answered.
 /// `limiters` is present when the rate-limit layer is installed and admitted
 /// the request on its first token (see [`crate::ratelimit::rate_limit`]).
-/// `submission_budget` is present when `--rate-limit-submissions` is set and
-/// carries the global bucket's edge verdict, settled here once the request is
+/// `submission_budget` is present when `--rate-limit-submissions` is set: the
+/// edge then charged only the per-IP bucket, and the request's first call is
+/// charged here to the global or the submission bucket once the request is
 /// classified (see [`SubmissionBudget`]).
 /// `request` is the final extractor: its headers are taken first, then its
 /// body is read here, while the router's byte-budget layer
@@ -402,11 +403,28 @@ pub(crate) async fn proxy(
         return error_response_with_id(&GatewayError::MethodNotAllowed, id);
     }
 
-    // The rate-limit layer charged one token before the body was read; a
-    // batch pays one more for each call beyond its first before it is
-    // screened or forwarded, to the same client the layer charged (the
-    // resolved `ClientAddr`, not the TCP peer). Like the layer's own refusal,
-    // this one cannot name an id.
+    // the class picks the rate budget, the in-flight cap and, with a
+    // redirect, the upstream
+    let class = scan.calls.class();
+
+    // with `--rate-limit-submissions` the edge charged only the per-IP bucket,
+    // since it could not tell the classes apart: the first call is charged
+    // here, a submission to its own budget and anything else to the global
+    // bucket, and a refusal gives the per-IP token back, so a refused
+    // submission spends no read budget and a refused read no submission budget
+    if let Some(Extension(budget)) = &submission_budget {
+        if let Err(err) = budget.charge(class == Class::Submission) {
+            return error_response(&err, body.as_ref());
+        }
+    }
+
+    // The first call is paid for, by the rate-limit layer before the body was
+    // read or, with a submission budget, by the layer's per-IP charge and the
+    // class charge above. A batch pays one more for each call beyond its first
+    // before it is screened or forwarded, to the same client the layer charged
+    // (the resolved `ClientAddr`, not the TCP peer), from the per-IP and
+    // global buckets whatever its class. Like the layer's own refusal, this
+    // one cannot name an id.
     let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
         limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
@@ -431,19 +449,6 @@ pub(crate) async fn proxy(
             );
         }
         return error_response_with_id(&err, id);
-    }
-
-    // the class picks the rate budget, the in-flight cap and, with a
-    // redirect, the upstream
-    let class = scan.calls.class();
-
-    // with `--rate-limit-submissions` the edge left the global bucket's verdict
-    // for here: a submission is charged to its own budget whatever that
-    // verdict, and any other request is refused if the global bucket was empty
-    if let Some(Extension(budget)) = &submission_budget {
-        if let Err(err) = budget.charge(class == Class::Submission) {
-            return error_response(&err, body.as_ref());
-        }
     }
 
     // fail fast rather than queue: a route that has used up its slots (a

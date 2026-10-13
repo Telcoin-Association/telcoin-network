@@ -139,7 +139,7 @@ Every flag has an environment-variable fallback.
 | `--upstream-failure-threshold` | `WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD` | `3` | Worker forwards in a row that fail to connect, a connect timeout included, before the upstream is marked not-ready (`0` disables); a timeout or failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes, and a worker that accepts connections but stops answering is left to the poller; see [Passive health on the RPC path](#passive-health-on-the-rpc-path). |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
 | `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline, connection setup included, so it must be longer than `--upstream-connect-timeout`; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
-| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL; must not exceed `--upstream-request-timeout` (`0` = use `--upstream-request-timeout`). |
+| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL (`0` = use `--upstream-request-timeout`); the default drops to `--upstream-request-timeout` when that is shorter, and a value set here must not exceed it. |
 | `--upstream-ca-cert` | `WORKER_GATEWAY_UPSTREAM_CA_CERT` | (none) | PEM file of extra CA certificates trusted for `https` upstreams, on top of the system roots; see [TLS to workers](#tls-to-workers). |
 | `--upstream-client-cert` | `WORKER_GATEWAY_UPSTREAM_CLIENT_CERT` | (none) | PEM client certificate chain presented to an `https` upstream that asks for one; requires `--upstream-client-key`. |
 | `--upstream-client-key` | `WORKER_GATEWAY_UPSTREAM_CLIENT_KEY` | (none) | Unencrypted PEM private key for `--upstream-client-cert`; requires `--upstream-client-cert`. |
@@ -306,11 +306,13 @@ never a bare reset.
 
 A batch costs one token per call, the first before its body is read and the rest once its calls are counted, in the same order and with the same refund; see [Batches](#batches).
 A third, optional bucket reserves rate for submissions.
-With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions.
-The per-IP limit still covers both classes and still refuses at the edge.
-The edge cannot tell the classes apart before the body is read, so a request the global bucket refuses is classified first: a query then gets the `429`, and a submission is charged to the submission bucket instead.
-A submission still spends a global token while one is left.
-A batch pays for its calls beyond the first from the global bucket whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not.
+With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions, and a submission flood over its own budget no longer spends the read budget.
+The edge cannot tell the classes apart before the body is read, so there it runs only the per-IP limit, which still covers both classes and still refuses an over-limit client before its body is read.
+Once the request is read and classified, its first call is charged to the global bucket for a query or to the submission bucket for a submission.
+A refusal there is a `429` and gives the per-IP token back, so a refused submission spends no global token and a refused query no submission token.
+Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit.
+A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
+A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal leaves the first call's tokens spent, as it does without the flag.
 With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
 Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
 Without the flag the edge check is unchanged.
@@ -456,7 +458,7 @@ Every request is classified, with or without `--redirect-queries`.
 A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync` calls is a submission; everything else, including a batch that mixes the two kinds, is a query.
 
 - Each class has its own in-flight cap: `--max-inflight-submissions` and `--max-inflight-queries`, 256 each by default (`0` means unlimited; without `--redirect-queries` the query cap is lowered, see below).
-  A request whose class has no free slot is answered at once with `503` / `-32009` ("gateway overloaded; retry later"), never queued, so a stalled query upstream fills only the query slots and submissions keep theirs.
+  A request whose class has no free slot is answered at once with `503` / `-32009` ("gateway overloaded; retry later") and `Retry-After: 1`, never queued, so a stalled query upstream fills only the query slots and submissions keep theirs.
   The inbound connection cap (`--max-connections`) still bounds both classes together, so keep `--max-inflight-queries` well below it: the difference is what a saturated query route leaves for submissions, and the gateway warns at startup when the query cap is unlimited or not below `--max-connections`.
 - Every forward to a worker, of either class, also takes a slot on `--max-upstream-inflight` (100 by default, `0` means unlimited), with the same `503` when none is free.
   Without `--redirect-queries` that is every request, so reads and submissions share the cap.
@@ -465,11 +467,14 @@ A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync`
   With `--redirect-queries` the query cap is kept as given, and the only reads a worker sees are the [reads kept on the worker](#reads-kept-on-the-worker); together they may hold at most a fifth of `--max-upstream-inflight` (20 with the defaults, at least 1, no limit when the worker cap is `0`).
   One over that share gets the same `503` / `-32009` at once, even with worker slots free, so a slow worker cannot let those reads take the slots submissions need; submissions do not count against that share.
   Startup logs the share as `max_worker_pool_reads` on the "edge protections configured" line.
+  The startup line `edge protections configured` logs that reserve as `submission_reserve`: the worker cap less the effective query cap, or with `--redirect-queries` less the share of the reads kept on the worker (80 with the defaults); `0` when nothing is held back, or `unlimited` with an unlimited worker cap.
   The worker cap bounds how much of the worker's shared RPC connection limit one gateway can hold; size it with [Sizing for N gateways](#sizing-for-n-gateways).
 - With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never answers frees each query slot after 10 s rather than 35 s.
   Requests to the worker keep `--upstream-request-timeout`.
 
 A class slot is held from classification until the response body has been sent to the client, or until the request fails, so a query upstream that sends its head and then stalls still holds only query slots.
+A client that reads its response slowly holds its query slot for the whole transfer too: with the defaults, 80 slow readers (256 with `--redirect-queries`) put every other read on `503`, while submissions keep their own slots.
+On Linux `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, 30 s) ends a read whose client stops acknowledging, and `--max-connection-duration` (10 m) ends one that trickles; on other hosts only `--max-connection-duration` does (see [Connection handling](#connection-handling)), and the per-IP limit and `--max-connections-per-ip` bound how many such reads one client starts.
 A worker slot is released when the worker's response head arrives: by then the worker has built the whole response and freed its own connection permit.
 `tn_worker_gateway_route_inflight{route}` and `tn_worker_gateway_upstream_inflight` show the slots in use, and every `503` from a cap counts as `tn_worker_gateway_rejections_total{reason="overloaded"}`.
 
@@ -482,7 +487,7 @@ A declared `Content-Length` over the cap is rejected before any of the body is r
 
 `--max-inflight-request-bytes` (default 512 MiB) budgets the request-body bytes held across all in-flight requests.
 Each request reserves its `Content-Length`, or the whole `--max-request-bytes` when its body is chunked, before the body is read, and returns the reservation once the request has been forwarded or rejected.
-A request that does not fit in what is left gets a JSON-RPC error at once (`503`, `-32010`) instead of waiting; its `id` echoes as `null`, since its body is never read.
+A request that does not fit in what is left gets a JSON-RPC error at once (`503`, `-32010`, with `Retry-After: 1`) instead of waiting; its `id` echoes as `null`, since its body is never read.
 Clients should retry it after a short backoff.
 The `/health`, `/ready` and `/ready/any` probes are exempt, and a rate-limited request costs no budget.
 The budget must be at least `--max-request-bytes`, so a chunked request can always fit; `0` disables it.
@@ -527,7 +532,7 @@ A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls
   A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before it is screened or forwarded, whichever upstream it would go to.
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
-  The first token is taken before the body is read; the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
+  The first token is taken before the body is read (with `--rate-limit-submissions`, only its per-IP part, see [Rate limiting](#rate-limiting)); the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
   The K - 1 come from the per-IP bucket first, the same client's bucket the first token came from (behind a front listed in `--trusted-proxies`, the forwarded client's, see [Client identity behind a front](#client-identity-behind-a-front)), or the shared overflow bucket when the per-client table is full, so a client over its own limit spends none of the global budget on them; a global refusal refunds them, and each bucket is charged all or nothing.
   They come from the global bucket whatever the batch's class, with `--rate-limit-submissions` set too (see [Rate limiting](#rate-limiting)).
   A batch needs K tokens at once and a bucket never holds more than its burst, which is why the length cap stops at the smallest burst: a longer batch gets the final `413` rather than a `429` that no retry could satisfy.
@@ -737,6 +742,8 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
 | Upstream answered an error status without a JSON body | the upstream's | `-32012` |
+
+The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
 An upstream error answer with a JSON body (`application/json` or any `+json`
 subtype) is the upstream's own JSON-RPC error and passes through unchanged:

@@ -212,17 +212,18 @@ pub(crate) struct Cli {
     pub(crate) upstream_request_timeout: Duration,
 
     /// Overall per-request deadline when forwarding to the `--redirect-queries`
-    /// endpoint (default 10s; `0` disables it, and the query route then uses
+    /// endpoint (default 10s, or `--upstream-request-timeout` when that is
+    /// shorter; `0` disables it, and the query route then uses
     /// `--upstream-request-timeout`). A stalled query upstream frees each read's
     /// slot this soon, while submissions keep the longer worker deadline. With
-    /// `--redirect-queries` set it must not exceed `--upstream-request-timeout`.
+    /// `--redirect-queries` set, a value given here must not exceed
+    /// `--upstream-request-timeout`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT",
-        default_value = "10s",
         value_parser = humantime::parse_duration
     )]
-    pub(crate) query_request_timeout: Duration,
+    pub(crate) query_request_timeout: Option<Duration>,
     /// PEM file of extra CA certificates to trust for `https` upstreams, on
     /// top of the platform's native root store. Every certificate in the file
     /// is trusted; the file is read once at startup. Applies to the worker RPC
@@ -752,11 +753,15 @@ impl Cli {
                 ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url)
             })
             .transpose()?;
-        let query_request_timeout = resolve_optional_duration(self.query_request_timeout);
+        let query_request_timeout = resolve_query_request_timeout(
+            self.query_request_timeout,
+            self.upstream_request_timeout,
+        );
         // the query deadline exists to shorten the query route; one longer than
         // the worker's would not, and could outlast the whole-request deadline
-        // built from `--upstream-request-timeout`. without a redirect the flag
-        // is unused, so it is not checked.
+        // built from `--upstream-request-timeout`. the default is clamped to the
+        // worker's deadline, so only a value set explicitly can fail here, and
+        // without a redirect the flag is unused, so it is not checked.
         if let Some(query_timeout) = query_request_timeout.filter(|_| query_upstream.is_some()) {
             eyre::ensure!(
                 query_timeout <= self.upstream_request_timeout,
@@ -1064,6 +1069,19 @@ fn resolve_optional_duration(value: Duration) -> Option<Duration> {
     (!value.is_zero()).then_some(value)
 }
 
+/// `--query-request-timeout` when it is not set, unless the worker's deadline
+/// is shorter.
+const DEFAULT_QUERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The query route's deadline for `--query-request-timeout`, or `None` when
+/// it is `0` and the route follows `--upstream-request-timeout`. Unset, it is
+/// [`DEFAULT_QUERY_REQUEST_TIMEOUT`] clamped to `upstream`, so a worker
+/// deadline under 10 s needs no second flag; a value set explicitly is kept as
+/// given, for the caller to check against `upstream`.
+fn resolve_query_request_timeout(value: Option<Duration>, upstream: Duration) -> Option<Duration> {
+    resolve_optional_duration(value.unwrap_or(DEFAULT_QUERY_REQUEST_TIMEOUT.min(upstream)))
+}
+
 /// `--max-inflight-queries` when it is not set (before [`effective_query_cap`]).
 const DEFAULT_MAX_INFLIGHT_QUERIES: usize = 256;
 
@@ -1117,6 +1135,23 @@ fn worker_pool_read_cap(max_upstream_inflight: usize) -> usize {
 /// may hold (see [`worker_pool_read_cap`]).
 fn worker_slot_fifth(max_upstream_inflight: usize) -> usize {
     (max_upstream_inflight / 5).max(1)
+}
+
+/// The worker slots reads can never hold, which stay free for submissions:
+/// `max_upstream_inflight` less the reads that may hold a worker slot at once,
+/// which is the effective query cap `max_inflight_queries` without a redirect
+/// (as [`effective_query_cap`] left it) and the share of the reads kept on the
+/// worker with one (see [`worker_pool_read_cap`]); `None` when the worker cap
+/// is unlimited. An unlimited read cap holds nothing back, and neither does one
+/// at or above the worker cap.
+pub(crate) fn submission_reserve(
+    max_upstream_inflight: usize,
+    worker_bound_reads: usize,
+) -> Option<usize> {
+    (max_upstream_inflight != 0).then(|| match worker_bound_reads {
+        0 => 0,
+        cap => max_upstream_inflight.saturating_sub(cap),
+    })
 }
 
 /// Whether a query cap of `cap` (`0` = unlimited) lets a saturated query route
@@ -2413,6 +2448,35 @@ mod tests {
     }
 
     #[test]
+    fn submission_reserve_is_the_worker_cap_less_the_query_cap() -> eyre::Result<()> {
+        let reserve = |flags: &[&str]| -> eyre::Result<Option<usize>> {
+            let settings = cli_with_flags(flags).into_settings()?;
+            let worker_bound_reads = if settings.query_upstream.is_some() {
+                settings.max_worker_pool_reads
+            } else {
+                settings.max_inflight_queries
+            };
+            Ok(submission_reserve(settings.max_upstream_inflight, worker_bound_reads))
+        };
+        // the defaults hold back a fifth of the 100 worker slots
+        assert_eq!(reserve(&[])?, Some(20));
+        assert_eq!(reserve(&["--max-upstream-inflight=5"])?, Some(1));
+        assert_eq!(reserve(&["--max-inflight-queries=50"])?, Some(50));
+        // a worker cap of 1 cannot spare a slot, and an unlimited one needs none
+        assert_eq!(reserve(&["--max-upstream-inflight=1"])?, Some(0));
+        assert_eq!(reserve(&["--max-upstream-inflight=0"])?, None);
+        // with a redirect only the reads kept on the worker take a worker
+        // slot, up to their fifth, whatever the query cap says
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        assert_eq!(reserve(&[redirect])?, Some(80));
+        assert_eq!(reserve(&[redirect, "--max-inflight-queries=0"])?, Some(80));
+        assert_eq!(reserve(&[redirect, "--max-inflight-queries=40"])?, Some(80));
+        assert_eq!(reserve(&[redirect, "--max-upstream-inflight=10"])?, Some(8));
+        assert_eq!(reserve(&[redirect, "--max-upstream-inflight=0"])?, None);
+        Ok(())
+    }
+
+    #[test]
     fn query_cap_warning_covers_unlimited_and_the_connection_cap() {
         let connections = NonZeroUsize::new(500).expect("nonzero");
         for (cap, warns) in [(0, true), (80, false), (499, false), (500, true), (600, true)] {
@@ -2655,9 +2719,6 @@ mod tests {
         ])
         .into_settings();
         assert!(result.is_err(), "a query deadline above the worker's must fail startup");
-        // the 10s default is above a 5s worker deadline too
-        let result = cli_with_flags(&[redirect, "--upstream-request-timeout=5s"]).into_settings();
-        assert!(result.is_err(), "the default query deadline must still be checked");
 
         // the boundary, the default, and the disabled sentinel are accepted
         let settings = cli_with_flags(&[
@@ -2678,7 +2739,25 @@ mod tests {
         assert_eq!(settings.query_request_timeout, None);
 
         // without a redirect the flag is unused and not checked
-        cli_with_flags(&["--upstream-request-timeout=5s"]).into_settings()?;
+        cli_with_flags(&["--upstream-request-timeout=5s", "--query-request-timeout=6s"])
+            .into_settings()?;
+        Ok(())
+    }
+
+    /// The default deadline follows a shorter worker deadline instead of
+    /// failing startup, and stays 10 s under a longer one.
+    #[test]
+    fn default_query_timeout_is_clamped_to_the_upstream_timeout() -> eyre::Result<()> {
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        let settings =
+            cli_with_flags(&[redirect, "--upstream-request-timeout=5s"]).into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(5)));
+        let settings =
+            cli_with_flags(&[redirect, "--upstream-request-timeout=10s"]).into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(10)));
+        let settings =
+            cli_with_flags(&[redirect, "--upstream-request-timeout=60s"]).into_settings()?;
+        assert_eq!(settings.query_request_timeout, Some(Duration::from_secs(10)));
         Ok(())
     }
 
