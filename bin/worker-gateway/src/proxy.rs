@@ -1084,18 +1084,28 @@ fn parse_chain_id(answer: &[u8]) -> Option<u64> {
 /// Start a client for the upstream hop with the settings every upstream client
 /// shares: rustls, trusting the platform's native root store plus every
 /// `--upstream-ca-cert` certificate, the `--upstream-client-cert` identity when
-/// one is configured, the upstream connect timeout, and a resolver over
-/// `lookup` (the system resolver, [`dns::SystemLookup`], outside tests).
+/// one is configured, no proxy, the upstream connect timeout, and a resolver
+/// over `lookup` (the system resolver, [`dns::SystemLookup`], outside tests).
 ///
 /// The forwarding client ([`proxy_client`]) and the readiness poller's client
-/// both start here, so an `https` worker URL and its readiness URL are verified
-/// the same way and see the same client certificate. The forwarding client also
+/// ([`readiness_client`]) both start here and can only be built from here, so
+/// a setting that governs how the gateway reaches an upstream cannot reach one
+/// hop and silently miss the other: an `https` worker URL and its readiness
+/// URL are verified the same way and see the same client certificate. Both
+/// finish the builder with redirects off, so neither hop follows a `3xx`
+/// anywhere. The forwarding client also
 /// serves the `--redirect-queries` route and the poller's probe of it (see
 /// [`crate::readiness::QueryProbe`]), so the extra CA certificates are trusted
 /// there too, and the client certificate goes to that endpoint if it asks for
 /// one (rustls sends it only on request). An upstream whose
 /// certificate chains to none of these roots fails the handshake: a forward to
 /// it fails and a poll marks it not ready, so a wrong CA fails closed.
+///
+/// Proxies are off. reqwest otherwise sends every request through
+/// `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` from the environment, loopback
+/// and private addresses included unless `NO_PROXY` lists them, so a variable
+/// set for some other program would carry forwarded calls, readiness polls
+/// and the upstreams' answers through a host the operator never chose.
 ///
 /// Upstream names resolve through a [`CachingResolver`] that caches each
 /// host's addresses for `--dns-cache-ttl` and caps how many lookups run at once
@@ -1105,19 +1115,40 @@ fn parse_chain_id(answer: &[u8]) -> Option<u64> {
 /// the connection at once, which [`classify_error`] reports as
 /// `UpstreamUnreachable`; passive health does not count that refusal against
 /// the worker (see [`dns::is_saturated`]).
-pub(crate) fn client_builder(settings: &Settings, lookup: Arc<dyn LookupHost>) -> ClientBuilder {
+pub(crate) fn client_builder(
+    settings: &Settings,
+    lookup: Arc<dyn LookupHost>,
+) -> UpstreamClientBuilder {
     let resolver =
         CachingResolver::new(lookup, settings.dns_cache_ttl, settings.max_concurrent_dns_lookups);
     let builder = settings.upstream_ca_certs.iter().cloned().fold(
         Client::builder()
             .use_rustls_tls()
+            .no_proxy()
             .connect_timeout(settings.upstream_connect_timeout)
             .dns_resolver(Arc::new(resolver)),
         ClientBuilder::add_root_certificate,
     );
-    match &settings.upstream_identity {
+    UpstreamClientBuilder(match &settings.upstream_identity {
         Some(identity) => builder.identity(identity.clone()),
         None => builder,
+    })
+}
+
+/// A builder that only [`client_builder`] can make (the field is private to
+/// this module), so both upstream hops share every upstream setting (the TLS
+/// inputs, the resolver, the no-proxy policy) and one added there later
+/// reaches both.
+pub(crate) struct UpstreamClientBuilder(ClientBuilder);
+
+#[cfg(test)]
+impl UpstreamClientBuilder {
+    /// A builder with [`client_builder`]'s rustls backend, no-proxy policy and
+    /// `connect_timeout`, but no `Settings`: no extra CA, no client
+    /// certificate and the default resolver. For tests whose upstreams are
+    /// plain-`http` IP literals.
+    pub(crate) fn for_test(connect_timeout: Duration) -> Self {
+        Self(Client::builder().use_rustls_tls().no_proxy().connect_timeout(connect_timeout))
     }
 }
 
@@ -1132,15 +1163,34 @@ pub(crate) fn client_builder(settings: &Settings, lookup: Arc<dyn LookupHost>) -
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either.
 ///
-/// TLS, the connect timeout and the resolver come from `builder`. reqwest
-/// builds a client over an empty native root store without complaint, so
-/// startup checks the store itself when an `https` upstream depends on it (see
-/// [`crate::app`]).
+/// TLS, the connect timeout, the resolver and the no-proxy policy come from
+/// `builder`. reqwest builds a client over an empty native root store without
+/// complaint, so startup checks the store itself when an `https` upstream
+/// depends on it (see [`crate::app`]).
 pub(crate) fn proxy_client(
-    builder: ClientBuilder,
+    builder: UpstreamClientBuilder,
     request_timeout: Duration,
 ) -> reqwest::Result<Client> {
-    builder.redirect(Policy::none()).user_agent(USER_AGENT).timeout(request_timeout).build()
+    builder.0.redirect(Policy::none()).user_agent(USER_AGENT).timeout(request_timeout).build()
+}
+
+/// Finish `builder` (see [`client_builder`]) into the readiness poller's
+/// client.
+///
+/// Redirects are never followed here either. A readiness endpoint answering
+/// with a redirect would otherwise send the poller to whatever host its
+/// `Location` names, any internal host the gateway can reach included, and a
+/// ready payload served there would mark the worker ready on another node's
+/// word. The poll gets the `3xx` response itself instead and counts it as
+/// not ready, so only a `2xx` answer from the configured readiness URL can
+/// mark its worker ready.
+///
+/// TLS, the connect timeout, the resolver and the no-proxy policy come from
+/// `builder`, as for [`proxy_client`]. There is no request timeout: the
+/// poller bounds each poll with `--readiness-poll-timeout` (see
+/// [`crate::readiness::run_poller`]).
+pub(crate) fn readiness_client(builder: UpstreamClientBuilder) -> reqwest::Result<Client> {
+    builder.0.redirect(Policy::none()).build()
 }
 
 /// Classify a `reqwest` forwarding failure into a client-facing gateway error.
@@ -2986,7 +3036,7 @@ mod tests {
         let state = AppState {
             readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
             http: proxy_client(
-                Client::builder().connect_timeout(Duration::from_secs(2)),
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
                 Duration::from_secs(5),
             )
             .expect("client"),
@@ -3743,6 +3793,9 @@ mod tests {
             Duration::from_secs(1),
         );
         assert!(proxy.is_ok(), "{proxy:?}");
+        let readiness =
+            readiness_client(client_builder(&settings, Arc::new(crate::dns::SystemLookup)));
+        assert!(readiness.is_ok(), "{readiness:?}");
     }
 
     #[test]

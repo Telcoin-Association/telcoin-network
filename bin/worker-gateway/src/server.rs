@@ -1408,8 +1408,8 @@ mod tests {
         dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
         proxy::{
-            client_builder, proxy_client, DEFAULT_MAX_BATCH_LEN, MAX_REQUEST_BYTES,
-            SUBMISSION_ANSWER_SLACK,
+            client_builder, proxy_client, UpstreamClientBuilder, DEFAULT_MAX_BATCH_LEN,
+            MAX_REQUEST_BYTES, SUBMISSION_ANSWER_SLACK,
         },
         ratelimit::RateLimit,
         readiness::{run_poller, QueryProbe, ReadinessThresholds},
@@ -2445,7 +2445,7 @@ mod tests {
     /// not ready.
     fn redirect_state(worker: SocketAddr, query: Option<SocketAddr>) -> AppState {
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(5),
         )
         .expect("client");
@@ -2755,7 +2755,7 @@ mod tests {
         );
         let (query, _query) = spawn(slow).await;
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_millis(200),
         )
         .expect("client");
@@ -3415,7 +3415,7 @@ mod tests {
     /// forwards in a row.
     fn passive_health_state(upstreams: &[UpstreamWorker], rpc_failure: u32) -> AppState {
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(5),
         )
         .expect("client");
@@ -3521,7 +3521,7 @@ mod tests {
         );
         let (worker, _worker) = spawn(slow).await;
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_millis(200),
         )
         .expect("client");
@@ -3719,7 +3719,7 @@ mod tests {
         .await;
         // the proxy client's 3s deadline is what ends the stalled body
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(3),
         )
         .expect("client");
@@ -4492,7 +4492,7 @@ mod tests {
         );
         let (slow, _slow) = spawn(slow).await;
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_millis(200),
         )
         .expect("client");
@@ -6186,7 +6186,7 @@ mod tests {
         };
         let (worker, _worker) = spawn_with_limits(slow, wide.clone()).await;
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(30),
         )
         .expect("client");
@@ -7390,7 +7390,7 @@ mod tests {
         // chain id) and against a query upstream that is down
         let header = QueryHeader::parse(&api_key_line()).expect("valid header");
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(5),
         )
         .expect("client");
@@ -8556,5 +8556,165 @@ mod tests {
         }
         assert!(text.contains("latency_ms="), "{text:?}");
         Ok(())
+    }
+
+    /// Worker `worker_id` with its RPC and readiness endpoints on `addr`.
+    fn upstream_at(worker_id: u16, addr: SocketAddr) -> UpstreamWorker {
+        UpstreamWorker { worker_id, ..upstream(addr) }
+    }
+
+    /// A mock node whose `GET /health/workers` reports workers 0 and 1 both
+    /// accepting transactions. Returns the number of polls it has answered;
+    /// the `Notifier` keeps it alive.
+    async fn counted_ready_node() -> (SocketAddr, Arc<AtomicUsize>, Notifier) {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&polls);
+        let node = Router::new().route(
+            "/health/workers",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                async {
+                    r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true},{"worker_id":1,"accepting_transactions":true}]}"#
+                }
+            }),
+        );
+        let (addr, shutdown) = spawn(node).await;
+        (addr, polls, shutdown)
+    }
+
+    /// Run the readiness poller over `readiness` with `client` and no query
+    /// probe, polling every 50 ms. The `Notifier` stops it.
+    fn spawn_readiness_poller(readiness: Arc<GatewayReadiness>, client: Client) -> Notifier {
+        let shutdown = Notifier::new();
+        tokio::spawn(run_poller(
+            readiness,
+            client,
+            None,
+            Duration::from_millis(50),
+            Duration::from_secs(2),
+            shutdown.subscribe(),
+        ));
+        shutdown
+    }
+
+    /// Wait up to five seconds for `done` to hold, and report whether it did.
+    async fn wait_until(done: impl Fn() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// The readiness client follows no redirect. Worker 0's readiness endpoint
+    /// answers `302` toward a node that reports it ready, with a body that
+    /// reports it ready too; the poll must leave worker 0 not ready, and that
+    /// node must never be polled. Worker 1 is polled directly at an identical
+    /// node, so the client and the poller are shown to work in the same run.
+    /// The client is the one `app::run` builds (see [`UpstreamClients`]).
+    #[tokio::test]
+    async fn readiness_client_does_not_follow_redirects() {
+        let (target, target_polls, _target) = counted_ready_node().await;
+        let (control, _control_polls, _control) = counted_ready_node().await;
+        let location = format!("http://{target}/health/workers");
+        let bounces = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&bounces);
+        let bouncer = Router::new().route(
+            "/health/workers",
+            get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let location = location.clone();
+                async move {
+                    let ready = r#"{"version":1,"workers":[{"worker_id":0,"accepting_transactions":true}]}"#;
+                    (StatusCode::FOUND, [(header::LOCATION, location)], ready)
+                }
+            }),
+        );
+        let (bouncer, _bouncer) = spawn(bouncer).await;
+
+        let redirected = upstream_at(0, bouncer);
+        let direct = upstream_at(1, control);
+        // thresholds of one, so a single poll decides each worker
+        let thresholds = ReadinessThresholds { failure: nz(1), success: nz(1), rpc_failure: None };
+        let readiness =
+            Arc::new(GatewayReadiness::new(&[redirected.clone(), direct.clone()], thresholds));
+        let settings = worker_settings("http", bouncer, bouncer, &[]);
+        let UpstreamClients { readiness: client, .. } =
+            UpstreamClients::new(&settings, Arc::new(SystemLookup)).expect("clients");
+        let _poller = spawn_readiness_poller(Arc::clone(&readiness), client);
+
+        // poll cycles run one after another, so a second bounce means the
+        // whole first cycle has been recorded
+        assert!(
+            wait_until(|| bounces.load(Ordering::SeqCst) >= 2).await,
+            "the poller never reached the redirecting endpoint twice"
+        );
+        assert_eq!(
+            readiness.first_ready_rpc_url(),
+            Some(direct.rpc_url),
+            "worker 1 must be ready and worker 0 not, at {}",
+            redirected.rpc_url
+        );
+        assert_eq!(target_polls.load(Ordering::SeqCst), 0, "the redirect target was polled");
+    }
+
+    /// Both upstream clients ignore proxy variables. Every proxy variable
+    /// points at a port nothing listens on, with no `NO_PROXY` exemption, yet
+    /// a poll through the production readiness client still marks the worker
+    /// ready and a call through the production proxy client still reaches it.
+    /// Both clients are the ones `app::run` builds (see [`UpstreamClients`]).
+    ///
+    /// The variables set here are process-wide, so the body runs only under
+    /// nextest's process-per-test model, where they reach no other test; any
+    /// other runner skips it.
+    #[tokio::test]
+    async fn clients_ignore_proxy_environment() {
+        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+            eprintln!(
+                "skipped: clients_ignore_proxy_environment needs nextest's process-per-test model"
+            );
+            return;
+        }
+        for name in
+            ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"]
+        {
+            std::env::set_var(name, "http://127.0.0.1:9");
+        }
+        // `REQUEST_METHOD` makes reqwest skip `HTTP_PROXY` (a CGI guard), so it
+        // goes too, along with any loopback exemption the environment carries
+        for name in ["NO_PROXY", "no_proxy", "REQUEST_METHOD"] {
+            std::env::remove_var(name);
+        }
+
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (node, node_polls, _node) = counted_ready_node().await;
+        let settings = worker_settings("http", worker, node, &[]);
+        let UpstreamClients { proxy, readiness: readiness_client } =
+            UpstreamClients::new(&settings, Arc::new(SystemLookup)).expect("clients");
+        let state = test_state_with_client(&settings.upstreams, proxy);
+        let readiness = Arc::clone(&state.readiness);
+        let _poller = spawn_readiness_poller(Arc::clone(&readiness), readiness_client);
+        assert!(
+            wait_until(|| readiness.any_ready()).await,
+            "the readiness poll must reach the node directly"
+        );
+        assert!(node_polls.load(Ordering::SeqCst) >= 1);
+
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        // the test's own client must not use the proxy either
+        let client = Client::builder().no_proxy().build().expect("client");
+        let response = client
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_chainId", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("text"), "worker");
+        assert_eq!(worker_seen.hits(), 1);
     }
 }

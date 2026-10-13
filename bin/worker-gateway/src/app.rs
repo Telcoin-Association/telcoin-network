@@ -19,8 +19,8 @@ use crate::{
     config::UpstreamWorker,
     dns::{LookupHost, SystemLookup},
     proxy::{
-        client_builder, fetch_chain_id, proxy_client, QueryHeader, Route, UpstreamOrigin,
-        WARNING_THROTTLES,
+        client_builder, fetch_chain_id, proxy_client, readiness_client, QueryHeader, Route,
+        UpstreamOrigin, WARNING_THROTTLES,
     },
     ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
@@ -54,11 +54,12 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     ensure_root_store(&settings, native_root_count)?;
 
-    // Dedicated clients, both started from the same TLS settings (see
-    // `client_builder`): the proxy enforces connect + per-request deadlines and
-    // never follows redirects (see `proxy_client`); the poller bounds each
-    // probe with its own tokio timeout. Each resolves upstream names through
-    // its own cache and lookup cap (see `UpstreamClients`).
+    // Dedicated clients, both started from `client_builder` so they share the
+    // connect timeout, TLS and the no-proxy policy, and neither follows
+    // redirects: the proxy also enforces a per-request deadline (see
+    // `proxy_client`); the poller bounds each probe with its own tokio timeout
+    // (see `readiness_client`). Each resolves upstream names through its own
+    // cache and lookup cap (see `UpstreamClients`).
     let UpstreamClients { proxy: proxy_client, readiness: readiness_client } =
         UpstreamClients::new(&settings, Arc::new(SystemLookup)).wrap_err(TLS_SETTINGS_HINT)?;
     let Settings {
@@ -376,14 +377,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
 }
 
 /// The gateway's two upstream HTTP clients, both started from
-/// [`client_builder`], so they share the TLS settings.
+/// [`client_builder`], so they share the TLS settings and the no-proxy policy,
+/// and neither follows a redirect.
 #[derive(Debug)]
 pub(crate) struct UpstreamClients {
     /// Forwards client requests to the workers and the query upstream, and
     /// probes the query upstream for the poller (see [`proxy_client`] and
     /// [`QueryProbe`]).
     pub(crate) proxy: Client,
-    /// Polls the workers' readiness endpoints.
+    /// Polls the workers' readiness endpoints (see [`readiness_client`]).
     pub(crate) readiness: Client,
 }
 
@@ -405,7 +407,7 @@ impl UpstreamClients {
                 client_builder(settings, Arc::clone(&lookup)),
                 settings.upstream_request_timeout,
             )?,
-            readiness: client_builder(settings, lookup).build()?,
+            readiness: readiness_client(client_builder(settings, lookup))?,
         })
     }
 }
@@ -625,7 +627,7 @@ async fn run_poller_until_listener_closes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
+    use crate::{cli::Cli, proxy::UpstreamClientBuilder};
     use axum::{
         http::{HeaderMap, StatusCode},
         routing::{get, post},
@@ -754,7 +756,7 @@ mod tests {
 
     fn client() -> Client {
         proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(5),
         )
         .expect("client")
@@ -830,7 +832,7 @@ mod tests {
         ))
         .await);
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_millis(200),
         )
         .expect("client");
@@ -921,7 +923,7 @@ mod tests {
         // a request timeout far past the bound below, so only the shutdown can
         // end the check
         let client = proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(2)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
             Duration::from_secs(600),
         )
         .expect("client");

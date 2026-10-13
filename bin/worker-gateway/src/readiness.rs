@@ -645,7 +645,7 @@ impl fmt::Display for NotReadyCause {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::telemetry::test_utils::CapturedMetrics;
+    use crate::{proxy::UpstreamClientBuilder, telemetry::test_utils::CapturedMetrics};
     use axum::{body::Body, response::IntoResponse as _, routing::get, Router};
     use std::{io, net::SocketAddr, sync::atomic::AtomicU8, time::Instant};
     use tn_types::Notifier;
@@ -1246,7 +1246,7 @@ mod tests {
         // the url carries a credential in its userinfo, path and query; the
         // logs may name only its origin
         let client = crate::proxy::proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(1)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(1)),
             Duration::from_secs(2),
         )
         .expect("client");
@@ -1318,7 +1318,7 @@ mod tests {
         tokio::spawn(async move { axum::serve(listener, mock).await });
 
         let client = crate::proxy::proxy_client(
-            Client::builder().connect_timeout(Duration::from_secs(1)),
+            UpstreamClientBuilder::for_test(Duration::from_secs(1)),
             Duration::from_secs(2),
         )
         .expect("client");
@@ -1340,5 +1340,72 @@ mod tests {
             !format!("{keyed:?}").contains(API_KEY),
             "the probe's debug output must be redacted"
         );
+    }
+
+    /// A readiness URL for `addr` whose userinfo, path and query carry secrets.
+    fn secret_url(addr: SocketAddr) -> Url {
+        Url::parse(&format!("http://user:s3cr3t@{addr}/k3y?token=t0k3n")).expect("url")
+    }
+
+    /// The readiness poll logs name the upstream by origin only. Three
+    /// upstreams whose RPC and readiness URLs carry secrets in their userinfo,
+    /// path and query are polled while nothing listens, while the node answers
+    /// `500` (reqwest's status error also carries the URL), and while the node
+    /// never answers; no secret may reach the debug output, and each upstream's
+    /// lines still name its origin and the poll's cause.
+    #[tokio::test]
+    async fn readiness_logs_hide_the_url() {
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("gateway=debug")
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let failing_addr =
+            serve_mock(Router::new().fallback(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
+                .await;
+        // bound but never accepted: the connect completes and no answer comes
+        let silent = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let silent_addr = silent.local_addr().expect("addr");
+        // nothing listens on port 1
+        let refused_addr: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+
+        let addrs = [refused_addr, failing_addr, silent_addr];
+        let upstreams: Vec<_> = (0u16..)
+            .zip(addrs)
+            .map(|(worker_id, addr)| UpstreamWorker {
+                worker_id,
+                rpc_url: secret_url(addr),
+                readiness_url: secret_url(addr),
+            })
+            .collect();
+        let readiness = GatewayReadiness::new(&upstreams, thresholds(3, 2));
+        poll_cycle(&readiness, &Client::new(), Duration::from_millis(300)).await;
+        assert!(!readiness.any_ready());
+
+        let lines = captured.lines();
+        let logs = lines.join("\n");
+        assert_eq!(logs.matches("readiness poll failed").count(), 3, "{logs}");
+        assert_eq!(logs.matches("not ready since startup").count(), 3, "{logs}");
+        for (addr, cause) in [
+            (refused_addr, "cause=connection error (connect)"),
+            (failing_addr, "cause=HTTP status 500 Internal Server Error"),
+            (silent_addr, "cause=timeout"),
+        ] {
+            // the origin ends at a field boundary, so port 1 never matches a
+            // longer port
+            let origin = format!("http://{addr} ");
+            let named: Vec<_> = lines.iter().filter(|line| line.contains(&origin)).collect();
+            assert_eq!(named.len(), 2, "{addr}: {logs}");
+            assert!(named.iter().all(|line| line.contains(cause)), "{addr}: {logs}");
+            assert!(logs.contains(&format!("upstream={origin}")), "{addr} missing: {logs}");
+            assert!(logs.contains(&format!("readiness={origin}")), "{addr} missing: {logs}");
+        }
+        for secret in ["user", "s3cr3t", "k3y", "t0k3n"] {
+            assert!(!logs.contains(secret), "`{secret}` leaked into: {logs}");
+        }
     }
 }

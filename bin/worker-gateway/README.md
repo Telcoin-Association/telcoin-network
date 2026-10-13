@@ -98,6 +98,11 @@ port so the gateway is a drop-in edge for clients; on a single host that means
 the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
+Startup also rejects a self-pointing upstream URL written as an IPv4-mapped IPv6 literal such as `[::ffff:127.0.0.1]`, an upstream list that names one worker id twice, and a zero `--readiness-poll-interval`, `--readiness-poll-timeout`, `--upstream-connect-timeout`, `--upstream-request-timeout` or `--header-read-timeout`, none of which has a disabled setting.
+
+The gateway ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`: forwarded calls and readiness polls connect to the configured URLs directly.
+Neither follows an HTTP redirect: a readiness poll that gets a `3xx` counts as not ready, so only a `2xx` answer from the configured readiness URL can mark its worker ready.
+
 YAML (`--config gateway.yaml`):
 
 ```yaml
@@ -564,7 +569,9 @@ A batch the gateway cannot read to its end is refused rather than routed (see [B
 
 The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
-The URL must not point at the gateway itself or at a worker's RPC host and port, and plain `http` to a host that is not a loopback or private address logs a warning at startup.
+The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names.
+A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback or private address.
+A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
 A batch goes to the worker only when every element is a submission.
 A batch that mixes submissions with other calls, an element that is not a call object included, goes, whole, to the query URL; otherwise a client could put one submission in front of any number of reads and push them all onto the validator.
