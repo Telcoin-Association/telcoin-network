@@ -143,14 +143,6 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_prefix,
     );
     let trusted_proxies = Arc::new(trusted_proxies);
-    if trusted_proxies.has_catch_all() {
-        warn!(
-            target: "gateway",
-            "--trusted-proxies contains a /0 range: every client that can reach the gateway is \
-             a trusted proxy, may choose its own rate-limit key and is not counted by \
-             --max-connections-per-ip; list only the fronts' own addresses"
-        );
-    }
     // the method policy applies only without a redirect, and an empty list
     // (an empty or unset-in-template env var included) turns it off; say which
     let method_policy = if query_upstream.is_some() {

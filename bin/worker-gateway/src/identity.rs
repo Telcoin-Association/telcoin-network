@@ -148,11 +148,30 @@ impl TrustedProxies {
         self.0.is_empty()
     }
 
-    /// Whether a range spans a whole address family (`/0`, or the IPv4-mapped
-    /// `::ffff:0:0/96`), which makes every client that can reach the gateway a
-    /// trusted proxy.
-    pub(crate) fn has_catch_all(&self) -> bool {
-        self.0.iter().any(|cidr| cidr.prefix.bits() == 0)
+    /// Whether the ranges together cover every IPv4 address (`0.0.0.0/0`, the
+    /// IPv4-mapped `::ffff:0:0/96`, or ranges that add up to it, such as
+    /// `0.0.0.0/1,128.0.0.0/1`), which makes every IPv4 client that can reach
+    /// the gateway a trusted proxy, an IPv4-mapped one on a dual-stack
+    /// listener included.
+    pub(crate) fn covers_all_ipv4(&self) -> bool {
+        let spans = self.0.iter().filter(|cidr| cidr.network.is_ipv4()).map(Cidr::span);
+        covers_up_to(spans, u128::from(u32::MAX))
+    }
+
+    /// Whether the ranges together cover every native IPv6 address (`::/0`, or
+    /// ranges that add up to it), which makes every IPv6 client that can reach
+    /// the gateway a trusted proxy. IPv4 and IPv4-mapped clients are matched
+    /// against the IPv4 ranges only, so the mapped block `::ffff:0:0/96` need
+    /// not be covered.
+    pub(crate) fn covers_all_ipv6(&self) -> bool {
+        let mapped = u128::from(Ipv4Addr::UNSPECIFIED.to_ipv6_mapped());
+        let spans = self
+            .0
+            .iter()
+            .filter(|cidr| cidr.network.is_ipv6())
+            .map(Cidr::span)
+            .chain([(mapped, mapped | u128::from(u32::MAX))]);
+        covers_up_to(spans, u128::MAX)
     }
 
     /// Whether `ip` falls inside a trusted range. An IPv4-mapped IPv6 address
@@ -356,6 +375,37 @@ impl Cidr {
             _ => false,
         }
     }
+
+    /// The first and last address of the range as integers, an IPv4 range in
+    /// the low 32 bits.
+    fn span(&self) -> (u128, u128) {
+        let (first, unused_bits) = match self.network {
+            IpAddr::V4(network) => (u128::from(u32::from(network)), 96),
+            IpAddr::V6(network) => (u128::from(network), 0),
+        };
+        // every host bit below the prefix set; a full-length prefix has none
+        let hosts = u128::MAX.checked_shr(u32::from(self.prefix.bits()) + unused_bits).unwrap_or(0);
+        (first, first | hosts)
+    }
+}
+
+/// Whether the inclusive `(first, last)` spans together cover every integer
+/// from `0` to `max`.
+fn covers_up_to(spans: impl Iterator<Item = (u128, u128)>, max: u128) -> bool {
+    let mut spans: Vec<_> = spans.collect();
+    spans.sort_unstable();
+    // the lowest value no span seen so far covers
+    let mut next = 0_u128;
+    for (first, last) in spans {
+        if first > next {
+            return false;
+        }
+        if last >= max {
+            return true;
+        }
+        next = next.max(last + 1);
+    }
+    false
 }
 
 impl FromStr for Cidr {
@@ -551,11 +601,59 @@ mod tests {
 
     #[test]
     fn catch_all_ranges_are_detected() {
-        for list in ["0.0.0.0/0", "::/0", "::ffff:0:0/96", "10.0.0.0/8, ::/0"] {
-            assert!(trusted(list).has_catch_all(), "{list}");
-        }
-        assert!(!trusted("10.0.0.0/8, 192.0.2.7, 2001:db8::/32").has_catch_all());
-        assert!(!TrustedProxies::default().has_catch_all());
+        let covered = |list: &str| {
+            let list = trusted(list);
+            (list.covers_all_ipv4(), list.covers_all_ipv6())
+        };
+        assert_eq!(covered("0.0.0.0/0"), (true, false));
+        assert_eq!(covered("::ffff:0:0/96"), (true, false));
+        assert_eq!(covered("10.0.0.0/8, ::/0"), (false, true));
+        assert_eq!(covered("0.0.0.0/0, ::/0"), (true, true));
+        assert_eq!(covered("10.0.0.0/8, 192.0.2.7, 2001:db8::/32"), (false, false));
+        assert_eq!(
+            covered("255.255.255.255, ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"),
+            (false, false)
+        );
+        let none = TrustedProxies::default();
+        assert_eq!((none.covers_all_ipv4(), none.covers_all_ipv6()), (false, false));
+    }
+
+    #[test]
+    fn ranges_that_add_up_to_a_family_are_detected() {
+        let covered = |list: &str| {
+            let list = trusted(list);
+            (list.covers_all_ipv4(), list.covers_all_ipv6())
+        };
+        // split halves, in any order and overlapping
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/1"), (true, false));
+        assert_eq!(covered("128.0.0.0/1, 0.0.0.0/2, 64.0.0.0/2, 10.0.0.0/8"), (true, false));
+        assert_eq!(covered("::/1, 8000::/1"), (false, true));
+        // the mapped halves are the ipv4 halves
+        assert_eq!(covered("::ffff:0:0/97, ::ffff:128.0.0.0/97"), (true, false));
+        // a gap anywhere, however small, leaves the family uncovered
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/2, 192.0.0.0/3, 224.0.0.0/4"), (false, false));
+        assert_eq!(covered("0.0.0.0/1, 192.0.0.0/2"), (false, false));
+        assert_eq!(covered("0.0.0.0/1, 128.0.0.0/2, 192.0.0.0/2, ::/1"), (true, false));
+        // two halves of the same half are not the whole family
+        assert_eq!(covered("0.0.0.0/2, 64.0.0.0/2, 0.0.0.0/1"), (false, false));
+        // `::/0` covers native ipv6 only, and no ipv6 range needs to cover the
+        // mapped block, which is matched as ipv4
+        assert!(!trusted("::/0").contains(ip("::ffff:10.0.0.1")));
+        // the ranges tiling every ipv6 address around the mapped block
+        // `::ffff:0:0/96` (2^48 - 2^32 to 2^48 - 1): /81 to /96 below it, /80 to
+        // /1 above it
+        let below = (81..=96_u32).map(|bits| ((1_u128 << 48) - (1_u128 << (129 - bits)), bits));
+        let above = (1..=80_u32).map(|bits| (1_u128 << (128 - bits), bits));
+        let tiles: Vec<String> = below
+            .chain(above)
+            .map(|(first, bits)| format!("{}/{bits}", Ipv6Addr::from(first)))
+            .collect();
+        assert_eq!(covered(&tiles.join(",")), (false, true));
+        // without the tile right below the mapped block, or the first one,
+        // there is a gap
+        assert_eq!(tiles[15], "::fffe:0:0/96");
+        assert_eq!(covered(&[&tiles[..15], &tiles[16..]].concat().join(",")), (false, false));
+        assert_eq!(covered(&tiles[1..].join(",")), (false, false));
     }
 
     #[test]

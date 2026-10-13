@@ -815,6 +815,12 @@ impl Cli {
             .unwrap_or_default()
             .parse::<TrustedProxies>()
             .map_err(|err| eyre::eyre!("invalid --trusted-proxies: {err}"))?;
+        warn_on_whole_families(
+            "--trusted-proxies",
+            &trusted_proxies,
+            "is a trusted proxy, may choose its own rate-limit key and is not counted by \
+             --max-connections-per-ip",
+        );
         eyre::ensure!(
             !self.proxy_protocol || !trusted_proxies.is_empty(),
             "--proxy-protocol requires --trusted-proxies: the PROXY header is read only from a \
@@ -1010,6 +1016,26 @@ pub(crate) enum LogFormat {
     /// One JSON object per line, with the event's `timestamp`, `level`,
     /// `target` and `fields`.
     Json,
+}
+
+/// Warn when the ranges of `flag` cover a whole address family, naming the
+/// family and what every client of it that can reach the gateway then does
+/// (`consequence`). IPv4 and IPv4-mapped clients are matched against the IPv4
+/// ranges only and native IPv6 clients against the IPv6 ranges only, so each
+/// family is judged on its own.
+fn warn_on_whole_families(flag: &str, ranges: &TrustedProxies, consequence: &str) {
+    for (family, covered) in [
+        ("IPv4 address, IPv4-mapped ones included", ranges.covers_all_ipv4()),
+        ("native IPv6 address", ranges.covers_all_ipv6()),
+    ] {
+        if covered {
+            warn!(
+                target: "gateway",
+                "{flag} covers every {family}: every such client that can reach the gateway \
+                 {consequence}; list only the fronts' own addresses"
+            );
+        }
+    }
 }
 
 /// Reject a zero value for a duration flag that has no disabled sentinel. A
@@ -2145,6 +2171,35 @@ mod tests {
             };
             assert!(message.contains("--trusted-proxies"), "{list}: {message}");
         }
+    }
+
+    #[test]
+    fn trusted_ranges_covering_a_whole_family_warn_for_that_family() -> eyre::Result<()> {
+        const IPV4: &str = "--trusted-proxies covers every IPv4 address, IPv4-mapped ones included";
+        const IPV6: &str = "--trusted-proxies covers every native IPv6 address";
+        for (list, warns_v4, warns_v6) in [
+            ("0.0.0.0/0", true, false),
+            // halves that add up to the whole family
+            ("0.0.0.0/1,128.0.0.0/1", true, false),
+            ("::ffff:0:0/96", true, false),
+            // `::/0` covers native ipv6 only
+            ("::/0", false, true),
+            ("::/1,8000::/1,0.0.0.0/0", true, true),
+            ("10.0.0.0/8,2001:db8::/32", false, false),
+            ("0.0.0.0/1,::/0", false, true),
+        ] {
+            let flag = format!("--trusted-proxies={list}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[flag.as_str()]));
+            settings?;
+            assert_eq!(logs.contains(IPV4), warns_v4, "{list}: {logs}");
+            assert_eq!(logs.contains(IPV6), warns_v6, "{list}: {logs}");
+            assert_eq!(
+                logs.matches("covers every").count(),
+                usize::from(warns_v4) + usize::from(warns_v6),
+                "{list}: {logs}"
+            );
+        }
+        Ok(())
     }
 
     #[test]

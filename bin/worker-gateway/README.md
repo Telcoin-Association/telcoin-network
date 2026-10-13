@@ -430,9 +430,12 @@ entries a listed hop vouched for. From any other peer they are ignored and the
 client is the peer. Behind a listed front, a client cannot choose its own
 rate-limit bucket as long as every listed front does what the list above
 requires. List only the fronts' own addresses: a range that also covers clients
-(or other workloads that can reach the gateway) lets them spoof, and a `/0`
-range logs a warning at startup. Firewall the gateways so that only the front
-reaches them (see [Firewalling](#firewalling)).
+(or other workloads that can reach the gateway) lets them spoof. A list that
+covers a whole address family logs a startup warning naming the family: IPv4
+for `0.0.0.0/0`, `::ffff:0:0/96` or ranges that add up to the IPv4 space such
+as `0.0.0.0/1,128.0.0.0/1`, native IPv6 for `::/0` or ranges that add up to
+it. Firewall the gateways so that only the front reaches them (see
+[Firewalling](#firewalling)).
 
 An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) matches as IPv4 in the peer, the
 chain and the ranges alike, so a dual-stack listener needs no extra ranges. A
