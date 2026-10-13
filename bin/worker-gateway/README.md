@@ -294,22 +294,20 @@ Two token-bucket limiters shed load before a request is buffered or forwarded:
 - A **global** limiter (`--rate-limit-global` / `--rate-limit-global-burst`)
   caps aggregate throughput to roughly what the upstream workers can absorb.
 
-The global limiter is checked first and the per-client limiter second, so a
-request the per-client limiter refuses has already spent a global token: a
-source sending above its per-client rate still drains the global budget that
-every other client shares (WG-08 in the
-[production-readiness review](docs/production-readiness.md)).
+The per-client bucket is checked first, and only a request it admits takes a global token, so a source over its own limit cannot drain the shared budget the other clients depend on (WG-08 in the [production-readiness review](docs/production-readiness.md)).
+If the global bucket then refuses the request, its per-client token is refunded, so a global refusal costs the client nothing either.
 
 Either limiter is disabled by setting its rate to `0`; a `0` burst derives twice
 the sustained rate. An over-limit request receives a JSON-RPC `429` (see below),
 never a bare reset.
 
-A batch costs one token per call, the first before its body is read and the rest once its calls are counted; see [Batches](#batches).
+A batch costs one token per call, the first before its body is read and the rest once its calls are counted, in the same order and with the same refund; see [Batches](#batches).
 A third, optional bucket reserves rate for submissions.
 With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions.
 The per-IP limit still covers both classes and still refuses at the edge.
 The edge cannot tell the classes apart before the body is read, so a request the global bucket refuses is classified first: a query then gets the `429`, and a submission is charged to the submission bucket instead.
 A submission still spends a global token while one is left.
+A batch pays for its calls beyond the first from the global bucket whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not.
 With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
 Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
 Without the flag the edge check is unchanged.
@@ -363,9 +361,22 @@ Service, set `externalTrafficPolicy: Local` to keep their addresses).
 The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
 The probe listener (`--probe-addr`) has no rate limit at all.
 
-Per-IP state is bounded: idle buckets are swept periodically and the number of
+Per-IP state is bounded: idle buckets are swept every minute and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
-limit.
+limit. Once the table is full (100,000 entries), a newly seen client gets no
+bucket of its own: every client the table cannot track shares one overflow
+bucket with the per-client rate and burst, so together they get one client's
+budget however many prefixes they spread over. One IPv6 `/48` (65,536 `/64`s)
+still fits in the table with a bucket per `/64`; the overflow bucket meters only
+the prefixes beyond the cap. A client keeps its own bucket only while it is
+busy: the sweep drops every bucket that has refilled, and a client that returns
+while the table is full shares the overflow bucket too.
+
+> **Residual limitation.** A source holding more than 100,000 prefixes (two
+> `/48`s, or one `/47`) can refill the table after each sweep and then keep the
+> overflow bucket empty, so clients without an entry get `429` until the next
+> sweep while the global bucket looks healthy. If that matters for your
+> deployment, limit new source prefixes at the ingress.
 
 #### Client identity behind a front
 
@@ -511,7 +522,8 @@ A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
   The first token is taken before the body is read; the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
-  The K - 1 come from the per-IP bucket first, the same client's bucket the first token came from (behind a front listed in `--trusted-proxies`, the forwarded client's, see [Client identity behind a front](#client-identity-behind-a-front)), so a client over its own limit spends none of the global budget on them, and each bucket is charged all or nothing.
+  The K - 1 come from the per-IP bucket first, the same client's bucket the first token came from (behind a front listed in `--trusted-proxies`, the forwarded client's, see [Client identity behind a front](#client-identity-behind-a-front)), or the shared overflow bucket when the per-client table is full, so a client over its own limit spends none of the global budget on them; a global refusal refunds them, and each bucket is charged all or nothing.
+  They come from the global bucket whatever the batch's class, with `--rate-limit-submissions` set too (see [Rate limiting](#rate-limiting)).
   A batch needs K tokens at once and a bucket never holds more than its burst, which is why the length cap stops at the smallest burst: a longer batch gets the final `413` rather than a `429` that no retry could satisfy.
   The defaults (200 per IP, 6000 global, against 50) leave the cap at 50.
 - **Every submission is screened.** In a batch made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync` calls, each element is screened like a single call (see [Transaction screening](#transaction-screening)).
