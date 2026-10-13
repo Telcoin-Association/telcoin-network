@@ -535,6 +535,7 @@ Every element counts towards the cap and the tokens whatever its shape: an eleme
 The gateway reads a body as the worker's JSON-RPC server does, leading whitespace included, so no prefix can hide a batch from the count.
 A batch the gateway cannot read to its end is refused whole with `400` / `-32600` and a `null` id, before it is charged or forwarded, so a batch's length is never unknown.
 That covers bytes after the batch and a truncated batch, which the worker refuses whole anyway, and an element holding a value the gateway's JSON reader refuses although it is valid JSON, such as a number out of range (`1e400`) or an unpaired surrogate escape (`"\udc00"`), which the worker would skip while running the rest of the batch.
+An element with more than one `method` member ends the read too: the worker refuses that element as an invalid request, and the gateway refuses the batch whole rather than route it by either name.
 
 ### Transaction screening
 
@@ -576,7 +577,7 @@ Refused calls are counted in `tn_worker_gateway_rejections_total` with reason `m
 On a validator, set `--redirect-queries <URL>` so that the worker receives transaction submissions and only the reads that must see its pool.
 With the flag set, `eth_sendRawTransaction` and `eth_sendRawTransactionSync` go to the first ready worker, and so do the [reads kept on the worker](#reads-kept-on-the-worker); every other call goes to the URL, typically a public RPC.
 Method names match exactly and case-sensitively, after unicode escapes are decoded, as the worker reads them.
-Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, or a single call with bytes after it.
+Everything else counts as a query: `eth_sendTransaction` (no node configures a signer, so the worker could only refuse it), `tn_*` and `debug_*` calls, and any body the gateway cannot read as submissions, such as one that is not JSON, an empty batch, a `method` that is not a string, a single call with more than one `method` member, or a single call with bytes after it.
 A batch the gateway cannot read to its end is refused rather than routed (see [Batches](#batches)).
 
 The URL may be `http` or `https`, as worker URLs may.
