@@ -1606,9 +1606,9 @@ mod tests {
             ]
         );
         assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         assert!(engine.worker_http_client(&1).await.is_err());
-        assert!(engine.is_worker_initialized(0).await);
+        assert!(engine.is_worker_running(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
         let inactive = client
             .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
@@ -1620,7 +1620,7 @@ mod tests {
         // Repeated deactivation and mode updates must not make the removed worker ready.
         engine.deactivate_workers_above(1).await;
         engine.set_workers_syncing(false).await;
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         assert_eq!(
             manager
                 .worker_network_handles
@@ -1660,7 +1660,7 @@ mod tests {
                 crate::health::WorkerReadiness::new(1, true),
             ]
         );
-        assert!(engine.is_worker_initialized(1).await);
+        assert!(engine.is_worker_running(1).await);
         assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(engine.worker_state(1).await, WorkerState::Running);
