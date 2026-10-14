@@ -8,9 +8,16 @@
 #                           tndb, tndb group, production MDBX); skips the reference columns
 #                           that sync every write, which dominate the run time on a disk whose
 #                           fsync flushes its cache (most Linux setups), and runs 3 compaction-cost
-#                           pairs of 300 rounds. About 20-30 minutes on a laptop NVMe.
+#                           pairs instead of 6. About 25-35 minutes on a laptop NVMe.
 #   ROUNDS=1 ...            runs each workload once instead of three times (default 3; 1 if QUICK)
 #   ONLY="workload_mixed"   runs only the named workloads (space separated)
+#
+# The compaction-cost pairs (`workload_mixed_compaction`) run at a busy node's batch rate, 1 MB
+# batches 25 times a second, for 6000 rounds a run: long enough for the batch log to reach its
+# compaction threshold a few times. TN_BENCH_PAIR_BATCH_KB / TN_BENCH_PAIR_RATE /
+# TN_BENCH_PAIR_ROUNDS / TN_BENCH_PAIRS override them; e.g. TN_BENCH_PAIR_RATE=0
+# TN_BENCH_PAIR_BATCH_KB=256 TN_BENCH_PAIR_ROUNDS=300 for the drive-saturating burst (batches as
+# fast as taken), far beyond production rates.
 #
 # Needs this checkout's tn-storage with the tndb work (an uncommitted tree can be copied over
 # with `rsync -a --exclude target <repo>/ <host>:<repo>/`), a Rust toolchain, and a few GB free in
@@ -25,10 +32,14 @@ bench_dir="$(cd "$bench_dir" && pwd)"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 report="${2:-$repo/storage-baseline-$(hostname -s)-$(date +%Y%m%d-%H%M%S).txt}"
 quick="${QUICK:-}"
+# The compaction-cost pairs at a busy node's batch rate (see the usage above).
+export TN_BENCH_PAIR_BATCH_KB="${TN_BENCH_PAIR_BATCH_KB:-1024}" \
+    TN_BENCH_PAIR_RATE="${TN_BENCH_PAIR_RATE:-25}" \
+    TN_BENCH_PAIR_ROUNDS="${TN_BENCH_PAIR_ROUNDS:-6000}"
 if [ -n "$quick" ]; then
     rounds="${ROUNDS:-1}"
-    # Fewer, shorter compaction-cost pairs.
-    export TN_BENCH_PAIRS="${TN_BENCH_PAIRS:-3}" TN_BENCH_PAIR_ROUNDS="${TN_BENCH_PAIR_ROUNDS:-300}"
+    # Fewer compaction-cost pairs.
+    export TN_BENCH_PAIRS="${TN_BENCH_PAIRS:-3}"
 else
     rounds="${ROUNDS:-3}"
 fi

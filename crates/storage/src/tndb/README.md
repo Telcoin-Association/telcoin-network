@@ -393,20 +393,30 @@ environment's write lock), and reads of the epoch and kad tables come from memor
 tndb replays its logs (about 0.8 s for a 229 MB log); MDBX recovers at once. Its disk use stays
 smaller (it reuses freed pages).
 
-**On Linux** (i7-1360P laptop, NVMe ext4 with FUA: a synchronous 4 KB write takes 1.74 ms; partial
-baseline run, 2026-10-12), every durable ack pays a drive-cache flush, and the gap to production
+**On Linux** (i7-1360P laptop, NVMe ext4 with FUA: a synchronous 4 KB write takes about 2.5 ms;
+QUICK baseline, 2026-10-13), every durable ack pays a drive-cache flush, and the gap to production
 widens:
 
 | N=50 | Split | Composite / layered MDBX |
 |---|---|---|
-| consensus alone: ms per round | **7.4** | 1127 |
-| vote durable p50 / p99 | **4.3 / 7.9 ms** | 871 ms / 2.2 s |
-| beside 1 MB batches at 25/s: ms per round | **8.4** | 1677 |
-| vote durable p50 / p99 | **4.7 / 10.0 ms** | 1.09 s / 4.97 s |
+| consensus alone: ms per round | **7.1** | 1136 |
+| vote durable p50 / p99 | **3.7 / 5.8 ms** | 824 ms / 2.9 s |
+| beside 1 MB batches at 25/s: ms per round | **7.5** | 1508 |
+| vote durable p50 / p99 | **3.4 / 9.5 ms** | 1.07 s / 3.4 s |
+| startup reload, 28,800 rounds into an epoch (N=10) | **24.5 ms** | 473 ms |
 
-A vote's durability there is about two sync rounds (~2.2 ms each). Beside 256 KB batches as fast as
-taken (~300 MB/s), Split degrades to 68 ms per round (vote p50 35 ms): each `fsync` flushes the whole
-drive cache, so separate logs share the flush cost on one drive.
+A vote's durability there is about two sync rounds (~2.1 ms each). The batch stream at 25 MB/s
+raises vote p99 from 5.8 to about 9 ms by sharing the drive, with compaction off as much as on.
+
+**A drive-saturating burst:** 256 KB batches as fast as taken, 460-780 MB/s against the drive's
+825 MB/s.
+- **Consensus:** Split takes 29 ms per round with compaction off and 40 ms with it on (vote p99
+  67 / 94 ms), against 7.1 alone. The epoch log's write lock is held up to 20-120 ms, the kernel
+  blocking a writer inside it.
+- **Compaction:** the batch log's compactions can't keep up; some give up after three switch tries.
+- **How far from production:** that rate takes about 50-80 validators all sending ten full 1 MB
+  batches in every header, every round: 4-6 Gbps into every node, and execution far beyond one
+  node's EVM.
 
 The node opens tndb with the `tn-storage/tndb` feature (`DatabaseType = SplitDatabase`, at
 `<consensus db>/tndb`); MDBX stays the default. On its first tndb open, a node that ran on MDBX

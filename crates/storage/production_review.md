@@ -103,7 +103,22 @@ preallocated padding (a close that did not commit cleanly would mean a latched f
 a cancelled compaction. Diagnose with the time-based churn run and its per-column file listing, then
 fix before production.
 
-**M5. tnlog writes block tokio workers** (measured; Linux makes it worse: write call p50 220–250 µs,
+**M5. tnlog writes block tokio workers** — **CLOSED 2026-10-13 after the Linux QUICK baseline: not
+a production cost, and the "outside the lock" reading was a comparison error.**
+- **This run:** the vote write call was p50 238 µs / p99 1.48 ms at N=50. That compares one call
+  type's median with lock waits (54 µs) and holds (13 µs) averaged over every write: certificates,
+  their indexes, payload rows, headers and votes, about 347 a round, of which votes are 50.
+- **Why votes wait longer:** the bench starts all 50 vote tasks at once on 16 workers, so the votes
+  queue on the lock together. Each handoff wakes a parked thread, which fits a vote median near
+  240 µs inside the wait.
+  - Outside the lock a write does only a lookup, encoding, an atomic fence and sometimes a condvar
+    notify.
+  - This is inferred, not timed per call.
+- **Production cost:** about 50 votes a second at N=50, at about 0.25 ms each, is about 12 ms of one
+  worker per second.
+- **Full analysis:** the root `tndb-linux-unpaced.md`, section 3.
+
+*(original text, for the record)* (measured; Linux makes it worse: write call p50 220–250 µs,
 p99 1.4–1.6 ms at N=50, with lock waits averaging 50 µs and holds 13 µs, so ~150 µs of the median is
 outside the lock: profile on Linux first).
 - **Detail:** the environment's write lock is held for p50 73 µs and p99 ~1.1 ms in the mixed bench. Vote handlers and the proposer call `insert` from async tasks.
@@ -230,7 +245,7 @@ the rest. M6 dropped. Original order, for reference:
 
 **Each fix:** a test that fails first; a mutation check for durability fixes; `workload_*` before and after for the performance items; e2e epoch and restart tests on a tnlog binary at the end. No git writes.
 
-**L15 (added 2026-10-12, after M4). [DEFERRED 2026-10-13: needs a Linux measurement (copy pacing interacts with I/O stalls); noted in the tndb README.]** Under extreme churn the B+tree index file grows while a
+**L15 (added 2026-10-12, after M4). [DEFERRED 2026-10-13: needs a Linux measurement (copy pacing interacts with I/O stalls); noted in the tndb README. Linux QUICK baseline 2026-10-13: 104.8 MB index for 2,048 rows at about 100K churn steps a second; bounded per compaction; no fix needed at production rates. Kept deferred.]** Under extreme churn the B+tree index file grows while a
 compaction's copy pins its snapshot: pages superseded meanwhile can't be reused (102 MB for 2,048
 rows on the Mac at ~280 MB/s of churn). Each switch replaces it with a fresh index, so it is bounded
 per compaction; production write rates make it negligible. Possible fix: copy unpaced when the live
