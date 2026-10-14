@@ -13,7 +13,7 @@
 //! respawned when the epoch rolls over).
 
 use crate::{ChainSpec, RethEnv, WorkerTxPool};
-use futures::StreamExt as _;
+use futures::{FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
@@ -81,7 +81,9 @@ impl WorkerComponents {
             let destination = destination.clone();
             self.pool_handoff = Some(tokio::spawn(async move {
                 pool.migrate_transactions_to(&destination).await;
-                admissions.for_each(|()| pool.migrate_transactions_to(&destination)).await;
+                admissions
+                    .for_each(|()| pool.migrate_transactions_to(&destination).map(drop))
+                    .await;
             }));
         });
     }
