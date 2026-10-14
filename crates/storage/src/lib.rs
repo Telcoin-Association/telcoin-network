@@ -237,9 +237,12 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
 /// peer records. Of the caches, only `OurNodeBatchesCache` is copied: its sealed but uncommitted
 /// batches have no other copy (their transactions would be lost); the others refill.
 ///
-/// The copy is made durable before a marker file in `tndb_root` records that it is done; until
-/// then every open runs it again (MDBX is not written meanwhile, so copying it again only rewrites
-/// the same rows). The MDBX directories are left in place.
+/// Once the copy is durable, the MDBX environments it read are deleted (MDBX's own files, and each
+/// directory if nothing else is in it), so a later reset of tndb cannot bring back their state from
+/// the time of the switch; then a marker file in `tndb_root` records that the migration is done.
+/// Until then every open runs it again: an environment still present is copied again (MDBX is not
+/// written meanwhile, so that only rewrites the same rows) and deleted, and one already deleted was
+/// copied before it. A downgrade to the MDBX build after the switch starts with empty epoch tables.
 #[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
 pub(crate) fn migrate_from_mdbx(
     store_path: &std::path::Path,
@@ -255,7 +258,9 @@ pub(crate) fn migrate_from_mdbx(
     // An environment exists only if its data file does: opening an absent one would create it.
     let present = |dir: &str| store_path.join(dir).join("mdbx.dat").exists();
     let mut copied = 0;
-    if present("epoch") {
+    let read: Vec<&str> =
+        ["epoch", "kad", "cache"].into_iter().filter(|dir| present(dir)).collect();
+    if read.contains(&"epoch") {
         let src = open_mdbx_env(store_path, MdbxEnv::Epoch)?;
         copied += copy_table::<LastProposed, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<Votes, _>(&src, db, ROWS_PER_TXN)?;
@@ -265,19 +270,26 @@ pub(crate) fn migrate_from_mdbx(
         copied += copy_table::<ProposedCertificates, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<Payload, _>(&src, db, ROWS_PER_TXN)?;
     }
-    if present("kad") {
+    if read.contains(&"kad") {
         let src = open_mdbx_env(store_path, MdbxEnv::Kad)?;
         copied += copy_table::<KadRecords, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<KadProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<KadWorkerRecords, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<KadWorkerProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
     }
-    if present("cache") {
+    if read.contains(&"cache") {
         let src = open_mdbx_env(store_path, MdbxEnv::Cache)?;
         // A batch is up to 1 MB, and a transaction holds its rows until it commits.
         copied += copy_table::<OurNodeBatchesCache, _>(&src, db, 64)?;
     }
     db.wait_durable_blocking()?;
+    // Only now, with every row copied durable in tndb (and each environment closed).
+    for dir in &read {
+        remove_mdbx_env(store_path, dir)?;
+    }
+    if !read.is_empty() {
+        archive::data_file::fsync_directory(store_path)?;
+    }
     let tmp = tndb_root.join(format!("{}.tmp", tndb::MDBX_MIGRATED));
     {
         let mut file = std::fs::File::create(&tmp)?;
@@ -290,6 +302,34 @@ pub(crate) fn migrate_from_mdbx(
         tracing::info!(target: "tn::storage", "copied {copied} rows of the consensus DB from MDBX to tndb");
     }
     Ok(copied)
+}
+
+/// The files MDBX keeps in an environment's directory.
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+const MDBX_FILES: [&str; 2] = ["mdbx.dat", "mdbx.lck"];
+
+/// Delete the MDBX environment `dir` under `store_path`, whose rows are durably in tndb: MDBX's own
+/// files, then the directory if nothing else is in it. A file MDBX did not make is kept, with its
+/// directory, and logged; nothing is removed recursively.
+#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+fn remove_mdbx_env(store_path: &std::path::Path, dir: &str) -> eyre::Result<()> {
+    use eyre::WrapErr as _;
+
+    let env = store_path.join(dir);
+    for file in MDBX_FILES {
+        let path = env.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).wrap_err_with(|| format!("delete {}", path.display())),
+        }
+    }
+    if let Err(e) = std::fs::remove_dir(&env) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(target: "tn::storage", "kept {} after moving to tndb: {e}", env.display());
+        }
+    }
+    Ok(())
 }
 
 /// Rows per transaction when copying a table of small values (see [`copy_table`]).
@@ -403,9 +443,17 @@ mod migrate_test {
                 .expect("our batch");
             mdbx.sync_persist();
         }
+        // The consensus packs live beside the MDBX environments (`epochs/` next to `epoch/`).
+        let pack = store.join("epochs").join("epoch-1").join("data");
+        std::fs::create_dir_all(pack.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&pack, b"pack").expect("write");
         let root = store.join(TNDB_DIR);
         let db = open_split(&root);
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 4, "rows copied");
+        for env in ["epoch", "kad", "cache"] {
+            assert!(!store.join(env).exists(), "the MDBX {env} environment is deleted");
+        }
+        assert!(pack.exists(), "the packs beside it are not");
         assert!(
             db.get::<OurNodeBatchesCache>(&B256::repeat_byte(3)).expect("get").is_some(),
             "our own uncommitted batch is carried over"
@@ -417,7 +465,8 @@ mod migrate_test {
         assert!(root.join(MDBX_MIGRATED).exists(), "the marker");
         drop(db);
 
-        // Once done, it never runs again (MDBX keeps whatever it held).
+        // Once done, it never runs again: MDBX recreated after the switch (as by a downgrade) is
+        // not read.
         {
             let mdbx = crate::_open_mdbx(store);
             mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(8), &vote).expect("vote");
@@ -427,6 +476,31 @@ mod migrate_test {
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 0, "done once");
         assert_eq!(db.get::<Votes>(&AuthorityIdentifier::dummy_for_test(8)).expect("get"), None);
         assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote), "kept across a reopen");
+    }
+
+    /// A file in an MDBX environment's directory that is not MDBX's keeps the directory (only
+    /// MDBX's files are deleted); a rerun with the marker gone finds nothing left to copy.
+    #[test]
+    fn test_migrate_from_mdbx_deletes_only_mdbx_files() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_files").expect("temp dir");
+        let store = tmp.path();
+        {
+            let mdbx = crate::_open_mdbx(store);
+            let vote = VoteInfo { epoch: 1, round: 1, vote_digest: VoteDigest::default() };
+            mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(7), &vote).expect("vote");
+            mdbx.sync_persist();
+        }
+        let stray = store.join("kad").join("notes.txt");
+        std::fs::write(&stray, b"an operator's file").expect("write");
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 1, "rows copied");
+        assert!(stray.exists(), "a file MDBX did not make is kept");
+        assert!(!store.join("kad").join("mdbx.dat").exists(), "MDBX's own files are deleted");
+        assert!(!store.join("epoch").exists());
+        std::fs::remove_file(root.join(MDBX_MIGRATED)).expect("remove the marker");
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("rerun"), 0, "nothing left to copy");
+        assert!(root.join(MDBX_MIGRATED).exists(), "the marker, written again");
     }
 
     /// A node with no MDBX data (a fresh node) copies nothing, and records that it is done.

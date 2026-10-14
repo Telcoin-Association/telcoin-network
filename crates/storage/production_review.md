@@ -251,3 +251,65 @@ rows on the Mac at ~280 MB/s of churn). Each switch replaces it with a fresh ind
 per compaction; production write rates make it negligible. Possible fix: copy unpaced when the live
 set is small (shorter pin), or let the index reuse pages that no live snapshot can reach.
 
+
+## Second review (2026-10-13): tndb as it stands
+
+**Scope:**
+- every tndb source file; its 74 tests checked by name for coverage;
+- the tndb README;
+- the node's open path and the MDBX migration (`lib.rs` `_open_tndb`, `migrate_from_mdbx`,
+  `copy_table`).
+
+The storage README's "Intentional design decisions" and "Reviewed and sound" above were not
+re-raised.
+
+**Re-checked and sound:**
+- the lock order (registry → write; the commit and compaction threads take no writer lock);
+- the commit thread's idle handshake (SeqCst fences on both sides);
+- `wait_durable` (no lost wakeups: `advance` needs the waiter's mutex);
+- sync rounds across a switch (the new log is synced before the rename, so advancing to an older
+  frontier's sequence number is safe);
+- `install_gen` and generation lifetimes; replay and recovery; manifest atomicity;
+- `record_prior_to` (strictly-less, as MDBX's);
+- the migration marker (durable before the node writes anything).
+
+**N1. [FIXED 2026-10-13: `CompactShared::request_auto` checks `running` again under the state lock; test `test_tndb_abandoned_compaction_waits_out_its_backoff` (a test-only pause in `request_auto`), which failed first.] An abandoned compaction was retried at once, skipping its backoff.**
+- **The race:** `request_auto` checked `running` before taking the state lock but not after.
+  1. A writer that saw no compaction running took the lock just after one started, and set
+     `wanted` again.
+  2. When that compaction was abandoned, `run` set the backoff, found `wanted` set and started
+     another at once.
+- **Once per failure streak:** once the backoff was set, a racing request was turned away.
+- **Effects:**
+  - one wasted immediate retry, at the worst time (a burst, a near-full disk);
+  - the backoff doubled a step early;
+  - after a successful switch, a needless snapshot under the write lock.
+- **The Linux run's open question:** it explains the 2 abandons per run under the unpaced burst.
+
+**N2. [FIXED 2026-10-13: test `test_tndb_txn_dropped_while_panicking_writes_nothing`, which failed first.] A write transaction dropped while a panic unwinds committed its partial writes.**
+- **The risk:** with the default panic strategy (unwind), a panic between related writes in one
+  transaction (a certificate and its digest-index rows) committed half of them, silently.
+  `LayeredDatabase` also commits a dropped transaction (with a warning); raw MDBX aborts it.
+- **Now:**
+  - a transaction dropped while `std::thread::panicking()` writes nothing (logged as an error);
+  - one dropped without a commit otherwise is written as before, with a warning;
+  - an empty one does nothing.
+
+**N3. [FIXED 2026-10-13 (user: delete, not rename): tests `test_migrate_from_mdbx_keeps_epoch_and_kad_tables` (extended), `test_migrate_from_mdbx_deletes_only_mdbx_files`.] The MDBX directories stayed after the migration,** so deleting `consensus-db/tndb` later would re-import the epoch state from the time of the switch (possibly epochs old).
+- **The fix:** once the copy is durable, and before the marker, `migrate_from_mdbx` deletes each
+  environment it read.
+  - It removes MDBX's own files (`mdbx.dat`, `mdbx.lck`), then the directory with `remove_dir`. A
+    file MDBX did not make keeps its directory and is logged; nothing is removed recursively.
+  - It then syncs the consensus DB directory, then writes the marker.
+- **Crashes:** a crash part way reruns the copy for what is still present.
+- **Mutation check:** a recursive delete is caught.
+- **Trade-off:** a downgrade to the MDBX build after the switch now starts with empty epoch tables.
+
+**N4. [FIXED 2026-10-13.] Nit:** a duplicated doc comment on `split.rs` `ENVIRONMENTS`.
+
+**Observations, no action:**
+- A switch holds the registry lock through its pre-lock catch-up and sync. That blocks only a
+  table's first-ever row and new table registration, which happen at startup in production.
+- A catch-up reads the old log through the snapshot's view. A log that outgrows its 16 GiB
+  reservation during a compaction would make the compaction abandon (a bounds error), not misread.
+- `TnDbTxMut::get` scans the transaction's writes linearly; production transactions are small.

@@ -1233,6 +1233,59 @@ fn test_tndb_compaction_close_cancels() {
 /// A compaction that fails before its rename (at start, short of disk at start or midway, a
 /// panic, a row count that does not match) is abandoned: its files are deleted, the database
 /// carries on in its generation, and a later compaction still runs.
+/// A write transaction dropped while a panic unwinds writes nothing (it was cut off part way); one
+/// dropped without a commit otherwise is written.
+#[test]
+fn test_tndb_txn_dropped_while_panicking_writes_nothing() {
+    let tmp = TempDir::with_prefix("tndb_txn_panic").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut txn = db.write_txn().expect("txn");
+        txn.insert::<TestTable>(&1, &"half".to_string()).expect("insert");
+        panic!("cut off before the rest of the transaction");
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(db.get::<TestTable>(&1).expect("get"), None, "nothing of the cut-off transaction");
+    {
+        let mut txn = db.write_txn().expect("txn");
+        txn.insert::<TestTable>(&2, &"dropped".to_string()).expect("insert");
+    }
+    assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("dropped".to_string()));
+}
+
+/// An automatic request that saw no compaction running, but takes the state lock only once one has
+/// started, does not ask for another: when that one is abandoned, the next waits out the backoff
+/// rather than starting at once.
+#[test]
+fn test_tndb_abandoned_compaction_waits_out_its_backoff() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let tmp = TempDir::with_prefix("tndb_compact_backoff").expect("temp dir");
+    let db = open_compacting(tmp.path(), CommitMode::Group, manual());
+    for i in 0..100_u64 {
+        db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
+    }
+    let compact = &db.core().compact;
+    let (paused, unpause) = compact.test.pause_next_request();
+    std::thread::scope(|s| {
+        // An automatic request, past its lock-free check while no compaction runs.
+        let request = s.spawn(|| compact.request_auto());
+        assert_eq!(next_checkpoint(&paused), 0);
+        // A compaction starts, and will be abandoned (its row count is wrong).
+        let (arrivals, release) = compact.test.gate_next();
+        compact.test.skip_a_row.store(true, Relaxed);
+        compact.test.force.store(true, Relaxed);
+        db.compact().expect("request");
+        assert_eq!(next_checkpoint(&arrivals), 1);
+        drop(unpause);
+        request.join().expect("request thread");
+        drop(release);
+    });
+    let abandoned = compact.wait_done(1).expect("the compaction ended");
+    assert!(abandoned.expect_err("abandoned").contains("rows compacted"));
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(compact.done(), 1, "no compaction before the backoff");
+}
+
 #[test]
 fn test_tndb_compaction_failures_before_the_rename_abandon() {
     use std::sync::atomic::Ordering::Relaxed;

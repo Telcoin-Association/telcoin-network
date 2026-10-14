@@ -283,9 +283,11 @@ struct TxWrite {
 }
 
 /// A write transaction, buffered: its writes stay in memory (its own `get` sees them) and are
-/// written as one batch when it commits, or when it is dropped (as `LayeredDatabase`'s dropped
-/// transactions are: kept, never rolled back). A batch is atomic across tables: after a crash,
-/// all of it is there or none. Other readers and transactions see none of it until then.
+/// written as one batch when it commits, or when it is dropped without a commit (as
+/// `LayeredDatabase`'s dropped transactions are: kept, never rolled back), unless it is dropped
+/// while a panic unwinds: then it was cut off part way, and nothing of it is written. A batch is
+/// atomic across tables: after a crash, all of it is there or none. Other readers and transactions
+/// see none of it until then.
 ///
 /// Every key and value is encoded into one byte arena (no allocation per write); at commit each
 /// table's writes are sorted by key, so they land in key order, and only a key's last write is
@@ -365,10 +367,19 @@ impl TnDbTxMut {
 
 impl Drop for TnDbTxMut {
     fn drop(&mut self) {
-        if !self.done {
-            if let Err(e) = self.finish() {
-                tracing::error!(target: "tndb", "a dropped write transaction failed to write: {e:#}");
-            }
+        if self.done || self.tables.is_empty() {
+            return;
+        }
+        if std::thread::panicking() {
+            tracing::error!(
+                target: "tndb",
+                "a write transaction dropped while panicking: its writes are discarded"
+            );
+            return;
+        }
+        tracing::warn!(target: "tndb", "a write transaction dropped without commit; writing it");
+        if let Err(e) = self.finish() {
+            tracing::error!(target: "tndb", "a dropped write transaction failed to write: {e:#}");
         }
     }
 }

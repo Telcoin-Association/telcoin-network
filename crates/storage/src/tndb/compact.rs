@@ -224,8 +224,17 @@ impl CompactShared {
         if self.running.load(Ordering::Acquire) {
             return;
         }
+        #[cfg(test)]
+        checkpoint(&self.test.request_pause.lock().take(), 0);
         let mut state = self.state.lock();
-        if state.wanted || state.stop || state.retry_at.is_some_and(|at| Instant::now() < at) {
+        // `running` again, under the lock that starts a compaction: one that started since the
+        // check above must not be followed by another as soon as it ends, nor, if it is abandoned,
+        // before its backoff.
+        if self.running.load(Ordering::Acquire)
+            || state.wanted
+            || state.stop
+            || state.retry_at.is_some_and(|at| Instant::now() < at)
+        {
             return;
         }
         state.wanted = true;
@@ -307,6 +316,9 @@ pub(super) struct TestHooks {
     /// The most unpublished pages a compacted index had when the last switch installed it (their
     /// CRCs are stamped under the write lock).
     pub(super) private_at_switch: std::sync::atomic::AtomicU64,
+    /// The next automatic request pauses once past its lock-free check, as `gate` does (it
+    /// reports checkpoint 0).
+    pub(super) request_pause: Mutex<Option<Gate>>,
 }
 
 #[cfg(test)]
@@ -321,6 +333,16 @@ impl TestHooks {
         let (arrived, arrivals) = std::sync::mpsc::channel();
         let (release, released) = std::sync::mpsc::channel();
         *self.gate.lock() = Some((arrived, released));
+        (arrivals, release)
+    }
+
+    /// Pause the next automatic request (see `request_pause`).
+    pub(super) fn pause_next_request(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<u32>, std::sync::mpsc::Sender<()>) {
+        let (arrived, arrivals) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        *self.request_pause.lock() = Some((arrived, released));
         (arrivals, release)
     }
 }

@@ -154,11 +154,12 @@ sync, or a crash in a test) fails rather than waiting for a sync no thread will 
 
 A `TnDbTxMut` encodes its writes into one byte arena (no allocation per write), per table and in
 order, noting whether the table was cleared first. Its own `get` sees them (each key's last write);
-nobody else does until it commits. Commit, or drop as with `LayeredDatabase`, sorts each table's
-writes by key, keeps each key's last, and writes them as one batch, **atomic across tables** and in
+nobody else does until it commits. Commit, or a drop without one as with `LayeredDatabase` (with
+a warning), sorts each table's writes by key, keeps each key's last, and writes them as one batch, **atomic across tables** and in
 key order (so a bulk transaction's rows scan sequentially). A batch therefore names each key at most
 once per table, its clear first, which lets the write path decide each removal from the index
-alone. Production
+alone. A transaction dropped while a panic unwinds was cut off part way: nothing of it is
+written. Production
 transactions only write and then commit (`CertificateStore::delete` reads through its own
 transaction), so buffering changes nothing they rely on.
 
@@ -185,7 +186,8 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
 - a clean reopen;
 - a crash rebuild of interleaved tables;
 - cross-table transaction atomicity (a torn flagged record drops the whole batch);
-- buffered transaction visibility, and a dropped transaction being written;
+- buffered transaction visibility, and a dropped transaction being written (and one dropped while
+  panicking not);
 - a CLEAR inside a batch;
 - a failed batch taken back (injected index allocation failure; also checked after a later write
   publishes);
@@ -264,7 +266,8 @@ empty, in a log of at least 1 MiB with a dead row, also asks for one at once (au
 compaction on), whatever the threshold. The epoch tables are all cleared at every epoch's end,
 so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms.
 `Database::compact` asks for one at once (a log of at least 1 MiB). A failed compaction backs
-the trigger off (60 s, doubling to 1 h).
+the trigger off (60 s, doubling to 1 h); a request that arrives while one runs is ignored, so it
+cannot start another the moment that one ends.
 
 **Steps.** One `tndb-compact` thread per database:
 1. **Snapshot**, under the write lock: every table's last publish and the log's end `E`, one
@@ -422,9 +425,12 @@ The node opens tndb with the `tn-storage/tndb` feature (`DatabaseType = SplitDat
 `<consensus db>/tndb`); MDBX stays the default. On its first tndb open, a node that ran on MDBX
 has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates),
 kad tables and own uncommitted batches (`OurNodeBatchesCache`: no other copy holds them) copied
-over (`migrate_from_mdbx` in `lib.rs`), made durable, then marked done (`tndb/mdbx-migrated`); a
-crash before the marker reruns the copy. The other caches start empty (they refill), and the MDBX
-directories are left in place. Abandoning the epoch tables instead would be safe only while the
+over (`migrate_from_mdbx` in `lib.rs`) and made durable. Then the MDBX environments are deleted
+(MDBX's own files, and each directory if nothing else is in it), so a later reset of tndb cannot
+bring back their state from the time of the switch, and the migration is marked done
+(`tndb/mdbx-migrated`). A crash before the marker reruns the copy for whatever is still there.
+The other caches start empty (they refill). A downgrade to the MDBX build after the switch starts
+with empty epoch tables. Abandoning the epoch tables instead would be safe only while the
 network keeps making rounds as validators restart: after a stop-all halt every node would return
 to the same round with no memory of what it proposed and voted there. The migration is kept for
 the release that switches backends; the next one removes it with the MDBX consensus backend.

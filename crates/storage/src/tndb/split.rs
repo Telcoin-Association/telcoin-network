@@ -31,9 +31,8 @@ pub const CACHE_AUTO_MIN_BYTES: u64 = 256 << 20;
 /// compaction stalls mid-epoch.
 pub const EPOCH_AUTO_MIN_BYTES: u64 = 2 << 30;
 
-/// The environments, in [`SplitDatabase::dbs`] order.
 /// The environments' directories under a `SplitDatabase`'s root, in [`EPOCH`], [`KAD`],
-/// [`CACHE`] order.
+/// [`CACHE`] order (the order of `SplitDatabase::dbs`).
 pub(super) const ENVIRONMENTS: [&str; 3] = ["epoch", "kad", "cache"];
 
 /// The file in a `SplitDatabase`'s root recording that the node's MDBX consensus tables were
