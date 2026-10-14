@@ -1253,6 +1253,41 @@ fn test_prune_disconnected_evicts_oldest_not_newest() {
     }
 }
 
+/// A committee member's `Confirmed` record is exempt from disconnected pruning even when it is the
+/// oldest disconnect, so its `bls_by_peer_id` binding and validator identity survive (issue #1649).
+#[test]
+fn test_prune_disconnected_retains_committee_record() {
+    let config = PeerConfig::default();
+    let mut all_peers = create_all_peers(None);
+
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
+    // the member is the OLDEST disconnect, so pruning evicts it first without the exemption
+    all_peers.update_connection_status(&validator_id, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+    all_peers.get_peer_mut(&validator_id).into_iter().for_each(|peer| {
+        peer.set_connection_status(ConnectionStatus::Disconnected {
+            instant: Instant::now() - Duration::from_secs(10_000),
+        });
+    });
+    (0..config.max_disconnected_peers).for_each(|_| {
+        all_peers.update_connection_status(&PeerId::random(), NewConnectionStatus::Disconnected);
+    });
+
+    // the triggering disconnect takes the total to `max_disconnected_peers + 2`
+    all_peers.register_disconnected(&PeerId::random());
+
+    assert!(all_peers.get_peer(&validator_id).is_some(), "committee record must survive pruning");
+    assert_eq!(all_peers.bls_for_peer(&validator_id), Some(bls), "binding must survive pruning");
+    assert!(all_peers.is_peer_validator(&validator_id), "member keeps its validator identity");
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+}
+
 #[test]
 fn test_is_validator() {
     let mut all_peers =
