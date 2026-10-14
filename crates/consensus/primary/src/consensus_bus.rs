@@ -225,11 +225,22 @@ impl<T: Send + 'static> TnSender<T> for QueChannel<T> {
         Ok(self.channel.send(value).await?)
     }
 
+    /// Queue `value` without waiting, or drop it while no receiver is subscribed.
     fn try_send(&self, value: T) -> Result<(), tn_types::TrySendError<T>> {
+        self.try_send_outcome(value).map(|_outcome| ())
+    }
+
+    /// Queue `value` like [`TnSender::try_send`], and report
+    /// [`tn_types::TrySendOutcome::Unsubscribed`] when no receiver is subscribed, so the network
+    /// layer counts the drop as shed instead of as forwarded.
+    fn try_send_outcome(
+        &self,
+        value: T,
+    ) -> Result<tn_types::TrySendOutcome, tn_types::TrySendError<T>> {
         if !self.subscribed.load(Ordering::Acquire) {
-            return Ok(());
+            return Ok(tn_types::TrySendOutcome::Unsubscribed);
         }
-        Ok(self.channel.try_send(value)?)
+        Ok(self.channel.try_send(value).map(|()| tn_types::TrySendOutcome::Queued)?)
     }
 }
 
