@@ -1,18 +1,26 @@
 //! Test network handler tests.
 
 use assert_matches::assert_matches;
-use std::{collections::BTreeSet, sync::Arc};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
+};
 use tn_batch_validator::NoopBatchValidator;
 use tn_network_libp2p::{
     types::{NetworkCommand, NetworkHandle},
     GossipMessage, Penalty, TopicHash,
 };
-use tn_network_types::MockWorkerToPrimary;
+use tn_network_types::{
+    MockWorkerToPrimary, WorkerOthersBatchMessage, WorkerOwnBatchMessage, WorkerToPrimaryClient,
+};
 use tn_storage::{mem_db::MemDatabase, tables::NodeBatchesCache};
 use tn_test_utils::CommitteeFixture;
 use tn_types::{
-    Batch, BatchValidation, BatchValidationError, BcsError, BlsPublicKey, Database, SealedBatch,
-    TaskManager, B256,
+    Address, Batch, BatchValidation, BatchValidationError, BcsError, BlsPublicKey, Database,
+    SealedBatch, TaskManager, B256,
 };
 use tn_worker::{
     RequestHandler, WorkerGossip, WorkerNetworkError, WorkerNetworkHandle, WorkerRequest,
@@ -78,6 +86,15 @@ fn create_test_types_with_chain_id(chain_id: u64) -> TestTypes {
 fn create_test_types_with_validator(
     validator: Arc<dyn BatchValidation>,
 ) -> (TestTypes, MemDatabase) {
+    create_test_types_with_validator_and_primary(validator, Arc::new(MockWorkerToPrimary()))
+}
+
+/// Like [`create_test_types_with_validator`], but binds `primary` as the worker's local primary
+/// handler, so a test can observe what the report path sends to the primary.
+fn create_test_types_with_validator_and_primary(
+    validator: Arc<dyn BatchValidation>,
+    primary: Arc<dyn WorkerToPrimaryClient>,
+) -> (TestTypes, MemDatabase) {
     let committee = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
     let authority = committee.first_authority();
     let config = authority.consensus_config();
@@ -92,7 +109,7 @@ fn create_test_types_with_validator(
     config
         .local_network(worker_id)
         .expect("worker 0 local network")
-        .set_worker_to_primary_local_handler(Arc::new(MockWorkerToPrimary()))
+        .set_worker_to_primary_local_handler(primary)
         .expect("register mock primary handler");
     let handler = RequestHandler::new(worker_id, validator, config, network_handle);
     (TestTypes { committee, handler, task_manager, network_commands_rx }, store)
@@ -109,6 +126,79 @@ impl BatchValidation for RejectingBatchValidator {
     }
 
     fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
+}
+
+/// The result a [`CountingBatchValidator`] returns for every batch.
+#[derive(Debug, Clone, Copy)]
+enum Verdict {
+    /// Accept every batch.
+    Accept,
+    /// Reject every batch with [`BatchValidationError::EmptyBatch`].
+    Reject,
+}
+
+/// A [`BatchValidation`] that counts `validate_batch` calls and returns the same [`Verdict`] for
+/// every batch. Used to prove how often the report path validates a repeated batch.
+#[derive(Debug)]
+struct CountingBatchValidator {
+    /// Number of `validate_batch` calls so far.
+    calls: Arc<AtomicUsize>,
+    /// The result returned for every batch.
+    verdict: Verdict,
+}
+
+impl BatchValidation for CountingBatchValidator {
+    fn validate_batch(&self, _batch: SealedBatch) -> Result<(), BatchValidationError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        match self.verdict {
+            Verdict::Accept => Ok(()),
+            Verdict::Reject => Err(BatchValidationError::EmptyBatch),
+        }
+    }
+
+    fn submit_txn_if_mine(&self, _tx_bytes: &[u8], _committee_size: u64, _committee_slot: u64) {}
+}
+
+/// A [`WorkerToPrimaryClient`] that counts `report_others_batch` calls. Used to prove the report
+/// path still acknowledges a repeated batch.
+#[derive(Debug)]
+struct CountingWorkerToPrimary {
+    /// Number of `report_others_batch` calls so far.
+    others_reports: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl WorkerToPrimaryClient for CountingWorkerToPrimary {
+    async fn report_own_batch(&self, _request: WorkerOwnBatchMessage) -> eyre::Result<()> {
+        Ok(())
+    }
+
+    async fn report_others_batch(&self, _request: WorkerOthersBatchMessage) -> eyre::Result<()> {
+        self.others_reports.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+/// Counters shared with a handler built by [`create_counting_test_types`].
+struct ReportCounters {
+    /// Number of `validate_batch` calls.
+    validations: Arc<AtomicUsize>,
+    /// Number of `report_others_batch` calls to the primary.
+    others_reports: Arc<AtomicUsize>,
+}
+
+/// Build a handler whose validator returns `verdict` and whose validator and primary count their
+/// calls. Returns the test types, the shared node store, and the counters.
+fn create_counting_test_types(verdict: Verdict) -> (TestTypes, MemDatabase, ReportCounters) {
+    let counters = ReportCounters {
+        validations: Arc::new(AtomicUsize::new(0)),
+        others_reports: Arc::new(AtomicUsize::new(0)),
+    };
+    let (types, store) = create_test_types_with_validator_and_primary(
+        Arc::new(CountingBatchValidator { calls: counters.validations.clone(), verdict }),
+        Arc::new(CountingWorkerToPrimary { others_reports: counters.others_reports.clone() }),
+    );
+    (types, store, counters)
 }
 
 // ============================================================================
@@ -135,6 +225,98 @@ async fn test_report_batch_fails_non_committee_peer() {
     let bad_peer = BlsPublicKey::default();
     let res = handler.pub_process_report_batch(&bad_peer, sealed_batch).await;
     assert_matches!(res, Err(WorkerNetworkError::NonCommitteeBatch));
+}
+
+/// A committee member that reports the same batch twice gets two acknowledgements, but the worker
+/// validates and caches the batch only once (issue #1515). Without the cache check the repeat is
+/// validated again, so the validation count is 2 and this test fails.
+#[tokio::test]
+async fn test_report_batch_dedupes_repeat_digest() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    // current-epoch batch (fixture epoch is 0)
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(first, Ok(()));
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert_matches!(repeat, Ok(()));
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        1,
+        "a repeat of a cached digest must not be validated again"
+    );
+    assert_eq!(
+        counters.others_reports.load(Ordering::SeqCst),
+        2,
+        "every report must still be acknowledged"
+    );
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_some());
+}
+
+/// A repeat that attaches a different body to a cached digest is acknowledged, but that body is not
+/// validated or stored: the cache keeps the body the worker validated. Without the cache check the
+/// repeat overwrites the cached body, so this test fails.
+#[tokio::test]
+async fn test_report_batch_repeat_keeps_validated_body() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Accept);
+    let validated = Batch::default();
+    let digest = validated.digest();
+    // same digest, different body: the digest in a `SealedBatch` is not checked on construction
+    let other_body = Batch { beneficiary: Address::repeat_byte(0x42), ..Batch::default() };
+    assert_ne!(other_body.beneficiary, validated.beneficiary);
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, validated.clone().seal(digest)).await;
+    assert_matches!(first, Ok(()));
+    let repeat =
+        handler.pub_process_report_batch(&reporter, SealedBatch::new(other_body, digest)).await;
+    assert_matches!(repeat, Ok(()));
+
+    assert_eq!(counters.validations.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 2);
+    let cached = store
+        .get::<NodeBatchesCache>(&digest)
+        .expect("read store")
+        .expect("validated batch is cached");
+    assert_eq!(
+        cached.beneficiary, validated.beneficiary,
+        "a repeat must not replace the validated body of a cached digest"
+    );
+}
+
+/// A rejected batch is never cached, so a repeat of it is validated again and never acknowledged.
+/// This pins that the dedupe only skips digests that passed validation.
+#[tokio::test]
+async fn test_report_batch_revalidates_after_rejected_report() {
+    let (TestTypes { committee, handler, .. }, store, counters) =
+        create_counting_test_types(Verdict::Reject);
+    let batch = Batch::default();
+    let digest = batch.digest();
+    let reporter = committee.last_authority().primary_public_key();
+
+    let first = handler.pub_process_report_batch(&reporter, batch.clone().seal(digest)).await;
+    assert_matches!(
+        first,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+    );
+    let repeat = handler.pub_process_report_batch(&reporter, batch.seal(digest)).await;
+    assert_matches!(
+        repeat,
+        Err(WorkerNetworkError::BatchValidation(BatchValidationError::EmptyBatch))
+    );
+
+    assert_eq!(
+        counters.validations.load(Ordering::SeqCst),
+        2,
+        "a rejected batch must be validated again on repeat"
+    );
+    assert_eq!(counters.others_reports.load(Ordering::SeqCst), 0);
+    assert!(store.get::<NodeBatchesCache>(&digest).expect("read store").is_none());
 }
 
 // ============================================================================

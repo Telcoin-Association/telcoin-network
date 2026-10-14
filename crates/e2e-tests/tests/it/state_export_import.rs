@@ -7,13 +7,13 @@
 //!
 //! ## Topology: 4 validators, exactly one exporter
 //!
-//! A literal single producing node is not possible — `CommitteeInner::load`
-//! (`crates/types/src/committee.rs`) asserts a committee larger than one, and the whole point of
-//! the test (the importer must *sync and then follow*) requires a live network that keeps advancing
-//! epochs while and after the observer joins. So the network is the standard 4-validator committee
-//! used by every other epoch test, and `--enable-state-export` is enabled on **exactly one** of
-//! them (`validator-1`). That single exporter produces the bundle the observer imports; the other
-//! three only keep the quorum alive.
+//! A literal single producing node is not possible — `Committee::new` (builder) and
+//! `CommitteeInner::validate` (decode) in `crates/types/src/committee.rs` both refuse a committee
+//! of one, and the whole point of the test (the importer must *sync and then follow*) requires a
+//! live network that keeps advancing epochs while and after the observer joins. So the network is
+//! the standard 4-validator committee used by every other epoch test, and `--enable-state-export`
+//! is enabled on **exactly one** of them (`validator-1`). That single exporter produces the bundle
+//! the observer imports; the other three only keep the quorum alive.
 //!
 //! ## What the restored node needs from the snapshot block
 //!

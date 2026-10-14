@@ -26,13 +26,15 @@
 #![deny(unused_must_use, rust_2018_idioms)]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+mod addresses;
 mod parse;
 mod protocol;
 mod record;
 
+pub use addresses::{validate_advertised_addresses, AddressError, MAX_ADVERTISED_MULTIADDRS};
 pub use parse::{parse_bls_pubkey, ParseBlsPubkeyError};
 pub use protocol::{gossip_protocol_id_prefix, NetworkType};
-pub use record::{NetworkInfo, NodeRecord, RecordDomain, MAX_ADVERTISED_MULTIADDRS};
+pub use record::{NetworkInfo, NodeRecord, RecordDomain};
 
 // re-export the libp2p and tn-types items that appear in this crate's public API so a consumer
 // can name them without a direct dependency on either

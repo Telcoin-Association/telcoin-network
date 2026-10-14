@@ -149,11 +149,12 @@ The bypass mode is *Always allow*, which also lets an admin push to `main` with 
 `main` is the only writer of the cache entries the lanes restore.
 `.github/workflows/cache-deps.yaml` runs there and saves two entries: `clippy-cache` (dependencies for both clippy passes under the nightly pin) and `test-cache` (dependencies for both test lanes, default and adiri features, under the stable pin). `Swatinem/rust-cache` does not save the workspace crates or their test binaries, so each PR still builds those from its own source.
 The lanes in `pr.yaml` restore those and never save (`save-if: "false"`): a cache saved by a `pull_request` run is scoped to that PR's branch and one saved by a `merge_group` run lands on the queue's throwaway branch, so nothing else could ever read them, while the upload adds minutes to the critical path and eats quota that evicts the entries the queue does read.
+The rust-cache step in `quic-interop.yaml` keys its own `quic-<release>` entries and saves them only on `main` (`save-if: ${{ github.ref == 'refs/heads/main' }}`, so the weekly schedule or a dispatch there), for the same reason.
 
 A warm runs on a push to `main` that touches a `Cargo.toml`, `Cargo.lock`, `rust-toolchain.toml`, `rust-nightly`, `.cargo/config.toml`, `etc/ci-lanes.sh` or the workflow itself; on a schedule twice a week (GitHub deletes an entry not accessed for seven days, and a quiet week would otherwise leave the queue cold); and by hand from the Actions tab (*Warm dependency cache* -> *Run workflow*).
 When the entry already matches, the run restores it, rebuilds only the workspace crates, saves nothing, and is done in a few minutes.
 
-All six cache steps (two in `cache-deps.yaml`, three in `pr.yaml`, one in `durable-e2e.yaml`) pin the same `Swatinem/rust-cache` release.
+All seven cache steps (two in `cache-deps.yaml`, three in `pr.yaml`, one in `durable-e2e.yaml`, one in `quic-interop.yaml`) pin the same `Swatinem/rust-cache` release.
 Three of its properties shape all of this.
 They were checked against v2.9.2, and a later release can change them; the third is about a release that changes the key:
 
@@ -243,6 +244,9 @@ The pinned actions and the runtime each one uses (each pin's SHA, and the releas
 | `taiki-e/install-action` | composite (shell steps only) |
 | `actions/upload-pages-artifact` | composite (runs `actions/upload-artifact`, node24, itself pinned by SHA) |
 | `actions/deploy-pages` | node24 |
+| `actions/upload-artifact` | node24 |
+| `actions/download-artifact` | node24 |
+| `actions/setup-python` | node24 |
 
 `Swatinem/rust-cache` is left out of the table: its pin moves on its own terms, and "Caches" above covers it.
 The runtime column matters because GitHub removed Node 20 from the hosted runners on 2026-09-23 and now forces any node20 action onto Node 24, which it was not written for.

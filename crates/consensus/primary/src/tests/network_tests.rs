@@ -14,10 +14,11 @@ use crate::{
 };
 use assert_matches::assert_matches;
 use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use parking_lot::Mutex;
 use rand::{rngs::StdRng, SeedableRng};
 use roaring::RoaringBitmap;
 use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     num::NonZeroUsize,
     path::Path,
     sync::Arc,
@@ -31,7 +32,7 @@ use tn_network_libp2p::{
         GossipPayload, IntoResponse as _, NetworkCommand, NetworkEvent, NetworkResponseMessage,
         NetworkResult,
     },
-    GossipMessage, Penalty, TopicHash,
+    GossipMessage, Penalty, StreamError, TopicHash,
 };
 use tn_storage::{
     consensus::{ConsensusChain, ConsensusChainError},
@@ -518,17 +519,188 @@ async fn test_retrieve_consensus_output() {
         assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
     }
 
-    // A number we do not have is a benign miss: it errors and carries no penalty.
+    // A number past the local tip is a benign miss: it is reported unknown before any pack read
+    // and carries no penalty.
     let err =
         handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
-    assert_matches!(
-        err,
-        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
-            PackError::ConsensusNumberTooHigh
-        ))
-    );
+    assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(999));
     let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
     assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+}
+
+/// An output one to three positions past the local tip is reported unknown at once (issue #1646).
+///
+/// The serve holds a sync-stream permit, so it must not poll for the output to arrive. The clock
+/// is paused: any retry sleep would auto-advance it, so an unchanged clock proves that no retry
+/// timer ran.
+#[tokio::test(start_paused = true)]
+async fn test_consensus_output_past_tip_is_unknown_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+
+    // store outputs 1..=3 so the local tip is 3
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag(1)).await;
+    handler.consensus_chain().write_subdag_for_test(2, sub_dag(2)).await;
+    handler.consensus_chain().write_subdag_for_test(3, sub_dag(3)).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 3);
+
+    // each miss is unknown, carries no penalty, and runs no retry timer
+    macro_rules! assert_unknown_without_waiting {
+        ($number:expr) => {{
+            let start = tokio::time::Instant::now();
+            let err = handler
+                .consensus_output_bytes($number)
+                .await
+                .expect_err("an output past the local tip must be unknown");
+            assert_eq!(tokio::time::Instant::now(), start, "output {} must not wait", $number);
+            assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(n) if n == $number);
+            let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+        }};
+    }
+    assert_unknown_without_waiting!(4u64);
+    assert_unknown_without_waiting!(5u64);
+    assert_unknown_without_waiting!(6u64);
+
+    // the stored tip is still served
+    let bytes = handler.consensus_output_bytes(3).await.expect("stored tip output is served");
+    assert!(!bytes.is_empty(), "served tip output bytes must not be empty");
+}
+
+/// Save a minimal certificate for `record` (a valid BLS signature reused from a vote, empty signer
+/// bitmap). The epoch-record serve does not verify the certificate, so this makes the record
+/// available.
+async fn certify_epoch_record(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    record: &EpochRecord,
+) {
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: record.sign_vote(&key_config).signature,
+        signed_authorities: RoaringBitmap::new(),
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_certificate(record.digest(), cert)
+        .await
+        .expect("store epoch certificate");
+}
+
+/// An epoch record without its certificate is reported unavailable at once, by number and by
+/// digest (issue #1646).
+///
+/// The serve holds an epoch-record permit, so it must not wait for the certificate. The old code
+/// waited 1.5 s before it reported the miss. The clock is real: the lookup runs on the epoch
+/// database thread, so a paused clock could advance to an unrelated timer.
+#[tokio::test]
+async fn test_uncertified_epoch_record_is_unavailable_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+
+    // each miss is unavailable, carries no penalty, and returns before the old wait
+    macro_rules! assert_unavailable_without_waiting {
+        ($epoch:expr, $hash:expr, $($expected:tt)+) => {{
+            let start = Instant::now();
+            let err = handler
+                .retrieve_epoch_record($epoch, $hash)
+                .await
+                .expect_err("an uncertified epoch record must be unavailable");
+            assert!(start.elapsed() < Duration::from_secs(1), "an uncertified record must not wait");
+            assert_matches!(err, $($expected)+);
+            let penalty: Option<Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unavailable epoch record must not penalize the peer");
+        }};
+    }
+    assert_unavailable_without_waiting!(Some(0), None, PrimaryNetworkError::UnavailableEpoch(0));
+    assert_unavailable_without_waiting!(
+        None,
+        Some(record.digest()),
+        PrimaryNetworkError::UnavailableEpochDigest(digest) if digest == record.digest()
+    );
+
+    // with its certificate saved, the record is served by number and by digest
+    certify_epoch_record(&handler, &committee, &record).await;
+    let by_number = handler.retrieve_epoch_record(Some(0), None).await;
+    let by_digest = handler.retrieve_epoch_record(None, Some(record.digest())).await;
+    [by_number, by_digest].into_iter().for_each(|response| {
+        assert_matches!(
+            response,
+            Ok(PrimaryResponse::EpochRecord { record: served, certificate })
+                if served.digest() == record.digest() && certificate.epoch_hash == record.digest()
+        );
+    });
+}
+
+/// A sync request for the output one past the local tip is shed with `Deny(Unavailable)` at once
+/// (issue #1646), so the requester retries another peer. The bytes are resolved as in
+/// `process_sync_consensus_output_stream`.
+#[tokio::test]
+async fn test_sync_consensus_output_past_tip_denies() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // store output 1 so the local tip is 1
+    let cert = Certificate::default();
+    let sub_dag = CommittedSubDag::new(
+        vec![cert.clone()],
+        cert,
+        1,
+        ReputationScores::new(&committee_obj),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 1);
+
+    // the output at tip + 1 is unavailable, and the serve sheds it
+    let bytes = handler.consensus_output_bytes(2).await.ok();
+    assert!(bytes.is_none(), "the output past the local tip must be unavailable");
+    let mut out: Vec<u8> = Vec::new();
+    crate::network::sync_codec::send_sync_consensus_output_over_stream(
+        &mut out,
+        bytes,
+        Duration::from_secs(5),
+        BlsPublicKey::default(),
+        2,
+    )
+    .await
+    .expect("serving an unavailable output sheds cleanly without erroring");
+
+    // the first (and only) frame must be Deny(Unavailable)
+    let (mut dec, mut comp) = (Vec::new(), Vec::new());
+    let frame = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+        &mut futures::io::Cursor::new(out),
+        &mut dec,
+        &mut comp,
+        crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+    )
+    .await
+    .expect("read deny frame");
+    assert_matches!(
+        frame,
+        tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
+    );
 }
 
 #[tokio::test]
@@ -2480,12 +2652,12 @@ async fn test_request_vote_persistent_tier_two_lead_is_retryable() -> eyre::Resu
 }
 
 /// A header further ahead of the local clock than the drift tolerance plus the vote timeout is
-/// rejected for good: `InvalidTimestamp`, a severe penalty, and a verdict cached for its digest.
+/// rejected for good: `InvalidTimestamp`, no score penalty, and a verdict cached for its digest.
 ///
 /// The repeat request is answered from the cache with the already-converted response; a fresh
 /// evaluation would return the error itself instead.
 #[tokio::test]
-async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
+async fn test_vote_tier_three_lead_is_cached_without_penalty() -> eyre::Result<()> {
     pin_subsecond_fork(true);
     let temp_dir = TempDir::new().unwrap();
     let TestTypes { committee, handler, parent, task_manager: _task_manager, .. } =
@@ -2510,10 +2682,9 @@ async fn test_vote_tier_three_lead_is_cached_and_severe() -> eyre::Result<()> {
         PrimaryNetworkError::InvalidHeader(HeaderError::InvalidTimestamp { created, .. })
             if *created == created_at
     );
-    assert_matches!(
-        Option::<Penalty>::from(&err),
-        Some(Penalty::Severe),
-        "a header beyond the vote window must cost the author a severe penalty"
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "clock skew must reject the header without scoring its author"
     );
 
     let repeat = handler.vote(peer, header, vec![]).await?;
@@ -2594,8 +2765,8 @@ async fn test_vote_tier_two_lead_is_deferred_before_seed_signature_check() -> ey
 /// names execution block 1, which this node has not reached (the fixture stops at block 0). The
 /// execution wait would suspend on that block until the vote timeout fired and end the request as
 /// a `Timeout`, which carries no penalty (see `test_vote_inner_timeout`). The drift tier is decided
-/// first instead: the answer is `InvalidTimestamp` with its severe penalty. The paused clock moves
-/// only while every task waits, so a call that never waits takes no virtual time.
+/// first instead: the answer is `InvalidTimestamp`, without scoring clock skew. The paused clock
+/// moves only while every task waits, so a call that never waits takes no virtual time.
 #[tokio::test(start_paused = true)]
 async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::Result<()> {
     pin_subsecond_fork(true);
@@ -2634,10 +2805,9 @@ async fn test_vote_tier_three_lead_is_rejected_before_execution_wait() -> eyre::
          after {waited:?}"
     );
     assert_eq!(waited, Duration::ZERO, "the voter must not wait for the header's execution block");
-    assert_matches!(
-        Option::<Penalty>::from(&err),
-        Some(Penalty::Severe),
-        "a header beyond the vote window must cost the author a severe penalty"
+    assert!(
+        Option::<Penalty>::from(&err).is_none(),
+        "clock skew must reject the header without scoring its author"
     );
 
     Ok(())
@@ -2908,8 +3078,9 @@ fn test_epoch_record_admission_enforces_per_peer_cap() {
 
 /// `EpochRecord` request-response admission must cap the concurrent serve count across all peers
 /// at [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`] and free the budget when serves end
-/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn and, since a permit is held for the
-/// serve's lifetime, the total in-flight certificate-wait budget as well.
+/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn. A permit is held for the serve's
+/// lifetime, which is only the lookup and the response (an uncertified record is answered as
+/// unavailable at once, without a wait).
 #[test]
 fn test_epoch_record_admission_enforces_global_cap() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
@@ -2943,6 +3114,68 @@ fn test_epoch_record_admission_enforces_global_cap() {
     assert!(
         try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
         "dropping in-flight serves must free global concurrency"
+    );
+}
+
+/// Uncertified epoch-record serves release their admission permits at once (issue #1646).
+///
+/// Every global permit is held by a serve that answers an uncertified record, and a further peer
+/// is shed while they are held. When the serves end, the global budget and the per-peer counts
+/// are free again, and a certified record is served under a new permit. The per-peer cap is
+/// covered by `test_epoch_record_admission_enforces_per_peer_cap`.
+#[tokio::test]
+async fn test_epoch_record_permits_release_after_unavailable_serves() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(3);
+
+    // one serve per distinct peer holds every global permit
+    let peer_pool: Vec<_> = (0..MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)
+        .map(|_| *BlsKeypair::generate(&mut rng).public())
+        .collect();
+    let held: Vec<_> = peer_pool
+        .iter()
+        .map(|peer| {
+            try_admit_epoch_record(&semaphore, &peers, *peer)
+                .expect("a global permit must be available while the budget is not exhausted")
+        })
+        .collect();
+
+    // a further peer is shed while every permit is held
+    let extra = *BlsKeypair::generate(&mut rng).public();
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_none(),
+        "a fresh peer must be shed while every epoch-record permit is held"
+    );
+
+    // each held serve answers the uncertified record as unavailable, without a wait
+    let start = Instant::now();
+    let served = futures::future::join_all(
+        held.iter().map(|_permit| handler.retrieve_epoch_record(Some(0), None)),
+    )
+    .await;
+    assert!(start.elapsed() < Duration::from_secs(1), "uncertified serves must not wait");
+    served.into_iter().for_each(|response| {
+        assert_matches!(response, Err(PrimaryNetworkError::UnavailableEpoch(0)));
+    });
+
+    // ending the serves frees the global budget and every per-peer count
+    drop(held);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_EPOCH_RECORD_REQUESTS);
+    assert!(peers.lock().is_empty(), "ended serves must leave no per-peer count");
+
+    // a new serve is admitted, and a certified record is served under its permit
+    certify_epoch_record(&handler, &committee, &record).await;
+    let _permit = try_admit_epoch_record(&semaphore, &peers, extra)
+        .expect("a freed budget must admit a new serve");
+    assert_matches!(
+        handler.retrieve_epoch_record(Some(0), None).await,
+        Ok(PrimaryResponse::EpochRecord { record: served, .. })
+            if served.digest() == record.digest()
     );
 }
 
@@ -3351,7 +3584,7 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
     failed.insert(peers[1], 7);
     failed.insert(peers[2], 6);
 
-    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, &mut rng);
+    let ordered = crate::network::order_probe_peers(peers.clone(), &failed, 7, None, &mut rng);
 
     // Same set, no drops.
     assert_eq!(
@@ -3372,6 +3605,246 @@ fn test_order_probe_peers_deprioritises_this_epoch_failures() {
         ordered[..3].contains(&peers[2]),
         "a failure recorded for another epoch must not de-prioritise the peer"
     );
+}
+
+/// Stand in for the swarm behind a [`PrimaryNetworkHandle`] in the sync probe tests.
+///
+/// The spawned task answers `ConnectedPeers` with `peers` and fails every `OpenStream`: a peer in
+/// `unsupported` gets `UpgradeFailed` (it does not speak the sync protocol), every other peer gets
+/// `Timeout` (a transient failure). Each opened peer is recorded in order. Any other command
+/// panics, which closes the command channel and fails the probe.
+fn spawn_scripted_swarm(
+    peers: Vec<BlsPublicKey>,
+    unsupported: HashSet<BlsPublicKey>,
+) -> (PrimaryNetworkHandle, Arc<Mutex<Vec<BlsPublicKey>>>) {
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let opened = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&opened);
+    tokio::spawn(async move {
+        while let Some(command) = rx.recv().await {
+            match command {
+                NetworkCommand::ConnectedPeers { reply } => {
+                    // the prober awaits this reply, so the send cannot fail
+                    let _ = reply.send(peers.clone());
+                }
+                NetworkCommand::OpenStream { peer, reply } => {
+                    recorder.lock().push(peer);
+                    let error = if unsupported.contains(&peer) {
+                        StreamError::UpgradeFailed
+                    } else {
+                        StreamError::Timeout
+                    };
+                    let _ = reply.send(Err(NetworkError::Stream(error)));
+                }
+                other => panic!("unexpected command from a sync probe: {other:?}"),
+            }
+        }
+    });
+    (handle, opened)
+}
+
+/// Sixteen connected peers and a consensus chain holding a fresh epoch-0 pack.
+///
+/// Returns the temp dir so the chain's files outlive the test body.
+async fn sync_probe_peers_and_chain() -> (Vec<BlsPublicKey>, ConsensusChain, TempDir) {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers = (0..16).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let fixture = CommitteeFixture::builder(MemDatabase::default).randomize_ports(true).build();
+    let temp_dir = TempDir::new().unwrap();
+    let chain = ConsensusChain::new_for_test(temp_dir.path().to_owned(), fixture.committee())
+        .await
+        .unwrap();
+    (peers, chain, temp_dir)
+}
+
+/// One full-pack fetch walks every connected peer before it gives up, so a single server among
+/// many peers is always reached, and the peers that failed are probed again on the next call.
+#[tokio::test]
+async fn test_request_epoch_pack_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    let all: BTreeSet<BlsPublicKey> = peers.iter().copied().collect();
+    let record = EpochRecord::default();
+
+    for call in 1..=2 {
+        let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+        assert!(result.await.is_err(), "no peer serves, so call {call} must fail");
+        let opens = std::mem::take(&mut *opened.lock());
+        assert_eq!(opens.len(), 16, "call {call} must open one stream to every peer");
+        assert_eq!(
+            opens.into_iter().collect::<BTreeSet<_>>(),
+            all,
+            "call {call} must probe each connected peer once"
+        );
+    }
+}
+
+/// One consensus-output fetch walks every connected peer before it gives up.
+#[tokio::test]
+async fn test_request_consensus_output_probes_every_eligible_peer() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the fetch must open one stream to every peer");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "the fetch must probe each connected peer once"
+    );
+}
+
+/// A full-pack fetch caches the peers that do not speak the sync protocol as unsyncable and the
+/// next call walks only the peers that do, still without a cap.
+#[tokio::test]
+async fn test_request_epoch_pack_skips_cached_unsyncable_peers() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let unsupported: HashSet<BlsPublicKey> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    let record = EpochRecord::default();
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the first call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the first call must open one stream to every peer");
+
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the second call must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the second call must skip the four cached unsyncable peers");
+    assert_eq!(
+        opens.into_iter().collect::<BTreeSet<_>>(),
+        peers[4..].iter().copied().collect::<BTreeSet<_>>(),
+        "the second call must probe exactly the sync-capable peers"
+    );
+}
+
+/// `order_probe_peers` puts the last peer that served first while it is fresh, first among the
+/// failed peers once it has failed this epoch, and ignores a preferred key that is not connected.
+#[test]
+fn test_order_probe_peers_puts_last_server_first() {
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peers: Vec<BlsPublicKey> =
+        (0..6).map(|_| *BlsKeypair::generate(&mut rng).public()).collect();
+    let none_failed = HashMap::new();
+
+    // whichever peer served last, it is probed first while it has not failed this epoch
+    for &preferred in &peers {
+        let ordered = crate::network::order_probe_peers(
+            peers.clone(),
+            &none_failed,
+            7,
+            Some(preferred),
+            &mut rng,
+        );
+        assert_eq!(ordered[0], preferred, "a fresh preferred peer must be probed first");
+    }
+
+    // the preferred peer and one other both failed epoch 7: both sit behind the four fresh peers,
+    // the preferred one first
+    let failed: HashMap<BlsPublicKey, Epoch> = [(peers[0], 7), (peers[1], 7)].into();
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &failed, 7, Some(peers[0]), &mut rng);
+    assert_eq!(ordered[4], peers[0], "a failed preferred peer must lead the failed group");
+    assert_eq!(ordered[5], peers[1], "the other failed peer must be probed last");
+
+    // a failure recorded for another epoch does not cost the preference
+    let stale: HashMap<BlsPublicKey, Epoch> = [(peers[0], 6)].into();
+    let ordered =
+        crate::network::order_probe_peers(peers.clone(), &stale, 7, Some(peers[0]), &mut rng);
+    assert_eq!(ordered[0], peers[0], "a failure in another epoch must not demote the peer");
+
+    // a preferred key that is not connected changes nothing: same rng state, same order as `None`
+    let stranger = *BlsKeypair::generate(&mut rng).public();
+    let with_stranger = crate::network::order_probe_peers(
+        peers.clone(),
+        &none_failed,
+        7,
+        Some(stranger),
+        &mut rng.clone(),
+    );
+    let without = crate::network::order_probe_peers(peers.clone(), &none_failed, 7, None, &mut rng);
+    assert_eq!(with_stranger, without, "an unconnected preferred key must not reorder peers");
+    assert_eq!(
+        with_stranger.into_iter().collect::<BTreeSet<_>>(),
+        peers.into_iter().collect::<BTreeSet<_>>(),
+        "ordering must be a permutation of the input"
+    );
+}
+
+/// Both probe loops open the last peer that served first, failed and unsupported probes leave the
+/// preference in place, and a preferred peer that already failed this epoch is opened after every
+/// fresh peer.
+#[tokio::test]
+async fn test_probe_loops_open_last_server_first() {
+    let (peers, chain, _temp_dir) = sync_probe_peers_and_chain().await;
+    let record = EpochRecord::default();
+
+    // four peers refuse the protocol (`Unsupported`) and the rest time out (`Failed`); neither
+    // outcome may move the preference
+    let unsupported: HashSet<_> = peers[..4].iter().copied().collect();
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), unsupported);
+    handle.record_sync_served(peers[9]);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens[0], peers[9], "the pack fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        Some(peers[9]),
+        "failed and unsupported probes must not move the preference"
+    );
+
+    // the four unsupported peers are now cached unsyncable and skipped; every other peer failed
+    // epoch 0 above, and the preferred peer leads that group
+    let result = handle.request_consensus_output(1, &chain, ConsensusHeaderDigest::default()).await;
+    assert!(result.is_err(), "no peer serves, so the output fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 12, "the output fetch must skip the peers cached unsyncable");
+    assert_eq!(opens[0], peers[9], "the output fetch must open the last server first");
+    assert_eq!(
+        *handle.last_sync_server.lock(),
+        Some(peers[9]),
+        "failed probes must not move the preference"
+    );
+
+    // a preferred peer that already failed this epoch goes behind every fresh peer
+    let (handle, opened) = spawn_scripted_swarm(peers.clone(), HashSet::new());
+    handle.record_sync_served(peers[9]);
+    handle.epoch_sync_failed.lock().insert(peers[9], 0);
+    let result = handle.request_epoch_pack(&record, &record, &chain, Duration::from_secs(10));
+    assert!(result.await.is_err(), "no peer serves, so the pack fetch must fail");
+    let opens = std::mem::take(&mut *opened.lock());
+    assert_eq!(opens.len(), 16, "the pack fetch must open one stream to every peer");
+    assert_eq!(opens.last(), Some(&peers[9]), "a failed preferred peer must be opened last");
+}
+
+/// `clear_sync_capability` empties the per-epoch caches but keeps the last peer that served.
+#[test]
+fn test_clear_sync_capability_keeps_last_server() {
+    let (tx, _rx) = tokio::sync::mpsc::channel(1);
+    let handle = PrimaryNetworkHandle::new_for_test(tx);
+    let mut rng = StdRng::from_seed([7; 32]);
+    let peer = *BlsKeypair::generate(&mut rng).public();
+    let other = *BlsKeypair::generate(&mut rng).public();
+
+    handle.epoch_sync_failed.lock().insert(peer, 3);
+    handle.epoch_sync_failed.lock().insert(other, 3);
+    handle.record_sync_served(peer);
+    assert_eq!(handle.sync_capability.lock().get(&peer), Some(&true));
+    assert!(
+        !handle.epoch_sync_failed.lock().contains_key(&peer),
+        "serving must clear the peer's failure for this epoch"
+    );
+
+    handle.clear_sync_capability();
+    assert!(handle.sync_capability.lock().is_empty(), "capability cache must be cleared");
+    assert!(handle.epoch_sync_failed.lock().is_empty(), "failure map must be cleared");
+    assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
 }
 
 /// F40 + F2 (penalty half): `import_fault_is_peer_caused` admits ONLY faults attributable solely to

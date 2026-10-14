@@ -6,18 +6,20 @@ mod behavior;
 mod cache;
 mod manager;
 mod peer;
+mod penalty;
+mod policy;
 mod score;
 mod status;
 mod types;
 pub(crate) use manager::{PeerManager, PutRecordRate};
-pub(crate) use types::PeerEvent;
+pub use penalty::LoadPenalty;
+pub(crate) use penalty::Severity;
+pub(crate) use types::{PeerEvent, PenaltyOutcome};
 pub use types::{PeerExchangeMap, Penalty};
 
 // visibility for tests
 #[cfg(test)]
 pub(crate) use peer::MAX_MULTIADDRS_PER_PEER;
-#[cfg(test)]
-pub(crate) use score::GLOBAL_SCORE_CONFIG;
 
 /// Shared production thresholds used by the consensus call-site regression tests.
 #[cfg(test)]

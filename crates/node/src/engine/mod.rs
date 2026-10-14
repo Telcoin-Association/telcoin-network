@@ -54,8 +54,9 @@ pub struct TnBuilder {
     /// service starts.
     ///
     /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// healthcheck service responds unconditionally. This reads from `HEALTHCHECK_TCP_PORT` env
-    /// var.
+    /// liveness route responds unconditionally; `/health/workers` reports transaction acceptance
+    /// and `/health/network` reports cached swarm reachability and established-peer counts,
+    /// returning 503 while not-ready. This reads from the `HEALTHCHECK_TCP_PORT` env var.
     pub healthcheck: Option<u16>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
@@ -205,9 +206,9 @@ impl std::fmt::Debug for TnBuilder {
 pub enum WorkerState {
     /// The worker has never been activated in this process.
     Uninitialized,
-    /// The pool is retained, but the worker's RPC listeners have been stopped.
+    /// The pool and listeners are retained, but transaction admission is closed.
     Stopped,
-    /// The worker's RPC listeners are running.
+    /// The worker's transaction admission is open.
     Running,
 }
 
@@ -250,6 +251,9 @@ impl ExecutionNode {
     ///
     /// This method can run before startup synchronization. Call
     /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
+    /// Only call this for [`WorkerState::Uninitialized`], in consecutive worker id order.
+    /// Existing workers must use [`Self::restart_worker_rpc`] to reuse their components.
+    /// Invalid worker ids return an error before creating a pool or binding RPC listeners.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -311,33 +315,36 @@ impl ExecutionNode {
         !self.internal.read().await.workers.is_empty()
     }
 
-    /// Stop RPC listeners for initialized workers outside the current committee.
+    /// Close transaction admission for initialized workers outside the current committee.
     ///
-    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    /// Hand pending and parked transactions to worker 0, including late in-flight admissions.
+    /// Each removed worker spawns a relay that moves them off this lock, so epoch entry does not
+    /// wait on the retired pool's size. Retain empty pools for reactivation. Normal destination
+    /// validation and capacity apply.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
-        self.internal
-            .write()
-            .await
-            .workers
-            .iter_mut()
-            .skip(active_workers)
-            .for_each(WorkerComponents::deactivate);
+        let mut guard = self.internal.write().await;
+        let destination =
+            guard.workers.first().filter(|_| active_workers > 0).map(WorkerComponents::pool);
+        destination.into_iter().for_each(|destination| {
+            guard
+                .workers
+                .iter_mut()
+                .skip(active_workers)
+                .for_each(|worker| worker.deactivate(&destination));
+        });
     }
 
-    /// Refresh an initialized worker's fee and reopen its RPC listeners if stopped.
+    /// Refresh an initialized worker's fee and reopen admission on its retained RPC listeners.
     pub async fn restart_worker_rpc(&self, worker_id: WorkerId, base_fee: u64) -> eyre::Result<()> {
         let mut guard = self.internal.write().await;
-        let reth_env = guard.reth_env.clone();
         guard
             .workers
             .get_mut(usize::from(worker_id))
-            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))?
-            .restart_rpc(&reth_env, worker_id, base_fee)
-            .await
-            .map_err(Into::into)
+            .map(|worker| worker.reactivate(base_fee))
+            .ok_or_else(|| eyre::eyre!("cannot restart uninitialized worker {worker_id}"))
     }
 
-    /// Return whether a worker needs initial construction, RPC restart, or task refresh.
+    /// Return whether a worker needs initial construction, reactivation, or task refresh.
     pub async fn worker_state(&self, worker_id: WorkerId) -> WorkerState {
         self.internal.read().await.workers.get(usize::from(worker_id)).map_or(
             WorkerState::Uninitialized,
@@ -355,7 +362,9 @@ impl ExecutionNode {
     ///
     /// Backs the `/health/workers` readiness endpoint. A retained pool alone does not make a
     /// removed worker ready to accept transactions.
-    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+    /// Use [`Self::worker_state`] to decide whether initial construction is needed: stopped
+    /// workers retain their components and must be restarted rather than initialized again.
+    pub async fn is_worker_running(&self, worker_id: WorkerId) -> bool {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 

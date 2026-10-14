@@ -106,6 +106,12 @@ help:
 attest:
 	./etc/test-and-attest.sh ;
 
+# Run transport qualification on the attest box with explicit hardware evidence.
+.PHONY: quic-attest
+quic-attest:
+	@test -n "$(QUIC_EVIDENCE_DIR)" -a -n "$(QUIC_QUALIFICATION_REPORT)" || { echo "Set QUIC_EVIDENCE_DIR and QUIC_QUALIFICATION_REPORT"; exit 1; }
+	python3 -I testing/quic-interop/attest.py --output "$(QUIC_EVIDENCE_DIR)" --qualification "$(QUIC_QUALIFICATION_REPORT)"
+
 # check for unused dependencies
 udeps:
 	find . -type f -name Cargo.toml -exec sed -rne 's/^name = "(.*)"/\1/p' {} + | xargs -I {} sh -c "echo '\n\n{}:' && cargo +$(NIGHTLY) udeps --package {}" ;
@@ -263,6 +269,12 @@ TN_E2E_GOVERNANCE_SAFE_FORK_EPOCH ?= 2
 # run restart integration tests
 test-restarts: build-e2e-bin
 	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --run-ignored all test_restarts ;
+
+.PHONY: test-sigkill
+# Reproduce abrupt validator restarts across a measured epoch boundary, with retained capture.
+SIGKILL_FILTER ?= test(sigkill::)
+test-sigkill: build-e2e-bin
+	TN_BIN_PATH="$(E2E_BIN)" TN_SEED_SIGNATURE_FORK_EPOCH=$(TN_SEED_SIGNATURE_FORK_EPOCH) TN_MULTI_WORKERS_FORK_EPOCH=$(TN_MULTI_WORKERS_FORK_EPOCH) TN_PREVRANDAO_FORK_EPOCH=$(TN_PREVRANDAO_FORK_EPOCH) TN_LEADER_SEEDED_ORDERING_FORK_EPOCH=$(TN_LEADER_SEEDED_ORDERING_FORK_EPOCH) TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=$(TN_SUBSECOND_TIMESTAMP_FORK_EPOCH) TN_GOVERNANCE_SAFE_FORK_EPOCH=$(TN_GOVERNANCE_SAFE_FORK_EPOCH) cargo nextest run --profile sigkill --locked -p e2e-tests --test it --run-ignored all -E '$(SIGKILL_FILTER)' ;
 
 # run epoch integration tests (same filter as the public-tests epoch line). The scheduled
 # Durable e2e lane (#1149) runs this and test-restarts with TN_TEST_MDBX_SYNC=durable

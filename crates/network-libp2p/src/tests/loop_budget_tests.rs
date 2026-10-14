@@ -159,6 +159,7 @@ async fn drive(harness: Harness) -> Progress {
         h.running().then_some(())?;
         match next_loop_event(&mut h.refresh, &mut h.source, &mut h.commands).await {
             LoopEvent::Refresh => h.progress.refresh_ticks += 1,
+            LoopEvent::RecordRetry => {}
             LoopEvent::Swarm(()) => h.progress.events += 1,
             LoopEvent::Command(_) => h.progress.commands += 1,
             LoopEvent::CommandsClosed => {}

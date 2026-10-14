@@ -1,6 +1,47 @@
 //! TNCodec tests used by the consensus network libp2p req/res protocol.
 
 use super::*;
+
+/// Malformed framing, snappy and BCS are distinguishable from a truncated transport read.
+#[tokio::test]
+async fn test_codec_violations_are_invalid_data() -> std::io::Result<()> {
+    use futures::StreamExt;
+
+    let mut bad_bcs = Vec::new();
+    encode_message(&mut bad_bcs, &2u8, &mut Vec::new(), &mut Vec::new(), 1024).await?;
+    let mut wrong_size = bad_bcs.clone();
+    wrong_size.splice(..4, 2u32.to_le_bytes());
+    let excessive_compression =
+        1u32.to_le_bytes().into_iter().chain(u32::MAX.to_le_bytes()).collect::<Vec<_>>();
+    let invalid_snappy = 1u32
+        .to_le_bytes()
+        .into_iter()
+        .chain(3u32.to_le_bytes())
+        .chain([1, 2, 3])
+        .collect::<Vec<_>>();
+    futures::stream::iter([
+        1025u32.to_le_bytes().to_vec(),
+        excessive_compression,
+        invalid_snappy,
+        wrong_size,
+        bad_bcs,
+    ])
+    .for_each(|frame| async move {
+        let result = decode_message::<_, bool>(
+            &mut frame.as_slice(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+            1024,
+        )
+        .await;
+        assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::InvalidData));
+    })
+    .await;
+    let result =
+        decode_message::<_, bool>(&mut [].as_slice(), &mut Vec::new(), &mut Vec::new(), 1024).await;
+    assert!(result.is_err_and(|error| error.kind() == std::io::ErrorKind::UnexpectedEof));
+    Ok(())
+}
 use crate::{
     common::{TestPrimaryRequest, TestPrimaryResponse},
     TNCodec,

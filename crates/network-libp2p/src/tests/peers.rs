@@ -1,7 +1,7 @@
 //! Unit tests for `AllPeers`
 
 use super::*;
-use crate::common::{create_multiaddr, ensure_score_config, random_ip_addr};
+use crate::common::{create_multiaddr, random_ip_addr};
 use libp2p::PeerId;
 use rand::{rngs::StdRng, Rng as _, SeedableRng as _};
 use std::{
@@ -15,9 +15,98 @@ use tn_types::{BlsKeypair, NetworkKeypair};
 /// Helper function to create a test AllPeers instance
 fn create_all_peers(peer_config: Option<PeerConfig>) -> AllPeers {
     let config = peer_config.unwrap_or_default();
-    ensure_score_config(Some(config.score_config));
     let dial_timeout = Duration::from_secs(5);
-    AllPeers::new(dial_timeout, config.max_banned_peers, config.max_disconnected_peers)
+    AllPeers::new(
+        dial_timeout,
+        config.max_banned_peers,
+        config.max_disconnected_peers,
+        Arc::new(config.score_config),
+    )
+}
+
+/// Peer creation, promotion, reconnect and committee resets retain the registry's scoring policy.
+#[test]
+fn instance_peer_registry_configuration() {
+    let first = PeerConfig {
+        score_config: ScoreConfig {
+            default_score: 30.0,
+            max_score: 40.0,
+            ..ScoreConfig::default()
+        },
+        ..PeerConfig::default()
+    };
+    let second = PeerConfig {
+        score_config: ScoreConfig {
+            default_score: 60.0,
+            max_score: 80.0,
+            ..ScoreConfig::default()
+        },
+        ..PeerConfig::default()
+    };
+    [false, true].into_iter().for_each(|reverse| {
+        let configs = if reverse { [second, first] } else { [first, second] };
+        let registries =
+            configs.map(|config| (create_all_peers(Some(config)), config.score_config));
+        registries.into_iter().for_each(|(mut peers, config)| {
+            let mut rng = StdRng::from_seed([0; 32]);
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+            let peer_id: PeerId = net.clone().into();
+            let addr = create_multiaddr(None);
+
+            // A known peer receives this registry's default score.
+            peers.upsert_peer(bls, net.clone(), Vec::new());
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score)
+            );
+
+            // An anonymous connection also uses this registry's policy, then carries it through
+            // identity promotion and a disconnect/reconnect cycle.
+            let bls = *BlsKeypair::generate(&mut rng).public();
+            let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+            let peer_id: PeerId = net.clone().into();
+            peers.update_connection_status(
+                &peer_id,
+                NewConnectionStatus::Connected {
+                    multiaddr: addr.clone(),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score)
+            );
+            assert!(peers.get_peer_mut(&peer_id).is_some_and(|peer| {
+                peer.apply_penalty(Penalty::Severe, PeerPolicy::default());
+                peer.score().aggregate_score() == config.default_score - 10.0
+            }));
+            peers.upsert_peer(bls, net.clone(), Vec::new());
+            peers.register_disconnected(&peer_id);
+            peers.update_connection_status(
+                &peer_id,
+                NewConnectionStatus::Connected {
+                    multiaddr: addr,
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.default_score - 10.0)
+            );
+
+            // Committee promotion and explicit operator trust both use this instance's maximum.
+            assert!(peers.get_peer_mut(&peer_id).is_some_and(|peer| {
+                peer.reset_score_to_max();
+                peer.score().aggregate_score() == config.max_score
+            }));
+            peers.add_trusted_peer(bls, net);
+            assert_eq!(
+                peers.get_peer(&peer_id).map(|peer| peer.score().aggregate_score()),
+                Some(config.max_score)
+            );
+        });
+    });
 }
 
 #[test]
@@ -847,6 +936,100 @@ fn test_connected_peers_by_score() {
     assert!(peers_by_score.last().map(|peer| peer.1.is_routable()).unwrap())
 }
 
+/// Read the start of a ban without relying on elapsed wall-clock time in expiry assertions.
+fn banned_at(peer: &Peer) -> eyre::Result<Instant> {
+    match peer.connection_status() {
+        ConnectionStatus::Banned { instant } => Ok(*instant),
+        ConnectionStatus::Unknown
+        | ConnectionStatus::Connected { .. }
+        | ConnectionStatus::Disconnected { .. }
+        | ConnectionStatus::Disconnecting { .. }
+        | ConnectionStatus::Dialing { .. } => Err(eyre::eyre!("expected banned connection")),
+    }
+}
+
+/// Status-only bans expire at the configured boundary and update bookkeeping exactly once.
+#[test]
+fn status_only_ban_expires_at_configured_timeout() -> eyre::Result<()> {
+    [Duration::ZERO, Duration::from_secs(17), Duration::from_secs(600)].into_iter().try_for_each(
+        |duration| -> eyre::Result<()> {
+            let mut peers = create_all_peers(None);
+            let id = PeerId::random();
+            peers.update_connection_status(
+                &id,
+                NewConnectionStatus::Connected {
+                    multiaddr: create_multiaddr(None),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            (0..4).for_each(|_| {
+                peers.process_penalty(&id, Penalty::Medium);
+            });
+            let (action, pruned) = peers.register_disconnected(&id);
+            assert!(matches!(action, PeerAction::Ban(_)));
+            assert!(pruned.is_empty());
+            let peer = peers.get_peer(&id).ok_or_else(|| eyre::eyre!("missing banned peer"))?;
+            assert_eq!(peer.reputation(), Reputation::Disconnected);
+            let instant = banned_at(peer)?;
+            assert_eq!(peers.banned_peers.total(), 1);
+            assert_eq!(peers.disconnected_peers, 0);
+
+            if !duration.is_zero() {
+                let before_expiry = instant + duration - Duration::from_nanos(1);
+                assert!(peers.update_peer_scores(before_expiry, duration).is_empty());
+                assert_eq!(peers.banned_peers.total(), 1);
+            }
+            let actions = peers.update_peer_scores(instant + duration, duration);
+            assert!(
+                matches!(actions.as_slice(), [(peer_id, PeerAction::Unban(_))] if *peer_id == id)
+            );
+            assert!(peers.get_peer(&id).is_some_and(|peer| matches!(
+                peer.connection_status(),
+                ConnectionStatus::Disconnected { .. }
+            )));
+            assert_eq!(peers.banned_peers.total(), 0);
+            assert_eq!(peers.disconnected_peers, 1);
+            assert!(peers.update_peer_scores(instant + duration, duration).is_empty());
+            assert_eq!(peers.disconnected_peers, 1);
+            Ok(())
+        },
+    )
+}
+
+/// Expiring a connection ban cannot bypass a Fatal or accumulated reputation ban.
+#[test]
+fn status_only_ban_recovery_preserves_reputation_bans() -> eyre::Result<()> {
+    [vec![Penalty::Fatal], vec![Penalty::Medium; 10]].into_iter().try_for_each(
+        |penalties| -> eyre::Result<()> {
+            let mut peers = create_all_peers(None);
+            let id = PeerId::random();
+            peers.update_connection_status(
+                &id,
+                NewConnectionStatus::Connected {
+                    multiaddr: create_multiaddr(None),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            penalties.into_iter().for_each(|penalty| {
+                peers.process_penalty(&id, penalty);
+            });
+            peers.register_disconnected(&id);
+            let peer = peers.get_peer(&id).ok_or_else(|| eyre::eyre!("missing banned peer"))?;
+            assert_eq!(peer.reputation(), Reputation::Banned);
+            let instant = banned_at(peer)?;
+            let duration = PeerConfig::default().excess_peers_reconnection_timeout;
+            assert!(peers.update_peer_scores(instant + duration, duration).is_empty());
+            assert_eq!(peers.banned_peers.total(), 1);
+            assert_eq!(peers.disconnected_peers, 0);
+            assert!(peers.get_peer(&id).is_some_and(|peer| matches!(
+                peer.connection_status(),
+                ConnectionStatus::Banned { .. }
+            )));
+            Ok(())
+        },
+    )
+}
+
 #[test]
 fn test_heartbeat_maintenance() {
     let mut all_peers = create_all_peers(None);
@@ -865,7 +1048,8 @@ fn test_heartbeat_maintenance() {
     }
 
     // Run heartbeat maintenance
-    let _ = all_peers.heartbeat_maintenance();
+    let _ =
+        all_peers.heartbeat_maintenance(PeerConfig::default().excess_peers_reconnection_timeout);
 
     // The peer should now be disconnected
     let peer = all_peers.get_peer(&peer_id).unwrap();
@@ -892,7 +1076,8 @@ fn test_heartbeat_dial_timeout_notifies_caller() {
             instant: Instant::now() - Duration::from_secs(10),
         }); // Older than the 5s timeout
 
-    let _ = all_peers.heartbeat_maintenance();
+    let _ =
+        all_peers.heartbeat_maintenance(PeerConfig::default().excess_peers_reconnection_timeout);
 
     // the caller is notified of the genuine timeout
     let result = receiver.try_recv().expect("heartbeat must notify the dialer of the timeout");
@@ -1068,10 +1253,45 @@ fn test_prune_disconnected_evicts_oldest_not_newest() {
     }
 }
 
+/// A committee member's `Confirmed` record is exempt from disconnected pruning even when it is the
+/// oldest disconnect, so its `bls_by_peer_id` binding and validator identity survive (issue #1649).
+#[test]
+fn test_prune_disconnected_retains_committee_record() {
+    let config = PeerConfig::default();
+    let mut all_peers = create_all_peers(None);
+
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
+    // the member is the OLDEST disconnect, so pruning evicts it first without the exemption
+    all_peers.update_connection_status(&validator_id, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+    all_peers.get_peer_mut(&validator_id).into_iter().for_each(|peer| {
+        peer.set_connection_status(ConnectionStatus::Disconnected {
+            instant: Instant::now() - Duration::from_secs(10_000),
+        });
+    });
+    (0..config.max_disconnected_peers).for_each(|_| {
+        all_peers.update_connection_status(&PeerId::random(), NewConnectionStatus::Disconnected);
+    });
+
+    // the triggering disconnect takes the total to `max_disconnected_peers + 2`
+    all_peers.register_disconnected(&PeerId::random());
+
+    assert!(all_peers.get_peer(&validator_id).is_some(), "committee record must survive pruning");
+    assert_eq!(all_peers.bls_for_peer(&validator_id), Some(bls), "binding must survive pruning");
+    assert!(all_peers.is_peer_validator(&validator_id), "member keeps its validator identity");
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
+}
+
 #[test]
 fn test_is_validator() {
-    ensure_score_config(None);
-    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+    let mut all_peers =
+        AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
 
     // a committee member is a confirmed peer (bls known) whose libp2p id resolves to its bls
     let mut rng = StdRng::from_seed([0; 32]);
@@ -1085,13 +1305,13 @@ fn test_is_validator() {
     assert!(!all_peers.is_peer_validator(&PeerId::random()));
 }
 
-/// Regression guard for issue #715: a validator's exemption is derived from committee
-/// membership, not a stored flag, so rotating out of the committee revokes the exemption
+/// Regression guard for issue #715: a validator's load exemption is derived from committee
+/// membership, so rotating out of the committee revokes the load exemption
 /// (and, because operator trust is separate, never touches an operator allowlist).
 #[test]
-fn test_committee_rotation_revokes_validator_exemption() {
-    ensure_score_config(None);
-    let mut all_peers = AllPeers::new(Duration::from_secs(5), 10, 10);
+fn test_committee_rotation_revokes_validator_exemption() -> eyre::Result<()> {
+    let mut all_peers =
+        AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
 
     // a committee validator that the operator did NOT allowlist
     let mut rng = StdRng::from_seed([0; 32]);
@@ -1101,18 +1321,99 @@ fn test_committee_rotation_revokes_validator_exemption() {
     all_peers.upsert_peer(bls, net, vec![]);
     all_peers.current_committee.insert(bls);
 
-    // while in the committee the peer is exempt: a fatal penalty is suppressed and its
-    // reputation is unaffected
-    let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+    // Load does not affect a committee peer's reputation.
+    let load = Penalty::Load(crate::LoadPenalty::KademliaFlood);
+    let action = all_peers.process_penalty(&peer_id, load);
     assert!(matches!(action, PeerAction::NoAction));
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Trusted);
+    let reputation =
+        all_peers.get_peer(&peer_id).ok_or_else(|| eyre::eyre!("missing validator"))?;
+    assert_eq!(reputation.reputation(), Reputation::Trusted);
 
     // rotate the validator out of the committee
     all_peers.current_committee.clear();
 
-    // the exemption is gone: the same fatal penalty now lands and the peer is banned
-    let _ = all_peers.process_penalty(&peer_id, Penalty::Fatal);
-    assert_eq!(all_peers.get_peer(&peer_id).unwrap().reputation(), Reputation::Banned);
+    // The same repeated load signals become scoreable once committee privileges expire.
+    (0..100).for_each(|_| {
+        all_peers.process_penalty(&peer_id, load);
+    });
+    let reputation =
+        all_peers.get_peer(&peer_id).ok_or_else(|| eyre::eyre!("missing validator"))?;
+    assert_eq!(reputation.reputation(), Reputation::Banned);
+    Ok(())
+}
+
+/// Operator trust preserves protocol bans, but promotion to any committee slot restores liveness.
+#[test]
+fn test_committee_promotion_forgives_protocol_bans() -> Result<(), NetworkError> {
+    (0..3).try_for_each(|slot| {
+        let mut all_peers =
+            AllPeers::new(Duration::from_secs(5), 10, 10, Arc::new(ScoreConfig::default()));
+        let mut rng = StdRng::from_seed([46; 32]);
+        let (bls, net, peer_id) = committee_member(&mut rng);
+        all_peers.add_trusted_peer(bls, net.clone());
+        let before = all_peers
+            .get_peer(&peer_id)
+            .ok_or(NetworkError::PeerMissing)?
+            .score()
+            .aggregate_score();
+        (0..100).for_each(|_| {
+            all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood));
+        });
+        assert_eq!(
+            all_peers
+                .get_peer(&peer_id)
+                .ok_or(NetworkError::PeerMissing)?
+                .score()
+                .aggregate_score(),
+            before
+        );
+        assert!(all_peers.peer_policy(&peer_id).protects_retention());
+        let action = all_peers.process_penalty(&peer_id, Penalty::Fatal);
+        assert!(action.is_ban());
+        assert!(all_peers.peer_banned(&peer_id));
+        all_peers.add_trusted_peer(bls, net);
+        assert!(all_peers.peer_banned(&peer_id), "operator trust must preserve protocol bans");
+        let members = |candidate| {
+            if slot == candidate {
+                HashSet::from([bls])
+            } else {
+                HashSet::new()
+            }
+        };
+        let actions = all_peers.update_committees(members(0), members(1), members(2));
+        assert_eq!(actions.len(), 1, "promotion must emit the swarm unban action");
+        assert!(!all_peers.peer_banned(&peer_id));
+        assert!(all_peers.can_dial(&peer_id));
+        assert_eq!(all_peers.banned_peers.total(), 0);
+        let primed = all_peers
+            .get_peer(&peer_id)
+            .ok_or(NetworkError::PeerMissing)?
+            .score()
+            .aggregate_score();
+        (0..120).for_each(|_| {
+            [Penalty::Mild, Penalty::Medium, Penalty::Severe, Penalty::Fatal].into_iter().for_each(
+                |penalty| {
+                    assert!(!all_peers.process_penalty(&peer_id, penalty).is_ban());
+                },
+            );
+        });
+        assert_eq!(
+            all_peers
+                .get_peer(&peer_id)
+                .ok_or(NetworkError::PeerMissing)?
+                .score()
+                .aggregate_score(),
+            primed
+        );
+        assert!(!all_peers.peer_banned(&peer_id));
+        assert!(all_peers.apply_membership_if_committee(bls).is_empty());
+        assert!(all_peers.mark_committee_for_dial(HashSet::from([bls])).is_empty());
+        all_peers.update_committees(HashSet::new(), HashSet::new(), HashSet::new());
+        assert!(all_peers.process_penalty(&peer_id, Penalty::Fatal).is_ban());
+        assert!(all_peers.peer_banned(&peer_id), "committee exit restores protocol scoring");
+        assert_eq!(all_peers.banned_peers.total(), 1);
+        Ok(())
+    })
 }
 
 #[test]
@@ -1576,7 +1877,7 @@ fn test_update_committees_no_change() {
     assert!(all_peers.is_peer_validator(&x_id));
     assert!(all_peers.current_committee.contains(&x_bls));
     assert!(all_peers.next_committee.contains(&x_bls));
-    assert_eq!(all_peers.trust_basis(&x_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&x_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1673,7 +1974,7 @@ fn test_update_committees_tracks_undiscovered_member_then_trusts_on_discovery() 
 
     // now the member resolves: validator + exempt, the moment discovery completed
     assert!(all_peers.is_peer_validator(&peer_id));
-    assert_eq!(all_peers.trust_basis(&peer_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&peer_id), PeerPolicy::from_bases([TrustBasis::Validator]));
     // a freshly discovered, never-banned peer needs no unban action
     assert!(actions.is_empty());
 }
@@ -1693,10 +1994,14 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     all_peers.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
     assert!(!all_peers.is_peer_validator(&peer_id), "unidentified peer is not yet a validator");
 
-    // the member connects anonymously and is banned during the window (Unidentified record)
+    // An unidentified member incurs a load-only ban before its BLS identity is resolved.
     all_peers.update_connection_status(&peer_id, NewConnectionStatus::Disconnected);
-    let ban = all_peers.update_connection_status(&peer_id, NewConnectionStatus::Banned);
-    assert!(matches!(ban, PeerAction::Ban(_)));
+    let ban = (0..100)
+        .map(|_| {
+            all_peers.process_penalty(&peer_id, Penalty::Load(crate::LoadPenalty::KademliaFlood))
+        })
+        .find(PeerAction::is_ban);
+    assert!(ban.is_some());
     assert!(all_peers.peer_banned(&peer_id), "member should be banned during the window");
     assert!(!all_peers.is_peer_validator(&peer_id), "still unidentified, still not a validator");
 
@@ -1710,8 +2015,8 @@ fn test_undiscovered_committee_member_banned_then_unbanned_on_discovery() {
     assert!(all_peers.is_peer_validator(&peer_id), "discovered member is now a validator");
     assert!(!all_peers.peer_banned(&peer_id), "discovered committee member must be unbanned");
     assert_eq!(
-        all_peers.trust_basis(&peer_id),
-        Some(TrustBasis::Validator),
+        all_peers.peer_policy(&peer_id),
+        PeerPolicy::from_bases([TrustBasis::Validator]),
         "discovered member must be exempt as a validator"
     );
     assert!(
@@ -1733,7 +2038,7 @@ fn test_apply_membership_if_committee_is_noop_for_non_member() {
 
     assert!(actions.is_empty());
     assert!(!all_peers.is_peer_validator(&peer_id));
-    assert_eq!(all_peers.trust_basis(&peer_id), None);
+    assert_eq!(all_peers.peer_policy(&peer_id), PeerPolicy::default());
 }
 
 #[test]
@@ -1745,7 +2050,7 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     let (m_bls, m_net, m_id) = committee_member(&mut rng);
     discover(&mut all_peers, m_bls, &m_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([m_bls]), HashSet::new());
-    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&m_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 
     // next epoch: M moves to the previous slot (still in-window) alongside a disjoint current
     let (other_bls, other_net, _other_id) = committee_member(&mut rng);
@@ -1756,7 +2061,7 @@ fn test_update_committees_in_window_peer_stays_trusted() {
     // one-way ratchet, but because the exemption derives from its tracked membership.
     assert!(all_peers.previous_committee.contains(&m_bls));
     assert!(all_peers.is_peer_validator(&m_id));
-    assert_eq!(all_peers.trust_basis(&m_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&m_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1768,7 +2073,7 @@ fn test_update_committees_demotes_peer_that_exits_window() {
     let (e_bls, e_net, e_id) = committee_member(&mut rng);
     discover(&mut all_peers, e_bls, &e_net);
     all_peers.update_committees(HashSet::new(), HashSet::from([e_bls]), HashSet::new());
-    assert_eq!(all_peers.trust_basis(&e_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&e_id), PeerPolicy::from_bases([TrustBasis::Validator]));
     assert!(all_peers.is_peer_validator(&e_id));
 
     // next epoch's three slots do not include E at all
@@ -1778,7 +2083,7 @@ fn test_update_committees_demotes_peer_that_exits_window() {
 
     // E fell out of the window: the validator exemption is gone (derived from the slots, so no
     // demotion pass is needed) and E no longer counts as a validator
-    assert_eq!(all_peers.trust_basis(&e_id), None);
+    assert_eq!(all_peers.peer_policy(&e_id), PeerPolicy::default());
     assert!(!all_peers.is_peer_validator(&e_id));
 }
 
@@ -1792,7 +2097,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
     let op_net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
     let op_id: PeerId = op_net.clone().into();
     all_peers.add_trusted_peer(op_bls, op_net);
-    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
+    assert_eq!(all_peers.peer_policy(&op_id), PeerPolicy::from_bases([TrustBasis::Operator]));
 
     // a committee update that does not involve the operator peer
     let (c_bls, c_net, _c_id) = committee_member(&mut rng);
@@ -1801,7 +2106,7 @@ fn test_update_committees_does_not_demote_operator_trusted_peer_never_in_committ
 
     // operator trust is stored at construction and never altered by epoch rotation, so the
     // committee update does not touch the operator peer's exemption
-    assert_eq!(all_peers.trust_basis(&op_id), Some(TrustBasis::Operator));
+    assert_eq!(all_peers.peer_policy(&op_id), PeerPolicy::from_bases([TrustBasis::Operator]));
 }
 
 #[test]
@@ -1844,7 +2149,7 @@ fn test_update_committees_populates_previous() {
 
     assert_eq!(all_peers.previous_committee, HashSet::from([p_bls]));
     assert!(all_peers.is_peer_validator(&p_id));
-    assert_eq!(all_peers.trust_basis(&p_id), Some(TrustBasis::Validator));
+    assert_eq!(all_peers.peer_policy(&p_id), PeerPolicy::from_bases([TrustBasis::Validator]));
 }
 
 #[test]
@@ -1878,8 +2183,8 @@ fn test_update_committees_invariants_under_random_committees() {
             prev_ids.iter().chain(curr_ids.iter()).chain(next_ids.iter()).copied().collect();
         for id in &union {
             assert_eq!(
-                all_peers.trust_basis(id),
-                Some(TrustBasis::Validator),
+                all_peers.peer_policy(id),
+                PeerPolicy::from_bases([TrustBasis::Validator]),
                 "union member {id} should be exempt after round {round}"
             );
         }
@@ -1888,8 +2193,8 @@ fn test_update_committees_invariants_under_random_committees() {
         // distinct across rounds, so the entire prior union re-enters the score model)
         for id in prev_union.difference(&union) {
             assert_eq!(
-                all_peers.trust_basis(id),
-                None,
+                all_peers.peer_policy(id),
+                PeerPolicy::default(),
                 "exited peer {id} should re-enter the score model after round {round}"
             );
         }

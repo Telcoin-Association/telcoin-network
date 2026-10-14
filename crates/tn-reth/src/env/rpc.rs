@@ -16,6 +16,9 @@
 //! namespace gets the corrected and guarded methods, and a transport without the
 //! namespace has no eth methods to correct or guard. The `Result` keeps a future
 //! registration failure from passing silently (issues #1231, #1160).
+//! Epoch-priced simulation replacements also return registration errors. The eth
+//! methods (`crate::rpc_call`, `crate::rpc_bundle`) and debug methods (`crate::rpc_debug`)
+//! are installed only on transports configured to expose their corresponding namespace.
 //!
 //! Endpoints are derived per worker: [`RethEnv::start_rpc`] shifts the operator's
 //! configured http/ws ports into a per-worker band and suffixes the IPC path with the
@@ -40,7 +43,9 @@ use tn_types::{gas_accumulator::WorkerBaseFee, WorkerId};
 use crate::{
     error::{TnRethError, TnRethResult},
     evm::TnEvmConfig,
+    rpc_bundle::{BundleWithEpochBaseFee, EpochBundleServer as _},
     rpc_call::{EpochSimulationServer as _, SimulationWithEpochBaseFee},
+    rpc_debug::{DebugSimulationWithEpochBaseFee, EpochDebugSimulationServer as _},
     rpc_fee_cap::{CappedEthSubmitServer as _, EthSubmitWithCap, TxFeeCapWei},
     rpc_fee_history::{EpochFeeHistoryServer as _, FeeHistoryWithEpochBaseFee},
     rpc_fill_transaction::{EpochFillTransactionServer as _, FillTransactionWithEpochBaseFee},
@@ -252,6 +257,7 @@ impl RethEnv {
         base_fee: WorkerBaseFee,
         other: impl Into<Methods>,
     ) -> eyre::Result<RpcServer> {
+        let admission = network.rpc_admission();
         let transaction_pool: EthTransactionPool<
             BlockchainProvider<TelcoinNode>,
             DiskFileBlobStore,
@@ -308,17 +314,30 @@ impl RethEnv {
         // drove its answer to the 500-gwei clamp on adiri (issue #1305).
         let gas_price = GasPriceWithEpochBaseFee::new(base_fee.clone());
         // Simulations use the same epoch fee as quotes and pool admission (#1348).
-        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee);
+        let simulation = SimulationWithEpochBaseFee::new(eth_api.clone(), base_fee.clone());
         // Guard the eth submission methods with the operator's `--rpc.txfeecap` (issue
         // #1160). Reth's pool validator only checks the cap for local-treated
         // transactions, and raw RPC submissions are External, so the guard runs at the
-        // RPC boundary and then delegates to these same reth handlers.
+        // RPC boundary and then delegates to these same reth handlers. The same guard checks
+        // worker admission and live worker membership before decoding.
         let fee_cap_guard = EthSubmitWithCap::new(
             eth_api.clone(),
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
+            admission,
+            base_fee.clone(),
         );
-        let mut server = rpc_builder.build(modules_config, eth_api, engine_events);
-        if let Err(e) = server.merge_configured(other) {
+        // Use one registry so the replacement debug handlers share reth's concurrency
+        // guard with the other tracing endpoints. Delegate through their RPC traits.
+        let mut registry = rpc_builder.into_registry(
+            modules_config.config().cloned().unwrap_or_default(),
+            eth_api,
+            engine_events,
+        );
+        let bundle = BundleWithEpochBaseFee::new(registry.bundle_api(), base_fee.clone());
+        let debug = DebugSimulationWithEpochBaseFee::new(registry.debug_api(), base_fee);
+        let mut server = registry.create_transport_rpc_modules(modules_config);
+        // `tn` is selected like reth's modules; it is in the default set and always on IPC.
+        if let Err(e) = server.merge_if_module_configured(crate::cli::tn_module(), other) {
             tracing::error!(target: "tn::execution", "Error merging TN rpc module: {e:?}");
         }
         // Replace `eth_feeHistory` on every transport that exposes the eth namespace. A
@@ -338,6 +357,8 @@ impl RethEnv {
         server
             .add_or_replace_if_module_configured(RethRpcModule::Eth, fill_transaction.into_rpc())?;
         server.add_or_replace_if_module_configured(RethRpcModule::Eth, simulation.into_rpc())?;
+        server.add_or_replace_if_module_configured(RethRpcModule::Eth, bundle.into_rpc())?;
+        server.add_or_replace_if_module_configured(RethRpcModule::Debug, debug.into_rpc())?;
 
         Ok(server)
     }
@@ -370,6 +391,7 @@ impl RethEnv {
 
 #[cfg(test)]
 mod tests {
+    mod namespaces;
     mod simulation;
 
     use super::*;
@@ -390,8 +412,8 @@ mod tests {
     use tempfile::TempDir;
     use tn_types::{
         gas_accumulator::{BaseFeeContainer, GasAccumulator},
-        test_genesis, Address, Bytes, Decodable2718 as _, Encodable2718 as _, TaskManager,
-        TransactionTrait as _, WorkerId, B256, U256,
+        test_genesis, test_genesis_at, Address, Bytes, Decodable2718 as _, Encodable2718 as _,
+        TaskManager, TransactionTrait as _, WorkerId, B256, U256,
     };
     use url::Url;
 
@@ -431,9 +453,103 @@ mod tests {
         (server.methods_by(|name| name.starts_with("eth_send")), pool, chain)
     }
 
+    /// Build production submission handlers backed by one live worker slot and its retained pool.
+    ///
+    /// Disable the fee cap to verify that worker removal independently closes admission.
+    fn submission_methods_for_worker(
+        accumulator: &GasAccumulator,
+        worker_id: WorkerId,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<(Methods, WorkerTxPool, Arc<RethChainSpec>)> {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
+            chain.clone(),
+            tmp_dir.path(),
+            task_manager,
+            None,
+            reth::args::RpcServerArgs { rpc_tx_fee_cap: 0, ..Default::default() },
+        )?;
+        let pool = reth_env.init_txn_pool(accumulator.base_fee(worker_id))?;
+        let network = WorkerNetwork::new_for_test(reth_env.chainspec());
+        reth_env
+            .get_rpc_server(
+                pool.clone(),
+                network,
+                accumulator.worker_base_fee(worker_id),
+                RpcModule::new(()),
+            )
+            .map(|server| (server.methods_by(|name| name.starts_with("eth_send")), pool, chain))
+    }
+
+    /// Shrink closes raw admission before worker deactivation; retained modules reopen on regrow.
+    #[tokio::test]
+    async fn test_removed_worker_rejects_raw_transaction() -> eyre::Result<()> {
+        let removed_dir = TempDir::new()?;
+        let active_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let (removed, removed_pool, chain) =
+            submission_methods_for_worker(&accumulator, 1, &tasks, &removed_dir)?;
+        let (active, active_pool, _) =
+            submission_methods_for_worker(&accumulator, 0, &tasks, &active_dir)?;
+        let mut factory = TransactionFactory::new();
+        let tx = factory.create_eip1559(
+            chain,
+            Some(21_000),
+            7,
+            Some(Address::ZERO),
+            U256::from(100),
+            Bytes::new(),
+        );
+        let raw = Bytes::from(tx.encoded_2718());
+
+        // Keep the old handlers and pool alive across the boundary, before deactivation runs.
+        accumulator.set_num_workers(1);
+        let error = removed
+            .call::<_, B256>("eth_sendRawTransaction", rpc_params![raw.clone()])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted a transaction"))?;
+        assert!(error.to_string().contains("worker is no longer active"), "{error}");
+        assert!(removed_pool.get(tx.hash()).is_none());
+        assert_eq!(removed_pool.pool_size().pending, 0);
+
+        // Worker zero remains usable at the same boundary.
+        let accepted: B256 =
+            active.call("eth_sendRawTransaction", rpc_params![raw.clone()]).await?;
+        assert_eq!(accepted, *tx.hash());
+        assert!(active_pool.get(tx.hash()).is_some());
+
+        accumulator.set_num_workers(2);
+        let accepted: B256 = removed.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+        assert_eq!(accepted, *tx.hash());
+        assert!(removed_pool.get(tx.hash()).is_some());
+        Ok(())
+    }
+
+    /// Sync submission rejects removal before decoding or waiting for a receipt, even with no cap.
+    #[tokio::test]
+    async fn test_removed_worker_rejects_sync_transaction_before_decoding() -> eyre::Result<()> {
+        let tmp_dir = TempDir::new()?;
+        let tasks = TaskManager::default();
+        let accumulator = GasAccumulator::new(2);
+        let (methods, pool, _) = submission_methods_for_worker(&accumulator, 1, &tasks, &tmp_dir)?;
+        accumulator.set_num_workers(1);
+        let error = methods
+            .call::<_, serde_json::Value>("eth_sendRawTransactionSync", rpc_params![Bytes::new()])
+            .await
+            .err()
+            .ok_or_else(|| eyre::eyre!("removed worker accepted sync submission"))?;
+        assert!(error.to_string().contains("worker is no longer active"), "{error}");
+        assert_eq!(pool.pool_size().pending, 0);
+        Ok(())
+    }
+
     /// The IPC transport must serve the validated allowlist, not reth's
-    /// `default_ipc_modules()` (every module, admin and txpool included). The default
-    /// `rpc_args` serve IPC only, so the methods below are exactly the IPC registration.
+    /// `default_ipc_modules()` (every module, admin and txpool included), and that set includes
+    /// `tn`. The default `rpc_args` serve IPC only, so the methods below are exactly the IPC
+    /// registration.
     #[tokio::test]
     async fn test_ipc_transport_serves_only_the_validated_modules() {
         let tmp_dir = TempDir::new().expect("temp dir");
@@ -454,7 +570,7 @@ mod tests {
                 pool,
                 network,
                 GasAccumulator::new(1).worker_base_fee(0),
-                RpcModule::new(()),
+                namespaces::probe_tn(),
             )
             .expect("rpc server");
 
@@ -473,6 +589,8 @@ mod tests {
             server.methods_by(|name| name.starts_with("eth_")).method_names().count() > 0,
             "IPC still serves the eth namespace"
         );
+        let ipc = server.ipc_methods(|_| true).expect("ipc is enabled by default");
+        assert!(ipc.method("tn_probe").is_some(), "IPC serves the tn namespace");
     }
 
     #[tokio::test]
@@ -593,44 +711,151 @@ mod tests {
         assert_eq!(pool.pool_size().pending, 0);
     }
 
+    /// Every transport rejects both raw submission methods while its worker is inactive,
+    /// before fee-cap decoding or pool insertion, and reuses the same handlers on activation.
+    #[tokio::test]
+    async fn inactive_worker_submission_gate_covers_every_transport() -> eyre::Result<()> {
+        use crate::worker::WorkerRpcState;
+        use futures::{StreamExt as _, TryStreamExt as _};
+
+        init_reth_defaults();
+        let transports = [
+            reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() },
+            reth::args::RpcServerArgs { ws: true, ipcdisable: true, ..Default::default() },
+            reth::args::RpcServerArgs::default(),
+        ];
+        futures::stream::iter(transports)
+            .then(|rpc_args| async move {
+                let temp = TempDir::new()?;
+                let tasks = TaskManager::default();
+                let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+                let env = RethEnv::new_for_temp_chain_with_rpc_args(
+                    chain.clone(),
+                    temp.path(),
+                    &tasks,
+                    None,
+                    reth::args::RpcServerArgs { rpc_tx_fee_cap: 200_000, ..rpc_args },
+                )?;
+                let pool = env.init_txn_pool(BaseFeeContainer::default())?;
+                let network = WorkerNetwork::new_for_test(env.chainspec());
+                let admission = network.rpc_admission();
+                let server = env.get_rpc_server(
+                    pool.clone(),
+                    network,
+                    GasAccumulator::new(1).worker_base_fee(0),
+                    RpcModule::new(()),
+                )?;
+                let methods = server.methods_by(|name| name.starts_with("eth_send"));
+                let mut factory = TransactionFactory::new();
+                let transaction = factory.create_eip1559(
+                    chain,
+                    Some(21_000),
+                    7,
+                    Some(Address::ZERO),
+                    U256::from(100),
+                    Bytes::new(),
+                );
+                let raw = Bytes::from(transaction.encoded_2718());
+                admission.set_state(WorkerRpcState::Inactive);
+                let error = methods
+                    .call::<_, B256>("eth_sendRawTransaction", rpc_params![raw.clone()])
+                    .await
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("inactive worker accepted a valid transaction"))?;
+                assert!(error.to_string().contains("worker is inactive"), "{error}");
+                assert_eq!(pool.pool_size().pending, 0);
+                assert!(pool.get(transaction.hash()).is_none());
+                // Invalid bytes must reach admission first on the sync variant, too. This
+                // avoids waiting for a receipt if a mutation removes that method's gate.
+                let error = methods
+                    .call::<_, serde_json::Value>(
+                        "eth_sendRawTransactionSync",
+                        rpc_params![Bytes::new()],
+                    )
+                    .await
+                    .err()
+                    .ok_or_else(|| eyre::eyre!("inactive sync submission was accepted"))?;
+                assert!(error.to_string().contains("worker is inactive"), "{error}");
+                assert_eq!(pool.pool_size().pending, 0);
+                admission.set_state(WorkerRpcState::Active);
+                let accepted: B256 =
+                    methods.call("eth_sendRawTransaction", rpc_params![raw]).await?;
+                assert_eq!(accepted, *transaction.hash());
+                assert_eq!(pool.pool_size().pending, 1);
+                Ok::<_, eyre::Report>(())
+            })
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(())
+    }
+
     /// Return the production-registered simulation and fill methods with independently chosen epoch
     /// and header fees. Callers seed reth's defaults before constructing `rpc_args`.
+    ///
+    /// Also returns the chain spec the environment was built from, so callers can address genesis
+    /// by the hash the node actually has: a second `test_genesis()` call would be stamped with a
+    /// different second and hash to a block the node does not know.
     fn epoch_fee_methods(
         epoch_fee: u64,
         header_fee: u64,
         rpc_args: reth::args::RpcServerArgs,
         task_manager: &TaskManager,
         tmp_dir: &TempDir,
-    ) -> eyre::Result<Methods> {
-        let mut genesis = test_genesis();
+    ) -> eyre::Result<(Methods, Arc<RethChainSpec>)> {
+        // Pin the timestamp so independent historical hash lookups use the same genesis.
+        let mut genesis = test_genesis_at(0);
         genesis.base_fee_per_gas = Some(u128::from(header_fee));
+        epoch_fee_methods_from_genesis(epoch_fee, genesis, rpc_args, task_manager, tmp_dir)
+    }
+
+    /// Build production RPC methods over a genesis that can contain simulation probe code.
+    fn epoch_fee_methods_from_genesis(
+        epoch_fee: u64,
+        genesis: alloy::genesis::Genesis,
+        rpc_args: reth::args::RpcServerArgs,
+        task_manager: &TaskManager,
+        tmp_dir: &TempDir,
+    ) -> eyre::Result<(Methods, Arc<RethChainSpec>)> {
+        use reth_provider::CanonChainTracker as _;
+
         let chain: Arc<RethChainSpec> = Arc::new(genesis.into());
+        let genesis_header = reth_primitives_traits::SealedHeader::new(
+            chain.genesis_header().clone(),
+            chain.genesis_hash(),
+        );
         let reth_env = RethEnv::new_for_temp_chain_with_rpc_args(
-            chain,
+            chain.clone(),
             tmp_dir.path(),
             task_manager,
             None,
             rpc_args,
         )?;
+        // Finality tags resolve to genesis, so historical requests exercise header fees.
+        reth_env.blockchain_provider().set_safe(genesis_header.clone());
+        reth_env.blockchain_provider().set_finalized(genesis_header);
         // One accumulator feeds the pool's container and the RPC server's handle, as in
         // production (#1262, #1282).
         let accumulator = GasAccumulator::new(1);
         accumulator.base_fee(0).set_base_fee(epoch_fee);
         let pool = reth_env.init_txn_pool(accumulator.base_fee(0))?;
         let network = WorkerNetwork::new_for_test(reth_env.chainspec());
-        reth_env
-            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))
-            .map(|server| {
-                server.methods_by(|name| {
-                    matches!(
-                        name,
-                        "eth_call"
-                            | "eth_estimateGas"
-                            | "eth_createAccessList"
-                            | "eth_fillTransaction"
-                    )
-                })
-            })
+        let methods = reth_env
+            .get_rpc_server(pool, network, accumulator.worker_base_fee(0), RpcModule::new(()))?
+            .methods_by(|name| {
+                matches!(
+                    name,
+                    "eth_call"
+                        | "eth_estimateGas"
+                        | "eth_createAccessList"
+                        | "eth_fillTransaction"
+                        | "eth_callMany"
+                        | "eth_simulateV1"
+                        | "eth_callBundle"
+                        | "debug_traceCall"
+                        | "debug_traceCallMany"
+                )
+            });
+        Ok((methods, chain))
     }
 
     /// Check that a transfer's gas, chain ID, and fees agree with its raw encoding.
@@ -667,7 +892,7 @@ mod tests {
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
         // The header differs, so a matching fill proves the container is the source.
-        let methods = epoch_fee_methods(
+        let (methods, _) = epoch_fee_methods(
             12_345,
             7,
             reth::args::RpcServerArgs::default(),
@@ -697,7 +922,7 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods =
+        let (methods, _) =
             epoch_fee_methods(7, 7, reth::args::RpcServerArgs::default(), &task_manager, &tmp_dir)?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(Address::repeat_byte(0x42)),
@@ -717,7 +942,7 @@ mod tests {
         init_reth_defaults();
         let tmp_dir = TempDir::new()?;
         let task_manager = TaskManager::default();
-        let methods = epoch_fee_methods(
+        let (methods, _) = epoch_fee_methods(
             7,
             1_000,
             reth::args::RpcServerArgs::default(),
@@ -743,7 +968,7 @@ mod tests {
         let task_manager = TaskManager::default();
         let rpc_args =
             reth::args::RpcServerArgs { http: true, ipcdisable: true, ..Default::default() };
-        let methods = epoch_fee_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
+        let (methods, _) = epoch_fee_methods(12_345, 7, rpc_args, &task_manager, &tmp_dir)?;
         let request = alloy::rpc::types::TransactionRequest {
             from: Some(TransactionFactory::new().address()),
             to: Some(Address::ZERO.into()),
