@@ -23,6 +23,7 @@ use std::{
     hash::Hasher as _,
     io::{self, Read, Seek, Write},
     marker::PhantomData,
+    ops::Range,
     path::Path,
 };
 
@@ -855,7 +856,8 @@ impl ZstdCtx {
 
 /// Encodes values the way a pack stores them (the codec, then one zstd frame for a compressed
 /// pack), for [`Pack::append_stored`]: the same bytes [`Pack::append`] writes for a value, made
-/// beforehand. One encoder serves many values, reusing its zstd context and staging buffer.
+/// beforehand. One encoder serves many values, reusing its zstd context and staging buffer, and
+/// appends each into a buffer the caller keeps (so a warm caller allocates nothing).
 #[derive(Debug)]
 pub(crate) struct RecordEncoder {
     compression: PackCompression,
@@ -870,12 +872,36 @@ impl RecordEncoder {
         Self { compression, zstd_ctx: None, stage: Vec::new(), max }
     }
 
-    /// `value`'s stored bytes: what [`Pack::append`] would frame for it.
-    pub(crate) fn encode<V: Serialize>(&mut self, value: &V) -> Result<Vec<u8>, AppendError> {
-        let mut out = Vec::new();
+    /// Append `value`'s stored bytes (what [`Pack::append`] would frame for it) to `out`, and
+    /// return where they are in it. On an error `out` is left as it was.
+    pub(crate) fn encode_into<V: Serialize>(
+        &mut self,
+        value: &V,
+        out: &mut Vec<u8>,
+    ) -> Result<Range<usize>, AppendError> {
+        let start = out.len();
+        let encoded = self.write_stored(value, out).and_then(|()| {
+            let size = out.len() - start;
+            if size > self.max as usize {
+                return Err(AppendError::RecordTooLarge { size, max: self.max });
+            }
+            Ok(start..out.len())
+        });
+        if encoded.is_err() {
+            out.truncate(start);
+        }
+        encoded
+    }
+
+    /// Write `value`'s stored bytes to the end of `out`.
+    fn write_stored<V: Serialize>(
+        &mut self,
+        value: &V,
+        out: &mut Vec<u8>,
+    ) -> Result<(), AppendError> {
         match self.compression {
             PackCompression::None => {
-                write_payload(&mut out, &mut self.stage, Payload::Value(value), self.max)?
+                write_payload(out, &mut self.stage, Payload::Value(value), self.max)
             }
             PackCompression::ZStd => {
                 let ctx = match &mut self.zstd_ctx {
@@ -884,15 +910,12 @@ impl RecordEncoder {
                 };
                 // A value that failed part-way left its frame unfinished; start every value clean.
                 ctx.0.reset(zstd::zstd_safe::ResetDirective::SessionOnly).map_err(zstd_error)?;
-                let mut encoder = zstd::stream::write::Encoder::with_context(&mut out, &mut ctx.0);
+                let mut encoder = zstd::stream::write::Encoder::with_context(out, &mut ctx.0);
                 write_payload(&mut encoder, &mut self.stage, Payload::Value(value), self.max)?;
                 encoder.finish()?;
+                Ok(())
             }
         }
-        if out.len() > self.max as usize {
-            return Err(AppendError::RecordTooLarge { size: out.len(), max: self.max });
-        }
-        Ok(out)
     }
 }
 
@@ -2206,10 +2229,12 @@ mod tests {
                 Pack::open(&appended, 0, false, compression, 1).expect("open");
             let mut b: Pack<TestRec> = Pack::open(&stored, 0, false, compression, 1).expect("open");
             let mut encoder = RecordEncoder::new(compression, b.max_record());
+            // One buffer for every value, as a save reuses it: each record is its own range.
+            let mut buffer = Vec::new();
             for value in &values {
                 let at = a.append(value).expect("append");
-                let bytes = encoder.encode(value).expect("encode");
-                let bt = b.append_stored(&bytes).expect("append stored");
+                let range = encoder.encode_into(value, &mut buffer).expect("encode");
+                let bt = b.append_stored(&buffer[range]).expect("append stored");
                 assert_eq!(at, bt, "the same position");
                 assert_eq!(a.record_bytes(at).expect("read"), b.record_bytes(bt).expect("read"));
                 let read = b.fetch(bt).expect("fetch");

@@ -106,9 +106,11 @@ no thread of its own.
   and each copies or decodes what it returns before letting go of the lock (see `seal_now`).
 - **Writers** (a save, a persist, a flush, the close) take a writer lock, one at a time.
   - **A save** checks the output under the read lock, encodes and compresses its records under the
-    writer lock alone (`RecordEncoder`), then takes the write lock only to append them
-    (`Pack::append_stored`) and index the output. A reader sees an output whole or not at all, and
-    a failed save rolls back under that same lock.
+    writer lock alone, then takes the write lock only to append them (`Pack::append_stored`) and
+    index the output. A reader sees an output whole or not at all, and a failed save rolls back
+    under that same lock. The encoding (`OutputEncoder`) reuses its buffers from save to save, and
+    splits a large output's batches, in order, across threads that compress at once (each record
+    is compressed on its own, so the bytes are the same).
   - **A persist** syncs under the read lock and stamps the commit marker under a brief write lock.
   - **A panic** inside the write lock takes the state out, unsealed (the next open recovers it), and
     every later use of the pack fails.

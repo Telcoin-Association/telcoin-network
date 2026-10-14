@@ -1522,11 +1522,25 @@ impl ConsensusChain {
 
     /// Resolve when the current epoch is fully persisted to storage.
     pub async fn persist_current(&self) -> Result<(), ConsensusChainError> {
+        self.persist_current_timed().await.map(|_| ())
+    }
+
+    /// [`Self::persist_current`], also returning how long the pack's sync and the slot files'
+    /// syncs each took: `(pack, slots)`. They run together, so the whole takes about the longer.
+    pub(crate) async fn persist_current_timed(
+        &self,
+    ) -> Result<(Duration, Duration), ConsensusChainError> {
+        async fn timed<T>(work: impl std::future::Future<Output = T>) -> (T, Duration) {
+            let start = std::time::Instant::now();
+            let out = work.await;
+            (out, start.elapsed())
+        }
         let pack = &self.current_pack();
         // The pack's sync and the slot files' syncs are independent: wait for both together.
-        let (persisted, ()) = tokio::join!(pack.persist(), self.latest_consensus.persist());
+        let ((persisted, pack_time), ((), slots_time)) =
+            tokio::join!(timed(pack.persist()), timed(self.latest_consensus.persist()));
         persisted?;
-        Ok(())
+        Ok((pack_time, slots_time))
     }
 
     /// Poll (up to `timeout`) until this is the sole owner of the shared pack state — i.e. no other

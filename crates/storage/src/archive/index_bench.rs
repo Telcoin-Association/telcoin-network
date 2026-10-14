@@ -25,8 +25,9 @@
 //! - `HdxIndex`: cache-free mmap hash index. It is rebuilt from the data-log WAL on an unclean
 //!   shutdown, so it defers CRC off the per-op path: each write zeros the bucket's CRC trailer (a
 //!   "dirty" marker) and only the dirty buckets are CRC'd at `sync()`; a read verifies the CRC of
-//!   each bucket it touches. A bloom filter accelerates `load_miss`. That makes per-op sync (`insert_dur`) cheap
-//!   while a full-build `sync_bulk` (nearly all buckets dirty) is the worst case.
+//!   each bucket it touches. A bloom filter accelerates `load_miss`. That makes per-op sync
+//!   (`insert_dur`) cheap while a full-build `sync_bulk` (nearly all buckets dirty) is the worst
+//!   case.
 //! - `BtreeIndex`: paged, mmap-backed B+tree using the same lazy-CRC regime — a modified page's CRC
 //!   trailer is zeroed as a dirty marker, only dirty pages are CRC'd at `sync()`, and reads do
 //!   **not** verify a per-op CRC. There is no bloom, so `load_miss` is a full root->leaf descent (≈

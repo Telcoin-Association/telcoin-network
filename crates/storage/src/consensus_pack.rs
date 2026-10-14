@@ -8,6 +8,7 @@ use std::{
     fmt::Display,
     hash::BuildHasherDefault,
     io::{self, Cursor},
+    ops::Range,
     panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
@@ -185,9 +186,9 @@ impl PackRecord {
 struct Shared {
     /// The pack's files and indexes; `None` once it is closed, or after a save panicked.
     inner: RwLock<Option<Inner>>,
-    /// Serializes the writers, and holds the encoder a save encodes its records with before it
-    /// takes the write lock.
-    writer: Mutex<RecordEncoder>,
+    /// Serializes the writers, and holds what a save encodes its records with before it takes the
+    /// write lock.
+    writer: Mutex<OutputEncoder>,
 }
 
 impl std::fmt::Debug for Shared {
@@ -198,7 +199,8 @@ impl std::fmt::Debug for Shared {
 
 impl Shared {
     /// Save `consensus`: checked under the read lock ([`Inner::check_save`]), encoded under the
-    /// writer lock alone, then appended and indexed under the write lock ([`Inner::append_prepared`]).
+    /// writer lock alone, then appended and indexed under the write lock
+    /// ([`Inner::append_prepared`]).
     fn save(&self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let mut encoder = self.writer.lock();
         let check = {
@@ -217,7 +219,9 @@ impl Shared {
             SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
         };
         let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
-        self.mutate(|inner| inner.append_prepared(&prepared))
+        let saved = self.mutate(|inner| inner.append_prepared(&prepared));
+        encoder.release();
+        saved
     }
 
     /// Run `change` on the state under the write lock. A panic part way leaves the pack's state
@@ -464,7 +468,7 @@ impl ConsensusPack {
     fn from_inner(inner: Inner, epoch: Epoch, committee: Committee, is_static: bool) -> Self {
         let version = inner.version();
         let compression = inner.data.header().compression();
-        let encoder = RecordEncoder::new(compression, inner.data.max_record());
+        let encoder = OutputEncoder::new(compression, inner.data.max_record());
         let shared =
             Arc::new(Shared { inner: RwLock::new(Some(inner)), writer: Mutex::new(encoder) });
         Self { shared, epoch, committee, compression, is_static, version }
@@ -1017,6 +1021,15 @@ impl ConsensusPack {
         }
     }
 
+    /// Test-only: split each save's batches across up to `max_lanes` lanes, one for each
+    /// `lane_bytes` of them (see [`OutputEncoder`]).
+    #[cfg(test)]
+    fn set_encode_lanes(&self, max_lanes: usize, lane_bytes: usize) {
+        let mut encoder = self.shared.writer.lock();
+        *encoder =
+            OutputEncoder::with_lanes(encoder.compression, encoder.max, max_lanes, lane_bytes);
+    }
+
     /// Test-only: the next save panics once its records are appended and indexed.
     #[cfg(test)]
     pub(crate) fn panic_next_save(&self) {
@@ -1498,35 +1511,195 @@ enum SaveCheck {
     Next { consensus_idx: u64, batches: BTreeMap<BlockHash, Batch> },
 }
 
-/// One output's records as the pack stores them (see [`RecordEncoder`]), made before the save
-/// takes the write lock, so readers never wait for its encoding and compression.
-struct PreparedOutput {
+/// One output's records as the pack stores them (see [`RecordEncoder`]), made in the
+/// [`OutputEncoder`]'s buffers before the save takes the write lock, so readers never wait for
+/// its encoding and compression.
+struct PreparedOutput<'a> {
     consensus_idx: u64,
     digest: ConsensusHeaderDigest,
-    header: Vec<u8>,
-    batches: Vec<(BlockHash, Vec<u8>)>,
+    header: &'a [u8],
+    /// The batch records, in the order they are appended.
+    batches: Vec<(BlockHash, &'a [u8])>,
 }
 
-impl PreparedOutput {
+impl<'a> PreparedOutput<'a> {
     /// Encode `consensus`, the output at `consensus_idx` in its pack with `batches` (see
-    /// [`Inner::check_save`]), the way the header-first layout stores it.
+    /// [`Inner::check_save`]), the way the header-first layout stores it: its header, then its
+    /// batches in digest order. Each record is compressed on its own, so splitting the batches
+    /// across lanes yields the same bytes as encoding them one after another.
     fn encode(
         consensus: &ConsensusOutput,
         consensus_idx: u64,
         batches: BTreeMap<BlockHash, Batch>,
-        encoder: &mut RecordEncoder,
+        encoder: &'a mut OutputEncoder,
     ) -> Result<Self, PackError> {
-        let encode =
-            |encoder: &mut RecordEncoder, record: &PackRecord| -> Result<Vec<u8>, PackError> {
-                encoder.encode(record).map_err(|e| PackError::Append(e.to_string()))
-            };
-        let header =
-            encode(encoder, &PackRecord::Consensus(Box::new(consensus.consensus_header())))?;
-        let batches = batches
+        let chunks = encoder.split(batches.into_iter().collect());
+        let lanes = encoder.lanes_for(chunks.len());
+        let (first, others) = lanes.split_first_mut().expect("an encoder has a lane");
+        let mut chunks = chunks.into_iter();
+        let first_chunk = chunks.next().unwrap_or_default();
+        let header = PackRecord::Consensus(Box::new(consensus.consensus_header()));
+        let (header, encoded) = std::thread::scope(|scope| {
+            let started: Vec<_> = others
+                .iter_mut()
+                .zip(chunks)
+                .map(|(lane, chunk)| {
+                    std::thread::Builder::new()
+                        .name("pack-encode".to_string())
+                        .spawn_scoped(scope, move || lane.encode_batches(chunk))
+                })
+                .collect();
+            let header = first.encode(&header);
+            let mut encoded = vec![first.encode_batches(first_chunk)];
+            for lane in started {
+                encoded.push(match lane {
+                    Ok(thread) => thread.join().unwrap_or_else(|panic| resume_unwind(panic)),
+                    Err(e) => Err(PackError::Append(format!("start a pack encode thread: {e}"))),
+                });
+            }
+            (header, encoded)
+        });
+        let header = header?;
+        let encoded = encoded.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let encoder: &'a OutputEncoder = encoder;
+        let batches = encoded
             .into_iter()
-            .map(|(digest, batch)| Ok((digest, encode(encoder, &PackRecord::Batch(batch))?)))
-            .collect::<Result<_, PackError>>()?;
-        Ok(Self { consensus_idx, digest: consensus.consensus_header_hash(), header, batches })
+            .zip(&encoder.lanes)
+            .flat_map(|(records, lane)| {
+                records.into_iter().map(|(digest, range)| (digest, &lane.bytes[range]))
+            })
+            .collect();
+        Ok(Self {
+            consensus_idx,
+            digest: consensus.consensus_header_hash(),
+            header: &encoder.lanes[0].bytes[header],
+            batches,
+        })
+    }
+}
+
+/// What a save encodes its records with before it takes the write lock (see [`PreparedOutput`]),
+/// kept by the writer from save to save so a warm save allocates nothing.
+///
+/// Compression is most of a save (40-74% of it on Linux), and an output's batch records are
+/// independent, so a large output's batches are split, in order, across lanes that compress at
+/// once, one thread each: the saving thread takes the header and the first share.
+#[derive(Debug)]
+struct OutputEncoder {
+    compression: PackCompression,
+    /// The pack's largest record.
+    max: u32,
+    /// The most lanes one save uses.
+    max_lanes: usize,
+    /// Batch bytes per lane: an output gets a lane for each this much of its batches, up to
+    /// `max_lanes`, so a small output is not split at all.
+    lane_bytes: usize,
+    lanes: Vec<Lane>,
+}
+
+/// One compression lane: an encoder, and the buffer it encodes records into.
+#[derive(Debug)]
+struct Lane {
+    encoder: RecordEncoder,
+    bytes: Vec<u8>,
+}
+
+impl Lane {
+    /// Encode `record` to the end of this lane's buffer, returning where it is.
+    fn encode(&mut self, record: &PackRecord) -> Result<Range<usize>, PackError> {
+        self.encoder
+            .encode_into(record, &mut self.bytes)
+            .map_err(|e| PackError::Append(e.to_string()))
+    }
+
+    /// Encode `batches` in order, returning where each one is.
+    fn encode_batches(
+        &mut self,
+        batches: Vec<(BlockHash, Batch)>,
+    ) -> Result<Vec<(BlockHash, Range<usize>)>, PackError> {
+        batches
+            .into_iter()
+            .map(|(digest, batch)| Ok((digest, self.encode(&PackRecord::Batch(batch))?)))
+            .collect()
+    }
+}
+
+impl OutputEncoder {
+    /// Batch data worth a lane of its own: most of a millisecond of zstd, against tens of
+    /// microseconds to start a thread.
+    const LANE_BYTES: usize = 256 * 1024;
+    /// The most lanes on any machine. A save runs beside execution, so it uses at most half the
+    /// cores.
+    const MAX_LANES: usize = 8;
+    /// The most buffer a lane keeps between saves; a rare larger output's is freed after it.
+    const RETAIN_BYTES: usize = 8 * 1024 * 1024;
+
+    /// The encoder for a pack of `compression` whose records are at most `max` bytes.
+    fn new(compression: PackCompression, max: u32) -> Self {
+        let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        let max_lanes = (cores / 2).clamp(1, Self::MAX_LANES);
+        Self::with_lanes(compression, max, max_lanes, Self::LANE_BYTES)
+    }
+
+    /// An encoder splitting an output across up to `max_lanes` lanes, one for each `lane_bytes`
+    /// of its batches.
+    fn with_lanes(
+        compression: PackCompression,
+        max: u32,
+        max_lanes: usize,
+        lane_bytes: usize,
+    ) -> Self {
+        Self { compression, max, max_lanes: max_lanes.max(1), lane_bytes, lanes: Vec::new() }
+    }
+
+    /// Split `batches` (in order) into one run per lane, each holding about an equal share of
+    /// their bytes. There is always a run; it is empty only when `batches` is.
+    fn split(&self, batches: Vec<(BlockHash, Batch)>) -> Vec<Vec<(BlockHash, Batch)>> {
+        let size = |batch: &Batch| batch.transactions.iter().map(Vec::len).sum::<usize>();
+        let total: usize = batches.iter().map(|(_, batch)| size(batch)).sum();
+        let lanes =
+            (total / self.lane_bytes.max(1)).clamp(1, self.max_lanes).min(batches.len().max(1));
+        if lanes == 1 {
+            return vec![batches];
+        }
+        let mut runs = Vec::with_capacity(lanes);
+        let mut run = Vec::new();
+        let mut filled = 0;
+        for (digest, batch) in batches {
+            filled += size(&batch);
+            run.push((digest, batch));
+            // Close a run once the runs so far hold their share of the bytes; the last takes
+            // the rest.
+            if runs.len() + 1 < lanes && filled * lanes >= total * (runs.len() + 1) {
+                runs.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            runs.push(run);
+        }
+        runs
+    }
+
+    /// The first `count` lanes, made as needed, with their buffers emptied.
+    fn lanes_for(&mut self, count: usize) -> &mut [Lane] {
+        while self.lanes.len() < count {
+            let encoder = RecordEncoder::new(self.compression, self.max);
+            self.lanes.push(Lane { encoder, bytes: Vec::new() });
+        }
+        let lanes = &mut self.lanes[..count.max(1)];
+        lanes.iter_mut().for_each(|lane| lane.bytes.clear());
+        lanes
+    }
+
+    /// Done with a save's records: empty the buffers, keeping each for the next save unless an
+    /// unusually large output grew it past [`Self::RETAIN_BYTES`].
+    fn release(&mut self) {
+        for lane in &mut self.lanes {
+            lane.bytes.clear();
+            if lane.bytes.capacity() > Self::RETAIN_BYTES {
+                lane.bytes = Vec::new();
+            }
+        }
     }
 }
 
@@ -3487,7 +3660,7 @@ impl Inner {
                 .inspect_err(|_| self.rollback_output(data_start, pos_idx_start));
         }
         let mut encoder =
-            RecordEncoder::new(self.data.header().compression(), self.data.max_record());
+            OutputEncoder::new(self.data.header().compression(), self.data.max_record());
         let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
         self.append_prepared(&prepared)
     }
@@ -3564,7 +3737,7 @@ impl Inner {
     /// Append an output encoded by [`PreparedOutput::encode`] (after [`Self::check_save`] found it
     /// next, with no save since) and index it, atomically: a failure rolls the data log and the
     /// indexes back to where they started ([`Self::rollback_output`]).
-    fn append_prepared(&mut self, prepared: &PreparedOutput) -> Result<u64, PackError> {
+    fn append_prepared(&mut self, prepared: &PreparedOutput<'_>) -> Result<u64, PackError> {
         let data_start = self.data.file_len();
         let pos_idx_start = self.consensus_pos_idx.len();
         match self.append_prepared_records(prepared) {
@@ -3578,10 +3751,10 @@ impl Inner {
 
     /// Append an output already encoded, in the header-first layout: the header, then its batches
     /// in digest order, each indexed, then the output's position entry.
-    fn append_prepared_records(&mut self, prepared: &PreparedOutput) -> Result<u64, PackError> {
+    fn append_prepared_records(&mut self, prepared: &PreparedOutput<'_>) -> Result<u64, PackError> {
         let position = self
             .data
-            .append_stored(&prepared.header)
+            .append_stored(prepared.header)
             .map_err(|e| PackError::Append(e.to_string()))?;
         for (digest, stored) in &prepared.batches {
             let batch_position =
@@ -3854,7 +4027,9 @@ impl Inner {
     /// at 1) so this is always well-defined; the `saturating_sub` is defense-in-depth — a malformed
     /// meta with `start == 0` and no outputs fails safe to `0` (which the startup hint-clamp then
     /// treats as "no durable tip" and clamps down to) rather than wrapping to `u64::MAX` in release
-    /// and silently defeating [`ConsensusChain::clamp_latest_to_pack`](crate::consensus::ConsensusChain::clamp_latest_to_pack).
+    /// and silently defeating
+    /// [`ConsensusChain::clamp_latest_to_pack`](crate::consensus::ConsensusChain::clamp_latest_to_pack).
+    ///
     fn latest_consensus_number(&self) -> u64 {
         (self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64)
             .saturating_sub(1)
@@ -4925,7 +5100,7 @@ impl From<io::Error> for PackError {
 #[cfg(test)]
 pub(crate) mod test {
     use std::{
-        collections::VecDeque,
+        collections::{BTreeMap, VecDeque},
         fs::{File, OpenOptions},
         io::{Seek as _, SeekFrom},
         num::NonZeroUsize,
@@ -4947,7 +5122,8 @@ pub(crate) mod test {
         archive::pack::{Pack, PackCompression, DATA_HEADER_BYTES},
         consensus_pack::{
             epoch_start_consensus_number, max_batches_per_output, ConsensusPack, EpochMeta,
-            EpochMigrate, EpochRepair, Inner, PackRecord, PACK_VERSION,
+            EpochMigrate, EpochRepair, Inner, OutputEncoder, PackRecord, PreparedOutput,
+            PACK_VERSION,
         },
         mem_db::MemDatabase,
     };
@@ -5442,6 +5618,169 @@ pub(crate) mod test {
             compare_outputs(&read, output);
         }
         reopened.close().await;
+    }
+
+    /// `output`'s batches by digest, as a save encodes them.
+    fn batches_by_digest(output: &ConsensusOutput) -> BTreeMap<BlockHash, Batch> {
+        output
+            .batches()
+            .iter()
+            .flat_map(|c| c.batches.iter().map(|b| (b.digest(), b.clone())))
+            .collect()
+    }
+
+    /// Each record of an output by the batch digest it stores (the default digest for the
+    /// header), in the order they are appended.
+    type Records = Vec<(BlockHash, Vec<u8>)>;
+
+    /// An output's records as `encoder` stores them, header first, plus how many of its lanes
+    /// encoded any.
+    fn encoded_records(
+        output: &ConsensusOutput,
+        batches: &BTreeMap<BlockHash, Batch>,
+        mut encoder: OutputEncoder,
+    ) -> Result<(Records, usize), super::PackError> {
+        let records = {
+            let prepared = PreparedOutput::encode(output, 0, batches.clone(), &mut encoder)?;
+            std::iter::once((BlockHash::default(), prepared.header.to_vec()))
+                .chain(prepared.batches.iter().map(|(digest, stored)| (*digest, stored.to_vec())))
+                .collect()
+        };
+        let used = encoder.lanes.iter().filter(|lane| !lane.bytes.is_empty()).count();
+        Ok((records, used))
+    }
+
+    /// Splitting an output's batches across lanes that compress at once stores the same records,
+    /// in the same order, as encoding them one after another.
+    #[test]
+    fn test_split_encoding_matches_one_lane() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let output = make_wide_test_output(
+            &fixture.committee(),
+            chain,
+            1,
+            ConsensusHeader::default().digest(),
+            40,
+        );
+        let batches = batches_by_digest(&output);
+        for compression in [PackCompression::None, PackCompression::ZStd] {
+            let lanes = |max_lanes| OutputEncoder::with_lanes(compression, u32::MAX, max_lanes, 1);
+            let (one, used) = encoded_records(&output, &batches, lanes(1)).expect("one lane");
+            assert_eq!(used, 1);
+            let (split, used) = encoded_records(&output, &batches, lanes(4)).expect("four lanes");
+            assert_eq!(used, 4, "{compression:?}: the batches were split across every lane");
+            assert_eq!(one.len(), batches.len() + 1);
+            assert!(
+                one[1..].iter().map(|(digest, _)| *digest).eq(batches.keys().copied()),
+                "the batches in digest order"
+            );
+            assert!(one == split, "{compression:?}: the same records in the same order");
+        }
+    }
+
+    /// A record too large for the pack fails the whole encode, on the saving thread or on another
+    /// lane, and the encoder then encodes the next output normally.
+    #[test]
+    fn test_an_oversized_batch_fails_the_encode_in_any_lane() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let output = make_wide_test_output(
+            &fixture.committee(),
+            chain,
+            1,
+            ConsensusHeader::default().digest(),
+            1,
+        );
+        let batch = |fill: u8, len: usize| {
+            Batch::new_for_test(vec![vec![fill; len]], ExecHeader::default(), 0, u32::from(fill))
+        };
+        // Eight 16 KiB batches, so four lanes each take two.
+        let fits: BTreeMap<BlockHash, Batch> =
+            (1..=8).map(|fill| batch(fill, 16 * 1024)).map(|b| (b.digest(), b)).collect();
+        let encoder = || OutputEncoder::with_lanes(PackCompression::None, 20 * 1024, 4, 1);
+        let (expected, used) = encoded_records(&output, &fits, encoder()).expect("all fit");
+        assert_eq!(used, 4);
+        // A 24 KiB batch first in digest order (the saving thread's lane), or last (another's).
+        for digest in [BlockHash::ZERO, BlockHash::repeat_byte(0xff)] {
+            let mut batches = fits.clone();
+            batches.insert(digest, batch(9, 24 * 1024));
+            let mut encoder = encoder();
+            let err = PreparedOutput::encode(&output, 0, batches, &mut encoder)
+                .err()
+                .expect("a record past the cap");
+            assert!(err.to_string().contains("exceeds the maximum"), "{err}");
+            let (after, _) = encoded_records(&output, &fits, encoder).expect("the next output");
+            assert!(after == expected, "the failed encode left nothing behind");
+        }
+    }
+
+    /// A pack whose saves split their batches across lanes stores and serves the same outputs,
+    /// byte for byte, as one that encodes each on one thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_consensus_pack_split_saves_store_the_same_outputs() {
+        let one_dir = TempDir::with_prefix("test_pack_one_lane").expect("temp dir");
+        let split_dir = TempDir::with_prefix("test_pack_split_lanes").expect("temp dir");
+        let (one, previous_epoch, committee, outputs) = pack_with_outputs(one_dir.path(), 6);
+        let split = ConsensusPack::open_append(split_dir.path(), previous_epoch, committee)
+            .expect("open pack");
+        one.set_encode_lanes(1, usize::MAX);
+        split.set_encode_lanes(3, 1);
+        for output in &outputs {
+            let a = one.save_consensus_output(output.clone()).await.expect("save");
+            let b = split.save_consensus_output(output.clone()).await.expect("save");
+            assert_eq!(a, b, "the same encoded size");
+        }
+        assert_eq!(
+            one.data_file_len().await.expect("length"),
+            split.data_file_len().await.expect("length")
+        );
+        for (i, output) in outputs.iter().enumerate() {
+            let number = i as u64 + 1;
+            assert_eq!(
+                one.get_consensus_output_bytes(number).await.expect("bytes"),
+                split.get_consensus_output_bytes(number).await.expect("bytes"),
+                "output {number}"
+            );
+            let read = split.get_consensus_output(number).await.expect("read back");
+            compare_outputs(&read, output);
+            let digests = batch_digests_of(output);
+            let found = split.batches(digests.clone()).await;
+            assert!(found.iter().all(Option::is_some), "every batch of output {number}");
+        }
+        one.close().await;
+        split.close().await;
+    }
+
+    /// The split keeps the batches in order and gives each lane about an equal share of their
+    /// bytes, and a small output is not split at all.
+    #[test]
+    fn test_split_runs_are_ordered_and_balanced() {
+        let batch = |fill: u8, len: usize| {
+            let batch = Batch::new_for_test(
+                vec![vec![fill; len]],
+                ExecHeader::default(),
+                0,
+                u32::from(fill),
+            );
+            (batch.digest(), batch)
+        };
+        let sizes = [40, 10, 10, 10, 10, 30, 30, 20, 20, 20];
+        let batches: Vec<_> =
+            sizes.iter().enumerate().map(|(i, kib)| batch(i as u8, kib * 1024)).collect();
+        let encoder = OutputEncoder::with_lanes(PackCompression::ZStd, u32::MAX, 4, 1);
+        let runs = encoder.split(batches.clone());
+        let kib: Vec<usize> = runs
+            .iter()
+            .map(|run| run.iter().map(|(_, b)| b.transactions[0].len() / 1024).sum())
+            .collect();
+        assert_eq!(kib, [50, 60, 50, 40], "each run closes once the runs so far hold their share");
+        let flat: Vec<BlockHash> = runs.into_iter().flatten().map(|(digest, _)| digest).collect();
+        assert!(flat.iter().eq(batches.iter().map(|(digest, _)| digest)), "in order");
+
+        let small = OutputEncoder::with_lanes(PackCompression::ZStd, u32::MAX, 4, 1024 * 1024);
+        assert_eq!(small.split(batches).len(), 1, "under a lane's worth: not split");
+        assert_eq!(small.split(Vec::new()).len(), 1, "no batches: one empty run");
     }
 
     #[tokio::test]

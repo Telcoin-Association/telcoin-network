@@ -71,9 +71,10 @@
 //!   distinct signed EIP-1559 transactions (transfers, ERC-20 transfers and larger contract calls
 //!   from [`POOL_SENDERS`] accounts), sliced from a pool signed once. A thread builds the outputs
 //!   ahead of the writer, outside the timed region.
-//! - **Writes**: each output is `save_consensus_output` then `persist_current` (the pack's `msync`,
-//!   then the latest-consensus slot's syncs), as state sync's `save_consensus` makes an output
-//!   durable before forwarding it to execution. Their sum is the time to forward.
+//! - **Writes**: each output is `save_consensus_output` then `persist_current` (the pack's `msync`
+//!   and the latest-consensus slot syncs, which run together and are also timed one by one), as
+//!   state sync's `save_consensus` makes an output durable before forwarding it to execution. Their
+//!   sum is the time to forward.
 //! - **Reads**, on other tasks while the saves run, of the newest [`RECENT_OUTPUTS`] outputs:
 //!   `consensus_header_by_digest` N times per output interval (one per gossiped certificate),
 //!   `get_batches` for one header's batches N/2 times per interval with [`BATCH_MISS_PERCENT`]% of
@@ -1271,6 +1272,9 @@ type Recent = Arc<parking_lot::RwLock<VecDeque<Arc<SavedOutput>>>>;
 struct WriterStats {
     save: Vec<Duration>,
     persist: Vec<Duration>,
+    /// The two halves of each persist, which run together: the pack's sync and the slot syncs.
+    persist_pack: Vec<Duration>,
+    persist_slots: Vec<Duration>,
     /// Save plus persist: when the output could be forwarded to execution.
     forward: Vec<Duration>,
     /// Outputs that were not built by their slot (the writer waited on the builder).
@@ -1306,10 +1310,12 @@ async fn run_writer(
         let call = Instant::now();
         stats.pack_bytes += chain.save_consensus_output(output).await.expect("save output");
         let saved_at = Instant::now();
-        chain.persist_current().await.expect("persist output");
+        let (pack, slots) = chain.persist_current_timed().await.expect("persist output");
         let persisted_at = Instant::now();
         stats.save.push(saved_at - call);
         stats.persist.push(persisted_at - saved_at);
+        stats.persist_pack.push(pack);
+        stats.persist_slots.push(slots);
         stats.forward.push(persisted_at - call);
         let mut recent = recent.write();
         if recent.len() == RECENT_OUTPUTS {
@@ -1661,6 +1667,8 @@ fn workload_column(
     let mut latencies = vec![
         ("save ms".to_string(), Unit::Ms, spread(&mut writer.save)),
         ("persist ms".to_string(), Unit::Ms, spread(&mut writer.persist)),
+        ("persist: pack sync ms".to_string(), Unit::Ms, spread(&mut writer.persist_pack)),
+        ("persist: slot syncs ms".to_string(), Unit::Ms, spread(&mut writer.persist_slots)),
         ("save+persist ms".to_string(), Unit::Ms, spread(&mut writer.forward)),
     ];
     let mut values = vec![
@@ -1780,8 +1788,9 @@ fn consensus_pack_workload() {
             format!(
                 "outputs: {} headers ({ROUNDS_PER_OUTPUT} rounds x N), {WORKLOAD_BATCHES_PER_HEADER} \
                  batches each, saved at {pace}; save = save_consensus_output, persist = \
-                 persist_current (pack msync + the latest-consensus slot syncs), save+persist = \
-                 the wait before an output is forwarded to execution",
+                 persist_current (the pack msync and the latest-consensus slot syncs, together; \
+                 each half also timed alone), save+persist = the wait before an output is \
+                 forwarded to execution",
                 n * ROUNDS_PER_OUTPUT as usize
             ),
             format!(

@@ -7,9 +7,9 @@
 //! - **One DB per process**: the [`SplitDatabase`] that `open_db` builds, one tndb log per
 //!   environment (epoch, kad, batch cache) committing in group mode, so `persist` acks once the
 //!   writes queued before it are durable. The MDBX columns model the release before it: a
-//!   `CompositeDatabase<MdbxDatabase>` routing each table to one of three `LayeredDatabase`s,
-//!   each with one background thread applying writes in order (`db_run` in `layered_db.rs`), the
-//!   epoch and kad layers holding every row in memory and the cache layer only unwritten rows.
+//!   `CompositeDatabase<MdbxDatabase>` routing each table to one of three `LayeredDatabase`s, each
+//!   with one background thread applying writes in order (`db_run` in `layered_db.rs`), the epoch
+//!   and kad layers holding every row in memory and the cache layer only unwritten rows.
 //! - **A consensus round** (committee N, [`BATCHES_PER_HEADER`] batches per header), all on the
 //!   epoch layer:
 //!   - N certificate writes, each one transaction of the certificate and its by-round and by-origin
