@@ -324,7 +324,7 @@ impl RethEnv {
             eth_api.clone(),
             TxFeeCapWei::new(self.node_config().rpc.rpc_tx_fee_cap),
             admission,
-            base_fee,
+            base_fee.clone(),
         );
         // Use one registry so the replacement debug handlers share reth's concurrency
         // guard with the other tracing endpoints. Delegate through their RPC traits.
