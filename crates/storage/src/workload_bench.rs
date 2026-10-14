@@ -4,12 +4,12 @@
 //! drives its consensus DB, so the backends can be compared on the traffic they would carry. The
 //! model, from the production callers:
 //!
-//! - **One DB per process**: the `CompositeDatabase<MdbxDatabase>` that `open_db` builds (`Durable`
-//!   sync in a production binary). It routes each table to one of three `LayeredDatabase`s, each
-//!   with one background thread applying writes in order (`db_run` in `layered_db.rs`): a write
-//!   made outside a transaction is its own physical commit, and `persist` acks behind everything
-//!   queued before it. The epoch and kad layers keep every row in memory (loaded at `open_table`);
-//!   the cache layer keeps only rows not yet written, so its reads go to disk.
+//! - **One DB per process**: the [`SplitDatabase`] that `open_db` builds, one tndb log per
+//!   environment (epoch, kad, batch cache) committing in group mode, so `persist` acks once the
+//!   writes queued before it are durable. The MDBX columns model the release before it: a
+//!   `CompositeDatabase<MdbxDatabase>` routing each table to one of three `LayeredDatabase`s,
+//!   each with one background thread applying writes in order (`db_run` in `layered_db.rs`), the
+//!   epoch and kad layers holding every row in memory and the cache layer only unwritten rows.
 //! - **A consensus round** (committee N, [`BATCHES_PER_HEADER`] batches per header), all on the
 //!   epoch layer:
 //!   - N certificate writes, each one transaction of the certificate and its by-round and by-origin
@@ -58,7 +58,7 @@
 //!
 //! `MemDb` (no disk; the floor); tndb: `TnDb` (each write durable when it returns),
 //! `TnDb-group` (group commit) and `Split<TnDb-group>` (one log per production environment, as
-//! the `tndb` feature opens it); `MDBX-prod` (production `Durable` sync and geometry; not in the
+//! `open_db` opens it); `MDBX-prod` (production `Durable` sync and geometry; not in the
 //! consensus workload, see the caveats); and MDBX behind a `LayeredDatabase`: full-memory
 //! (`Layered<_>`, the epoch layer) or cache-mode (`Layered-cache<_>`, the batch cache), as
 //! production configures them. `TN_BENCH_COLUMNS` (comma separated) runs only the named columns.

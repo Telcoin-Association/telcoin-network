@@ -2103,7 +2103,7 @@ mod tests {
         }
     }
 
-    // F4: a CRC-valid but internally corrupt zstd frame must surface as an error rather
+    // A CRC-valid but internally corrupt zstd frame must surface as an error rather
     // than silently passing through. Either FetchError::IO (zstd decode error) or
     // FetchError::DeserializeValue (zstd produced different bytes that bincode rejects)
     // is acceptable — both signal that the frame did not round-trip cleanly.

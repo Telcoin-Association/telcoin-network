@@ -10,8 +10,9 @@
 //! `HdxIndex::find_in_bucket` borrows the target bucket from the hdx mapping, scans it, and — on
 //! a miss — follows the append-only overflow chain by re-slicing the odx mapping one record at a
 //! time. Exactly one shared slice is live at any moment and no slice is ever held across a write,
-//! so a growth/remap (which needs `&mut`) can never invalidate one. Reads do **not** verify a
-//! per-op CRC (see the CRC note below).
+//! so a growth/remap (which needs `&mut`) can never invalidate one. Every bucket a lookup reads is
+//! CRC-verified before its answer is trusted; a bucket this handle dirtied since its last sync is
+//! trusted by its zeroed marker instead (see the CRC note below).
 //!
 //! ## Writes (write-through)
 //! Inserts are read-modify-write: the bucket is mutated in place through the mapping (its overflow
@@ -1595,7 +1596,7 @@ mod tests {
         );
     }
 
-    /// F2: a cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
+    /// A cleanly-sealed index whose FIRST bucket is not CRC-valid is rejected on open, so the
     /// caller rebuilds from the WAL instead of silently misreading buckets. This is exactly the
     /// shape a bloom-size mismatch produces — the bloom sits between the header and the first
     /// bucket, and its size is a compile-time constant not recorded on disk, so a build with a

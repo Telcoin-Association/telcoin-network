@@ -3335,7 +3335,7 @@ async fn test_consensus_certs_large_committee_flood_survives() -> eyre::Result<(
     Ok(())
 }
 
-/// F16: `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
+/// `order_probe_peers` shuffles candidates and moves peers that already failed a probe for
 /// THIS epoch to the back, so a Byzantine/drip peer fixed in stable `HashMap` order can no longer
 /// starve every retry. A failure recorded for a DIFFERENT epoch does not de-prioritise a peer.
 #[test]
@@ -3613,7 +3613,7 @@ fn test_clear_sync_capability_keeps_last_server() {
     assert_eq!(*handle.last_sync_server.lock(), Some(peer), "the preference must survive");
 }
 
-/// F40 + F2 (penalty half): `import_fault_is_peer_caused` admits ONLY faults attributable solely to
+/// `import_fault_is_peer_caused` admits ONLY faults attributable solely to
 /// the peer's streamed bytes (which then carry the severity `consensus_chain_error_to_penalty`
 /// assigns), and excludes every local/ambiguous error so an honest peer is never banned for this
 /// node's own storage/IO failure.

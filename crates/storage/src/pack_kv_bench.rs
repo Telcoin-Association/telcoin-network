@@ -47,9 +47,8 @@
 //! - A pack durable barrier msyncs **one file** (the data log); the hash digest index is
 //!   WAL-derived and is not synced per barrier, exactly like `ConsensusPack::persist`. MDBX does a
 //!   single-env commit.
-//! - Pack gives O(1) point KV but **no ordered range scan / cursor** and no cross-key atomic
-//!   transaction — features MDBX has that a replacement would need to add. This bench measures only
-//!   the point-KV subset. Values use `PackCompression::None`.
+//! - The pack columns measure only the point-KV subset: no cross-key transactions, and ordered
+//!   scans only through `pack-btree`'s index (tndb adds both). Values use `PackCompression::None`.
 //! - MDBX is itself mmap-backed, so `mdbx-durable` fsyncs its own mmap; `pack` uses `msync`.
 
 use std::{

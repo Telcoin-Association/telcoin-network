@@ -457,11 +457,11 @@ impl Pacer {
     }
 }
 
-/// The generation being built. Unless it is handed over ([`Self::finish`]), its files and
-/// directory are deleted when it drops, so a cancelled or failed compaction leaves nothing.
 /// The page size [`Builder::write_behind`] rounds its ranges down to.
 const WRITE_BEHIND_PAGE: u64 = 4096;
 
+/// The generation being built. Unless it is handed over ([`Self::finish`]), its files and
+/// directory are deleted when it drops, so a cancelled or failed compaction leaves nothing.
 struct Builder {
     /// Emptied once handed over.
     dir: PathBuf,

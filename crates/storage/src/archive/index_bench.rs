@@ -24,8 +24,8 @@
 //! barrier, and the two indexes make different tradeoffs:
 //! - `HdxIndex`: cache-free mmap hash index. It is rebuilt from the data-log WAL on an unclean
 //!   shutdown, so it defers CRC off the per-op path: each write zeros the bucket's CRC trailer (a
-//!   "dirty" marker) and only the dirty buckets are CRC'd at `sync()` (reads do not verify a per-op
-//!   CRC). A bloom filter accelerates `load_miss`. That makes per-op sync (`insert_dur`) cheap
+//!   "dirty" marker) and only the dirty buckets are CRC'd at `sync()`; a read verifies the CRC of
+//!   each bucket it touches. A bloom filter accelerates `load_miss`. That makes per-op sync (`insert_dur`) cheap
 //!   while a full-build `sync_bulk` (nearly all buckets dirty) is the worst case.
 //! - `BtreeIndex`: paged, mmap-backed B+tree using the same lazy-CRC regime — a modified page's CRC
 //!   trailer is zeroed as a dirty marker, only dirty pages are CRC'd at `sync()`, and reads do
@@ -237,7 +237,7 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
     let cell_w = 12usize;
 
     println!("\n=== archive index comparison: HdxIndex vs BtreeIndex (ms; lower is better) ===");
-    println!("legend: overlapping point-lookup ops only (no sorting). HdxIndex = cache-free mmap hash index; per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync, reads do not verify a per-op CRC (WAL/rebuildable regime), and a bloom filter accelerates load_miss (the production 2 MiB under cfg(test)). BtreeIndex = paged mmap-backed B+tree with the same lazy-CRC regime (modified page CRC zeroed as a dirty marker, only dirty pages CRC'd at sync, reads do not verify a per-op CRC); no bloom, so load_miss is a full root->leaf descent (~load_hit cost); sync is msync + header-last. insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. reopen_load is cold only in-process (file stays in the OS page cache). macOS fsync is not a full barrier — run on Linux/SSD for the durability rows.");
+    println!("legend: overlapping point-lookup ops only (no sorting). HdxIndex = cache-free mmap hash index; per-op CRC replaced by a zeroed dirty marker, only dirty buckets CRC'd at sync, each bucket a read touches CRC-verified, and a bloom filter accelerates load_miss (the production 2 MiB under cfg(test)). BtreeIndex = paged mmap-backed B+tree with the same lazy-CRC regime (modified page CRC zeroed as a dirty marker, only dirty pages CRC'd at sync, reads do not verify a per-op CRC); no bloom, so load_miss is a full root->leaf descent (~load_hit cost); sync is msync + header-last. insert_dur = {K_DUR} save+sync pairs; per size: insert/load_hit/load_miss/reopen_load = N, sync_bulk = 1. reopen_load is cold only in-process (file stays in the OS page cache). macOS fsync is not a full barrier — run on Linux/SSD for the durability rows.");
 
     print!("{:<label_w$}", "benchmark", label_w = label_w);
     for (name, _) in cols {

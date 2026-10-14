@@ -2,8 +2,9 @@
 //! production usage patterns.
 //!
 //! Pack files are append-only archive files (BCS + per-record ZStd) with position/digest indexes.
-//! The production [`ConsensusPack`] drives them from one background thread per pack — every public
-//! `async fn` sends a message over a channel and awaits a `oneshot` reply. Two benches:
+//! The production [`ConsensusPack`] shares one pack between its writer and its readers: reads run
+//! under a read lock beside saves, and a save takes the write lock only to append and index its
+//! already-encoded records. Two benches:
 //!
 //! - `pack_file_bench` runs a battery of those operations, one at a time on small synthetic
 //!   outputs, and prints one column per output width, so runs can be compared over time to catch
@@ -28,7 +29,7 @@
 //! with [`make_wide_test_output`], whose batches are genuinely distinct across outputs (random
 //! transactions). Every one of the pack's files (data + position index + digest index) is
 //! memory-mapped; `persist()` msyncs the data log (the WAL, source of truth), while the derived
-//! indexes are written through the pack's background thread and rebuilt from the log on recovery.
+//! indexes are written in place and rebuilt from the log on recovery.
 //!
 //! The rows, grouped, capture the real call sites traced through `consensus_pack.rs` /
 //! `consensus.rs` / `state-sync/src/lib.rs`:
@@ -54,7 +55,7 @@
 //! - Timings are on a `tempfile` dir — they reflect that filesystem, not a specific production
 //!   disk.
 //! - Every pack file is memory-mapped and uses `msync` durability barriers, driving the production
-//!   `ConsensusPack` (background thread + channel).
+//!   `ConsensusPack`.
 //!
 //! ## `consensus_pack_workload`: production-shaped outputs beside readers
 //!

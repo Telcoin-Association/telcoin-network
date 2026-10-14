@@ -197,8 +197,8 @@ impl std::fmt::Debug for Shared {
 }
 
 impl Shared {
-    /// Save `consensus` (see [`Inner::save_consensus_output`]): checked under the read lock,
-    /// encoded under the writer lock alone, then appended and indexed under the write lock.
+    /// Save `consensus`: checked under the read lock ([`Inner::check_save`]), encoded under the
+    /// writer lock alone, then appended and indexed under the write lock ([`Inner::append_prepared`]).
     fn save(&self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let mut encoder = self.writer.lock();
         let check = {
@@ -3562,8 +3562,8 @@ impl Inner {
     }
 
     /// Append an output encoded by [`PreparedOutput::encode`] (after [`Self::check_save`] found it
-    /// next, with no save since) and index it, atomically: the same records and indexes, and the
-    /// same rollback, as [`Self::save_consensus_output`].
+    /// next, with no save since) and index it, atomically: a failure rolls the data log and the
+    /// indexes back to where they started ([`Self::rollback_output`]).
     fn append_prepared(&mut self, prepared: &PreparedOutput) -> Result<u64, PackError> {
         let data_start = self.data.file_len();
         let pos_idx_start = self.consensus_pos_idx.len();
@@ -3854,7 +3854,7 @@ impl Inner {
     /// at 1) so this is always well-defined; the `saturating_sub` is defense-in-depth — a malformed
     /// meta with `start == 0` and no outputs fails safe to `0` (which the startup hint-clamp then
     /// treats as "no durable tip" and clamps down to) rather than wrapping to `u64::MAX` in release
-    /// and silently defeating [`Self::clamp_latest_to_pack`].
+    /// and silently defeating [`ConsensusChain::clamp_latest_to_pack`](crate::consensus::ConsensusChain::clamp_latest_to_pack).
     fn latest_consensus_number(&self) -> u64 {
         (self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64)
             .saturating_sub(1)
@@ -4093,7 +4093,7 @@ fn available_space(path: &Path) -> io::Result<u64> {
 /// carried inside the value being decoded, not the record's — so a record whose committee claims a
 /// different epoch was parsed under a layout the record's own epoch does not select, and no later
 /// reader can tell. Both halves are then used as if they agreed: `epoch_meta.epoch` decides which
-/// outputs [`Inner::save_consensus_output`] accepts, while `epoch_meta.committee` is the validator
+/// outputs [`Inner::check_save`] accepts, while `epoch_meta.committee` is the validator
 /// set every output in the pack is decoded and verified against, and
 /// [`ConsensusPack::stream_import`] reports `epoch()` from the request while `committee()` comes
 /// from this record. A local write cannot break the equality — [`Inner::open_append`] derives the
@@ -6604,7 +6604,7 @@ pub(crate) mod test {
         }
     }
 
-    /// F6: a legacy v0 (batches-first) or v1 (header-first) pack migrates 1:1 into a current v2
+    /// A legacy v0 (batches-first) or v1 (header-first) pack migrates 1:1 into a current v2
     /// pack. After migration the pack is v2, opens through the sentinel-gated read-only door,
     /// and every consensus output round-trips unchanged. Re-running the migration is a no-op
     /// (`AlreadyCurrent`).
@@ -6685,7 +6685,7 @@ pub(crate) mod test {
         assert_eq!(std::fs::read(&cert_index).expect("cert index kept"), b"cert index bytes");
     }
 
-    /// F6: a migration dry run (`apply == false`) reports what it would do but writes nothing — the
+    /// A migration dry run (`apply == false`) reports what it would do but writes nothing — the
     /// on-disk version and length are unchanged and no temp dir is left behind.
     #[tokio::test]
     async fn test_migrate_dry_run_writes_nothing() {

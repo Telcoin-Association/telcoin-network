@@ -311,8 +311,7 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     documented never to be handed a live, capacity-padded mmap file. Not a "reads past end" bug.
 13. **`PackIter::logical_position()` (whole-frame boundary).** Recovery truncates using
     `logical_position()`, advanced only by complete record frames; it is a valid boundary only after a
-    successful `next()`, deliberately distinct from a raw byte offset. (The former physical
-    `position()` was removed — the recovery walk no longer does a per-frame `lseek`.)
+    successful `next()`, deliberately distinct from a raw byte offset.
 14. **`refresh_data_file_end` clears a prior `set_read_bound` clamp.** A documented precondition; no
     production path refreshes a clamped read-only handle. Not a live SIGBUS.
 15. **Trailing-CRC "dirty" (zero) sentinel in `crc.rs`.** A zeroed trailing CRC is a deliberate
@@ -345,17 +344,16 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 19. **Recovery reads the WAL through a cloned fd + `BufReader` (pread), not the mmap.** `recover_pack`
     and the index rebuilds walk the data log with syscall reads rather than faulting the whole file
     into the page cache through the mapping, and `PositionIndex::sync` issues a harmless extra
-    `MS_ASYNC` beside its fsync. These are deliberate, low-priority performance choices; the per-frame
-    `lseek` that once made the cold-recovery walk expensive was already removed. Not a bug.
+    `MS_ASYNC` beside its fsync. These are deliberate, low-priority performance choices. Not a bug.
 20. **Digest-index bucket placement is stable across compiler upgrades by design.** Placement feeds
     the raw key bytes straight to the vendored `FxHasher` (`HdxIndex::stable_hash` → `Hasher::write`),
     deliberately bypassing `impl Hash for [u8]`, whose length-prefix encoding is not stable across Rust
     versions. The salt/pepper marker is derived with the same primitive, so the open-time drift check
     catches a change of hasher and routes it to a WAL rebuild (INV3). It cannot see a change in how
     key bytes are fed to the same hasher: hashing the 8-byte salt is identical either way, so an
-    index built by `main` (placement via `Hash for [u8]`) passes it. What retires those indexes is
-    the version-gated migration of every pre-v2 pack and the rebuild of any index file without a
-    clean-close sentinel (which no `main`-built file has). Do not "simplify" this back to
+    index built by an older release (placement via `Hash for [u8]`) passes it. What retires those
+    indexes is the version-gated migration of every pre-v2 pack and the rebuild of any index file
+    without a clean-close sentinel (which no older release's file has). Do not "simplify" this back to
     `hash_one`/`Hash for [u8]` — that would reintroduce toolchain-dependent placement and force an
     index rebuild on every compiler upgrade.
 21. **Index rebuild adds an output's digests before it confirms the output is complete.** Recovery
