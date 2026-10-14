@@ -206,6 +206,22 @@ struct Shared {
     /// Serializes the writers, and holds what a save encodes its records with before it takes the
     /// write lock.
     writer: Mutex<OutputEncoder>,
+    /// Test-only: how long each save's parts took, for the pack bench.
+    #[cfg(test)]
+    save_phases: Mutex<Vec<SavePhases>>,
+}
+
+/// Test-only: how long one save's parts took (see [`Shared::save`]).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SavePhases {
+    /// Checking the output against the pack under the read lock (`Inner::check_save`, which
+    /// gathers the output's batches by digest).
+    pub(crate) check: std::time::Duration,
+    /// Encoding and compressing its records (`PreparedOutput::encode`).
+    pub(crate) encode: std::time::Duration,
+    /// Appending and indexing them under the write lock (`Inner::append_prepared`).
+    pub(crate) append: std::time::Duration,
 }
 
 impl std::fmt::Debug for Shared {
@@ -220,6 +236,8 @@ impl Shared {
     /// ([`Inner::append_prepared`]).
     fn save(&self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
         let mut encoder = self.writer.lock();
+        #[cfg(test)]
+        let started = std::time::Instant::now();
         let check = {
             let guard = self.inner.read();
             let inner = guard.as_ref().ok_or(PackError::SendFailed)?;
@@ -235,9 +253,21 @@ impl Shared {
             SaveCheck::Saved(bytes) => return Ok(bytes),
             SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
         };
+        #[cfg(test)]
+        let checked = std::time::Instant::now();
         let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
+        #[cfg(test)]
+        let encoded = std::time::Instant::now();
         let saved = self.mutate(|inner| inner.append_prepared(&prepared));
         encoder.release();
+        #[cfg(test)]
+        if saved.is_ok() {
+            self.save_phases.lock().push(SavePhases {
+                check: checked - started,
+                encode: encoded - checked,
+                append: encoded.elapsed(),
+            });
+        }
         saved
     }
 
@@ -486,8 +516,12 @@ impl ConsensusPack {
         let version = inner.version();
         let compression = inner.data.header().compression();
         let encoder = OutputEncoder::new(compression, inner.data.max_record());
-        let shared =
-            Arc::new(Shared { inner: RwLock::new(Some(inner)), writer: Mutex::new(encoder) });
+        let shared = Arc::new(Shared {
+            inner: RwLock::new(Some(inner)),
+            writer: Mutex::new(encoder),
+            #[cfg(test)]
+            save_phases: Mutex::default(),
+        });
         Self { shared, epoch, committee, compression, is_static, version }
     }
 
@@ -1045,6 +1079,12 @@ impl ConsensusPack {
         let mut encoder = self.shared.writer.lock();
         *encoder =
             OutputEncoder::with_lanes(encoder.compression, encoder.max, max_lanes, lane_bytes);
+    }
+
+    /// Test-only: the parts of each save since the last call (see [`SavePhases`]).
+    #[cfg(test)]
+    pub(crate) fn take_save_phases(&self) -> Vec<SavePhases> {
+        std::mem::take(&mut *self.shared.save_phases.lock())
     }
 
     /// Test-only: the next save panics once its records are appended and indexed.

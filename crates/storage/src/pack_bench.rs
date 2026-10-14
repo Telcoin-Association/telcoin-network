@@ -97,6 +97,10 @@
 //! - `TN_BENCH_PACK_MAX_MB`: the most batch data one configuration writes (default 4096); a heavier
 //!   configuration saves fewer outputs.
 //! - `TN_BENCH_PACK_READ_SECS`: length of the readers-only phase (default 15).
+//! - `TN_BENCH_PACK_READERS`: 0 runs no readers, to profile the writer alone (default 1).
+//! - `TN_BENCH_PACK_NO_SLOTS`: 1 persists the pack alone, without the latest-consensus slot syncs
+//!   that `persist_current` runs beside it: a measurement of what the slots add, never a
+//!   production setting (default 0).
 //!
 //! The chain lives in a temp dir under `TMPDIR`. On Linux a tmpfs or ramfs `TMPDIR` is refused:
 //! `msync` is free there, so the durable rows would mean nothing.
@@ -741,6 +745,11 @@ struct WorkloadKnobs {
     max_bytes: u64,
     /// Length of the readers-only phase.
     read_only: Duration,
+    /// Whether readers run at all (off for profiling the writer alone).
+    readers: bool,
+    /// Persist the pack alone, without the slot syncs `persist_current` runs beside it (a
+    /// measurement only: production always syncs both).
+    no_slots: bool,
 }
 
 impl WorkloadKnobs {
@@ -762,6 +771,8 @@ impl WorkloadKnobs {
             committees: list("TN_BENCH_PACK_COMMITTEE", "10,50"),
             max_bytes: var("TN_BENCH_PACK_MAX_MB", 4096_u64) << 20,
             read_only: Duration::from_secs(var("TN_BENCH_PACK_READ_SECS", 15_u64)),
+            readers: var("TN_BENCH_PACK_READERS", 1_u8) != 0,
+            no_slots: var("TN_BENCH_PACK_NO_SLOTS", 0_u8) != 0,
         }
     }
 
@@ -1272,9 +1283,16 @@ type Recent = Arc<parking_lot::RwLock<VecDeque<Arc<SavedOutput>>>>;
 struct WriterStats {
     save: Vec<Duration>,
     persist: Vec<Duration>,
-    /// The two halves of each persist, which run together: the pack's sync and the slot syncs.
+    /// The two halves of each persist, which run together: the pack's sync and the slot syncs
+    /// (none when they are skipped).
     persist_pack: Vec<Duration>,
     persist_slots: Vec<Duration>,
+    /// The parts of each save: the pack's check, encode and append (see `SavePhases`), and the
+    /// rest of the call (the blocking-pool dispatch, the latest-consensus update, waits).
+    save_check: Vec<Duration>,
+    save_encode: Vec<Duration>,
+    save_append: Vec<Duration>,
+    save_outside: Vec<Duration>,
     /// Save plus persist: when the output could be forwarded to execution.
     forward: Vec<Duration>,
     /// Outputs that were not built by their slot (the writer waited on the builder).
@@ -1291,6 +1309,7 @@ async fn run_writer(
     built: &mut mpsc::Receiver<BuiltOutput>,
     outputs: u64,
     rate: u32,
+    no_slots: bool,
     recent: &Recent,
 ) -> WriterStats {
     let mut stats = WriterStats::default();
@@ -1310,12 +1329,23 @@ async fn run_writer(
         let call = Instant::now();
         stats.pack_bytes += chain.save_consensus_output(output).await.expect("save output");
         let saved_at = Instant::now();
-        let (pack, slots) = chain.persist_current_timed().await.expect("persist output");
+        if no_slots {
+            stats.persist_pack.push(chain.persist_pack_only().await.expect("persist the pack"));
+        } else {
+            let (pack, slots) = chain.persist_current_timed().await.expect("persist output");
+            stats.persist_pack.push(pack);
+            stats.persist_slots.push(slots);
+        }
         let persisted_at = Instant::now();
         stats.save.push(saved_at - call);
         stats.persist.push(persisted_at - saved_at);
-        stats.persist_pack.push(pack);
-        stats.persist_slots.push(slots);
+        for phases in chain.take_save_phases() {
+            let inside = phases.check + phases.encode + phases.append;
+            stats.save_check.push(phases.check);
+            stats.save_encode.push(phases.encode);
+            stats.save_append.push(phases.append);
+            stats.save_outside.push((saved_at - call).saturating_sub(inside));
+        }
         stats.forward.push(persisted_at - call);
         let mut recent = recent.write();
         if recent.len() == RECENT_OUTPUTS {
@@ -1604,9 +1634,11 @@ fn run_configuration(
     let (committee_tx, committee_rx) = std::sync::mpsc::channel();
     let builder = {
         let pool = pool.clone();
-        std::thread::spawn(move || {
-            build_workload_outputs(shape, outputs, pool, committee_tx, outputs_tx)
-        })
+        // Named, so a profile can tell its work from the writer's.
+        std::thread::Builder::new()
+            .name("pack-build".to_string())
+            .spawn(move || build_workload_outputs(shape, outputs, pool, committee_tx, outputs_tx))
+            .expect("start the output builder")
     };
     let committee = committee_rx.recv().expect("the builder's committee");
     let epoch = committee.epoch();
@@ -1620,7 +1652,8 @@ fn run_configuration(
         }
         let recent = Recent::default();
         let phase = Arc::new(AtomicU8::new(PHASE_WITH_SAVES));
-        let readers: Vec<_> = ReadKind::ALL
+        let kinds: &[ReadKind] = if knobs.readers { &ReadKind::ALL } else { &[] };
+        let readers: Vec<_> = kinds
             .iter()
             .enumerate()
             .map(|(i, &kind)| {
@@ -1635,9 +1668,12 @@ fn run_configuration(
                 ))
             })
             .collect();
-        let writer = run_writer(&chain, &mut built, outputs, knobs.rate, &recent).await;
+        let writer =
+            run_writer(&chain, &mut built, outputs, knobs.rate, knobs.no_slots, &recent).await;
         phase.store(PHASE_READS_ONLY, Ordering::Release);
-        tokio::time::sleep(knobs.read_only).await;
+        if knobs.readers {
+            tokio::time::sleep(knobs.read_only).await;
+        }
         phase.store(PHASE_STOP, Ordering::Release);
         let mut reads = Vec::with_capacity(readers.len());
         for reader in readers {
@@ -1666,11 +1702,21 @@ fn workload_column(
     let per_output = |total: u64| total as f64 / outputs as f64;
     let mut latencies = vec![
         ("save ms".to_string(), Unit::Ms, spread(&mut writer.save)),
+        ("save: check ms".to_string(), Unit::Ms, spread(&mut writer.save_check)),
+        ("save: encode ms".to_string(), Unit::Ms, spread(&mut writer.save_encode)),
+        ("save: append+index ms".to_string(), Unit::Ms, spread(&mut writer.save_append)),
+        ("save: outside the pack ms".to_string(), Unit::Ms, spread(&mut writer.save_outside)),
         ("persist ms".to_string(), Unit::Ms, spread(&mut writer.persist)),
         ("persist: pack sync ms".to_string(), Unit::Ms, spread(&mut writer.persist_pack)),
-        ("persist: slot syncs ms".to_string(), Unit::Ms, spread(&mut writer.persist_slots)),
-        ("save+persist ms".to_string(), Unit::Ms, spread(&mut writer.forward)),
     ];
+    if !knobs.no_slots {
+        latencies.push((
+            "persist: slot syncs ms".to_string(),
+            Unit::Ms,
+            spread(&mut writer.persist_slots),
+        ));
+    }
+    latencies.push(("save+persist ms".to_string(), Unit::Ms, spread(&mut writer.forward)));
     let mut values = vec![
         (
             "outputs saved".to_string(),
@@ -1784,13 +1830,19 @@ fn consensus_pack_workload() {
             );
             cols.push(run_configuration(&rt, &knobs, shape, &pool));
         }
-        let legend = vec![
+        let persist = if knobs.no_slots {
+            "the pack msync alone (TN_BENCH_PACK_NO_SLOTS: the slot syncs skipped, unlike \
+             production)"
+        } else {
+            "persist_current (the pack msync and the latest-consensus slot syncs, together; each \
+             half also timed alone)"
+        };
+        let mut legend = vec![
             format!(
                 "outputs: {} headers ({ROUNDS_PER_OUTPUT} rounds x N), {WORKLOAD_BATCHES_PER_HEADER} \
-                 batches each, saved at {pace}; save = save_consensus_output, persist = \
-                 persist_current (the pack msync and the latest-consensus slot syncs, together; \
-                 each half also timed alone), save+persist = the wait before an output is \
-                 forwarded to execution",
+                 batches each, saved at {pace}; save = save_consensus_output (its check, encode \
+                 and append+index inside the pack, and the rest outside it), persist = {persist}, \
+                 save+persist = the wait before an output is forwarded to execution",
                 n * ROUNDS_PER_OUTPUT as usize
             ),
             format!(
@@ -1807,6 +1859,9 @@ fn consensus_pack_workload() {
              outside the save, as the pack's append does"
                 .to_string(),
         ];
+        if !knobs.readers {
+            legend[1] = "reads: none (TN_BENCH_PACK_READERS=0)".to_string();
+        }
         print_workload_table(&format!("consensus pack workload: N={n}"), &legend, &cols);
     }
 }

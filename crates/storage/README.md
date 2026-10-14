@@ -265,7 +265,7 @@ cargo test --release -p tn-storage --lib -- <path> --exact --ignored --nocapture
 
 | path | measures | knobs |
 |---|---|---|
-| `pack_bench::consensus_pack_workload` | production-shaped `ConsensusChain` traffic: real signed outputs saved and persisted at 2/s while readers look up headers, batches and output bytes; the save, the persist (each sync half) and read latencies; compression | `TN_BENCH_PACK_{RATE,OUTPUTS,BATCH_KB,COMMITTEE,MAX_MB,READ_SECS}` |
+| `pack_bench::consensus_pack_workload` | production-shaped `ConsensusChain` traffic: real signed outputs saved and persisted at 2/s while readers look up headers, batches and output bytes; the save (and its parts: check, encode, append+index), the persist (each sync half) and read latencies; compression | `TN_BENCH_PACK_{RATE,OUTPUTS,BATCH_KB,COMMITTEE,MAX_MB,READ_SECS}`; `TN_BENCH_PACK_READERS=0` (the writer alone), `TN_BENCH_PACK_NO_SLOTS=1` (persist the pack without the slot syncs; a measurement only) |
 | `pack_bench::pack_file_bench` | the `ConsensusPack` operations one at a time on small outputs, a regression baseline by output width | |
 | `workload_bench::workload_consensus_rounds` | consensus rounds on the epoch tables at two committee sizes: ms per round, durable vote and header latency | `TN_BENCH_COLUMNS` |
 | `workload_bench::workload_batch_cache` | the batch cache at two batch sizes: write MB/s, gets/s with 4 readers | `TN_BENCH_COLUMNS` |

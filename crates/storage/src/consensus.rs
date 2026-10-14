@@ -1538,6 +1538,22 @@ impl ConsensusChain {
         self.persist_current_timed().await.map(|_| ())
     }
 
+    /// Test-only, for the pack bench: make the current pack durable without syncing the slot
+    /// files (which [`Self::persist_current`] does beside it), returning how long that took.
+    #[cfg(test)]
+    pub(crate) async fn persist_pack_only(&self) -> Result<Duration, ConsensusChainError> {
+        let start = std::time::Instant::now();
+        self.current_pack().persist().await?;
+        Ok(start.elapsed())
+    }
+
+    /// Test-only, for the pack bench: the parts of each save to the current pack since the last
+    /// call.
+    #[cfg(test)]
+    pub(crate) fn take_save_phases(&self) -> Vec<crate::consensus_pack::SavePhases> {
+        self.current_pack().take_save_phases()
+    }
+
     /// [`Self::persist_current`], also returning how long the pack's sync and the slot files'
     /// syncs each took: `(pack, slots)`. They run together, so the whole takes about the longer.
     pub(crate) async fn persist_current_timed(
