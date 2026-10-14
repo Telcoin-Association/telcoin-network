@@ -254,6 +254,12 @@ cargo test --release -p tn-storage --lib -- <path> --exact --ignored --nocapture
   and pack benches refuse tmpfs, where syncs are free.
 - **macOS `fsync` and `msync` don't flush the drive's cache,** so durability numbers come from
   Linux.
+- **Paced runs leave the machine idle between operations,** so on a laptop they include CPU and
+  NVMe power-state wake-ups. On the reference Linux laptop (i7-1360P, SK Hynix NVMe), a
+  `consensus_pack_workload` persist took 9.3 ms paced at 2 outputs/s and 1.4 ms back to back
+  (`TN_BENCH_PACK_RATE=0`), and a save 9.1 ms against 3.5. With NVMe power saving (APST) off and
+  the performance CPU governor, the paced run came down to 2.3 ms and 4.2 ms. Compare runs of the
+  same pacing, and note the machine's power settings.
 - **MDBX columns** need the default `reth-libmdbx` feature.
 - **`TN_BENCH_COLUMNS`** (comma separated) narrows the `workload_bench` benches to the named
   columns.
