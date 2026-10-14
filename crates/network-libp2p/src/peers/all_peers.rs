@@ -1069,10 +1069,8 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) =
-                filter(peer.connection_status()).filter(|_| {
-                    !peer.is_operator_allowlisted() && !self.is_committee_record(id)
-                })
+            if let Some(instant) = filter(peer.connection_status())
+                .filter(|_| !peer.is_operator_allowlisted() && !self.is_committee_record(id))
             {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
