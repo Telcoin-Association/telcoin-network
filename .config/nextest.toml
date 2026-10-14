@@ -27,6 +27,16 @@ filter = "package(e2e-tests)"
 test-group = "e2e"
 slow-timeout = { period = "720s", terminate-after = 3 }
 
+# Fleet-timed crash captures have longer bounded waits than the ordinary e2e lane.
+# Keep the ordinary lane's limits; select this profile explicitly for SIGKILL captures.
+[profile.sigkill]
+inherits = "default"
+
+[[profile.sigkill.overrides]]
+filter = "package(e2e-tests) & test(sigkill::)"
+test-group = "e2e"
+slow-timeout = { period = "18000s", terminate-after = 1 }
+
 # The cross-process slot allocator (tn_types::helpers) closes the ephemeral-port race,
 # so e2e tests no longer need retries to mask it. Real regressions now surface instead of
 # being silently retried away. The allocator's degraded edges (window exhausted, slot
