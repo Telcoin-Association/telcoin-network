@@ -241,6 +241,46 @@ drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on 
 `db migrate` and `db load-state` refuse to run while a live node holds the `<datadir>/telcoin.pid`
 lock (intentional-design item 9).
 
+### Benchmarks
+
+Every bench is an `#[ignore]`d test, run on demand:
+
+```
+cargo test --release -p tn-storage --lib -- <path> --exact --ignored --nocapture --test-threads 1
+```
+
+- **Always `--release`.**
+- **The database files go under `TMPDIR`,** which must be on the disk under test. The workload
+  and pack benches refuse tmpfs, where syncs are free.
+- **macOS `fsync` and `msync` don't flush the drive's cache,** so durability numbers come from
+  Linux.
+- **MDBX columns** need the default `reth-libmdbx` feature.
+- **`TN_BENCH_COLUMNS`** (comma separated) narrows the `workload_bench` benches to the named
+  columns.
+- **Two scripts:**
+  - `etc/storage-baseline-bench.sh <dir>` runs the workload suite plus `consensus_pack_workload`
+    into one report;
+  - `etc/storage-ab-bench.sh <dir> <before-commit> [path]` runs one bench on a commit and on this
+    checkout, in before/after/after/before order, with checked-distinct builds and one report.
+
+| path | measures | knobs |
+|---|---|---|
+| `pack_bench::consensus_pack_workload` | production-shaped `ConsensusChain` traffic: real signed outputs saved and persisted at 2/s while readers look up headers, batches and output bytes; the save, the persist (each sync half) and read latencies; compression | `TN_BENCH_PACK_{RATE,OUTPUTS,BATCH_KB,COMMITTEE,MAX_MB,READ_SECS}` |
+| `pack_bench::pack_file_bench` | the `ConsensusPack` operations one at a time on small outputs, a regression baseline by output width | |
+| `workload_bench::workload_consensus_rounds` | consensus rounds on the epoch tables at two committee sizes: ms per round, durable vote and header latency | `TN_BENCH_COLUMNS` |
+| `workload_bench::workload_batch_cache` | the batch cache at two batch sizes: write MB/s, gets/s with 4 readers | `TN_BENCH_COLUMNS` |
+| `workload_bench::workload_startup_reload` | a restart late in an epoch: the reopen time | `TN_BENCH_COLUMNS` |
+| `workload_bench::workload_compaction` | a table under churn with tndb compaction off and on: disk, step latency, switch holds | `TN_BENCH_CHURN_SECS`, `TN_BENCH_COLUMNS` |
+| `workload_bench::workload_mixed` | N=50 consensus beside a batch stream (256 KB unpaced; 1 MB at 25/s) | `TN_BENCH_COLUMNS` |
+| `workload_bench::workload_mixed_compaction` | compaction's cost to consensus, as interleaved off/on pairs (ratios of vote p99 and ms per round) | `TN_BENCH_PAIRS`, `TN_BENCH_PAIR_{ROUNDS,RATE,BATCH_KB}` |
+| `workload_bench::msync_concurrency_probe` | how this file system overlaps msyncs of different files | |
+| `db_bench::db_backend_comparison` | every `Database` backend through the basic operations | |
+| `pack_kv_bench::pack_vs_mdbx_bench` | the pack-file KV against MDBX on raw point KV | |
+| `pack_kv_bench::kv_concurrent_read_bench` | concurrent point reads as threads are added, with and without a writer | |
+| `archive::index_bench::index_bench` | `HdxIndex` against `BtreeIndex` across index sizes | `INDEX_BENCH_N` (comma list; the default's 8M needs a few GB) |
+
+Each bench module's docs describe its model, columns and caveats in full.
+
 ---
 
 ## Intentional design decisions — please do not flag these

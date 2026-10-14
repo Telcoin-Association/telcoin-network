@@ -4,6 +4,15 @@
 //! - A records file containing [`EpochRecord`] entries, indexed by epoch number (position index)
 //!   and by digest (hash index).
 //! - A certs file containing [`EpochCertificate`] entries, indexed by digest only.
+//!
+//! ## Where things are
+//! - `EpochRecordDb`: the handle; `run_db_loop` is its actor thread.
+//! - Validation: `EpochRecordValidation`, `epoch_committee_valid`,
+//!   `validate_record_against_anchor` and `CertifiedRecordError`.
+//! - `impl EpochRecordDb`: the API.
+//! - `impl Inner`: the two logs: open, recovery, appends and reads.
+//! - `EpochDbError` and the bundle helpers (`write_bounded_pack`, `append_bundle_increment`), then
+//!   `mod test`.
 
 use std::{
     error::Error,

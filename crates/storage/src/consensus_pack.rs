@@ -1,5 +1,22 @@
 //! Implement a Pack file to contain consensus chain data (Batches and ConsensusHeaders).
 //! Stored per epoch.
+//!
+//! ## Where things are
+//! - `Shared`: the locking model (reads under the read lock; a writer lock serializes saves,
+//!   persists and the close; a save takes the write lock only to append and index).
+//! - `impl ConsensusPack`: the public API: the open doors (`open_append*`, `open_static`,
+//!   `stream_import`), `save_consensus_output`, the reads, `persist`, `close` and `seal_now`.
+//! - `PreparedOutput` and `OutputEncoder`: a save's encoding, outside the write lock, its batches
+//!   split across lanes.
+//! - `impl Inner`, in order:
+//!   - recovery (`files_consistent`, `recover_pack`, `replay_wal`);
+//!   - legacy migration (`migrate_*`) and index (re)builds (`build_static_indexes`);
+//!   - the opens (`open_indexes_*`, `open_append`, `open_append_exists`, `open_static`);
+//!   - peer import (`stream_import`, `import_streamed_output`);
+//!   - save (`check_save`, `append_prepared`, `rollback_output`);
+//!   - the reads (`consensus_header_by_*`, `bytes_for_consensus`, `batch`).
+//! - Output decode and verification: `bytes_to_verified_output`, `iter_to_output`.
+//! - `PackError`, then `mod test` (helpers first), which is more than half the file.
 
 use std::{
     cmp::max,

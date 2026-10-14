@@ -1,4 +1,17 @@
 //! Wrap access to the epoch consensus files into a single interface.
+//!
+//! ## Where things are
+//! - `LatestConsensus`: the double-buffered slot files holding the resume hint (an actor thread).
+//! - `impl ConsensusChain`, in order:
+//!   - `new` and the recent-header cache;
+//!   - the epoch handoff (`new_epoch`, `seal_previous_pack`);
+//!   - import and staging (`stream_import`, `import_partial_to_staging`,
+//!     `recover_incomplete_installs`, `install_imported_epoch_dir`);
+//!   - save and persist (`save_consensus_output`, `persist_current_timed`, `clamp_latest_to_pack`);
+//!   - the reads (`consensus_header_by_digest`, `consensus_output_by_number`, `get_batches`);
+//!   - the static-pack cache and its read-side heal (`get_static`, `heal_static`).
+//! - `ReadSideHeal`, the `ConsensusChainReader`/`ConsensusChainWriter` impls,
+//!   `ConsensusChainError` and `ImportPath`, then `mod tests`.
 
 use std::{
     collections::{HashMap, VecDeque},
