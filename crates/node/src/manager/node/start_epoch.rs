@@ -1290,15 +1290,6 @@ mod tests {
             Unsubscribe(WorkerId, String),
         }
 
-        /// A worker's batch-topic operation at epoch entry.
-        #[derive(Debug, PartialEq)]
-        enum BatchTopicChange {
-            /// Subscribe with the committee's authorized publishers.
-            Subscribe(WorkerId, String, Option<HashSet<BlsPublicKey>>),
-            /// Remove the batch subscription for an observer.
-            Unsubscribe(WorkerId, String),
-        }
-
         let temp = tempfile::TempDir::new()?;
         let count = NonZeroUsize::new(2).ok_or_else(|| eyre!("two workers"))?;
         let fixture =
