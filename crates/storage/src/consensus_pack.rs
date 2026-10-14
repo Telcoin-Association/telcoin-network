@@ -8,13 +8,13 @@ use std::{
     fmt::Display,
     hash::BuildHasherDefault,
     io::{self, Cursor},
+    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
-    thread::JoinHandle,
     time::Duration,
 };
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use tn_types::{
     gas_accumulator::RewardsCounter, max_batch_size, AuthorityIdentifier, Batch, BlockHash,
@@ -22,13 +22,7 @@ use tn_types::{
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Round, B256,
     MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
-use tokio::{
-    io::{AsyncRead, BufReader},
-    sync::{
-        mpsc::{self, Receiver, Sender},
-        oneshot,
-    },
-};
+use tokio::io::{AsyncRead, BufReader};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -42,7 +36,7 @@ use crate::{
         },
         fxhasher::FxHasher,
         index::Index as _,
-        pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
+        pack::{DataHeader, Pack, PackCompression, RecordEncoder, DATA_HEADER_BYTES},
         pack_iter::AsyncPackIter,
         position_index::index::{PosIndexValue, PositionIndex},
     },
@@ -180,38 +174,132 @@ impl PackRecord {
     }
 }
 
-enum PackMessage {
-    ConsensusOutput(ConsensusOutput, oneshot::Sender<Result<u64, PackError>>),
-    ContainsConsensusHeaderNumber(u64, oneshot::Sender<bool>),
-    ContainsConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<bool>),
-    ConsensusHeader(ConsensusHeaderDigest, oneshot::Sender<Option<ConsensusHeader>>),
-    ConsensusHeaderNumber(u64, oneshot::Sender<Result<ConsensusHeader, PackError>>),
-    Persist(oneshot::Sender<Result<(), PackError>>),
-    BytesForConsensus(u64, oneshot::Sender<Result<Vec<u8>, PackError>>),
-    OutputEndForConsensus(u64, oneshot::Sender<Result<u64, PackError>>),
-    ReadLastCommitted(oneshot::Sender<Result<HashMap<AuthorityIdentifier, Round>, PackError>>),
-    ReadLatestFinalRep(oneshot::Sender<Result<Option<CommittedSubDag>, PackError>>),
-    ContainsBatch(B256, oneshot::Sender<bool>),
-    Batch(B256, oneshot::Sender<Option<Batch>>),
-    CountLeaders(Round, RewardsCounter, oneshot::Sender<Result<(), PackError>>),
-    LatestConsensusHeader(oneshot::Sender<Result<Option<ConsensusHeader>, PackError>>),
-    LatestConsensusNumber(oneshot::Sender<u64>),
-    Shutdown,
-    AsyncShutdown(oneshot::Sender<()>),
-    // Flush the write buffer to the data file WITHOUT fsync, so freshly appended bytes
-    /// become visible to other file handles on the same file (visibility, not durability).
-    FlushData(oneshot::Sender<Result<(), PackError>>),
-    /// Read the logical data length (`end`) of the pack — the number of real record bytes,
-    /// ignoring the mmap capacity padding. A consumer copying the raw file bounds its read to
-    /// this so it never captures the trailing zero padding (or a later append).
-    DataFileLen(oneshot::Sender<u64>),
+/// A pack's state, shared by every [`ConsensusPack`] handle.
+///
+/// Reads take the read lock, any number at once, and never wait for a save's encoding or a
+/// persist's sync. A writer (a save, a persist, a flush, the close) takes the writer lock, so there
+/// is one at a time. A save encodes and compresses its records under that lock alone, then takes
+/// the write lock only to append them and index the output, so a reader sees an output whole or
+/// not at all. Closing takes the state out under the write lock: no read touches a pack's mappings
+/// while or after it is sealed, and a read after that finds no state and fails.
+struct Shared {
+    /// The pack's files and indexes; `None` once it is closed, or after a save panicked.
+    inner: RwLock<Option<Inner>>,
+    /// Serializes the writers, and holds the encoder a save encodes its records with before it
+    /// takes the write lock.
+    writer: Mutex<RecordEncoder>,
+}
+
+impl std::fmt::Debug for Shared {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Shared").field("open", &self.inner.read().is_some()).finish_non_exhaustive()
+    }
+}
+
+impl Shared {
+    /// Save `consensus` (see [`Inner::save_consensus_output`]): checked under the read lock,
+    /// encoded under the writer lock alone, then appended and indexed under the write lock.
+    fn save(&self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
+        let mut encoder = self.writer.lock();
+        let check = {
+            let guard = self.inner.read();
+            let inner = guard.as_ref().ok_or(PackError::SendFailed)?;
+            // Tests build genuine legacy (v0) packs to migrate, through the one-step save.
+            #[cfg(test)]
+            if inner.version() == 0 {
+                drop(guard);
+                return self.mutate(|inner| inner.save_consensus_output(consensus));
+            }
+            inner.check_save(consensus)?
+        };
+        let (consensus_idx, batches) = match check {
+            SaveCheck::Saved(bytes) => return Ok(bytes),
+            SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
+        };
+        let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
+        self.mutate(|inner| inner.append_prepared(&prepared))
+    }
+
+    /// Run `change` on the state under the write lock. A panic part way leaves the pack's state
+    /// unknown: it is taken out and dropped while the panic unwinds (so it is not sealed as clean,
+    /// and the next open recovers it from the data log), and every later use of the pack fails.
+    fn mutate<R>(
+        &self,
+        change: impl FnOnce(&mut Inner) -> Result<R, PackError>,
+    ) -> Result<R, PackError> {
+        let mut guard = self.inner.write();
+        let inner = guard.as_mut().ok_or(PackError::SendFailed)?;
+        match catch_unwind(AssertUnwindSafe(|| change(inner))) {
+            Ok(result) => result,
+            Err(panic) => {
+                let failed = guard.take();
+                drop(guard);
+                // Dropped by the unwind below, so its files skip the clean-close seal.
+                let _failed = failed;
+                resume_unwind(panic)
+            }
+        }
+    }
+
+    /// Make everything appended so far durable (see [`Inner::persist`]). The sync holds only the
+    /// read lock, so reads carry on while it runs.
+    fn persist(&self) -> Result<(), PackError> {
+        let _writer = self.writer.lock();
+        {
+            let guard = self.inner.read();
+            let inner = guard.as_ref().ok_or(PackError::SendFailed)?;
+            if inner.data.read_only() {
+                return Ok(());
+            }
+            inner.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+        }
+        // The commit marker, stamped after the sync so it never points past durable data.
+        self.mutate(|inner| {
+            inner.data.stamp_commit_marker();
+            Ok(())
+        })
+    }
+
+    /// Flush appended data to the page cache, without a sync (see [`Inner::flush_data`]).
+    fn flush(&self) -> Result<(), PackError> {
+        let _writer = self.writer.lock();
+        self.mutate(|inner| inner.flush_data())
+    }
+
+    /// Seal the pack: take its state out, after any running writer, and drop it (dropping it
+    /// commits the data, syncs the indexes and writes the clean-close sentinels). Idempotent.
+    fn close(&self) {
+        let _writer = self.writer.lock();
+        let inner = self.inner.write().take();
+        drop(inner);
+    }
+}
+
+impl Drop for Shared {
+    /// The last handle to a pack that was never closed: seal it as dropping its state does, but
+    /// never on a multi-threaded runtime's worker, which must not block on the clean-close syncs
+    /// (about 60-75 ms): there the seal runs on the blocking pool. On a current-thread runtime (or
+    /// none) it runs here, so a caller that drops a pack and reopens it finds it sealed.
+    fn drop(&mut self) {
+        let Some(inner) = self.inner.get_mut().take() else { return };
+        match tokio::runtime::Handle::try_current() {
+            Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+                rt.spawn_blocking(move || drop(inner));
+            }
+            _ => drop(inner),
+        }
+    }
 }
 
 /// Manage a single pack file of consensus data (typically one epoch os the consensus chain).
+///
+/// A cheap `Clone` handle on the pack's shared state (see [`Shared`]); it runs no thread of its
+/// own. Reads and writes run on tokio's blocking pool (a read may decompress and decode
+/// megabytes, a save encodes and compresses an output, a persist syncs), except constant-time
+/// lookups, which run on the caller.
 #[derive(Debug, Clone)]
 pub struct ConsensusPack {
-    tx: Sender<PackMessage>,
-    handle: Arc<Mutex<Option<JoinHandle<()>>>>,
+    shared: Arc<Shared>,
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
@@ -219,128 +307,12 @@ pub struct ConsensusPack {
     version: u16, // Version of the underlying data pack file.
 }
 
-fn run_pack_loop(mut inner: Inner, mut rx: Receiver<PackMessage>) {
-    // When this returns None then the channel is consumed and closed, so exit the thread.
-    // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
-    // below.
-    // Note: code in this thread should NEVER panic. If it does, unwinding drops `Inner`, but the
-    // data file's `Drop` does not seal while panicking: a mid-save panic leaves the pack
-    // unsealed, so the next open runs recovery and drops the incomplete output instead of
-    // trusting it.
-    let mut async_confirm: Option<oneshot::Sender<()>> = None;
-    while let Some(msg) = rx.blocking_recv() {
-        match msg {
-            PackMessage::ConsensusOutput(output, tx) => {
-                let _ = tx.send(inner.save_consensus_output(&output));
-            }
-            PackMessage::ContainsConsensusHeaderNumber(number, tx) => {
-                let _ = tx.send(inner.contains_consensus_header_number(number));
-            }
-            PackMessage::ContainsConsensusHeader(digest, tx) => {
-                let _ = tx.send(inner.contains_consensus_header(digest));
-            }
-            PackMessage::ConsensusHeader(digest, tx) => {
-                let _ = tx.send(inner.consensus_header_by_digest(digest));
-            }
-            PackMessage::ConsensusHeaderNumber(number, tx) => {
-                let _ = tx.send(inner.consensus_header_by_number(number));
-            }
-            PackMessage::Persist(tx) => {
-                let _ = tx.send(inner.persist());
-            }
-            PackMessage::BytesForConsensus(number, tx) => {
-                let _ = tx.send(inner.bytes_for_consensus(number));
-            }
-            PackMessage::OutputEndForConsensus(number, tx) => {
-                let _ = tx.send(inner.output_end_for_consensus(number));
-            }
-            PackMessage::ReadLastCommitted(tx) => {
-                let _ = tx.send(inner.read_last_committed());
-            }
-            PackMessage::ReadLatestFinalRep(tx) => {
-                let _ = tx.send(inner.read_latest_commit_with_final_reputation_scores());
-            }
-            PackMessage::ContainsBatch(digest, tx) => {
-                let _ = tx.send(inner.contains_batch(digest));
-            }
-            PackMessage::Batch(digest, tx) => {
-                let _ = tx.send(inner.batch(digest));
-            }
-            PackMessage::CountLeaders(last_executed_round, rewards_counter, tx) => {
-                let _ = tx.send(inner.count_leaders(last_executed_round, &rewards_counter));
-            }
-            PackMessage::LatestConsensusHeader(tx) => {
-                let _ = tx.send(inner.latest_consensus_header());
-            }
-            PackMessage::LatestConsensusNumber(tx) => {
-                let _ = tx.send(inner.latest_consensus_number());
-            }
-            PackMessage::Shutdown => break,
-            PackMessage::AsyncShutdown(tx) => {
-                // Confirm AFTER the clean-close below (not here) so `close().await` returns only
-                // once the pack is fully sealed: data committed, indexes synced, sentinels written.
-                async_confirm = Some(tx);
-                break;
-            }
-            PackMessage::FlushData(tx) => {
-                let _ = tx.send(inner.flush_data());
-            }
-            PackMessage::DataFileLen(tx) => {
-                let _ = tx.send(inner.data.file_len());
-            }
-        }
-    }
-    // Clean-close: dropping `inner` commits the data, ordered-syncs the indexes, and writes the
-    // clean-close sentinels. Do it before confirming an async shutdown; it also runs for the sync
-    // `Shutdown` and channel-closed paths (the sync `Drop`'s `join()` waits on this return).
-    drop(inner);
-    if let Some(tx) = async_confirm {
-        let _ = tx.send(());
-    }
-}
-
 impl Drop for ConsensusPack {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.handle) == 1 {
-            // If we are the last ConsensusPack then shutdown thread and wait for it to persist and
-            // exit. Reaching this with a live handle means close() was NOT used: a correct
-            // close().await already took the handle, so the block below is skipped. Drop is the
-            // safety net; the proper async path is close().await.
-            if let Some(handle) = self.handle.lock().take() {
-                if self.tx.is_closed() {
-                    // The actor already exited (only a panic ends it while a handle still holds
-                    // its join handle): there is nothing left to seal, and `close()` could not have
-                    // done better. Reap the finished thread and report why it ended.
-                    if let Err(e) = handle.join() {
-                        error!(target: "consensus_pack", ?e, epoch = self.epoch, "consensus pack thread had panicked");
-                    }
-                    return;
-                }
-                warn!(target: "consensus_pack", "ConsensusPack dropped without calling close(); sealing as a fallback");
-                if self.tx.try_send(PackMessage::Shutdown).is_err() {
-                    // Full bounded channel — detach. The actor clean-closes when the last Sender
-                    // drops; only the synchronous "sealed on return" wait is lost, and only on this
-                    // misuse path.
-                    error!(target: "consensus_pack", "Failed to send shutdown message to ConsensusPack (should be using close())");
-                    return;
-                }
-                let join = move || {
-                    if let Err(e) = handle.join() {
-                        error!(target: "consensus_pack", ?e, "Failed to join consensus pack thread");
-                    }
-                };
-                // Never block a multi-threaded runtime worker on the ~60-75ms clean-close fsyncs:
-                // offload the join to the blocking pool. On a current-thread runtime (nothing else
-                // to starve) or no runtime, a synchronous join keeps "sealed on
-                // return" for callers/tests that drop then immediately reopen.
-                // `close().await` is still the intended path.
-                match tokio::runtime::Handle::try_current() {
-                    Ok(rt) if rt.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
-                        rt.spawn_blocking(join);
-                    }
-                    _ => join(),
-                }
-            }
+        // The last handle, with the pack still open: `close()` was not used. Dropping the shared
+        // state seals it (see `Drop for Shared`); `close().await` is the intended path.
+        if Arc::strong_count(&self.shared) == 1 && self.shared.inner.read().is_some() {
+            warn!(target: "consensus_pack", epoch = self.epoch, "ConsensusPack dropped without calling close(); sealing as a fallback");
         }
     }
 }
@@ -481,22 +453,21 @@ impl ConsensusPack {
         committee: Committee,
         version: u16,
     ) -> Result<ConsensusPack, PackError> {
-        let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let epoch = committee.epoch();
         let inner = Inner::open_append(path.clone(), &previous_epoch, committee.clone(), version)?;
+        Ok(Self::from_inner(inner, epoch, committee, false))
+    }
+
+    /// A handle on `inner`, the pack of `epoch` opened for `committee` (`is_static`: complete and
+    /// read only).
+    fn from_inner(inner: Inner, epoch: Epoch, committee: Committee, is_static: bool) -> Self {
         let version = inner.version();
         let compression = inner.data.header().compression();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self {
-            tx,
-            handle: Arc::new(Mutex::new(Some(handle))),
-            epoch,
-            committee,
-            compression,
-            is_static: false,
-            version,
-        })
+        let encoder = RecordEncoder::new(compression, inner.data.max_record());
+        let shared =
+            Arc::new(Shared { inner: RwLock::new(Some(inner)), writer: Mutex::new(encoder) });
+        Self { shared, epoch, committee, compression, is_static, version }
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
@@ -506,42 +477,18 @@ impl ConsensusPack {
     /// earlier [`Self::open_append`] ran with the chain-derived committee. Today they reach only
     /// telemetry; `verify_epoch_meta` is where any field becomes authenticated.
     pub fn open_append_exists<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
-        let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let inner = Inner::open_append_exists(path.clone(), epoch)?;
-        let version = inner.version();
-        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self {
-            tx,
-            handle: Arc::new(Mutex::new(Some(handle))),
-            epoch,
-            committee,
-            compression,
-            is_static: false,
-            version,
-        })
+        Ok(Self::from_inner(inner, epoch, committee, false))
     }
 
     /// Open up the static files for previous epoch.  These will be read only.
     pub fn open_static<P: Into<PathBuf>>(path: P, epoch: Epoch) -> Result<Self, PackError> {
-        let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let inner = Inner::open_static(path.clone(), epoch)?;
-        let version = inner.version();
-        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
-        let handle = std::thread::spawn(move || run_pack_loop(inner, rx));
-        Ok(Self {
-            tx,
-            handle: Arc::new(Mutex::new(Some(handle))),
-            epoch,
-            committee,
-            compression,
-            is_static: true,
-            version,
-        })
+        Ok(Self::from_inner(inner, epoch, committee, true))
     }
 
     /// Build, off to the side and without touching anything live, the read-side heal a sealed past
@@ -989,7 +936,6 @@ impl ConsensusPack {
         timeout: Duration,
         min_free: u64,
     ) -> Result<ConsensusPack, PackError> {
-        let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let inner = Inner::stream_import(
             path,
@@ -1001,21 +947,8 @@ impl ConsensusPack {
             min_free,
         )
         .await?;
-        let version = inner.version();
-        let compression = inner.data.header().compression();
         let committee = inner.epoch_meta.committee.clone();
-        let handle = std::thread::spawn(move || {
-            run_pack_loop(inner, rx);
-        });
-        Ok(Self {
-            tx,
-            handle: Arc::new(Mutex::new(Some(handle))),
-            epoch,
-            committee,
-            compression,
-            is_static: true,
-            version,
-        })
+        Ok(Self::from_inner(inner, epoch, committee, true))
     }
 
     /// Is this packfile static- i.e. complete and read only.
@@ -1036,12 +969,60 @@ impl ConsensusPack {
         self.epoch
     }
 
-    /// True while the background actor thread is still serving requests. A `false` means the actor
-    /// exited (it only dies via a panic — there is no `panic = "abort"`), after which every lookup
-    /// wrapper collapses to `false`/`None`; the static-pack cache uses this to evict a dead handle
-    /// so the next access re-opens the epoch fresh.
+    /// True while the pack is open. A `false` means it was sealed, or a save panicked part way and
+    /// took it out of service, after which every lookup wrapper collapses to `false`/`None`; the
+    /// static-pack cache uses this to evict a dead handle so the next access re-opens the epoch
+    /// fresh.
     pub fn is_alive(&self) -> bool {
-        !self.tx.is_closed()
+        self.read_now(|_| ()).is_ok()
+    }
+
+    /// Run `read` on the pack's state on the blocking pool (a read may decompress and decode
+    /// megabytes), holding the read lock: alongside any number of other reads, and never behind a
+    /// save's encoding or a persist's sync. Fails once the pack is closed.
+    async fn read<R: Send + 'static>(
+        &self,
+        read: impl FnOnce(&Inner) -> R + Send + 'static,
+    ) -> Result<R, PackError> {
+        let shared = Arc::clone(&self.shared);
+        tokio::task::spawn_blocking(move || {
+            shared.inner.read().as_ref().map(read).ok_or(PackError::SendFailed)
+        })
+        .await
+        .map_err(|_| PackError::ReceiveFailed)?
+    }
+
+    /// [`Self::read`] for a constant-time lookup, run here.
+    fn read_now<R>(&self, read: impl FnOnce(&Inner) -> R) -> Result<R, PackError> {
+        self.shared.inner.read().as_ref().map(read).ok_or(PackError::SendFailed)
+    }
+
+    /// Run `write` on the blocking pool (see [`Shared`]).
+    async fn write<R: Send + 'static>(
+        &self,
+        write: impl FnOnce(&Shared) -> Result<R, PackError> + Send + 'static,
+    ) -> Result<R, PackError> {
+        let shared = Arc::clone(&self.shared);
+        tokio::task::spawn_blocking(move || write(&shared))
+            .await
+            .map_err(|_| PackError::ReceiveFailed)?
+    }
+
+    /// Test-only: the next save fails once its records are appended and indexed (see
+    /// `Inner::fail_save_after_append`).
+    #[cfg(test)]
+    pub(crate) fn fail_next_save(&self) {
+        if let Some(inner) = self.shared.inner.write().as_mut() {
+            inner.fail_save_after_append = true;
+        }
+    }
+
+    /// Test-only: the next save panics once its records are appended and indexed.
+    #[cfg(test)]
+    pub(crate) fn panic_next_save(&self) {
+        if let Some(inner) = self.shared.inner.write().as_mut() {
+            inner.panic_save_after_append = true;
+        }
     }
 
     /// Return the epoch-START committee this epoch's consensus output is decoded and verified
@@ -1066,23 +1047,12 @@ impl ConsensusPack {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<u64, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let len = if self.tx.send(PackMessage::ConsensusOutput(consensus, tx)).await.is_ok() {
-            rx.await.map_err(|_| PackError::ReceiveFailed)??
-        } else {
-            return Err(PackError::SendFailed);
-        };
-        Ok(len)
+        self.write(move |shared| shared.save(&consensus)).await
     }
 
     /// Load and return the consensus output form this epoch.
     pub async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
-            rx.await.map_err(|_| PackError::ReceiveFailed)??
-        } else {
-            return Err(PackError::SendFailed);
-        };
+        let bytes = self.read(move |inner| inner.bytes_for_consensus(number)).await??;
         decode_output_bytes(bytes, self.version, self.compression, &self.committee).await
     }
 
@@ -1121,12 +1091,7 @@ impl ConsensusPack {
 
     /// Load and return the pack file bytes for consensus output form this epoch.
     pub async fn get_consensus_output_bytes(&self, number: u64) -> Result<Vec<u8>, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let bytes = if self.tx.send(PackMessage::BytesForConsensus(number, tx)).await.is_ok() {
-            rx.await.map_err(|_| PackError::ReceiveFailed)?
-        } else {
-            Err(PackError::SendFailed)
-        }?;
+        let bytes = self.read(move |inner| inner.bytes_for_consensus(number)).await??;
         serve_output_bytes(bytes, self.version)
     }
 
@@ -1135,35 +1100,21 @@ impl ConsensusPack {
     /// pack containing every output up to and including `number` (plus the data header). Errors
     /// if `number` is outside the range this pack contains.
     pub async fn consensus_output_end(&self, number: u64) -> Result<u64, PackError> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::OutputEndForConsensus(number, tx)).await.is_ok() {
-            rx.await.map_err(|_| PackError::ReceiveFailed)?
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read_now(|inner| inner.output_end_for_consensus(number))?
     }
 
     /// True if consensus header by digest is found by digest.
     pub async fn contains_consensus_header_number(&self, number: u64) -> Result<bool, PackError> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::ContainsConsensusHeaderNumber(number, tx)).await.is_ok() {
-            Ok(rx.await.map_err(|_| PackError::ReceiveFailed)?)
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read_now(|inner| inner.contains_consensus_header_number(number))
     }
 
     /// True if consensus header by digest is found by digest.
     pub async fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::ContainsConsensusHeader(digest, tx)).await.is_ok() {
-            if let Ok(found) = rx.await {
-                return found;
-            }
+        if let Ok(found) = self.read(move |inner| inner.contains_consensus_header(digest)).await {
+            return found;
         }
-        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
-        // `false`.
-        error!(target: "consensus_pack", epoch = self.epoch(), "contains_consensus_header: pack actor unavailable (channel closed); reporting not-found");
+        // A closed pack is not a real miss — surface it instead of a silent `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_consensus_header: pack closed; reporting not-found");
         false
     }
 
@@ -1172,14 +1123,11 @@ impl ConsensusPack {
         &self,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::ConsensusHeader(digest, tx)).await.is_ok() {
-            if let Ok(header) = rx.await {
-                return header;
-            }
+        if let Ok(header) = self.read(move |inner| inner.consensus_header_by_digest(digest)).await {
+            return header;
         }
-        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
-        error!(target: "consensus_pack", epoch = self.epoch(), "consensus_header_by_digest: pack actor unavailable (channel closed); reporting not-found");
+        // A closed pack is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "consensus_header_by_digest: pack closed; reporting not-found");
         None
     }
 
@@ -1188,28 +1136,19 @@ impl ConsensusPack {
         &self,
         number: u64,
     ) -> Result<ConsensusHeader, PackError> {
-        let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(PackMessage::ConsensusHeaderNumber(number, tx))
-            .await
-            .map_err(|_| PackError::SendFailed)?;
-        rx.await.map_err(|_| PackError::ReceiveFailed)?
+        self.read(move |inner| inner.consensus_header_by_number(number)).await?
     }
 
     /// Durably commit the data file written since the last persist (an msync; size extensions are
     /// fsynced as they grow). Indexes are not synced: recovery rebuilds them from the data log.
     pub async fn persist(&self) -> Result<(), PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::Persist(tx)).await;
-        rx.await.map_err(|_| PackError::ReceiveFailed)?
+        self.write(|shared| shared.persist()).await
     }
 
     /// Flush buffered data to the page cache (visible to readers) without the fsync durability
     /// barrier that [`Self::persist`] provides.
     pub async fn flush_data(&self) -> Result<(), PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::FlushData(tx)).await;
-        rx.await.map_err(|_| PackError::ReceiveFailed)?
+        self.write(|shared| shared.flush()).await
     }
 
     /// The logical data length (`end`) of the pack: the number of real record bytes, excluding the
@@ -1217,22 +1156,14 @@ impl ConsensusPack {
     /// it captures exactly `[0, end)` (the immutable, append-only records) and never the
     /// trailing padding — regardless of the physical file size or any concurrent append.
     pub async fn data_file_len(&self) -> Result<u64, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::DataFileLen(tx)).await;
-        rx.await.map_err(|_| PackError::ReceiveFailed)
+        self.read_now(|inner| inner.data.file_len())
     }
 
     /// Read the last committed rounds for authorities from the epoch.
     pub async fn read_last_committed(
         &self,
     ) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::ReadLastCommitted(tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read(|inner| inner.read_last_committed()).await?
     }
 
     /// Reads from storage the latest commit sub dag from the epoch where its
@@ -1241,13 +1172,7 @@ impl ConsensusPack {
     pub async fn read_latest_commit_with_final_reputation_scores(
         &self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self.tx.send(PackMessage::ReadLatestFinalRep(tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read(|inner| inner.read_latest_commit_with_final_reputation_scores()).await?
     }
 
     /// Return the latest consensus header by reading directly from the pack index.
@@ -1257,12 +1182,7 @@ impl ConsensusPack {
     /// Fails closed: a read or channel failure is returned, never reported as "no header". See the
     /// note on the inner reader.
     pub async fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::LatestConsensusHeader(tx)).await.is_ok() {
-            rx.await.unwrap_or(Err(PackError::SendFailed))
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read(|inner| inner.latest_consensus_header()).await?
     }
 
     /// The latest stored consensus number, defined for ANY pack with a valid meta: `start + N - 1`
@@ -1271,39 +1191,43 @@ impl ConsensusPack {
     /// recovered pack (a meta-only pack is the deterministic epoch-boundary case, where
     /// [`Self::latest_consensus_header`] returns `None`).
     pub async fn latest_consensus_number(&self) -> Result<u64, PackError> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::LatestConsensusNumber(tx)).await.is_ok() {
-            rx.await.map_err(|_| PackError::SendFailed)
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read_now(|inner| inner.latest_consensus_number())
     }
 
     /// True if the pack contains the batch for digest.
     pub async fn contains_batch(&self, digest: BlockHash) -> bool {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::ContainsBatch(digest, tx)).await.is_ok() {
-            if let Ok(found) = rx.await {
-                return found;
-            }
+        if let Ok(found) = self.read(move |inner| inner.contains_batch(digest)).await {
+            return found;
         }
-        // A closed channel (dead actor) is not a real miss — surface it instead of a silent
-        // `false`.
-        error!(target: "consensus_pack", epoch = self.epoch(), "contains_batch: pack actor unavailable (channel closed); reporting not-found");
+        // A closed pack is not a real miss — surface it instead of a silent `false`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "contains_batch: pack closed; reporting not-found");
         false
     }
 
     /// Return the Batch for digest if found.
     pub async fn batch(&self, digest: BlockHash) -> Option<Batch> {
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::Batch(digest, tx)).await.is_ok() {
-            if let Ok(batch) = rx.await {
-                return batch;
+        if let Ok(batch) = self.read(move |inner| inner.batch(digest)).await {
+            return batch;
+        }
+        // A closed pack is not a real miss — surface it instead of a silent `None`.
+        error!(target: "consensus_pack", epoch = self.epoch(), "batch: pack closed; reporting not-found");
+        None
+    }
+
+    /// [`Self::batch`] for each of `digests`, in order, in one read.
+    pub async fn batches(&self, digests: Vec<BlockHash>) -> Vec<Option<Batch>> {
+        let count = digests.len();
+        match self
+            .read(move |inner| digests.into_iter().map(|digest| inner.batch(digest)).collect())
+            .await
+        {
+            Ok(batches) => batches,
+            Err(_) => {
+                // A closed pack is not a real miss — surface it instead of a silent `None`.
+                error!(target: "consensus_pack", epoch = self.epoch(), "batches: pack closed; reporting not-found");
+                vec![None; count]
             }
         }
-        // A closed channel (dead actor) is not a real miss — surface it instead of a silent `None`.
-        error!(target: "consensus_pack", epoch = self.epoch(), "batch: pack actor unavailable (channel closed); reporting not-found");
-        None
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -1312,14 +1236,7 @@ impl ConsensusPack {
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> Result<(), PackError> {
-        let (tx, rx) = oneshot::channel();
-        let _ =
-            self.tx.send(PackMessage::CountLeaders(last_executed_round, rewards_counter, tx)).await;
-        if let Ok(r) = rx.await {
-            r
-        } else {
-            Err(PackError::SendFailed)
-        }
+        self.read(move |inner| inner.count_leaders(last_executed_round, &rewards_counter)).await?
     }
 
     /// True when this is the only live handle to the pack, so [`Self::close`] will actually seal it
@@ -1327,23 +1244,22 @@ impl ConsensusPack {
     /// later `Drop`). Best-effort/racy — for diagnostics at an epoch handoff, not a
     /// synchronization point.
     pub fn is_sole_handle(&self) -> bool {
-        Arc::strong_count(&self.handle) == 1
+        Arc::strong_count(&self.shared) == 1
     }
 
     /// Take ownership and close async so we Drop does not get a chance to block any threads.
     /// Note, will only close if this is the last reference to this pack.
     /// Essentially this an async drop.
     pub async fn close(self) {
-        if Arc::strong_count(&self.handle) == 1 {
+        if Arc::strong_count(&self.shared) == 1 {
             self.seal_now().await;
         }
     }
 
-    /// Seal the pack now (clean-close: msync + truncate + sentinel via the actor's
-    /// `AsyncShutdown`), REGARDLESS of how many clones remain. Idempotent and drop-safe: the
-    /// join handle is taken under the lock, so only the first caller actually seals and a later
-    /// call — or a surviving clone's `Drop` — finds it gone and no-ops (no double-seal, no
-    /// panic).
+    /// Seal the pack now (clean-close: msync + truncate + sentinel), REGARDLESS of how many clones
+    /// remain. Idempotent and drop-safe: the state is taken out under the write lock, so only the
+    /// first caller actually seals and a later call — or a surviving clone's `Drop` — finds it gone
+    /// and no-ops (no double-seal, no panic).
     ///
     /// Used only at graceful shutdown, when a clone (e.g. a winding-down RPC connection) outlived
     /// the sole-owner drain: sealing under that clone is strictly better than leaving the pack
@@ -1351,31 +1267,21 @@ impl ConsensusPack {
     /// [`Self::close`].
     ///
     /// ## Why this is memory-safe under a live clone
-    /// The seal truncates the `data` file (dropping the mmap capacity padding) and stops the actor,
-    /// but a surviving clone cannot dangle on the freed mapping, because a `ConsensusPack` clone is
-    /// a CHANNEL-ONLY handle: it holds just `tx` + `handle` + `Copy` metadata, never a
-    /// `MmapDataFile`. The mmaps live solely in the actor's `Inner`, and every read/write is
-    /// mediated by a `PackMessage` on `tx` — so all mmap access happens on the one actor
-    /// thread, never concurrently with (or after) the seal it runs itself. `MmapDataFile::drop`
-    /// also unmaps BEFORE it truncates, and only the read-write current pack truncates
-    /// (read-only static/staging packs early-return) — and only the padding past `end`, which
-    /// no valid read touches. External byte-stream readers (`get_epoch_stream`, state export)
-    /// use a cloned fd + `pread` bounded to `end`, never the shared mmap. Once the actor exits,
-    /// a surviving clone's `tx.send`/`rx.await` return closed-channel errors — reads/writes
-    /// fail cleanly (`None`/`Err`, logged), never touching freed memory.
+    /// The seal truncates the `data` file (dropping the mmap capacity padding) and unmaps it, but a
+    /// surviving clone cannot dangle on the freed mapping. Every read holds the pack's read lock
+    /// while it touches mapped memory, and copies or decodes what it returns before it lets go;
+    /// the seal takes the state out under the write lock, so it waits for running reads and runs
+    /// alone. A read after it finds no state and fails cleanly (`None`/`Err`, logged).
+    /// `MmapDataFile::drop` also unmaps BEFORE it truncates, and only the read-write current pack
+    /// truncates (read-only static/staging packs early-return) — and only the padding past `end`,
+    /// which no valid read touches. External byte-stream readers (`get_epoch_stream`, state
+    /// export) use a cloned fd + `pread` bounded to `end`, never the shared mmap.
     ///
-    /// **Invariant this relies on:** never hand a clone direct mmap/file access to a pack's data —
-    /// keep every read and write channel-mediated — or this guarantee breaks.
+    /// **Invariant this relies on:** never hand out a reference into a pack's mappings that
+    /// outlives the read lock — copy or decode under it — or this guarantee breaks.
     pub(crate) async fn seal_now(&self) {
-        let Some(_handle) = self.handle.lock().take() else {
-            // Already sealed by a prior `seal_now`/`close` or a Drop; nothing to do.
-            return;
-        };
-        let (tx, rx) = oneshot::channel();
-        if self.tx.send(PackMessage::AsyncShutdown(tx)).await.is_ok() {
-            // Async wait for the clean-close confirmation instead of a sync `join()`.
-            let _ = rx.await;
-        }
+        let shared = Arc::clone(&self.shared);
+        let _ = tokio::task::spawn_blocking(move || shared.close()).await;
     }
 }
 
@@ -1583,6 +1489,47 @@ pub(crate) fn install_dir_rename_aside(
 }
 
 #[derive(Debug)]
+/// What [`Inner::check_save`] found for an output.
+enum SaveCheck {
+    /// Already in the pack: its encoded size there.
+    Saved(u64),
+    /// The next output: its index in this pack, and its batches by digest (the order they are
+    /// stored in).
+    Next { consensus_idx: u64, batches: BTreeMap<BlockHash, Batch> },
+}
+
+/// One output's records as the pack stores them (see [`RecordEncoder`]), made before the save
+/// takes the write lock, so readers never wait for its encoding and compression.
+struct PreparedOutput {
+    consensus_idx: u64,
+    digest: ConsensusHeaderDigest,
+    header: Vec<u8>,
+    batches: Vec<(BlockHash, Vec<u8>)>,
+}
+
+impl PreparedOutput {
+    /// Encode `consensus`, the output at `consensus_idx` in its pack with `batches` (see
+    /// [`Inner::check_save`]), the way the header-first layout stores it.
+    fn encode(
+        consensus: &ConsensusOutput,
+        consensus_idx: u64,
+        batches: BTreeMap<BlockHash, Batch>,
+        encoder: &mut RecordEncoder,
+    ) -> Result<Self, PackError> {
+        let encode =
+            |encoder: &mut RecordEncoder, record: &PackRecord| -> Result<Vec<u8>, PackError> {
+                encoder.encode(record).map_err(|e| PackError::Append(e.to_string()))
+            };
+        let header =
+            encode(encoder, &PackRecord::Consensus(Box::new(consensus.consensus_header())))?;
+        let batches = batches
+            .into_iter()
+            .map(|(digest, batch)| Ok((digest, encode(encoder, &PackRecord::Batch(batch))?)))
+            .collect::<Result<_, PackError>>()?;
+        Ok(Self { consensus_idx, digest: consensus.consensus_header_hash(), header, batches })
+    }
+}
+
 struct Inner {
     data: Pack<PackRecord>,
     /// Positional index pointing to the first byte of ConsensusHeader, the first byte of the first
@@ -1598,6 +1545,9 @@ struct Inner {
     /// worst case (data appended, indexes advanced).
     #[cfg(test)]
     fail_save_after_append: bool,
+    /// Test-only: when set, the next save panics once its records are appended and indexed.
+    #[cfg(test)]
+    panic_save_after_append: bool,
 }
 
 impl Inner {
@@ -2298,6 +2248,8 @@ impl Inner {
             epoch_meta,
             #[cfg(test)]
             fail_save_after_append: false,
+            #[cfg(test)]
+            panic_save_after_append: false,
         };
         inner.persist().map_err(MigrateAbort::Fatal)?;
         // Drop seals every backing file (msync + truncate-to-`end` + clean-close sentinel).
@@ -2987,6 +2939,8 @@ impl Inner {
             epoch_meta,
             #[cfg(test)]
             fail_save_after_append: false,
+            #[cfg(test)]
+            panic_save_after_append: false,
         })
     }
 
@@ -3067,6 +3021,8 @@ impl Inner {
             epoch_meta,
             #[cfg(test)]
             fail_save_after_append: false,
+            #[cfg(test)]
+            panic_save_after_append: false,
         })
     }
 
@@ -3149,6 +3105,8 @@ impl Inner {
             epoch_meta,
             #[cfg(test)]
             fail_save_after_append: false,
+            #[cfg(test)]
+            panic_save_after_append: false,
         })
     }
 
@@ -3246,6 +3204,8 @@ impl Inner {
             epoch_meta,
             #[cfg(test)]
             fail_save_after_append: false,
+            #[cfg(test)]
+            panic_save_after_append: false,
         };
         // Fill the pack from the stream. Any error abandons the partial pack cheaply: a peer can
         // stream data and then send a bad record, and letting `pack` drop normally would msync +
@@ -3466,7 +3426,7 @@ impl Inner {
     }
 
     /// Record a fully imported output in the position index and advance the digest indexes'
-    /// data-length markers (the same bookkeeping as [`Self::append_output_records`]).
+    /// data-length markers (the same bookkeeping as [`Self::append_prepared_records`]).
     fn finish_imported_output(
         &mut self,
         consensus_idx: u64,
@@ -3482,6 +3442,7 @@ impl Inner {
     }
 
     /// Write the batches for consensus to the pack file.
+    #[cfg(test)]
     fn save_consensus_batches(
         &mut self,
         batches: BTreeMap<BlockHash, Batch>,
@@ -3508,7 +3469,34 @@ impl Inner {
     /// Atomic: the append + index updates either all land, or the data log is rolled back to
     /// exactly its pre-save state, so a failed save never leaves an orphan record for an
     /// in-process retry to duplicate (a duplicate a later WAL rebuild would mis-sequence).
+    ///
+    /// Test-only, in one step on `Inner` (tests drive it directly, and build legacy v0 packs
+    /// with it); a handle saves through [`Shared::save`], which runs the same steps with the
+    /// encoding outside the write lock.
+    #[cfg(test)]
     fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
+        let (consensus_idx, batches) = match self.check_save(consensus)? {
+            SaveCheck::Saved(bytes) => return Ok(bytes),
+            SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
+        };
+        if self.version() == 0 {
+            let data_start = self.data.file_len();
+            let pos_idx_start = self.consensus_pos_idx.len();
+            return self
+                .append_output_records_v0(consensus, consensus_idx, batches)
+                .inspect_err(|_| self.rollback_output(data_start, pos_idx_start));
+        }
+        let mut encoder =
+            RecordEncoder::new(self.data.header().compression(), self.data.max_record());
+        let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
+        self.append_prepared(&prepared)
+    }
+
+    /// Whether `consensus` may be saved next: already in the pack (a no-op; its encoded size), the
+    /// next output (its index in this pack, and its batches by digest), or an error (the wrong
+    /// epoch or number, a different output under a stored number, or a batch set that does not
+    /// match its sub-dag). Writes nothing.
+    fn check_save(&self, consensus: &ConsensusOutput) -> Result<SaveCheck, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
@@ -3540,13 +3528,13 @@ impl Inner {
             // under a stored number must not be reported as persisted (and then executed) while
             // the pack keeps the other one. We do need to return the bytes this output requires in
             // the pack file.
-            let pos = self.consensus_pos_idx.load(consensus_idx)?;
+            let pos = self.consensus_pos_idx.get(consensus_idx)?;
             let stored = self.data.fetch(pos.consensus_header)?.into_consensus()?.digest();
             let got = consensus.consensus_header_hash();
             if stored != got {
                 return Err(PackError::ConflictingOutput { number: consensus_number, stored, got });
             }
-            return Ok(pos.output_end.saturating_sub(pos.output_start));
+            return Ok(SaveCheck::Saved(pos.output_end.saturating_sub(pos.output_start)));
         } else if consensus_idx as usize != self.consensus_pos_idx.len() {
             return Err(PackError::InvalidConsensusNumber(
                 self.consensus_pos_idx.len() as u64 + self.epoch_meta.start_consensus_number,
@@ -3570,10 +3558,16 @@ impl Inner {
                 return Err(PackError::ExtraBatches);
             }
         }
-        // Snapshot the exact pre-append state so any mid-save error rolls back to it atomically.
+        Ok(SaveCheck::Next { consensus_idx, batches })
+    }
+
+    /// Append an output encoded by [`PreparedOutput::encode`] (after [`Self::check_save`] found it
+    /// next, with no save since) and index it, atomically: the same records and indexes, and the
+    /// same rollback, as [`Self::save_consensus_output`].
+    fn append_prepared(&mut self, prepared: &PreparedOutput) -> Result<u64, PackError> {
         let data_start = self.data.file_len();
         let pos_idx_start = self.consensus_pos_idx.len();
-        match self.append_output_records(consensus, consensus_idx, batches) {
+        match self.append_prepared_records(prepared) {
             Ok(bytes) => Ok(bytes),
             Err(e) => {
                 self.rollback_output(data_start, pos_idx_start);
@@ -3582,30 +3576,27 @@ impl Inner {
         }
     }
 
-    /// Append one output's records (header + batches) and index them. Split from
-    /// [`Self::save_consensus_output`] so a mid-way error can be rolled back atomically by
-    /// [`Self::rollback_output`]. The header-first layout writes the header, then its batches.
-    fn append_output_records(
-        &mut self,
-        consensus: &ConsensusOutput,
-        consensus_idx: u64,
-        batches: BTreeMap<BlockHash, Batch>,
-    ) -> Result<u64, PackError> {
-        // Tests build genuine legacy (v0) packs to migrate; a release build never writes one.
-        #[cfg(test)]
-        if self.version() == 0 {
-            return self.append_output_records_v0(consensus, consensus_idx, batches);
-        }
-        let consensus_digest = consensus.consensus_header_hash();
+    /// Append an output already encoded, in the header-first layout: the header, then its batches
+    /// in digest order, each indexed, then the output's position entry.
+    fn append_prepared_records(&mut self, prepared: &PreparedOutput) -> Result<u64, PackError> {
         let position = self
             .data
-            .append(&PackRecord::Consensus(Box::new(consensus.consensus_header())))
+            .append_stored(&prepared.header)
             .map_err(|e| PackError::Append(e.to_string()))?;
-        self.save_consensus_batches(batches)?;
-        self.index_appended_output(consensus_digest, consensus_idx, position, position)
+        for (digest, stored) in &prepared.batches {
+            let batch_position =
+                self.data.append_stored(stored).map_err(|e| PackError::Append(e.to_string()))?;
+            self.batch_digests
+                .save(*digest, batch_position)
+                .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+            let len = self.data.file_len();
+            self.consensus_digests.set_data_file_length(len);
+            self.batch_digests.set_data_file_length(len);
+        }
+        self.index_appended_output(prepared.digest, prepared.consensus_idx, position, position)
     }
 
-    /// Test-only: [`Self::append_output_records`] in the legacy v0 (batches-first) layout, the
+    /// Test-only: an output's records in the legacy v0 (batches-first) layout, the
     /// output's batches before its header, so tests can build the packs a pre-v1 build left on
     /// disk for the migration to read.
     #[cfg(test)]
@@ -3646,6 +3637,12 @@ impl Inner {
         self.consensus_digests.set_data_file_length(len);
         self.batch_digests.set_data_file_length(len);
 
+        // Test-only: a panic at the same worst case.
+        #[cfg(test)]
+        if std::mem::take(&mut self.panic_save_after_append) {
+            panic!("injected panic mid-save");
+        }
+
         // Test-only: exercise the rollback at its worst case (everything appended and indexed).
         #[cfg(test)]
         if self.fail_save_after_append {
@@ -3657,7 +3654,7 @@ impl Inner {
     }
 
     /// Roll the data log and position index back to the snapshot captured before a failed
-    /// [`Self::append_output_records`], and mark the digest indexes for rebuild — making the save
+    /// [`Self::append_prepared_records`], and mark the digest indexes for rebuild — making the save
     /// atomic.
     ///
     /// The data log's logical end is moved back with [`Pack::rewind_to`] (zeroing the abandoned
@@ -3701,7 +3698,7 @@ impl Inner {
     /// record is re-hashed against `digest`. That way a stale index entry left by a rolled-back
     /// save — one that now points at an offset reused by a *different* record — can never report a
     /// spurious hit (which would wrongly suppress storing the real header).
-    fn contains_consensus_header(&mut self, digest: ConsensusHeaderDigest) -> bool {
+    fn contains_consensus_header(&self, digest: ConsensusHeaderDigest) -> bool {
         self.consensus_header_by_digest(digest).is_some()
     }
 
@@ -3714,14 +3711,11 @@ impl Inner {
     /// hardening. Under the epoch-gated seed-signature serde, pre-fork packs stay decodable and
     /// the logged arms should never fire - they are the difference between a loud signal and
     /// silent chain corruption for every future format change.
-    fn consensus_header_by_digest(
-        &mut self,
-        digest: ConsensusHeaderDigest,
-    ) -> Option<ConsensusHeader> {
+    fn consensus_header_by_digest(&self, digest: ConsensusHeaderDigest) -> Option<ConsensusHeader> {
         let epoch = self.epoch_meta.epoch;
         let pos = self
             .consensus_digests
-            .load(digest.into())
+            .get(digest.into())
             .inspect_err(|e| {
                 if !fetch_error_is_absent(e) {
                     error!(target: "consensus_pack", epoch, ?digest, "consensus digest index lookup failed (not a miss): {e}");
@@ -3758,7 +3752,7 @@ impl Inner {
     }
 
     /// Retrieve a consensus header by number.
-    fn consensus_header_by_number(&mut self, number: u64) -> Result<ConsensusHeader, PackError> {
+    fn consensus_header_by_number(&self, number: u64) -> Result<ConsensusHeader, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -3768,7 +3762,7 @@ impl Inner {
         }
         let pos = self
             .consensus_pos_idx
-            .load(number.saturating_sub(self.epoch_meta.start_consensus_number))?
+            .get(number.saturating_sub(self.epoch_meta.start_consensus_number))?
             .consensus_header;
         self.data.fetch(pos)?.into_consensus()
     }
@@ -3798,7 +3792,7 @@ impl Inner {
     }
 
     /// Read and return all the bytes for consensus number (all batches and the consensus header).
-    fn bytes_for_consensus(&mut self, number: u64) -> Result<Vec<u8>, PackError> {
+    fn bytes_for_consensus(&self, number: u64) -> Result<Vec<u8>, PackError> {
         // Validate the range like consensus_header_by_number; without this a number below
         // start_consensus_number would saturate to index 0 and silently return the epoch's
         // first output instead of an error.
@@ -3811,7 +3805,7 @@ impl Inner {
         let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
         let IndexPositions { consensus_header: _, output_start, output_end } = self
             .consensus_pos_idx
-            .load(rec_pos_idx)
+            .get(rec_pos_idx)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         let bytes = self
             .data
@@ -3822,7 +3816,7 @@ impl Inner {
 
     /// Return the byte offset in the data file just past the end of the consensus output for
     /// `number` (the `output_end` of its index entry). Range-checked like `bytes_for_consensus`.
-    fn output_end_for_consensus(&mut self, number: u64) -> Result<u64, PackError> {
+    fn output_end_for_consensus(&self, number: u64) -> Result<u64, PackError> {
         if number < self.epoch_meta.start_consensus_number {
             return Err(PackError::ConsensusNumberTooLow);
         }
@@ -3832,7 +3826,7 @@ impl Inner {
         let rec_pos_idx = number.saturating_sub(self.epoch_meta.start_consensus_number);
         let pos = self
             .consensus_pos_idx
-            .load(rec_pos_idx)
+            .get(rec_pos_idx)
             .map_err(|e| PackError::ReadError(e.to_string()))?;
         Ok(pos.output_end)
     }
@@ -3845,7 +3839,7 @@ impl Inner {
     /// header's sub-dag as the epoch seed chain anchor, and an absent anchor means "start a fresh
     /// chain", so collapsing an error into `None` would silently re-root the chain and fork
     /// execution permanently.
-    fn latest_consensus_header(&mut self) -> Result<Option<ConsensusHeader>, PackError> {
+    fn latest_consensus_header(&self) -> Result<Option<ConsensusHeader>, PackError> {
         if self.consensus_pos_idx.is_empty() {
             return Ok(None);
         }
@@ -3866,9 +3860,9 @@ impl Inner {
             .saturating_sub(1)
     }
 
-    fn read_last_committed(&mut self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
+    fn read_last_committed(&self) -> Result<HashMap<AuthorityIdentifier, Round>, PackError> {
         let mut res = HashMap::new();
-        let iter = self.consensus_pos_idx.rev_iter(50)?;
+        let iter = self.consensus_pos_idx.rev_iter_shared(50)?;
         for pos in iter {
             let pos = pos?;
             let block = self.data.fetch(pos.consensus_header)?.into_consensus()?;
@@ -3886,9 +3880,9 @@ impl Inner {
     }
 
     fn read_latest_commit_with_final_reputation_scores(
-        &mut self,
+        &self,
     ) -> Result<Option<CommittedSubDag>, PackError> {
-        let iter = self.consensus_pos_idx.rev_iter(1000)?;
+        let iter = self.consensus_pos_idx.rev_iter_shared(1000)?;
         for pos in iter {
             let pos = pos?;
             let commit = self.data.fetch(pos.consensus_header)?.into_consensus()?.sub_dag;
@@ -3911,16 +3905,16 @@ impl Inner {
     /// masking + digest re-verification) and can never report a spurious hit from a stale index
     /// entry that points at an offset reused by a different record. A miss short-circuits in
     /// `load` before any fetch, so only a genuine hit pays the read.
-    fn contains_batch(&mut self, digest: BlockHash) -> bool {
+    fn contains_batch(&self, digest: BlockHash) -> bool {
         self.batch(digest).is_some()
     }
 
     /// Return the Batch for digest if found.
-    fn batch(&mut self, digest: BlockHash) -> Option<Batch> {
+    fn batch(&self, digest: BlockHash) -> Option<Batch> {
         let epoch = self.epoch_meta.epoch;
         let pos = self
             .batch_digests
-            .load(digest)
+            .get(digest)
             .inspect_err(|e| {
                 if !fetch_error_is_absent(e) {
                     error!(target: "consensus_pack", epoch, ?digest, "batch digest index lookup failed (not a miss): {e}");
@@ -3946,12 +3940,12 @@ impl Inner {
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
     fn count_leaders(
-        &mut self,
+        &self,
         last_executed_round: Round,
         rewards_counter: &RewardsCounter,
     ) -> Result<(), PackError> {
         let headers = self.consensus_pos_idx.len();
-        let iter = self.consensus_pos_idx.rev_iter(headers)?;
+        let iter = self.consensus_pos_idx.rev_iter_shared(headers)?;
         for pos in iter {
             let pos = pos?;
             let header = self
@@ -5267,6 +5261,187 @@ pub(crate) mod test {
                 "header digest must be found after mmap reopen",
             );
         }
+    }
+
+    /// A pack and the outputs to save into it, chained from the default header.
+    fn pack_with_outputs(
+        dir: &std::path::Path,
+        count: u64,
+    ) -> (ConsensusPack, EpochRecord, Committee, Vec<ConsensusOutput>) {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let pack = ConsensusPack::open_append(dir, previous_epoch.clone(), committee.clone())
+            .expect("open pack");
+        let mut parent = ConsensusHeader::default().digest();
+        let outputs = (1..=count)
+            .map(|number| {
+                let output = make_test_output(
+                    &committee,
+                    (number as usize) % 4,
+                    chain.clone(),
+                    number,
+                    parent,
+                );
+                parent = output.consensus_header_hash();
+                output
+            })
+            .collect();
+        (pack, previous_epoch, committee, outputs)
+    }
+
+    /// The batch digests of `output`.
+    fn batch_digests_of(output: &ConsensusOutput) -> Vec<BlockHash> {
+        output.batches().iter().flat_map(|c| c.batches.iter().map(Batch::digest)).collect()
+    }
+
+    /// Reads run on other threads while saves land, and every output a reader can see (its number
+    /// at or below the latest) reads back whole: its header by number and by digest, and each of
+    /// its batches, one at a time and all at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_consensus_pack_reads_run_beside_saves() {
+        let temp_dir = TempDir::with_prefix("test_pack_reads_beside_saves").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 40);
+        let outputs = Arc::new(outputs);
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let readers: Vec<_> = (0..4)
+            .map(|reader| {
+                let (pack, outputs, done) = (pack.clone(), outputs.clone(), done.clone());
+                tokio::spawn(async move {
+                    let mut reads = 0_u64;
+                    let mut next = reader as u64;
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        let latest = pack.latest_consensus_number().await.expect("latest");
+                        if latest == 0 {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        next = next % latest + 1;
+                        let output = &outputs[next as usize - 1];
+                        let digest = output.consensus_header_hash();
+                        let header = pack.consensus_header_by_number(next).await.expect("visible");
+                        assert_eq!(header.digest(), digest, "output {next} by number");
+                        let by_digest = pack.consensus_header_by_digest(digest).await;
+                        assert_eq!(by_digest.map(|h| h.digest()), Some(digest), "by digest");
+                        let digests = batch_digests_of(output);
+                        for d in &digests {
+                            let batch = pack.batch(*d).await.expect("a visible output's batch");
+                            assert_eq!(batch.digest(), *d);
+                        }
+                        let all = pack.batches(digests.clone()).await;
+                        assert!(all
+                            .iter()
+                            .zip(&digests)
+                            .all(|(b, d)| b.as_ref().map(Batch::digest) == Some(*d)));
+                        reads += 1;
+                    }
+                    reads
+                })
+            })
+            .collect();
+        for (i, output) in outputs.iter().enumerate() {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+            if i % 4 == 0 {
+                pack.persist().await.expect("persist");
+            }
+        }
+        done.store(true, std::sync::atomic::Ordering::Release);
+        let mut reads = 0;
+        for reader in readers {
+            reads += reader.await.expect("reader");
+        }
+        assert!(reads > 0, "the readers ran");
+        assert_eq!(pack.latest_consensus_number().await.expect("latest"), 40);
+        pack.close().await;
+    }
+
+    /// A save that fails part way (its records appended and indexed, then rolled back) is never
+    /// visible: not to readers running beside it, and not after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_consensus_pack_failed_save_is_never_visible() {
+        let temp_dir = TempDir::with_prefix("test_pack_failed_save_unseen").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 6);
+        for output in &outputs[..5] {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        let failed = outputs[5].clone();
+        let earlier: std::collections::HashSet<BlockHash> =
+            outputs[..5].iter().flat_map(batch_digests_of).collect();
+        let unseen: Vec<BlockHash> =
+            batch_digests_of(&failed).into_iter().filter(|d| !earlier.contains(d)).collect();
+        assert!(!unseen.is_empty(), "the failed output has batches of its own");
+        let digest = failed.consensus_header_hash();
+        let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        async fn check(pack: ConsensusPack, digest: ConsensusHeaderDigest, unseen: Vec<BlockHash>) {
+            assert_eq!(pack.latest_consensus_number().await.expect("latest"), 5);
+            assert!(pack.consensus_header_by_digest(digest).await.is_none(), "its header");
+            assert!(pack.batches(unseen).await.iter().all(Option::is_none), "its batches");
+        }
+        let readers: Vec<_> = (0..4)
+            .map(|_| {
+                let (pack, unseen, done) = (pack.clone(), unseen.clone(), done.clone());
+                tokio::spawn(async move {
+                    while !done.load(std::sync::atomic::Ordering::Acquire) {
+                        check(pack.clone(), digest, unseen.clone()).await;
+                    }
+                })
+            })
+            .collect();
+        pack.fail_next_save();
+        let err = pack.save_consensus_output(failed).await.expect_err("injected failure");
+        assert!(matches!(err, super::PackError::IndexAppend(_)), "{err:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        done.store(true, std::sync::atomic::Ordering::Release);
+        for reader in readers {
+            reader.await.expect("reader");
+        }
+        check(pack.clone(), digest, unseen).await;
+        pack.close().await;
+    }
+
+    /// A save that panics part way takes the pack out of service: the save fails, and so does every
+    /// later read. The pack is not sealed as clean, so reopening it recovers from the data log:
+    /// every output saved before the panic, and the one it cut off only as far as whole outputs
+    /// reached the log (here the panic came after all its records were appended, so it is whole).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_consensus_pack_panicking_save_takes_the_pack_out_of_service() {
+        let temp_dir = TempDir::with_prefix("test_pack_panicking_save").expect("temp dir");
+        let (pack, previous_epoch, committee, outputs) = pack_with_outputs(temp_dir.path(), 4);
+        for output in &outputs[..3] {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        pack.persist().await.expect("persist");
+        pack.panic_next_save();
+        let err = pack.save_consensus_output(outputs[3].clone()).await.expect_err("panicked");
+        assert!(matches!(err, super::PackError::ReceiveFailed), "{err:?}");
+        assert!(!pack.is_alive(), "out of service");
+        assert!(pack.latest_consensus_number().await.is_err());
+        assert!(pack.batch(batch_digests_of(&outputs[0])[0]).await.is_none());
+        drop(pack);
+        let data = Pack::<PackRecord>::open(
+            temp_dir.path().join("epoch-0").join(Inner::DATA_NAME),
+            0,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .expect("open the data log");
+        assert!(data.opened_unclean(), "a panicked save's state is never sealed as clean");
+        drop(data);
+        let reopened = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee)
+            .expect("reopen recovers");
+        assert_eq!(reopened.latest_consensus_number().await.expect("latest"), 4);
+        for (i, output) in outputs.iter().enumerate() {
+            let read = reopened.get_consensus_output(i as u64 + 1).await.expect("read back");
+            compare_outputs(&read, output);
+        }
+        reopened.close().await;
     }
 
     #[tokio::test]

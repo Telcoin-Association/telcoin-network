@@ -8,9 +8,15 @@
 #                           tndb, tndb group, production MDBX); skips the reference columns
 #                           that sync every write, which dominate the run time on a disk whose
 #                           fsync flushes its cache (most Linux setups), and runs 3 compaction-cost
-#                           pairs instead of 6. About 25-35 minutes on a laptop NVMe.
+#                           pairs instead of 6. About 30-40 minutes on a laptop NVMe.
 #   ROUNDS=1 ...            runs each workload once instead of three times (default 3; 1 if QUICK)
 #   ONLY="workload_mixed"   runs only the named workloads (space separated)
+#
+# Every run also ends with `consensus_pack_workload` (tn-storage `pack_bench`): production-shaped
+# consensus outputs saved and made durable at 2 a second while readers query the pack, at N=10 and
+# N=50 with 16 KB and 256 KB batches (about 7 minutes). TN_BENCH_PACK_RATE / TN_BENCH_PACK_OUTPUTS /
+# TN_BENCH_PACK_BATCH_KB / TN_BENCH_PACK_COMMITTEE / TN_BENCH_PACK_MAX_MB / TN_BENCH_PACK_READ_SECS
+# override it (see the bench's docs); ONLY="consensus_pack_workload" runs it alone.
 #
 # The compaction-cost pairs (`workload_mixed_compaction`) run at a busy node's batch rate, 1 MB
 # batches 25 times a second, for 6000 rounds a run: long enough for the batch log to reach its
@@ -71,7 +77,9 @@ if ! cargo test --release -p tn-storage --all-features --lib --no-run >"$build_l
 fi
 bin="$repo/$(grep -o 'target/release/deps/tn_storage-[0-9a-f]*' "$build_log" | head -1)"
 rm -f "$build_log"
-if ! "$bin" --list --ignored 2>/dev/null | grep -q 'workload_mixed_compaction'; then
+tests="$("$bin" --list --ignored 2>/dev/null || true)"
+if ! grep -q 'workload_mixed_compaction' <<<"$tests" ||
+    ! grep -q 'consensus_pack_workload' <<<"$tests"; then
     echo "error: $bin lacks the baseline workloads; is this the tree with the tndb work?" >&2
     exit 1
 fi
@@ -145,10 +153,24 @@ quick_columns() {
     esac
 }
 
+# A bench's test path: the pack workload lives in `pack_bench`, the rest in `workload_bench`.
+test_path() {
+    case "$1" in
+        consensus_pack_workload) echo "pack_bench::$1" ;;
+        *) echo "workload_bench::$1" ;;
+    esac
+}
+
 run() {
-    local name="$1" label="$2" out start end status rss="" columns=""
+    local name="$1" label="$2" out start end status rss="" columns="" path fork_env=""
     out="$(mktemp)"
+    path="$(test_path "$name")"
     [ -n "$quick" ] && columns="$(quick_columns "$name")"
+    # The pack workload writes headers in the mainnet layout. This binary has every feature, so
+    # `adiri`, whose epoch 0 predates the seed-signature and millisecond-timestamp forks;
+    # `test-utils` lets these overrides move both forks to genesis.
+    [ "$name" = consensus_pack_workload ] &&
+        fork_env="TN_SEED_SIGNATURE_FORK_EPOCH=0 TN_SUBSECOND_TIMESTAMP_FORK_EPOCH=0"
     echo "running $name ($label)..."
     section "WORKLOAD $name $label"
     kv load "$(uptime | sed 's/.*load average[s]*: //')"
@@ -156,13 +178,13 @@ run() {
     start="$(date +%s)"
     set +e
     if [ "$os" = "Linux" ] && [ -x /usr/bin/time ]; then
-        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" "$bin" \
-            "workload_bench::$name" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 /usr/bin/time -v -o "$out.time" \
+            env $fork_env "$bin" "$path" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
         rss="$(awk -F: '/Maximum resident set size/ {gsub(/ /, "", $2); print $2 " KiB"}' "$out.time")"
     else
-        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 "$bin" \
-            "workload_bench::$name" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
+        TN_BENCH_COLUMNS="$columns" TMPDIR="$bench_dir" NO_COLOR=1 env $fork_env "$bin" \
+            "$path" --exact --ignored --nocapture --test-threads 1 >"$out" 2>&1
         status=$?
     fi
     set -e
@@ -186,6 +208,7 @@ done
 if [ -z "${ONLY:-}" ]; then
     run workload_startup_reload "run 1"
     run workload_mixed_compaction "run 1"
+    run consensus_pack_workload "run 1"
 fi
 
 section END

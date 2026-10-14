@@ -430,9 +430,17 @@ pub struct ConsensusChain {
     /// also stages into a directory of its own, so clearing the installed pack never touches an
     /// import still streaming.
     staging_import: Arc<tokio::sync::Mutex<()>>,
+    /// The last few headers [`Self::consensus_header_by_digest`] read from a pack, newest last:
+    /// asked again (the primary asks for the last executed one on every gossiped certificate),
+    /// one is answered here instead of decompressing and decoding its whole sub-dag again. Each is
+    /// exactly what the pack returned.
+    recent_headers: Arc<Mutex<VecDeque<ConsensusHeader>>>,
 }
 
 impl ConsensusChain {
+    /// How many recently read headers [`Self::consensus_header_by_digest`] answers from memory.
+    const RECENT_HEADERS: usize = 8;
+
     /// How many recently opened pack files to maintain.
     const PACK_CACHE_SIZE: usize = 10;
 
@@ -495,7 +503,31 @@ impl ConsensusChain {
             heal_locks: Arc::new(Mutex::new(HashMap::new())),
             heal_failures: Arc::new(Mutex::new(HashMap::new())),
             staging_import: Arc::new(tokio::sync::Mutex::new(())),
+            recent_headers: Arc::new(Mutex::new(VecDeque::new())),
         })
+    }
+
+    /// Remember `header`, just read from a pack (see `recent_headers`).
+    fn remember_header(&self, header: ConsensusHeader) {
+        let mut recent = self.recent_headers.lock();
+        if recent.len() == Self::RECENT_HEADERS {
+            recent.pop_front();
+        }
+        recent.push_back(header);
+    }
+
+    /// The remembered header of `epoch` with `digest`, if it is one of the last few read.
+    fn recent_header(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> Option<ConsensusHeader> {
+        let recent = self.recent_headers.lock();
+        recent
+            .iter()
+            .rev()
+            .find(|header| header.sub_dag.leader_epoch() == epoch && header.digest() == digest)
+            .cloned()
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -614,10 +646,10 @@ impl ConsensusChain {
     /// Seal the just-replaced previous-epoch pack now, even if a reader still holds a clone.
     ///
     /// Readers clone the current pack only for the duration of one request, so give them a short
-    /// grace to finish, then seal regardless. `seal_now` is safe under a live clone: clones hold
-    /// only the actor's channel, requests already queued are served before the seal, and a later
-    /// request on a straggling clone fails cleanly instead of the epoch staying unsealed until that
-    /// clone drops. The seal runs on the actor thread and is awaited asynchronously, so this never
+    /// grace to finish, then seal regardless. `seal_now` is safe under a live clone: reads running
+    /// under the pack's read lock finish before the seal takes the state out, and a later request
+    /// on a straggling clone fails cleanly instead of the epoch staying unsealed until that clone
+    /// drops. The seal runs on the blocking pool and is awaited asynchronously, so this never
     /// blocks a tokio worker.
     async fn seal_previous_pack(old_pack: ConsensusPack) {
         let deadline = tokio::time::Instant::now() + Self::HANDOFF_SEAL_GRACE;
@@ -1142,6 +1174,22 @@ impl ConsensusChain {
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
+        if let Some(header) = self.recent_header(epoch, digest) {
+            return Ok(Some(header));
+        }
+        let found = self.consensus_header_by_digest_from_packs(epoch, digest).await?;
+        if let Some(header) = &found {
+            self.remember_header(header.clone());
+        }
+        Ok(found)
+    }
+
+    /// [`Self::consensus_header_by_digest`], read from the packs.
+    async fn consensus_header_by_digest_from_packs(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+    ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
         if let Some(pack) = self.current_pack_for(epoch) {
             let direct = pack.consensus_header_by_digest(digest).await;
             return if direct.is_some() {
@@ -1475,8 +1523,9 @@ impl ConsensusChain {
     /// Resolve when the current epoch is fully persisted to storage.
     pub async fn persist_current(&self) -> Result<(), ConsensusChainError> {
         let pack = &self.current_pack();
-        pack.persist().await?;
-        self.latest_consensus.persist().await;
+        // The pack's sync and the slot files' syncs are independent: wait for both together.
+        let (persisted, ()) = tokio::join!(pack.persist(), self.latest_consensus.persist());
+        persisted?;
         Ok(())
     }
 
@@ -1506,10 +1555,11 @@ impl ConsensusChain {
     /// it (its in-flight reads then fail — benign at shutdown) avoids a full WAL recovery on the
     /// next start. Only called at graceful shutdown.
     ///
-    /// Force-sealing under a live clone is memory-safe: each component is an actor whose mmaps live
-    /// only on its own thread and whose clones are channel-only handles, so the truncate/unmap runs
-    /// on the owning thread and a surviving clone's later reads/writes fail cleanly on the
-    /// closed channel — see the safety note on `ConsensusPack::seal_now`.
+    /// Force-sealing under a live clone is memory-safe. A pack's reads touch its mmaps only under
+    /// its read lock, and the seal takes its state out under the write lock; the other components
+    /// are actors whose mmaps live only on their own threads and whose clones are channel-only
+    /// handles. Either way the truncate/unmap never races a read, and a surviving clone's later
+    /// reads/writes fail cleanly — see the safety note on `ConsensusPack::seal_now`.
     pub async fn close(self) {
         let Self { current_pack, latest_consensus, recent_packs, epochs, staging, .. } = self;
         // Every component is force-sealed with `seal_now`, never the sole-owner-gated `close`:
@@ -1642,15 +1692,12 @@ impl ConsensusChain {
         epoch: Epoch,
         digests: impl Iterator<Item = &BlockHash>,
     ) -> Vec<Batch> {
-        let mut result = Vec::new();
-        if let Ok(pack) = self.get_static(epoch).await {
-            for digest in digests {
-                if let Some(batch) = pack.batch(*digest).await {
-                    result.push(batch);
-                }
+        match self.get_static(epoch).await {
+            Ok(pack) => {
+                pack.batches(digests.copied().collect()).await.into_iter().flatten().collect()
             }
+            Err(_) => Vec::new(),
         }
-        result
     }
 
     /// Count leaders in this pack (in rewards_counter) lower than last_executed_round.
@@ -1687,13 +1734,12 @@ impl ConsensusChain {
         if pack.epoch() == epoch {
             return Ok(pack);
         }
-        // Purge any cached pack whose background actor thread has died (panic): it would otherwise
-        // be served from the cache and silently answer every lookup as not-found. Only rebuild
-        // the deque when a dead entry is actually present, and drop the
-        // dead packs OUTSIDE the lock — a last-handle `Drop` must not run under the cache
-        // lock (same rule as the eviction below; mirrors the pop-front-into-kept pattern in
-        // `save`). A dead pack's actor has exited (or is finishing its unwind), so its `Drop`
-        // only reaps the thread: the join returns at once and nothing is sealed.
+        // Purge any cached pack that went out of service (a save panicked, or it was sealed): it
+        // would otherwise be served from the cache and silently answer every lookup as not-found.
+        // Only rebuild the deque when a dead entry is actually present, and drop the dead packs
+        // OUTSIDE the lock — a last-handle `Drop` must not run under the cache lock (same rule as
+        // the eviction below; mirrors the pop-front-into-kept pattern in `save`). A dead pack has
+        // no state left, so its `Drop` seals nothing.
         let dead = {
             let mut recents = self.recent_packs.lock();
             if recents.iter().all(|p| p.is_alive()) {
@@ -1746,7 +1792,13 @@ impl ConsensusChain {
         // completes while we open, the handle may point at a since-replaced inode and must not be
         // cached.
         let gen_before = self.install_generation.load(Ordering::Acquire);
-        let pack = match ConsensusPack::open_static(&self.base_path, epoch) {
+        // The open reads and checks the pack's files: off the async worker.
+        let base_path = self.base_path.clone();
+        let opened =
+            tokio::task::spawn_blocking(move || ConsensusPack::open_static(&base_path, epoch))
+                .await
+                .map_err(|_| PackError::ReceiveFailed)?;
+        let pack = match opened {
             Ok(pack) => pack,
             // Genuinely absent and no install in flight: a plain miss, answered without waiting
             // on `pack_install`. Checked in this order: an install moves the live dir aside to
@@ -2457,6 +2509,54 @@ mod test {
         let latest = LatestConsensus::new(temp_dir.path()).unwrap();
         assert_eq!(latest.epoch(), 0, "both slots corrupt -> fresh start");
         assert_eq!(latest.number(), 0, "both slots corrupt -> fresh start");
+    }
+
+    /// A header read by digest is remembered: asked again, it comes from memory, exactly what the
+    /// pack returned; asked under another epoch, it does not; and once the last few reads push it
+    /// out, a lookup reads the pack again, with the same answer.
+    #[tokio::test]
+    async fn test_consensus_header_by_digest_remembers_recent_reads() {
+        let temp_dir = TempDir::with_prefix("test_recent_headers").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let previous_epoch = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            ..Default::default()
+        };
+        let consensus_chain =
+            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
+        let mut parent = ConsensusHeader::default().digest();
+        let mut digests = Vec::new();
+        for i in 0..12u64 {
+            let output =
+                make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
+            parent = output.digest();
+            digests.push(output.consensus_header_hash());
+            consensus_chain.save_consensus_output(output).await.unwrap();
+        }
+        consensus_chain.persist_current().await.unwrap();
+        let last = *digests.last().expect("outputs");
+
+        let first = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
+        let first = first.expect("held");
+        assert_eq!(first.digest(), last);
+        assert_eq!(consensus_chain.recent_header(0, last), Some(first.clone()), "remembered");
+        let again = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
+        assert_eq!(again, Some(first.clone()), "the same answer from memory");
+
+        assert_eq!(consensus_chain.recent_header(1, last), None, "another epoch's lookup");
+        assert_eq!(consensus_chain.consensus_header_by_digest(1, last).await.unwrap(), None);
+
+        for digest in &digests[..ConsensusChain::RECENT_HEADERS] {
+            consensus_chain.consensus_header_by_digest(0, *digest).await.unwrap().expect("held");
+        }
+        assert_eq!(consensus_chain.recent_header(0, last), None, "pushed out");
+        let reread = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
+        assert_eq!(reread, Some(first), "read from the pack again");
     }
 
     #[tokio::test]

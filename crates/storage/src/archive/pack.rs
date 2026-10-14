@@ -207,6 +207,19 @@ where
         self.inner.append_raw_parts(parts)
     }
 
+    /// Append `stored`, a value already encoded the way this pack stores it (by a
+    /// [`RecordEncoder`] made with this pack's compression), as one record: the record
+    /// [`Self::append`] would write for that value, encoded beforehand so an owner that serializes
+    /// appends behind a lock need not hold it while it encodes and compresses.
+    pub(crate) fn append_stored(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        self.inner.append_stored(stored)
+    }
+
+    /// The largest record payload this pack takes (see [`MmapFileOptions::max_record_size`]).
+    pub(crate) fn max_record(&self) -> u32 {
+        self.inner.max_record
+    }
+
     /// Test-only failure injector: make the next append fail with
     /// [`AppendError::WriteDataError`], the same classification a real io write failure gets.
     /// The append path then marks the pack failed, which is the poisoned state the queued-save
@@ -492,6 +505,28 @@ where
         Ok(record_pos)
     }
 
+    /// Stored-bytes sibling of [`Self::append_inner`]: frame `stored` (already encoded, and
+    /// compressed if the pack is) as one record, as is.
+    fn append_stored_inner(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        let record_pos = self.data_file.len();
+
+        #[cfg(test)]
+        self.injected_append_failure()?;
+
+        let result = frame_record::<V>(
+            &mut self.data_file,
+            None,
+            &mut self.stage,
+            Payload::Raw(stored),
+            self.max_record,
+        );
+        if result.is_err() {
+            self.data_file.rewind_to(record_pos);
+        }
+        result?;
+        Ok(record_pos)
+    }
+
     /// Append `payload` as one framed record (see [`frame_record`]), compressing it with this
     /// pack's reused zstd context when the pack is compressed. A record that fails part-way is
     /// rolled back: whatever of it reached the file is zeroed and the logical end moves back to
@@ -547,6 +582,17 @@ where
         }
         self.failed_cause().map_err(AppendError::WriteDataError)?;
         let result = self.append_raw_parts_inner(parts);
+        self.classify_append(result)
+    }
+
+    /// Append an already-encoded value as one record (see [`Pack::append_stored`]), with the same
+    /// guards and failure classification as [`Self::append`].
+    fn append_stored(&mut self, stored: &[u8]) -> Result<u64, AppendError> {
+        if self.read_only {
+            return Err(AppendError::ReadOnly);
+        }
+        self.failed_cause().map_err(AppendError::WriteDataError)?;
+        let result = self.append_stored_inner(stored);
         self.classify_append(result)
     }
 
@@ -804,6 +850,49 @@ impl ZstdCtx {
         let mut ctx = zstd::zstd_safe::CCtx::create();
         ctx.set_parameter(zstd::zstd_safe::CParameter::CompressionLevel(0)).map_err(zstd_error)?;
         Ok(Self(ctx))
+    }
+}
+
+/// Encodes values the way a pack stores them (the codec, then one zstd frame for a compressed
+/// pack), for [`Pack::append_stored`]: the same bytes [`Pack::append`] writes for a value, made
+/// beforehand. One encoder serves many values, reusing its zstd context and staging buffer.
+#[derive(Debug)]
+pub(crate) struct RecordEncoder {
+    compression: PackCompression,
+    zstd_ctx: Option<ZstdCtx>,
+    stage: Vec<u8>,
+    max: u32,
+}
+
+impl RecordEncoder {
+    /// An encoder for a pack of `compression` whose records are at most `max` bytes.
+    pub(crate) fn new(compression: PackCompression, max: u32) -> Self {
+        Self { compression, zstd_ctx: None, stage: Vec::new(), max }
+    }
+
+    /// `value`'s stored bytes: what [`Pack::append`] would frame for it.
+    pub(crate) fn encode<V: Serialize>(&mut self, value: &V) -> Result<Vec<u8>, AppendError> {
+        let mut out = Vec::new();
+        match self.compression {
+            PackCompression::None => {
+                write_payload(&mut out, &mut self.stage, Payload::Value(value), self.max)?
+            }
+            PackCompression::ZStd => {
+                let ctx = match &mut self.zstd_ctx {
+                    Some(ctx) => ctx,
+                    slot @ None => slot.insert(ZstdCtx::new()?),
+                };
+                // A value that failed part-way left its frame unfinished; start every value clean.
+                ctx.0.reset(zstd::zstd_safe::ResetDirective::SessionOnly).map_err(zstd_error)?;
+                let mut encoder = zstd::stream::write::Encoder::with_context(&mut out, &mut ctx.0);
+                write_payload(&mut encoder, &mut self.stage, Payload::Value(value), self.max)?;
+                encoder.finish()?;
+            }
+        }
+        if out.len() > self.max as usize {
+            return Err(AppendError::RecordTooLarge { size: out.len(), max: self.max });
+        }
+        Ok(out)
     }
 }
 
@@ -2098,6 +2187,38 @@ mod tests {
     /// A pack opened with a record cap other than [`MAX_RECORD_SIZE`] enforces it on append and
     /// on every read path; a pack opened with the default cap refuses a larger record written
     /// by another (reads past the cap fail, they never allocate for an absurd length).
+    /// A value encoded beforehand by a [`RecordEncoder`] and appended with
+    /// [`Pack::append_stored`] is the very record [`Pack::append`] writes for it (byte for byte,
+    /// compressed or not), and reads back through `fetch`.
+    #[test]
+    fn stored_append_matches_append() {
+        let tmp = TempDir::with_prefix("pack_stored").expect("temp dir");
+        for compression in [PackCompression::None, PackCompression::ZStd] {
+            let values: Vec<TestRec> = (0..4_u64)
+                .map(|i| TestRec {
+                    idx: i,
+                    name: format!("value {i} {}", "x".repeat(i as usize * 300)),
+                })
+                .collect();
+            let appended = tmp.path().join(format!("appended-{compression:?}"));
+            let stored = tmp.path().join(format!("stored-{compression:?}"));
+            let mut a: Pack<TestRec> =
+                Pack::open(&appended, 0, false, compression, 1).expect("open");
+            let mut b: Pack<TestRec> = Pack::open(&stored, 0, false, compression, 1).expect("open");
+            let mut encoder = RecordEncoder::new(compression, b.max_record());
+            for value in &values {
+                let at = a.append(value).expect("append");
+                let bytes = encoder.encode(value).expect("encode");
+                let bt = b.append_stored(&bytes).expect("append stored");
+                assert_eq!(at, bt, "the same position");
+                assert_eq!(a.record_bytes(at).expect("read"), b.record_bytes(bt).expect("read"));
+                let read = b.fetch(bt).expect("fetch");
+                assert_eq!((read.idx, &read.name), (value.idx, &value.name));
+            }
+            assert_eq!(a.file_len(), b.file_len());
+        }
+    }
+
     #[test]
     fn per_pack_record_cap() {
         let tmp = TempDir::with_prefix("pack_record_cap").expect("temp dir");

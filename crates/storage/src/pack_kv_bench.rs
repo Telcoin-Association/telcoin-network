@@ -12,7 +12,7 @@
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
 //! ```text
-//! cargo test -p tn-storage pack_vs_mdbx_bench -- --ignored --nocapture --test-threads 1
+//! cargo test --release -p tn-storage pack_vs_mdbx_bench -- --ignored --nocapture --test-threads 1
 //! ```
 //!
 //! ## Columns
@@ -616,7 +616,8 @@ fn print_table(title: &str, legend: &str, rows: &[String], cols: &[(&str, Vec<Du
 /// Compare the memory-mapped pack-file KV against MDBX (durable + nosync) on raw point-KV.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
-/// `cargo test -p tn-storage pack_vs_mdbx_bench -- --ignored --nocapture --test-threads 1`.
+/// `cargo test --release -p tn-storage pack_vs_mdbx_bench -- --ignored --nocapture
+/// --test-threads 1`.
 #[test]
 #[ignore = "on-demand pack-file-KV vs MDBX comparison; run with --ignored --nocapture --test-threads 1"]
 fn pack_vs_mdbx_bench() {

@@ -1230,6 +1230,22 @@ impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
     }
 }
 
+impl<const KSIZE: usize, S: BuildHasher + Default> HdxIndex<KSIZE, S> {
+    /// The position stored for `key`, through a shared reference (what [`Index::load`] does): the
+    /// bloom filter first, then the key's bucket chain in the mapping. For readers that share the
+    /// index with its writer behind a read lock (a save, or a bucket split, takes the write lock).
+    pub fn get(&self, key: B256) -> Result<u64, FetchError> {
+        if !self.bloom.contains(key) {
+            return Err(FetchError::NotFound);
+        }
+        let bucket = self.hash_to_bucket(key.as_slice());
+        match self.find_in_bucket(bucket, key.as_slice())? {
+            Some(pos) => Ok(pos),
+            None => Err(FetchError::NotFound),
+        }
+    }
+}
+
 impl<const KSIZE: usize, S: BuildHasher + Default> Drop for HdxIndex<KSIZE, S> {
     fn drop(&mut self) {
         if !self.read_only && !self.synced && !self.remove_on_drop {
@@ -1261,16 +1277,7 @@ impl<const KSIZE: usize, S: BuildHasher + Default> Index<B256, u64> for HdxIndex
     }
 
     fn load(&mut self, key: B256) -> Result<u64, FetchError> {
-        // Quick check the bloom filter first.
-        if !self.bloom.contains(key) {
-            Err(FetchError::NotFound)
-        } else {
-            let bucket = self.hash_to_bucket(key.as_slice());
-            match self.find_in_bucket(bucket, key.as_slice())? {
-                Some(pos) => Ok(pos),
-                None => Err(FetchError::NotFound),
-            }
-        }
+        self.get(key)
     }
 
     /// Flush and sync all the index data to disk. The `data_file_length` commit marker is written

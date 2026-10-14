@@ -97,8 +97,24 @@ An epoch's pack directory `epoch-{N}/` contains `data` (the WAL), `idx/` (positi
 `hash/` + `bhash/` (consensus-header and batch digest indexes), plus the per-epoch certificate pack
 (`cert_data` + `cert_hash/`, a `CertificatePack`). Records are a leading
 `EpochMeta` (committee, epoch-start linkage) followed by, per output, a `Consensus` header and its
-`Batch` records. A background thread (`run_pack_loop`) serializes writes behind a channel; the public
-type is `Send + Sync + Clone`.
+`Batch` records. The public type is `Send + Sync + Clone`: a handle on the pack's shared state, with
+no thread of its own.
+
+**Reads and writes** (as tndb's readers taught: no hop and no wait behind a writer):
+- **Reads** take the state's read lock, any number at once, and run on tokio's blocking pool, or on
+  the caller for a constant-time lookup. They never wait for a save's encoding or a persist's sync,
+  and each copies or decodes what it returns before letting go of the lock (see `seal_now`).
+- **Writers** (a save, a persist, a flush, the close) take a writer lock, one at a time.
+  - **A save** checks the output under the read lock, encodes and compresses its records under the
+    writer lock alone (`RecordEncoder`), then takes the write lock only to append them
+    (`Pack::append_stored`) and index the output. A reader sees an output whole or not at all, and
+    a failed save rolls back under that same lock.
+  - **A persist** syncs under the read lock and stamps the commit marker under a brief write lock.
+  - **A panic** inside the write lock takes the state out, unsealed (the next open recovers it), and
+    every later use of the pack fails.
+- **Closing** takes the state out under the write lock and seals it; a read after that fails.
+- **`ConsensusChain::consensus_header_by_digest`** remembers the last few headers it read, since the
+  primary asks for the last executed one on every gossiped certificate.
 
 **Open doors:**
 | door | mode | on damage |
