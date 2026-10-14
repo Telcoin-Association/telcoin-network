@@ -2428,8 +2428,10 @@ where
                 // identifies the current BLS key even when it changed while disconnected.
                 self.request_current_record(peer_id);
 
-                // manage connected peers for
-                self.connected_peers.push_back(peer_id);
+                // Keep one routing entry per peer even when it has multiple connections.
+                if !self.connected_peers.contains(&peer_id) {
+                    self.connected_peers.push_back(peer_id);
+                }
 
                 // if this is a trusted/validator (important) peer, mark it as explicit in gossipsub
                 if self.swarm.behaviour().peer_manager.peer_is_important(&peer_id) {

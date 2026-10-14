@@ -85,8 +85,20 @@ async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::
         network_address: config.primary_address(),
         rpc: None,
     };
+    // Keep the existing committee connection when the hub takes us above the population target.
+    local
+        .update_committees(
+            std::collections::HashSet::new(),
+            std::collections::HashSet::from([other_bls]),
+            std::collections::HashSet::new(),
+        )
+        .await?;
     local.add_bootstrap_peers([(other_bls, endpoint(&other_config))].into_iter().collect()).await?;
     local.dial_by_bls(other_bls).await?;
+    wait_until(Duration::from_secs(15), "committee peer fills the population target", || async {
+        Ok(local.established_peer_count().await? == 1)
+    })
+    .await?;
     local.add_trusted_peers([(hub_bls, endpoint(&hub_config))].into_iter().collect()).await?;
     wait_until(
         Duration::from_secs(15),
@@ -96,8 +108,8 @@ async fn trusted_hub_reconnects_over_transport_and_stops_on_shutdown() -> eyre::
     .await?;
     hub_task.abort();
     assert!(hub_task.await.err().is_some_and(|error| error.is_cancelled()));
-    // Count established connections only. The retry timer keeps an offline hub in a pending
-    // dial, and `connected_peer_count` counts pending dials.
+    // Count connected peers, excluding pending dials while the hub is offline.
+    // `connected_peer_count` also includes pending dials.
     wait_until(
         Duration::from_secs(15),
         "hub disconnect leaves unrelated peer connected",
@@ -179,7 +191,7 @@ async fn query_peer_counts(
     counts
 }
 
-/// Readiness excludes pending dials, tracks the request-routing queue after connection, and
+/// Readiness excludes pending dials, counts each peer once in the request-routing queue, and
 /// returns to zero when the established peer disconnects.
 #[tokio::test]
 async fn established_peer_count_excludes_pending_dials() -> eyre::Result<()> {
@@ -207,8 +219,15 @@ async fn established_peer_count_excludes_pending_dials() -> eyre::Result<()> {
     })?;
     assert_matches!(response.await?, Err(NetworkError::NoPeers));
 
-    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr))?;
+    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr.clone()))?;
     assert_eq!(query_peer_counts(network).await?.1, 1);
+
+    network.process_peer_manager_event(PeerEvent::PeerConnected(peer_id, addr))?;
+    assert_eq!(
+        query_peer_counts(network).await?.1,
+        1,
+        "a second connection to the same peer must not add another routing entry"
+    );
 
     network.process_peer_manager_event(PeerEvent::PeerDisconnected(peer_id))?;
     assert_eq!(query_peer_counts(network).await?.1, 0);
@@ -3620,6 +3639,13 @@ async fn test_trusted_kad_flood_remains_bounded_and_protocol_bannable() -> eyre:
     let mut network = peer1.network;
     let record = peer2.network.get_peer_record();
     let source = record.publisher.ok_or_else(|| eyre::eyre!("fixture record has no publisher"))?;
+    // The direct PUT fixture models a connected sender whose record has a retention owner.
+    network
+        .swarm
+        .behaviour_mut()
+        .kademlia
+        .store_mut()
+        .retain_connected(source, record.key.clone())?;
     let (reply, _ack) = tokio::sync::oneshot::channel();
     network.swarm.behaviour_mut().peer_manager.add_trusted_peer_and_dial(
         peer2.config.key_config().primary_public_key(),
