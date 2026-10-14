@@ -99,7 +99,7 @@ impl SplitDatabase {
 
     /// Block until every write so far, in every environment, is durable (see
     /// [`TnDatabase::wait_durable_blocking`]).
-    #[cfg(any(test, feature = "tndb"))]
+    #[cfg(any(test, feature = "reth-libmdbx"))]
     pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
         for db in &self.dbs {
             db.wait_durable_blocking()?;

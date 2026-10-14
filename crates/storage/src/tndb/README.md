@@ -373,10 +373,11 @@ batch writer:
 | 1 MB batches at 25/s | ms per round | 4.0 | 3.05 | **2.99** |
 | | vote durable p50 / p99 | 1.0 / 4.3 ms | 0.34 / 2.1 ms | **0.33 / 1.9 ms** |
 
-## Against production today
+## Against MDBX (the previous backend)
 
-`workload_mixed`'s `Composite<MDBX-prod>` column is `open_db`'s `CompositeDatabase<MdbxDatabase>`
-(production geometry, `Durable` sync), beside `SplitDatabase` (median of 3 runs, N=50, this Mac).
+`workload_mixed`'s `Composite<MDBX-prod>` column is the `CompositeDatabase<MdbxDatabase>` that
+`open_db` built before tndb (production geometry, `Durable` sync), beside `SplitDatabase` (median of
+3 runs, N=50, this Mac).
 The bench now runs it beside the paced stream only: beside the unpaced one, its cache layer's
 unbounded write queue reached 39 GB resident.
 
@@ -390,7 +391,7 @@ unbounded write queue reached 39 GB resident.
 | own header durable p50 | **0.13 ms** | 52.3 ms |
 | vote write call p50 / p99 | 73 µs / 1.14 ms | **1 / 94 µs** |
 
-What production's layer still does better: a write returns from memory (tndb's take the
+What MDBX's layer still did better: a write returns from memory (tndb's take the
 environment's write lock), and reads of the epoch and kad tables come from memory (batch-cache
 `multi_get` runs at 55–65% of its rate; tndb checks each record's CRC on read). After a crash
 tndb replays its logs (about 0.8 s for a 229 MB log); MDBX recovers at once. Its disk use stays
@@ -421,8 +422,8 @@ raises vote p99 from 5.8 to about 9 ms by sharing the drive, with compaction off
   batches in every header, every round: 4-6 Gbps into every node, and execution far beyond one
   node's EVM.
 
-The node opens tndb with the `tn-storage/tndb` feature (`DatabaseType = SplitDatabase`, at
-`<consensus db>/tndb`); MDBX stays the default. On its first tndb open, a node that ran on MDBX
+tndb is the node's consensus DB (`DatabaseType = SplitDatabase`, at `<consensus db>/tndb`, since
+2026-10; MDBX before). On its first tndb open, a node that ran on MDBX
 has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates),
 kad tables and own uncommitted batches (`OurNodeBatchesCache`: no other copy holds them) copied
 over (`migrate_from_mdbx` in `lib.rs`) and made durable. Then the MDBX environments are deleted

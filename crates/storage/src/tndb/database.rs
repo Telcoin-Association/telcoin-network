@@ -168,7 +168,7 @@ impl TnDatabase {
 
     /// Block until every write so far is durable, running the sync here if none is in flight: for
     /// a caller with no async runtime to await [`Database::persist`] on (e.g. a migration at open).
-    #[cfg(any(test, feature = "tndb"))]
+    #[cfg(any(test, feature = "reth-libmdbx"))]
     pub(crate) fn wait_durable_blocking(&self) -> eyre::Result<()> {
         super::commit::wait_durable(&self.core, self.core.durability.last_seq())
     }

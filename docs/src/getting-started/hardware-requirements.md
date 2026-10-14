@@ -92,7 +92,7 @@ These do not change with the worker count:
   One engine executes one consensus output at a time on one blocking thread [^engine-single], and a header carries at most 10 batch digests in total, shared across the node's workers in round-robin order [^header-cap].
   More workers let a validator seal batches in parallel, and an output can carry more blocks than the benchmark's outputs did, but never more than the header cap allows.
 - The batch cache.
-  There is one cache environment per process, keyed by batch hash with no worker id [^cache-shared], so all workers share its 1 GiB maximum.
+  There is one cache log per process, keyed by batch hash with no worker id [^cache-shared], so all workers share it.
 - Storage growth and network bandwidth, which follow committed batch bytes, so the tiers size them for the same planning load.
   Their tier figures are not doubled.
 
@@ -120,8 +120,8 @@ The DWPD ratings in the summary are twice the write rate modelled at the ceiling
 
 CPU and memory are not expected to be the limit in any tier.
 The minimum tier is twice a host that carried 5,384 TPS, about twenty times the 6-hour ceiling, with its engine queue at 3 or below and memory pressure at zero.
-Two things could exhaust that margin: more workers than the doubling was sized for, or a release that raises the batch-cache ceiling toward the thousands of TPS the benchmark ran.
-A multi-worker benchmark is due before the worker count reaches four, and a ceiling change ships as a release, so this page will be re-derived before either matters.
+Two things could exhaust that margin: more workers than the doubling was sized for, or sustained load toward the thousands of TPS the benchmark ran, which the batch cache no longer caps (see [Per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling)).
+A multi-worker benchmark is due before the worker count reaches four, and this page will be re-derived before sustained load approaches the benchmark's.
 
 For a three-year hardware cycle, the recommended tier holds at loads up to about 100 TPS of the benchmark mix.
 At the ceiling its disk fills in about 16 months, so plan a storage upgrade then or start on the headroom tier.
@@ -269,10 +269,11 @@ Plan capacity from the growth formula, not from the size of the chain today.
 | --- | --- | --- |
 | `db`, `static_files` | Execution database and static files | β_reth per transaction |
 | `consensus-db/epochs` | Consensus packs: committed outputs with their batches, one directory per epoch | β_pack per transaction |
-| `consensus-db/cache` | Batch cache | Fixed 1 GiB maximum, reused each epoch |
-| `consensus-db/epoch` | Current epoch's consensus tables | Fixed 512 MiB maximum, cleared each epoch |
+| `consensus-db/tndb/cache` | Batch cache (a tndb log) | Its uncommitted batches, plus removed ones until the next compaction (see [Per-epoch batch-cache ceiling](#per-epoch-batch-cache-ceiling)) |
+| `consensus-db/tndb/epoch` | Current epoch's consensus tables (a tndb log) | Grows through the epoch and resets when it closes: 212 MB measured 28,800 rounds into an epoch at 10 validators [^epoch-log] |
+| `consensus-db/tndb/kad` | Peer records (a tndb log) | Small |
 
-Paths are set in `crates/config` [^datadir], and the two fixed maximum sizes in `crates/storage` [^cache-max].
+Paths are set in `crates/config` [^datadir] and `crates/storage` [^tndb-layout].
 
 Daily growth is:
 
@@ -292,7 +293,7 @@ Both fleets agree to within 3%.
 The [storage growth planning](#storage-growth-planning) table applies the formula to other loads.
 
 Execution reads state on its single thread, so random-read latency adds directly to execution time.
-The consensus database also syncs to disk on every commit in production builds [^mdbx-durable].
+The consensus database also syncs to disk before every vote, header or certificate leaves the node, one sync for every write waiting on it [^tndb-durable].
 
 Disk demand at p95 on the busiest validator was [^b-disk]:
 
@@ -311,15 +312,19 @@ Endurance is covered under [Storage: TLC over QLC](#storage-tlc-over-qlc).
 
 #### Per-epoch batch-cache ceiling
 
-Every batch a validator creates or receives is written to the batch cache in `consensus-db/cache` [^cache-tables].
-The cache is an MDBX environment with a fixed 1 GiB maximum [^cache-max].
+Every batch a validator creates or receives is written to the batch cache in `consensus-db/tndb/cache` [^cache-tables].
 A batch leaves it when the consensus output that commits it, already saved to the epoch's pack, is forwarded to execution, and a batch that is never committed leaves when the epoch closes [^cache-clear].
 So the cache holds batches waiting to be committed and those that never will be, not the epoch's committed batch data.
 
+The cache is a tndb log with no fixed maximum [^cache-compact].
+A removal appends a record, and the log compacts in the background once it is at least 256 MiB and twice its length after the last compaction: the batches still live are rewritten into a new file, and the old one is deleted.
+So between compactions its log holds the live batches plus removed ones, up to the larger of 256 MiB and twice the live data at the last compaction.
+Each file also keeps up to 128 MiB of preallocated space, and a running compaction briefly holds a second copy of the live batches.
+
+Releases before tndb kept the cache in an MDBX file with a fixed 1 GiB maximum [^cache-max].
 Mainnet and testnet run 6-hour epochs [^epoch-mainnet].
 New genesis files default to 8 hours unless `--epoch-duration-in-secs` is set [^epoch-default].
-Dividing 1 GiB by the epoch length gives the ceiling.
-Before committed batches were evicted, it capped the committee's sustained batch rate; now it caps only the rate at which batches can be left uncommitted over an epoch:
+Dividing that 1 GiB by the epoch length gave a ceiling on the rate at which batches could be left uncommitted over an epoch, and the tiers keep its 6-hour value as their planning load:
 
 | Epoch length | Batch bytes per second | TPS at 110 B | TPS at 188 to 192 B (benchmark mix, measured) | TPS at 250 B | TPS at 400 B |
 | --- | --- | --- | --- | --- | --- |
@@ -330,22 +335,16 @@ Before committed batches were evicted, it capped the committee's sustained batch
 
 The 110, 250 and 400 B columns count raw transaction bytes.
 The benchmark measured about 190 B of batch data per transaction for its mix, which includes batch encoding [^b-txbytes].
-At that size the 6-hour ceiling is about 260 TPS (259 to 264), and an 8-hour epoch gives about 200.
-These are still upper bounds, because MDBX page overhead inside the cache is not included.
+At that size the 6-hour figure is about 260 TPS (259 to 264), and an 8-hour epoch gives about 200.
+tndb removes the limit itself: uncommitted batch data takes more disk until it is committed or the epoch closes, and nothing caps the rate.
 
-Filling the cache does not stop the node, but it moves new batches into memory.
-The node reaches the cache through a layered database: an insert writes the batch to an in-memory layer, returns, and leaves the MDBX write to a background thread, which drops the in-memory copy once the write succeeds [^seal-fatal].
-When the MDBX file is full the write fails, and the background thread logs an error that starts `DB Insert node_batches_cache` (target `layered_db_runner`), counts it in `tn_storage_write_failures_total` [^write-failures], sets a failure flag and keeps the batch in memory.
-Only a durability check (`persist`) reads that flag, and the worker never makes one, so it keeps sealing batches.
-Each batch that could not be written stays in RAM until it is evicted or the epoch closes, so resident memory climbs while the file is full.
-Evictions free space inside the file, but on a full file an eviction can share its MDBX transaction with a failed insert and be lost with it.
-A lost eviction is not retried, so its batches hold their space until the epoch closes.
-Alert on the counter or the log line (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
-The worker's `FatalDBFailure` error fires only when the insert call itself fails, for example because the database thread has gone.
-More hardware does not raise the ceiling because the size is a compiled-in constant.
-A release with a larger cache or a shorter epoch length does.
+A batch write the disk cannot take fails at once and is taken back; the batch is not kept in memory instead [^tndb-write-fail].
+The worker's seal then returns `FatalDBFailure` for that batch.
+Log growth preallocates its disk blocks, so a full disk surfaces as a write error, not a crash, and a compaction gives way while less than 256 MiB is free.
+A failed sync stops that database: every later write fails until the node restarts, and `tn_storage_tndb_failed` reads 1.
+Alert on it and on compaction abandons (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
 
-The tiers use the 6-hour ceiling as their planning load for chain growth, although this release does not enforce it.
+The tiers use the 6-hour figure as their planning load for chain growth; no release enforces it.
 At that load a committee carries about 4.3 GB of batch data per day, 1.57 TB per year.
 Disk growth is that amount times m = (β_reth + β_pack) / 190 B, which is about 1.8 on the benchmark mix, plus G_idle.
 That gives about 7.8 GB a day, or with G_idle about 2.9 TB a year and 8.8 TB over three years (lower bounds, because β_reth is).
@@ -353,13 +352,13 @@ m is close to 1.8 for transfer-heavy and contract-heavy loads too, so this figur
 The recommended and headroom tiers use it.
 A committee that sustains more batch data fills disks sooner (see [Storage growth planning](#storage-growth-planning)).
 
-At 20-minute epochs the ceiling is in the thousands of TPS, so a benchmark with short epochs measures hardware limits, not this ceiling.
+The 2026-09 benchmarks ran on MDBX, before tndb.
+At 20-minute epochs the MDBX ceiling was in the thousands of TPS, so a benchmark with short epochs measured hardware limits, not this ceiling.
 The benchmark stayed below its own 20-minute ceiling: its epochs carried about 0.52 to 0.55 GB of batch data on average.
 The cache file still reached its 1 GiB maximum on every c3 validator and on four of the ten e2 validators (the other six stopped at 960 MiB), because MDBX never shrinks the file [^cache-max].
 A re-run on 2026-09-29 (r20260929-1647) with faster disks raised throughput enough to fill the cache inside a 20-minute epoch: every validator logged `DB Insert node_batches_cache: environment map size limit reached` in the last minutes of two epochs.
 Both runs used a release that kept every batch until the epoch closed.
-Evicting committed batches frees pages inside the file for reuse, but the file keeps its size.
-File size is a high-water mark, not live occupancy (see [Capacity monitoring](validator-operations.md#capacity-monitoring)).
+tndb has neither the maximum nor the high-water mark: the cache's files shrink back to the live batches at each compaction.
 
 ### Networking
 
@@ -466,7 +465,7 @@ Disable swap on observers too.
 
 An observer stores the same execution database and consensus packs as a validator, so use the same capacity, IOPS and endurance figures.
 In the benchmark the observer wrote 64 MB/s (e2) and 174 MB/s (c3) at p95, at 4,770 and 1,790 write IOPS [^b-obs-disk].
-It does not write batches into the batch cache from gossip, and its cache file reached only 64 to 192 MiB against 1 GiB on validators.
+It does not write batches into the batch cache from gossip; in the 2026-09 benchmark (on MDBX) its cache file reached only 64 to 192 MiB against 1 GiB on validators.
 
 ### Networking
 
@@ -622,8 +621,8 @@ The node's idle footprint fits in 8 GB, and it writes several MB/s to disk even 
 
 | Figure | Source | Confidence |
 | --- | --- | --- |
-| Code constants (1 GiB batch cache, 64 + 8 output queue, 10 batches per header, 1 MB batch, 6 h mainnet epoch, 8 h CLI default) | Code | Exact for this release |
-| Batch-cache TPS ceiling | Constants and the measured 190 B per transaction | Modelled from a measured input; MDBX page overhead not included |
+| Code constants (64 + 8 output queue, 10 batches per header, 1 MB batch, 6 h mainnet epoch, 8 h CLI default, 256 MiB cache compaction threshold) | Code | Exact for this release |
+| Batch-cache TPS ceiling (the planning load) | The 1 GiB MDBX cache of earlier releases and the measured 190 B per transaction | Modelled from a measured input; a planning figure, not a limit of this release |
 | CPU, RAM, disk and network use at benchmark load | Benchmark, both fleets | Measured |
 | Single-worker minimum and recommended CPU and RAM | Benchmark and the tier rules | Measured |
 | Validator CPU and RAM tiers in the summary | Twice the single-worker figures | Modelled margin for the multi-worker rollout, not measured |
@@ -690,14 +689,16 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^engine-queue]: `crates/engine/src/lib.rs:52` (`MAX_QUEUED_OUTPUTS = 8`), `crates/engine/src/lib.rs:271`.
 [^archive]: `crates/tn-reth/src/cli.rs:517` (`ensure_archive_mode`).
 [^datadir]: `crates/config/src/traits.rs:156` (`consensus-db/epochs`), `crates/config/src/traits.rs:189` (`consensus-db`), `crates/config/src/traits.rs:193` (`db`).
-[^cache-max]: `crates/storage/src/lib.rs:177` (`EPOCH_MAX = 512 MB`), `crates/storage/src/lib.rs:179` (`CACHE_MAX = 1024 MB`), `crates/storage/src/lib.rs:186-191`, `crates/storage/src/mdbx/database.rs:228-234` (fixed maximum size), `crates/storage/src/mdbx/database.rs:234` (`shrink_threshold: Some(0)`: the file never shrinks).
-[^mdbx-durable]: `crates/storage/src/mdbx/database.rs:189-190`.
-[^cache-tables]: `crates/storage/src/lib.rs:123-128` (`TableHint::Cache` tables); writers at `crates/consensus/worker/src/network/handler.rs:269`, `crates/consensus/worker/src/network/handler.rs:301`, `crates/consensus/worker/src/batch_fetcher.rs:253`, `crates/consensus/worker/src/worker.rs:421`.
+[^cache-max]: Releases before tndb: the MDBX cache environment's fixed maximum (`PROD_CACHE_MAX = 1024 MB`) and the epoch environment's (`PROD_EPOCH_MAX = 512 MB`) in `crates/storage/src/mdbx/database.rs`, opened with `shrink_threshold: Some(0)` (the file never shrinks). tndb replaced it as the node's consensus database in 2026-10.
+[^cache-compact]: `crates/storage/src/tndb/split.rs:26` (`CACHE_AUTO_MIN_BYTES = 256 MiB` for the cache log) and `crates/storage/src/tndb/split.rs:49` (`env_options`), `crates/storage/src/tndb/store.rs:641` (`wants_compaction`: at least that long, at least twice its length after the last compaction, and holding a dead row), `crates/storage/src/tndb/compact.rs` (the module docs: only live rows are copied into the new generation, which replaces the old one), `crates/storage/src/tndb/README.md` (Compaction).
+[^tndb-durable]: `crates/storage/src/lib.rs:353-358` (`open_db`: tndb in group commit), `crates/storage/src/tndb/commit.rs:246` (`persist` resolves once the sync covering every earlier write is done), `crates/storage/src/tndb/README.md` (Durability).
+[^tndb-layout]: `crates/storage/src/tndb/mod.rs:33` (`TNDB_DIR`), `crates/storage/src/tndb/split.rs` (`ENVIRONMENTS`: `epoch`, `kad`, `cache`).
+[^epoch-log]: `storage-baseline--20261013-181849.txt` (the tndb Linux baseline, `workload_startup_reload`: 1,326,760 rows, 212.1 MB on disk); `crates/storage/src/tndb/split.rs:32` (`EPOCH_AUTO_MIN_BYTES`) and `crates/storage/src/tndb/store.rs:650` (`note_if_emptied`: the epoch-close clear empties every table and the log compacts at once).
+[^cache-tables]: `crates/storage/src/lib.rs:125-130` (`TableHint::Cache` tables); writers at `crates/consensus/worker/src/network/handler.rs:269`, `crates/consensus/worker/src/network/handler.rs:301`, `crates/consensus/worker/src/batch_fetcher.rs:253`, `crates/consensus/worker/src/worker.rs:421`.
 [^cache-clear]: `crates/node/src/manager/node/run_epoch.rs:602` and `crates/node/src/manager/node/run_epoch.rs:1077-1091` (`process_output` evicts the output's batches from `NodeBatchesCache` and `OurNodeBatchesCache` in one transaction before forwarding it; a failure is logged and not retried), `crates/consensus/executor/src/subscriber.rs:174-203`, `crates/consensus/executor/src/subscriber.rs:317-348`, `crates/consensus/executor/src/subscriber.rs:698-705` and `crates/state-sync/src/lib.rs:128-132` (each output is saved and persisted to the pack before it is sent on), `crates/node/src/manager/node/close_epoch.rs:892` (the epoch-close clear), `crates/consensus/worker/src/network/handler.rs:167-173` (late gossip for an evicted batch fetches and caches it again until the epoch closes).
 [^epoch-mainnet]: `chain-configs/testnet/genesis.yaml:103` (ConsensusRegistry epoch-duration slot, `0x5460` = 21,600 s). Mainnet launches with the same 6-hour epochs; the mainnet genesis in this repository (`chain-configs/mainnet/genesis.yaml:99`) still encodes 86,400 s at the time of writing and is being regenerated. Epoch length is a genesis parameter (`--epoch-duration-in-secs`), not a node setting, so operators cannot change it.
 [^epoch-default]: `crates/telcoin-network-cli/src/genesis/mod.rs:93`.
-[^seal-fatal]: `crates/storage/src/composite_db.rs:44` (the cache database runs in cache mode, `full_memory = false`), `crates/storage/src/layered_db.rs:555-560` (insert writes the in-memory layer and queues the MDBX write), `crates/storage/src/layered_db.rs:292-333` (a failed MDBX write is logged at error level, latches `commit_failed` and keeps the in-memory copy), `crates/storage/src/layered_db.rs:368-383` and `crates/storage/src/layered_db.rs:635-653` (only the `persist` barrier reads the latch), `crates/consensus/worker/src/worker.rs:355-359` and `crates/consensus/worker/src/worker.rs:421-424` (`FatalDBFailure` only when the insert call returns an error).
-[^write-failures]: `crates/storage/src/layered_db.rs:780-841` (`tn_storage.write_failures_total`, which Prometheus exports as `tn_storage_write_failures_total`, and its `env` and `op` labels), `crates/storage/src/layered_db.rs:467-471` (every `env` and `op` series is registered at zero when the database opens), `crates/tn-metrics/src/recorder.rs:110` (the exporter renders `.` as `_`), `crates/storage/src/composite_db.rs:42-44` (`env` is `epoch`, `kad` or `cache`), `crates/storage/src/layered_db.rs:268-291`, `crates/storage/src/layered_db.rs:308-312`, `crates/storage/src/layered_db.rs:320-325` and `crates/storage/src/layered_db.rs:335-363` (each failed commit, staged insert, bare insert, remove and clear is counted), `crates/storage/src/layered_db.rs:259-264` (a transaction that cannot start is counted under `begin` and loses no write, because its writes go out one at a time), `crates/storage/src/layered_db.rs:243-247` (a bare insert sent while a transaction is open rides that transaction), `crates/storage/src/layered_db.rs:193-198` (a failed commit discards every write the transaction carried).
+[^tndb-write-fail]: `crates/storage/src/tndb/store.rs` (`Core::write`: a batch that fails to append is rolled back and its error returned), `crates/consensus/worker/src/worker.rs:355-359` and `crates/consensus/worker/src/worker.rs:421-423` (`FatalDBFailure` when the insert returns an error), `crates/storage/src/archive/data_file.rs:1219` (`grow_to` preallocates), `crates/storage/src/tndb/compact.rs:121` and `crates/storage/src/tndb/compact.rs:369` (a compaction gives way below 256 MiB free), `crates/storage/src/tndb/store.rs:617` and `crates/storage/src/tndb/commit.rs:181` (a failed sync latches, stopping writes until a restart), `crates/storage/src/tndb/metrics.rs:25` (`tn_storage_tndb_failed`).
 [^qw-fanout]: `crates/consensus/worker/src/quorum_waiter.rs:136-137`.
 [^header-delay]: `crates/config/src/node.rs:325-331` (2.5 s maximum, 1 s minimum).
 [^drift]: `crates/consensus/primary/src/network/handler.rs:768-830` (`check_header_lead`: a lead within the tolerance is passed on to be waited out at 778-788, a lead within the tolerance plus `vote_timeout` gets a retryable answer with no penalty at 789-817, and a larger lead is rejected at 818-828), `crates/consensus/primary/src/network/handler.rs:878-880` (a deferral is answered on arrival), `crates/consensus/primary/src/network/handler.rs:1020-1033` (the wait before voting), `penalty_from_header_error` in `crates/consensus/primary/src/error/network.rs` (no score penalty for relative clock skew), `crates/config/src/network.rs:448-449` (`max_header_time_drift_tolerance`), `crates/config/src/network.rs:486` (250 ms default), `crates/config/src/node.rs:333-335` (5 s `vote_timeout` default). The node writes its network config only when the file is missing (`crates/config/src/traits.rs:76-83`), so a data directory first started by an older binary keeps the `1` that binary wrote, read as 1 s. `crates/telcoin-network-cli/README.md`, section `max_header_time_drift_tolerance (network-config)`, shows how to check and change it.
@@ -712,4 +713,4 @@ Notes whose names start with `b-` cite the benchmark: the run, and the field in 
 [^workers-rpc]: `crates/tn-reth/src/env/rpc.rs:62` (`WORKER_PORT_STRIDE = 200`), `crates/tn-reth/src/env/rpc.rs:137-144` (worker 0 keeps the configured ports; worker k shifts its HTTP port down by 200·k and its WebSocket port up by 400·k).
 [^workers-swarm]: `crates/node/src/manager/node.rs:170-233` (`prepare_worker_networks` requires a distinct listen address and key per worker), `crates/node/src/manager/node.rs:1496-1541` (one long-running swarm per configured worker), `crates/node/src/manager/node/start_epoch.rs:1053-1054` (batch topic per worker).
 [^header-cap]: `crates/types/src/primary/header.rs:34` (the payload maps batch digest to worker id), `crates/types/src/primary/header.rs:166-171` (a header with more than `MAX_HEADER_NUM_OF_BATCHES` digests is rejected), `crates/consensus/primary/src/proposer.rs:715-749` (header slots are shared across workers round-robin, up to the cap in total).
-[^cache-shared]: `crates/node/src/manager/node.rs:703-717` (one consensus database per process, shared across epochs), `crates/storage/src/lib.rs:121-128` (cache tables keyed by batch hash only); the maximum size is in [^cache-max].
+[^cache-shared]: `crates/node/src/manager/node.rs:703-717` (one consensus database per process, shared across epochs), `crates/storage/src/lib.rs:125-130` (cache tables keyed by batch hash only); its compaction is in [^cache-compact].

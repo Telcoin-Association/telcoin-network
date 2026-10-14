@@ -29,7 +29,8 @@ pub(crate) mod error_latch;
 pub mod exec_state_pack;
 /// `LayeredDatabase`: a write-behind memory layer whose writer thread commits to a backend.
 pub mod layered_db;
-/// The reth MDBX key/value backend (the default `Database` backend).
+/// The reth MDBX key/value backend: the consensus DB of the release before tndb (the migration's
+/// source), and a backend for tests and benches.
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
@@ -49,6 +50,7 @@ pub mod tndb;
 
 pub use tn_types::error::StoreError;
 
+#[cfg(all(test, feature = "reth-libmdbx"))]
 use crate::composite_db::CompositeDatabase;
 
 /// Key type for the proposer's last-proposed-header table.
@@ -134,31 +136,12 @@ pub mod tables {
     );
 }
 
-// mdbx is the default; tndb replaces it when set.
-/// The configured composite database backend: MDBX (the default).
-#[cfg(all(feature = "reth-libmdbx", not(feature = "tndb")))]
-pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
-/// The configured database backend: tndb, one shared log per environment, when the `tndb`
-/// feature is on.
-#[cfg(feature = "tndb")]
+/// The node's consensus database: tndb, one shared log per environment ([`tndb::SplitDatabase`]).
 pub type DatabaseType = tndb::SplitDatabase;
 
-/// Open the configured DB with the required tables.
-/// This will return a concrete type for the currently configured Database.
-#[allow(unreachable_code)] // Need this so it compiles cleanly with every feature set.
-pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the tndb flag is set.
-    #[cfg(feature = "tndb")]
-    return _open_tndb(store_path);
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "tndb")))]
-    return _open_mdbx(store_path);
-    panic!("No DB configured!")
-}
-
-// The open functions below are the way they are so we can use if cfg!... on open_db.
-
-/// Open or reopen all the storage of the node backed by MDBX.
-#[cfg(feature = "reth-libmdbx")]
+/// The node's consensus database as the release before tndb opened it, on MDBX: the source the
+/// migration tests write.
+#[cfg(all(test, feature = "reth-libmdbx"))]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
     use tn_types::Database as _;
 
@@ -243,7 +226,7 @@ fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<Mdb
 /// Until then every open runs it again: an environment still present is copied again (MDBX is not
 /// written meanwhile, so that only rewrites the same rows) and deleted, and one already deleted was
 /// copied before it. A downgrade to the MDBX build after the switch starts with empty epoch tables.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+#[cfg(feature = "reth-libmdbx")]
 pub(crate) fn migrate_from_mdbx(
     store_path: &std::path::Path,
     tndb_root: &std::path::Path,
@@ -305,13 +288,13 @@ pub(crate) fn migrate_from_mdbx(
 }
 
 /// The files MDBX keeps in an environment's directory.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+#[cfg(feature = "reth-libmdbx")]
 const MDBX_FILES: [&str; 2] = ["mdbx.dat", "mdbx.lck"];
 
 /// Delete the MDBX environment `dir` under `store_path`, whose rows are durably in tndb: MDBX's own
 /// files, then the directory if nothing else is in it. A file MDBX did not make is kept, with its
 /// directory, and logged; nothing is removed recursively.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+#[cfg(feature = "reth-libmdbx")]
 fn remove_mdbx_env(store_path: &std::path::Path, dir: &str) -> eyre::Result<()> {
     use eyre::WrapErr as _;
 
@@ -333,12 +316,12 @@ fn remove_mdbx_env(store_path: &std::path::Path, dir: &str) -> eyre::Result<()> 
 }
 
 /// Rows per transaction when copying a table of small values (see [`copy_table`]).
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+#[cfg(feature = "reth-libmdbx")]
 const ROWS_PER_TXN: usize = 10_000;
 
 /// Copy every row of table `T` from `src` into `dst`, in transactions of at most `rows_per_txn`
 /// rows (the whole copy is made durable, and marked done, by the caller). Returns the rows copied.
-#[cfg(all(feature = "reth-libmdbx", any(test, feature = "tndb")))]
+#[cfg(feature = "reth-libmdbx")]
 fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     src: &MdbxDatabase,
     dst: &D,
@@ -361,14 +344,13 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     Ok(rows)
 }
 
-/// Open or reopen all the storage of the node backed by tndb: one shared log per environment
-/// ([`tndb::SplitDatabase`]) under `<store_path>/tndb` (never sharing files with MDBX's `epoch`,
-/// `kad` and `cache` directories), in group commit (a write returns at once; `persist` waits for
-/// the sync covering it), compacting in the background. A node that ran on MDBX has its epoch and
-/// kad tables and its own uncommitted batches copied over on the first open
-/// ([`migrate_from_mdbx`]).
-#[cfg(feature = "tndb")]
-fn _open_tndb<P: AsRef<std::path::Path> + Send>(store_path: P) -> tndb::SplitDatabase {
+/// Open or reopen all the storage of the node: one tndb shared log per environment
+/// ([`DatabaseType`]) under `<store_path>/tndb` (beside the consensus packs in `epochs/`), in group
+/// commit (a write returns at once; `persist` waits for the sync covering it), compacting in the
+/// background, with every table open. A node that ran on MDBX (the release before tndb) has its
+/// epoch and kad tables and its own uncommitted batches copied over on the first open, and its
+/// MDBX files deleted (`migrate_from_mdbx`).
+pub fn open_db<P: AsRef<std::path::Path> + Send>(store_path: P) -> DatabaseType {
     use tn_types::Database as _;
 
     let store_path = store_path.as_ref();
@@ -410,7 +392,7 @@ mod migrate_test {
         tndb::{CommitMode, SplitDatabase, TnDbOptions, MDBX_MIGRATED, TNDB_DIR},
     };
 
-    /// tndb opened as `_open_tndb` opens it (its tables open), without the migration.
+    /// tndb opened as `open_db` opens it (its tables open), without the migration.
     fn open_split(root: &std::path::Path) -> SplitDatabase {
         let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
         let db = SplitDatabase::open_with(root, options).expect("open tndb");

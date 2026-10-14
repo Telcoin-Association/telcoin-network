@@ -167,7 +167,7 @@ still held rows its slow disk writes had not reached. The per-read CRC stays.
   Fix: capture the persist target eagerly, and fail pending waiters when the commit thread exits.
 - **L8. [FIXED 2026-10-13: a buffer past 4 MiB is let go after use; test `test_tndb_encode_buffers_shrink_after_a_large_value`.] Thread-local `BUFS` never shrink;** each keeps the largest value it ever wrote. Fix: shrink past a few MiB.
 - **L9. [FIXED 2026-10-13: tndb deleted; tnlog owns `CommitMode`, `CompactionConfig`, its layout helpers (`tnlog/layout.rs`) and the compaction constants; the archive's sync-ticket code and two test helpers only tndb used went with it; bench columns moved to tnlog.] tnlog depends on tndb;** `pub mod tndb` ships about 6.4K lines. Fix (S4): move `CommitMode`, `CompactionConfig`, the layout helpers and the constants into tnlog; delete tndb.
-- **L10. [DEFERRED 2026-10-13 (user): no CI lane until tndb nears becoming the default.] No CI test lane runs the node on tnlog;** only the `--all-features` clippy pass compiles it. Fix: a nightly lane (DB-using crates plus e2e epoch and restart tests with `tn-storage/tnlog`), until it becomes the default.
+- **L10. [RESOLVED 2026-10-14: tndb is the node's only consensus backend, so every CI lane (and the e2e suites) runs it. DEFERRED 2026-10-13 (user): no CI lane until tndb nears becoming the default.] No CI test lane runs the node on tnlog;** only the `--all-features` clippy pass compiles it. Fix: a nightly lane (DB-using crates plus e2e epoch and restart tests with `tn-storage/tnlog`), until it becomes the default.
 - **L11. [DOCUMENTED 2026-10-13: the tndb README's Limits and choices; reservations unchanged.] Address-space reservation:** 16 GiB per log and 1 GiB per index (~62 GiB at rest, more during compaction), shared mappings, not commit-charged; falls back under `ulimit -v`. Fix: document; consider 4 GiB log reserves.
 - **L12. [WON'T FIX 2026-10-13: at most one compaction after a restart, and only past the threshold and twice the base; documented in the tndb README.] `has_dead` is assumed true at every open,** so a restart may cost one unneeded compaction. Optional: keep a dead-row count in `compacted`.
 - **L13. [FIXED 2026-10-13: `telcoin-network db tndb-stat` (`tndb::inspect` / `inspect_split`): read-only, refuses an open database via a shared lock; tests `test_tndb_inspect_*`, CLI `db_tndb_stat_*`.] No inspection tool** (MDBX has `mdbx_stat`). Fix: a `db tnlog-stat` subcommand; it also serves M7.
@@ -313,3 +313,21 @@ re-raised.
 - A catch-up reads the old log through the snapshot's view. A log that outgrows its 16 GiB
   reservation during a compaction would make the compaction abandon (a bounds error), not misread.
 - `TnDbTxMut::get` scans the transaction's writes linearly; production transactions are small.
+
+## tndb becomes the default (2026-10-14)
+
+`DatabaseType = tndb::SplitDatabase` unconditionally; the `tndb` feature is gone.
+- `open_db` opens `<consensus db>/tndb` in group commit and runs the MDBX migration, which copies
+  the old records and then deletes the MDBX files.
+- MDBX stays compiled (the default `reth-libmdbx` feature) only as the migration's source and as a
+  test and bench backend. The next release removes it with the migration.
+- `tn-storage` now also builds without MDBX (`--no-default-features`: tndb, no migration).
+
+**Checks:** fmt, clippy (default and all features), the CI test lanes (`test-default` 2825
+passed, `test-adiri` 1581 passed), and the e2e suite as `etc/test-and-attest.sh` runs it (30
+passed: restarts, epochs, ejections, base fee, state export/import, sync). Nothing failed, so
+there was nothing to fix.
+
+**Docs:** the operator docs (`validator-operations.md`, `hardware-requirements.md`) describe
+tndb's layout, compaction and alerts. The nightly e2e lane no longer sets `TN_TEST_MDBX_SYNC`,
+since the spawned nodes' tndb always syncs for real.
