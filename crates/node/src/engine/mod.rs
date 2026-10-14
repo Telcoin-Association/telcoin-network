@@ -317,15 +317,21 @@ impl ExecutionNode {
 
     /// Close transaction admission for initialized workers outside the current committee.
     ///
-    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    /// Hand pending and parked transactions to worker 0, including late in-flight admissions.
+    /// Each removed worker spawns a relay that moves them off this lock, so epoch entry does not
+    /// wait on the retired pool's size. Retain empty pools for reactivation. Normal destination
+    /// validation and capacity apply.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
-        self.internal
-            .write()
-            .await
-            .workers
-            .iter_mut()
-            .skip(active_workers)
-            .for_each(WorkerComponents::deactivate);
+        let mut guard = self.internal.write().await;
+        let destination =
+            guard.workers.first().filter(|_| active_workers > 0).map(WorkerComponents::pool);
+        destination.into_iter().for_each(|destination| {
+            guard
+                .workers
+                .iter_mut()
+                .skip(active_workers)
+                .for_each(|worker| worker.deactivate(&destination));
+        });
     }
 
     /// Refresh an initialized worker's fee and reopen admission on its retained RPC listeners.

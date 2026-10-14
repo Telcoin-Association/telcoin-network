@@ -13,6 +13,7 @@
 //! respawned when the epoch rolls over).
 
 use crate::{ChainSpec, RethEnv, WorkerTxPool};
+use futures::{FutureExt as _, StreamExt as _};
 use jsonrpsee::{core::RpcResult, types::ErrorObjectOwned};
 use parking_lot::RwLock;
 use reth::{network::config::SecretKey, rpc::builder::RpcServerHandle};
@@ -39,6 +40,8 @@ pub struct WorkerComponents {
     rpc_handle: RpcServerHandle,
     /// The worker's transaction pool.
     pool: WorkerTxPool,
+    /// Relay late admissions to worker 0 while this worker has no batch builder.
+    pool_handoff: Option<tokio::task::JoinHandle<()>>,
     /// Keep the WorkerNetwork around so we can update it's task(s).
     network: WorkerNetwork,
 }
@@ -46,7 +49,7 @@ pub struct WorkerComponents {
 impl WorkerComponents {
     /// Create a new instance of [Self].
     pub fn new(rpc_handle: RpcServerHandle, pool: WorkerTxPool, network: WorkerNetwork) -> Self {
-        Self { rpc_handle, pool, network }
+        Self { rpc_handle, pool, pool_handoff: None, network }
     }
 
     /// Return the RPC handle only while this worker is active.
@@ -54,23 +57,46 @@ impl WorkerComponents {
         self.network.rpc_admission.is_active().then_some(&self.rpc_handle)
     }
 
-    /// Stop accepting transactions while retaining the pool for a later reactivation.
+    /// Close admission and hand all admitted transactions to an active worker.
     ///
     /// A removed worker has no batch builder. Close admission before updating its shim and fee.
     /// Keep its listeners bound: jsonrpsee's graceful stop can retain a listener indefinitely
     /// while an unfinished HTTP request drains, preventing a fixed-port reactivation (#1505).
     /// Read-only RPC queries remain available while transaction submissions are rejected.
-    pub fn deactivate(&mut self) {
+    ///
+    /// Subscribe to admissions before the gate closes, because a submission that passed the gate
+    /// can still land after it. A spawned relay drains the pool once and then hands every late
+    /// admission to `destination`, so the caller never waits on the pool size. A relay still alive
+    /// from an earlier epoch keeps running. The empty pool survives for reactivation. Parked
+    /// transactions are migrated under the destination fee, even if the removed slot's fallback
+    /// fee promotes them locally.
+    pub fn deactivate(&mut self, destination: &WorkerTxPool) {
+        let relay_needed = self.pool_handoff.as_ref().is_none_or(|task| task.is_finished());
+        let admissions = relay_needed.then(|| self.pool.admitted_transactions());
         self.network.rpc_admission.set_state(WorkerRpcState::Inactive);
         self.network.set_syncing(true);
         self.pool.set_epoch_base_fee(MIN_PROTOCOL_BASE_FEE);
+        admissions.into_iter().for_each(|admissions| {
+            let pool = self.pool.clone();
+            let destination = destination.clone();
+            self.pool_handoff = Some(tokio::spawn(async move {
+                pool.migrate_transactions_to(&destination).await;
+                admissions
+                    .for_each(|()| pool.migrate_transactions_to(&destination).map(drop))
+                    .await;
+            }));
+        });
     }
 
     /// Refresh the pool's epoch fee before reopening transaction admission.
     ///
     /// Listeners and modules stay attached to the same pool and endpoints across removals.
     /// Reactivation never binds a socket and cannot depend on a client's connection lifetime.
+    /// Stop the retired-pool relay first; transactions already handed off remain with the active
+    /// worker. A move in flight completes or is dropped whole, and the source copy is removed only
+    /// after the destination holds it, so the abort can neither lose nor duplicate a transaction.
     pub fn reactivate(&mut self, base_fee: u64) {
+        self.pool_handoff.take().into_iter().for_each(|task| task.abort());
         self.pool.set_epoch_base_fee(base_fee);
         self.network.rpc_admission.set_state(WorkerRpcState::Active);
     }
@@ -83,6 +109,13 @@ impl WorkerComponents {
     /// Return the worker network inteface (RPC helper) for this worker.
     pub fn worker_network(&self) -> &WorkerNetwork {
         &self.network
+    }
+}
+
+impl Drop for WorkerComponents {
+    /// Stop the relay when the retained worker components leave the node.
+    fn drop(&mut self) {
+        self.pool_handoff.take().into_iter().for_each(|task| task.abort());
     }
 }
 
