@@ -360,7 +360,8 @@ pub(crate) struct Cli {
     /// (see `--max-inflight-queries`). With it, the reads kept on the worker
     /// (pending nonce reads and recent submission lookups) may hold at most a
     /// fifth of it (at least one slot), and one over that share is answered at
-    /// once with the same `503`.
+    /// once with the same `503`. At `1` no slot stays free for submissions, and
+    /// startup warns.
     #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
     pub(crate) max_upstream_inflight: usize,
 
@@ -895,6 +896,22 @@ impl Cli {
                 "without --redirect-queries reads share --max-upstream-inflight with submissions; \
                  lowering --max-inflight-queries so a fifth of the worker slots stays free for \
                  submissions"
+            );
+        }
+        // the reads that may hold a worker slot, counted as the startup line
+        // in `app::run` counts them
+        let worker_bound_reads = if query_upstream.is_some() {
+            worker_pool_read_cap(self.max_upstream_inflight)
+        } else {
+            max_inflight_queries
+        };
+        if submission_reserve(self.max_upstream_inflight, worker_bound_reads) == Some(0) {
+            warn!(
+                target: "gateway",
+                max_upstream_inflight = self.max_upstream_inflight,
+                "no worker slot stays free for submissions: one slow read can hold every worker \
+                 slot, and every concurrent submission is then refused with 503; raise \
+                 --max-upstream-inflight"
             );
         }
         if query_cap_reaches_connections(max_inflight_queries, self.max_connections) {
@@ -2950,6 +2967,27 @@ mod tests {
         );
         // the share follows the worker cap, never the query cap
         assert_eq!(pool_read_cap(&[redirect, "--max-inflight-queries=4"])?, 20);
+        Ok(())
+    }
+
+    #[test]
+    fn submission_reserve_of_zero_warns() -> eyre::Result<()> {
+        const WARNING: &str = "no worker slot stays free for submissions";
+        let redirect = "--redirect-queries=https://rpc.example.com/";
+        for flags in [&["--max-upstream-inflight=1"][..], &["--max-upstream-inflight=1", redirect]]
+        {
+            let (settings, logs) = into_settings_logged(cli_with_flags(flags));
+            settings?;
+            assert!(logs.contains(WARNING), "{flags:?}: {logs}");
+            assert!(logs.contains("max_upstream_inflight=1"), "{flags:?}: {logs}");
+        }
+        for flags in
+            [&[][..], &[redirect], &["--max-upstream-inflight=2"], &["--max-upstream-inflight=0"]]
+        {
+            let (settings, logs) = into_settings_logged(cli_with_flags(flags));
+            settings?;
+            assert!(!logs.contains(WARNING), "{flags:?}: {logs}");
+        }
         Ok(())
     }
 
