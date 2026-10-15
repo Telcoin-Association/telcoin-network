@@ -227,8 +227,17 @@ where
                 "record frame extends past the logical data end",
             )));
         }
-        buffer.resize(val_size as usize, 0);
-        file.read_exact(buffer)?;
+        // Read the payload into the buffer as it arrives rather than into a zero-filled buffer of
+        // the declared size: no zero-fill precedes a read that overwrites it, and a damaged size
+        // prefix (within the frame bound above) costs only the bytes actually there.
+        buffer.clear();
+        let read = file.by_ref().take(u64::from(val_size)).read_to_end(buffer)?;
+        if read != val_size as usize {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "record payload ends before its declared size",
+            )));
+        }
         // The record CRC covers `len | payload`.
         let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];
@@ -373,8 +382,16 @@ where
         if val_size > MAX_RECORD_SIZE {
             return Err(FetchError::RequestedSizeTooLarge(val_size, MAX_RECORD_SIZE));
         }
-        buffer.resize(val_size as usize, 0);
-        file.read_exact(buffer).await?;
+        // As the sync reader does: the payload grows the buffer as it arrives, so a stream that
+        // declares a large record and then stalls or ends has cost only what it sent.
+        buffer.clear();
+        let read = (&mut *file).take(u64::from(val_size)).read_to_end(buffer).await?;
+        if read != val_size as usize {
+            return Err(FetchError::IO(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "record payload ends before its declared size",
+            )));
+        }
         // The record CRC covers `len | payload`.
         let calc_crc32 = crc32_update(crc32(&val_size_buf), buffer);
         let mut buf_u32 = [0_u8; 4];

@@ -1069,8 +1069,8 @@ async fn resolve_prior_epoch_record(
 /// `SplitDatabase`) both tables live in the cache environment, one shared log: the transaction's
 /// removes are appended to it as one batch at commit, and its commit thread makes them durable in
 /// the background (group commit; nothing here waits for it). Sharing one txn makes one batch per
-/// output where bare removes would each be their own. A failure here is only logged. A batch left in
-/// [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
+/// output where bare removes would each be their own. A failure here is only logged. A batch left
+/// in [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
 /// [`OurNodeBatchesCache`] survives that clear and reaches `orphan_batches` as if it had never
 /// been committed.
 fn evict_committed_batches<DB: TNDatabase>(db: &DB, digests: &VecDeque<BlockHash>) {

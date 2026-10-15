@@ -118,10 +118,12 @@ fn reset<T: Table, DB: Database>(rt: &Runtime, db: &DB) {
 /// Bulk-load `BenchEpoch` with `BASIC_N` small rows in one transaction (insert + commit timed).
 fn bench_bulk_insert<DB: Database>(rt: &Runtime, db: &DB) -> Duration {
     reset::<BenchEpoch, _>(rt, db);
+    // The values, made before the clock starts.
+    let values: Vec<ByteVec> = (0..BASIC_N).map(|i| make_value(SMALL_VAL, i)).collect();
     let start = Instant::now();
     let mut txn = db.write_txn().expect("write_txn");
-    for i in 0..BASIC_N {
-        txn.insert::<BenchEpoch>(&i, &make_value(SMALL_VAL, i)).expect("insert");
+    for (i, value) in (0..BASIC_N).zip(&values) {
+        txn.insert::<BenchEpoch>(&i, value).expect("insert");
     }
     txn.commit().expect("commit");
     let elapsed = start.elapsed();
@@ -192,9 +194,10 @@ fn bench_small_commits<DB: Database>(rt: &Runtime, db: &DB) -> Duration {
     start.elapsed()
 }
 
-/// Like [`bench_small_commits`] but awaits `persist` after each commit — the durable externalization
-/// pattern (proposer header / vote / proposed-cert), where losing a record across a crash would let
-/// an honest node equivocate. This is the row where async-layered and raw-durable diverge most.
+/// Like [`bench_small_commits`] but awaits `persist` after each commit — the durable
+/// externalization pattern (proposer header / vote / proposed-cert), where losing a record across a
+/// crash would let an honest node equivocate. This is the row where async-layered and raw-durable
+/// diverge most.
 fn bench_durable_commits<DB: Database>(rt: &Runtime, db: &DB) -> Duration {
     reset::<BenchEpoch, _>(rt, db);
     let val = make_value(SMALL_VAL, 9);

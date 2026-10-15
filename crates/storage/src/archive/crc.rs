@@ -21,9 +21,9 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 /// On aarch64 with PMULL, inputs of at least `pmull::MIN_LEN` bytes take a carry-less-multiply
 /// folding path (a port of `crc32fast`'s x86 pclmulqdq one): `crc32fast` itself uses a single
 /// serial `crc32` instruction chain there, several times slower on large buffers. Everything else
-/// (small inputs, other targets) is `crc32fast`.
+/// (small inputs, other targets, big-endian aarch64) is `crc32fast`.
 pub(crate) fn crc32_update(crc: u32, data: &[u8]) -> u32 {
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     if data.len() >= pmull::MIN_LEN && std::arch::is_aarch64_feature_detected!("aes") {
         // SAFETY: the `aes` feature (which carries PMULL) was detected at runtime just above.
         return unsafe { pmull::update(crc, data) };
@@ -37,8 +37,9 @@ pub(crate) fn crc32_update(crc: u32, data: &[u8]) -> u32 {
 /// `specialized::pclmulqdq::calculate` (same constants, same steps), so it computes the same value.
 /// Each `_mm_clmulepi64_si128` there becomes a `vmull_p64` here: selector `0x00` multiplies the
 /// low 64-bit halves, `0x11` the high halves, and `0x10` the first operand's low half by the second
-/// operand's high half.
-#[cfg(target_arch = "aarch64")]
+/// operand's high half. Little-endian only: the folding loads bytes as 64-bit lanes the way x86
+/// does (a big-endian aarch64 target takes `crc32fast`).
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 mod pmull {
     use std::arch::aarch64::{
         uint64x2_t, vdupq_n_u64, veorq_u64, vgetq_lane_u64, vld1q_u64, vld1q_u8, vmull_high_p64,

@@ -2,7 +2,7 @@
 //! intended to be read and shared with other nodes.
 
 use serde::{de::DeserializeOwned, Serialize};
-use tn_types::{encode_into_buffer, try_decode, try_decode_from_read};
+use tn_types::{encode_into_buffer, try_decode};
 use tokio::io::{AsyncRead, AsyncReadExt as _};
 
 use crate::archive::{
@@ -11,7 +11,7 @@ use crate::archive::{
         load_header::LoadHeaderError, open::OpenError, rename::RenameError,
     },
     fxhasher::FxHasher,
-    pack_iter::{PackIter, MAX_RECORD_SIZE},
+    pack_iter::{decompress_checked, PackIter, MAX_RECORD_SIZE},
 };
 
 use super::{
@@ -291,8 +291,8 @@ where
     /// Roll the log's logical end back to `new_len`, zeroing the abandoned region, WITHOUT a
     /// physical truncate/remap (see [`MmapDataFile::rewind_to`]). Used to atomically undo a partial
     /// append without opening a read-only-mmap SIGBUS window; a later append lands at `new_len`.
-    pub fn rewind_to(&mut self, new_len: u64) {
-        self.inner.data_file.rewind_to(new_len);
+    pub fn rewind_to(&mut self, new_len: u64) -> Option<std::ops::Range<u64>> {
+        self.inner.data_file.rewind_to(new_len)
     }
 
     /// The durable acked-data watermark recovered from the tail commit marker of an unclean pack,
@@ -409,6 +409,12 @@ where
         opts: MmapFileOptions,
     ) -> Result<Self, OpenError> {
         let max_record = opts.max_record_size.unwrap_or(MAX_RECORD_SIZE);
+        // Every read caps a decompressed record at `MAX_RECORD_SIZE`, and a compressed pack's cap
+        // applies to the record before compression: above it, an append could succeed and the
+        // read fail.
+        if matches!(compression, PackCompression::ZStd) && max_record > MAX_RECORD_SIZE {
+            return Err(OpenError::RecordCapTooLarge(max_record));
+        }
         let (data_file, header) =
             Self::open_data_file(path, uid_idx, read_only, compression, version, opts)
                 .map_err(OpenError::DataFileOpen)?;
@@ -754,17 +760,15 @@ where
                 try_decode(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
             }
             PackCompression::ZStd => {
-                // Stream-decode straight from the decompressor, capping decompressed bytes at
-                // MAX_RECORD_SIZE with `take` -- no interim buffer (this is the `&self`
-                // random-access read, where a reusable buffer would mean a per-read alloc or a
-                // `&mut self` field). A record that decompresses past the cap is rejected by
-                // *failing to decode* (the reader hits the cap mid-value); unlike the iterator
-                // paths it does not surface `RequestedDecompressSizeTooLarge`.
-                let mut decoder = zstd::stream::read::Decoder::new(payload)?;
-                decoder.window_log_max(24)?;
-                let limited = decoder.take(MAX_RECORD_SIZE as u64);
-                try_decode_from_read(limited)
-                    .map_err(|e| FetchError::DeserializeValue(e.to_string()))
+                // Decompress (capped at `MAX_RECORD_SIZE`) into a buffer, then decode the slice:
+                // decoding from the decompressor itself would let a length prefix in a damaged
+                // record allocate up to the codec's sequence limit before the bytes ran out,
+                // where a slice's decode checks each length against the bytes it has. The buffer
+                // is per read; the packs that compress (epoch records, execution state) are read
+                // rarely.
+                let mut decompressed = Vec::new();
+                let bytes = decompress_checked(payload, &mut decompressed)?;
+                try_decode(bytes).map_err(|e| FetchError::DeserializeValue(e.to_string()))
             }
         }
     }
@@ -1753,6 +1757,60 @@ mod tests {
         assert_eq!(recs[0].idx, 2);
     }
 
+    /// A compressed pack refuses a record cap above what its reads decompress, rather than take
+    /// records it could not read back.
+    #[test]
+    fn open_refuses_a_zstd_cap_its_reads_cannot_meet() {
+        let tmp_path = TempDir::with_prefix("test_pack_zstd_cap").expect("temp dir");
+        let path = tmp_path.path().join("pack_zstd_cap");
+        let opts = |max| MmapFileOptions { max_record_size: Some(max), ..Default::default() };
+        let err = Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::ZStd,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect_err("a cap above the read cap");
+        assert!(matches!(err, OpenError::RecordCapTooLarge(_)), "got {err:?}");
+        Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::ZStd,
+            0,
+            opts(MAX_RECORD_SIZE),
+        )
+        .expect("the read cap itself");
+        Pack::<TestRec>::open_with(
+            tmp_path.path().join("plain"),
+            0,
+            false,
+            PackCompression::None,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect("an uncompressed pack reads what it wrote");
+    }
+
+    /// A compressed record whose decoded bytes declare a length far past what is there is a decode
+    /// error, not a panic or an abort.
+    #[test]
+    fn zstd_read_of_a_lying_length_prefix_fails_cleanly() {
+        let tmp_path = TempDir::with_prefix("test_pack_zstd_lying_len").expect("temp dir");
+        let path = tmp_path.path().join("pack");
+        let mut db: Pack<Vec<u8>> =
+            Pack::open(&path, 0, false, PackCompression::ZStd, 0).expect("open pack");
+        // ULEB128 for 2^31 - 2 (bcs's longest sequence), then three bytes.
+        let lying = [0xfe_u8, 0xff, 0xff, 0xff, 0x07, 1, 2, 3];
+        let compressed = zstd::bulk::compress(&lying, 3).expect("compress");
+        let pos = db.append_raw(&compressed).expect("append");
+        db.commit().expect("commit");
+        let err = db.fetch(pos).expect_err("a length past the bytes");
+        assert!(matches!(err, FetchError::DeserializeValue(_)), "got {err:?}");
+    }
+
     fn archive_pack_(compression: PackCompression) {
         let tmp_path = TempDir::with_prefix("test_archive_pack_one").expect("temp dir");
         let mut db: TestPack =
@@ -2074,11 +2132,9 @@ mod tests {
         (tmp_path, pos)
     }
 
-    // The in-memory MAX_RECORD_SIZE cap bounds decompressed output at every decompression site.
-    // The iterator sites (sync + async) buffer the decompressed bytes and report the precise
-    // `RequestedDecompressSizeTooLarge`; the `fetch` site streams the decode with no buffer (a
-    // deliberate no-alloc optimization) and so rejects a bomb by *failing to decode* -- a
-    // `DeserializeValue`, not the size-cap error. These parity tests pin that intended split.
+    // The in-memory MAX_RECORD_SIZE cap bounds decompressed output at every decompression site,
+    // and every site (`fetch` and both iterators) buffers the decompressed bytes and reports the
+    // precise `RequestedDecompressSizeTooLarge`. These parity tests pin that.
 
     #[test]
     fn test_zstd_decompression_bomb_fetch() {
@@ -2087,10 +2143,8 @@ mod tests {
         let pack: TestPack =
             Pack::open(&path, 0, true, PackCompression::ZStd, 0).expect("open pack");
         match pack.fetch(pos) {
-            // Streaming fetch caps decompressed bytes with `take` and rejects the bomb by failing
-            // to decode (bcs sees data past the record) rather than reporting the size cap.
-            Err(FetchError::DeserializeValue(_)) => {}
-            other => panic!("expected the bomb to fail decoding, got {other:?}"),
+            Err(FetchError::RequestedDecompressSizeTooLarge(MAX_RECORD_SIZE)) => {}
+            other => panic!("expected the size-cap rejection, got {other:?}"),
         }
     }
 

@@ -1602,6 +1602,38 @@ fn test_tndb_compaction_copy_gives_way_to_a_full_disk() {
     assert_eq!(db.iter::<TestTable>().count(), 64);
 }
 
+/// A catch-up round checks for room on the disk as it copies, as the copy does, not only before
+/// it starts: the first round replays everything written during the copy, and a disk filling
+/// meanwhile must abandon the compaction before the writer's growth finds it full.
+#[test]
+fn test_tndb_compaction_catch_up_checks_the_disk_as_it_goes() {
+    let tmp = TempDir::with_prefix("tndb_compact_catch_up_room").expect("temp dir");
+    let config = CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 };
+    let db = open_compacting(tmp.path(), CommitMode::Group, config);
+    let value = "v".repeat(64 << 10);
+    for i in 0..16_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+    }
+    let hooks = &db.core().compact.test;
+    let (arrivals, release) = hooks.gate_next();
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        assert_eq!(arrivals.recv_timeout(Duration::from_secs(20)), Ok(1), "the copy's end");
+        // 4 MiB written while the copy ran: the first catch-up round copies it.
+        for i in 100..164_u64 {
+            db.insert::<TestTable>(&i, &value).expect("insert");
+        }
+        let before = hooks.room_checks.load(std::sync::atomic::Ordering::Relaxed);
+        release.send(()).expect("release the copy's end");
+        assert_eq!(arrivals.recv_timeout(Duration::from_secs(20)), Ok(2), "the round's end");
+        let checks = hooks.room_checks.load(std::sync::atomic::Ordering::Relaxed) - before;
+        assert!(checks >= 4, "a 4 MiB round checked the disk {checks} times");
+        drop(release);
+        compaction.join().expect("compaction thread").expect("compacted");
+    });
+    assert_eq!(db.iter::<TestTable>().count(), 80);
+}
+
 /// Zero the CRC trailer of every page of each index in generation directory `gen` but its header
 /// and root: at-rest damage the index reports as `CorruptIndex` on a read through those pages
 /// (the open checks only the header and the root).
@@ -2196,6 +2228,34 @@ fn test_tndb_sync_no_op_waits_for_the_state_it_saw() {
     });
 }
 
+/// In `Sync` mode `persist` covers another thread's write that is visible but not yet durable
+/// (its sync paused here), as in group mode, rather than only checking for a failure.
+#[test]
+fn test_tndb_sync_persist_waits_for_another_writers_write() {
+    let tmp = TempDir::with_prefix("tndb_sync_persist").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Sync);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    let (arrived, release) = db.core().durability.gate_next_sync();
+    let db = &db;
+    std::thread::scope(|s| {
+        let writer = s.spawn(|| db.insert::<TestTable>(&2, &"b".to_string()));
+        arrived.recv_timeout(Duration::from_secs(10)).expect("the write's sync paused");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let persist = s.spawn(move || {
+            let persisted = block_on(db.persist::<TestTable>());
+            let _ = done_tx.send(());
+            persisted
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "persist returned before the write it covers was durable"
+        );
+        drop(release);
+        writer.join().expect("thread").expect("the write");
+        persist.join().expect("thread").expect("the persist");
+    });
+}
+
 /// A `persist` waiting when the commit thread stops (a crashed process's) fails instead of
 /// waiting forever for a sync no thread will run.
 #[test]
@@ -2319,6 +2379,41 @@ fn test_tndb_power_loss_keeps_rows_from_before_an_unclean_reopen() {
     let db = open(tmp.path(), CommitMode::Group);
     assert_eq!(rows::<TestTable>(&db).len(), 20, "every row the reopened log built on");
     drop(db);
+    disk_model::untrack(&log_path(tmp.path()));
+}
+
+/// Recovery that cuts a log back to its last whole batch flushes the zeros it leaves at once. The
+/// open-time sync made the old tail durable (here a damaged batch and a whole one after it), and
+/// zeros only in memory would leave it on disk past the cut after a power loss, for a later
+/// replay to reach behind newer batches.
+#[test]
+fn test_tndb_recovery_flushes_the_tail_it_cuts() {
+    use std::os::unix::fs::FileExt as _;
+
+    use crate::archive::data_file::disk_model;
+    let tmp = TempDir::with_prefix("tndb_recovery_flush").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    disk_model::track(&log_path(tmp.path()));
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    let cut = db.core().frontier.load().end;
+    db.stop_commit_thread();
+    db.insert::<TestTable>(&2, &"x".repeat(4096)).expect("a batch, never synced");
+    db.insert::<TestTable>(&3, &"y".repeat(4096)).expect("a whole batch after it");
+    crash(db);
+    // Damage the first of them: the next open replays only up to `cut`.
+    let log = std::fs::OpenOptions::new().write(true).open(log_path(tmp.path())).expect("open");
+    log.write_all_at(&[0xAA], cut + 40).expect("damage the batch");
+    drop(log);
+
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(rows::<TestTable>(&db), [(1, "a".to_string())], "cut at the damaged batch");
+    crash(db);
+    disk_model::power_loss(&log_path(tmp.path()));
+    let log = std::fs::File::open(log_path(tmp.path())).expect("open");
+    let mut tail = vec![0_u8; 8192];
+    log.read_exact_at(&mut tail, cut).expect("read past the cut");
+    assert!(tail.iter().all(|&b| b == 0), "the cut tail's zeros reached the disk");
     disk_model::untrack(&log_path(tmp.path()));
 }
 

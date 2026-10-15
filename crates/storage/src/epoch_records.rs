@@ -1194,8 +1194,8 @@ impl EpochRecordDb {
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
     /// lookup. The vector is sorted because the database's thread extends it from the stored
-    /// records, which are stored in epoch order ([`sync_routing`]). If `number` is beyond the last stored epoch, returns
-    /// `last_epoch + 1` (the current in-progress epoch).
+    /// records, which are stored in epoch order ([`sync_routing`]). If `number` is beyond the last
+    /// stored epoch, returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
         let finals = self.final_numbers.lock();
         finals.partition_point(|final_num| number > *final_num) as u32

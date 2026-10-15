@@ -146,21 +146,36 @@ fn tndb_column<W: Workload>(
     commit: CommitMode,
     name: &str,
 ) -> Column {
-    tndb_stats_column(rt, w, name, open_tndb(dir, commit), dir)
+    tndb_stats_column(rt, w, name, || open_tndb(dir, commit), dir)
 }
 
-/// [`column`] for a tndb-backed `db` at `dir`, then print what its logs' sync rounds and write
-/// locks did (summed over every log it has).
+/// [`column`] for the tndb-backed database `open` makes at `dir`, then print what its logs'
+/// sync rounds and write locks did (summed over every log it has).
 fn tndb_stats_column<W: Workload, DB: Database>(
     rt: &Runtime,
     w: &mut W,
     name: &str,
-    db: DB,
+    open: impl FnOnce() -> DB,
+    dir: &Path,
+) -> Column {
+    if !column_wanted(name) {
+        println!("  skipping {name} (not in TN_BENCH_COLUMNS)");
+        return (name.to_string(), Vec::new());
+    }
+    measured_tndb_column(rt, w, name, open, dir)
+}
+
+/// [`tndb_stats_column`] whatever `TN_BENCH_COLUMNS` says.
+fn measured_tndb_column<W: Workload, DB: Database>(
+    rt: &Runtime,
+    w: &mut W,
+    name: &str,
+    open: impl FnOnce() -> DB,
     dir: &Path,
 ) -> Column {
     let _ = tndb_stats::take();
     let _ = tndb_stats::take_logs();
-    let col = column(rt, w, name.to_string(), db, Some(dir));
+    let col = run_column(rt, w, name.to_string(), open, Some(dir));
     let s = tndb_stats::take();
     let avg_us = |ns: u64, n: u64| ns as f64 / n.max(1) as f64 / 1e3;
     println!(
@@ -564,18 +579,31 @@ fn column_wanted(name: &str) -> bool {
     }
 }
 
+/// Run `w` on the database `open` makes, as column `name` (a skipped column opens nothing).
 fn column<W: Workload, DB: Database>(
     rt: &Runtime,
     w: &mut W,
     name: String,
-    db: DB,
+    open: impl FnOnce() -> DB,
     dir: Option<&Path>,
 ) -> Column {
     if !column_wanted(&name) {
         println!("  skipping {name} (not in TN_BENCH_COLUMNS)");
         return (name, Vec::new());
     }
+    run_column(rt, w, name, open, dir)
+}
+
+/// [`column`] whatever `TN_BENCH_COLUMNS` says.
+fn run_column<W: Workload, DB: Database>(
+    rt: &Runtime,
+    w: &mut W,
+    name: String,
+    open: impl FnOnce() -> DB,
+    dir: Option<&Path>,
+) -> Column {
     println!("  running {name} ...");
+    let db = open();
     w.open_tables(&db);
     let cells = w.run(rt, db, dir);
     (name, cells)
@@ -591,12 +619,12 @@ fn run_backends<W: Workload>(
     layer: Layer,
     raw_mdbx: bool,
 ) -> Vec<Column> {
-    let mut cols = vec![column(rt, w, "MemDb".to_string(), MemDatabase::new(), None)];
+    let mut cols = vec![column(rt, w, "MemDb".to_string(), MemDatabase::new, None)];
     cols.push(tndb_column(rt, w, &base.join("tndb"), CommitMode::Sync, "TnDb"));
     cols.push(tndb_column(rt, w, &base.join("tndb_group"), CommitMode::Group, "TnDb-group"));
     let root = base.join("split_tndb");
-    let db = open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
-    cols.push(tndb_stats_column(rt, w, "Split<TnDb-group>", db, &root));
+    let open = || open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
+    cols.push(tndb_stats_column(rt, w, "Split<TnDb-group>", open, &root));
 
     #[cfg(feature = "reth-libmdbx")]
     {
@@ -609,12 +637,13 @@ fn run_backends<W: Workload>(
         };
         if raw_mdbx {
             let dir = base.join("mdbx_prod");
-            let db = open_mdbx_prod(&dir, tables, max_size, growth);
-            cols.push(column(rt, w, "MDBX-prod".to_string(), db, Some(&dir)));
+            let open = || open_mdbx_prod(&dir, tables, max_size, growth);
+            cols.push(column(rt, w, "MDBX-prod".to_string(), open, Some(&dir)));
         }
         let dir = base.join("mdbx_prod_layered");
-        let db = LayeredDatabase::open(open_mdbx_prod(&dir, tables, max_size, growth), full_memory);
-        cols.push(column(rt, w, format!("{layered}<MDBX-prod>"), db, Some(&dir)));
+        let open =
+            || LayeredDatabase::open(open_mdbx_prod(&dir, tables, max_size, growth), full_memory);
+        cols.push(column(rt, w, format!("{layered}<MDBX-prod>"), open, Some(&dir)));
     }
     cols
 }
@@ -980,19 +1009,19 @@ fn workload_mixed() {
         )];
         let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
         let root = tmp.path().join("split_tndb_nocompact");
-        let db = open_split_tndb(&root, CommitMode::Group, off);
-        cols.push(tndb_stats_column(&rt, &mut w, "Split-nocompact", db, &root));
+        let open = || open_split_tndb(&root, CommitMode::Group, off);
+        cols.push(tndb_stats_column(&rt, &mut w, "Split-nocompact", open, &root));
         let root = tmp.path().join("split_tndb");
-        let db = open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
-        cols.push(tndb_stats_column(&rt, &mut w, "Split<TnDb-group>", db, &root));
+        let open = || open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
+        cols.push(tndb_stats_column(&rt, &mut w, "Split<TnDb-group>", open, &root));
         // The previous production DB, for scale: beside the paced stream only. Its cache layer
         // queues writes unbounded, and beside the unpaced one that queue held 39 GB (resident;
         // an 86 GB footprint) on a Mac, enough to take a smaller machine down.
         #[cfg(feature = "reth-libmdbx")]
         if rate.is_some() {
             let root = tmp.path().join("composite_mdbx_prod");
-            let db = open_composite_mdbx_prod(&root);
-            cols.push(column(&rt, &mut w, "Composite<MDBX-prod>".to_string(), db, Some(&root)));
+            let open = || open_composite_mdbx_prod(&root);
+            cols.push(column(&rt, &mut w, "Composite<MDBX-prod>".to_string(), open, Some(&root)));
         }
         let pace = rate.map_or_else(|| "as fast as taken".to_string(), |r| format!("{r}/s"));
         print_table(
@@ -1001,7 +1030,8 @@ fn workload_mixed() {
                 batch >> 10
             ),
             "one database; the batch writer runs on its own thread for the whole consensus run, \
-             keeping the last 64 batches (each insert evicts the oldest)",
+             keeping the last 64 batches (each insert evicts the oldest); batch MB/s alongside \
+             spans the writer's whole run, the consensus run's warm-up and epoch clear included",
             &cols,
         );
     }
@@ -1053,7 +1083,7 @@ fn consensus_cost_pairs(
     let env = |name: &str, default: usize| {
         std::env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
     };
-    let pairs_wanted = env("TN_BENCH_PAIRS", 6);
+    let pairs_wanted = env("TN_BENCH_PAIRS", 6).max(1);
     let pair_rounds = env("TN_BENCH_PAIR_ROUNDS", 1000) as u32;
     let batch = env("TN_BENCH_PAIR_BATCH_KB", 256) << 10;
     let rate = match env("TN_BENCH_PAIR_RATE", 0) {
@@ -1078,8 +1108,8 @@ fn consensus_cost_pairs(
             };
             let root = tmp.path().join("split");
             let name = names[usize::from(second)];
-            let db = open(second, &root);
-            let col = tndb_stats_column(&rt, &mut w, name, db, &root);
+            // Both columns of a pair always run (`TN_BENCH_COLUMNS` does not apply).
+            let col = measured_tndb_column(&rt, &mut w, name, || open(second, &root), &root);
             println!(
                 "    {name}: {:.0} batch MB/s alongside, {:.0} MB on disk after close",
                 value(&col, "batch MB/s alongside"),
@@ -1339,6 +1369,8 @@ fn count_epoch_rows<DB: Database>(db: &DB) -> usize {
 /// (open plus `open_table`) and the full-memory layer over it (which loads every row into memory).
 /// With `crash` (how to abandon an open handle as a crashed process would, so the next open
 /// recovers), also time both reopens after a crash. Returns the raw and layered report columns.
+/// Every reopen finds the files just written, in the page cache: the times are the open's own
+/// work, not a cold read from the drive (which a restart after a reboot also pays).
 fn reload<DB: Database>(
     name: &str,
     dir: &Path,
@@ -1394,10 +1426,10 @@ fn reload<DB: Database>(
 
     let cells = |time: Duration, crashed: Option<Duration>| {
         vec![
-            Cell::ms("reopen ms", time),
+            Cell::ms("reopen ms (warm cache)", time),
             crashed.map_or_else(
-                || Cell::new("crash reopen ms (rebuild)", Better::Lower, "-".to_string()),
-                |d| Cell::ms("crash reopen ms (rebuild)", d),
+                || Cell::new("crash reopen ms (warm cache)", Better::Lower, "-".to_string()),
+                |d| Cell::ms("crash reopen ms (warm cache)", d),
             ),
             Cell::count("rows", rows),
             Cell::mb("disk MB", Some(disk)),
@@ -1617,10 +1649,11 @@ fn workload_compaction() {
     let off = CompactionConfig { auto_min_bytes: None, ..Default::default() };
     let mut cols = Vec::new();
     let dir = tmp.path().join("TnDb-group-nocompact");
-    let db =
+    let open = || {
         TnDatabase::open_with(&dir, TnDbOptions { commit: CommitMode::Group, compaction: off })
-            .expect("open tndb");
-    cols.push(tndb_stats_column(&rt, &mut w, "TnDb-group-nocompact", db, &dir));
+            .expect("open tndb")
+    };
+    cols.push(tndb_stats_column(&rt, &mut w, "TnDb-group-nocompact", open, &dir));
     cols.push(tndb_column(
         &rt,
         &mut w,
@@ -1631,14 +1664,13 @@ fn workload_compaction() {
     #[cfg(feature = "reth-libmdbx")]
     {
         let dir = tmp.path().join("mdbx_prod");
-        let db = open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH);
-        cols.push(column(&rt, &mut w, "MDBX-prod".to_string(), db, Some(&dir)));
+        let open = || open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH);
+        cols.push(column(&rt, &mut w, "MDBX-prod".to_string(), open, Some(&dir)));
         let dir = tmp.path().join("mdbx_prod_layered");
-        let db = LayeredDatabase::open(
-            open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH),
-            false,
-        );
-        cols.push(column(&rt, &mut w, "Layered-cache<MDBX-prod>".to_string(), db, Some(&dir)));
+        let open = || {
+            LayeredDatabase::open(open_mdbx_prod(&dir, 4, PROD_CACHE_MAX, PROD_CACHE_GROWTH), false)
+        };
+        cols.push(column(&rt, &mut w, "Layered-cache<MDBX-prod>".to_string(), open, Some(&dir)));
     }
     print_table(
         &format!(

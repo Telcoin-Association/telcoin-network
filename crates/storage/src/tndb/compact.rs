@@ -301,6 +301,8 @@ pub(super) struct TestHooks {
     pub(super) skip_a_row: AtomicBool,
     /// The free space the disk guards see.
     pub(super) free_space: Mutex<Option<u64>>,
+    /// How many times a disk guard has run.
+    pub(super) room_checks: std::sync::atomic::AtomicU64,
     /// The next switch panics just before its rename, or just after it.
     pub(super) panic_before_rename: AtomicBool,
     pub(super) panic_after_rename: AtomicBool,
@@ -367,6 +369,8 @@ fn free_bytes(core: &Core) -> Option<u64> {
 
 /// Give way to the writer when the disk is nearly full (an unknown free space does not block).
 fn check_room(core: &Core) -> eyre::Result<()> {
+    #[cfg(test)]
+    core.compact.test.room_checks.fetch_add(1, Ordering::Relaxed);
     match free_bytes(core) {
         Some(free) if free < MIN_FREE => Err(GiveWay::DiskFull(format!(
             "tndb: compaction abandoned: {free} bytes free, below {MIN_FREE}"
@@ -693,7 +697,12 @@ fn catch_up(
     from: u64,
     to: u64,
     ksizes: &Ksizes<'_>,
+    guard: Option<&Core>,
 ) -> eyre::Result<()> {
+    // A round can be large (the first replays everything written during the copy), so outside
+    // the write lock it checks for a cancellation and for room on the disk as it goes, as the copy
+    // does (unpaced): a writer's growth must not be what finds the disk full.
+    let mut pacer = guard.map(|core| (Pacer::new(0), core));
     let mut cleared = BTreeSet::new();
     let mut net: BTreeMap<(TableId, Vec<u8>), Net> = BTreeMap::new();
     let mut pos = from;
@@ -725,6 +734,9 @@ fn catch_up(
                 let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
                 let ksize = ksizes.get(id).unwrap_or(0);
                 out.copy_row(id, ksize, &key, payload)?;
+                if let Some((pacer, core)) = pacer.as_mut() {
+                    pacer.pace(payload.len() as u64 + FRAME, core)?;
+                }
             }
             Net::Remove => out.remove(id, &key)?,
         }
@@ -750,7 +762,9 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let Some(snap) = core.compaction_snapshot(requested.then_some(min)) else { return Ok(false) };
     #[cfg(test)]
     let mut skip_a_row = shared.test.skip_a_row.swap(false, Ordering::Relaxed);
-    let needed = dir_bytes(&snap.gen_dir) + DISK_HEADROOM;
+    // Room for the new generation, and the floor the copy keeps above it: a compaction admitted
+    // with less would copy almost everything and then give way (`check_room`), every backoff.
+    let needed = dir_bytes(&snap.gen_dir) + DISK_HEADROOM + MIN_FREE;
     if let Some(free) = free_bytes(core).filter(|&free| free < needed) {
         let why = format!("tndb: compaction skipped: {free} bytes free, {needed} needed");
         return Err(GiveWay::DiskFull(why).into());
@@ -793,7 +807,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         shared.check_cancel()?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes)?;
+        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
         let behind = to - done;
         done = to;
         out.sync()?;
@@ -821,7 +835,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         shared.check_cancel()?;
         check_room(core)?;
         let to = core.frontier.load().end;
-        catch_up(&mut out, &view, done, to, &ksizes)?;
+        catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
         done = to;
         out.sync()?;
         let base = out.log_len();
@@ -843,7 +857,8 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
             shared.test.switch_retries.fetch_add(1, Ordering::Relaxed);
             continue;
         }
-        catch_up(&mut out, &view, done, end, &ksizes)?;
+        // Under the write lock, and at most a tail's worth (the cap above): no checks.
+        catch_up(&mut out, &view, done, end, &ksizes, None)?;
         for (id, rows) in writer.table_rows() {
             if out.rows(id) != rows {
                 bail!(

@@ -207,6 +207,34 @@ pub(crate) mod disk_model {
         image[from..to].copy_from_slice(&map[from..to]);
     }
 
+    /// [`flushed_range`] for a mapping another thread may be appending to (a [`MapView`]'s): its
+    /// pages are copied through the raw pointer, never borrowed as a slice, since bytes past `end`
+    /// in the last page can be written meanwhile (the model keeps whatever the page holds, as the
+    /// flush did).
+    pub(crate) fn flushed_range_raw(ino: u64, base: *const u8, mapped: u64, start: u64, end: u64) {
+        if TRACKED.load(Ordering::Relaxed) == 0 || start >= end {
+            return;
+        }
+        let mut images = images();
+        let Some(image) = images.as_mut().and_then(|images| images.get_mut(&ino)) else {
+            return;
+        };
+        let page = super::page_size();
+        let from = (start - start % page) as usize;
+        let to = (end.div_ceil(page) * page).min(mapped) as usize;
+        if from >= to {
+            return;
+        }
+        if image.len() < to {
+            image.resize(to, 0);
+        }
+        // SAFETY: the caller's `[base, base + mapped)` is a live mapping and `[from, to)` lies
+        // within it; the copy goes into the model's own buffer, which no one else touches.
+        unsafe {
+            std::ptr::copy_nonoverlapping(base.add(from), image[from..to].as_mut_ptr(), to - from);
+        }
+    }
+
     /// The inode of `file`, if any file is tracked (else 0, never a tracked one).
     pub(crate) fn ino_if_tracking(file: &File) -> u64 {
         if TRACKED.load(Ordering::Relaxed) == 0 {
@@ -397,8 +425,9 @@ impl MapView {
         self.mapped.store(len, Ordering::Release);
     }
 
-    /// Publish `len` bytes as fully written and readable (they must already be in the mapping and
-    /// never change while readers can see them).
+    /// Publish `len` bytes as fully written and readable (they must already be in the mapping, and
+    /// no byte a reader can reach may change: an append-only log never rewrites them, and a B+tree
+    /// rewrites only pages no reader's snapshot reaches).
     pub(crate) fn publish_len(&self, len: u64) {
         self.published.store(len, Ordering::Release);
     }
@@ -429,28 +458,34 @@ impl MapView {
             return Err(io::Error::last_os_error());
         }
         #[cfg(test)]
-        {
-            // SAFETY: as above, `[base, base + mapped)` is a live mapping. Bytes past `end` may be
-            // written meanwhile; the model copies whatever the page holds, as the flush did.
-            let map = unsafe { std::slice::from_raw_parts(base, mapped as usize) };
-            disk_model::flushed_range(self.ino.load(Ordering::Relaxed), map, start, end);
-        }
+        disk_model::flushed_range_raw(self.ino.load(Ordering::Relaxed), base, mapped, start, end);
         Ok(())
     }
 
-    /// Borrow `[offset, offset + len)` if it lies within the published bytes, else `None`.
+    /// Borrow exactly `[offset, offset + len)` if it lies within the published bytes, else
+    /// `None`. Only those bytes are borrowed, so a file whose owner rewrites other published bytes
+    /// in place (a B+tree reusing a page no reader's snapshot can reach) is never borrowed from
+    /// where it is being written.
     pub(crate) fn slice(&self, offset: u64, len: usize) -> Option<&[u8]> {
-        self.tail(offset)?.get(..len)
+        let end = offset.checked_add(len as u64)?;
+        let limit = self.published.load(Ordering::Acquire).min(self.mapped.load(Ordering::Acquire));
+        if end > limit {
+            return None;
+        }
+        let base = self.base.load(Ordering::Acquire);
+        if base.is_null() {
+            return None;
+        }
+        // SAFETY: `[base, base + mapped)` is a live mapping (see the type docs), and
+        // `[offset, end)` lies within it and within the published bytes, which the owner does not
+        // modify while a reader can reach them.
+        Some(unsafe { std::slice::from_raw_parts(base.add(offset as usize), len) })
     }
 
-    /// Borrow every published byte from `offset` on (`None` past the published end): one bounds
-    /// check for a reader that learns a record's length from its own prefix.
-    pub(crate) fn tail(&self, offset: u64) -> Option<&[u8]> {
-        self.tail_within(offset, self.published.load(Ordering::Acquire))
-    }
-
-    /// [`Self::tail`] bounded by `limit` instead of the view's published length: for a reader
-    /// whose snapshot carries its own limit (bytes its owner wrote in full before the snapshot).
+    /// Borrow every byte from `offset` up to `limit` (`None` past it), where `limit` is a length
+    /// the owner wrote in full before the reader's snapshot: one bounds check for a reader that
+    /// learns a record's length from its own prefix. For an append-only file (a log), whose
+    /// written bytes never change; a file rewritten in place reads through [`Self::slice`].
     pub(crate) fn tail_within(&self, offset: u64, limit: u64) -> Option<&[u8]> {
         let end = limit.min(self.mapped.load(Ordering::Acquire));
         let len = end.checked_sub(offset)?;
@@ -1065,7 +1100,12 @@ impl MmapDataFile {
     fn take_backing(&mut self) {
         let old = std::mem::replace(&mut self.backing, Backing::Empty);
         if Arc::strong_count(&self.view) > 1 && !matches!(old, Backing::Empty) {
+            // A reader may hold the old base: keep it mapped (and the view on it) until the
+            // replacement is installed.
             self.retired.push(old);
+        } else {
+            // Unmapped as `old` drops: the view must not keep its base.
+            self.view.set_mapping(std::ptr::null(), 0);
         }
     }
 
@@ -1090,6 +1130,8 @@ impl MmapDataFile {
         // and `Drop` does not seal a file whose mapping was lost mid-flight.
         self.file.set_len(new_len).inspect_err(|_| self.poison())?;
         if new_len == 0 {
+            // Nothing is mapped now, and the file is empty: a retired map's pages are gone too.
+            self.sync_view();
             return Ok(());
         }
         let reserved_map = if self.reserved > 0 {
@@ -1362,11 +1404,13 @@ impl MmapDataFile {
     ///
     /// Used to atomically undo a partial append (see the consensus pack's save rollback). `new_len`
     /// must be `<= end`; a value at or beyond `end` is ignored (use [`Self::ensure_len`] to grow).
-    /// No-op on a read-only handle.
-    pub fn rewind_to(&mut self, new_len: u64) {
+    /// No-op on a read-only handle. Returns the span it zeroed (the chunks that held non-zero
+    /// bytes), if any, for a caller that must flush the zeros or report what it cut.
+    pub fn rewind_to(&mut self, new_len: u64) -> Option<std::ops::Range<u64>> {
         if self.read_only || new_len >= self.end {
-            return;
+            return None;
         }
+        let mut zeroed: Option<std::ops::Range<u64>> = None;
         if let Backing::Rw(map) = &mut self.backing {
             // Zero only the chunks that actually hold non-zero bytes (the torn tail). `[new_len,
             // end)` on an unclean open is mostly sparse capacity padding (holes that
@@ -1378,10 +1422,15 @@ impl MmapDataFile {
             // Skipping already-zero chunks keeps the "padding reads as zeros" invariant
             // at a fraction of the cost.
             let tail = (self.end - new_len) as usize;
+            let mut at = new_len;
             for chunk in map_range_mut(map, new_len as usize, tail).chunks_mut(64 << 10) {
+                let next = at + chunk.len() as u64;
                 if chunk.iter().any(|&b| b != 0) {
                     chunk.fill(0);
+                    let start = zeroed.as_ref().map_or(at, |span| span.start);
+                    zeroed = Some(start..next);
                 }
+                at = next;
             }
         }
         self.end = new_len;
@@ -1392,6 +1441,7 @@ impl MmapDataFile {
         if self.seek_pos > new_len {
             self.seek_pos = new_len;
         }
+        zeroed
     }
 
     /// Clone the underlying file handle, `msync`ing its dirty range first (`[flushed_end, end)` for
@@ -1811,8 +1861,10 @@ impl Write for MmapDataFile {
 
 impl Drop for MmapDataFile {
     fn drop(&mut self) {
+        // Whatever path this takes, a reader still holding the view finds nothing mapped from now
+        // on, rather than a mapping about to go.
+        self.view.set_mapping(std::ptr::null(), 0);
         if self.remove_on_drop {
-            self.view.set_mapping(std::ptr::null(), 0);
             self.backing = Backing::Empty; // release the map before removing the file
             match std::fs::remove_file(&self.path) {
                 // Already unlinked (e.g. its directory was removed while it was still mapped).
@@ -2174,13 +2226,14 @@ mod tests {
         let old = view.slice(0, 1_000).expect("published slice");
         assert_eq!(old, &pattern(1_000)[..]);
         assert_eq!(view.slice(900, 101), None, "past the published length");
+        assert_eq!(view.slice(1_000, 0).map(<[u8]>::len), Some(0));
+        assert_eq!(view.slice(1_001, 0), None);
         assert_eq!(
-            view.tail(900).map(<[u8]>::len),
+            view.tail_within(900, 1_000).map(<[u8]>::len),
             Some(100),
-            "the tail stops at the published end"
+            "the tail stops at its limit"
         );
-        assert_eq!(view.tail(1_000).map(<[u8]>::len), Some(0));
-        assert_eq!(view.tail(1_001), None);
+        assert_eq!(view.tail_within(1_001, 1_000), None);
 
         df.write_all(&pattern(40_000)[1_000..]).expect("grow past the reservation");
         assert!(df.reserved >= 40_000, "re-reserved larger (reserved {})", df.reserved);
@@ -2190,6 +2243,38 @@ mod tests {
         let new = view.slice(0, 40_000).expect("slice after the move");
         assert_eq!(new, &pattern(40_000)[..]);
         assert_ne!(new.as_ptr(), old.as_ptr(), "the view follows the new mapping");
+    }
+
+    /// A view outlives its file only as an empty view: once the file drops, by any of its paths
+    /// (here a read-only handle's, and an unclean writable one's), a reader holding the view finds
+    /// nothing mapped instead of a mapping that is gone. A slice is exactly the bytes asked for.
+    #[test]
+    fn map_view_is_empty_once_its_file_drops() {
+        let tmp = TempDir::with_prefix("mmap_df_view_drop").expect("temp dir");
+        let path = tmp.path().join("data");
+        {
+            let mut df = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+            df.write_all(&pattern(1_000)).expect("write");
+            let view = df.view();
+            view.publish_len(1_000);
+            assert_eq!(view.slice(10, 20).map(<[u8]>::len), Some(20), "exactly the bytes asked");
+            df.sync_all().expect("sync");
+        }
+        let read_only = MmapDataFile::open_with(&path, true, tiny_opts()).expect("open read-only");
+        let view = read_only.view();
+        view.publish_len(1_000);
+        assert!(view.slice(0, 8).is_some(), "mapped while the file is open");
+        drop(read_only);
+        assert_eq!(view.slice(0, 8), None, "nothing mapped once a read-only file drops");
+        assert_eq!(view.tail_within(0, 8), None);
+
+        let mut unclean = MmapDataFile::open_with(&path, false, tiny_opts()).expect("open");
+        unclean.write_all(&pattern(10)).expect("write");
+        unclean.opened_unclean = true;
+        let view = unclean.view();
+        view.publish_len(8);
+        drop(unclean);
+        assert_eq!(view.slice(0, 8), None, "nor once an unclean file drops, unsealed");
     }
 
     /// An empty file opened with a reservation is mapped at once (no first-write remap) and works

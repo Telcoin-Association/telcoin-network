@@ -1140,7 +1140,12 @@ impl Core {
         super::stats::hold(held);
         #[cfg(test)]
         super::stats::log(self.stat_slot).hold(held);
-        self.metrics.wrote(end, pending, waited, held);
+        // The gauges from the frontier as it is now, not as this batch left it: a sync round (or
+        // another writer, or a switch) may have moved it since the lock was let go, and values
+        // captured under the lock would overwrite theirs with older ones.
+        let now = self.frontier.load();
+        let unsynced = now.end.saturating_sub(now.sync.synced.load(Ordering::Acquire));
+        self.metrics.wrote(now.end, unsynced, waited, held);
         self.durability.wrote(pending);
         if compact {
             self.compact.request_auto();
@@ -1444,7 +1449,16 @@ fn recover(
         rebuild(id) && manifest.tables.iter().any(|t| t.id == id && t.ksize > 0)
     })?;
     if end < log.file_len() {
-        log.rewind_to(end);
+        if let Some(cut) = log.rewind_to(end) {
+            // Bytes followed the last whole batch. After a power loss that is normal (a round's
+            // pages reach the disk in any order, so unacknowledged batches can survive past a
+            // torn page); otherwise it can mean damage to acknowledged data. Say what was cut.
+            tracing::warn!(target: "tndb", "recovery cut the log at {end}, its last whole batch; non-zero bytes followed up to {} (commit marker: {:?})", cut.end, log.committed_end());
+            // The open-time sync made the old tail durable, and its zeros are only in memory:
+            // flush them now, as a rollback does, or a power loss before writeback could bring
+            // stale batches back behind the ones written next.
+            log.view().msync(cut.start, cut.end)?;
+        }
     }
     let len = log.file_len();
     for (id, rows) in rows {

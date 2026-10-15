@@ -220,7 +220,8 @@ pub(crate) struct SavePhases {
     pub(crate) check: std::time::Duration,
     /// Encoding and compressing its records (`PreparedOutput::encode`).
     pub(crate) encode: std::time::Duration,
-    /// Appending and indexing them under the write lock (`Inner::append_prepared`).
+    /// Appending and indexing them under the write lock (`Inner::append_prepared`), the wait for
+    /// the lock (behind running reads) included.
     pub(crate) append: std::time::Duration,
 }
 
@@ -255,10 +256,12 @@ impl Shared {
         };
         #[cfg(test)]
         let checked = std::time::Instant::now();
-        let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder)?;
+        let prepared = PreparedOutput::encode(consensus, consensus_idx, batches, &mut encoder);
         #[cfg(test)]
         let encoded = std::time::Instant::now();
-        let saved = self.mutate(|inner| inner.append_prepared(&prepared));
+        let saved =
+            prepared.and_then(|prepared| self.mutate(|inner| inner.append_prepared(&prepared)));
+        // Whether the encode, the append or neither failed.
         encoder.release();
         #[cfg(test)]
         if saved.is_ok() {
@@ -351,6 +354,10 @@ impl Drop for Shared {
 #[derive(Debug, Clone)]
 pub struct ConsensusPack {
     shared: Arc<Shared>,
+    /// One strong count per handle (cloned with it): [`Self::is_sole_handle`] and [`Self::close`]
+    /// count handles, not the blocking tasks that hold `shared` while they run (a read a cancelled
+    /// request left running would otherwise keep the pack from sealing).
+    handles: Arc<()>,
     epoch: Epoch,
     committee: Committee,
     compression: PackCompression,
@@ -362,7 +369,7 @@ impl Drop for ConsensusPack {
     fn drop(&mut self) {
         // The last handle, with the pack still open: `close()` was not used. Dropping the shared
         // state seals it (see `Drop for Shared`); `close().await` is the intended path.
-        if Arc::strong_count(&self.shared) == 1 && self.shared.inner.read().is_some() {
+        if Arc::strong_count(&self.handles) == 1 && self.shared.inner.read().is_some() {
             warn!(target: "consensus_pack", epoch = self.epoch, "ConsensusPack dropped without calling close(); sealing as a fallback");
         }
     }
@@ -522,7 +529,7 @@ impl ConsensusPack {
             #[cfg(test)]
             save_phases: Mutex::default(),
         });
-        Self { shared, epoch, committee, compression, is_static, version }
+        Self { shared, handles: Arc::new(()), epoch, committee, compression, is_static, version }
     }
 
     /// Open up the files for previous epoch in append mode.  Will fail if files do not exist.
@@ -1335,18 +1342,19 @@ impl ConsensusPack {
     }
 
     /// True when this is the only live handle to the pack, so [`Self::close`] will actually seal it
-    /// (rather than no-op because another clone keeps the actor alive and defers the seal to a
-    /// later `Drop`). Best-effort/racy — for diagnostics at an epoch handoff, not a
-    /// synchronization point.
+    /// (rather than no-op because another clone may still use it and defers the seal to a later
+    /// `Drop`). A read or write still running on the blocking pool for a handle already dropped
+    /// (its caller cancelled) is not a handle: the seal waits for it. Best-effort/racy — for an
+    /// epoch handoff's wait, not a synchronization point.
     pub fn is_sole_handle(&self) -> bool {
-        Arc::strong_count(&self.shared) == 1
+        Arc::strong_count(&self.handles) == 1
     }
 
     /// Take ownership and close async so we Drop does not get a chance to block any threads.
-    /// Note, will only close if this is the last reference to this pack.
-    /// Essentially this an async drop.
+    /// Note, will only close if this is the last handle to this pack (see
+    /// [`Self::is_sole_handle`]). Essentially this an async drop.
     pub async fn close(self) {
-        if Arc::strong_count(&self.shared) == 1 {
+        if self.is_sole_handle() {
             self.seal_now().await;
         }
     }
@@ -1740,12 +1748,17 @@ impl OutputEncoder {
     /// The most lanes on any machine. A save runs beside execution, so it uses at most half the
     /// cores.
     const MAX_LANES: usize = 8;
-    /// The most buffer a lane keeps between saves; a rare larger output's is freed after it.
-    const RETAIN_BYTES: usize = 8 * 1024 * 1024;
+    /// The most buffer the lanes keep between saves, together; a rare larger output's is freed
+    /// after it.
+    const RETAIN_BYTES: usize = 16 * 1024 * 1024;
 
     /// The encoder for a pack of `compression` whose records are at most `max` bytes.
     fn new(compression: PackCompression, max: u32) -> Self {
-        let cores = std::thread::available_parallelism().map_or(1, |cores| cores.get());
+        // Every pack open builds an encoder; the core count (which reads cgroup files on Linux)
+        // is looked up once.
+        static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let cores = *CORES
+            .get_or_init(|| std::thread::available_parallelism().map_or(1, |cores| cores.get()));
         let max_lanes = (cores / 2).clamp(1, Self::MAX_LANES);
         Self::with_lanes(compression, max, max_lanes, Self::LANE_BYTES)
     }
@@ -1808,13 +1821,16 @@ impl OutputEncoder {
         lanes
     }
 
-    /// Done with a save's records: empty the buffers, keeping each for the next save unless an
-    /// unusually large output grew it past [`Self::RETAIN_BYTES`].
+    /// Done with a save's records: empty the buffers, keeping them for the next save while they
+    /// fit [`Self::RETAIN_BYTES`] together (the first lanes first); an unusually large output's
+    /// are freed.
     fn release(&mut self) {
+        let mut budget = Self::RETAIN_BYTES;
         for lane in &mut self.lanes {
             lane.bytes.clear();
-            if lane.bytes.capacity() > Self::RETAIN_BYTES {
-                lane.bytes = Vec::new();
+            match budget.checked_sub(lane.bytes.capacity()) {
+                Some(left) => budget = left,
+                None => lane.bytes = Vec::new(),
             }
         }
     }
@@ -5873,6 +5889,30 @@ pub(crate) mod test {
         }
     }
 
+    /// Between saves the lanes keep their buffers only up to a total, not each up to it: a large
+    /// output's buffers are freed after it, and an ordinary one's are kept for the next save.
+    #[test]
+    fn test_released_lanes_keep_a_bounded_total() {
+        let mut encoder = OutputEncoder::with_lanes(PackCompression::None, u32::MAX, 8, 1);
+        let kept = |encoder: &OutputEncoder| {
+            encoder.lanes.iter().map(|lane| lane.bytes.capacity()).sum::<usize>()
+        };
+        for lane in encoder.lanes_for(8) {
+            lane.bytes.reserve(OutputEncoder::RETAIN_BYTES / 2);
+        }
+        encoder.release();
+        assert!(kept(&encoder) <= OutputEncoder::RETAIN_BYTES, "kept {}", kept(&encoder));
+        assert!(kept(&encoder) > 0, "the first lanes keep theirs");
+        let mut encoder = OutputEncoder::with_lanes(PackCompression::None, u32::MAX, 8, 1);
+        for lane in encoder.lanes_for(8) {
+            lane.bytes.extend_from_slice(&[1; 1024]);
+        }
+        let before = kept(&encoder);
+        encoder.release();
+        assert_eq!(kept(&encoder), before, "an ordinary save's buffers are all kept");
+        assert!(encoder.lanes.iter().all(|lane| lane.bytes.is_empty()), "and emptied");
+    }
+
     /// A pack whose saves split their batches across lanes stores and serves the same outputs,
     /// byte for byte, as one that encodes each on one thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -5945,6 +5985,35 @@ pub(crate) mod test {
             "the save waited for the whole request ({left:?} of reads were left when it finished)"
         );
         pack.close().await;
+    }
+
+    /// A read whose caller was cancelled keeps running on the blocking pool, but it is not a
+    /// handle: the last real handle is still the sole one, and its `close` seals the pack (after
+    /// the read it waits for) instead of leaving the seal to whichever drop comes last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_consensus_pack_cancelled_read_does_not_hold_off_close() {
+        let temp_dir = TempDir::with_prefix("test_pack_cancelled_read").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 2);
+        for output in &outputs {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        let digests: Vec<BlockHash> = outputs.iter().flat_map(batch_digests_of).collect();
+        assert!(digests.len() >= 4, "a read that outlasts the test's checks");
+        pack.slow_batch_reads(Duration::from_millis(100));
+        let reader = {
+            let pack = pack.clone();
+            tokio::spawn(async move { pack.batches(digests).await })
+        };
+        // The blocking read is under way; cancel its caller (dropping its handle).
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        reader.abort();
+        assert!(reader.await.is_err(), "cancelled");
+        assert!(pack.is_sole_handle(), "the running read is not a handle");
+        pack.persist().await.expect("persist");
+        pack.close().await;
+        // Only a sealed pack opens static: `close` sealed it, not a later drop.
+        let sealed = ConsensusPack::open_static(temp_dir.path(), 0).expect("sealed by close");
+        sealed.close().await;
     }
 
     /// The split keeps the batches in order and gives each lane about an equal share of their

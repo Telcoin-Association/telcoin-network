@@ -130,7 +130,8 @@ lock.
 - **`CommitMode::Sync`:** each write, or transaction commit, waits until it is durable before it
   returns. The first writer waiting runs the round itself, with no thread hand-off; the others wait
   for it, and one whose batch it didn't cover leads the next. A write is readable before its writer
-  returns, as in group mode.
+  returns, as in group mode, so `persist` still waits (running the round itself if none is) for
+  another thread's write that was visible but not yet durable when it was called.
 - **`CommitMode::Group`:** writes return at once, and `persist` (async) waits for the round
   covering every earlier batch. The `tndb-commit` thread syncs **on demand**: at once when a
   `persist` waits, otherwise once the unsynced writes are 2 ms old or 4 MiB large (`SYNC_DELAY`,
@@ -159,7 +160,10 @@ a warning), sorts each table's writes by key, keeps each key's last, and writes 
 key order (so a bulk transaction's rows scan sequentially). A batch therefore names each key at most
 once per table, its clear first, which lets the write path decide each removal from the index
 alone. A transaction dropped while a panic unwinds was cut off part way: nothing of it is
-written. Production
+written. A read transaction (`TnDbTx`) is not one snapshot: each `get` reads its table's latest
+publish, so two reads in it can see different moments (as with the layered MDBX before it). A
+caller that iterates one table and then reads another can find a row removed in between.
+Production
 transactions only write and then commit (`CertificateStore::delete` reads through its own
 transaction), so buffering changes nothing they rely on.
 
@@ -226,7 +230,8 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
 - inspection: rows and dead bytes before and after a compaction, a crashed log reported unclean
   with no file changed, an open database refused, damage reported, and a `SplitDatabase`;
 - failures: a panic in a rollback and in a publish latching, a poisoned index latching, a
-  rollback flushing its zeros, a `Sync` no-op waiting for the state it saw, a `persist` failing
+  rollback flushing its zeros, a `Sync` no-op waiting for the state it saw, a `Sync` `persist`
+  waiting for another writer's sync, a `persist` failing
   once the commit thread stops, encode buffers shrinking, a 20 MiB value (written, replayed,
   compacted), the switch's `base` matching the written one, and index pages stamped before the
   switch;
@@ -297,12 +302,12 @@ cannot start another the moment that one ends.
    frontier, and publishes every table. The install does no I/O and cannot fail.
 
 **Failures.** Before the rename, a failure (or a panic, or less than 256 MiB free, checked once
-per MiB of the copy, before each round and before the switch, or more than 64 MiB landing before
-the last switch try) abandons the
-compaction: its files are deleted after the locks are
-released, and the database carries on in its generation. After the rename, a failure (the
-directory sync) or a panic stops the writer, latched: which generation the next open picks is
-unknown. A compaction needs the generation's size plus 128 MiB free to start. A close cancels a
+per MiB of the copy and of each catch-up round outside the write lock, and before the switch, or
+more than 64 MiB landing before the last switch try) abandons the compaction: its files are
+deleted after the locks are released, and the database carries on in its generation. After the
+rename, a failure (the directory sync) or a panic stops the writer, latched: which generation the
+next open picks is unknown. A compaction needs the generation's size plus 128 MiB, plus the
+256 MiB floor, free to start, so it is not admitted only to give way near the copy's end. A close cancels a
 running compaction (checked each MiB of the copy, during pacing sleeps, between rounds and
 before each sync); its unfinished log is discarded without a flush, so the close does not wait on
 writing out what it throws away.
@@ -490,7 +495,17 @@ environments and notes the MDBX migration's marker; `telcoin-network db tndb-sta
 - **Address space.** Each log reserves 16 GiB of address space and each index 1 GiB (about 62 GiB
   for a `SplitDatabase` at rest, more while a compaction holds both generations). The
   reservations are virtual, shared and not commit-charged; a process under a `ulimit -v` too small
-  for them falls back to mapping each file at its length, remapping as it grows.
+  for them falls back (with a warning) to mapping each file at its length, remapping as it grows.
+  In that mode a remap keeps the old mapping until the generation closes, since a reader may hold
+  a slice of it, so a log's mappings add up as it grows: about 17 GiB of address space for a 2 GiB
+  log at 128 MiB growth steps, until a compaction (or the epoch close's clear) starts a new
+  generation. Under a tight limit a remap then fails and writes stop. Give the node an
+  address-space limit above the reservations instead.
+- **A damaged record's length at open.** Replay reads the log record by record into a buffer, so
+  a damaged length prefix (a torn tail, in an unclean log) is read as far as it claims before its
+  CRC fails it: never past the log's end, and at most `MAX_RECORD` (1 GiB). That memory is
+  transient and only on an unclean open; replaying from the mapping instead would avoid it, at the
+  cost of a second read path for recovery.
 - **`has_dead` at open.** A log with records is assumed to hold dead rows when it opens, so a
   restart can cost one compaction that frees little. It happens only when the log is already past
   its threshold and twice its base, so it is kept as is rather than recording a dead-row count.

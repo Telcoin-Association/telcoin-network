@@ -523,16 +523,18 @@ impl Database for TnDatabase {
     }
 
     /// Wait until every write made before the call (in any table) is durable; an error once any
-    /// write or sync has failed. In [`CommitMode::Sync`] every write was durable when it returned.
+    /// write or sync has failed. In [`CommitMode::Sync`] a write is durable when it returns, but
+    /// another thread's can be visible before its sync finishes: that one is waited for too (by
+    /// running the round, as a Sync write does).
     fn persist<T: Table>(&self) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
-        let durability = Arc::clone(&self.core.durability);
+        let core = Arc::clone(&self.core);
         let mode = self.mode;
         // The writes so far, as of the call (not the first poll).
-        let target = durability.last_seq();
+        let target = core.durability.last_seq();
         async move {
             match mode {
-                CommitMode::Group => durability.persist(target).await,
-                CommitMode::Sync => durability.check(),
+                CommitMode::Group => core.durability.persist(target).await,
+                CommitMode::Sync => super::commit::wait_durable(&core, target),
             }
         }
     }

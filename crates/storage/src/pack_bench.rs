@@ -45,8 +45,8 @@
 //! - **streams** — the partial catch-up prefix (`prefix_stream` = `consensus_output_end` + read
 //!   `[0, end)`), the full state-sync serve (`full_stream` = sequential read to EOF), and the
 //!   receive side (`stream_import` = replay a whole epoch into a fresh pack).
-//! - **lifecycle** — `reopen_static` opens the finished pack cold (the pack-cache-miss + index-load
-//!   cost).
+//! - **lifecycle** — `reopen_static` opens the finished pack (the pack-cache-miss + index-load
+//!   cost), its files still in the page cache from being written.
 //!
 //! ## Caveats (printed with the results too)
 //!
@@ -101,8 +101,8 @@
 //! - `TN_BENCH_PACK_NO_SLOTS`: 1 persists the pack alone, without the latest-consensus slot syncs
 //!   that `persist_current` runs beside it: a measurement of what the slots add, never a production
 //!   setting (default 0).
-//! - `TN_BENCH_PACK_BATCH_REQ`: batches per `get_batches` request (default 5, one header's); a
-//!   peer may ask for hundreds, served 200 at a time.
+//! - `TN_BENCH_PACK_BATCH_REQ`: batches per `get_batches` request (default 5, one header's); a peer
+//!   may ask for hundreds, served 200 at a time.
 //!
 //! The chain lives in a temp dir under `TMPDIR`. On Linux a tmpfs or ramfs `TMPDIR` is refused:
 //! `msync` is free there, so the durable rows would mean nothing.
@@ -371,9 +371,11 @@ async fn bench_save_seq<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOutput]
     let dir = TempDir::with_prefix("pack_bench_save").expect("temp dir");
     let mut pack = P::open_append(dir.path(), fx.previous_epoch.clone(), fx.committee.clone())
         .expect("open pack");
+    // The copies the saves take, made before the clock starts.
+    let outputs = outputs.to_vec();
     let start = Instant::now();
     for output in outputs {
-        pack.save_consensus_output(output.clone()).await.expect("save");
+        pack.save_consensus_output(output).await.expect("save");
     }
     let elapsed = start.elapsed();
     pack.close().await; // seal synchronously before the TempDir drops (untimed), not a deferred drop
@@ -386,9 +388,10 @@ async fn bench_save_durable<P: BenchPack>(fx: &Fixtures, outputs: &[ConsensusOut
     let dir = TempDir::with_prefix("pack_bench_durable").expect("temp dir");
     let mut pack = P::open_append(dir.path(), fx.previous_epoch.clone(), fx.committee.clone())
         .expect("open pack");
+    let outputs = outputs.to_vec();
     let start = Instant::now();
     for output in outputs {
-        pack.save_consensus_output(output.clone()).await.expect("save");
+        pack.save_consensus_output(output).await.expect("save");
         pack.persist().await.expect("persist");
     }
     let elapsed = start.elapsed();
@@ -510,12 +513,16 @@ async fn bench_stream_import<P: BenchPack>(fx: &Fixtures, data_path: &Path, end:
     elapsed
 }
 
-/// Cold-open the finished pack read-only, touching the index (the pack-cache-miss open cost).
+/// Open the finished pack read-only, touching the index (the pack-cache-miss open cost). Its
+/// files were just written, so they are in the page cache: this is the open's own work, not a
+/// read from the drive.
 async fn bench_reopen_static<P: BenchPack>(path: &Path, epoch: Epoch) -> Duration {
     let start = Instant::now();
     let mut pack = P::open_static(path, epoch).expect("open static");
     pack.latest_consensus_header().await.expect("latest after reopen");
-    start.elapsed()
+    let elapsed = start.elapsed();
+    pack.close().await; // before the TempDir drops (untimed)
+    elapsed
 }
 
 /// One report column: the ordered rows plus the on-disk size of the populated pack.
@@ -1886,6 +1893,10 @@ fn consensus_pack_workload() {
             ),
             "compression: every record of a sample of outputs BCS-encoded and zstd-compressed \
              outside the save, as the pack's append does"
+                .to_string(),
+            "save: append+index includes the wait for the pack's write lock (behind running \
+             reads); outputs/s and reads/s with saves divide by the writer's whole run (the \
+             readers start with the first save), a slight undercount of both"
                 .to_string(),
         ];
         if !knobs.readers {

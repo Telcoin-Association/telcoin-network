@@ -538,6 +538,10 @@ impl ConsensusChain {
         let entry =
             RecentHeader { epoch: header.sub_dag.leader_epoch(), digest: header.digest(), header };
         let mut recent = self.recent_headers.lock();
+        // Two lookups that missed at once both read the pack: keep one copy, not two slots.
+        if recent.iter().any(|known| known.epoch == entry.epoch && known.digest == entry.digest) {
+            return;
+        }
         if recent.len() == Self::RECENT_HEADERS {
             recent.pop_front();
         }
@@ -2652,6 +2656,21 @@ mod test {
         assert_eq!(consensus_chain.recent_header(0, last), None, "pushed out");
         let reread = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
         assert_eq!(reread, Some(first), "read from the pack again");
+    }
+
+    /// Lookups that missed together remember their header once, so duplicates never take the
+    /// slots of other headers.
+    #[tokio::test]
+    async fn test_concurrent_header_misses_remember_one_copy() {
+        let temp_dir = TempDir::with_prefix("test_recent_header_dedupe").expect("temp dir");
+        let (chain, digests) = chain_with_outputs(temp_dir.path(), 3).await;
+        let last = *digests.last().expect("outputs");
+        let header = full_header(&chain, last).await;
+        chain.remember_header(header.clone());
+        chain.remember_header(header);
+        let copies =
+            chain.recent_headers.lock().iter().filter(|known| known.digest == last).count();
+        assert_eq!(copies, 1);
     }
 
     /// `with_consensus_header_by_digest` hands its function the header `consensus_header_by_digest`

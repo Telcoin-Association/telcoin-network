@@ -69,6 +69,14 @@ use crate::archive::{
 /// (+5–8% on a one-write-plus-sync bench), and was flat at 1 GiB.
 pub(crate) const BTX_MAP_RESERVE: u64 = 1 << 30;
 
+/// CRC-stamp a page this handle created, unless it already is. `crc_state` classifies pages, so
+/// the stamp is never zero: a genuine CRC of 0 must not be re-read as the all-zero dirty marker.
+fn stamp_unstamped(page: &mut [u8]) {
+    if crc_is_zero(page) {
+        add_crc32_nonzero(page);
+    }
+}
+
 /// Map a read failure encountered on the write path into an append error.
 fn fetch_to_append(e: FetchError) -> AppendError {
     match e {
@@ -545,7 +553,10 @@ impl BtreeIndex {
         }
         self.reset_empty()?;
         for (k, v) in entries {
-            self.insert_kv(k.as_ref(), v)?;
+            let key = k.as_ref();
+            self.key_size_ok(key)
+                .map_err(|(expected, got)| AppendError::KeySize { expected, got })?;
+            self.insert_kv(key, v)?;
         }
         Ok(())
     }
@@ -1095,11 +1106,7 @@ impl BtreeIndex {
         for p in self.private.drain() {
             let p = p as u32; // inserted as a u32 page number
             if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
-                if crc_is_zero(buf) {
-                    // `crc_state` classifies pages, so stamp never-zero: a genuine CRC of 0 must
-                    // not be re-read as the all-zero dirty marker.
-                    add_crc32_nonzero(buf);
-                }
+                stamp_unstamped(buf);
             }
         }
     }
@@ -1160,6 +1167,13 @@ impl BtreeIndex {
             already_free.insert(p);
         }
         let created: Vec<u64> = self.private.drain().collect();
+        // Stamped as a publish would, so a free page does not read as dirty to
+        // `page_crc_scan` (a reuse zeroes it again first).
+        for &p in &created {
+            if let Some(buf) = self.file.slice_mut(Self::page_offset(p as u32), PAGE_SIZE) {
+                stamp_unstamped(buf);
+            }
+        }
         self.free
             .extend(created.into_iter().filter(|&p| !already_free.contains(p)).map(|p| p as u32));
         self.superseded.clear();
@@ -1507,6 +1521,9 @@ mod tests {
         idx.revert_to_published().expect("revert");
         check(&idx, &published);
         idx.sync().expect("sync");
+        // The pages the reverts freed were stamped as they were freed: a scan finds none dirty.
+        let scan = idx.page_crc_scan();
+        assert_eq!((scan.dirty, scan.corrupt), (0, 0), "a clean index after reverts: {scan:?}");
         drop(snapshot);
         drop(idx);
         let idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("reopen");
@@ -2691,6 +2708,19 @@ mod tests {
     #[test]
     fn test_archive_btx_wrong_key_size_is_an_error() {
         let tmp = TempDir::with_prefix("btx_key_size").expect("temp dir");
+        {
+            let data_header = DataHeader::new(0, PackCompression::None, 0);
+            let dir = tmp.path().join("rebuilt");
+            let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+            let entries = [(key_of(1).to_vec(), 1), (vec![7_u8; 31], 2)];
+            assert!(
+                matches!(
+                    idx.rebuild_from(entries),
+                    Err(AppendError::KeySize { expected: 32, got: 31 })
+                ),
+                "a rebuild refuses a wrong-size key rather than panicking"
+            );
+        }
         let mut idx = open_ksize(&tmp, 32);
         let short = [7_u8; 31];
         assert!(matches!(idx.save(&short, 1), Err(AppendError::KeySize { expected: 32, got: 31 })));
