@@ -199,15 +199,28 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     if let Some(idle_heads) =
         idle_heads_exhausting_budget(max_inflight_request_bytes, max_request_bytes, max_connections)
     {
-        warn!(
-            target: "gateway",
-            idle_heads,
-            max_connections = max_connections.get(),
-            "this many idle requests, fewer than --max-connections, can hold the whole in-flight \
-             byte budget until the request deadline by sending only their headers, and every \
-             other request body is then refused; raise --max-inflight-request-bytes, or lower \
-             --max-request-bytes or --max-connections"
-        );
+        if one_prefix_holds_budget(idle_heads, max_connections_per_ip) {
+            warn!(
+                target: "gateway",
+                idle_heads,
+                max_connections_per_ip = max_connections_per_ip.map_or(0, NonZeroUsize::get),
+                "one client prefix can hold the whole in-flight byte budget with this many idle \
+                 requests, within --max-connections-per-ip, until the request deadline by sending \
+                 only their headers, and every other request body is then refused; raise \
+                 --max-inflight-request-bytes, or lower --max-request-bytes or \
+                 --max-connections-per-ip"
+            );
+        } else {
+            warn!(
+                target: "gateway",
+                idle_heads,
+                max_connections = max_connections.get(),
+                "this many idle requests, fewer than --max-connections, can hold the whole \
+                 in-flight byte budget until the request deadline by sending only their headers, \
+                 and every other request body is then refused; raise \
+                 --max-inflight-request-bytes, or lower --max-request-bytes or --max-connections"
+            );
+        }
     }
     if query_upstream.is_none() && denied_method_prefixes.is_empty() {
         warn!(
@@ -497,6 +510,16 @@ fn idle_heads_exhausting_budget(
     (idle_heads < max_connections.get()).then_some(idle_heads)
 }
 
+/// Whether one client prefix may open the `idle_heads` connections that hold
+/// the whole in-flight byte budget (see [`idle_heads_exhausting_budget`]): true
+/// when `--max-connections-per-ip` is set and allows at least that many.
+fn one_prefix_holds_budget(
+    idle_heads: usize,
+    max_connections_per_ip: Option<NonZeroUsize>,
+) -> bool {
+    max_connections_per_ip.is_some_and(|per_ip| idle_heads <= per_ip.get())
+}
+
 /// The startup chain-id check (see [`check_chain_ids`]) as a task for [`run`]
 /// to spawn, or `None` without a query upstream or without a worker.
 ///
@@ -732,6 +755,20 @@ mod tests {
             cap,
             NonZeroUsize::new(connections).expect("nonzero"),
         )
+    }
+
+    #[test]
+    fn one_prefix_holding_the_budget_is_reported() {
+        let per_ip = NonZeroUsize::new(32);
+        assert!(one_prefix_holds_budget(32, per_ip), "at the per-ip cap");
+        assert!(one_prefix_holds_budget(1, per_ip));
+        assert!(!one_prefix_holds_budget(33, per_ip), "above the per-ip cap");
+        assert!(!one_prefix_holds_budget(1, None), "no per-ip cap");
+        // a 16 MiB --max-request-bytes against the default 512 MiB budget: 32
+        // idle requests, which one prefix may hold at a per-ip cap of 32
+        let idle_heads = idle_heads(512, 16 * MIB, 500).expect("below the connection cap");
+        assert_eq!(idle_heads, 32);
+        assert!(one_prefix_holds_budget(idle_heads, per_ip));
     }
 
     #[test]

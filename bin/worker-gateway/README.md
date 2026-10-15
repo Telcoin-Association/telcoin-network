@@ -538,7 +538,7 @@ Size it from both ends:
   Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
   About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
   On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold.
-  The budget is shared by every client and no client prefix's share of it is capped, so below that point a few clients together, or one client when the quotient is at or below `--max-connections-per-ip`, can hold all of it with idle requests.
+  The budget is shared by every client and no client prefix's share of it is capped, so below that point a few clients together, or one client when the quotient is at or below `--max-connections-per-ip`, can hold all of it with idle requests; startup warns in that case too.
   If the limit has to stay lower, lower the budget, for example `--max-inflight-request-bytes 268435456` (256 MiB) for about 352 MiB.
   A 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it, which brings the figure to about 336 MiB.
 
