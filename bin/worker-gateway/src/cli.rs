@@ -1798,10 +1798,19 @@ fn same_host_and_port(a: &Url, b: &Url) -> bool {
 /// [`url_host_ips`]) match when they share one, so an IPv4-mapped IPv6 literal
 /// (`[::ffff:10.0.0.7]`) matches the IPv4 address it names and `localhost`
 /// matches either loopback address; other domain names match only as written.
+/// Any loopback or unspecified address also matches any other, in either
+/// family: each names this machine (an unspecified address connects to it),
+/// and a node bound to an unspecified address serves every loopback spelling,
+/// so `[::1]`, `127.0.0.2` and `0.0.0.0` all reach a worker on `127.0.0.1`.
 fn same_host(a: &Url, b: &Url) -> bool {
-    url_host_ips(a)
-        .zip(url_host_ips(b))
-        .map_or_else(|| a.host() == b.host(), |(a, b)| a.iter().any(|ip| b.contains(ip)))
+    let this_machine = |ip: &IpAddr| ip.is_loopback() || ip.is_unspecified();
+    url_host_ips(a).zip(url_host_ips(b)).map_or_else(
+        || a.host() == b.host(),
+        |(a, b)| {
+            a.iter().any(|ip| b.contains(ip))
+                || (a.iter().any(this_machine) && b.iter().any(this_machine))
+        },
+    )
 }
 
 /// Whether `url` is plain `http` to anything but an address literal that is
@@ -1871,11 +1880,13 @@ fn ensure_not_gateway(listen_addr: SocketAddr, url: &Url) -> eyre::Result<()> {
 /// covers the other. An unspecified IPv6 address covers both families (tokio
 /// leaves `IPV6_V6ONLY` unset, so `[::]` binds dual-stack on a default Linux
 /// host); an unspecified IPv4 address covers only IPv4. Port `0` asks for an
-/// ephemeral port, so it never collides. The two listeners cannot share a
-/// socket, and the probes are only out of the client connection cap's reach
-/// on a socket of their own.
+/// ephemeral port, so it never collides. An IPv4-mapped IPv6 address
+/// (`[::ffff:127.0.0.1]`) is compared as the IPv4 address it names, on either
+/// side, as [`ensure_not_gateway`] does: it binds the same IPv4 port. The two
+/// listeners cannot share a socket, and the probes are only out of the client
+/// connection cap's reach on a socket of their own.
 fn ensure_probe_addr(listen_addr: SocketAddr, probe_addr: SocketAddr) -> eyre::Result<()> {
-    let (listen_ip, probe_ip) = (listen_addr.ip(), probe_addr.ip());
+    let (listen_ip, probe_ip) = (listen_addr.ip().to_canonical(), probe_addr.ip().to_canonical());
     let covers =
         |wide: IpAddr, other: IpAddr| wide.is_unspecified() && (wide.is_ipv6() || other.is_ipv4());
     let overlaps =
@@ -2567,6 +2578,8 @@ mod tests {
             ("http://127.0.0.1:9545/", "http://localhost:9545/"),
             ("http://localhost:9545/", "http://[::1]:9545/"),
             ("http://localhost:9545/", "http://[::ffff:127.0.0.1]:9545/"),
+            // any other loopback address is this machine too
+            ("http://[::1]:9545/", "http://127.0.0.2:9545/"),
         ] {
             let message = match flags(rpc, redirect) {
                 Ok(_) => panic!("{redirect} is the worker at {rpc}"),
@@ -2574,8 +2587,8 @@ mod tests {
             };
             assert!(message.contains("worker 0's RPC host and port"), "{message}");
         }
-        // another loopback address is another host to the check
-        flags("http://[::1]:9545/", "http://127.0.0.2:9545/")?;
+        // an address off this machine is another host to the check
+        flags("http://[::1]:9545/", "http://10.0.0.9:9545/")?;
         Ok(())
     }
 
@@ -3890,6 +3903,53 @@ mod tests {
         assert_eq!(try_parse_test_argv(argv(Some("text")))?.log_format, LogFormat::Text);
         assert_eq!(try_parse_test_argv(argv(Some("json")))?.log_format, LogFormat::Json);
         Ok(())
+    }
+
+    #[test]
+    fn redirect_to_this_machine_by_another_spelling_is_caught() -> eyre::Result<()> {
+        // off the default listen port 8545, so the gateway self-pointing check
+        // is not what trips
+        let worker = |redirect: &str| {
+            try_parse_test_argv([
+                "worker-gateway".to_string(),
+                "--upstream-rpc-url=http://127.0.0.1:8544".to_string(),
+                "--upstream-readiness-url=http://127.0.0.1:8551/health/workers".to_string(),
+                format!("--redirect-queries={redirect}"),
+            ])
+            .expect("argv parses")
+        };
+        for redirect in ["http://[::1]:8544", "http://127.0.0.2:8544", "http://0.0.0.0:8544"] {
+            let message = match worker(redirect).into_settings() {
+                Ok(_) => panic!("{redirect} reaches the worker on 127.0.0.1:8544"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains("is worker 0's RPC host and port"), "{redirect}: {message}");
+        }
+        let (settings, logs) = into_settings_logged(worker("http://[::1]:9545"));
+        settings?;
+        assert!(
+            logs.contains("--redirect-queries is on a worker's host at another port"),
+            "{logs}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn probe_addr_mapped_loopback_collides() {
+        let message = match try_parse_test_argv([
+            "worker-gateway",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+            "--listen-addr=0.0.0.0:9000",
+            "--probe-addr=[::ffff:127.0.0.1]:9000",
+        ])
+        .expect("argv parses")
+        .into_settings()
+        {
+            Ok(_) => panic!("a mapped loopback probe address on the listen port must collide"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(message.contains("collides with --listen-addr"), "{message}");
     }
 
     #[test]
