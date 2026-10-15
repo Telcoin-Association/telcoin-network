@@ -139,8 +139,8 @@ Every flag has an environment-variable fallback.
 | `--readiness-success-threshold` | `WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD` | `2` | Successful polls in a row that turn a not-ready upstream ready, at startup too (at least 1). |
 | `--upstream-failure-threshold` | `WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD` | `3` | Worker forwards in a row that fail to connect, a connect timeout included, before the upstream is marked not-ready (`0` disables); a timeout or failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes, and a worker that accepts connections but stops answering is left to the poller; see [Passive health on the RPC path](#passive-health-on-the-rpc-path). |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
-| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline, connection setup included, so it must be longer than `--upstream-connect-timeout`; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
-| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL (`0` = use `--upstream-request-timeout`); the default drops to `--upstream-request-timeout` when that is shorter, and a value set here must not exceed it. |
+| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream deadline for the response head, connection setup included, so it must be longer than `--upstream-connect-timeout`, and the longest a response body may go without data (a body that keeps arriving is never cut); the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
+| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Deadline for the `--redirect-queries` URL's response head, and the longest its response body may go without data (`0` = use `--upstream-request-timeout`); the default drops to `--upstream-request-timeout` when that is shorter, and a value set here must not exceed it. |
 | `--upstream-ca-cert` | `WORKER_GATEWAY_UPSTREAM_CA_CERT` | (none) | PEM file of extra CA certificates trusted for `https` upstreams, on top of the system roots; see [TLS to workers](#tls-to-workers). |
 | `--upstream-client-cert` | `WORKER_GATEWAY_UPSTREAM_CLIENT_CERT` | (none) | PEM client certificate chain presented to an `https` upstream that asks for one; requires `--upstream-client-key`. |
 | `--upstream-client-key` | `WORKER_GATEWAY_UPSTREAM_CLIENT_KEY` | (none) | Unencrypted PEM private key for `--upstream-client-cert`; requires `--upstream-client-cert`. |
@@ -776,7 +776,8 @@ whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
 itself a worker-saturation signal.
 
 An upstream body that fails after the status and headers have gone out (the
-upstream closes or resets mid-stream) cannot be turned into an error any more:
+upstream closes or resets mid-stream, or sends nothing for the route's request
+timeout) cannot be turned into an error any more:
 the client gets the upstream's status with a truncated body (a chunked
 response without its final chunk), and the gateway logs the failure at debug
 and counts it as `result="body_failed"` in

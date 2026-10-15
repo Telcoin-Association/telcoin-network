@@ -220,9 +220,11 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_connect_timeout: Duration,
 
-    /// Overall per-request deadline when forwarding to an upstream: a worker,
-    /// or the `--redirect-queries` endpoint when `--query-request-timeout` is
-    /// `0`. The default outlasts the 30 s reth gives
+    /// Deadline for the upstream's response head, connection setup included,
+    /// and the longest the response body may go without data, when forwarding
+    /// to an upstream: a worker, or the `--redirect-queries` endpoint when
+    /// `--query-request-timeout` is `0`; a body that keeps arriving is never
+    /// cut. The default outlasts the 30 s reth gives
     /// `eth_sendRawTransactionSync` to wait for its receipt
     /// (`--rpc.send-raw-transaction-sync-timeout`), so a slow Sync call gets
     /// the worker's own answer rather than a gateway timeout. It covers
@@ -236,13 +238,14 @@ pub(crate) struct Cli {
     )]
     pub(crate) upstream_request_timeout: Duration,
 
-    /// Overall per-request deadline when forwarding to the `--redirect-queries`
-    /// endpoint (default 10s, or `--upstream-request-timeout` when that is
-    /// shorter; `0` disables it, and the query route then uses
-    /// `--upstream-request-timeout`). A stalled query upstream frees each read's
-    /// slot this soon, while submissions keep the longer worker deadline. With
-    /// `--redirect-queries` set, a value given here must not exceed
-    /// `--upstream-request-timeout`.
+    /// Deadline for the `--redirect-queries` endpoint's response head,
+    /// connection setup included, and the longest its response body may go
+    /// without data; a body that keeps arriving is never cut. The default is
+    /// 10s, or `--upstream-request-timeout` when that is shorter; `0` disables
+    /// it, and the query route then uses `--upstream-request-timeout`. A
+    /// stalled query upstream frees each read's slot this soon, while
+    /// submissions keep the longer worker deadline. With `--redirect-queries`
+    /// set, a value given here must not exceed `--upstream-request-timeout`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT",

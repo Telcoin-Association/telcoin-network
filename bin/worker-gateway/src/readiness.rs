@@ -390,9 +390,9 @@ pub(crate) struct ReadinessThresholds {
 pub(crate) struct QueryProbe {
     /// The query upstream's URL.
     pub(crate) url: Url,
-    /// The proxy client (see [`crate::proxy::proxy_client`]), so the probe
-    /// travels like a redirected read: same connection pool, user agent and
-    /// redirect policy.
+    /// The query route's client (see [`crate::proxy::route_clients`]), so the
+    /// probe travels like a redirected read: same connection pool, user agent,
+    /// redirect policy and resolver.
     pub(crate) client: Client,
     /// The `--redirect-queries-header` header, sent with every probe like
     /// with every redirected read, or `None`. Its `Debug` is redacted.

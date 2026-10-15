@@ -19,7 +19,7 @@ use crate::{
     config::UpstreamWorker,
     dns::{LookupHost, SystemLookup},
     proxy::{
-        client_builder, fetch_chain_id, proxy_client, readiness_client, QueryHeader, Route,
+        client_builder, fetch_chain_id, readiness_client, route_clients, QueryHeader, Route,
         UpstreamOrigin, WARNING_THROTTLES,
     },
     ratelimit::{run_gc, RateLimiters},
@@ -54,13 +54,15 @@ const TLS_SETTINGS_HINT: &str = "cannot build the upstream clients; check --upst
 pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     ensure_root_store(&settings, native_root_count)?;
 
-    // Dedicated clients, both started from `client_builder` so they share the
-    // connect timeout, TLS and the no-proxy policy, and neither follows
-    // redirects: the proxy also enforces a per-request deadline (see
-    // `proxy_client`); the poller bounds each probe with its own tokio timeout
-    // (see `readiness_client`). Each resolves upstream names through its own
-    // cache and lookup cap (see `UpstreamClients`).
-    let UpstreamClients { proxy: proxy_client, readiness: readiness_client } =
+    // Dedicated clients, all started from `client_builder`'s settings so they
+    // share the connect timeout, TLS and the no-proxy policy, and none follows
+    // redirects: one forwarding client per route, whose read timeout bounds
+    // the wait for a response head and every gap in its body (see
+    // `route_clients`), and the poller's, which bounds each probe with its own
+    // tokio timeout (see `readiness_client`). The forwarding clients share one
+    // DNS cache and lookup cap, and the poller's has its own (see
+    // `UpstreamClients`).
+    let UpstreamClients { proxy: proxy_client, query: query_client, readiness: readiness_client } =
         UpstreamClients::new(&settings, Arc::new(SystemLookup)).wrap_err(TLS_SETTINGS_HINT)?;
     let Settings {
         listen_addr,
@@ -77,7 +79,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         upstream_failure_threshold,
         upstream_connect_timeout: _,
         upstream_request_timeout,
-        query_request_timeout,
+        query_request_timeout: _,
         upstream_ca_certs: _,
         upstream_identity: _,
         dns_cache_ttl,
@@ -279,14 +281,15 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         None
     };
 
-    // The poller probes the query upstream with the proxy client, so the probe
-    // travels like a redirected read, through the same DNS cache and lookup
-    // cap, and with the same `--redirect-queries-header`.
-    let query_probe = query_upstream.clone().map(|url| QueryProbe {
-        url,
-        client: proxy_client.clone(),
-        query_header: query_header.clone(),
-    });
+    // The poller probes the query upstream with the query route's client, so
+    // the probe travels like a redirected read, with the same read timeout,
+    // through the proxy's DNS cache and lookup cap, and with the same
+    // `--redirect-queries-header`. With a redirect, `route_clients` always
+    // builds that client.
+    let query_probe = query_upstream
+        .clone()
+        .zip(query_client.clone())
+        .map(|(url, client)| QueryProbe { url, client, query_header: query_header.clone() });
     // submissions are remembered only for the redirect's hash routing
     let recent_submissions = recent_submission_ttl
         .filter(|_| query_upstream.is_some())
@@ -299,7 +302,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         recent_submissions,
         denied_method_prefixes: denied_method_prefixes.into(),
         max_batch_len,
-        query_request_timeout,
+        query_http: query_client,
+        upstream_request_timeout,
         submission_slots: inflight_slots(max_inflight_submissions),
         query_slots: inflight_slots(max_inflight_queries),
         upstream_slots: inflight_slots(max_upstream_inflight),
@@ -399,24 +403,28 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     Ok(())
 }
 
-/// The gateway's two upstream HTTP clients, both started from
-/// [`client_builder`], so they share the TLS settings and the no-proxy policy,
-/// and neither follows a redirect.
+/// The gateway's upstream HTTP clients, all started from [`client_builder`]'s
+/// settings, so they share the TLS settings and the no-proxy policy, and none
+/// follows a redirect.
 #[derive(Debug)]
 pub(crate) struct UpstreamClients {
-    /// Forwards client requests to the workers and the query upstream, and
-    /// probes the query upstream for the poller (see [`proxy_client`] and
-    /// [`QueryProbe`]).
+    /// Forwards client requests to the workers, and to the query upstream when
+    /// `query` is `None` (see [`route_clients`]).
     pub(crate) proxy: Client,
+    /// Forwards client requests to the `--redirect-queries` upstream and
+    /// probes it for the poller (see [`QueryProbe`]), or `None` without a
+    /// redirect.
+    pub(crate) query: Option<Client>,
     /// Polls the workers' readiness endpoints (see [`readiness_client`]).
     pub(crate) readiness: Client,
 }
 
 impl UpstreamClients {
-    /// Build both clients from `settings`, each with its own
-    /// [`crate::dns::CachingResolver`] over `lookup` (see [`client_builder`]):
-    /// its own cache, and its own cap of `--max-concurrent-dns-lookups`
-    /// lookups at once.
+    /// Build the clients from `settings`: the forwarding clients over one
+    /// shared [`crate::dns::CachingResolver`] (see [`route_clients`]) and the
+    /// readiness client over its own (see [`client_builder`]), each resolver
+    /// over `lookup` with its own cache and its own cap of
+    /// `--max-concurrent-dns-lookups` lookups at once.
     ///
     /// The readiness client must not share the proxy's resolver. Query traffic
     /// to hosts that resolve slowly can hold every proxy lookup permit, and a
@@ -425,11 +433,10 @@ impl UpstreamClients {
     /// listener closes the connection after each response, so every poll opens
     /// a new connection and goes through the resolver.
     pub(crate) fn new(settings: &Settings, lookup: Arc<dyn LookupHost>) -> reqwest::Result<Self> {
+        let routes = route_clients(settings, Arc::clone(&lookup))?;
         Ok(Self {
-            proxy: proxy_client(
-                client_builder(settings, Arc::clone(&lookup)),
-                settings.upstream_request_timeout,
-            )?,
+            proxy: routes.worker,
+            query: routes.query,
             readiness: readiness_client(client_builder(settings, lookup))?,
         })
     }
@@ -673,7 +680,10 @@ async fn run_poller_until_listener_closes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli::try_parse_test_argv, proxy::UpstreamClientBuilder};
+    use crate::{
+        cli::try_parse_test_argv,
+        proxy::{proxy_client, UpstreamClientBuilder},
+    };
     use axum::{
         http::{HeaderMap, StatusCode},
         routing::{get, post},
@@ -949,7 +959,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: Arc::from([]),
             max_batch_len: None,
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),

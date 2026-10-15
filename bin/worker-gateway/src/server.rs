@@ -141,8 +141,8 @@ const CLIENT_CLOSED_REQUEST: u16 = 499;
 pub(crate) struct AppState {
     /// Live readiness view of the configured upstream workers.
     pub(crate) readiness: Arc<GatewayReadiness>,
-    /// Client used to forward requests on both routes (built by
-    /// [`crate::proxy::proxy_client`] outside tests).
+    /// Client for the worker route, and for the query route when `query_http`
+    /// is `None` (built by [`crate::proxy::route_clients`] outside tests).
     pub(crate) http: Client,
     /// Endpoint serving every call the worker does not (`--redirect-queries`),
     /// or `None` when every call goes to the workers. It is not
@@ -162,9 +162,13 @@ pub(crate) struct AppState {
     /// Maximum calls in one JSON-RPC batch (`--max-batch-len`), or `None` when
     /// unlimited.
     pub(crate) max_batch_len: Option<NonZeroUsize>,
-    /// Per-request deadline on the query route (`--query-request-timeout`), or
-    /// `None` when it follows the client's own (`--upstream-request-timeout`).
-    pub(crate) query_request_timeout: Option<Duration>,
+    /// Client for the query route, with `--query-request-timeout` as its read
+    /// timeout and sharing `http`'s resolver, or `None`, which sends the query
+    /// route through `http` (see [`crate::proxy::route_clients`]).
+    pub(crate) query_http: Option<Client>,
+    /// The deadline, from send, for reading a buffered submission answer whole
+    /// (`--upstream-request-timeout`; see [`crate::proxy`]).
+    pub(crate) upstream_request_timeout: Duration,
     /// In-flight cap for requests made only of submissions
     /// (`--max-inflight-submissions`); see [`inflight_slots`].
     pub(crate) submission_slots: Arc<Semaphore>,
@@ -1533,7 +1537,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -1802,9 +1807,14 @@ mod tests {
         );
         let (upstream_addr, _mock) = spawn(mock).await;
 
-        let proxy_client =
-            Client::builder().timeout(Duration::from_millis(200)).build().expect("build client");
-        let state = test_state_with_client(&[upstream(upstream_addr)], proxy_client);
+        // the production client, whose read timeout also bounds the wait for
+        // the response head
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let state = test_state_with_client(&[upstream(upstream_addr)], client);
         state.readiness.set_ready(0, true);
         let (gateway_addr, _shutdown) = spawn(test_router(state)).await;
 
@@ -2506,7 +2516,8 @@ mod tests {
             ))),
             denied_method_prefixes: default_denied(),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
@@ -2877,6 +2888,176 @@ mod tests {
         assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(4)));
         assert_eq!(worker_seen.hits(), 0);
+    }
+
+    /// A mock upstream that answers every request at once with a `200` head
+    /// and then sends `body` in pieces of `piece` bytes, one every `every`,
+    /// and then, when `stall` is set, holds the body open without sending
+    /// anything more.
+    async fn trickling_mock(
+        body: &'static str,
+        piece: usize,
+        every: Duration,
+        stall: bool,
+    ) -> (SocketAddr, Notifier) {
+        let mock = Router::new().route(
+            "/",
+            post(move || async move {
+                let pieces = futures::stream::unfold(body.as_bytes(), move |rest| async move {
+                    if rest.is_empty() {
+                        return None;
+                    }
+                    tokio::time::sleep(every).await;
+                    let (now, later) = rest.split_at(piece.min(rest.len()));
+                    Some((Ok::<_, std::io::Error>(Bytes::from_static(now)), later))
+                });
+                let tail = futures::StreamExt::flatten(futures::stream::iter(
+                    stall.then(futures::stream::pending),
+                ));
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::body::Body::from_stream(futures::StreamExt::chain(pieces, tail)),
+                )
+            }),
+        );
+        spawn(mock).await
+    }
+
+    /// The query route's request timeout bounds each gap in a streamed answer,
+    /// not the whole transfer: an answer that keeps arriving runs well past it
+    /// and reaches the client whole.
+    #[tokio::test]
+    async fn progressing_query_answer_outlives_the_route_deadline() {
+        let mut metrics = CapturedMetrics::install();
+        let answer = "0123456789".repeat(15);
+        let answer: &'static str = answer.leak();
+        // 15 pieces 100 ms apart, about 1.5 s in all
+        let (query, _query) = trickling_mock(answer, 10, Duration::from_millis(100), false).await;
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let deadline = Duration::from_millis(400);
+        let mut state = redirect_state(worker, Some(query));
+        state.query_http = Some(
+            proxy_client(UpstreamClientBuilder::for_test(Duration::from_secs(2)), deadline)
+                .expect("client"),
+        );
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.bytes().await.expect("the whole body");
+        let elapsed = started.elapsed();
+        assert_eq!(body.as_ref(), answer.as_bytes());
+        assert!(elapsed > 3 * deadline, "the answer took {elapsed:?}, past the deadline");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "body_failed")]), 0.0);
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "forwarded")]), 1.0);
+    }
+
+    /// A query answer that stops arriving still fails once its route's request
+    /// timeout passes without data: the client gets the `200` head and then a
+    /// body that cannot be read to the end, and the failure is counted.
+    #[tokio::test]
+    async fn stalled_query_body_fails_after_the_idle_window() {
+        let mut metrics = CapturedMetrics::install();
+        // one piece, then nothing
+        let start = r#"{"jsonrpc":"2.0","#;
+        let (query, _query) =
+            trickling_mock(start, start.len(), Duration::from_millis(10), true).await;
+        let (worker, _worker_seen, _worker) = named_mock("worker").await;
+        let mut state = redirect_state(worker, Some(query));
+        state.query_http = Some(
+            proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_millis(400),
+            )
+            .expect("client"),
+        );
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = tokio::time::timeout(Duration::from_secs(10), response.bytes())
+            .await
+            .expect("the stalled body must end");
+        let elapsed = started.elapsed();
+        assert!(body.is_err(), "a stalled body must not read as complete");
+        assert!(elapsed < Duration::from_secs(3), "the stalled body ended after {elapsed:?}");
+
+        let routed = "tn_worker_gateway_routed_requests_total";
+        assert_eq!(metrics.value(routed, &[("route", "query"), ("result", "body_failed")]), 1.0);
+    }
+
+    /// The worker's answer to a remembered submission is read whole, so it
+    /// stays bounded by `--upstream-request-timeout` from send even while each
+    /// piece arrives inside the read timeout: a worker that trickles an
+    /// accepting answer past the deadline loses it, and the hash is not
+    /// remembered.
+    #[tokio::test]
+    async fn buffered_submission_answer_keeps_its_deadline() {
+        // the accepting answer in 26 pieces 100 ms apart, about 2.6 s in all,
+        // each gap well inside the 400 ms read timeout
+        let (worker, _worker) =
+            trickling_mock(ACCEPTED, 4, Duration::from_millis(100), false).await;
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(400),
+        )
+        .expect("client");
+        let mut state = redirect_state_with_client(worker, None, client);
+        state.upstream_request_timeout = Duration::from_millis(400);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let started = tokio::time::Instant::now();
+        let (status, text) = post_rpc(gateway, None, submission(7)).await;
+        let elapsed = started.elapsed();
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert!(elapsed < Duration::from_secs(2), "the answer was given up after {elapsed:?}");
+        assert!(!recent.contains(&submitted_hash()));
+    }
+
+    /// The worker and query clients resolve upstream names through one cache:
+    /// a host the worker client has resolved is not looked up again when the
+    /// query client connects to it.
+    #[tokio::test]
+    async fn query_and_worker_clients_share_one_resolver() {
+        let (upstream, _upstream_seen, _upstream) = named_mock("upstream").await;
+        let lookups = Arc::new(AtomicUsize::new(0));
+        let lookup = {
+            let lookups = Arc::clone(&lookups);
+            lookup_fn(move |_host| {
+                lookups.fetch_add(1, Ordering::SeqCst);
+                async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], 0))]) }
+            })
+        };
+        let url = named_url("shared.test", upstream, "/");
+        let settings =
+            worker_settings("http", upstream, upstream, &[format!("--redirect-queries={url}")]);
+        let clients = crate::proxy::route_clients(&settings, lookup).expect("clients");
+        let query = clients.query.expect("a redirect builds a query client");
+
+        for client in [&clients.worker, &query] {
+            let response = client.post(url.clone()).send().await.expect("send");
+            assert_eq!(response.text().await.expect("text"), "upstream");
+        }
+        assert_eq!(lookups.load(Ordering::SeqCst), 1, "the query client hits the shared cache");
     }
 
     #[tokio::test]
@@ -4545,7 +4726,13 @@ mod tests {
         let (worker, _worker) = slow_mock("worker", Duration::from_secs(1)).await;
         let (query, _query) = slow_mock("query", Duration::from_secs(1)).await;
         let mut state = redirect_state(worker, Some(query));
-        state.query_request_timeout = Some(Duration::from_millis(200));
+        state.query_http = Some(
+            proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_millis(200),
+            )
+            .expect("client"),
+        );
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
@@ -5802,14 +5989,16 @@ mod tests {
     /// production clients, as `app::run` wires them. The two `Notifier`s keep
     /// the server and the poller alive.
     async fn spawn_polled_gateway(settings: &Settings) -> (SocketAddr, Notifier, Notifier) {
-        let UpstreamClients { proxy, readiness: readiness_client } =
+        let UpstreamClients { proxy, query, readiness: readiness_client } =
             UpstreamClients::new(settings, Arc::new(SystemLookup)).expect("upstream clients");
-        let state = test_state_with_client(&settings.upstreams, proxy);
-        let query_probe = settings.query_upstream.clone().map(|url| QueryProbe {
-            url,
-            client: state.http.clone(),
-            query_header: settings.query_header.clone(),
-        });
+        let mut state = test_state_with_client(&settings.upstreams, proxy);
+        let query_probe =
+            settings.query_upstream.clone().zip(query.clone()).map(|(url, client)| QueryProbe {
+                url,
+                client,
+                query_header: settings.query_header.clone(),
+            });
+        state.query_http = query;
         let poller = Notifier::new();
         tokio::spawn(run_poller(
             Arc::clone(&state.readiness),
@@ -9668,7 +9857,7 @@ mod tests {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
         let (node, node_polls, _node) = counted_ready_node().await;
         let settings = worker_settings("http", worker, node, &[]);
-        let UpstreamClients { proxy, readiness: readiness_client } =
+        let UpstreamClients { proxy, readiness: readiness_client, .. } =
             UpstreamClients::new(&settings, Arc::new(SystemLookup)).expect("clients");
         let state = test_state_with_client(&settings.upstreams, proxy);
         let readiness = Arc::clone(&state.readiness);

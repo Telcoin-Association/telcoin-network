@@ -545,6 +545,10 @@ pub(crate) async fn proxy(
         access.forwarding(route);
     }
 
+    // a submission's answer read whole below must arrive within
+    // `--upstream-request-timeout` of this point (see
+    // [`relay_submission_answer`])
+    let sent = tokio::time::Instant::now();
     match forward(&state, route, &headers, body.clone(), upstream_url.clone(), forwarding).await {
         Ok(upstream) => {
             // the worker has answered with its head, so it no longer holds a
@@ -614,15 +618,15 @@ pub(crate) async fn proxy(
             let remember = recent
                 .zip(scan.submitted)
                 .filter(|_| route == Route::Worker && upstream.status().is_success());
-            if let Some((recent, hash)) = remember {
+            if let Some(remember) = remember {
                 return relay_submission_answer(
                     upstream,
                     &upstream_url,
                     body.as_ref(),
-                    recent,
-                    hash,
+                    remember,
                     in_flight,
                     class_slot,
+                    state.upstream_request_timeout.saturating_sub(sent.elapsed()),
                 )
                 .await;
             }
@@ -720,12 +724,14 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// JSON-RPC success (see [`submission_accepted`]).
 ///
 /// The answer is read whole, at most the request's length plus
-/// [`SUBMISSION_ANSWER_SLACK`], and passed on unchanged with the worker's
-/// status and content type. An answer that cannot be read within the cap
-/// (longer than it, a body that fails, or one that runs past the request
-/// timeout) is lost: the client gets `502` / `-32001`, and the forward counts
-/// once, as `routed_requests_total{route="worker", result="body_failed"}`,
-/// never as `forwarded`.
+/// [`SUBMISSION_ANSWER_SLACK`], within `read_within` (what is left of
+/// `--upstream-request-timeout` since the request was sent, so the whole
+/// exchange stays within it), and passed on unchanged with the worker's status
+/// and content type. An answer that cannot be read within the cap (longer than
+/// it, a body that fails, or one not read whole in time) is lost: the client
+/// gets `502` / `-32001`, and the forward counts once, as
+/// `routed_requests_total{route="worker", result="body_failed"}`, never as
+/// `forwarded`.
 ///
 /// An answer that was read goes out as a [`HeldAnswer`], which keeps
 /// `in_flight` and `class_slot` until the client has taken it, as a streamed
@@ -734,15 +740,18 @@ async fn relay_submission_answer(
     upstream: reqwest::Response,
     upstream_url: &Url,
     request_body: &[u8],
-    recent: &RecentSubmissions,
-    hash: B256,
+    (recent, hash): (&RecentSubmissions, B256),
     in_flight: telemetry::RequestInFlight,
     class_slot: telemetry::InFlightSlot,
+    read_within: Duration,
 ) -> Response {
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let cap = request_body.len().saturating_add(SUBMISSION_ANSWER_SLACK);
-    match read_answer(upstream, cap).await {
+    // the worker client's read timeout bounds each gap in the answer, not the
+    // whole read, so a worker that trickles its answer is cut here
+    let answer = tokio::time::timeout(read_within, read_answer(upstream, cap)).await;
+    match answer.unwrap_or(Err(AnswerLost::TimedOut)) {
         Ok(answer) => {
             if submission_accepted(&answer) {
                 recent.record(hash);
@@ -770,8 +779,9 @@ async fn relay_submission_answer(
 }
 
 /// Read an upstream's answer whole, giving up once it runs past `cap` bytes.
-/// The read runs under the proxy client's request timeout, so an upstream
-/// that stalls mid-answer fails it instead of holding it.
+/// The client's read timeout fails the read when the body sends nothing for
+/// that long, so an upstream that stalls mid-answer cannot hold it; the caller
+/// bounds the whole read (see [`relay_submission_answer`]).
 async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Bytes, AnswerLost> {
     let mut answer = Vec::new();
     while let Some(chunk) =
@@ -790,9 +800,12 @@ async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Byte
 enum AnswerLost {
     /// The answer ran past the cap.
     TooLong,
-    /// The body failed or ran past the request timeout. The error carries no
-    /// url, so it can be logged.
+    /// The body failed, or sent nothing for the client's read timeout. The
+    /// error carries no url, so it can be logged.
     Failed(reqwest::Error),
+    /// The answer was not read whole within `--upstream-request-timeout` of
+    /// the request being sent.
+    TimedOut,
 }
 
 impl fmt::Display for AnswerLost {
@@ -800,6 +813,7 @@ impl fmt::Display for AnswerLost {
         match self {
             Self::TooLong => f.write_str("answer longer than the read cap"),
             Self::Failed(err) => ErrorChain(err).fmt(f),
+            Self::TimedOut => f.write_str("answer not read within --upstream-request-timeout"),
         }
     }
 }
@@ -934,9 +948,11 @@ pub(crate) fn reject_non_post(method: &Method) -> Response {
 /// [`QueryHeader`] goes to the query upstream only (see [`stamp_route`]).
 /// `forwarding` supplies `X-Forwarded-For` and `X-Forwarded-Proto`; the
 /// client's own values of those headers are not copied.
-/// The query route also gets its own deadline (`--query-request-timeout`) in
-/// place of the client's, so a stalled query upstream frees its slots sooner;
-/// the worker route keeps the client's `--upstream-request-timeout`.
+/// Each route has its own client (see [`route_clients`]), whose read timeout
+/// bounds the wait for the response head and every gap in the body: the query
+/// route's is `--query-request-timeout`, so a stalled query upstream frees its
+/// slots sooner, and the worker route's is `--upstream-request-timeout`.
+/// Without a query client of its own, the query route uses the worker's.
 ///
 /// A transport failure is returned as the raw `reqwest` error so the caller can
 /// log its cause before [`classify_error`] reduces it to a client-facing error.
@@ -955,18 +971,17 @@ async fn forward(
         .cloned()
         .unwrap_or_else(|| HeaderValue::from_static("application/json"));
 
-    let request = state.http.post(upstream_url).header(header::CONTENT_TYPE, content_type);
-    let request = stamp_route(request, route, state.query_header.as_ref())
+    let client = match route {
+        Route::Query => state.query_http.as_ref().unwrap_or(&state.http),
+        Route::Worker => &state.http,
+    };
+    let request = client.post(upstream_url).header(header::CONTENT_TYPE, content_type);
+    stamp_route(request, route, state.query_header.as_ref())
         .header(X_FORWARDED_FOR, forwarding.x_forwarded_for())
         .header(X_FORWARDED_PROTO, forwarding.x_forwarded_proto())
-        .body(body);
-    // a per-request timeout replaces the client's total timeout for this
-    // request only
-    let request = match (route, state.query_request_timeout) {
-        (Route::Query, Some(timeout)) => request.timeout(timeout),
-        _ => request,
-    };
-    request.send().await
+        .body(body)
+        .send()
+        .await
 }
 
 /// Whether an upstream response is an error status without a JSON body, which
@@ -1040,9 +1055,11 @@ fn relay(
     // Stream the upstream body through instead of buffering it whole: response
     // sizes are client-controlled (`eth_getLogs`, `debug_*`, large batches can
     // reach the worker's ~160 MB response cap), so N concurrent buffered
-    // responses would exhaust gateway memory. The proxy client's total request
-    // timeout bounds a stalled *upstream* (hyper keeps polling the body while
-    // its write buffer has room, so the timeout is observed) but not a
+    // responses would exhaust gateway memory. The route's request timeout is a
+    // read timeout: it bounds the wait for the head and each gap in the body,
+    // so a stalled *upstream* fails the body (hyper keeps polling it while its
+    // write buffer has room, so the timeout is observed), while a body that
+    // keeps arriving is never cut, however long it runs. It does not bound a
     // slow-reading *client*: under downstream backpressure hyper stops polling
     // the body and the poll-driven timeout never fires. That side is bounded
     // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
@@ -1185,10 +1202,10 @@ pub(crate) fn chain_id_request(
 /// `route` like a forwarded call (see [`stamp_route`]): the query upstream gets
 /// the configured `query_header` and a worker never does.
 ///
-/// Send it through the proxy client so `--upstream-request-timeout` bounds the
-/// whole exchange, answer included; the answer is read up to
-/// [`MAX_CHAIN_ID_ANSWER_BYTES`]. The error is a reason that is safe to log: it
-/// never carries the URL, the answer or the header.
+/// Send it through a forwarding client (see [`route_clients`]), whose request
+/// timeout bounds the wait for the head and for each part of the answer, which
+/// is read up to [`MAX_CHAIN_ID_ANSWER_BYTES`] (64 KiB). The error is a reason
+/// that is safe to log: it never carries the URL, the answer or the header.
 pub(crate) async fn fetch_chain_id(
     client: &Client,
     route: Route,
@@ -1261,9 +1278,10 @@ fn parse_chain_id(answer: &[u8]) -> Option<u64> {
 /// Upstream names resolve through a [`CachingResolver`] that caches each
 /// host's addresses for `--dns-cache-ttl` and caps how many lookups run at once
 /// at `--max-concurrent-dns-lookups` (see [`crate::dns`]). Each call installs a
-/// new one, so every client built from here has its own cache and its own cap
-/// (see [`crate::app::UpstreamClients`]). A lookup the resolver refuses fails
-/// the connection at once, which [`classify_error`] reports as
+/// new one, so every client built from here has its own cache and its own cap;
+/// the two forwarding clients share one instead (see [`route_clients`] and
+/// [`crate::app::UpstreamClients`]). A lookup the resolver refuses fails the
+/// connection at once, which [`classify_error`] reports as
 /// `UpstreamUnreachable`; passive health does not count that refusal against
 /// the worker (see [`dns::is_saturated`]).
 pub(crate) fn client_builder(
@@ -1272,18 +1290,71 @@ pub(crate) fn client_builder(
 ) -> UpstreamClientBuilder {
     let resolver =
         CachingResolver::new(lookup, settings.dns_cache_ttl, settings.max_concurrent_dns_lookups);
+    builder_with(settings, Arc::new(resolver))
+}
+
+/// [`client_builder`] over a given `resolver`, which the caller may share
+/// between clients.
+fn builder_with(settings: &Settings, resolver: Arc<CachingResolver>) -> UpstreamClientBuilder {
     let builder = settings.upstream_ca_certs.iter().cloned().fold(
         Client::builder()
             .use_rustls_tls()
             .no_proxy()
             .connect_timeout(settings.upstream_connect_timeout)
-            .dns_resolver(Arc::new(resolver)),
+            .dns_resolver(resolver),
         ClientBuilder::add_root_certificate,
     );
     UpstreamClientBuilder(match &settings.upstream_identity {
         Some(identity) => builder.identity(identity.clone()),
         None => builder,
     })
+}
+
+/// Build the forwarding clients, one per route (see [`proxy_client`]), over one
+/// shared [`CachingResolver`], so every forward goes through one DNS cache and
+/// one cap of `--max-concurrent-dns-lookups` lookups, whichever route it takes.
+///
+/// The worker client's request timeout is `--upstream-request-timeout`. The
+/// query client is built only with `--redirect-queries`, with
+/// `--query-request-timeout`, or `--upstream-request-timeout` when that is
+/// off. The readiness client must not share this resolver, so it is built
+/// with [`client_builder`] on its own (see [`crate::app::UpstreamClients`]).
+pub(crate) fn route_clients(
+    settings: &Settings,
+    lookup: Arc<dyn LookupHost>,
+) -> reqwest::Result<RouteClients> {
+    let resolver = Arc::new(CachingResolver::new(
+        lookup,
+        settings.dns_cache_ttl,
+        settings.max_concurrent_dns_lookups,
+    ));
+    let worker = proxy_client(
+        builder_with(settings, Arc::clone(&resolver)),
+        settings.upstream_request_timeout,
+    )?;
+    let query = settings
+        .query_upstream
+        .as_ref()
+        .map(|_| {
+            proxy_client(
+                builder_with(settings, resolver),
+                settings.query_request_timeout.unwrap_or(settings.upstream_request_timeout),
+            )
+        })
+        .transpose()?;
+    Ok(RouteClients { worker, query })
+}
+
+/// The forwarding clients [`route_clients`] builds, sharing one resolver.
+#[derive(Debug)]
+pub(crate) struct RouteClients {
+    /// Forwards to the workers, and to the query upstream when `query` is
+    /// `None`; its read timeout is `--upstream-request-timeout`.
+    pub(crate) worker: Client,
+    /// Forwards to the `--redirect-queries` upstream, with
+    /// `--query-request-timeout` as its read timeout, or `None` without a
+    /// redirect.
+    pub(crate) query: Option<Client>,
 }
 
 /// A builder that only [`client_builder`] can make (the field is private to
@@ -1303,8 +1374,12 @@ impl UpstreamClientBuilder {
     }
 }
 
-/// Finish `builder` (see [`client_builder`]) into the client that forwards
-/// requests on both routes.
+/// Finish `builder` (see [`client_builder`]) into a client that forwards
+/// requests on one route (see [`route_clients`]).
+///
+/// `request_timeout` is a read timeout: it bounds the wait for the response
+/// head, connection setup included, and every gap in the response body, never
+/// a body that keeps arriving, however long it runs.
 ///
 /// Redirects are never followed. reqwest follows up to ten by default and
 /// replays a POST body on `307`/`308`, so a query upstream answering with a
@@ -1323,7 +1398,7 @@ pub(crate) fn proxy_client(
     builder: UpstreamClientBuilder,
     request_timeout: Duration,
 ) -> reqwest::Result<Client> {
-    builder.0.redirect(Policy::none()).user_agent(USER_AGENT).timeout(request_timeout).build()
+    builder.0.redirect(Policy::none()).user_agent(USER_AGENT).read_timeout(request_timeout).build()
 }
 
 /// Finish `builder` (see [`client_builder`]) into the readiness poller's
@@ -3406,7 +3481,8 @@ mod tests {
             recent_submissions: None,
             denied_method_prefixes: Arc::from([]),
             max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
-            query_request_timeout: None,
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
             submission_slots: inflight_slots(0),
             query_slots: inflight_slots(0),
             upstream_slots: inflight_slots(0),
