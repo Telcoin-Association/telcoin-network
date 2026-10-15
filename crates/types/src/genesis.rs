@@ -27,7 +27,7 @@ pub fn test_genesis() -> Genesis {
 pub fn test_genesis_at(timestamp: u64) -> Genesis {
     let mut genesis = Genesis::default();
     set_genesis_defaults_at(&mut genesis, timestamp);
-    genesis.config.chain_id = 2017;
+    genesis.config.chain_id = ADIRI_CHAIN_ID;
     let default_factory_accounts = vec![
         (
             // Default transaction factory
