@@ -226,9 +226,13 @@ struct GlobalLimiter {
 }
 
 impl GlobalLimiter {
-    /// Refill to `now`, then spend `cost` tokens if that many are available.
-    fn admit(&self, now: Instant, cost: f64) -> bool {
-        lock(&self.bucket).try_admit(now, self.limit.tokens_per_sec(), self.limit.capacity(), cost)
+    /// Refill to the time `clock` reads, then spend `cost` tokens if that many
+    /// are available. The clock is read under the lock, so admissions refill
+    /// in lock order and a stale reading never reaches the bucket.
+    fn admit(&self, clock: &impl Clock, cost: f64) -> bool {
+        let mut bucket = lock(&self.bucket);
+        let now = clock.now();
+        bucket.try_admit(now, self.limit.tokens_per_sec(), self.limit.capacity(), cost)
     }
 }
 
@@ -322,13 +326,11 @@ impl PrefixPolicy {
     }
 
     /// The IPv4 prefix width, in bits.
-    #[cfg(test)]
     pub(crate) fn v4_bits(&self) -> u8 {
         self.v4.bits()
     }
 
     /// The IPv6 prefix width, in bits.
-    #[cfg(test)]
     pub(crate) fn v6_bits(&self) -> u8 {
         self.v6.bits()
     }
@@ -456,9 +458,13 @@ impl PerIpLimiter {
     /// a fresh bucket that is not inserted: the receipt is
     /// [`PerIpReceipt::Fresh`], and the caller inserts the bucket with
     /// [`Self::insert_fresh`] once a shared bucket has admitted the request.
+    ///
+    /// The clock is read under the map lock, so admissions refill in lock
+    /// order; the overflow bucket is touched only with the map lock held, so
+    /// the same reading serves it.
     fn admit(
         &self,
-        now: Instant,
+        clock: &impl Clock,
         ip: IpAddr,
         cost: f64,
         defer: bool,
@@ -468,6 +474,7 @@ impl PerIpLimiter {
         // client keeps spending the same budget.
         let key = self.prefix.key(ip);
         let mut buckets = lock(&self.buckets);
+        let now = clock.now();
         match buckets.get_mut(&key) {
             Some(bucket) => bucket
                 .try_admit_then(now, self.limit.tokens_per_sec(), self.limit.capacity(), cost, then)
@@ -568,10 +575,11 @@ impl PerIpLimiter {
     /// If the table is full by now and [`Self::make_room`] frees no slot,
     /// nothing is inserted and the prefix stays untracked until its next
     /// request.
-    fn insert_fresh(&self, now: Instant, key: IpAddr, at: Instant, cost: f64) {
+    fn insert_fresh(&self, clock: &impl Clock, key: IpAddr, at: Instant, cost: f64) {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
         let mut buckets = lock(&self.buckets);
+        let now = clock.now();
         if let Some(bucket) = buckets.get_mut(&key) {
             // the request is admitted already: this only records what it spent
             bucket.try_admit(now, rate, capacity, cost);
@@ -678,13 +686,12 @@ impl<C: Clock> RateLimiters<C> {
     /// (see [`Self::charge_class`]).
     fn try_admit_then(
         &self,
-        now: Instant,
         client: Option<IpAddr>,
         cost: f64,
         then: impl FnOnce() -> bool,
     ) -> Option<PerIpReceipt> {
         match self.per_ip.as_ref().zip(client) {
-            Some((per_ip, ip)) => per_ip.admit(now, ip, cost, false, then),
+            Some((per_ip, ip)) => per_ip.admit(&self.clock, ip, cost, false, then),
             None => then().then_some(PerIpReceipt::NotCharged),
         }
     }
@@ -692,9 +699,9 @@ impl<C: Clock> RateLimiters<C> {
     /// Insert the per-IP bucket a [`PerIpReceipt::Fresh`] names, once a shared
     /// bucket has admitted its request; every other receipt names a bucket
     /// that is tracked already, or none (see [`PerIpLimiter::insert_fresh`]).
-    fn track_fresh(&self, now: Instant, receipt: PerIpReceipt) {
+    fn track_fresh(&self, receipt: PerIpReceipt) {
         if let (Some(per_ip), PerIpReceipt::Fresh { key, at }) = (&self.per_ip, receipt) {
-            per_ip.insert_fresh(now, key, at, 1.0);
+            per_ip.insert_fresh(&self.clock, key, at, 1.0);
         }
     }
 
@@ -708,8 +715,8 @@ impl<C: Clock> RateLimiters<C> {
 
     /// Spend `cost` tokens from the global bucket; always admitted when there
     /// is none.
-    fn admit_global(&self, now: Instant, cost: f64) -> bool {
-        self.global.as_ref().is_none_or(|global| global.admit(now, cost))
+    fn admit_global(&self, cost: f64) -> bool {
+        self.global.as_ref().is_none_or(|global| global.admit(&self.clock, cost))
     }
 
     /// Admit or reject a request from `client` (its [`ClientAddr`]). A `None`
@@ -723,8 +730,7 @@ impl<C: Clock> RateLimiters<C> {
     /// Each bucket is charged only for requests both admit (see
     /// [`Self::try_admit_then`]).
     pub(crate) fn check(&self, client: Option<IpAddr>) -> Result<(), GatewayError> {
-        let now = self.clock.now();
-        self.try_admit_then(now, client, 1.0, || self.admit_global(now, 1.0))
+        self.try_admit_then(client, 1.0, || self.admit_global(1.0))
             .map(drop)
             .ok_or(GatewayError::RateLimited)
     }
@@ -756,8 +762,7 @@ impl<C: Clock> RateLimiters<C> {
             return Ok(());
         }
         let cost = f64::from(u32::try_from(tokens).unwrap_or(u32::MAX));
-        let now = self.clock.now();
-        self.try_admit_then(now, client, cost, || self.admit_global(now, cost))
+        self.try_admit_then(client, cost, || self.admit_global(cost))
             .map(drop)
             .ok_or(GatewayError::RateLimited)
     }
@@ -772,14 +777,13 @@ impl<C: Clock> RateLimiters<C> {
     /// A first-seen client's bucket ([`PerIpReceipt::Fresh`]) is inserted only
     /// when the class bucket admits the request; a refused one leaves no entry.
     fn charge_class(&self, edge: PerIpReceipt, submission: bool) -> Result<(), GatewayError> {
-        let now = self.clock.now();
         let admitted = if submission {
-            self.submissions.as_ref().is_none_or(|submissions| submissions.admit(now, 1.0))
+            self.submissions.as_ref().is_none_or(|submissions| submissions.admit(&self.clock, 1.0))
         } else {
-            self.admit_global(now, 1.0)
+            self.admit_global(1.0)
         };
         if admitted {
-            self.track_fresh(now, edge);
+            self.track_fresh(edge);
             Ok(())
         } else {
             self.refund_per_ip(edge, 1.0);
@@ -809,9 +813,8 @@ impl<C: Clock> RateLimiters<C> {
         if self.submissions.is_none() {
             return self.check(client).map(|()| None);
         }
-        let now = self.clock.now();
         let edge = match self.per_ip.as_ref().zip(client) {
-            Some((per_ip, ip)) => per_ip.admit(now, ip, 1.0, true, || true),
+            Some((per_ip, ip)) => per_ip.admit(&self.clock, ip, 1.0, true, || true),
             None => Some(PerIpReceipt::NotCharged),
         }
         .ok_or(GatewayError::RateLimited)?;
@@ -828,9 +831,8 @@ impl<C: Clock> RateLimiters<C> {
     /// was already answered, so the verdict decides only the insertion; the
     /// per-IP token the edge spent stays spent either way.
     fn settle_unclassified(&self, edge: PerIpReceipt) {
-        let now = self.clock.now();
-        if self.admit_global(now, 1.0) {
-            self.track_fresh(now, edge);
+        if self.admit_global(1.0) {
+            self.track_fresh(edge);
         }
     }
 
@@ -838,10 +840,11 @@ impl<C: Clock> RateLimiters<C> {
     /// periodically from a background task.
     pub(crate) fn gc(&self) {
         if let Some(per_ip) = &self.per_ip {
-            let now = self.clock.now();
             let rate = per_ip.limit.tokens_per_sec();
             let capacity = per_ip.limit.capacity();
             let mut buckets = lock(&per_ip.buckets);
+            // read under the lock, like every admission's
+            let now = self.clock.now();
             buckets.retain(|_, bucket| !bucket.is_idle(now, rate, capacity));
         }
     }
@@ -1028,6 +1031,69 @@ mod tests {
         fn global_tokens(&self) -> Option<f64> {
             self.global.as_ref().map(|global| lock(&global.bucket).tokens)
         }
+
+        /// When the global bucket last refilled, if it is enabled.
+        fn global_last_refill(&self) -> Option<Instant> {
+            self.global.as_ref().map(|global| lock(&global.bucket).last_refill)
+        }
+    }
+
+    /// A [`ManualClock`] whose first reading once `armed` is set stalls: it
+    /// takes the time, says so on `entered`, then waits up to 500 ms for a
+    /// message on `release` before returning that time, stale by then.
+    #[derive(Clone)]
+    struct GatedClock {
+        inner: ManualClock,
+        gate: Arc<Gate>,
+    }
+
+    struct Gate {
+        armed: AtomicBool,
+        entered: std::sync::mpsc::Sender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl Clock for GatedClock {
+        fn now(&self) -> Instant {
+            let now = self.inner.now();
+            if self.gate.armed.swap(false, Ordering::SeqCst) {
+                // the test waits on `entered`; a send fails only if it gave up
+                let _ = self.gate.entered.send(());
+                // a timeout is the expected outcome when the reader holds the
+                // lock the releasing thread waits on
+                let _ = lock(&self.gate.release).recv_timeout(Duration::from_millis(500));
+            }
+            now
+        }
+    }
+
+    /// Thread A reads the clock at `t1` and stalls in that reading while the
+    /// clock moves to `t2` and thread B admits a request. A reading taken
+    /// before the bucket lock lets B refill to `t2` first and A then move the
+    /// refill clock back to `t1`, crediting `t1..t2` twice; read under the
+    /// lock, A holds the bucket while it stalls and B refills after it.
+    #[test]
+    fn stale_clock_read_cannot_rewind_a_bucket() {
+        let (entered, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release) = std::sync::mpsc::channel();
+        let gate =
+            Arc::new(Gate { armed: AtomicBool::new(false), entered, release: Mutex::new(release) });
+        let clock = GatedClock { inner: ManualClock::new(), gate: Arc::clone(&gate) };
+        let limiters = Arc::new(limiters(clock.clone(), None, Some(limit(1, 10)), 16));
+        gate.armed.store(true, Ordering::SeqCst);
+        let thread_a = {
+            let limiters = Arc::clone(&limiters);
+            std::thread::spawn(move || limiters.check(None))
+        };
+        entered_rx.recv().expect("thread A read the clock");
+        clock.inner.advance(Duration::from_millis(100));
+        let t2 = clock.inner.now();
+        // thread B is this one
+        assert!(limiters.check(None).is_ok());
+        // with the fix, A has stopped waiting already and nobody receives this
+        let _ = release_tx.send(());
+        assert!(thread_a.join().expect("thread A finished").is_ok());
+        assert_eq!(limiters.global_last_refill(), Some(t2), "a stale reading rewound the bucket");
     }
 
     /// Limiters under the shipped prefix policy (`/32` v4, `/64` v6).
