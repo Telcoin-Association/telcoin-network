@@ -49,6 +49,11 @@
 //! [`record_connection_refused`] counts inbound connections the accept loop
 //! closed without serving, by `reason`. They never carry a request to the
 //! proxy, so they appear in neither request counter.
+//!
+//! [`ConnectionSlot`] pairs an accepted client connection's
+//! `--max-connections` permit with `tn_worker_gateway_open_connections`, so the
+//! gauge always equals the slots held; at the cap, new connections wait in the
+//! kernel's accept backlog.
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -125,6 +130,11 @@ const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 /// missing, malformed or late).
 const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
 
+/// Client-listener connections holding a `--max-connections` slot. While it
+/// reads the cap, new connections wait in the kernel's accept backlog. The
+/// `--probe-addr` listener has no cap and is not counted.
+const OPEN_CONNECTIONS: &str = "tn_worker_gateway_open_connections";
+
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
 
@@ -197,6 +207,32 @@ impl InFlightSlot {
 impl Drop for InFlightSlot {
     fn drop(&mut self) {
         self.gauge.decrement(1.0);
+    }
+}
+
+/// RAII guard for one accepted client connection's `--max-connections` slot:
+/// the semaphore permit plus the open-connections gauge that counts it.
+///
+/// The accept loop builds it only once a connection is accepted, so a failed
+/// accept never counts, and the connection's task drops it when the
+/// connection ends, lowering the gauge as the permit goes back, so the gauge
+/// cannot drift from the slots actually held.
+pub(crate) struct ConnectionSlot {
+    /// The held permit; dropping it frees the slot.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionSlot {
+    /// Count the connection accepted under `permit` as open.
+    pub(crate) fn open(permit: OwnedSemaphorePermit) -> Self {
+        gauge!(OPEN_CONNECTIONS).increment(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        gauge!(OPEN_CONNECTIONS).decrement(1.0);
     }
 }
 

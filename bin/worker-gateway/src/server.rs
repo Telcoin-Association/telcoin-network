@@ -1105,6 +1105,9 @@ async fn accept_loop(
                 continue;
             }
         };
+        // counted from here, so a failed accept never shows as an open
+        // connection
+        let connection_slot = telemetry::ConnectionSlot::open(permit);
 
         // Nagle + delayed-ACK can add ~40ms to small JSON-RPC responses; the
         // upstream hop (reqwest) already disables it. Best-effort: a failure
@@ -1259,7 +1262,7 @@ async fn accept_loop(
             // the connection future drops its client slot and its drain
             // receiver as it ends, before the global permit goes back
             connection.await;
-            drop(permit);
+            drop(connection_slot);
         });
     }
 
@@ -2227,6 +2230,41 @@ mod tests {
                 .expect("send");
             assert_eq!(response.status(), StatusCode::OK);
         }
+    }
+
+    /// `tn_worker_gateway_open_connections` counts the client connections
+    /// holding a `--max-connections` slot: it rises as connections are
+    /// accepted and falls as each one closes.
+    #[tokio::test]
+    async fn open_connections_gauge_tracks_held_connections() {
+        const OPEN: &str = "tn_worker_gateway_open_connections";
+        let mut metrics = CapturedMetrics::install();
+        let app = Router::new().route(HEALTH_PATH, get(|| async { "ok" }));
+        // idle connections send nothing, so the header read timeout is what
+        // would close them; keep it far past the test
+        let limits = ServerLimits { header_read_timeout: Duration::from_secs(60), ..test_limits() };
+        let (gateway, _shutdown) = spawn_with_limits(app, limits).await;
+
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(TcpStream::connect(gateway).await.expect("connect"));
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(OPEN, &[]) != 3.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("three accepted connections should read 3");
+
+        drop(held.pop());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(OPEN, &[]) != 2.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a closed connection should give its slot back");
     }
 
     /// Upstream response body sized well above the sum of every buffer
