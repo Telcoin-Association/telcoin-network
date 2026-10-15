@@ -639,6 +639,15 @@ pub(crate) struct Cli {
     #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_SAMPLE", default_value_t = 0.0)]
     pub(crate) access_log_sample: f64,
 
+    /// Most access-log lines written per second, applied after
+    /// `--access-log-sample`: a sampled request over it writes no line and is
+    /// counted in `tn_worker_gateway_access_log_suppressed_total`. The window
+    /// is a fixed second, so a burst across one window edge can write about
+    /// twice the ceiling within a second at most. Defaults to `1000`; `0`
+    /// means unlimited.
+    #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND", default_value_t = 1000)]
+    pub(crate) access_log_max_lines_per_second: u32,
+
     /// Tracing filter directive (e.g. `info,worker_gateway=debug`).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     pub(crate) log_filter: String,
@@ -800,6 +809,9 @@ pub(crate) struct Settings {
     /// Fraction of proxied requests the access log samples, in `0..=1`; `0`
     /// disables the log.
     pub(crate) access_log_sample: f64,
+    /// Most access-log lines written per second after sampling, or `None`
+    /// when unlimited.
+    pub(crate) access_log_max_lines_per_second: Option<NonZeroU32>,
 }
 
 impl Cli {
@@ -1158,6 +1170,7 @@ impl Cli {
             metrics_addr: self.metrics_addr,
             cors_allowed_origins,
             access_log_sample: self.access_log_sample,
+            access_log_max_lines_per_second: NonZeroU32::new(self.access_log_max_lines_per_second),
         })
     }
 
@@ -3094,6 +3107,17 @@ mod tests {
                 cli_with_flags(&[&format!("--access-log-sample={flag}")]).into_settings()?;
             assert!((settings.access_log_sample - rate).abs() < f64::EPSILON, "{flag}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn access_log_max_lines_per_second_parses() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(settings.access_log_max_lines_per_second, NonZeroU32::new(1000));
+        let settings = cli_with_flags(&["--access-log-max-lines-per-second=0"]).into_settings()?;
+        assert_eq!(settings.access_log_max_lines_per_second, None, "0 is unlimited");
+        let settings = cli_with_flags(&["--access-log-max-lines-per-second=5"]).into_settings()?;
+        assert_eq!(settings.access_log_max_lines_per_second, NonZeroU32::new(5));
         Ok(())
     }
 

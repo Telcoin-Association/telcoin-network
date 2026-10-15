@@ -403,12 +403,25 @@ pub(crate) struct RouterLayers {
 /// `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n`
 /// requests are logged, evenly spread. A rate of `1` logs every request. The
 /// probes are not counted.
+///
+/// A sampled request is then held to the line ceiling
+/// (`--access-log-max-lines-per-second`): a fixed one-second window counts the
+/// lines written, and a sampled request over the ceiling writes no line and is
+/// counted in `tn_worker_gateway_access_log_suppressed_total` instead. The
+/// window is fixed, not sliding, so a burst across one window edge can write
+/// about twice the ceiling within a second at most.
 #[derive(Debug)]
 pub(crate) struct AccessLog {
     /// Fraction of requests logged, in `(0, 1]`.
     rate: f64,
     /// Requests counted so far.
     requests: AtomicU64,
+    /// Most lines written per second, after sampling; `None` is unlimited.
+    max_lines_per_second: Option<NonZeroU32>,
+    /// When the log was built; the ceiling's windows are whole seconds since.
+    started: Instant,
+    /// The ceiling's current window.
+    window: Mutex<LineWindow>,
     /// Reduces a client address to the rate limiter's key for it (its network
     /// prefix), so a line names the client the way the limiter meters it.
     prefix: PrefixPolicy,
@@ -416,20 +429,73 @@ pub(crate) struct AccessLog {
 
 impl AccessLog {
     /// Build the access log for a sample `rate` already validated to `0..=1`,
-    /// or `None` at `0`, where the log is off and no layer is installed.
-    pub(crate) fn new(rate: f64, prefix: PrefixPolicy) -> Option<Arc<Self>> {
-        (rate > 0.0).then(|| Arc::new(Self { rate, requests: AtomicU64::new(0), prefix }))
+    /// writing at most `max_lines_per_second` lines a second (`None` is
+    /// unlimited), or `None` at a `0` rate, where the log is off and no layer
+    /// is installed.
+    pub(crate) fn new(
+        rate: f64,
+        max_lines_per_second: Option<NonZeroU32>,
+        prefix: PrefixPolicy,
+    ) -> Option<Arc<Self>> {
+        (rate > 0.0).then(|| {
+            Arc::new(Self {
+                rate,
+                requests: AtomicU64::new(0),
+                max_lines_per_second,
+                started: Instant::now(),
+                window: Mutex::default(),
+                prefix,
+            })
+        })
     }
 
     /// Count one request and report whether it is logged.
     fn sample(&self) -> bool {
+        self.sample_at(self.started.elapsed().as_secs())
+    }
+
+    /// [`Self::sample`] for a request arriving in window `second` (whole
+    /// seconds since the log was built).
+    fn sample_at(&self, second: u64) -> bool {
         // the counter only hands each request a distinct position, which
         // `fetch_add` does under any ordering
         let before = self.requests.fetch_add(1, Ordering::Relaxed);
         // exact while the count stays below 2^53, which takes centuries at any
         // rate the gateway can serve
-        (before.saturating_add(1) as f64 * self.rate).floor() > (before as f64 * self.rate).floor()
+        let sampled = (before.saturating_add(1) as f64 * self.rate).floor()
+            > (before as f64 * self.rate).floor();
+        sampled && self.admit_line(second)
     }
+
+    /// Whether a sampled request in window `second` still fits under the line
+    /// ceiling; one that does not is counted as suppressed.
+    fn admit_line(&self, second: u64) -> bool {
+        let Some(max) = self.max_lines_per_second else { return true };
+        // a poisoned lock only means a panic while holding it; the two plain
+        // fields are still consistent enough to cap a log line
+        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+        // a request that read the clock just before a newer one took the lock
+        // counts against the newer window rather than reopening its own
+        if second > window.second {
+            *window = LineWindow { second, lines: 0 };
+        }
+        if window.lines < max.get() {
+            window.lines += 1;
+            true
+        } else {
+            telemetry::record_access_log_suppressed();
+            false
+        }
+    }
+}
+
+/// One window of the access log's line ceiling.
+#[derive(Debug, Default)]
+struct LineWindow {
+    /// The window's second, counted from when the log was built.
+    second: u64,
+    /// Lines written in the window so far.
+    lines: u32,
 }
 
 /// Request extension marking a request the access log samples. The proxy
@@ -9648,7 +9714,7 @@ mod tests {
         layers: RouterLayers,
         trusted: Arc<TrustedProxies>,
     ) -> Router {
-        let access_log = AccessLog::new(rate, PrefixPolicy::default());
+        let access_log = AccessLog::new(rate, None, PrefixPolicy::default());
         router(
             state,
             Duration::from_secs(5),
@@ -9740,11 +9806,34 @@ mod tests {
         );
     }
 
+    /// The line ceiling caps the lines the sampler admits within one second
+    /// and counts the rest; the next second opens a fresh window.
+    #[test]
+    fn access_log_ceiling_suppresses_and_counts_lines_over_the_limit() {
+        let mut metrics = CapturedMetrics::install();
+        let log = AccessLog::new(1.0, NonZeroU32::new(2), PrefixPolicy::default())
+            .expect("a non-zero rate installs the log");
+        let second_zero: Vec<bool> = (0..3).map(|_| log.sample_at(0)).collect();
+        assert_eq!(second_zero, [true, true, false]);
+        assert!(log.sample_at(1), "a new second opens a new window");
+        assert_eq!(metrics.value("tn_worker_gateway_access_log_suppressed_total", &[]), 1.0);
+    }
+
+    /// A `0` ceiling (`None` once resolved) never suppresses a sampled line.
+    #[test]
+    fn access_log_ceiling_zero_is_unlimited() {
+        let mut metrics = CapturedMetrics::install();
+        let log = AccessLog::new(1.0, NonZeroU32::new(0), PrefixPolicy::default())
+            .expect("a non-zero rate installs the log");
+        assert!((0..10_000).all(|_| log.sample_at(0)), "every sampled line is written");
+        assert_eq!(metrics.value("tn_worker_gateway_access_log_suppressed_total", &[]), 0.0);
+    }
+
     #[tokio::test]
     async fn sample_rate_zero_logs_nothing() {
         let (lines, _capture) = AccessLines::capture();
         assert!(
-            AccessLog::new(0.0, PrefixPolicy::default()).is_none(),
+            AccessLog::new(0.0, None, PrefixPolicy::default()).is_none(),
             "a zero rate installs no access log"
         );
         let (worker, _seen, _worker) = named_mock("worker").await;
@@ -9875,7 +9964,7 @@ mod tests {
     async fn oversized_body_is_logged_unknown_rejected() {
         let (lines, _capture) = AccessLines::capture();
         let (worker, _seen, _worker) = named_mock("worker").await;
-        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let access_log = AccessLog::new(1.0, None, PrefixPolicy::default());
         let layers = RouterLayers { access_log, ..RouterLayers::default() };
         let app =
             router(ready_state(worker), Duration::from_secs(5), 64, None, layers, Arc::default());
@@ -10022,7 +10111,7 @@ mod tests {
             Client::builder().timeout(Duration::from_secs(5)).build().expect("build client");
         let state = test_state_with_client(&[upstream(worker)], proxy_client);
         state.readiness.set_ready(0, true);
-        let access_log = AccessLog::new(1.0, PrefixPolicy::default());
+        let access_log = AccessLog::new(1.0, None, PrefixPolicy::default());
         let layers = RouterLayers { access_log, ..RouterLayers::default() };
         let app = router(
             state,

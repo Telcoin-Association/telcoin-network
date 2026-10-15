@@ -174,6 +174,7 @@ Every flag has an environment-variable fallback.
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
 | `--access-log-sample` | `WORKER_GATEWAY_ACCESS_LOG_SAMPLE` | `0` | Fraction of proxied requests written to the access log, from `0` to `1` (`0` disables); see [Access log](#access-log). |
+| `--access-log-max-lines-per-second` | `WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND` | `1000` | Most access-log lines written per second, after sampling (`0` = unlimited); lines over it are dropped and counted; see [Access log](#access-log). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 | `--log-format` | `WORKER_GATEWAY_LOG_FORMAT` | `text` | Log line format: `text` or `json` (one JSON object per line). `text` is coloured only when stdout is a terminal and `NO_COLOR` is unset or empty; `json` is never coloured. |
 
@@ -861,6 +862,7 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 | `tn_worker_gateway_dns_lookups_total` | counter | `result` (`hit` / `miss` / `error` / `rejected`) | Upstream name resolutions: answered from the cache (fresh or stale), lookup started, lookup failed, or refused because every lookup slot was busy. A request that waits on a lookup already running for its host adds nothing. A stale answer whose background refresh is refused counts as both `hit` and `rejected`, and the request is still answered. The proxy and the readiness poller share the series. |
 | `tn_worker_gateway_connections_refused_total` | counter | `reason` (`per_ip_cap` / `proxy_header`) | Inbound connections closed before any request is read, by reason (`per_ip_cap`: the connection's client prefix already held `--max-connections-per-ip` connections, see [Connection handling](#connection-handling); `proxy_header`: a connection from a peer that must send a PROXY protocol v2 header sent a missing, malformed or late one, see [Client identity behind a front](#client-identity-behind-a-front); a peer that closes before its first byte, such as a TCP connect health check, is not counted). |
 | `tn_worker_gateway_open_connections` | gauge | | Client-listener connections holding a `--max-connections` slot; at the cap, new connections wait in the kernel's accept backlog (the probe listener is not counted). |
+| `tn_worker_gateway_access_log_suppressed_total` | counter | | Sampled access-log lines dropped because `--access-log-max-lines-per-second` was reached; see [Access log](#access-log). |
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
@@ -908,7 +910,7 @@ The log sits outside every layer that answers a request itself, so such a reques
 A line never carries the request URL, a header value, the body, the params, or a method name beyond its class.
 Under `--log-format json` a line is one object with `target` `gateway::access` and the same fields under `fields`, next to `message` `request`.
 With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
-The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, with no ceiling of its own, so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
+The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, capped at `--access-log-max-lines-per-second` (default 1000; lines over it are dropped and counted in `tn_worker_gateway_access_log_suppressed_total`; the cap counts whole seconds, so a burst across one second's edge can write about twice it), so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
 One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, not by its rate limit.
 Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
 

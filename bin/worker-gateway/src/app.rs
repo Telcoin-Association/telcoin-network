@@ -109,6 +109,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         metrics_addr,
         cors_allowed_origins,
         access_log_sample,
+        access_log_max_lines_per_second,
     } = settings;
 
     info!(
@@ -158,7 +159,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
     };
     // The sampled access log keys clients by the same prefix as the per-IP
     // limiter, or `None` when `--access-log-sample` is `0`.
-    let access_log = AccessLog::new(access_log_sample, rate_limit_prefix);
+    let access_log =
+        AccessLog::new(access_log_sample, access_log_max_lines_per_second, rate_limit_prefix);
     // the worker slots reads can never take, so the operator sees what
     // submissions are guaranteed, not just `--max-inflight-submissions`:
     // without a redirect every read may take one, with one only the reads kept

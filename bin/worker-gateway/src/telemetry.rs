@@ -138,6 +138,10 @@ const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_t
 /// `--probe-addr` listener has no cap and is not counted.
 const OPEN_CONNECTIONS: &str = "tn_worker_gateway_open_connections";
 
+/// Sampled access-log lines the line ceiling
+/// (`--access-log-max-lines-per-second`) dropped.
+const ACCESS_LOG_SUPPRESSED_TOTAL: &str = "tn_worker_gateway_access_log_suppressed_total";
+
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
 
@@ -310,6 +314,12 @@ pub(crate) fn record_mixed_batch() {
 /// by a stable machine-readable `reason`.
 pub(crate) fn record_connection_refused(reason: &'static str) {
     counter!(CONNECTIONS_REFUSED_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record a sampled access-log line dropped because the second's line ceiling
+/// was already reached.
+pub(crate) fn record_access_log_suppressed() {
+    counter!(ACCESS_LOG_SUPPRESSED_TOTAL).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or
