@@ -1,4 +1,10 @@
-FROM rust:1.94-slim-bookworm AS builder
+# Base images are pinned by digest, so a re-pushed tag cannot change a release build. Each
+# reference keeps its tag for readers; with a digest present, Docker pulls by the digest and
+# ignores the tag. To move to a newer image, look up the multi-platform index digest of the tag
+# and replace the digest after it:
+#   docker buildx imagetools inspect <image>:<tag> --format '{{json .Manifest.Digest}}'
+# rust:1.94-slim-bookworm, index digest as of 2026-10-15
+FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
 ENV RUSTUP_TOOLCHAIN=1.94
 
@@ -43,7 +49,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image
-FROM debian:bookworm-slim
+# debian:bookworm-slim, index digest as of 2026-10-15 (pinned like the builder above)
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 
 # OCI image annotations — these link the ghcr.io package page back to the
 # repo and let `docker inspect` self-report version + revision. `etc/release.sh build`
