@@ -159,8 +159,8 @@ Every flag has an environment-variable fallback.
 | `--http1-max-buf-size` | `WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE` | `65536` | Per-connection read buffer cap, in bytes (64 KiB; minimum 8192; a request head must fit in it; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
-| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
-| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
+| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv6 client into one bucket and one connection count), and startup warns below `/32`. |
+| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv4 client into one bucket and one connection count), and startup warns below `/16`. |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
@@ -336,7 +336,9 @@ global limit applies to it; a single IPv6 `/64` makes that trivial.
   IPv4 allocations.
 
 A prefix wider than its address family allows (`/33` for IPv4, `/129` for IPv6)
-is rejected at startup rather than clamped. On a dual-stack listener an IPv4
+is rejected at startup rather than clamped, and so is `/0`, which does not
+disable masking but would put a whole family into one bucket; startup warns
+below `/16` (IPv4) or `/32` (IPv6). On a dual-stack listener an IPv4
 peer is reported in the mapped `::ffff:a.b.c.d` form; those are unmapped and
 keyed by the **IPv4** prefix, so they are metered per address rather than all
 landing in one `/64`.

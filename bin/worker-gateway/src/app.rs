@@ -171,6 +171,9 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         proxy_protocol = proxy_protocol.is_some(),
         submission_budget,
         ?max_connections_per_ip,
+        // the per-ip key's prefix widths (`v4`, `v6`), which also key
+        // --max-connections-per-ip
+        ?rate_limit_prefix,
         max_request_bytes,
         ?max_batch_len,
         max_inflight_submissions,

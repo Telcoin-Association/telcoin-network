@@ -47,6 +47,16 @@ const DEFAULT_MAX_REQUEST_BYTES: NonZeroUsize =
 /// still starts, with a warning.
 const MIN_SUBMISSION_REQUEST_BYTES: usize = 2 * 128 * 1024 + 1024;
 
+/// The shortest `--rate-limit-per-ip-v4-prefix` that starts without a warning.
+/// A shorter prefix puts every client inside one such block (65536 addresses
+/// at `/16`) into one per-IP bucket and one connection count.
+const MIN_QUIET_V4_PREFIX: u8 = 16;
+
+/// The shortest `--rate-limit-per-ip-v6-prefix` that starts without a warning:
+/// `/32` is a typical allocation to a whole provider, so a shorter prefix groups
+/// many unrelated networks into one per-IP bucket and one connection count.
+const MIN_QUIET_V6_PREFIX: u8 = 32;
+
 /// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -465,7 +475,9 @@ pub(crate) struct Cli {
     /// the smallest subnet routed to one customer, so a client rotating
     /// addresses inside its own allocation keeps spending one bucket instead of
     /// minting a fresh one per address. Widen it (up to `/128`) only to meter
-    /// individual addresses.
+    /// individual addresses. `0` is rejected: it does not disable masking, it
+    /// would put every client of the family into one bucket and one connection
+    /// count; startup warns below /32 (IPv6) or /16 (IPv4).
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX",
@@ -479,7 +491,9 @@ pub(crate) struct Cli {
     /// a single address: it preserves the gateway's per-address behaviour and
     /// never groups unrelated customers that share one carrier-grade NAT.
     /// Narrow it only for a deployment whose clients genuinely map to larger
-    /// IPv4 allocations.
+    /// IPv4 allocations. `0` is rejected: it does not disable masking, it would
+    /// put every client of the family into one bucket and one connection count;
+    /// startup warns below /32 (IPv6) or /16 (IPv4).
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX",
@@ -865,6 +879,16 @@ impl Cli {
             self.rate_limit_per_ip_v4_prefix,
             self.rate_limit_per_ip_v6_prefix,
         )?;
+        warn_on_short_prefix(
+            "--rate-limit-per-ip-v4-prefix",
+            self.rate_limit_per_ip_v4_prefix,
+            MIN_QUIET_V4_PREFIX,
+        );
+        warn_on_short_prefix(
+            "--rate-limit-per-ip-v6-prefix",
+            self.rate_limit_per_ip_v6_prefix,
+            MIN_QUIET_V6_PREFIX,
+        );
         let trusted_proxies = self
             .trusted_proxies
             .as_deref()
@@ -1131,6 +1155,20 @@ fn warn_on_whole_families(flag: &str, ranges: &TrustedProxies, consequence: &str
     }
 }
 
+/// Warn when the per-IP prefix `flag` is shorter than `floor` bits: every
+/// client inside one such prefix shares one per-IP bucket and one
+/// `--max-connections-per-ip` count, so one busy client can throttle or lock
+/// out every other client of its block.
+fn warn_on_short_prefix(flag: &str, bits: u8, floor: u8) {
+    if bits < floor {
+        warn!(
+            target: "gateway",
+            "{flag} is /{bits}: every client inside one /{bits} shares one per-IP bucket and one \
+             --max-connections-per-ip count"
+        );
+    }
+}
+
 /// Reject a zero value for a duration flag that has no disabled sentinel. A
 /// zero readiness poll interval panics the poller (`tokio::time::interval`),
 /// and a zero timeout or deadline fails every poll, forward or request it
@@ -1285,8 +1323,21 @@ fn resolve_inflight_byte_budget(
 /// Validate the two per-IP prefix flags into a [`PrefixPolicy`]. A length wider
 /// than its address family allows is a startup error rather than a silently
 /// clamped value: a `/200` in a deployment's config is a typo, and quietly
-/// meaning `/32` would hide it.
+/// meaning `/32` would hide it. Exactly `/0` is a startup error too: the
+/// neighbouring flags read `0` as disabled, but here it would key a whole
+/// family to one bucket and one connection count. [`PrefixLen`] itself still
+/// accepts `/0`; only the operator boundary refuses it.
 fn resolve_prefix_policy(v4: u8, v6: u8) -> eyre::Result<PrefixPolicy> {
+    eyre::ensure!(
+        v4 > 0,
+        "--rate-limit-per-ip-v4-prefix 0 would put every IPv4 client in one bucket and one \
+         connection count; it does not disable masking"
+    );
+    eyre::ensure!(
+        v6 > 0,
+        "--rate-limit-per-ip-v6-prefix 0 would put every IPv6 client in one bucket and one \
+         connection count; it does not disable masking"
+    );
     PrefixLen::v4(v4)
         .map_err(|err| eyre::eyre!("invalid --rate-limit-per-ip-v4-prefix: {err}"))
         .and_then(|v4| {
@@ -2401,6 +2452,38 @@ mod tests {
         assert!(v4.is_err(), "a /33 IPv4 prefix must fail startup, not be clamped");
         let v6 = cli_with_flags(&["--rate-limit-per-ip-v6-prefix=129"]).into_settings();
         assert!(v6.is_err(), "a /129 IPv6 prefix must fail startup, not be clamped");
+    }
+
+    #[test]
+    fn per_ip_prefix_zero_is_rejected() {
+        for flag in ["--rate-limit-per-ip-v4-prefix", "--rate-limit-per-ip-v6-prefix"] {
+            let arg = format!("{flag}=0");
+            let err = cli_with_flags(&[arg.as_str()])
+                .into_settings()
+                .expect_err("a /0 per-IP prefix must fail startup");
+            let message = err.to_string();
+            assert!(message.contains(flag), "{message}");
+            assert!(message.contains("does not disable masking"), "{message}");
+        }
+    }
+
+    #[test]
+    fn short_per_ip_prefix_warns() -> eyre::Result<()> {
+        for (flag, short, floor) in
+            [("--rate-limit-per-ip-v4-prefix", 8, 16), ("--rate-limit-per-ip-v6-prefix", 16, 32)]
+        {
+            let warning = format!("{flag} is /{short}: every client inside one /{short} shares");
+            let arg = format!("{flag}={short}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[arg.as_str()]));
+            settings?;
+            assert!(logs.contains(&warning), "{flag}={short} must warn: {logs}");
+            // the floor itself is quiet
+            let arg = format!("{flag}={floor}");
+            let (settings, logs) = into_settings_logged(cli_with_flags(&[arg.as_str()]));
+            settings?;
+            assert!(!logs.contains(flag), "{flag}={floor} must not warn: {logs}");
+        }
+        Ok(())
     }
 
     #[test]
