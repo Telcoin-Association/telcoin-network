@@ -311,6 +311,8 @@ With `--rate-limit-submissions` set (requests per second, burst twice the rate),
 The edge cannot tell the classes apart before the body is read, so there it runs only the per-IP limit, which still covers both classes and still refuses an over-limit client before its body is read.
 Once the request is read and classified, its first call is charged to the global bucket for a query or to the submission bucket for a submission.
 A refusal there is a `429` and gives the per-IP token back, so a refused submission spends no global token and a refused query no submission token.
+A first-seen client gets its per-IP entry only once a shared bucket has admitted its request: its class bucket, or, for a request answered before it is classified (a `405`, an unreadable or over-length body, a denied method), the global bucket, which then charges it as a query; a request either bucket refuses leaves no entry, so with the flag as without it a flood the shared buckets refuse cannot fill the table.
+
 Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit.
 A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
 A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal leaves the first call's tokens spent, as it does without the flag.

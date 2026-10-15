@@ -47,13 +47,23 @@
 //! token to the bucket the edge charged: a refused submission spends no global
 //! token and a refused query no submission token. Without the flag the edge
 //! check is [`RateLimiters::check`].
+//!
+//! With the flag, a first-seen client's per-IP bucket is inserted only once a
+//! shared bucket has admitted its request: the class charge, or, for a request
+//! answered before it is classified (a `405`, an unreadable or over-length
+//! body, a denied method), a query charge to the global bucket made when its
+//! [`SubmissionBudget`] is dropped. So in both modes a table entry costs a
+//! shared token, and a flood the shared buckets refuse cannot fill the table.
 
 use std::{
     collections::HashMap,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
     num::NonZeroU32,
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex, MutexGuard, PoisonError,
+    },
     time::{Duration, Instant},
 };
 
@@ -398,6 +408,12 @@ enum PerIpReceipt {
     NotCharged,
     /// The client's own bucket, under its prefix-masked key.
     Own(IpAddr),
+    /// A first-seen prefix admitted on a fresh bucket that is not in the table
+    /// yet: the edge check under a submission budget defers the insertion until
+    /// a shared bucket has admitted the request (see
+    /// [`PerIpLimiter::insert_fresh`]). `at` is when the edge charged it, so
+    /// the bucket rebuilt at insertion refills from then.
+    Fresh { key: IpAddr, at: Instant },
     /// The overflow bucket every client the full table cannot track shares.
     Overflow,
 }
@@ -420,11 +436,17 @@ impl PerIpLimiter {
     /// Returns the bucket that was charged when the request is admitted, so a
     /// caller that learns later that it must refuse the request can refund it
     /// with [`Self::refund`].
+    ///
+    /// With `defer`, a first-seen prefix the table has room for is charged on
+    /// a fresh bucket that is not inserted: the receipt is
+    /// [`PerIpReceipt::Fresh`], and the caller inserts the bucket with
+    /// [`Self::insert_fresh`] once a shared bucket has admitted the request.
     fn admit(
         &self,
         now: Instant,
         ip: IpAddr,
         cost: f64,
+        defer: bool,
         then: impl FnOnce() -> bool,
     ) -> Option<PerIpReceipt> {
         // Every address in one allocation collapses onto this key, so a rotating
@@ -435,7 +457,7 @@ impl PerIpLimiter {
             Some(bucket) => bucket
                 .try_admit_then(now, self.limit.tokens_per_sec(), self.limit.capacity(), cost, then)
                 .then_some(PerIpReceipt::Own(key)),
-            None => self.admit_new_ip(&mut buckets, now, key, cost, then),
+            None => self.admit_new_ip(&mut buckets, now, key, cost, defer, then),
         }
     }
 
@@ -445,7 +467,12 @@ impl PerIpLimiter {
     /// The fresh bucket is inserted only when `then` admits the request too: a
     /// refused first request leaves no entry, exactly as if its refunded (full)
     /// bucket had been swept, so a flood the global limit refuses cannot fill the
-    /// table.
+    /// table. With `defer` (the edge check under a submission budget, whose
+    /// `then` admits everything) it is not inserted here at all: the receipt is
+    /// [`PerIpReceipt::Fresh`], and the bucket is inserted only once the
+    /// request's class charge, or the query charge made for a request answered
+    /// unclassified, admits it (see [`RateLimiters::charge_class`]), so the
+    /// guarantee holds in both modes.
     ///
     /// A new IP with the table already full is not tracked and spends from the
     /// shared overflow bucket instead, rather than evicting a live bucket or
@@ -462,17 +489,21 @@ impl PerIpLimiter {
         now: Instant,
         ip: IpAddr,
         cost: f64,
+        defer: bool,
         then: impl FnOnce() -> bool,
     ) -> Option<PerIpReceipt> {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
         if buckets.len() < self.max_entries {
             let mut bucket = Bucket::full(now, capacity);
-            let admitted = bucket.try_admit_then(now, rate, capacity, cost, then);
-            if admitted {
-                buckets.insert(ip, bucket);
+            if !bucket.try_admit_then(now, rate, capacity, cost, then) {
+                return None;
             }
-            admitted.then_some(PerIpReceipt::Own(ip))
+            if defer {
+                return Some(PerIpReceipt::Fresh { key: ip, at: now });
+            }
+            buckets.insert(ip, bucket);
+            Some(PerIpReceipt::Own(ip))
         } else {
             // Table full: share the overflow bucket (bounded memory over per-IP
             // fairness).
@@ -493,13 +524,36 @@ impl PerIpLimiter {
     fn refund(&self, receipt: PerIpReceipt, cost: f64) {
         let capacity = self.limit.capacity();
         match receipt {
-            PerIpReceipt::NotCharged => {}
+            // a fresh bucket was never inserted, so there is nothing to refund
+            PerIpReceipt::NotCharged | PerIpReceipt::Fresh { .. } => {}
             PerIpReceipt::Own(key) => {
                 if let Some(bucket) = lock(&self.buckets).get_mut(&key) {
                     bucket.refund(cost, capacity);
                 }
             }
             PerIpReceipt::Overflow => lock(&self.overflow).refund(cost, capacity),
+        }
+    }
+
+    /// Track the first-seen prefix `key` that the edge admitted at `at` on a
+    /// fresh bucket charged `cost` tokens (a [`PerIpReceipt::Fresh`]), now that
+    /// a shared bucket has admitted its request too.
+    ///
+    /// If the prefix has a bucket by now, a concurrent first request from it
+    /// was inserted first, and this request's `cost` is spent from that bucket
+    /// instead; its verdict is ignored, since the request is already admitted.
+    /// If the table is full by now, nothing is inserted and the prefix stays
+    /// untracked until its next request.
+    fn insert_fresh(&self, now: Instant, key: IpAddr, at: Instant, cost: f64) {
+        let rate = self.limit.tokens_per_sec();
+        let capacity = self.limit.capacity();
+        let mut buckets = lock(&self.buckets);
+        if let Some(bucket) = buckets.get_mut(&key) {
+            // the request is admitted already: this only records what it spent
+            bucket.try_admit(now, rate, capacity, cost);
+        } else if buckets.len() < self.max_entries {
+            // the bucket the edge charged, refilling from when it was charged
+            buckets.insert(key, Bucket { tokens: capacity - cost, last_refill: at });
         }
     }
 }
@@ -570,10 +624,12 @@ impl<C: Clock> RateLimiters<C> {
     ///
     /// An admitted request gets back the [`PerIpReceipt`] naming the per-IP
     /// bucket that was charged. [`Self::check`] and [`Self::charge_batch`]
-    /// pass the global bucket as `then` and need no receipt; with a submission
-    /// budget, [`Self::check_edge`] passes a `then` that admits, and the proxy
-    /// keeps the receipt to refund that bucket if the request's class bucket
-    /// refuses it (see [`Self::charge_class`]).
+    /// pass the global bucket as `then` and need no receipt. With a submission
+    /// budget, [`Self::check_edge`] charges the per-IP bucket alone, with a
+    /// first-seen client's insertion deferred (see [`PerIpLimiter::admit`]),
+    /// and the proxy keeps that receipt to refund the bucket if the request's
+    /// class bucket refuses it, or to insert it once a shared bucket admits it
+    /// (see [`Self::charge_class`]).
     fn try_admit_then(
         &self,
         now: Instant,
@@ -582,8 +638,17 @@ impl<C: Clock> RateLimiters<C> {
         then: impl FnOnce() -> bool,
     ) -> Option<PerIpReceipt> {
         match self.per_ip.as_ref().zip(client) {
-            Some((per_ip, ip)) => per_ip.admit(now, ip, cost, then),
+            Some((per_ip, ip)) => per_ip.admit(now, ip, cost, false, then),
             None => then().then_some(PerIpReceipt::NotCharged),
+        }
+    }
+
+    /// Insert the per-IP bucket a [`PerIpReceipt::Fresh`] names, once a shared
+    /// bucket has admitted its request; every other receipt names a bucket
+    /// that is tracked already, or none (see [`PerIpLimiter::insert_fresh`]).
+    fn track_fresh(&self, now: Instant, receipt: PerIpReceipt) {
+        if let (Some(per_ip), PerIpReceipt::Fresh { key, at }) = (&self.per_ip, receipt) {
+            per_ip.insert_fresh(now, key, at, 1.0);
         }
     }
 
@@ -657,6 +722,9 @@ impl<C: Clock> RateLimiters<C> {
     /// off). A refusal refunds the per-IP token `edge` names, so neither shared
     /// bucket is spent on a request the other refused and the client pays
     /// nothing for a refusal it did not cause.
+    ///
+    /// A first-seen client's bucket ([`PerIpReceipt::Fresh`]) is inserted only
+    /// when the class bucket admits the request; a refused one leaves no entry.
     fn charge_class(&self, edge: PerIpReceipt, submission: bool) -> Result<(), GatewayError> {
         let now = self.clock.now();
         let admitted = if submission {
@@ -665,6 +733,7 @@ impl<C: Clock> RateLimiters<C> {
             self.admit_global(now, 1.0)
         };
         if admitted {
+            self.track_fresh(now, edge);
             Ok(())
         } else {
             self.refund_per_ip(edge, 1.0);
@@ -681,6 +750,12 @@ impl<C: Clock> RateLimiters<C> {
     /// is touched: the edge cannot tell a query from a submission yet. The
     /// returned [`SubmissionBudget`] carries the per-IP receipt to the proxy,
     /// which charges the class bucket once it has classified the request.
+    ///
+    /// A first-seen client is charged on a fresh bucket that is not inserted
+    /// yet ([`PerIpReceipt::Fresh`]): the class charge inserts it once it
+    /// admits the request, and a budget dropped uncharged inserts it only if
+    /// the global bucket admits the request as a query (see
+    /// [`SubmissionBudget`]), so the edge alone never adds a table entry.
     fn check_edge(
         self: &Arc<Self>,
         client: Option<IpAddr>,
@@ -689,9 +764,28 @@ impl<C: Clock> RateLimiters<C> {
             return self.check(client).map(|()| None);
         }
         let now = self.clock.now();
-        let edge =
-            self.try_admit_then(now, client, 1.0, || true).ok_or(GatewayError::RateLimited)?;
-        Ok(Some(SubmissionBudget { limiters: Arc::clone(self), edge }))
+        let edge = match self.per_ip.as_ref().zip(client) {
+            Some((per_ip, ip)) => per_ip.admit(now, ip, 1.0, true, || true),
+            None => Some(PerIpReceipt::NotCharged),
+        }
+        .ok_or(GatewayError::RateLimited)?;
+        let inner =
+            BudgetInner { limiters: Arc::clone(self), edge, charged: AtomicBool::new(false) };
+        Ok(Some(SubmissionBudget { inner: Arc::new(inner) }))
+    }
+
+    /// Settle a request the edge admitted under a submission budget but that
+    /// was answered without a class charge (a `405`, an unreadable or
+    /// over-length body, a denied method, a loop): charge its first call to
+    /// the global bucket as a query, as [`Self::check`] would have, and insert
+    /// a first-seen client's bucket only if that bucket admits it. The request
+    /// was already answered, so the verdict decides only the insertion; the
+    /// per-IP token the edge spent stays spent either way.
+    fn settle_unclassified(&self, edge: PerIpReceipt) {
+        let now = self.clock.now();
+        if self.admit_global(now, 1.0) {
+            self.track_fresh(now, edge);
+        }
     }
 
     /// Drop idle (fully-refilled) per-IP buckets to bound memory. Called
@@ -715,12 +809,19 @@ impl<C: Clock> RateLimiters<C> {
 /// [`Self::charge`] once it has classified it. This keeps a read flood that
 /// drains the global bucket from refusing submissions, and a submission flood
 /// over its own budget from draining the global bucket.
+///
+/// A request answered before it is classified (a `405`, an unreadable or
+/// over-length body, a denied method, a loop) never reaches [`Self::charge`].
+/// When the last clone of its budget is dropped, it is charged to the global
+/// bucket as a query, and a first-seen client's per-IP bucket is inserted only
+/// if that bucket admits it, so such a request costs a global token and
+/// leaves no entry unless it paid one, as under [`RateLimiters::check`].
+/// Dropping a budget that was charged costs nothing more.
 #[derive(Clone)]
 pub(crate) struct SubmissionBudget<C: Clock = SystemClock> {
-    /// The limiters holding the global and submission buckets.
-    limiters: Arc<RateLimiters<C>>,
-    /// The per-IP bucket the edge charged, refunded if the class is refused.
-    edge: PerIpReceipt,
+    /// Shared by every clone (the request extension and the handler's copy),
+    /// so the request is settled once, when the last clone is dropped.
+    inner: Arc<BudgetInner<C>>,
 }
 
 impl<C: Clock> SubmissionBudget<C> {
@@ -728,7 +829,26 @@ impl<C: Clock> SubmissionBudget<C> {
     /// submission bucket, any other request to the global bucket. A refusal
     /// gives the edge's per-IP token back (see [`RateLimiters::charge_class`]).
     pub(crate) fn charge(&self, submission: bool) -> Result<(), GatewayError> {
-        self.limiters.charge_class(self.edge, submission)
+        self.inner.charged.store(true, Ordering::Relaxed);
+        self.inner.limiters.charge_class(self.inner.edge, submission)
+    }
+}
+
+/// The state every clone of one [`SubmissionBudget`] shares.
+struct BudgetInner<C: Clock> {
+    /// The limiters holding the global and submission buckets.
+    limiters: Arc<RateLimiters<C>>,
+    /// The per-IP bucket the edge charged, refunded if the class is refused.
+    edge: PerIpReceipt,
+    /// Whether [`SubmissionBudget::charge`] has run, whatever its verdict.
+    charged: AtomicBool,
+}
+
+impl<C: Clock> Drop for BudgetInner<C> {
+    fn drop(&mut self) {
+        if !*self.charged.get_mut() {
+            self.limiters.settle_unclassified(self.edge);
+        }
     }
 }
 
@@ -1217,14 +1337,131 @@ mod tests {
             Some(limit(1, 2)),
             limit(1, 1),
         );
-        assert!(limiters.check_edge(Some(ip(1))).is_ok());
+        let first = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget verdict");
+        assert!(first.charge(false).is_ok());
         // the client's own bucket is empty: refused at the edge, without
         // spending the global token another client can still use
         assert!(matches!(limiters.check_edge(Some(ip(1))), Err(GatewayError::RateLimited)));
         let other = limiters.check_edge(Some(ip(2))).expect("edge").expect("a budget verdict");
         // the edge charges no shared bucket at all: the class is not known yet
-        assert_eq!(limiters.global_tokens(), Some(2.0));
+        assert_eq!(limiters.global_tokens(), Some(1.0));
         assert!(other.charge(false).is_ok());
+    }
+
+    /// With a submission budget, the edge's per-IP check alone adds no table
+    /// entry: a first-seen client is tracked once its class bucket admits it,
+    /// with the edge's token spent, as `global_rejection_leaves_no_entry_for_a_new_client`
+    /// pins for the edge check without the budget.
+    #[test]
+    fn check_edge_inserts_no_entry_until_the_class_admits() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 2)),
+            Some(limit(1, 2)),
+            limit(1, 1),
+        );
+        let budget = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert_eq!(limiters.per_ip_len(), 0, "the edge tracked a client no shared bucket admitted");
+        assert!(budget.charge(false).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0), "the edge token was not kept");
+        assert_eq!(limiters.global_tokens(), Some(1.0));
+    }
+
+    /// A request answered before it is classified (a `GET` refused with `405`)
+    /// drops its budget uncharged: it pays a global token as a query, and the
+    /// client is tracked with its edge token spent, as `check` would leave it.
+    #[test]
+    fn edge_admission_without_a_class_charge_costs_a_global_token() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 2)),
+            Some(limit(1, 2)),
+            limit(1, 1),
+        );
+        let budget = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert_eq!(limiters.global_tokens(), Some(2.0), "the edge charged a shared bucket");
+        drop(budget);
+        assert_eq!(limiters.global_tokens(), Some(1.0), "an unclassified request was free");
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0));
+    }
+
+    /// The same with the global bucket empty: the unclassified request leaves
+    /// no entry, so a flood the global limit refuses cannot fill the table.
+    #[test]
+    fn edge_admission_without_a_class_charge_leaves_no_entry_when_global_refuses() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 2)),
+            Some(limit(1, 1)),
+            limit(1, 1),
+        );
+        let read = limiters.check_edge(None).expect("edge").expect("a budget");
+        assert!(read.charge(false).is_ok(), "the global bucket's only token");
+        for client in [ip(1), ip(2), ip(1)] {
+            drop(limiters.check_edge(Some(client)).expect("edge").expect("a budget"));
+        }
+        assert_eq!(limiters.per_ip_len(), 0, "a globally refused new client was tracked");
+    }
+
+    /// A budget is settled once: a charged one costs nothing more when it is
+    /// dropped, and a clone dropped before the charge settles nothing.
+    #[test]
+    fn dropping_a_charged_budget_charges_nothing_more() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 4)),
+            Some(limit(1, 4)),
+            limit(1, 2),
+        );
+        let read = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(read.charge(false).is_ok());
+        drop(read);
+        assert_eq!(limiters.global_tokens(), Some(3.0), "a charged read paid twice");
+
+        // the request extension's copy goes before the handler charges its own
+        let submission = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        drop(submission.clone());
+        assert_eq!(limiters.global_tokens(), Some(3.0), "a live budget was settled");
+        assert!(submission.charge(true).is_ok());
+        drop(submission);
+        assert_eq!(limiters.global_tokens(), Some(3.0), "a charged submission paid a global token");
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(2.0));
+    }
+
+    #[test]
+    fn class_refusal_leaves_no_entry() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 2)),
+            Some(limit(1, 1)),
+            limit(1, 1),
+        );
+        let read = limiters.check_edge(None).expect("edge").expect("a budget");
+        assert!(read.charge(false).is_ok(), "the global bucket's only token");
+        let refused = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(matches!(refused.charge(false), Err(GatewayError::RateLimited)));
+        drop(refused);
+        assert_eq!(limiters.per_ip_len(), 0, "a client its class bucket refused was tracked");
+    }
+
+    /// Two first requests from one new prefix both pass the edge on fresh
+    /// buckets; once both are charged the prefix has one entry that paid for
+    /// both.
+    #[test]
+    fn concurrent_first_requests_from_one_prefix_share_one_bucket() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 4)),
+            Some(limit(1, 4)),
+            limit(1, 2),
+        );
+        let first = limiters.check_edge(Some(ip6(1, 1))).expect("edge").expect("a budget");
+        let second = limiters.check_edge(Some(ip6(1, 2))).expect("edge").expect("a budget");
+        assert!(first.charge(false).is_ok());
+        assert!(second.charge(true).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+        assert_eq!(limiters.per_ip_tokens(ip6(1, 3)), Some(2.0));
     }
 
     #[test]
