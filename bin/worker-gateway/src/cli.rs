@@ -34,6 +34,19 @@ pub(crate) const DEFAULT_DENIED_METHOD_PREFIXES: &str = "tn_,debug_,trace_,admin
 /// period, so the orchestrator would kill it before the drain even starts.
 const MAX_SHUTDOWN_DELAY: Duration = Duration::from_secs(60);
 
+/// The `--max-request-bytes` default, [`crate::proxy::MAX_REQUEST_BYTES`], as
+/// the flag's non-zero type; evaluating it fails the build if that constant is
+/// ever `0`.
+const DEFAULT_MAX_REQUEST_BYTES: NonZeroUsize =
+    NonZeroUsize::new(crate::proxy::MAX_REQUEST_BYTES).expect("MAX_REQUEST_BYTES is non-zero");
+
+/// The smallest `--max-request-bytes` that admits the largest submission a
+/// worker accepts: reth's pool admits at most 128 KiB of raw transaction
+/// (`DEFAULT_MAX_TX_INPUT_BYTES`, see [`crate::proxy::MAX_REQUEST_BYTES`]),
+/// twice that once hex-encoded, plus 1 KiB of JSON-RPC envelope. A smaller cap
+/// still starts, with a warning.
+const MIN_SUBMISSION_REQUEST_BYTES: usize = 2 * 128 * 1024 + 1024;
+
 /// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -381,13 +394,15 @@ pub(crate) struct Cli {
     /// too large" error before being forwarded, and a declared
     /// `Content-Length` over it is rejected before the body is read. The total
     /// buffered across connections is bounded by
-    /// `--max-inflight-request-bytes`.
+    /// `--max-inflight-request-bytes`. Must be greater than 0 (`0` does not mean
+    /// unlimited here; it would refuse every body); startup warns below 257 KiB,
+    /// the largest admissible submission.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_REQUEST_BYTES",
-        default_value_t = crate::proxy::MAX_REQUEST_BYTES
+        default_value_t = DEFAULT_MAX_REQUEST_BYTES
     )]
-    pub(crate) max_request_bytes: usize,
+    pub(crate) max_request_bytes: NonZeroUsize,
 
     /// Maximum number of calls in one JSON-RPC batch (default 50; `0` means
     /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
@@ -918,8 +933,19 @@ impl Cli {
             }
             (cap, _) => cap,
         };
-        let max_inflight_request_bytes =
-            resolve_inflight_byte_budget(self.max_inflight_request_bytes, self.max_request_bytes)?;
+        let max_inflight_request_bytes = resolve_inflight_byte_budget(
+            self.max_inflight_request_bytes,
+            self.max_request_bytes.get(),
+        )?;
+        if self.max_request_bytes.get() < MIN_SUBMISSION_REQUEST_BYTES {
+            warn!(
+                target: "gateway",
+                max_request_bytes = self.max_request_bytes.get(),
+                floor = MIN_SUBMISSION_REQUEST_BYTES,
+                "--max-request-bytes is below one hex-encoded 128 KiB transaction plus its \
+                 JSON-RPC envelope; the largest admissible submission would get 413"
+            );
+        }
         // hyper panics on a smaller read buffer, so refuse it at startup
         eyre::ensure!(
             self.http1_max_buf_size >= crate::server::HTTP1_MIN_BUF_SIZE,
@@ -990,7 +1016,7 @@ impl Cli {
             max_worker_pool_reads: worker_pool_read_cap(self.max_upstream_inflight),
             tcp_user_timeout: resolve_optional_duration(self.tcp_user_timeout),
             max_connection_duration,
-            max_request_bytes: self.max_request_bytes,
+            max_request_bytes: self.max_request_bytes.get(),
             max_batch_len,
             max_inflight_request_bytes,
             http1_max_buf_size: self.http1_max_buf_size,
@@ -2686,6 +2712,34 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn max_request_bytes_zero_is_rejected() {
+        // `0` would refuse every body, so clap refuses it rather than letting
+        // it read as "unlimited" the way the sibling caps do
+        let err = Cli::try_parse_from([
+            "worker-gateway",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+            "--max-request-bytes=0",
+        ])
+        .expect_err("--max-request-bytes 0 must not parse");
+        assert!(err.to_string().contains("--max-request-bytes"), "{err}");
+    }
+
+    #[test]
+    fn max_request_bytes_below_the_submission_floor_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--max-request-bytes is below one hex-encoded 128 KiB transaction";
+        let (settings, logs) = into_settings_logged(cli_with_flags(&["--max-request-bytes=1024"]));
+        assert_eq!(settings?.max_request_bytes, 1_024);
+        assert!(logs.contains(WARNING), "{logs}");
+        assert!(logs.contains("max_request_bytes=1024"), "{logs}");
+        assert!(logs.contains("floor=263168"), "{logs}");
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[]));
+        settings?;
+        assert!(!logs.contains(WARNING), "the default must not warn: {logs}");
         Ok(())
     }
 
