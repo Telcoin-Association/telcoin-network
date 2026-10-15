@@ -320,9 +320,9 @@ pub(crate) async fn proxy(
             );
         }
         // the loop checks come before the scan, so a sampled request is
-        // scanned here for the access log's class
+        // classified here for the access log, a batch without being read
         if let Some(access) = &access {
-            access.classify(&body, scan(&body, None, &[]).calls);
+            access.classify_unscanned(&body);
         }
         return error_response(&GatewayError::LoopDetected, body.as_ref());
     }
@@ -344,7 +344,7 @@ pub(crate) async fn proxy(
             );
         }
         if let Some(access) = &access {
-            access.classify(&body, scan(&body, None, &[]).calls);
+            access.classify_unscanned(&body);
         }
         return error_response(&GatewayError::RedirectLoopDetected, body.as_ref());
     }
@@ -423,10 +423,11 @@ pub(crate) async fn proxy(
     // The first call is paid for, by the rate-limit layer before the body was
     // read or, with a submission budget, by the layer's per-IP charge and the
     // class charge above. A batch pays one more for each call beyond its first
-    // before it is screened or forwarded, to the same client the layer charged
-    // (the resolved `ClientAddr`, not the TCP peer), from the per-IP and
-    // global buckets whatever its class. Like the layer's own refusal, this
-    // one cannot name an id.
+    // before its screen verdict is applied or it is forwarded (the scan above
+    // has already decoded its submissions), to the same client the layer
+    // charged (the resolved `ClientAddr`, not the TCP peer), from the per-IP
+    // and global buckets whatever its class. Like the layer's own refusal,
+    // this one cannot name an id.
     let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
         limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
@@ -1617,6 +1618,20 @@ impl AccessRecord {
         let class = if is_batch(body.trim_ascii_start()) { "batch" } else { calls.class().label() };
         let bytes_in = u64::try_from(body.len()).unwrap_or(u64::MAX);
         self.classified.get_or_init(|| (class, bytes_in));
+    }
+
+    /// [`Self::classify`] for a request refused before the proxy scans its
+    /// body (a hop or redirect loop). A batch is labelled `batch` without
+    /// being read, since the scan's `calls` would be ignored for it; a single
+    /// call is scanned with no method policy and no length cap, which decodes
+    /// at most the one transaction it carries.
+    fn classify_unscanned(&self, body: &[u8]) {
+        let calls = if is_batch(body.trim_ascii_start()) {
+            Calls::Queries
+        } else {
+            scan(body, None, &[]).calls
+        };
+        self.classify(body, calls);
     }
 
     /// Note that a forward to `route` has started.
@@ -4364,5 +4379,81 @@ mod tests {
         assert_eq!(slots.available_permits(), 0, "the slot is held until the body drops");
         drop(held);
         assert_eq!(slots.available_permits(), 1);
+    }
+
+    /// Send `body` through [`proxy`] carrying `marker`, sampled by the access
+    /// log, to a gateway with a query upstream (so both loop checks are live);
+    /// hand back the answer and the record the log would read.
+    async fn looped_request(marker: HeaderName, body: &str) -> (Response, Arc<AccessRecord>) {
+        let worker = UpstreamWorker {
+            worker_id: 0,
+            rpc_url: Url::parse("http://127.0.0.1:1/").expect("url"),
+            readiness_url: Url::parse("http://127.0.0.1:1/health/workers").expect("url"),
+        };
+        let nz = |n| NonZeroU32::new(n).expect("nonzero");
+        let thresholds = ReadinessThresholds { failure: nz(3), success: nz(2), rpc_failure: None };
+        let state = AppState {
+            readiness: Arc::new(GatewayReadiness::new(&[worker], thresholds)),
+            http: proxy_client(
+                UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+                Duration::from_secs(5),
+            )
+            .expect("client"),
+            query_upstream: Some(Url::parse("http://127.0.0.1:1/").expect("url")),
+            query_header: None,
+            recent_submissions: None,
+            denied_method_prefixes: Arc::from([]),
+            max_batch_len: NonZeroUsize::new(DEFAULT_MAX_BATCH_LEN),
+            query_http: None,
+            upstream_request_timeout: Duration::from_secs(5),
+            submission_slots: inflight_slots(0),
+            query_slots: inflight_slots(0),
+            upstream_slots: inflight_slots(0),
+            pool_read_slots: inflight_slots(0),
+            draining: Arc::default(),
+        };
+        let forwarding = TrustedProxies::default()
+            .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+        let record = Arc::new(AccessRecord::default());
+        let mut request = Request::new(Body::from(body.to_owned()));
+        request.headers_mut().insert(marker, HeaderValue::from_static("1"));
+        request.extensions_mut().insert(AccessSampled(Arc::clone(&record)));
+        let response =
+            proxy(State(state), Extension(forwarding), PostOnly, None, None, None, request).await;
+        (response, record)
+    }
+
+    /// The loop checks answer before the scan, and a sampled looped batch is
+    /// labelled `batch` for the access log without a parse: its elements are
+    /// neither read nor decoded, on the hop-loop and the redirect-loop path.
+    #[tokio::test]
+    async fn looped_batch_is_classified_without_a_scan() {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":1}}"#
+        );
+        let body = format!(" [{}]", vec![call; 3].join(","));
+        let bytes_in = u64::try_from(body.len()).expect("fits");
+        for marker in [HOP_HEADER, REDIRECT_HEADER] {
+            PARSES.with(|parses| parses.set(0));
+            let (response, record) = looped_request(marker.clone(), &body).await;
+            assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "{marker}");
+            assert_eq!(PARSES.with(Cell::get), 0, "a looped batch is not scanned: {marker}");
+            assert_eq!(record.class(), Some(("batch", bytes_in)), "{marker}");
+            assert_eq!(record.route(), REJECTED_ROUTE, "{marker}");
+        }
+    }
+
+    /// A sampled looped single call is still scanned for its class, so a
+    /// submission is logged as one.
+    #[tokio::test]
+    async fn looped_single_call_is_still_classified() {
+        let body =
+            String::from_utf8(send_raw(&format!("[\"{EIP155_LEGACY_TX}\"]"))).expect("utf-8");
+        let bytes_in = u64::try_from(body.len()).expect("fits");
+        for marker in [HOP_HEADER, REDIRECT_HEADER] {
+            let (response, record) = looped_request(marker.clone(), &body).await;
+            assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "{marker}");
+            assert_eq!(record.class(), Some(("submission", bytes_in)), "{marker}");
+        }
     }
 }
