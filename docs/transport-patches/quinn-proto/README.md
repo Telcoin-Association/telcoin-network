@@ -73,8 +73,9 @@ Local pinned-toolchain verification on 2026-10-15:
   [candidate](evidence/candidate-mutations.json) and [source-control](evidence/source-mutations.json)
   receipts record nine observed regression failures when their corresponding observations or
   version checks are mutated.
-- The [native-count conversion receipt](evidence/gauge-value.json) records a direct pinned-Rust
-  test of values above u32 and at the native maximum, plus its failing truncation mutation.
+- The [native-count conversion receipt](evidence/gauge-value.json), captured from
+  [`e29a710a97cf2917cc30093249b0fd5d1101527e`](https://github.com/Telcoin-Association/telcoin-network/commit/e29a710a97cf2917cc30093249b0fd5d1101527e),
+  records a direct pinned-Rust test above u32 and at the native maximum, plus its failing truncation mutation.
   The metrics CI job also runs this regression in the complete crate.
 
 The staging workflow runs the full Linux candidate suite, primary/multiple-worker label and

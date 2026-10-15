@@ -1156,13 +1156,16 @@ mod tests {
     fn quic_metrics_clear_live_gauges_at_shutdown() {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let swarm = metrics::with_local_recorder(&recorder, || {
-            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+        let set_live = |swarm: &SwarmMetrics| {
             swarm.handles.quic_incoming_queued.set(2);
             swarm.handles.quic_incoming_limit.set(7);
             swarm.handles.quic_incoming_endpoints.set(1);
             swarm.handles.quic_incoming_handshakes.set(3);
             swarm.set_pending_incoming_connections(4);
+        };
+        let swarm = metrics::with_local_recorder(&recorder, || {
+            let swarm = SwarmMetrics::new_for(&NetworkType::Primary);
+            set_live(&swarm);
             swarm
         });
         let observed = || {
@@ -1183,14 +1186,22 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(observed().len(), 5);
-        assert!(observed()
-            .iter()
-            .all(|value| matches!(value, DebugValue::Gauge(value) if value.0 > 0.0)));
+        let before = observed();
+        assert_eq!(before.len(), 5);
+        assert!(
+            before.iter().all(|value| matches!(value, DebugValue::Gauge(value) if value.0 > 0.0)),
+            "live gauges: {before:?}"
+        );
+        // DebuggingRecorder consumes gauge values when snapshotting. Refill them so that
+        // the post-drop assertion verifies cleanup rather than the snapshot's reset.
+        set_live(&swarm);
         drop(swarm);
-        assert!(observed()
-            .iter()
-            .all(|value| matches!(value, DebugValue::Gauge(value) if value.0 == 0.0)));
+        let after = observed();
+        assert_eq!(after.len(), 5);
+        assert!(
+            after.iter().all(|value| matches!(value, DebugValue::Gauge(value) if value.0 == 0.0)),
+            "stopped gauges: {after:?}"
+        );
     }
 
     /// Capacity observations have only the configured swarm label and track occupancy and shedding.

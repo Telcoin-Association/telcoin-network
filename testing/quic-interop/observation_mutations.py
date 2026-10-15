@@ -34,7 +34,7 @@ def cases(suite):
          "self.counter.absolute(current)", ["metrics::tests::quic_metrics_accumulate_across_swarm_restarts"]),
         (metrics, '"tn_network.quic_incoming_outcomes_total"',
          '"tn_network.quic_incoming_outcomes_mutant_total"', ["metrics::tests::quic_metrics_have_bounded_per_swarm_series"]),
-        (metrics, "self.0.quic_incoming_queued.set(0)", "self.0.quic_incoming_queued.set(1)",
+        (metrics, "self.0.quic_incoming_queued.set(0)", "self.0.quic_incoming_queued.increment(0)",
          ["metrics::tests::quic_metrics_clear_live_gauges_at_shutdown"]),
     ]
 
