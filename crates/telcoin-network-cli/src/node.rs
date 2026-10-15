@@ -10,7 +10,7 @@ use std::{
     collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
     thread::available_parallelism,
 };
-use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
+use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{
@@ -36,6 +36,31 @@ pub enum NamedChain {
     TestNet,
     /// MainNet
     MainNet,
+}
+
+impl NamedChain {
+    /// Load this chain's bundled config. Writes nothing to the datadir.
+    pub(crate) fn load_config<P: TelcoinDirs>(
+        self,
+        tn_datadir: &P,
+        version: &'static str,
+    ) -> eyre::Result<Config> {
+        match self {
+            Self::Adiri | Self::TestNet => Config::load_adiri(tn_datadir, version),
+            Self::MainNet => Config::load_mainnet(tn_datadir, version),
+        }
+    }
+
+    /// Write this chain's bundled genesis committee to the datadir unless one is already there.
+    ///
+    /// Callers run this after their startup checks pass, so a refused start leaves the datadir
+    /// as it was.
+    pub(crate) fn write_committee<P: TelcoinDirs>(self, tn_datadir: &P) -> eyre::Result<()> {
+        match self {
+            Self::Adiri | Self::TestNet => Config::write_adiri_committee(tn_datadir),
+            Self::MainNet => Config::write_mainnet_committee(tn_datadir),
+        }
+    }
 }
 
 /// Start the node
@@ -248,16 +273,12 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         }
 
         // overwrite all genesis if `genesis` was passed to CLI
-        let tn_config = self.chain.take().map_or_else(
+        let named_chain = self.chain.take();
+        let tn_config = named_chain.map_or_else(
             || Config::load(&tn_datadir, SHORT_VERSION),
             |chain| {
                 info!(target: "cli", "Overwriting TN config with named chain: {chain:?}");
-                match chain {
-                    NamedChain::Adiri | NamedChain::TestNet => {
-                        Config::load_adiri(&tn_datadir, SHORT_VERSION)
-                    }
-                    NamedChain::MainNet => Config::load_mainnet(&tn_datadir, SHORT_VERSION),
-                }
+                chain.load_config(&tn_datadir, SHORT_VERSION)
             },
         )?;
         let chain_id = tn_config.genesis().config.chain_id;
@@ -320,6 +341,10 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
         let pid_lock = PidLock::acquire(&tn_datadir)?;
+        // the bundled committee is written only once every startup check above has passed
+        if let Some(chain) = named_chain {
+            chain.write_committee(&tn_datadir)?;
+        }
         // create dbs to survive between sync state transitions
         let reth_db = tn_reth::RethEnv::new_database(&node_config, tn_datadir.reth_db_path())?;
         let mut builder = TnBuilder::new(node_config, tn_config, reth_db)
@@ -743,11 +768,10 @@ mod tests {
         Ok(())
     }
 
-    /// Generate cleartext keys in `datadir` and run `node --chain main-net` (chain id 487) with
-    /// `--bls-passphrase-source no-passphrase` plus `extra` node arguments, through the same
-    /// passphrase resolution and launcher plumbing as the binary.
+    /// Generate cleartext validator keys in `datadir`, as `keytool generate validator
+    /// --bls-passphrase-source no-passphrase` does.
     #[cfg(not(feature = "adiri"))]
-    fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
+    fn generate_cleartext_keys(datadir: &str) -> eyre::Result<()> {
         use crate::cli::Cli;
 
         let keygen = Cli::<NoArgs>::try_parse_args_from([
@@ -765,7 +789,15 @@ mod tests {
             "0",
         ])?;
         let passphrase = keygen.resolve_bls_passphrase(None)?;
-        keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))?;
+        keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+    }
+
+    /// Run `node --chain main-net` (chain id 487) with `--bls-passphrase-source no-passphrase`
+    /// plus `extra` node arguments on `datadir`, through the same passphrase resolution and
+    /// launcher plumbing as the binary.
+    #[cfg(not(feature = "adiri"))]
+    fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
+        use crate::cli::Cli;
 
         let args =
             ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
@@ -777,18 +809,40 @@ mod tests {
         node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
     }
 
+    /// Every path under `dir`, sorted, so a test can compare a datadir before and after a run.
+    #[cfg(not(feature = "adiri"))]
+    fn datadir_listing(dir: &std::path::Path) -> eyre::Result<Vec<PathBuf>> {
+        let mut listing = Vec::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next)? {
+                let path = entry?.path();
+                if path.is_dir() {
+                    pending.push(path.clone());
+                }
+                listing.push(path);
+            }
+        }
+        listing.sort();
+        Ok(listing)
+    }
+
     /// `node --bls-passphrase-source no-passphrase` on chain id 487 loads the cleartext key and
-    /// is refused before any database is opened.
+    /// is refused before it changes the datadir: no database and no `genesis/` committee file.
     #[cfg(not(feature = "adiri"))]
     #[test]
     fn node_refuses_no_passphrase_on_chain_487() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        generate_cleartext_keys(datadir)?;
+        let before = datadir_listing(dir.path())?;
         let err = run_mainnet_node_with_cleartext_key(datadir, &[])
             .expect_err("no-passphrase on chain 487 must be refused");
         let msg = format!("{err:#}");
         assert!(msg.contains("refusing to start on chain id 487"), "{msg}");
         assert!(!dir.path().to_path_buf().reth_db_path().exists());
+        assert!(!dir.path().to_path_buf().genesis_path().exists());
+        assert_eq!(datadir_listing(dir.path())?, before);
         Ok(())
     }
 
@@ -802,8 +856,11 @@ mod tests {
         }
         let dir = tempfile::tempdir()?;
         let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        generate_cleartext_keys(datadir)?;
         run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])?;
-        // past every startup guard: the execution database was created for the launcher
+        // past every startup guard: the bundled committee and the execution database were
+        // written for the launcher
+        assert!(dir.path().to_path_buf().committee_path().exists());
         assert!(dir.path().to_path_buf().reth_db_path().exists());
         Ok(())
     }

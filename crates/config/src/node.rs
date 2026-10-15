@@ -97,7 +97,11 @@ impl Config {
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
-    /// Load a config from it's component parts.
+    /// Load the bundled adiri (testnet) config: node info from the datadir, parameters and
+    /// genesis compiled in.
+    ///
+    /// Writes nothing to the datadir. Call [`Config::write_adiri_committee`] once the caller has
+    /// decided to use this config, so a start refused after the load leaves the datadir as it was.
     pub fn load_adiri<P: TelcoinDirs>(tn_datadir: &P, version: &'static str) -> eyre::Result<Self> {
         let validator_info: NodeInfo =
             Config::load_from_path(tn_datadir.node_info_path(), ConfigFmt::YAML)?;
@@ -105,17 +109,16 @@ impl Config {
             serde_yaml::from_str(TESTNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(TESTNET_GENESIS).expect("bad adiri genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = tn_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(tn_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(TESTNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
     }
 
-    /// Load a config from it's component parts.
+    /// Load the bundled mainnet config: node info from the datadir, parameters and genesis
+    /// compiled in.
+    ///
+    /// Writes nothing to the datadir. Call [`Config::write_mainnet_committee`] once the caller
+    /// has decided to use this config, so a start refused after the load leaves the datadir as it
+    /// was.
     pub fn load_mainnet<P: TelcoinDirs>(
         tn_datadir: &P,
         version: &'static str,
@@ -126,14 +129,20 @@ impl Config {
             serde_yaml::from_str(MAINNET_PARAMETERS).expect("bad adiri parameters yaml data");
         let genesis: Genesis =
             serde_yaml::from_str(MAINNET_GENESIS).expect("bad adiri genesis yaml data");
-        // If the default committee file does not exist then save it.
-        let committee_path = tn_datadir.committee_path();
-        if !committee_path.exists() {
-            std::fs::create_dir_all(tn_datadir.genesis_path())?;
-            File::create_new(committee_path)?.write_all(MAINNET_COMMITTEE.as_bytes())?
-        }
 
         Ok(Config { node_info: validator_info, parameters, genesis, exex_critical: false, version })
+    }
+
+    /// Write the bundled adiri (testnet) genesis committee to `genesis/committee.yaml` unless
+    /// that file already exists.
+    pub fn write_adiri_committee<P: TelcoinDirs>(tn_datadir: &P) -> eyre::Result<()> {
+        write_committee_if_missing(tn_datadir, TESTNET_COMMITTEE)
+    }
+
+    /// Write the bundled mainnet genesis committee to `genesis/committee.yaml` unless that file
+    /// already exists.
+    pub fn write_mainnet_committee<P: TelcoinDirs>(tn_datadir: &P) -> eyre::Result<()> {
+        write_committee_if_missing(tn_datadir, MAINNET_COMMITTEE)
     }
 
     /// Update the authority protocol key.
@@ -529,6 +538,19 @@ impl Parameters {
     }
 }
 
+/// Write `committee_yaml` to the datadir's `genesis/committee.yaml` unless that file exists.
+fn write_committee_if_missing<P: TelcoinDirs>(
+    tn_datadir: &P,
+    committee_yaml: &str,
+) -> eyre::Result<()> {
+    let committee_path = tn_datadir.committee_path();
+    if !committee_path.exists() {
+        std::fs::create_dir_all(tn_datadir.genesis_path())?;
+        File::create_new(committee_path)?.write_all(committee_yaml.as_bytes())?
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod test {
     use super::Parameters;
@@ -559,7 +581,7 @@ mod test {
     /// paths `--chain mainnet` uses.
     ///
     /// `Config::load_mainnet` parses `MAINNET_GENESIS`/`MAINNET_PARAMETERS` with
-    /// `serde_yaml::from_str` and materializes `MAINNET_COMMITTEE` to
+    /// `serde_yaml::from_str` and `Config::write_mainnet_committee` writes `MAINNET_COMMITTEE` to
     /// `<datadir>/genesis/committee.yaml`, which the epoch manager later reads back via
     /// `Config::load_from_path::<Committee>` (crates/node/src/manager/node.rs). This gate
     /// drives all three files through exactly those paths, so a schema-stale committed file
@@ -589,6 +611,29 @@ mod test {
             4,
             "mainnet placeholder committee must seat the 4 placeholder validators"
         );
+    }
+
+    /// The named-chain loaders write nothing to the datadir; the committee writers add
+    /// `genesis/committee.yaml` once and leave an existing file alone.
+    #[test]
+    fn named_chain_load_writes_nothing_and_committee_write_keeps_existing_file() {
+        use crate::{NodeInfo, TelcoinDirs as _};
+
+        let dir = tempfile::tempdir().expect("datadir");
+        let datadir = dir.path().to_path_buf();
+        Config::write_to_path(datadir.node_info_path(), NodeInfo::default(), ConfigFmt::YAML)
+            .expect("seed node info");
+        Config::load_mainnet(&datadir, "test").expect("load mainnet");
+        Config::load_adiri(&datadir, "test").expect("load adiri");
+        assert!(!datadir.genesis_path().exists(), "a load must not create genesis/");
+
+        Config::write_mainnet_committee(&datadir).expect("write mainnet committee");
+        let written = std::fs::read_to_string(datadir.committee_path()).expect("committee");
+        assert_eq!(written, MAINNET_COMMITTEE);
+        // an existing committee file is kept as it is
+        Config::write_adiri_committee(&datadir).expect("existing committee kept");
+        let kept = std::fs::read_to_string(datadir.committee_path()).expect("committee");
+        assert_eq!(kept, MAINNET_COMMITTEE);
     }
 
     /// The mainnet genesis `ConsensusRegistry` account must carry the CURRENT tn-contracts
