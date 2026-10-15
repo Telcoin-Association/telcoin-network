@@ -100,6 +100,7 @@ the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
 The check holds across address families: a gateway listening on `[::]` takes IPv4 connections too, so `127.0.0.1` on its port is the gateway, and `localhost` counts as both `127.0.0.1` and `[::1]`.
+The check knows address literals and `localhost`, loopback and unspecified addresses included; it does not know the host's other interface addresses or a hostname that resolves to this machine, so an upstream URL naming the pod's own address passes startup, and the loop markers then stop every request to it with `508` (`loop_detected` or `redirect_loop_detected`).
 Startup also rejects a self-pointing upstream URL written as an IPv4-mapped IPv6 literal such as `[::ffff:127.0.0.1]`, an upstream list that names one worker id twice, and a zero `--readiness-poll-interval`, `--readiness-poll-timeout`, `--upstream-connect-timeout`, `--upstream-request-timeout` or `--header-read-timeout`, none of which has a disabled setting.
 It rejects an `--upstream-request-timeout` that is not longer than `--upstream-connect-timeout`: the request deadline includes connection setup, so it would end a stalled connect first, as a timeout that passive health cannot count.
 It rejects a `--readiness-poll-timeout` longer than `--readiness-poll-interval`: a poll cycle lasts up to the timeout, so one hanging upstream would slow every upstream's polls.
