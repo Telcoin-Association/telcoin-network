@@ -326,6 +326,8 @@ Mainnet uses chain id 487, and the devnet genesis files reuse it. On chain id 48
 - The BLS key was read from the cleartext `node-keys/bls.key` without a passphrase, for example with `--bls-passphrase-source no-passphrase`. Use a passphrase-encrypted key (`bls.kw`) instead.
 - The binary was built with the `faucet` feature. A faucet build also refuses the embedded mainnet genesis, with or without the flag.
 
+When the node loads its key from `bls.kw` and a cleartext `bls.key` is still in `node-keys/`, it starts on chain id 487 but logs a WARN naming that file. The node never reads it, but it is a cleartext copy of a BLS private key, so delete it.
+
 | Flag                          | Default | Description                                                                                             |
 | ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
 | `--allow-cleartext-bls-key`   | `false` | Start on chain id 487 with a cleartext `bls.key`. Test networks only. Command line only, no env variable |

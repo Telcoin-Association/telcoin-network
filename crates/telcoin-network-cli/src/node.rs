@@ -10,10 +10,15 @@ use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{
-    collections::BTreeMap, ffi::OsStr, net::SocketAddr, num::NonZeroUsize, path::PathBuf,
-    sync::Arc, thread::available_parallelism,
+    collections::BTreeMap,
+    ffi::OsStr,
+    net::SocketAddr,
+    num::NonZeroUsize,
+    path::{Path, PathBuf},
+    sync::Arc,
+    thread::available_parallelism,
 };
-use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs};
+use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs, BLS_KEYFILE};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
 use tn_types::{
@@ -311,6 +316,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             key_config.bls_key_is_cleartext(),
             self.allow_cleartext_bls_key,
         )?;
+        warn_stale_cleartext_bls_key(
+            chain_id,
+            key_config.bls_key_is_cleartext(),
+            &tn_datadir.node_keys_path(),
+        );
         // Runtime value, not a #[cfg], so the check holds no matter which crate in the
         // build graph enabled the faucet feature.
         validate_faucet_build(FAUCET_ENABLED, tn_config.genesis(), self.allow_faucet_on_chain_487)?;
@@ -465,6 +475,45 @@ pub(crate) fn validate_bls_key_protection(
          --bls-passphrase-source no-passphrase). Use a passphrase-encrypted key (bls.kw) and a \
          passphrase source, or pass --allow-cleartext-bls-key on a test network"
     ))
+}
+
+/// Warn about a cleartext `bls.key` left beside the encrypted key on chain id
+/// [`MAINNET_CHAIN_ID`].
+///
+/// When the node loaded its key from `bls.kw` (`cleartext_key` false), a `bls.key` in the same
+/// directory is a cleartext copy of a BLS private key that the node never reads. The node still
+/// starts; the warning names the file so the operator can delete it. Other chain ids are not
+/// checked. Returns the stale file's path when it warned.
+pub(crate) fn warn_stale_cleartext_bls_key(
+    chain_id: u64,
+    cleartext_key: bool,
+    keys_dir: &Path,
+) -> Option<PathBuf> {
+    if chain_id != MAINNET_CHAIN_ID || cleartext_key {
+        return None;
+    }
+    let stale = keys_dir.join(BLS_KEYFILE);
+    match std::fs::exists(&stale) {
+        Ok(true) => {
+            warn!(
+                target: "cli",
+                "cleartext BLS key file {} lies beside the encrypted key on chain id \
+                 {MAINNET_CHAIN_ID}; the node loaded bls.kw and does not read it, but it holds a \
+                 BLS private key in cleartext. Delete it",
+                stale.display()
+            );
+            Some(stale)
+        }
+        Ok(false) => None,
+        Err(e) => {
+            warn!(
+                target: "cli",
+                "cannot check for a stale cleartext BLS key file {}: {e}",
+                stale.display()
+            );
+            None
+        }
+    }
 }
 
 /// The startup line naming the compiled build features and the loaded chain:
@@ -832,6 +881,22 @@ mod tests {
         for chain_id in [ADIRI_CHAIN_ID, 911_329] {
             assert!(validate_bls_key_protection(chain_id, true, false).is_ok());
         }
+    }
+
+    /// On chain id 487 a `bls.key` beside the `bls.kw` the node loaded is reported; without the
+    /// file, with a cleartext-loaded key (the refusal covers that) or on another chain id nothing
+    /// is reported.
+    #[test]
+    fn stale_cleartext_bls_key_is_reported_on_chain_487() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let keys_dir = dir.path();
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, false, keys_dir), None);
+        let stale = keys_dir.join(BLS_KEYFILE);
+        std::fs::write(&stale, "stale")?;
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, false, keys_dir), Some(stale));
+        assert_eq!(warn_stale_cleartext_bls_key(MAINNET_CHAIN_ID, true, keys_dir), None);
+        assert_eq!(warn_stale_cleartext_bls_key(ADIRI_CHAIN_ID, false, keys_dir), None);
+        Ok(())
     }
 
     /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, has no environment
