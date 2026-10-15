@@ -5,6 +5,11 @@ use crate::cli::{Cli, Commands, PassSource};
 use eyre::{bail, eyre};
 use std::{ffi::OsString, fmt, fs::File, io::Read as _, path::Path};
 use zeroize::Zeroizing;
+#[cfg(target_os = "linux")]
+use {
+    libc::c_char,
+    std::ffi::{CStr, CString},
+};
 
 /// Environment variable read (and cleared) at process start for the BLS key passphrase.
 pub const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
@@ -22,57 +27,93 @@ pub const DEFAULT_BLS_PASSPHRASE_CREDENTIAL: &str = "bls-passphrase";
 /// start before any threads exists.  It will only return the passphrase
 /// on the first call (it clears the env if it is set).
 ///
-/// On Linux the original bytes of the value are overwritten with zeros before the variable is
-/// removed, so `/proc/<pid>/environ` no longer shows the passphrase (the variable name stays
-/// visible there, followed by zero bytes). Elsewhere the variable is only removed.
+/// A `TN_BLS_PASSPHRASE` that is present is always removed, including an empty value or one
+/// that is not valid UTF-8; both of those return `None`. On Linux the value bytes of every
+/// `TN_BLS_PASSPHRASE=` entry in the process environment block are overwritten with zeros
+/// first, so `/proc/<pid>/environ` keeps the variable name followed by zero bytes and no
+/// passphrase. Elsewhere the variable is only removed.
 ///
 /// Call this exactly once, as the FIRST statement of `main`, before any
 /// threads exist: it mutates the process environment, which is not thread safe.
 pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
-    if let Ok(passphrase) = std::env::var(BLS_PASSPHRASE_ENVVAR) {
-        let passphrase = Zeroizing::new(passphrase);
-        if !passphrase.is_empty() {
-            // `passphrase` is now the only copy the node keeps, so wipe the original
-            #[cfg(target_os = "linux")]
-            scrub_env_value(BLS_PASSPHRASE_ENVVAR);
-            // Clear then remove the passphrase from the env.
-            // Note on safety, these calls are unsafe because they are not thread safe and we
-            // only call this function once at the beginning of startup so no threads should
-            // exist yet.
-            unsafe {
-                std::env::set_var(BLS_PASSPHRASE_ENVVAR, "");
-                std::env::remove_var(BLS_PASSPHRASE_ENVVAR);
-            }
-            Some(passphrase)
-        } else {
+    let value = std::env::var_os(BLS_PASSPHRASE_ENVVAR)?;
+    // `value` is now the only copy the node keeps, so wipe the originals
+    #[cfg(target_os = "linux")]
+    scrub_env_values(BLS_PASSPHRASE_ENVVAR);
+    // Clear then remove the passphrase from the env.
+    // Note on safety, these calls are unsafe because they are not thread safe and we
+    // only call this function once at the beginning of startup so no threads should
+    // exist yet.
+    unsafe {
+        std::env::set_var(BLS_PASSPHRASE_ENVVAR, "");
+        std::env::remove_var(BLS_PASSPHRASE_ENVVAR);
+    }
+    // both conversions reuse the buffer, so whichever way it goes the bytes are cleared on drop
+    match String::from_utf8(value.into_encoded_bytes()) {
+        Ok(passphrase) => {
+            Some(Zeroizing::new(passphrase)).filter(|passphrase| !passphrase.is_empty())
+        }
+        Err(not_utf8) => {
+            drop(Zeroizing::new(not_utf8.into_bytes()));
             None
         }
-    } else {
-        None
     }
 }
 
-/// Overwrite the value of the environment variable `name` with zero bytes, in place.
+/// Overwrite the value of every `name=value` entry in the process environment block with zero
+/// bytes, in place.
 ///
 /// Removing a variable only unlinks it from libc's `environ` array. A value inherited at exec
 /// stays in the environment block the kernel set up, which `/proc/<pid>/environ` exposes to
-/// root and to the service user for the life of the process.
+/// root and to the service user for the life of the process. `execve` does not de-duplicate
+/// names and `getenv` returns only the first match, so this walks every entry.
 #[cfg(target_os = "linux")]
-fn scrub_env_value(name: &str) {
-    let name = std::ffi::CString::new(name).expect("environment variable names contain no nul");
+fn scrub_env_values(name: &str) {
+    let prefix =
+        CString::new(format!("{name}=")).expect("environment variable names contain no nul");
     // SAFETY: called once at startup, before any other thread exists, so nothing reads or
-    // changes the environment concurrently. linux libcs return from `getenv` either null or a
-    // pointer to the nul-terminated value inside the live `NAME=value` entry; that memory is
-    // writable (the initial process stack for an inherited variable, the heap for one set with
-    // `setenv`) and stays valid until the variable is changed or removed, which only happens
-    // after this call. `strlen` excludes the terminator, so the write stays within the value
-    // and leaves the entry a valid, empty c string.
+    // changes the environment concurrently. `environ` is the live array libc keeps: null or
+    // null-terminated, each entry a nul-terminated `NAME=value` string in writable memory (the
+    // initial process stack for an inherited variable, the heap for one set with `setenv`).
+    unsafe { zero_env_values(environ, &prefix) }
+}
+
+/// Zero the value bytes of every entry of `env` that starts with `prefix` (`NAME=`), leaving
+/// `NAME=` followed by zero bytes. Other entries are untouched.
+///
+/// # Safety
+///
+/// `env` must be null or point to a null-terminated array of pointers to writable,
+/// nul-terminated strings, and nothing may read or change the array or those strings while
+/// this runs.
+#[cfg(target_os = "linux")]
+unsafe fn zero_env_values(env: *const *mut c_char, prefix: &CStr) {
+    if env.is_null() {
+        return;
+    }
+    let prefix_len = prefix.to_bytes().len();
+    let mut entry = env;
+    // SAFETY: the caller guarantees `env` is null-terminated and every entry is a writable,
+    // nul-terminated string. `strncmp` stops at the first nul of either string, so a short
+    // entry is never read past its end. `strlen` excludes the terminator, so the write stays
+    // within the value and leaves the entry a valid c string.
     unsafe {
-        let value = libc::getenv(name.as_ptr());
-        if !value.is_null() {
-            std::ptr::write_bytes(value, 0, libc::strlen(value));
+        while !(*entry).is_null() {
+            let var = *entry;
+            if libc::strncmp(var, prefix.as_ptr(), prefix_len) == 0 {
+                let value = var.add(prefix_len);
+                std::ptr::write_bytes(value, 0, libc::strlen(value));
+            }
+            entry = entry.add(1);
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+extern "C" {
+    /// The process environment block (`environ(7)`). Declared here because the `libc` crate does
+    /// not export it for linux targets.
+    static mut environ: *const *mut c_char;
 }
 
 /// Prompt (twice) for a new passphrase when generating keys.
@@ -316,34 +357,91 @@ mod tests {
         let _env = env_lock();
         std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
         assert_eq!(get_bls_passphrase_from_env(), Some(Zeroizing::new("sekrit".into())));
-        assert!(std::env::var(BLS_PASSPHRASE_ENVVAR).is_err());
+        assert!(std::env::var_os(BLS_PASSPHRASE_ENVVAR).is_none());
         assert_eq!(get_bls_passphrase_from_env(), None);
     }
 
-    /// The original environment bytes are zeroed, not only unlinked from `environ`. Reading
-    /// them back after removal relies on glibc never freeing the strings `setenv` allocates,
-    /// hence the `gnu` gate.
+    /// An empty value, or one that is not UTF-8, resolves to `None` and is still removed.
+    #[cfg(unix)]
+    #[test]
+    fn test_env_preload_clears_empty_and_non_utf8_values() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let _env = env_lock();
+        for value in [b"".as_ref(), b"sek\xffrit"] {
+            std::env::set_var(BLS_PASSPHRASE_ENVVAR, std::ffi::OsStr::from_bytes(value));
+            assert_eq!(get_bls_passphrase_from_env(), None, "{value:?}");
+            assert!(std::env::var_os(BLS_PASSPHRASE_ENVVAR).is_none(), "{value:?}");
+        }
+    }
+
+    /// Every `TN_BLS_PASSPHRASE=` entry is zeroed, not only the first one `getenv` finds, and a
+    /// value that is not UTF-8 too. Entries that only share a prefix with the name are kept.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_env_scrub_zeroes_every_entry() {
+        let entries: [&[u8]; 6] = [
+            b"TN_BLS_PASSPHRASE=first\0",
+            b"PATH=/bin\0",
+            b"TN_BLS_PASSPHRASE=sek\xffrit\0",
+            b"TN_BLS_PASSPHRASE_CREDENTIAL=keep\0",
+            b"TN_BLS_PASSPHRASE\0",
+            b"X_TN_BLS_PASSPHRASE=keep\0",
+        ];
+        let mut buffers: Vec<Vec<u8>> = entries.iter().map(|entry| entry.to_vec()).collect();
+        let mut env: Vec<*mut c_char> =
+            buffers.iter_mut().map(|buffer| buffer.as_mut_ptr().cast()).collect();
+        env.push(std::ptr::null_mut());
+        let prefix = CString::new(format!("{BLS_PASSPHRASE_ENVVAR}=")).expect("prefix");
+
+        // SAFETY: `env` is null-terminated, every entry points into a nul-terminated buffer in
+        // `buffers`, and nothing else touches them during the call.
+        unsafe { zero_env_values(env.as_ptr(), &prefix) };
+
+        let expected: [&[u8]; 6] = [
+            b"TN_BLS_PASSPHRASE=\0\0\0\0\0\0",
+            b"PATH=/bin\0",
+            b"TN_BLS_PASSPHRASE=\0\0\0\0\0\0\0\0",
+            b"TN_BLS_PASSPHRASE_CREDENTIAL=keep\0",
+            b"TN_BLS_PASSPHRASE\0",
+            b"X_TN_BLS_PASSPHRASE=keep\0",
+        ];
+        for (buffer, expected) in buffers.iter().zip(expected) {
+            assert_eq!(buffer.as_slice(), expected);
+        }
+    }
+
+    /// The original environment bytes are zeroed, not only unlinked from `environ`, for a UTF-8
+    /// value and for one that is not. Reading them back after removal relies on glibc never
+    /// freeing the strings `setenv` allocates, hence the `gnu` gate.
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     #[test]
     fn test_env_preload_scrubs_original_bytes() {
+        use std::os::unix::ffi::OsStrExt as _;
         let _env = env_lock();
-        std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
-        let name = std::ffi::CString::new(BLS_PASSPHRASE_ENVVAR).expect("name");
-        // SAFETY: the env lock is held and the variable was set just above, so getenv returns
-        // a live, nul-terminated value.
-        let (value, len) = unsafe {
-            let value = libc::getenv(name.as_ptr());
-            assert!(!value.is_null());
-            (value, libc::strlen(value))
-        };
-        assert_eq!(len, "sekrit".len());
+        let name = CString::new(BLS_PASSPHRASE_ENVVAR).expect("name");
+        for value in [b"sekrit".as_ref(), b"sek\xffrit"] {
+            std::env::set_var(BLS_PASSPHRASE_ENVVAR, std::ffi::OsStr::from_bytes(value));
+            // SAFETY: the env lock is held and the variable was set just above, so getenv
+            // returns a live, nul-terminated value.
+            let (ptr, len) = unsafe {
+                let ptr = libc::getenv(name.as_ptr());
+                assert!(!ptr.is_null());
+                (ptr, libc::strlen(ptr))
+            };
+            assert_eq!(len, value.len());
 
-        assert_eq!(get_bls_passphrase_from_env(), Some(Zeroizing::new("sekrit".into())));
-        assert!(std::env::var(BLS_PASSPHRASE_ENVVAR).is_err());
-        // SAFETY: glibc keeps every string setenv allocated for the life of the process, so the
-        // removed entry's `len` value bytes are still readable.
-        let scrubbed = unsafe { std::slice::from_raw_parts(value.cast::<u8>(), len) };
-        assert!(scrubbed.iter().all(|byte| *byte == 0), "value bytes left in place: {scrubbed:?}");
+            let expected =
+                std::str::from_utf8(value).ok().map(|value| Zeroizing::new(value.into()));
+            assert_eq!(get_bls_passphrase_from_env(), expected);
+            assert!(std::env::var_os(BLS_PASSPHRASE_ENVVAR).is_none());
+            // SAFETY: glibc keeps every string setenv allocated for the life of the process, so
+            // the removed entry's `len` value bytes are still readable.
+            let scrubbed = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+            assert!(
+                scrubbed.iter().all(|byte| *byte == 0),
+                "value bytes left in place: {scrubbed:?}"
+            );
+        }
     }
 
     #[test]
