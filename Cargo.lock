@@ -11792,6 +11792,7 @@ dependencies = [
  "eyre",
  "fdlimit",
  "human_bytes",
+ "libc",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry-semantic-conventions",

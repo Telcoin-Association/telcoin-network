@@ -61,6 +61,10 @@ serde_yaml = { workspace = true }
 url = { workspace = true }
 zeroize = { workspace = true }
 
+# `getenv` for scrubbing the BLS passphrase from the process environment block
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 tn-types = { workspace = true, features = ["test-utils"] }
 tn-reth = { workspace = true, features = ["test-utils"] }

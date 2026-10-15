@@ -92,6 +92,7 @@ humantime-serde = "1.1"
 fdlimit = "0.3.0"
 snap = "1.1.1"
 rayon = "1.7"
+libc = "0.2"
 
 # crypto
 secp256k1 = { version = "0.31", default-features = false, features = [
