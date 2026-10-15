@@ -62,7 +62,7 @@ The current CLI stores the BLS12-381 key in `node-keys/bls.kw` when a passphrase
 
 For production today:
 
-- use `env`, `stdin`, or `ask` passphrase mode and never use `no-passphrase`;
+- use `credential` (systemd `LoadCredentialEncrypted=`), `env`, `stdin`, or `ask` passphrase mode and never use `no-passphrase`;
 - keep the data directory on an encrypted volume with owner-only access;
 - isolate the validator process and host from build jobs, developer tools, and public RPC services;
 - retrieve the passphrase from an operator secret system at startup and avoid shell history, command arguments, and long-lived environment files;

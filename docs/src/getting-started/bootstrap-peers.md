@@ -38,6 +38,15 @@ in `bootstrap-peers.yaml` and run:
 telcoin-network node --bootstrap-peers "$(cat bootstrap-peers.yaml)"
 ```
 
+Or let the node read the file itself, which keeps the map off the command line:
+
+```sh
+telcoin-network node --bootstrap-peers-file bootstrap-peers.yaml
+```
+
+The file is read and checked while arguments are parsed, so a missing or invalid
+file stops the node before it starts. The two flags cannot be combined.
+
 The CLI map takes precedence over `network-config` and is never written back to
 disk. An explicitly empty CLI map restores the genesis fallback even when
 `network-config` contains custom peers:
