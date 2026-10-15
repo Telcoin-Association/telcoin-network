@@ -11,11 +11,28 @@ pub(crate) const INTERVAL: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Summary {
     /// Events whose detailed diagnostic was emitted.
-    pub(super) emitted: u64,
+    emitted: u64,
     /// Events whose detailed diagnostic was skipped.
-    pub(super) suppressed: u64,
+    suppressed: u64,
     /// Actual elapsed observation time, including any scheduler delay.
-    pub(super) elapsed: Duration,
+    elapsed: Duration,
+}
+
+impl Summary {
+    /// Number of detailed diagnostics admitted in the completed window.
+    pub(super) const fn emitted(self) -> u64 {
+        self.emitted
+    }
+
+    /// Number of detailed diagnostics suppressed in the completed window.
+    pub(super) const fn suppressed(self) -> u64 {
+        self.suppressed
+    }
+
+    /// Actual duration of the completed observation window.
+    pub(super) const fn elapsed(self) -> Duration {
+        self.elapsed
+    }
 }
 
 /// Constant storage for one event class, independent of event payloads and identities.

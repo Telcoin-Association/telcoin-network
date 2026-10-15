@@ -115,9 +115,9 @@ fn report(class: Class, summary: Summary) {
     tracing::warn!(
         target: "network::diagnostics",
         event_class = ?class,
-        emitted = summary.emitted,
-        suppressed = summary.suppressed,
-        window_seconds = summary.elapsed.as_secs_f64(),
+        emitted = summary.emitted(),
+        suppressed = summary.suppressed(),
+        window_seconds = summary.elapsed().as_secs_f64(),
         "repeated network diagnostics suppressed"
     );
 }
@@ -201,8 +201,8 @@ mod tests {
         });
         assert_eq!(std::mem::size_of_val(&diagnostics), bytes);
         assert!(diagnostics.flush(start + INTERVAL).into_iter().all(|summary| {
-            summary
-                == Some(Summary { emitted: window::BURST, suppressed: 10_000, elapsed: INTERVAL })
+            summary.map(|summary| (summary.emitted(), summary.suppressed(), summary.elapsed()))
+                == Some((window::BURST, 10_000, INTERVAL))
         }));
         assert!(diagnostics.flush(start + INTERVAL).into_iter().all(|summary| summary.is_none()));
         Class::ALL.into_iter().for_each(|class| {
