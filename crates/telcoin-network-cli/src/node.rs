@@ -147,6 +147,20 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     )]
     pub allow_faucet_on_chain_487: bool,
 
+    /// Let the node start on chain id 487 with a cleartext BLS key. Testing only.
+    ///
+    /// On chain id 487, the mainnet chain id, the node refuses a BLS key read from the
+    /// cleartext `node-keys/bls.key` without a passphrase (for example with
+    /// `--bls-passphrase-source no-passphrase`) and requires the passphrase-encrypted `bls.kw`.
+    /// This flag lifts that refusal.
+    #[arg(
+        long,
+        env = "TN_ALLOW_CLEARTEXT_BLS_KEY",
+        value_parser = BoolishValueParser::new(),
+        hide_short_help = true
+    )]
+    pub allow_cleartext_bls_key: bool,
+
     /// Additional cli arguments
     #[clap(flatten)]
     pub ext: Ext,
@@ -269,6 +283,11 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 "Must NOT compile with adiri feature flag when connecting to non-adiri (testnet) networks!"
             ));
         }
+        validate_bls_key_protection(
+            chain_id,
+            key_config.bls_key_is_cleartext(),
+            self.allow_cleartext_bls_key,
+        )?;
         // Runtime value, not a #[cfg], so the check holds no matter which crate in the
         // build graph enabled the faucet feature.
         validate_faucet_build(FAUCET_ENABLED, tn_config.genesis(), self.allow_faucet_on_chain_487)?;
@@ -291,6 +310,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             node_name: _,
             tracing_url: _,
             allow_faucet_on_chain_487: _, // Used above
+            allow_cleartext_bls_key: _,   // Used above
         } = self;
 
         // set up reth node config for engine components
@@ -364,6 +384,37 @@ pub(crate) fn validate_faucet_build(
         ));
     }
     Ok(())
+}
+
+/// Refuse a cleartext BLS key on chain id [`MAINNET_CHAIN_ID`] unless the operator opted in.
+///
+/// `cleartext_key` is [`KeyConfig::bls_key_is_cleartext`]: the key was read from `bls.key`
+/// without a passphrase. That covers `--bls-passphrase-source no-passphrase`, the only source
+/// that reaches the node without a passphrase, and any caller that loads keys without one.
+/// Other chain ids are unaffected. With `allow_cleartext` set the node starts and logs a warning.
+pub(crate) fn validate_bls_key_protection(
+    chain_id: u64,
+    cleartext_key: bool,
+    allow_cleartext: bool,
+) -> eyre::Result<()> {
+    if chain_id != MAINNET_CHAIN_ID || !cleartext_key {
+        return Ok(());
+    }
+    if allow_cleartext {
+        warn!(
+            target: "cli",
+            "starting on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key (bls.key) because \
+             --allow-cleartext-bls-key is set"
+        );
+        return Ok(());
+    }
+    Err(eyre::eyre!(
+        "refusing to start on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key: the key was \
+         read from node-keys/bls.key without a passphrase (for example with \
+         --bls-passphrase-source no-passphrase). Use a passphrase-encrypted key (bls.kw) and a \
+         passphrase source, or pass --allow-cleartext-bls-key (env \
+         TN_ALLOW_CLEARTEXT_BLS_KEY=true) on a test network"
+    ))
 }
 
 /// The startup line naming the compiled build features and the loaded chain:
@@ -652,6 +703,112 @@ mod tests {
         );
         assert!(!command.render_help().to_string().contains("--allow-faucet-on-chain-487"));
         assert!(command.render_long_help().to_string().contains("--allow-faucet-on-chain-487"));
+        Ok(())
+    }
+
+    /// A cleartext key on chain id 487 is refused without the opt-in and the error names it;
+    /// the opt-in lifts the refusal.
+    #[test]
+    fn cleartext_bls_key_refused_on_chain_487_without_opt_in() {
+        let err = validate_bls_key_protection(MAINNET_CHAIN_ID, true, false)
+            .expect_err("cleartext key on chain 487");
+        let msg = err.to_string();
+        assert!(msg.contains("--allow-cleartext-bls-key"), "{msg}");
+        assert!(msg.contains("no-passphrase"), "{msg}");
+        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, true, true).is_ok());
+    }
+
+    /// An encrypted key passes on chain id 487, and other chain ids accept a cleartext key with
+    /// no opt-in.
+    #[test]
+    fn bls_key_protection_accepts_encrypted_keys_and_other_chains() {
+        assert!(validate_bls_key_protection(MAINNET_CHAIN_ID, false, false).is_ok());
+        for chain_id in [ADIRI_CHAIN_ID, 911_329] {
+            assert!(validate_bls_key_protection(chain_id, true, false).is_ok());
+        }
+    }
+
+    /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, reads its documented
+    /// environment variable, and stays out of the short help.
+    #[test]
+    fn allow_cleartext_flag_parses_and_is_hidden_from_short_help() -> eyre::Result<()> {
+        use clap::CommandFactory as _;
+
+        assert!(!NodeCommand::<NoArgs>::try_parse_from(["node"])?.allow_cleartext_bls_key);
+        let set = NodeCommand::<NoArgs>::try_parse_from(["node", "--allow-cleartext-bls-key"])?;
+        assert!(set.allow_cleartext_bls_key);
+        let mut command = NodeCommand::<NoArgs>::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_id() == "allow_cleartext_bls_key")
+            .ok_or_else(|| eyre::eyre!("flag registered"))?;
+        assert_eq!(arg.get_env().and_then(|env| env.to_str()), Some("TN_ALLOW_CLEARTEXT_BLS_KEY"));
+        assert!(!command.render_help().to_string().contains("--allow-cleartext-bls-key"));
+        assert!(command.render_long_help().to_string().contains("--allow-cleartext-bls-key"));
+        Ok(())
+    }
+
+    /// Generate cleartext keys in `datadir` and run `node --chain main-net` (chain id 487) with
+    /// `--bls-passphrase-source no-passphrase` plus `extra` node arguments, through the same
+    /// passphrase resolution and launcher plumbing as the binary.
+    #[cfg(not(feature = "adiri"))]
+    fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
+        use crate::cli::Cli;
+
+        let keygen = Cli::<NoArgs>::try_parse_args_from([
+            "tn",
+            "--bls-passphrase-source",
+            "no-passphrase",
+            "keytool",
+            "generate",
+            "validator",
+            "--workers",
+            "1",
+            "--datadir",
+            datadir,
+            "--address",
+            "0",
+        ])?;
+        let passphrase = keygen.resolve_bls_passphrase(None)?;
+        keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))?;
+
+        let args = ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
+            .into_iter()
+            .chain(["--datadir", datadir])
+            .chain(extra.iter().copied());
+        let node = Cli::<NoArgs>::try_parse_args_from(args)?;
+        let passphrase = node.resolve_bls_passphrase(None)?;
+        node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
+    }
+
+    /// `node --bls-passphrase-source no-passphrase` on chain id 487 loads the cleartext key and
+    /// is refused before any database is opened.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_refuses_no_passphrase_on_chain_487() -> eyre::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        let err = run_mainnet_node_with_cleartext_key(datadir, &[])
+            .expect_err("no-passphrase on chain 487 must be refused");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("refusing to start on chain id 487"), "{msg}");
+        assert!(!dir.path().to_path_buf().reth_db_path().exists());
+        Ok(())
+    }
+
+    /// With `--allow-cleartext-bls-key` the same node starts and reaches the launcher. Skipped
+    /// when the build carries the faucet mint, which refuses chain id 487 on its own.
+    #[cfg(not(feature = "adiri"))]
+    #[test]
+    fn node_starts_on_chain_487_with_cleartext_opt_in() -> eyre::Result<()> {
+        if FAUCET_ENABLED {
+            return Ok(());
+        }
+        let dir = tempfile::tempdir()?;
+        let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
+        run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])?;
+        // past every startup guard: the execution database was created for the launcher
+        assert!(dir.path().to_path_buf().reth_db_path().exists());
         Ok(())
     }
 }
