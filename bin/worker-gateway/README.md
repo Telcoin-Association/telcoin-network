@@ -370,6 +370,7 @@ Service, set `externalTrafficPolicy: Local` to keep their addresses).
 > the ingress.
 
 The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
+Only `GET` and `HEAD` on `/health` and `/ready` are exempt; any other method there is rate-limited like any request before it is refused.
 The probe listener (`--probe-addr`) has no rate limit at all.
 
 Per-IP state is bounded: idle buckets are swept every second and the number of tracked client prefixes is capped by `--rate-limit-per-ip-max-entries` (default 100,000), so a wide spread of source IPs cannot grow memory without limit.
@@ -715,7 +716,7 @@ The check runs once; a query URL that changes chains later is not detected.
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
 - `OPTIONS`, with `--cors-allowed-origins` set: a CORS preflight, answered by the gateway and never forwarded, on every path but `/ready/any` (see [CORS](#cors)).
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
-  On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
+  On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts only their `GET` and `HEAD`, so JSON-RPC sent to `/health` or `/ready` is rate-limited and then refused, never proxied past the limits.
 
 The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.

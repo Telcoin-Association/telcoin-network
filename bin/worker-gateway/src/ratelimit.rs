@@ -71,6 +71,7 @@ use std::{
 
 use axum::{
     extract::{Request, State},
+    http::Method,
     middleware::Next,
     response::Response,
 };
@@ -982,9 +983,10 @@ pub(crate) async fn rate_limit(
 ) -> Response {
     // Orchestration probes are never rate-limited: a liveness/readiness check
     // failing under load would take the gateway down (the orchestrator kills or
-    // depools the pod) exactly when it is meant to be absorbing a flood.
-    let path = request.uri().path();
-    let exempt = path == HEALTH_PATH || path == READY_PATH;
+    // depools the pod) exactly when it is meant to be absorbing a flood. Only a
+    // `GET` or `HEAD` there is a probe; any other method on a probe path is
+    // limited like any request before it gets its `405`.
+    let exempt = is_exempt(request.method(), request.uri().path());
     let client = request.extensions().get::<ClientAddr>().map(|client| client.0);
     let verdict = if exempt { Ok(None) } else { limiters.check_edge(client) };
     // The final dispatch stays a `match`: one arm awaits `next`, which a
@@ -999,6 +1001,12 @@ pub(crate) async fn rate_limit(
             next.run(request).await
         }
     }
+}
+
+/// Whether a request skips the rate limiter: a `GET` or `HEAD` on a probe
+/// path (`/health`, `/ready`). `/ready/any` never reaches this layer.
+fn is_exempt(method: &Method, path: &str) -> bool {
+    (path == HEALTH_PATH || path == READY_PATH) && matches!(*method, Method::GET | Method::HEAD)
 }
 
 #[cfg(test)]
@@ -1297,6 +1305,19 @@ mod tests {
         assert_eq!(bucket.last_refill, t2, "a stale reading moved the refill clock back");
         // (t3 - t2) x rate = 5 tokens, not the 6 that t1..t3 would credit
         assert_eq!(bucket.replenished(t3, rate, capacity), 5.0);
+    }
+
+    #[test]
+    fn only_get_and_head_on_probe_paths_are_exempt() {
+        for path in [HEALTH_PATH, READY_PATH] {
+            assert!(is_exempt(&Method::GET, path), "GET {path}");
+            assert!(is_exempt(&Method::HEAD, path), "HEAD {path}");
+            for method in [Method::POST, Method::PUT, Method::OPTIONS] {
+                assert!(!is_exempt(&method, path), "{method} {path} was exempt");
+            }
+        }
+        assert!(!is_exempt(&Method::GET, "/"), "GET / was exempt");
+        assert!(!is_exempt(&Method::GET, "/health/"), "a path near a probe's was exempt");
     }
 
     #[test]
