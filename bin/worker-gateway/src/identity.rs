@@ -340,8 +340,12 @@ pub(crate) async fn identify(
 /// another version, an unknown command, an address block shorter than its
 /// family needs, and a `PROXY` header for anything but TCP over IPv4 or IPv6
 /// (a front sending one is misconfigured, and serving the connection as the
-/// front's own would merge its clients into the front's rate-limit key). The
-/// caller bounds the read with the header read timeout.
+/// front's own would merge its clients into the front's rate-limit key). That
+/// includes a `PROXY` header with family `UNSPEC`, which the PROXY v2
+/// specification has a receiver accept and serve under the real connection's
+/// endpoints; the gateway closes such a connection instead, on purpose, so a
+/// relayed client is never served under the front's key. The caller bounds the
+/// read with the header read timeout.
 pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<ProxyHeader>
 where
     R: AsyncRead + Unpin,
