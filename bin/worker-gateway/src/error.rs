@@ -142,9 +142,11 @@ pub(crate) enum GatewayError {
     Overloaded,
     /// The upstream answered with a non-2xx `status` and a body that is not
     /// JSON, so it carries no JSON-RPC answer to relay. The client gets the
-    /// upstream's status with a JSON-RPC error in place of the body.
+    /// upstream's status with a JSON-RPC error in place of the body, or `502`
+    /// for a `1xx` or `304`, which can carry no body.
     UpstreamError {
-        /// The upstream's HTTP status, passed through to the client.
+        /// The HTTP status the client gets: the upstream's, or `502` in place
+        /// of a `1xx` or `304`.
         status: StatusCode,
     },
     /// The request's HTTP method was not `POST`. JSON-RPC over HTTP is

@@ -571,16 +571,21 @@ pub(crate) async fn proxy(
             // an error status without a json body (a worker's `429`
             // text/plain, say) carries no json-rpc answer: replace it with the
             // gateway's envelope, keeping the status and echoing the request's
-            // id
-            if is_non_json_error(&upstream) {
-                let status = upstream.status();
+            // id. hyper's server sends a 1xx or 304 without a body (and closes
+            // the connection after a 101), so such an answer could carry no
+            // json-rpc response whatever its content type: it gets the
+            // envelope with a 502
+            let unservable = upstream.status().is_informational()
+                || upstream.status() == StatusCode::NOT_MODIFIED;
+            if unservable || is_non_json_error(&upstream) {
+                let status = if unservable { StatusCode::BAD_GATEWAY } else { upstream.status() };
                 telemetry::record_routed(route.label(), "upstream_error");
                 if let Some(suppressed) = UPSTREAM_ERROR_WARNINGS.get(route).admit() {
                     warn!(
                         target: "gateway::proxy",
                         route = route.label(),
                         upstream = %UpstreamOrigin(&upstream_url),
-                        status = status.as_u16(),
+                        status = upstream.status().as_u16(),
                         suppressed,
                         "upstream answered an error status without a JSON-RPC body"
                     );

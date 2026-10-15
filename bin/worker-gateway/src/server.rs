@@ -5073,6 +5073,57 @@ mod tests {
         assert_eq!(metrics.value(routed, &[("route", "worker"), ("result", "forwarded")]), 1.0);
     }
 
+    /// hyper's server sends a `304` without a body, so an upstream's `304`
+    /// could carry no JSON-RPC answer whatever its content type: the client
+    /// gets `502` and the `-32012` error with its id instead.
+    #[tokio::test]
+    async fn upstream_not_modified_becomes_a_bad_gateway_error() {
+        for content_type in ["text/plain", "application/json"] {
+            let (worker, _worker) = answering_mock(
+                StatusCode::NOT_MODIFIED,
+                content_type,
+                r#"{"jsonrpc":"2.0","result":"0x1","id":5}"#,
+            )
+            .await;
+            let state = redirect_state(worker, None);
+            state.readiness.set_ready(0, true);
+            let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+            let (status, text) = post_rpc(gateway, None, call("eth_chainId", 5)).await;
+            assert_eq!(status, StatusCode::BAD_GATEWAY, "{content_type}");
+            assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(5)), "{content_type}");
+        }
+    }
+
+    /// An upstream's `101` would have hyper's server send the client a bare
+    /// protocol switch and close the connection; the client gets `502` and the
+    /// `-32012` error with its id instead.
+    #[tokio::test]
+    async fn upstream_switching_protocols_becomes_a_bad_gateway_error() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+        let worker = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            read_request(&mut stream).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\
+                      Upgrade: websocket\r\n\r\n",
+                )
+                .await
+                .expect("write");
+            // hold the connection until the gateway drops it
+            let _ = stream.read(&mut [0_u8; 1]).await;
+        });
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let (status, text) = post_rpc(gateway, None, call("eth_chainId", 6)).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(6)));
+    }
+
     /// A relayed response stays in the in-flight gauge until its body has
     /// finished streaming, not just until the handler returns its head.
     #[tokio::test]

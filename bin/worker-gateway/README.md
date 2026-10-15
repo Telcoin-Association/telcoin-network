@@ -763,7 +763,7 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | In-flight cap reached (overloaded) | `503` | `-32009` |
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
-| Upstream answered an error status without a JSON body | the upstream's | `-32012` |
+| Upstream answered an error status without a JSON body | the upstream's, or `502` for a `1xx` or `304` | `-32012` |
 
 The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
@@ -771,7 +771,9 @@ An upstream error answer with a JSON body (`application/json` or any `+json`
 subtype) is the upstream's own JSON-RPC error and passes through unchanged:
 status, body and content type. Any other non-2xx answer (a worker's `403`,
 `415` or `429` text/plain, or a `3xx`) keeps its status but has its body
-replaced by the `-32012` error, which echoes the request `id`. The
+replaced by the `-32012` error, which echoes the request `id`. A `1xx` or
+`304`, which cannot carry a body, gets the same error with status `502`,
+whatever its content type. The
 `upstream_error` outcome also covers refusals a client can cause (a request
 whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
 itself a worker-saturation signal.
