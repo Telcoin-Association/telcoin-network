@@ -4,6 +4,7 @@
 use crate::cli::{Cli, Commands, PassSource};
 use eyre::bail;
 use std::fmt;
+use zeroize::Zeroizing;
 
 /// Environment variable read (and cleared) at process start for the BLS key passphrase.
 pub const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
@@ -16,8 +17,9 @@ pub const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
 ///
 /// Call this exactly once, as the FIRST statement of `main`, before any
 /// threads exist: it mutates the process environment, which is not thread safe.
-pub fn get_bls_passphrase_from_env() -> Option<String> {
+pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
     if let Ok(passphrase) = std::env::var(BLS_PASSPHRASE_ENVVAR) {
+        let passphrase = Zeroizing::new(passphrase);
         if !passphrase.is_empty() {
             // Clear then remove the passphrase from the env.
             // NOTE: This is probably not doing much but is an attempt to make the var "more
@@ -40,9 +42,11 @@ pub fn get_bls_passphrase_from_env() -> Option<String> {
 }
 
 /// Prompt (twice) for a new passphrase when generating keys.
-fn read_passphrase() -> Option<String> {
+fn read_passphrase() -> Option<Zeroizing<String>> {
     while let Ok(pw) = rpassword::prompt_password("Enter a passphrase to ecrypt BLS key: ") {
+        let pw = Zeroizing::new(pw);
         if let Ok(pw2) = rpassword::prompt_password("Re-enter BLS key passphrase to confirm: ") {
+            let pw2 = Zeroizing::new(pw2);
             if pw == pw2 {
                 return if pw.is_empty() {
                     println!("No passphrase set for BLS key, this is not recommended.");
@@ -65,8 +69,8 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// parsed subcommand and errors when a required passphrase is absent.
     pub fn resolve_bls_passphrase(
         &self,
-        preloaded: Option<String>,
-    ) -> eyre::Result<Option<String>> {
+        preloaded: Option<Zeroizing<String>>,
+    ) -> eyre::Result<Option<Zeroizing<String>>> {
         self.resolve_bls_passphrase_with_reader(preloaded, std::io::stdin().lock())
     }
 
@@ -74,18 +78,21 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// reader so tests can supply synthetic input without touching real process stdin.
     fn resolve_bls_passphrase_with_reader<R: std::io::BufRead>(
         &self,
-        preloaded: Option<String>,
+        preloaded: Option<Zeroizing<String>>,
         mut reader: R,
-    ) -> eyre::Result<Option<String>> {
+    ) -> eyre::Result<Option<Zeroizing<String>>> {
         let mut passphrase = preloaded;
         match self.bls_passphrase_source {
             PassSource::Env => {} // Already have the env var if provided.
             PassSource::Stdin => {
-                let mut buffer = String::new();
+                let mut buffer = Zeroizing::new(String::new());
                 if let Err(err) = reader.read_line(&mut buffer) {
                     bail!("Error reading BLS passphrase from stdin: {err:?}");
                 }
-                passphrase = Some(buffer.trim_end().to_string()).filter(|s| !s.is_empty());
+                // trim in place: a trimmed copy would be a second, uncleared passphrase buffer
+                let len = buffer.trim_end().len();
+                buffer.truncate(len);
+                passphrase = Some(buffer).filter(|s| !s.is_empty());
             }
             PassSource::Ask => match &self.command {
                 Commands::Keytool(keytool) if keytool.needs_passphrase() => {
@@ -101,7 +108,8 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
                     // Simple ask once and app will error out later if this is wrong.
                     passphrase =
                         rpassword::prompt_password("Enter the BLS key passphrase to decrypt: ")
-                            .ok();
+                            .ok()
+                            .map(Zeroizing::new);
                 }
             },
             PassSource::NoPassphrase => {
@@ -138,15 +146,18 @@ mod tests {
     #[test]
     fn test_no_passphrase_source_resolves_none() {
         let cli = cli(&["tn", "node", "--bls-passphrase-source", "no-passphrase"]);
-        assert_eq!(cli.resolve_bls_passphrase(Some("preload".into())).unwrap(), None);
+        assert_eq!(
+            cli.resolve_bls_passphrase(Some(Zeroizing::new("preload".into()))).unwrap(),
+            None
+        );
     }
 
     #[test]
     fn test_env_source_keeps_preloaded_value() {
         let cli = cli(&["tn", "node"]); // default source is env
         assert_eq!(
-            cli.resolve_bls_passphrase(Some("preload".into())).unwrap(),
-            Some("preload".into())
+            cli.resolve_bls_passphrase(Some(Zeroizing::new("preload".into()))).unwrap(),
+            Some(Zeroizing::new("preload".into()))
         );
     }
 
@@ -187,7 +198,7 @@ mod tests {
                 std::io::Cursor::new(b"sekrit\n".as_ref())
             )
             .unwrap(),
-            Some("sekrit".into())
+            Some(Zeroizing::new("sekrit".into()))
         );
     }
 
@@ -196,7 +207,7 @@ mod tests {
     #[test]
     fn test_env_preload_reads_and_clears_var() {
         std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
-        assert_eq!(get_bls_passphrase_from_env(), Some("sekrit".into()));
+        assert_eq!(get_bls_passphrase_from_env(), Some(Zeroizing::new("sekrit".into())));
         assert!(std::env::var(BLS_PASSPHRASE_ENVVAR).is_err());
         assert_eq!(get_bls_passphrase_from_env(), None);
     }

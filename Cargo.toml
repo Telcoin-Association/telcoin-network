@@ -101,6 +101,8 @@ secp256k1 = { version = "0.31", default-features = false, features = [
 ] }
 
 rpassword = "7.4.0"
+# clears passphrases and other secret buffers on drop
+zeroize = "1.8.2"
 
 # execution
 #

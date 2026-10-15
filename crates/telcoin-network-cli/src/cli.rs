@@ -12,6 +12,7 @@ use tn_node::engine::TnBuilder;
 use tn_reth::{dirs::DEFAULT_ROOT_DIR, init_reth_defaults, LogArgs};
 use tokio::{runtime::Builder, task::JoinHandle};
 use tracing::info_span;
+use zeroize::Zeroizing;
 
 /// How do we want to get the BLS key passphrase?
 #[derive(Debug, Copy, Clone, clap::ValueEnum)]
@@ -132,7 +133,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
     /// })?;
     /// # Ok::<(), eyre::Report>(())
     /// ```
-    pub fn run<L>(mut self, passphrase: Option<String>, launcher: L) -> eyre::Result<()>
+    pub fn run<L>(mut self, passphrase: Option<Zeroizing<String>>, launcher: L) -> eyre::Result<()>
     where
         L: FnOnce(TnBuilder, Ext, PathBuf, KeyConfig, &'static str) -> JoinHandle<eyre::Result<()>>,
     {
