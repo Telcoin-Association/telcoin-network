@@ -80,6 +80,8 @@ Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000
 
 The current binary decrypts the BLS key into node process memory and does not provide an HSM or remote signer interface. See [Validator production operations](../../docs/src/getting-started/validator-operations.md#bls-key-custody) for production custody, backup, and isolation guidance.
 
+When a passphrase is supplied but `node-keys/bls.kw` does not exist, `node` and `keytool generate pop` stop with an error instead of reading a cleartext `bls.key`. To use a cleartext key on purpose, pass `--bls-passphrase-source no-passphrase`. On chain id 487 the node also needs `--allow-cleartext-bls-key`; see [Chain id 487 checks](#chain-id-487-checks).
+
 ### Generated files
 
 After running `keytool generate`, the data directory contains:
@@ -316,6 +318,28 @@ telcoin-network node \
 | `--node-name`         | auto-generated | Name for OpenTelemetry service identification                                                  |
 | `--tracing-url`       | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`            |
 | `--with-unused-ports` | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                             |
+
+### Chain id 487 checks
+
+Mainnet uses chain id 487, and the devnet genesis files reuse it. On chain id 487 the node refuses to start in two cases unless the matching flag is set:
+
+- The BLS key was read from the cleartext `node-keys/bls.key` without a passphrase, for example with `--bls-passphrase-source no-passphrase`. Use a passphrase-encrypted key (`bls.kw`) instead.
+- The binary was built with the `faucet` feature. A faucet build also refuses the embedded mainnet genesis, with or without the flag.
+
+| Flag                          | Default | Description                                                                                             |
+| ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
+| `--allow-cleartext-bls-key`   | `false` | Start on chain id 487 with a cleartext `bls.key`. Test networks only. Env: `TN_ALLOW_CLEARTEXT_BLS_KEY` |
+| `--allow-faucet-on-chain-487` | `false` | Let a faucet build start on a devnet that uses chain id 487. Env: `TN_ALLOW_FAUCET_ON_CHAIN_487`        |
+
+Both flags show in `node --help` but not in `node -h`. Their environment variables accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`. `db load-state` takes `--allow-faucet-on-chain-487` as well.
+
+At startup, before these checks, the node logs one INFO line with the build features and the loaded chain:
+
+```text
+node build: faucet=false adiri=false chain_id=487 genesis_hash=0x...
+```
+
+`faucet` is true for any binary that carries the faucet mint, including `adiri` builds. `telcoin-network --version` lists the same features on its `Build Features:` line, so a faucet build lists `faucet` there and an adiri build lists both `adiri` and `faucet`.
 
 ### global flags
 
