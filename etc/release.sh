@@ -1099,9 +1099,11 @@ image_binary() {
 }
 
 # verify step (i): the image's long version names this release's version, commit and channel
-# (crates/telcoin-network-cli/src/version.rs).
+# (crates/telcoin-network-cli/src/version.rs). "Build Features" lists the cli crate's cargo
+# features: a mainnet release lists none; an Adiri release lists adiri, and may list faucet,
+# which the adiri feature implies; anything else is refused.
 check_version_output() {
-    local ref=$1 out version sha features flist has_adiri=no
+    local ref=$1 out version sha features n_lines feature has_adiri=no
     # --entrypoint: run the very file image_binary copied, not whatever ENTRYPOINT or PATH picks.
     out=$(docker run --rm --network none --platform linux/amd64 \
         --entrypoint /usr/local/bin/telcoin "$ref" --version) ||
@@ -1109,20 +1111,30 @@ check_version_output() {
     # clap starts the first line with the program name: "telcoin-network-cli Version: X.Y.Z".
     version=$(printf '%s\n' "$out" | sed -n 's/^\([^ ]* \)\{0,1\}Version: //p')
     sha=$(printf '%s\n' "$out" | sed -n 's/^Commit SHA: //p')
-    features=$(printf '%s\n' "$out" | sed -n 's/^Build Features: //p')
+    n_lines=$(printf '%s\n' "$out" | awk '/^Build Features:/ { n++ } END { print n + 0 }')
+    features=$(printf '%s\n' "$out" | sed -n 's/^Build Features:[[:space:]]*//p')
     [ "$version" = "$VERSION" ] || die 1 "$ref reports 'Version: $version'; expected $VERSION"
     if [ "${#sha}" -lt 7 ]; then die 1 "$ref reports 'Commit SHA: $sha'; expected $COMMIT"; fi
     case "$COMMIT" in
         "$sha"*) ;;
         *) die 1 "$ref reports 'Commit SHA: $sha'; expected $COMMIT" ;;
     esac
-    flist=$(printf '%s' "$features" | tr ' ' ',')
-    case ",$flist," in *,adiri,*) has_adiri=yes ;; esac
+    [ "$n_lines" = 1 ] || die 1 "$ref prints $n_lines 'Build Features:' lines; expected one"
+    while IFS= read -r feature; do
+        [ -n "$feature" ] || continue
+        if [ "$CHANNEL" = mainnet ]; then
+            die 1 "$ref is a mainnet release but was built with cargo features (Build Features: $features); a mainnet release has none"
+        fi
+        case "$feature" in
+            adiri) has_adiri=yes ;;
+            faucet) ;;
+            *) die 1 "$ref is an Adiri release but was built with the feature $feature (Build Features: $features); expected adiri, and faucet at most" ;;
+        esac
+    done <<EOF
+$(printf '%s\n' "$features" | awk -F '[, \t]+' '{ for (i = 1; i <= NF; i++) if ($i != "") print $i }')
+EOF
     if [ "$CHANNEL" = adiri ] && [ "$has_adiri" = no ]; then
         die 1 "$ref was built without the adiri feature (Build Features: $features)"
-    fi
-    if [ "$CHANNEL" = mainnet ] && [ "$has_adiri" = yes ]; then
-        die 1 "$ref is a mainnet release but was built with the adiri feature"
     fi
     info "$ref: Version $version, Commit SHA $sha, Build Features ${features:-none}"
 }
@@ -1255,7 +1267,7 @@ cd "telcoin-network-$TAG-x86_64-unknown-linux-gnu" &&
 git -C ../tn-main rev-parse "refs/tags/$TAG^{commit}"
 ```
 
-The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed, and `Build Features:` must contain `adiri` for an `-adiri` tag and not for any other.
+The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed. `Build Features:` must be empty for a mainnet tag; for an `-adiri` tag it lists `adiri`, and may also list `faucet`, which the `adiri` feature implies, and nothing else.
 
 Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. These commands are the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
 

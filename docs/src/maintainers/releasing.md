@@ -218,7 +218,7 @@ docker logout ghcr.io
 - `IMAGE_DIGEST` matches the registry;
 - the tarball holds exactly the four expected files in its directory;
 - the binary in the tarball is byte-identical to the one in the image pulled by digest;
-- `--version` in the image shows the version, the tagged commit, and the `adiri` feature exactly when the tag is an Adiri tag.
+- `--version` in the image shows the version and the tagged commit, and its `Build Features` line is empty for a mainnet tag and, for an Adiri tag, lists `adiri` and at most `faucet` besides, which `adiri` implies; `release-build` runs the same check before it pushes the image.
 
 It ends with a line like `verified v0.17.0-adiri commit=... signatures=1/1 image=...`.
 

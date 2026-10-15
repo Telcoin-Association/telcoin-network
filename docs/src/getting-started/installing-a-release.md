@@ -140,7 +140,7 @@ The `--version` output must include these lines:
 
 - `telcoin-network-cli Version: X.Y.Z` as the first line, where `X.Y.Z` is the tag without its leading `v` and without `-adiri` or `-rcN` (`telcoin-network-cli Version: 0.17.0` for `v0.17.0-adiri`);
 - `Commit SHA:` followed by the commit that `git rev-parse` printed, which is the commit the tag points to;
-- `Build Features:` containing `adiri` for an `-adiri` tag, and not containing it for any other tag.
+- `Build Features:` with nothing after it for a mainnet tag (`vX.Y.Z` or `vX.Y.Z-rcN`); for an `-adiri` tag, `adiri`, possibly with `faucet`, which the `adiri` feature implies, and nothing else.
 
 Releases cut before this process print `Version: 0.1.0` after the program name.
 
@@ -236,7 +236,7 @@ Never extract, install or run anything from a release that failed one of these c
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
 | A fingerprint is missing from, or differs from, `SECURITY.md` or GitHub, or its `SECURITY.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
 | `IMAGE_DIGEST does not name a telcoin-network image by digest` | The signed `IMAGE_DIGEST` points outside the release repository | Stop and report it. |
-| `Commit SHA` differs from the tag's commit, or `Build Features` lacks `adiri` on an `-adiri` tag | The binary does not match the release | Stop and report it. |
+| `Commit SHA` differs from the tag's commit, `Build Features` is not empty on a mainnet tag, or on an `-adiri` tag lacks `adiri` or lists anything but `adiri` and `faucet` | The binary does not match the release | Stop and report it. |
 | `exec format error`, or Docker warns that the image platform does not match the host | The release is built for Linux x86_64 only | Use an x86_64 host, or build from source. |
 | `docker pull` fails with `denied` or `unauthorized` | The image is not publicly readable | Tell the maintainers. |
 
