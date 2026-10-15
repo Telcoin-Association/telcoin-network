@@ -222,6 +222,13 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
         preloaded: Option<Zeroizing<String>>,
         mut reader: R,
     ) -> eyre::Result<Option<Zeroizing<String>>> {
+        // The `db` subcommand is a read-only inspection tool and `keytool set-rpc`
+        // only edits public config; neither needs the BLS key passphrase.
+        let command_needs_passphrase = match &self.command {
+            Commands::Db(_) => false,
+            Commands::Keytool(keytool) => keytool.needs_passphrase(),
+            Commands::Genesis(_) | Commands::Node(_) => true,
+        };
         let mut passphrase = preloaded;
         match self.bls_passphrase_source {
             PassSource::Env => {} // Already have the env var if provided.
@@ -256,20 +263,15 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
             PassSource::NoPassphrase => {
                 passphrase = None;
             }
-            PassSource::Credential => {
+            // like `ask`, commands that never use the passphrase do not read the credential
+            PassSource::Credential if command_needs_passphrase => {
                 passphrase = Some(read_credential(
                     std::env::var_os(CREDENTIALS_DIRECTORY_ENVVAR),
                     credential_name(&self.bls_passphrase_credential)?,
                 )?);
             }
+            PassSource::Credential => {}
         }
-        // The `db` subcommand is a read-only inspection tool and `keytool set-rpc`
-        // only edits public config; neither needs the BLS key passphrase.
-        let command_needs_passphrase = match &self.command {
-            Commands::Db(_) => false,
-            Commands::Keytool(keytool) => keytool.needs_passphrase(),
-            Commands::Genesis(_) | Commands::Node(_) => true,
-        };
         let needs_passphrase =
             self.bls_passphrase_source.with_passphrase() && command_needs_passphrase;
         if passphrase.is_none() && needs_passphrase {
@@ -538,6 +540,29 @@ mod tests {
         let cli = cli(&["tn", "node", "--bls-passphrase-source", "credential"]);
         let err = cli.resolve_bls_passphrase(None).unwrap_err();
         assert!(err.to_string().contains("not running under a systemd credential directory"));
+    }
+
+    /// Like `ask`, the credential source is skipped for commands that need no passphrase, so
+    /// they run outside systemd and with an invalid credential name.
+    #[test]
+    fn test_credential_source_skipped_when_no_passphrase_needed() {
+        let _env = env_lock();
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENVVAR);
+        for args in [
+            &["tn", "--bls-passphrase-source", "credential", "keytool", "set-rpc", "--clear"][..],
+            &["tn", "--bls-passphrase-source", "credential", "db", "stats"],
+            &[
+                "tn",
+                "--bls-passphrase-source",
+                "credential",
+                "--bls-passphrase-credential",
+                "a/b",
+                "db",
+                "stats",
+            ],
+        ] {
+            assert_eq!(cli(args).resolve_bls_passphrase(None).unwrap(), None, "{args:?}");
+        }
     }
 
     #[test]
