@@ -662,7 +662,7 @@ mod tests {
     use super::*;
     use crate::{proxy::UpstreamClientBuilder, telemetry::test_utils::CapturedMetrics};
     use axum::{body::Body, response::IntoResponse as _, routing::get, Router};
-    use std::{io, net::SocketAddr, sync::atomic::AtomicU8, time::Instant};
+    use std::{io, net::SocketAddr, sync::atomic::AtomicU8};
     use tn_types::Notifier;
     use tokio::net::TcpListener;
 
@@ -794,6 +794,23 @@ mod tests {
                         }
                         _ => READY_BODY.into_response(),
                     }
+                }
+            }),
+        );
+        serve_mock(app).await
+    }
+
+    /// Serve a mock `GET /health/workers` that answers [`READY_BODY`] only once
+    /// as many requests as `barrier` counts are waiting on it, across every
+    /// mock that shares it.
+    async fn mock_readiness_at_barrier(barrier: Arc<tokio::sync::Barrier>) -> SocketAddr {
+        let app = Router::new().route(
+            "/health/workers",
+            get(move || {
+                let barrier = Arc::clone(&barrier);
+                async move {
+                    barrier.wait().await;
+                    READY_BODY
                 }
             }),
         );
@@ -1058,21 +1075,22 @@ mod tests {
 
     #[tokio::test]
     async fn readiness_polls_run_concurrently() {
-        // three upstreams, each behind its own mock that takes 300 ms to answer
+        // three upstreams, each behind its own mock, and none answers until all
+        // three polls are waiting: only polls that overlap release each other
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
         let mut upstreams = Vec::new();
         for worker_id in 0..3u16 {
-            let addr = mock_readiness(Arc::new(AtomicU8::new(SLOW))).await;
+            let addr = mock_readiness_at_barrier(Arc::clone(&barrier)).await;
             upstreams.push(upstream_at(worker_id, addr));
         }
         let readiness = GatewayReadiness::new(&upstreams, thresholds(3, 1));
         let client = Client::new();
 
-        let started = Instant::now();
         poll_cycle(&readiness, &client, Duration::from_secs(2)).await;
-        let elapsed = started.elapsed();
 
-        // polled one after another, the cycle would take at least 900 ms
-        assert!(elapsed < Duration::from_millis(600), "one cycle took {elapsed:?}");
+        // polled one after another (or two at a time), every poll would wait
+        // at the barrier until its 2 s timeout and fail, so no wall-clock
+        // bound is needed
         assert!(readiness.upstreams.iter().all(UpstreamReadiness::is_ready), "a poll failed");
     }
 

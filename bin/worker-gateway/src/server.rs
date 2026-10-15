@@ -2583,6 +2583,17 @@ mod tests {
         // A connection that never sends a byte must be closed by the lifetime
         // cap (well before the 5s header deadline, hence the 2s bound).
         let mut stream = TcpStream::connect(addr).await.expect("connect");
+
+        // The probe waits in the accept backlog while the only slot is held.
+        // Its request is written now, so its bytes are already buffered when
+        // it is accepted and its own 300ms cap cannot close it before they
+        // are read.
+        let mut probe = TcpStream::connect(addr).await.expect("connect probe");
+        probe
+            .write_all(b"GET /health HTTP/1.1\r\nHost: gateway\r\nConnection: close\r\n\r\n")
+            .await
+            .expect("write probe");
+
         let mut buf = [0_u8; 16];
         let read = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut buf))
             .await
@@ -2590,15 +2601,14 @@ mod tests {
         assert_eq!(read.expect("read"), 0, "expected EOF from the server");
 
         // The capped connection's permit must be released: with a single slot,
-        // this probe only gets accepted (and answered) if it was.
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            Client::new().get(format!("http://{addr}/health")).send(),
-        )
-        .await
-        .expect("permit should be released after the cap fires")
-        .expect("send");
-        assert_eq!(response.status(), StatusCode::OK);
+        // the probe only gets accepted (and answered) if it was.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), probe.read_to_end(&mut response))
+            .await
+            .expect("permit should be released after the cap fires")
+            .expect("read probe");
+        let response = String::from_utf8_lossy(&response);
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
     }
 
     /// The transport-stall guard actually arms the socket option (readable
@@ -3780,8 +3790,10 @@ mod tests {
         assert!(!logs.contains("elsewhere"), "the Location must not be logged: {logs}");
     }
 
-    /// A per-IP limit of one request with no burst headroom (no refill lands
-    /// inside a test), and no global limit.
+    /// A per-IP limit of one request per second with no burst headroom, and no
+    /// global limit. A test's exchanges see no refill while they take under
+    /// 1s in all, which loopback exchanges do (1 token/s is the slowest rate
+    /// the limit can express).
     fn one_request_per_ip() -> Option<Arc<RateLimiters>> {
         RateLimiters::new(
             Some(RateLimit::new(nz(1), nz(1))),
@@ -9250,8 +9262,9 @@ mod tests {
     #[tokio::test]
     async fn ready_reports_503_during_the_shutdown_delay_while_posts_succeed() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
-        let (gateway, shutdown, _accept) =
-            draining_gateway(worker, Duration::from_millis(500)).await;
+        // the test never waits the delay out, so a long one costs nothing
+        // and leaves the exchanges below no window to miss
+        let (gateway, shutdown, _accept) = draining_gateway(worker, Duration::from_secs(5)).await;
         assert_eq!(get_ready(gateway).await, (StatusCode::OK, serde_json::json!({"ready": true})));
 
         shutdown.notify();
@@ -9302,8 +9315,9 @@ mod tests {
     #[tokio::test]
     async fn ready_any_reports_503_during_the_shutdown_delay_while_posts_succeed() {
         let (worker, worker_seen, _worker) = named_mock("worker").await;
-        let (gateway, shutdown, _accept) =
-            draining_gateway(worker, Duration::from_millis(500)).await;
+        // the test never waits the delay out, so a long one costs nothing
+        // and leaves the exchanges below no window to miss
+        let (gateway, shutdown, _accept) = draining_gateway(worker, Duration::from_secs(5)).await;
         assert_eq!(
             get_probe(gateway, READY_ANY_PATH).await,
             (
