@@ -12,6 +12,40 @@ permissions:
   contents: read
 
 jobs:
+  workspace:
+    if: startsWith(github.base_ref, 'staging/')
+    name: Staging workspace (${{ matrix.lane }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        lane: [fmt, clippy, test-default, test-adiri]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          submodules: true
+      - name: Install pinned Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Install pinned nightly tools
+        if: matrix.lane == 'fmt' || matrix.lane == 'clippy'
+        run: rustup toolchain install "$(cat rust-nightly)" -c rustfmt,clippy,rust-src --profile minimal
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0
+        if: startsWith(matrix.lane, 'test-')
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6
+        if: matrix.lane != 'fmt'
+        with:
+          prefix-key: v1-rust
+          shared-key: ${{ matrix.lane == 'clippy' && 'clippy-cache' || 'test-cache' }}
+          save-if: "false"
+      - name: Run existing workspace CI lane
+        run: ./etc/ci-lanes.sh ${{ matrix.lane }}
+      - name: Include all targets required by the scope plan
+        if: matrix.lane == 'clippy'
+        run: cargo "+$(cat rust-nightly)" clippy --locked --workspace --all-targets --no-deps -- -D warnings
+
   regressions:
     runs-on: ubuntu-latest
     timeout-minutes: 45
