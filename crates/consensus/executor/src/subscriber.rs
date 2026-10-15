@@ -15,8 +15,8 @@ use tn_storage::consensus::ConsensusChain;
 use tn_types::{
     encode, to_intent_message, Address, AuthorityIdentifier, Batch, BlockHash, BlsSigner as _,
     CertifiedBatch, CommittedSubDag, Committee, ConsensusHeader, ConsensusHeaderDigest,
-    ConsensusOutput, ConsensusResult, Database, Hash as _, Noticer, TaskManager, TaskSpawner,
-    Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
+    ConsensusOutput, ConsensusResult, Database, Epoch, EpochRecord, Hash as _, Noticer, Round,
+    TaskManager, TaskSpawner, Timestamp, TimestampSec, TnReceiver, TnSender, WorkerId,
 };
 use tracing::{debug, error, info, instrument, warn};
 
@@ -28,6 +28,58 @@ use tracing::{debug, error, info, instrument, warn};
 /// the identical wait, a crash loop exactly when the node is furthest behind). The watchdog
 /// keeps the unbounded wait but makes a stall loud instead of silent.
 const FETCH_BATCHES_STALL_WARN_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Maximum age of the newest known consensus header for a catching-up CVV to treat it as the
+/// network head and rejoin consensus.
+///
+/// Under load the committee commits often, so the newest gossiped header stays recent. A header
+/// older than this is a stale record (for example one loaded at restart) and must not promote a
+/// node that has not caught up.
+const REJOIN_HEAD_MAX_AGE: Duration = Duration::from_secs(5);
+
+/// Only an output from this subscriber's still-open epoch can establish rejoin readiness.
+/// Future outputs are ignored by `handle_sync_output`, and finalized epochs must be replayed
+/// through their boundary even if their final headers are recent. The synthetic epoch-zero
+/// record has no final consensus block and does not mark that epoch as closed.
+fn rejoin_epoch_is_open(
+    current_epoch: Epoch,
+    output_epoch: Epoch,
+    latest_record: Option<&EpochRecord>,
+) -> bool {
+    output_epoch == current_epoch
+        && latest_record.is_none_or(|record| {
+            record.epoch < current_epoch
+                || (record.epoch == 0 && record.final_consensus.number == 0)
+        })
+}
+
+/// True when a catching-up CVV is close enough to the network head to rejoin consensus.
+///
+/// `handled_epoch` and `handled_round` belong to the consensus output the node just handled.
+/// `newest_epoch`, `newest_round` and `newest_age` belong to the newest consensus header the node
+/// knows about. The rule has three parts:
+/// - the newest known header is younger than [`REJOIN_HEAD_MAX_AGE`]. Freshness is checked on the
+///   newest known header, not on the handled output, so a stale record still blocks promotion;
+/// - both are in the same epoch, because rounds only compare inside one epoch;
+/// - the handled output trails the newest known header by at most `rejoin_window` rounds
+///   ([`tn_types::rejoin_round_window`]). A handled output at or ahead of the newest known header
+///   has a gap of zero.
+///
+/// The old rule required the handled output to be the newest known header. Under sustained load
+/// a node that must fetch, verify and execute every output is always a few outputs behind, so
+/// that rule never held until the load dropped.
+fn rejoin_ready(
+    handled_epoch: Epoch,
+    handled_round: Round,
+    newest_epoch: Epoch,
+    newest_round: Round,
+    newest_age: Duration,
+    rejoin_window: Round,
+) -> bool {
+    newest_age < REJOIN_HEAD_MAX_AGE
+        && handled_epoch == newest_epoch
+        && newest_round.saturating_sub(handled_round) <= rejoin_window
+}
 
 /// The `Subscriber` receives certificates sequenced by the consensus and waits until the
 /// downloaded all the transactions references by the certificates; it then
@@ -208,6 +260,7 @@ impl<DB: Database> Subscriber<DB> {
     }
 
     /// Catch up to current consensus and then try to rejoin as an active CVV.
+    /// Keep replaying finalized epochs even when their final headers still count as fresh.
     async fn catch_up_rejoin_consensus(&self, tasks: TaskSpawner) -> SubscriberResult<()> {
         // Get a receiver and then stream any missing outputs so we don't miss them.
         let mut rx_sync_output = self.consensus_bus.subscribe_sync_output();
@@ -217,24 +270,52 @@ impl<DB: Database> Subscriber<DB> {
             tasks,
             self.inner.consensus_chain.clone(),
         );
+        // Derived from the same helper as the demotion window in `behind_consensus`, so a node
+        // that rejoins is not demoted again at once.
+        let rejoin_window = tn_types::rejoin_round_window(self.config.parameters().gc_depth);
         while let Some(output) = rx_sync_output.recv().await {
             let consensus_header_number = output.number();
+            let handled_epoch = output.sub_dag().leader_epoch();
+            let handled_round = output.leader_round();
             self.handle_sync_output(output).await?;
+            // A recent header can belong to an epoch that has already closed. Activating there
+            // stops replay before its boundary, leaving this node proposing to peers in the next
+            // epoch until it is demoted again. Apply the output, but keep following consensus.
+            let latest_record = self.inner.consensus_chain.epochs().latest_record().await;
+            let epoch_is_open = rejoin_epoch_is_open(
+                self.inner.committee.epoch(),
+                handled_epoch,
+                latest_record.as_ref(),
+            );
             if let Some(last_consensus_header) =
                 self.consensus_bus.last_consensus_header().borrow().as_ref()
             {
-                // If we seem to be on the same number also make sure this is not a stale record.
-                // If that happens during a catch up it will lead to premature cvv active when not
-                // caught up.
+                // Rejoin when the handled output is within the rejoin window of the newest known
+                // header and that header is fresh. The freshness check stops a stale record from
+                // promoting a node that has not caught up.
                 // freshness is measured in milliseconds so a sub-second commit time is not rounded
                 // away. a pre-fork commit time is whole seconds, and there this equals comparing
                 // whole seconds against the clock rounded down to the second
-                if consensus_header_number == last_consensus_header.number
-                    && last_consensus_header.sub_dag.commit_timestamp_ms().elapsed()
-                        < Duration::from_secs(5)
+                let newest_round = last_consensus_header.sub_dag.leader_round();
+                if epoch_is_open
+                    && rejoin_ready(
+                        handled_epoch,
+                        handled_round,
+                        last_consensus_header.sub_dag.leader_epoch(),
+                        newest_round,
+                        last_consensus_header.sub_dag.commit_timestamp_ms().elapsed(),
+                        rejoin_window,
+                    )
                 {
                     // We are caught up enough so try to jump back into consensus
-                    info!(target: "subscriber", "attempting to rejoin consensus, consensus block height {consensus_header_number}");
+                    info!(
+                        target: "subscriber",
+                        consensus_header_number,
+                        newest_number = last_consensus_header.number,
+                        round_gap = newest_round.saturating_sub(handled_round),
+                        rejoin_window,
+                        "attempting to rejoin consensus"
+                    );
                     self.consensus_bus.node_mode().send_replace(NodeMode::CvvActive);
                     self.config.shutdown().notify();
                     return Ok(());
@@ -1334,5 +1415,139 @@ mod worker_fanout_tests {
             subscriber.fetch_batches_from_peers(unknown).await,
             Err(SubscriberError::UnexpectedWorkerId(7))
         ));
+    }
+}
+
+#[cfg(test)]
+mod rejoin_tests {
+    use super::*;
+    use tn_types::{gc_activity_window, rejoin_round_window, GC_ACTIVITY_BUFFER, MAX_GC_DEPTH};
+
+    /// Epoch shared by the handled output and the newest known header in these cases.
+    const EPOCH: Epoch = 3;
+    /// Round of the newest known header in these cases.
+    const NEWEST: Round = 400;
+    /// Age of a newest known header that counts as fresh.
+    const FRESH: Duration = Duration::from_millis(500);
+
+    /// `rejoin_ready` for a handled output `gap` rounds behind a fresh newest header, with the
+    /// rejoin window of the default `gc_depth`.
+    fn ready_at_gap(gap: Round) -> bool {
+        rejoin_ready(
+            EPOCH,
+            NEWEST.saturating_sub(gap),
+            EPOCH,
+            NEWEST,
+            FRESH,
+            rejoin_round_window(MAX_GC_DEPTH),
+        )
+    }
+
+    /// The old exact-match case still rejoins.
+    #[test]
+    fn rejoin_on_exact_match() {
+        assert!(ready_at_gap(0), "a node at the newest known header must rejoin");
+    }
+
+    /// A node a few rounds behind the head rejoins. The old exact-match rule refused this case,
+    /// which kept a node under load inactive until the load dropped (issue #1513).
+    #[test]
+    fn rejoin_with_small_gap() {
+        assert!(ready_at_gap(1), "a node one round behind must rejoin");
+        assert!(ready_at_gap(2), "a node one leader commit behind must rejoin");
+    }
+
+    /// The rejoin window is inclusive, and one round past it blocks promotion.
+    #[test]
+    fn rejoin_window_edge() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        assert!(ready_at_gap(window), "a gap equal to the rejoin window must rejoin");
+        assert!(!ready_at_gap(window + 1), "a gap past the rejoin window must not rejoin");
+    }
+
+    /// A node at the demotion edge does not rejoin, so it does not flip between active and
+    /// inactive.
+    #[test]
+    fn no_rejoin_at_demotion_edge() {
+        assert!(
+            !ready_at_gap(gc_activity_window(MAX_GC_DEPTH)),
+            "a gap at the demotion window must not rejoin"
+        );
+    }
+
+    /// A stale newest header blocks promotion even at an exact match.
+    #[test]
+    fn no_rejoin_on_stale_newest_header() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        assert!(
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, REJOIN_HEAD_MAX_AGE, window),
+            "a newest header at the age limit must not promote"
+        );
+        assert!(
+            !rejoin_ready(EPOCH, NEWEST, EPOCH, NEWEST, Duration::from_secs(60), window),
+            "an old newest header must not promote"
+        );
+    }
+
+    /// Rounds do not compare across epochs, so an epoch mismatch blocks promotion.
+    #[test]
+    fn no_rejoin_across_epochs() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        assert!(
+            !rejoin_ready(EPOCH, NEWEST, EPOCH + 1, NEWEST, FRESH, window),
+            "a node in an older epoch must not rejoin"
+        );
+    }
+
+    /// An ignored future output cannot promote the subscriber still closing an older epoch,
+    /// even when that output matches the fresh network head exactly.
+    #[test]
+    fn no_rejoin_on_ignored_future_output() {
+        assert!(
+            !rejoin_epoch_is_open(EPOCH, EPOCH + 1, None),
+            "an ignored future output must not activate the subscriber in its older epoch"
+        );
+    }
+
+    /// A finalized record closes that epoch and older epochs, while genesis and the epoch after
+    /// the finalized tip remain eligible for the normal freshness and round-gap checks.
+    #[test]
+    fn rejoin_epoch_respects_finalized_tip() {
+        let finalized = EpochRecord {
+            epoch: EPOCH,
+            final_consensus: tn_types::ConsensusNumHash::new(1, Default::default()),
+            ..Default::default()
+        };
+        assert!(
+            !rejoin_epoch_is_open(EPOCH, EPOCH, Some(&finalized)),
+            "a fresh header from a finalized epoch must not stop catch-up"
+        );
+        let older = EPOCH.saturating_sub(1);
+        assert!(!rejoin_epoch_is_open(older, older, Some(&finalized)));
+        assert!(rejoin_epoch_is_open(EPOCH + 1, EPOCH + 1, Some(&finalized)));
+        assert!(rejoin_epoch_is_open(0, 0, None));
+        assert!(rejoin_epoch_is_open(0, 0, Some(&EpochRecord::default())));
+        let finalized_zero = EpochRecord { epoch: 0, ..finalized };
+        assert!(!rejoin_epoch_is_open(0, 0, Some(&finalized_zero)));
+    }
+
+    /// A handled output ahead of the newest known header has a gap of zero.
+    #[test]
+    fn rejoin_when_ahead_of_newest_header() {
+        let window = rejoin_round_window(MAX_GC_DEPTH);
+        assert!(
+            rejoin_ready(EPOCH, NEWEST + 2, EPOCH, NEWEST, FRESH, window),
+            "a node past the newest known header must rejoin"
+        );
+    }
+
+    /// For every production `gc_depth`, promotion sits strictly inside the demotion window.
+    #[test]
+    fn rejoin_window_inside_demotion_window() {
+        assert!(
+            ((GC_ACTIVITY_BUFFER + 1)..=MAX_GC_DEPTH)
+                .all(|gc_depth| rejoin_round_window(gc_depth) < gc_activity_window(gc_depth)),
+            "the rejoin window must be smaller than the demotion window"
+        );
     }
 }

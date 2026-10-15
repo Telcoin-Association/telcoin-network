@@ -30,7 +30,7 @@ use tn_types::{
     forks::{seed_signature_active, subsecond_timestamp_active},
     now_ms, AuthorityIdentifier, BlockHash, Certificate, Committee, Database, Epoch, EpochDigest,
     EpochSeedMessage, Hash as _, Header, Noticer, Round, TaskManager, TaskSpawner, TnReceiver,
-    TnSender, WorkerId,
+    TnSender, VotingPower, WorkerId,
 };
 use tokio::{
     sync::oneshot,
@@ -396,12 +396,16 @@ impl<DB: Database> Proposer<DB> {
     ///
     /// The round test is `>=`, not `>`, and the equality case is load-bearing: reproposing the
     /// identical header for the *same* round must still take the write branch, because that is what
-    /// keeps the reproposal behind the durability barrier below. The certifier depends on this. It
-    /// releases its proposal lock before its own barrier, which is only safe because a reproposed
-    /// header cannot reach the certifier until this barrier acks - and since the barrier is
-    /// whole-DB and FIFO, that ack implies the certifier's earlier `ProposedCertificates` insert is
-    /// durable too. Narrowing this to `>` would let a reproposal skip the barrier and overtake that
-    /// insert, so a certificate could be re-gossiped from a record that is still memory-only.
+    /// keeps the reproposal behind the durability barrier below. After any failed epoch-DB commit
+    /// that barrier fails, so a reproposal fail-stops the proposer before its header reaches the
+    /// certifier. Narrowing this to `>` would let a reproposal skip the barrier and reach the
+    /// certifier on an epoch DB that can no longer make records durable.
+    ///
+    /// The barrier does not make the certifier's `ProposedCertificates` record durable. `persist`
+    /// queues its barrier when called and the runner acks in FIFO order, so the barrier covers only
+    /// the writes queued before it, and the certifier can insert that record after this barrier is
+    /// queued. The certifier's already-certified check therefore awaits its own
+    /// `ProposedCertificates` barrier before it re-gossips a stored certificate (issue #1530).
     async fn store_and_send_header(
         header: &Header,
         proposer_store: DB,
@@ -551,11 +555,44 @@ impl<DB: Database> Proposer<DB> {
     /// Process certificates received for this round.
     ///
     /// If the certificates are valid, include them as parents for the next header.
+    ///
+    /// Parents from another epoch are dropped before the round is compared: rounds restart every
+    /// epoch, so a stale certificate's round says nothing about this epoch's progress. Such parents
+    /// reach the proposer when the certificate store still holds a previous epoch's rows on
+    /// startup (the aggregator is replayed from it). Following them would jump the round past this
+    /// epoch's progress and propose a header whose parents every voter rejects.
     fn process_parents(&mut self, parents: Vec<Certificate>, round: Round) -> ProposerResult<()> {
-        // Sanity check: verify provided certs are of the correct round & epoch.
+        // Sanity check: verify provided certs are of the correct round.
         for parent in parents.iter() {
             if parent.round() != round {
                 error!(target: "primary::proposer", "received certificate {parent:?} that failed to match expected round {round}. This should not be possible.");
+            }
+        }
+
+        let epoch = self.committee.epoch();
+        let received = parents.len();
+        let parents: Vec<_> =
+            parents.into_iter().filter(|parent| parent.epoch() == epoch).collect();
+        if parents.len() < received {
+            warn!(
+                target: "primary::proposer",
+                authority=?self.authority_id,
+                epoch,
+                round=self.round,
+                parent_round=round,
+                ignored=received - parents.len(),
+                kept=parents.len(),
+                "ignoring parent certificates from another epoch",
+            );
+            // the aggregator counted the dropped certificates toward its quorum, so what is left
+            // only advances the round if it still reaches quorum on its own
+            let weight: VotingPower = parents
+                .iter()
+                .map(|parent| self.committee.voting_power_by_id(parent.origin()))
+                .sum();
+            if parents.is_empty() || (round > self.round && !self.committee.reached_quorum(weight))
+            {
+                return Ok(());
             }
         }
 
