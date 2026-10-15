@@ -177,13 +177,9 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// On chain id 487, the mainnet chain id, the node refuses a BLS key read from the
     /// cleartext `node-keys/bls.key` without a passphrase (for example with
     /// `--bls-passphrase-source no-passphrase`) and requires the passphrase-encrypted `bls.kw`.
-    /// This flag lifts that refusal.
-    #[arg(
-        long,
-        env = "TN_ALLOW_CLEARTEXT_BLS_KEY",
-        value_parser = BoolishValueParser::new(),
-        hide_short_help = true
-    )]
+    /// This flag lifts that refusal. It is read from the command line only, never from the
+    /// environment.
+    #[arg(long, hide_short_help = true)]
     pub allow_cleartext_bls_key: bool,
 
     /// Additional cli arguments
@@ -432,8 +428,7 @@ pub(crate) fn validate_bls_key_protection(
         "refusing to start on chain id {MAINNET_CHAIN_ID} with a cleartext BLS key: the key was \
          read from node-keys/bls.key without a passphrase (for example with \
          --bls-passphrase-source no-passphrase). Use a passphrase-encrypted key (bls.kw) and a \
-         passphrase source, or pass --allow-cleartext-bls-key (env \
-         TN_ALLOW_CLEARTEXT_BLS_KEY=true) on a test network"
+         passphrase source, or pass --allow-cleartext-bls-key on a test network"
     ))
 }
 
@@ -748,8 +743,8 @@ mod tests {
         }
     }
 
-    /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, reads its documented
-    /// environment variable, and stays out of the short help.
+    /// `--allow-cleartext-bls-key` defaults off, parses as a bare flag, has no environment
+    /// variable, and stays out of the short help.
     #[test]
     fn allow_cleartext_flag_parses_and_is_hidden_from_short_help() -> eyre::Result<()> {
         use clap::CommandFactory as _;
@@ -762,7 +757,7 @@ mod tests {
             .get_arguments()
             .find(|arg| arg.get_id() == "allow_cleartext_bls_key")
             .ok_or_else(|| eyre::eyre!("flag registered"))?;
-        assert_eq!(arg.get_env().and_then(|env| env.to_str()), Some("TN_ALLOW_CLEARTEXT_BLS_KEY"));
+        assert_eq!(arg.get_env(), None, "the cleartext opt-in is command-line only");
         assert!(!command.render_help().to_string().contains("--allow-cleartext-bls-key"));
         assert!(command.render_long_help().to_string().contains("--allow-cleartext-bls-key"));
         Ok(())

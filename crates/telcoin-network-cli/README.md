@@ -328,10 +328,10 @@ Mainnet uses chain id 487, and the devnet genesis files reuse it. On chain id 48
 
 | Flag                          | Default | Description                                                                                             |
 | ----------------------------- | ------- | ------------------------------------------------------------------------------------------------------- |
-| `--allow-cleartext-bls-key`   | `false` | Start on chain id 487 with a cleartext `bls.key`. Test networks only. Env: `TN_ALLOW_CLEARTEXT_BLS_KEY` |
+| `--allow-cleartext-bls-key`   | `false` | Start on chain id 487 with a cleartext `bls.key`. Test networks only. Command line only, no env variable |
 | `--allow-faucet-on-chain-487` | `false` | Let a faucet build start on a devnet that uses chain id 487. Env: `TN_ALLOW_FAUCET_ON_CHAIN_487`        |
 
-Both flags show in `node --help` but not in `node -h`. Their environment variables accept `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`. `db load-state` takes `--allow-faucet-on-chain-487` as well.
+Both flags show in `node --help` but not in `node -h`. `--allow-cleartext-bls-key` is read from the command line only, so an environment file cannot lift the cleartext key refusal. `TN_ALLOW_FAUCET_ON_CHAIN_487` accepts `true`, `false`, `1`, `0`, `yes`, `no`, `on` and `off`. `db load-state` takes `--allow-faucet-on-chain-487` as well.
 
 At startup, before these checks, the node logs one INFO line with the build features and the loaded chain:
 
