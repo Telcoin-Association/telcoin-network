@@ -12,7 +12,7 @@ mod policy;
 mod score;
 mod status;
 mod types;
-pub use admission::{AdmissionFallback, AdmissionStatus};
+pub use admission::{AdmissionFallback, AdmissionStatus, CommitteeUpdate};
 pub(crate) use manager::{PeerManager, PutRecordRate};
 pub use penalty::LoadPenalty;
 pub(crate) use penalty::Severity;

@@ -182,6 +182,10 @@ pub(crate) struct PeerManager {
     local_bls_key: Option<BlsPublicKey>,
     /// Epoch-versioned connection policy and renewable lease.
     admission_policy: AdmissionPolicy,
+    /// Age after which a cached window record is queried again on an accepted window update.
+    /// A live owner re-signs its record every publication interval, so an older binding can
+    /// belong to a retired network key. `None` disables the re-query.
+    record_max_age: Option<Duration>,
     /// Explicit trusted/bootstrap grants, separate from pinned dial hints and reputation.
     admission_operator_peers: HashMap<BlsPublicKey, PeerId>,
     /// Config
@@ -314,6 +318,11 @@ impl PeerManager {
         self.admission_policy.configure(config);
     }
 
+    /// Query cached window records older than `max_age` again on each accepted window update.
+    pub(crate) fn configure_record_max_age(&mut self, max_age: Duration) {
+        self.record_max_age = Some(max_age);
+    }
+
     /// Return admission observations separately from connected counts and consensus readiness.
     pub(crate) fn admission_status(&self) -> AdmissionStatus {
         self.evaluate_admission().0
@@ -333,9 +342,11 @@ impl PeerManager {
 
     /// Apply one predicate to every connection direction, including unknown pending identities.
     /// Closed rejects an unknown pending identity; authenticated establishment always rechecks.
+    /// Each Closed denial is counted by `direction` ({`in`, `out`}).
     pub(super) fn check_admission(
         &self,
         peer: Option<&PeerId>,
+        direction: &'static str,
     ) -> Result<(), libp2p::swarm::ConnectionDenied> {
         let (status, authorized) = self.evaluate_admission();
         if status.effective() != AdmissionMode::Closed
@@ -343,7 +354,10 @@ impl PeerManager {
         {
             Ok(())
         } else {
-            Err(libp2p::swarm::ConnectionDenied::new("closed connection admission policy"))
+            self.metrics.record_closed_admission_denied(direction);
+            Err(libp2p::swarm::ConnectionDenied::new(
+                super::behavior::PeerAdmissionDenied::ClosedAdmission,
+            ))
         }
     }
 
@@ -353,6 +367,13 @@ impl PeerManager {
         status.effective() == AdmissionMode::Closed && authorized.contains(peer)
     }
 
+    /// Under effective Closed, return the authorized set that bounds discovery dials.
+    /// Return `None` when the effective mode admits any peer. Evaluate once per pass.
+    fn admission_dial_scope(&self) -> Option<HashSet<PeerId>> {
+        let (status, authorized) = self.evaluate_admission();
+        (status.effective() == AdmissionMode::Closed).then_some(authorized)
+    }
+
     /// Unversioned compatibility updates must not enable a Closed policy.
     pub(crate) fn invalidate_admission(&mut self) {
         self.admission_policy.invalidate();
@@ -360,9 +381,12 @@ impl PeerManager {
 
     /// Atomically update authoritative membership and admission at an epoch revision.
     /// Old and contradictory updates fall back without replacing the accepted membership.
-    /// Return `true` only when the committee slots were replaced.
+    /// An accepted epoch-start update always applies the committee update, as the unversioned
+    /// update did, so a same-epoch re-entry keeps its side effects. An accepted renewal applies
+    /// it only when membership changed. Return `true` when the committee update was applied.
     pub(crate) fn update_committees_at(
         &mut self,
+        update: super::CommitteeUpdate,
         epoch: u64,
         previous: HashSet<BlsPublicKey>,
         current: HashSet<BlsPublicKey>,
@@ -371,12 +395,18 @@ impl PeerManager {
         let status = self.admission_status();
         let membership_changed = status.epoch() != Some(epoch)
             || status.fallback() == Some(super::AdmissionFallback::Missing);
+        let apply = match update {
+            super::CommitteeUpdate::EpochStart => true,
+            super::CommitteeUpdate::Renewal => membership_changed,
+        };
         let accepted =
             self.admission_policy.update(epoch, previous.clone(), current.clone(), next.clone());
         if accepted {
             if status.configured() != AdmissionMode::Open {
-                // Retry the complete window without reapplying ban forgiveness. Cold starts
-                // also need retiring identities before Closed can protect boundary traffic.
+                // Retry the complete window on every accepted update, renewals included. Cold
+                // starts also need retiring identities before Closed can protect boundary traffic.
+                // Outdated cached records are queried again, so a rotated network key is learned
+                // from an authorized peer.
                 let window = previous
                     .iter()
                     .chain(&current)
@@ -384,14 +414,14 @@ impl PeerManager {
                     .filter(|key| Some(**key) != self.local_bls_key)
                     .copied()
                     .collect();
-                self.trigger_missing_authorities(&window);
+                self.trigger_window_lookups(&window);
             }
-            if membership_changed {
+            if apply {
                 self.update_committees(previous, current, next);
             }
         }
         self.reconcile_admission();
-        accepted && membership_changed
+        accepted && apply
     }
 
     /// Revoke live connections outside a recovered Closed window without reputation penalties.
@@ -402,10 +432,13 @@ impl PeerManager {
             let revoked: Vec<_> =
                 self.peers.connected_peer_ids().filter(|peer| !authorized.contains(peer)).collect();
             revoked.into_iter().for_each(|peer| {
-                let banned = self.peers.peer_banned(&peer);
-                let action = self
-                    .peers
-                    .update_connection_status(&peer, NewConnectionStatus::Disconnecting { banned });
+                // Revocation is local policy, not misbehavior. It never marks the disconnect as
+                // banned, even when the peer shares an IP that was banned after it connected.
+                // A reputation-banned peer is already disconnecting and is not listed here.
+                let action = self.peers.update_connection_status(
+                    &peer,
+                    NewConnectionStatus::Disconnecting { banned: false },
+                );
                 self.events.push_back(PeerEvent::DisconnectPeer(peer));
                 // Ordinary disconnect actions impose a temporary ban. Admission revocation
                 // preserves existing ban ownership and creates no new ban or PX penalty.
@@ -481,6 +514,7 @@ impl PeerManager {
             local_peer_id,
             local_bls_key: None,
             admission_policy: Default::default(),
+            record_max_age: None,
             admission_operator_peers: Default::default(),
             config: *config,
             source_connections: SourceConnections::default(),
@@ -933,6 +967,11 @@ impl PeerManager {
         })
     }
 
+    /// Returns a boolean if the peer table has an entry for the peer.
+    pub(super) fn is_tracked_peer(&self, peer_id: &PeerId) -> bool {
+        self.peers.get_peer(peer_id).is_some()
+    }
+
     /// Whether `peer_id` is this swarm's own identity.
     ///
     /// A self-connection (the node dialing its own peer id, e.g. via a learned
@@ -1218,6 +1257,7 @@ impl PeerManager {
             // slots; the per-entry eligibility pass still visits each codec-bounded entry
             let peers_to_take = max_discovery_peers - current_count;
             let mut rng = rand::rng();
+            let scope = self.admission_dial_scope();
             let peers = peers
                 .into_iter()
                 .filter_map(|(_, (net_key, addrs))| {
@@ -1225,7 +1265,7 @@ impl PeerManager {
                         PeerInfo { peer_id: net_key.into(), addrs: addrs.into_iter().collect() };
 
                     // filter out ineligible peers
-                    if self.eligible_for_discovery(&info) {
+                    if self.eligible_for_discovery(&info, scope.as_ref()) {
                         debug!(target: "peer-manager", ?info, "peer exchange eligible");
                         Some(info)
                     } else {
@@ -1362,6 +1402,30 @@ impl PeerManager {
         if !missing.is_empty() {
             self.events.push_back(PeerEvent::MissingAuthorities(missing));
         }
+    }
+
+    /// Emit a [`PeerEvent::MissingAuthorities`] for window keys with no learned record or with
+    /// an outdated cached record. A Closed swarm cannot learn a rotated network key by
+    /// connection, so this lookup is its automatic path to the new binding.
+    fn trigger_window_lookups(&mut self, window: &HashSet<BlsPublicKey>) {
+        let observed = now();
+        let lookups: Vec<BlsPublicKey> = window
+            .iter()
+            .filter(|key| self.record_unlearned(key) || self.record_outdated(key, observed))
+            .copied()
+            .collect();
+        if !lookups.is_empty() {
+            self.events.push_back(PeerEvent::MissingAuthorities(lookups));
+        }
+    }
+
+    /// Whether the cached record for `bls_key` was signed more than the record age limit ago.
+    fn record_outdated(&self, bls_key: &BlsPublicKey, observed: tn_types::TimestampSec) -> bool {
+        self.record_max_age.is_some_and(|max_age| {
+            self.known_peers
+                .get(bls_key)
+                .is_some_and(|info| observed.saturating_sub(info.timestamp) > max_age.as_secs())
+        })
     }
 
     /// Emit a [`PeerEvent::MissingAuthorities`] for configured hubs whose record is unresolved
@@ -2014,7 +2078,8 @@ impl PeerManager {
     /// - it has at least one valid ip address (ipv4/ipv6)
     /// - none of its ip addresses are banned
     /// - it can be dialed (not connected/dialing/banned)
-    fn eligible_for_discovery(&self, info: &PeerInfo) -> bool {
+    /// - under effective Closed, it is in the authorized `scope`
+    fn eligible_for_discovery(&self, info: &PeerInfo, scope: Option<&HashSet<PeerId>>) -> bool {
         // never add our own identity to the discovery feed; a self entry (learned
         // via kad closest-peers or peer exchange) would otherwise be selected for
         // a self-dial during the heartbeat.
@@ -2031,6 +2096,7 @@ impl PeerManager {
             && info.addrs.len() <= MAX_MULTIADDRS_PER_PEER
             && self.has_valid_unbanned_ips(&info.addrs)
             && self.peers.can_dial(&info.peer_id)
+            && scope.is_none_or(|authorized| authorized.contains(&info.peer_id))
     }
 
     /// Process newly discovered peers for potential dial attempts.
@@ -2045,7 +2111,8 @@ impl PeerManager {
     /// heartbeat prune it mirrors. [`Self::process_peer_exchange`] stays fill-to-spare-capacity
     /// only, which keeps kad-discovered peers prioritized over exchange peers.
     pub(crate) fn process_peers_for_discovery(&mut self, mut peers: Vec<PeerInfo>) {
-        peers.retain(|peer| self.eligible_for_discovery(peer));
+        let scope = self.admission_dial_scope();
+        peers.retain(|peer| self.eligible_for_discovery(peer, scope.as_ref()));
         trace!(target: "peer-manager", ?peers, "adding eligible peers to discovery map");
         self.discovery_peers.extend(peers.into_iter().map(|info| (info.peer_id, info.addrs)));
 
@@ -2066,9 +2133,10 @@ impl PeerManager {
     fn discovery_heartbeat(&mut self) {
         // take discovery peers and filter ineligble peers
         let mut discovery_peers = std::mem::take(&mut self.discovery_peers);
+        let scope = self.admission_dial_scope();
         discovery_peers.retain(|peer_id, addrs| {
             let peer_info = PeerInfo { peer_id: *peer_id, addrs: addrs.clone() };
-            self.eligible_for_discovery(&peer_info)
+            self.eligible_for_discovery(&peer_info, scope.as_ref())
         });
 
         // calculate dial attempts needed for target connection limits

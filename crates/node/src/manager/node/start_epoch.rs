@@ -536,7 +536,8 @@ where
     ///
     /// Refresh each active handle and initialize pools and RPC servers in id order to preserve the
     /// engine's contiguous worker indexing, then bring up the epoch networks concurrently.
-    /// Extra configured swarms stay idle until a future epoch activates their ids.
+    /// Extra configured swarms keep listening, so they get this epoch's admission window and its
+    /// renewal, but no worker node, until a future epoch activates their ids.
     /// Workers removed from the committee close transaction admission before the new epoch's
     /// workers start.
     #[allow(clippy::too_many_arguments)]
@@ -564,6 +565,12 @@ where
             });
 
         engine.deactivate_workers_above(consensus_config.committee().number_of_workers()).await;
+        self.publish_inactive_worker_windows(
+            consensus_config,
+            &epoch_task_spawner,
+            previous_committee_keys.clone(),
+        )
+        .await?;
 
         // Follow mode changes while workers initialize.
         let engine_for_sync_status = engine.clone();
@@ -599,6 +606,47 @@ where
             )
         }))
         .await
+    }
+
+    /// Publish this epoch's admission window to every configured worker swarm outside the
+    /// on-chain worker range.
+    ///
+    /// These swarms keep their process-lifetime listeners. Without a versioned window their
+    /// admission falls back to Missing (startup) or Stale (after a shrink), and both map to Open
+    /// under Closed. Each gets the same window as the active workers and its renewal on this
+    /// epoch's spawner. No worker node, gossip subscription or dial starts for these ids.
+    async fn publish_inactive_worker_windows(
+        &self,
+        consensus_config: &ConsensusConfig<DB>,
+        epoch_task_spawner: &TaskSpawner,
+        previous_committee_keys: HashSet<BlsPublicKey>,
+    ) -> eyre::Result<()> {
+        let committee_keys: HashSet<BlsPublicKey> = consensus_config
+            .committee()
+            .authorities()
+            .into_iter()
+            .map(|a| *a.protocol_key())
+            .collect();
+        let next_committee_keys: HashSet<BlsPublicKey> =
+            consensus_config.next_committee_keys().iter().copied().collect();
+        futures::future::try_join_all(
+            self.worker_network_handles
+                .iter()
+                .skip(consensus_config.committee().number_of_workers())
+                .map(|handle| {
+                    Self::init_network_for_epoch(
+                        handle.inner_handle(),
+                        u64::from(consensus_config.committee().epoch()),
+                        previous_committee_keys.clone(),
+                        committee_keys.clone(),
+                        next_committee_keys.clone(),
+                        epoch_task_spawner,
+                        consensus_config.network_config().admission().refresh_interval(),
+                    )
+                }),
+        )
+        .await
+        .map(drop)
     }
 
     /// Initialize one worker's persistent components in ascending worker-id order.
@@ -1142,7 +1190,7 @@ where
                 let current = committee_keys.clone();
                 let next = next_committee_keys.clone();
                 async move {
-                    let _ = handle.update_committees_at(epoch, previous, current, next).await
+                    let _ = handle.renew_committees_at(epoch, previous, current, next).await
                         .inspect_err(|error| warn!(target: "epoch-manager", ?error, epoch, "admission snapshot renewal failed"));
                 }
             }).await;
@@ -1297,7 +1345,7 @@ mod tests {
         use rand::{rngs::StdRng, SeedableRng as _};
         use std::time::Duration;
         use tn_config::KeyConfig;
-        use tn_network_libp2p::types::NetworkCommand;
+        use tn_network_libp2p::{types::NetworkCommand, CommitteeUpdate};
         use tn_reth::RethEnv;
         use tn_storage::mem_db::MemDatabase;
         use tn_test_utils::CommitteeFixture;
@@ -1413,18 +1461,21 @@ mod tests {
         let identified_mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
         assert_eq!(std::mem::discriminant(&identified_mode), std::mem::discriminant(&mode));
         let (topic_sender, mut topic_changes) = mpsc::unbounded_channel();
+        let (window_sender, mut window_changes) = mpsc::unbounded_channel();
         // Neither worker can finish its first probe until both networks have entered their wait.
         let first_probes = Arc::new(tokio::sync::Barrier::new(2));
         manager.worker_network_handles = (0..2)
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
                 let topic_sender = topic_sender.clone();
+                let window_sender = window_sender.clone();
                 let first_probes = first_probes.clone();
                 network_tasks.spawn_task("test worker commands", async move {
                     let probed = std::sync::atomic::AtomicBool::new(false);
                     tokio_stream::wrappers::ReceiverStream::new(receiver)
                         .for_each(|command| {
                             let topic_sender = topic_sender.clone();
+                            let window_sender = window_sender.clone();
                             let first_probes = &first_probes;
                             let probed = &probed;
                             async move {
@@ -1448,6 +1499,13 @@ mod tests {
                                     let _ = topic_sender
                                         .send(BatchTopicChange::Unsubscribe(worker_id, topic));
                                     let _ = reply.send(false);
+                                } else if let NetworkCommand::UpdateAdmissionCommittees {
+                                    update,
+                                    epoch,
+                                    ..
+                                } = command
+                                {
+                                    let _ = window_sender.send((worker_id, update, epoch));
                                 } else if let NetworkCommand::ConnectedPeerIds { reply } = command {
                                     let _ = reply.send(Default::default());
                                 }
@@ -1630,6 +1688,21 @@ mod tests {
             futures::stream::iter(&shrunk).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0]);
         assert_topics(1);
+        // The retired worker keeps its listener, so it gets the same epoch-start window as
+        // worker 0. The reply to this command proves the mock handled the earlier window command.
+        manager
+            .worker_network_handles
+            .get(1)
+            .ok_or_else(|| eyre!("retired worker handle"))?
+            .inner_handle()
+            .connected_peer_count()
+            .await?;
+        let mut windows = std::iter::from_fn(|| window_changes.try_recv().ok())
+            .filter(|(_, update, epoch)| *update == CommitteeUpdate::EpochStart && *epoch == 2)
+            .map(|(worker_id, ..)| worker_id)
+            .collect::<Vec<_>>();
+        windows.sort_unstable();
+        assert_eq!(windows, vec![0, 1]);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(
             engine.worker_readiness().await,

@@ -18,13 +18,15 @@ use tracing::{debug, error, info, trace};
 
 /// A policy denial owned by the peer manager, preserved through libp2p's error wrapper.
 #[derive(Debug, Clone, Copy)]
-enum PeerAdmissionDenied {
+pub(super) enum PeerAdmissionDenied {
     /// The remote identity is this swarm's own identity.
     LocalPeer,
     /// The authenticated remote peer is banned.
     BannedPeer,
     /// The remote address has no supported, unbanned IP address.
     InvalidIp,
+    /// The Closed admission policy refuses this peer.
+    ClosedAdmission,
 }
 
 impl PeerAdmissionDenied {
@@ -34,6 +36,7 @@ impl PeerAdmissionDenied {
             Self::LocalPeer => "peer_manager_local_peer",
             Self::BannedPeer => "peer_manager_banned_peer",
             Self::InvalidIp => "peer_manager_invalid_ip",
+            Self::ClosedAdmission => "peer_manager_closed_admission",
         }
     }
 }
@@ -44,12 +47,24 @@ impl std::fmt::Display for PeerAdmissionDenied {
             Self::LocalPeer => "self-connection: remote peer id is our own",
             Self::BannedPeer => "peer is banned",
             Self::InvalidIp => "Connection denied: peer has no valid unbanned IP addresses",
+            Self::ClosedAdmission => "closed connection admission policy",
         };
         f.write_str(message)
     }
 }
 
 impl std::error::Error for PeerAdmissionDenied {}
+
+/// Whether the Closed admission policy refused this dial.
+fn is_closed_admission_denial(error: &DialError) -> bool {
+    matches!(
+        error,
+        DialError::Denied { cause }
+            if cause
+                .downcast_ref::<PeerAdmissionDenied>()
+                .is_some_and(|denied| matches!(denied, PeerAdmissionDenied::ClosedAdmission))
+    )
+}
 
 impl NetworkBehaviour for PeerManager {
     type ConnectionHandler = ConnectionHandler;
@@ -64,7 +79,7 @@ impl NetworkBehaviour for PeerManager {
     ) -> Result<Vec<Multiaddr>, ConnectionDenied> {
         // Check before the in-flight shortcut and Kademlia registration. Unknown identities
         // cannot start a Closed dial; every established connection is checked again.
-        self.check_admission(maybe_peer.as_ref())?;
+        self.check_admission(maybe_peer.as_ref(), "out")?;
         // kademlia can initiate dial attempts
         //
         // ensure PeerId isn't banned if known and register dial attempt
@@ -128,7 +143,6 @@ impl NetworkBehaviour for PeerManager {
         _local_addr: &Multiaddr,
         remote_addr: &Multiaddr,
     ) -> Result<THandler<Self>, ConnectionDenied> {
-        self.check_admission(Some(&peer))?;
         // drop a self-connection (loopback/hairpin back to our own id) without
         // scoring it. The inbound peer id is only known at this stage, so this is
         // the earliest point an inbound self-connection can be rejected.
@@ -139,6 +153,8 @@ impl NetworkBehaviour for PeerManager {
         if self.peer_banned(&peer) {
             return Err(ConnectionDenied::new(PeerAdmissionDenied::BannedPeer));
         }
+        // Check admission after the local and ban checks, so those denials keep their labels.
+        self.check_admission(Some(&peer), "in")?;
 
         self.reserve_source(connection_id, peer, remote_addr, "in")?;
         Ok(ConnectionHandler)
@@ -153,7 +169,6 @@ impl NetworkBehaviour for PeerManager {
         _port_use: PortUse,
     ) -> Result<THandler<Self>, ConnectionDenied> {
         trace!(target: "peer-manager", ?peer, ?addr, "outbound connection established");
-        self.check_admission(Some(&peer))?;
         // drop a self-connection without scoring it (backstop for the pending
         // guard in case a self-dial still reaches the established stage).
         if self.is_local_peer(&peer) {
@@ -167,6 +182,8 @@ impl NetworkBehaviour for PeerManager {
 
         // kad may dial peers by PeerId only, so always santize ban IPs after connection established
         self.sanitize_ip_addr(addr)?;
+        // Check admission after the local, ban and IP checks, so those denials keep their causes.
+        self.check_admission(Some(&peer), "out")?;
 
         self.reserve_source(connection_id, peer, addr, "out")?;
         Ok(ConnectionHandler)
@@ -374,7 +391,12 @@ impl PeerManager {
     pub(super) fn on_dial_failure(&mut self, peer_id: Option<PeerId>, error: &DialError) {
         self.metrics.record_dial_failure();
         if let Some(peer_id) = peer_id {
-            if !self.is_connected(&peer_id) {
+            // A Closed admission denial of an untracked peer adds no table entry, so refused
+            // discovery candidates do not churn the table. A peer that `dial_peer` registered
+            // as Dialing still moves to Disconnected.
+            let untracked_denial =
+                is_closed_admission_denial(error) && !self.is_tracked_peer(&peer_id);
+            if !self.is_connected(&peer_id) && !untracked_denial {
                 self.register_disconnected(&peer_id);
             }
 

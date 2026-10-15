@@ -14,7 +14,7 @@ pub enum AdmissionFallback {
     Missing,
     /// The snapshot lease expired or an older epoch attempted to replace it.
     Stale,
-    /// One epoch supplied different committees, or identity mappings conflict.
+    /// One epoch supplied different committees.
     Contradictory,
     /// Committee records or identity mappings are still unresolved.
     Unresolved,
@@ -37,6 +37,8 @@ pub struct AdmissionStatus {
     required_current: usize,
     /// Connected current peers, excluding the local identity.
     connected_current: usize,
+    /// Identities whose PeerId another identity also claims, or that differs from configuration.
+    contradicted: usize,
 }
 
 impl AdmissionStatus {
@@ -68,6 +70,19 @@ impl AdmissionStatus {
     pub fn connected_current(&self) -> usize {
         self.connected_current
     }
+    /// Return the number of identities with a contradicted PeerId binding.
+    pub fn contradicted(&self) -> usize {
+        self.contradicted
+    }
+}
+
+/// Sender of an authoritative committee window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitteeUpdate {
+    /// Epoch-start publication. An accepted update always applies the committee update.
+    EpochStart,
+    /// Lease renewal. An identical window only renews the lease.
+    Renewal,
 }
 
 /// Immutable committee window at one epoch revision.
@@ -138,7 +153,10 @@ impl AdmissionPolicy {
     }
 
     /// Resolve grants from verified records and explicit operator identities only.
-    /// Incomplete identities use Grace; missing, stale, and conflicting inputs use Open.
+    /// Incomplete identities use Grace; missing, stale, and contradictory revisions use Open.
+    /// A contradicted identity binding does not change the effective mode. Every resolved
+    /// PeerId and every configured operator PeerId stay authorized, so a forged record cannot
+    /// remove the grant of the identity it collides with. The status counts these identities.
     pub(super) fn evaluate(
         &self,
         known: &HashMap<BlsPublicKey, NetworkInfo>,
@@ -168,12 +186,24 @@ impl AdmissionPolicy {
             .chain(operator.keys())
             .filter_map(|key| resolve(key).map(|peer| (*key, peer)))
             .collect();
-        let authorized: HashSet<_> = identities.values().copied().collect();
+        let authorized: HashSet<_> =
+            identities.values().chain(operator.values()).copied().collect();
         let unresolved = keys.iter().any(|key| !identities.contains_key(key));
-        let contradictory = authorized.len() != identities.len()
-            || operator
-                .iter()
-                .any(|(key, peer)| resolve(key).is_some_and(|resolved| resolved != *peer));
+        let claims =
+            identities.values().fold(HashMap::<PeerId, usize>::new(), |mut claims, peer| {
+                claims
+                    .entry(*peer)
+                    .and_modify(|count| *count = count.saturating_add(1))
+                    .or_insert(1);
+                claims
+            });
+        let contradicted = identities
+            .iter()
+            .filter(|(key, peer)| {
+                claims.get(*peer).is_some_and(|count| *count > 1)
+                    || operator.get(*key).is_some_and(|configured| configured != *peer)
+            })
+            .count();
         let (resolved_current, required_current, connected_current) = self
             .snapshot
             .as_ref()
@@ -200,7 +230,6 @@ impl AdmissionPolicy {
             () if self.renewed.is_none_or(|at| at.elapsed() >= self.config.snapshot_max_age()) => {
                 Some(AdmissionFallback::Stale)
             }
-            () if contradictory => Some(AdmissionFallback::Contradictory),
             () if unresolved || resolved_current < required_current => {
                 Some(AdmissionFallback::Unresolved)
             }
@@ -227,6 +256,7 @@ impl AdmissionPolicy {
                 resolved_current,
                 required_current,
                 connected_current,
+                contradicted,
             },
             authorized,
         )

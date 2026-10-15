@@ -825,6 +825,8 @@ struct PeerManagerMetricHandles {
     admission_required_current: Gauge,
     /// Connected current peers, excluding the local identity.
     admission_connected_current: Gauge,
+    /// Identities with a contradicted PeerId binding. They do not change the effective mode.
+    admission_contradicted: Gauge,
     /// Fallback: healthy = 0, missing = 1, stale = 2, contradictory = 3, unresolved = 4.
     admission_fallback: Gauge,
     /// Currently connected peers.
@@ -873,6 +875,9 @@ impl PeerManagerMetrics {
         self.handles
             .admission_connected_current
             .set(u32::try_from(status.connected_current()).map_or(f64::MAX, f64::from));
+        self.handles
+            .admission_contradicted
+            .set(u32::try_from(status.contradicted()).map_or(f64::MAX, f64::from));
         self.handles.admission_fallback.set(status.fallback().map_or(0.0, |reason| match reason {
             crate::AdmissionFallback::Missing => 1.0,
             crate::AdmissionFallback::Stale => 2.0,
@@ -935,6 +940,16 @@ impl PeerManagerMetrics {
             "network" => self.network.clone(),
             "direction" => direction,
             "reason" => reason,
+        )
+        .increment(1);
+    }
+
+    /// Record a Closed admission policy denial by direction ({`in`, `out`}).
+    pub(crate) fn record_closed_admission_denied(&self, direction: &'static str) {
+        metrics::counter!(
+            "tn_network.closed_admission_denied_total",
+            "network" => self.network.clone(),
+            "direction" => direction,
         )
         .increment(1);
     }

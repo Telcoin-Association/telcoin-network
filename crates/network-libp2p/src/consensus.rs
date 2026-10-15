@@ -747,6 +747,11 @@ where
         // the primary BLS key, and there is no point caching ourselves as a known peer.
         let own_key = key_config.primary_public_key();
         behavior.peer_manager.configure_admission(network_config.admission().clone(), own_key);
+        // A live owner re-signs its record every publication interval. A cached window record
+        // older than two intervals is queried again, so a rotated network key heals under Closed.
+        behavior
+            .peer_manager
+            .configure_record_max_age(network_config.libp2p_config().kad_publication_interval * 2);
         let mut restored: usize = 0;
         for (key, info) in known {
             if key == own_key {
@@ -1487,18 +1492,25 @@ where
                 self.query_missing_required_records();
                 retention?;
             }
-            NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next } => {
-                // Mirror the `UpdateCommittees` arm for authoritative epoch updates. Only a
-                // replaced window moves retention, so an old or contradictory revision cannot
-                // prune the records of the accepted committees.
+            NetworkCommand::UpdateAdmissionCommittees {
+                update,
+                epoch,
+                previous,
+                current,
+                next,
+            } => {
+                // Mirror the `UpdateCommittees` arm for authoritative epoch updates. Only an
+                // applied update moves retention: every accepted epoch-start send, and a renewal
+                // that changes membership. An old or contradictory revision cannot prune the
+                // records of the accepted committees.
                 let window: Vec<_> =
                     previous.iter().chain(&current).chain(&next).copied().collect();
-                let replaced = self
+                let applied = self
                     .swarm
                     .behaviour_mut()
                     .peer_manager
-                    .update_committees_at(epoch, previous, current, next);
-                if replaced {
+                    .update_committees_at(update, epoch, previous, current, next);
+                if applied {
                     let retention = self
                         .swarm
                         .behaviour_mut()

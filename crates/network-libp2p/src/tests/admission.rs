@@ -1,11 +1,20 @@
 //! Admission matrices and deterministic fallback, renewal, and rotation regressions.
 
 use super::*;
-use crate::{common::create_multiaddr, types::NetworkType, AdmissionFallback};
-use libp2p::{
-    core::{transport::PortUse, Endpoint},
-    swarm::{ConnectionId, NetworkBehaviour as _},
+use crate::{
+    common::{create_multiaddr, random_ip_addr},
+    peers::behavior::PeerAdmissionDenied,
+    types::NetworkType,
+    AdmissionFallback, CommitteeUpdate,
 };
+use libp2p::{
+    core::{transport::PortUse, ConnectedPoint, Endpoint},
+    swarm::{
+        ConnectionClosed, ConnectionId, DialError, DialFailure, FromSwarm, ListenError,
+        ListenFailure, NetworkBehaviour as _,
+    },
+};
+use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use rand::{rngs::StdRng, SeedableRng as _};
 use tn_types::{now, BlsKeypair, NetworkKeypair};
 
@@ -85,12 +94,17 @@ impl AdmissionFixture {
     }
     /// Renew the immutable authoritative window.
     fn renew(&mut self, epoch: u64) {
+        self.publish(CommitteeUpdate::Renewal, epoch);
+    }
+    /// Send the immutable authoritative window. Return `true` when the update was applied.
+    fn publish(&mut self, update: CommitteeUpdate, epoch: u64) -> bool {
         self.manager.update_committees_at(
+            update,
             epoch,
             HashSet::from([self.previous.bls]),
             HashSet::from([self.local, self.current.bls]),
             HashSet::from([self.next.bls]),
-        );
+        )
     }
 }
 
@@ -211,7 +225,13 @@ async fn admission_faults_fallback_and_recover() {
     [&fixture.previous, &fixture.current, &fixture.next].into_iter().for_each(|peer| {
         fixture.manager.cache_known_peer(peer.bls, peer.info.clone());
     });
-    fixture.manager.update_committees_at(8, HashSet::new(), HashSet::new(), HashSet::new());
+    fixture.manager.update_committees_at(
+        CommitteeUpdate::EpochStart,
+        8,
+        HashSet::new(),
+        HashSet::new(),
+        HashSet::new(),
+    );
     assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Missing));
     assert_eq!(fixture.manager.admission_status().epoch(), Some(7));
     fixture.renew(7);
@@ -231,6 +251,7 @@ async fn admission_faults_fallback_and_recover() {
     assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
     fixture.renew(7);
     fixture.manager.update_committees_at(
+        CommitteeUpdate::EpochStart,
         7,
         HashSet::new(),
         HashSet::from([fixture.local]),
@@ -251,7 +272,7 @@ async fn admission_faults_fallback_and_recover() {
     assert_admission_hooks(&mut fixture.manager, ordinary, false);
 }
 
-/// Quorum counts ignore config stubs and connected peers; ambiguous identity maps fail open.
+/// Quorum counts ignore config stubs and connected peers; ambiguous identity maps stay Closed.
 #[tokio::test]
 async fn admission_resolution_is_separate_from_connections_and_grants() {
     let mut fixture = AdmissionFixture::new(NetworkType::Worker(0), AdmissionMode::Closed);
@@ -266,13 +287,47 @@ async fn admission_resolution_is_separate_from_connections_and_grants() {
     let contradictory =
         NetworkInfo { pubkey: fixture.current.info.pubkey.clone(), ..fixture.next.info.clone() };
     fixture.manager.cache_known_peer(fixture.next.bls, contradictory);
-    assert_eq!(
-        fixture.manager.admission_status().fallback(),
-        Some(AdmissionFallback::Contradictory)
-    );
-    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Open);
+    assert_eq!(fixture.manager.admission_status().fallback(), None);
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    assert_eq!(fixture.manager.admission_status().contradicted(), 2);
     fixture.manager.cache_known_peer(fixture.next.bls, fixture.next.info.clone());
     assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    assert_eq!(fixture.manager.admission_status().contradicted(), 0);
+}
+
+/// A window member's restored record that claims a bootstrap peer's network key cannot open a
+/// Closed swarm. The bootstrap victim stays admitted and the status counts both identities.
+#[tokio::test]
+async fn admission_record_collision_keeps_closed_and_victim() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
+    let victim = fixture.bootstrap.id();
+    let ordinary = fixture.ordinary.id();
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Closed);
+    assert_eq!(fixture.manager.admission_status().contradicted(), 0);
+    let forged =
+        NetworkInfo { pubkey: fixture.bootstrap.info.pubkey.clone(), ..fixture.next.info.clone() };
+    fixture.manager.add_restored_peer(fixture.next.bls, forged);
+    let status = fixture.manager.admission_status();
+    assert_eq!(status.fallback(), None);
+    assert_eq!(status.effective(), AdmissionMode::Closed);
+    assert_eq!(status.contradicted(), 2);
+    assert_admission_hooks(&mut fixture.manager, victim, true);
+    assert_admission_hooks(&mut fixture.manager, ordinary, false);
+}
+
+/// An identical same-epoch epoch-start send applies the committee update again in Open mode, as
+/// the unversioned update did. An identical renewal only renews the lease.
+#[tokio::test]
+async fn admission_epoch_start_reentry_reapplies_committee_update() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let current = fixture.current.id();
+    fixture.manager.temporarily_banned.insert(current);
+    assert!(!fixture.publish(CommitteeUpdate::Renewal, 7));
+    assert!(fixture.manager.temporarily_banned.contains(&current));
+    assert!(fixture.publish(CommitteeUpdate::EpochStart, 7));
+    assert!(!fixture.manager.temporarily_banned.contains(&current));
+    assert_eq!(fixture.manager.admission_status().epoch(), Some(7));
+    assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Open);
 }
 
 /// Recovering Closed revokes ordinary live peers while preserving grants under discovery pressure.
@@ -307,6 +362,7 @@ async fn admission_live_rotation_and_discovery_pressure() {
         ConnectionType::IncomingConnection { multiaddr: create_multiaddr(None) },
     );
     fixture.manager.update_committees_at(
+        CommitteeUpdate::EpochStart,
         8,
         HashSet::from([fixture.current.bls]),
         HashSet::from([fixture.local, fixture.next.bls]),
@@ -336,4 +392,207 @@ async fn admission_compatibility_modes_and_zero_lease() {
     );
     assert_eq!(fixture.manager.admission_status().effective(), AdmissionMode::Open);
     assert_eq!(fixture.manager.admission_status().fallback(), Some(AdmissionFallback::Stale));
+}
+
+/// A Closed refusal has its own listen-failure reason and a counter by direction.
+/// Ban denials keep their own label because admission is checked after them.
+#[tokio::test]
+async fn admission_closed_denial_is_typed_and_counted() {
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    metrics::with_local_recorder(&recorder, || {
+        let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
+        let ordinary = fixture.ordinary.id();
+        let addr = create_multiaddr(None);
+        let denial = fixture
+            .manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(1),
+                ordinary,
+                &addr,
+                &addr,
+            )
+            .err()
+            .expect("Closed refuses an ordinary inbound peer");
+        assert!(denial
+            .downcast_ref::<PeerAdmissionDenied>()
+            .is_some_and(|cause| matches!(cause, PeerAdmissionDenied::ClosedAdmission)));
+        fixture.manager.on_swarm_event(FromSwarm::ListenFailure(ListenFailure {
+            local_addr: &addr,
+            send_back_addr: &addr,
+            error: &ListenError::Denied { cause: denial },
+            connection_id: ConnectionId::new_unchecked(1),
+            peer_id: Some(ordinary),
+        }));
+        assert!(fixture
+            .manager
+            .handle_pending_outbound_connection(
+                ConnectionId::new_unchecked(2),
+                Some(ordinary),
+                &[],
+                Endpoint::Dialer
+            )
+            .is_err());
+        fixture.manager.temporarily_banned.insert(ordinary);
+        let banned = fixture
+            .manager
+            .handle_established_inbound_connection(
+                ConnectionId::new_unchecked(3),
+                ordinary,
+                &addr,
+                &addr,
+            )
+            .err()
+            .expect("a banned peer is refused");
+        assert!(banned
+            .downcast_ref::<PeerAdmissionDenied>()
+            .is_some_and(|cause| matches!(cause, PeerAdmissionDenied::BannedPeer)));
+    });
+
+    let snapshot = snapshotter.snapshot().into_vec();
+    let counter = |name: &str, label: &str, value: &str| {
+        snapshot
+            .iter()
+            .find(|(key, ..)| {
+                key.key().name() == name
+                    && key.key().labels().any(|l| l.key() == label && l.value() == value)
+            })
+            .map(|(_, _, _, metric)| match metric {
+                DebugValue::Counter(c) => *c,
+                DebugValue::Gauge(_) | DebugValue::Histogram(_) => {
+                    panic!("{name} must be a counter")
+                }
+            })
+    };
+    assert_eq!(counter("tn_network.closed_admission_denied_total", "direction", "in"), Some(1));
+    assert_eq!(counter("tn_network.closed_admission_denied_total", "direction", "out"), Some(1));
+    assert_eq!(
+        counter("tn_network.listen_failures_total", "reason", "peer_manager_closed_admission"),
+        Some(1)
+    );
+}
+
+/// A real Closed dial failure adds no table entry for an untracked peer, a Dialing peer still
+/// moves to Disconnected, and discovery skips unauthorized candidates.
+#[tokio::test]
+async fn admission_closed_dial_failure_and_discovery_scope() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
+    let ordinary = fixture.ordinary.id();
+    let deliver_denied_dial = |manager: &mut PeerManager| {
+        let cause = manager
+            .handle_pending_outbound_connection(
+                ConnectionId::new_unchecked(1),
+                Some(ordinary),
+                &[],
+                Endpoint::Dialer,
+            )
+            .err()
+            .expect("Closed refuses an ordinary dial");
+        manager.on_swarm_event(FromSwarm::DialFailure(DialFailure {
+            peer_id: Some(ordinary),
+            error: &DialError::Denied { cause },
+            connection_id: ConnectionId::new_unchecked(1),
+        }));
+    };
+    deliver_denied_dial(&mut fixture.manager);
+    assert!(fixture.manager.peers.get_peer(&ordinary).is_none());
+
+    fixture.manager.peers.register_dial_attempt(ordinary, None);
+    deliver_denied_dial(&mut fixture.manager);
+    assert!(fixture.manager.peers.get_peer(&ordinary).is_some_and(|peer| {
+        matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. })
+    }));
+
+    let candidate =
+        |peer: &AdmissionPeer| PeerInfo { peer_id: peer.id(), addrs: peer.info.multiaddrs.clone() };
+    let candidates = vec![candidate(&fixture.ordinary), candidate(&fixture.current)];
+    fixture.manager.process_peers_for_discovery(candidates);
+    assert!(!fixture.manager.discovery_peers.contains_key(&ordinary));
+    assert!(fixture.manager.discovery_peers.contains_key(&fixture.current.id()));
+}
+
+/// Revoking a peer on an IP banned after it connected creates no ban when the connection closes.
+#[tokio::test]
+async fn admission_revocation_on_banned_ip_creates_no_ban() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Open);
+    let ip = random_ip_addr();
+    let addr = create_multiaddr(Some(ip));
+    let ordinary = fixture.ordinary.id();
+    fixture.manager.register_peer_connection(
+        &ordinary,
+        ConnectionType::IncomingConnection { multiaddr: addr.clone() },
+    );
+    // two banned peers on the same IP ban that IP after the ordinary peer connected
+    [PeerId::random(), PeerId::random()].into_iter().for_each(|offender| {
+        fixture.manager.register_peer_connection(
+            &offender,
+            ConnectionType::IncomingConnection { multiaddr: addr.clone() },
+        );
+        fixture.manager.process_penalty(offender, Penalty::Fatal);
+        fixture.manager.register_disconnected(&offender);
+    });
+    assert!(fixture.manager.is_ip_banned(&ip));
+    fixture.manager.events.clear();
+
+    fixture.manager.configure_admission(
+        AdmissionConfig::new(AdmissionMode::Closed, Duration::from_secs(300)),
+        fixture.local,
+    );
+    fixture.renew(7);
+    assert!(fixture
+        .manager
+        .events
+        .iter()
+        .any(|event| matches!(event, PeerEvent::DisconnectPeer(peer) if *peer == ordinary)));
+    fixture.manager.on_swarm_event(FromSwarm::ConnectionClosed(ConnectionClosed {
+        peer_id: ordinary,
+        connection_id: ConnectionId::new_unchecked(1),
+        endpoint: &ConnectedPoint::Listener { local_addr: addr.clone(), send_back_addr: addr },
+        cause: None,
+        remaining_established: 0,
+    }));
+
+    // a ban would set Banned, raise the IP ban count, and emit `PeerEvent::Banned`
+    assert!(!fixture
+        .manager
+        .events
+        .iter()
+        .any(|event| matches!(event, PeerEvent::Banned(peer) if *peer == ordinary)));
+    assert!(!fixture.manager.temporarily_banned.contains(&ordinary));
+    assert!(fixture.manager.peers.get_peer(&ordinary).is_some_and(|peer| {
+        matches!(peer.connection_status(), ConnectionStatus::Disconnected { .. })
+    }));
+}
+
+/// A window update queries a key again when its cached record is older than the record age
+/// limit, so a Closed swarm can learn a rotated network key. Fresh records are not queried.
+#[test]
+fn admission_renewal_requeries_outdated_window_record() {
+    let mut fixture = AdmissionFixture::new(NetworkType::Primary, AdmissionMode::Closed);
+    let retired = AdmissionPeer::new();
+    fixture.previous = AdmissionPeer {
+        bls: retired.bls,
+        info: NetworkInfo { timestamp: now().saturating_sub(2 * 60 * 60), ..retired.info },
+    };
+    fixture.renew(8);
+    fixture.manager.cache_known_peer(fixture.previous.bls, fixture.previous.info.clone());
+    let queried = |manager: &PeerManager, key: &BlsPublicKey| {
+        manager
+            .events
+            .iter()
+            .any(|event| matches!(event, PeerEvent::MissingAuthorities(keys) if keys.contains(key)))
+    };
+
+    // Without an age limit, a learned record is never queried again.
+    fixture.manager.events.clear();
+    fixture.renew(8);
+    assert!(!queried(&fixture.manager, &fixture.previous.bls));
+
+    // With a one-hour limit, an identical renewal queries the two-hour-old record again.
+    fixture.manager.configure_record_max_age(Duration::from_secs(60 * 60));
+    fixture.manager.events.clear();
+    fixture.renew(8);
+    assert!(queried(&fixture.manager, &fixture.previous.bls));
+    assert!(!queried(&fixture.manager, &fixture.current.bls));
+    assert!(!queried(&fixture.manager, &fixture.next.bls));
 }

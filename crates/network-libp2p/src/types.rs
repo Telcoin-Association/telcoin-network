@@ -1,8 +1,8 @@
 //! Constants and trait implementations for network compatibility.
 
 use crate::{
-    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, GossipMessage,
-    PeerExchangeMap,
+    codec::TNMessage, error::NetworkError, peers::Penalty, AdmissionStatus, CommitteeUpdate,
+    GossipMessage, PeerExchangeMap,
 };
 pub use libp2p::gossipsub::MessageId;
 use libp2p::{
@@ -463,6 +463,8 @@ where
     },
     /// Set or renew a complete authoritative admission window at an epoch revision.
     UpdateAdmissionCommittees {
+        /// Epoch-start publication or lease renewal.
+        update: CommitteeUpdate,
         /// Epoch owning the immutable committee window.
         epoch: u64,
         /// Previous committee.
@@ -811,8 +813,9 @@ where
         Ok(())
     }
 
-    /// Set or renew an authoritative admission window. Identical revisions renew its lease.
-    /// Older or contradictory revisions trigger fallback without replacing accepted membership.
+    /// Publish the authoritative admission window at epoch start. An accepted update always
+    /// applies the committee update, also on a same-epoch re-entry. Older or contradictory
+    /// revisions trigger fallback without replacing accepted membership.
     pub async fn update_committees_at(
         &self,
         epoch: u64,
@@ -821,7 +824,34 @@ where
         next: HashSet<BlsPublicKey>,
     ) -> NetworkResult<()> {
         self.sender
-            .send(NetworkCommand::UpdateAdmissionCommittees { epoch, previous, current, next })
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::EpochStart,
+                epoch,
+                previous,
+                current,
+                next,
+            })
+            .await?;
+        Ok(())
+    }
+
+    /// Renew the lease of the accepted admission window. An identical window only renews the
+    /// lease. Older or contradictory revisions trigger fallback without replacing membership.
+    pub async fn renew_committees_at(
+        &self,
+        epoch: u64,
+        previous: HashSet<BlsPublicKey>,
+        current: HashSet<BlsPublicKey>,
+        next: HashSet<BlsPublicKey>,
+    ) -> NetworkResult<()> {
+        self.sender
+            .send(NetworkCommand::UpdateAdmissionCommittees {
+                update: CommitteeUpdate::Renewal,
+                epoch,
+                previous,
+                current,
+                next,
+            })
             .await?;
         Ok(())
     }
