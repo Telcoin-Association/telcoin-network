@@ -69,6 +69,9 @@ The YubiKey never goes to xerxes, and the registry token never goes on the lapto
 ### One-time setup
 
 - The allowlist on `main` must hold a provisioned key; every check fails on a placeholder file and names it.
+- A repository admin sets up the tag ruleset on `v*`, as [Settings the release workflow requires](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/ACTIONS.md#settings-the-release-workflow-requires) describes: only the maintainers can create a `v*` tag, and nobody can update or delete one.
+  The scripts cannot see the ruleset, and the signatures do not depend on it: every step that reads a tag requires exactly one signature on it, made by a key in the allowlist on `main`, and publishing requires at least `MIN_SIGNATURES` maintainer signatures over `SHA256SUMS`.
+  The ruleset covers what signatures cannot: GitHub runs `release.yaml` from the tagged commit, so the ruleset decides who can start the workflow for a release tag, and it keeps a tag from being moved or deleted after it was validated.
 - The ghcr package must be public, because the release scripts and operators read it without credentials.
   Push any image to it first (for example with `make docker-adiri`), then set its visibility to public at `https://github.com/orgs/Telcoin-Association/packages/container/telcoin-network/settings`.
   Until then, `release-build` stops with `package is not public`.
@@ -255,6 +258,21 @@ A candidate goes through the same seven steps with an `-rcN` tag, for example `v
 A later candidate, or the final release, can tag the same commit: start at step 2, setting `RELEASE_COMMIT` if `main` has moved.
 If fixes have landed since the candidate, start at step 1 with the new tag; `release-prep` replaces the candidate's section as long as it is still the newest one.
 Publishing a candidate never moves an image alias.
+
+## What the deployment scripts check
+
+The node deployment scripts in [tn-node-deployment](https://github.com/Telcoin-Association/tn-node-deployment) install and update nodes from these releases with no person reading the output, so they check every release the same way:
+
+1. They download `SHA256SUMS` and `SHA256SUMS.asc` from the release, and the tarball or `IMAGE_DIGEST`, whichever they install.
+2. They build a keyring from the maintainer public keys shipped in their own signed script release, not from this repository, and run `gpgv --status-fd 1 --keyring <keyring> SHA256SUMS.asc SHA256SUMS`.
+3. They require a `VALIDSIG` line whose primary key fingerprint, the line's last field, is one of those keys, and refuse the release on any `BADSIG`, `EXPKEYSIG`, `REVKEYSIG`, `NO_PUBKEY` or `ERRSIG` line.
+4. Before anything is installed, they check each file they use against its line in `SHA256SUMS`, the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` included.
+
+For maintainers this means:
+
+- The release files keep their names and formats: `SHA256SUMS` in `sha256sum` format with the chain-config lines under their repository paths, a detached ASCII-armored `SHA256SUMS.asc`, the tarball and `IMAGE_DIGEST`. A renamed or reformatted file stops every node update.
+- A new maintainer key, or a new signing subkey, reaches the scripts in a signed script release before it signs a node release; until then the scripts refuse that release with `NO_PUBKEY` or `ERRSIG`. An expired or revoked key stops verifying there as it does here.
+- The scripts require one valid signature. Raising `MIN_SIGNATURES` here does not raise what they require until they change too.
 
 ## When a step fails
 
