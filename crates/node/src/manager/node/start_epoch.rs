@@ -1046,10 +1046,10 @@ where
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
-    /// committee. A locally eligible node otherwise starts as
-    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is
-    /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
-    /// [`ConsensusBus`] before returning.
+    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
+    /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
+    /// assumes it is caught up and is demoted to inactive later if that turns out to be false.
+    /// The chosen mode is written to the [`ConsensusBus`] before returning.
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
