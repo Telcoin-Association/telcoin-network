@@ -2,13 +2,16 @@
 //!
 //! Starts the client
 use crate::{version::SHORT_VERSION, NoArgs};
-use clap::{builder::BoolishValueParser, value_parser, Parser};
+use clap::{
+    builder::{BoolishValueParser, PossibleValue, TypedValueParser},
+    value_parser, Parser,
+};
 use core::fmt;
 use fdlimit::raise_fd_limit;
 use rayon::ThreadPoolBuilder;
 use std::{
-    collections::BTreeMap, net::SocketAddr, num::NonZeroUsize, path::PathBuf, sync::Arc,
-    thread::available_parallelism,
+    collections::BTreeMap, ffi::OsStr, net::SocketAddr, num::NonZeroUsize, path::PathBuf,
+    sync::Arc, thread::available_parallelism,
 };
 use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs};
 use tn_node::engine::TnBuilder;
@@ -164,10 +167,13 @@ pub struct NodeCommand<Ext: clap::Args + fmt::Debug = NoArgs> {
     /// A binary built with the `faucet` feature refuses chain id 487, the mainnet chain id,
     /// unless this is set. Devnets that reuse chain id 487 set it. A faucet build refuses the
     /// embedded mainnet genesis even with this set.
+    ///
+    /// The environment variable accepts 1/0, true/false, yes/no, on/off, t/f and y/n in any case;
+    /// an empty value leaves the flag off and any other value is an argument error.
     #[arg(
         long,
         env = "TN_ALLOW_FAUCET_ON_CHAIN_487",
-        value_parser = BoolishValueParser::new(),
+        value_parser = OptInValueParser::default(),
         hide_short_help = true
     )]
     pub allow_faucet_on_chain_487: bool,
@@ -353,6 +359,35 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         builder.enable_repack_monitor = enable_repack_monitor;
 
         Ok(launcher(builder, ext, tn_datadir, key_config, SHORT_VERSION))
+    }
+}
+
+/// Value parser for an opt-in flag that can also be set from an environment variable.
+///
+/// An empty value reads as unset (`false`), so a variable set to the empty string (`VAR=` in an
+/// env file, or a `${VAR:-}` expansion) leaves the opt-in off instead of stopping the command.
+/// Any other value parses like clap's [`BoolishValueParser`]: `1/0`, `true/false`, `yes/no`,
+/// `on/off`, `t/f` and `y/n`, case-insensitive, and anything else is an argument error.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct OptInValueParser(BoolishValueParser);
+
+impl TypedValueParser for OptInValueParser {
+    type Value = bool;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        if value.is_empty() {
+            return Ok(false);
+        }
+        self.0.parse_ref(cmd, arg, value)
+    }
+
+    fn possible_values(&self) -> Option<Box<dyn Iterator<Item = PossibleValue> + '_>> {
+        self.0.possible_values()
     }
 }
 
@@ -719,6 +754,62 @@ mod tests {
         assert!(!command.render_help().to_string().contains("--allow-faucet-on-chain-487"));
         assert!(command.render_long_help().to_string().contains("--allow-faucet-on-chain-487"));
         Ok(())
+    }
+
+    /// An empty value reads as unset; booleans parse as clap's boolish parser does, in any case;
+    /// anything else is an argument error.
+    #[test]
+    fn opt_in_value_parser_reads_empty_as_unset() {
+        let cmd = clap::Command::new("node");
+        let parse = |raw: &str| {
+            OptInValueParser::default()
+                .parse_ref(&cmd, None, OsStr::new(raw))
+                .map_err(|error| error.kind())
+        };
+        assert_eq!(parse(""), Ok(false));
+        for raw in ["1", "true", "TRUE", "yes", "On", "t", "Y"] {
+            assert_eq!(parse(raw), Ok(true), "{raw:?}");
+        }
+        for raw in ["0", "false", "No", "OFF", "f", "n"] {
+            assert_eq!(parse(raw), Ok(false), "{raw:?}");
+        }
+        for raw in ["maybe", " ", "2"] {
+            assert_eq!(parse(raw), Err(ErrorKind::ValueValidation), "{raw:?}");
+        }
+    }
+
+    /// The faucet opt-in's environment value goes through [`OptInValueParser`] on both `node`
+    /// and `db load-state`: an empty value leaves the flag off, a boolean sets it, and anything
+    /// else stops the command at parse.
+    #[test]
+    fn faucet_opt_in_env_value_parses_on_node_and_load_state() {
+        use clap::{Args as _, CommandFactory as _};
+
+        // a variable no other test reads, bound onto the flag in place of the real one so the
+        // test runs clap's env path without depending on the developer's shell
+        const VAR: &str = "TN_TEST_FAUCET_OPT_IN_ENV_VALUE";
+        let flag = "allow_faucet_on_chain_487";
+        let cases = [
+            ("", Ok(false)),
+            ("TRUE", Ok(true)),
+            ("0", Ok(false)),
+            ("maybe", Err(ErrorKind::ValueValidation)),
+        ];
+        for (raw, expected) in cases {
+            std::env::set_var(VAR, raw);
+            let node = NodeCommand::<NoArgs>::command()
+                .mut_arg(flag, |arg| arg.env(VAR))
+                .try_get_matches_from(["node"]);
+            let load_state =
+                crate::db::DbLoadStateArgs::augment_args(clap::Command::new("load-state"))
+                    .mut_arg(flag, |arg| arg.env(VAR))
+                    .try_get_matches_from(["load-state", "pack"]);
+            for (command, matches) in [("node", node), ("db load-state", load_state)] {
+                let parsed = matches.map(|m| m.get_flag(flag)).map_err(|error| error.kind());
+                assert_eq!(parsed, expected, "{command} with {VAR}={raw:?}");
+            }
+        }
+        std::env::remove_var(VAR);
     }
 
     /// A cleartext key on chain id 487 is refused without the opt-in and the error names it;

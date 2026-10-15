@@ -6,10 +6,10 @@
 //! Misordered (present, but in the wrong consensus-header group).
 
 use crate::{
-    node::{validate_faucet_build, NamedChain},
+    node::{validate_faucet_build, NamedChain, OptInValueParser},
     version::SHORT_VERSION,
 };
-use clap::{builder::BoolishValueParser, Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
@@ -698,7 +698,7 @@ pub struct DbLoadStateArgs {
     #[arg(
         long,
         env = "TN_ALLOW_FAUCET_ON_CHAIN_487",
-        value_parser = BoolishValueParser::new(),
+        value_parser = OptInValueParser::default(),
         hide_short_help = true
     )]
     pub allow_faucet_on_chain_487: bool,
