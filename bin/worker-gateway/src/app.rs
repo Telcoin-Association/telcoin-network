@@ -423,15 +423,19 @@ impl UpstreamClients {
 }
 
 /// Fail startup when an `https` upstream would be verified against the native
-/// root store alone and that store is empty.
+/// root store alone and that store is empty, and warn when an empty store
+/// leaves `--upstream-ca-cert` as the only trusted root.
 ///
 /// reqwest builds a client over an empty native root store without complaint,
 /// so on a host without CA certificates every `https` call would fail at
 /// runtime instead, and a worker would just never become ready. The check
 /// applies only when some configured URL (a worker's RPC or readiness URL, or
-/// `--redirect-queries`) is `https` and no `--upstream-ca-cert` is given: the
-/// extra CA is something to verify against on its own. `native_root_count`
-/// loads the store, and is called only when the check applies.
+/// `--redirect-queries`) is `https`. Without `--upstream-ca-cert` an empty
+/// store is an error. With it the gateway starts, because private-CA workers
+/// verify against that CA alone, but warns: the one client trust store serves
+/// every upstream, so an `https` `--redirect-queries` signed by a public CA
+/// would then fail every call. `native_root_count` loads the store, and is
+/// called only when the check applies.
 fn ensure_root_store(
     settings: &Settings,
     native_root_count: impl FnOnce() -> usize,
@@ -442,15 +446,24 @@ fn ensure_root_store(
         .flat_map(|upstream| [&upstream.rpc_url, &upstream.readiness_url])
         .chain(settings.query_upstream.as_ref())
         .any(|url| url.scheme() == "https");
-    if !https || !settings.upstream_ca_certs.is_empty() {
+    if !https {
         return Ok(());
     }
-    eyre::ensure!(
-        native_root_count() > 0,
-        "an https upstream is configured but the system root store holds no CA certificates, \
-         so every https call would fail; install the ca-certificates package, point \
-         SSL_CERT_FILE or SSL_CERT_DIR at a CA bundle, or pass --upstream-ca-cert"
-    );
+    let native = native_root_count();
+    if settings.upstream_ca_certs.is_empty() {
+        eyre::ensure!(
+            native > 0,
+            "an https upstream is configured but the system root store holds no CA certificates, \
+             so every https call would fail; install the ca-certificates package, point \
+             SSL_CERT_FILE or SSL_CERT_DIR at a CA bundle, or pass --upstream-ca-cert"
+        );
+    } else if native == 0 {
+        warn!(
+            target: "gateway",
+            "the system root store holds no CA certificates, so every https upstream, \
+             --redirect-queries included, must chain to --upstream-ca-cert"
+        );
+    }
     Ok(())
 }
 
@@ -681,15 +694,34 @@ mod tests {
             settings(&[HTTP_RPC, HTTP_READY, "--redirect-queries=https://rpc.example.com/"]);
         assert!(ensure_root_store(&https_redirect, || 0).is_err());
 
-        // plain http everywhere, or an extra CA, never loads the store
+        // plain http everywhere never loads the store
         let http_only = settings(&[HTTP_RPC, HTTP_READY]);
         assert!(ensure_root_store(&http_only, || panic!("the store must not be loaded")).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn custom_ca_with_an_empty_store_starts() -> eyre::Result<()> {
         let ca_file = tempfile::NamedTempFile::new()?;
         let ca = rcgen::generate_simple_self_signed(vec!["ca.test".to_string()])?;
         std::fs::write(ca_file.path(), ca.cert.pem())?;
         let ca_flag = format!("--upstream-ca-cert={}", ca_file.path().display());
-        let with_ca = settings(&[HTTPS_RPC, HTTPS_READY, ca_flag.as_str()]);
-        assert!(ensure_root_store(&with_ca, || panic!("the store must not be loaded")).is_ok());
+        let with_ca = settings(&[
+            "--upstream-rpc-url=https://10.0.0.7:8545",
+            "--upstream-readiness-url=https://10.0.0.7:8551/health/workers",
+            "--redirect-queries=https://rpc.example.com/",
+            ca_flag.as_str(),
+        ]);
+
+        // the store is still loaded, so an empty one can be reported, but the
+        // private CA alone lets the workers verify, so startup goes on
+        let loaded = std::cell::Cell::new(false);
+        let result = ensure_root_store(&with_ca, || {
+            loaded.set(true);
+            0
+        });
+        assert!(result.is_ok(), "{result:?}");
+        assert!(loaded.get(), "the store must be loaded when an https url is configured");
         Ok(())
     }
 

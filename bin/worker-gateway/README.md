@@ -195,6 +195,7 @@ worker-gateway \
 
 - **System roots.** An `https` upstream is verified against the system CA certificates (or the bundle that `SSL_CERT_FILE` or `SSL_CERT_DIR` names), which the image installs.
   When an `https` URL is configured without `--upstream-ca-cert` and the system store holds no certificate, the gateway refuses to start instead of failing every call.
+  With `--upstream-ca-cert` it starts on an empty system store but warns that every `https` upstream, `--redirect-queries` included, must then chain to that CA.
 - **Custom CA.** `--upstream-ca-cert` adds every certificate in a PEM bundle to the trusted roots, so a worker certificate from a private CA needs only that CA's file.
   The system roots stay trusted alongside it.
   The certificate must name the host in the URL: a DNS name for a host name, an IP address entry for an IP literal.
