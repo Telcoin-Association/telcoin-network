@@ -10,6 +10,8 @@ use tn_types::{
     decode, decode_key, encode, encode_key, DBIter, Database, DbTx, DbTxMut, KeyT, Table, ValueT,
 };
 
+use crate::epoch_db_recovery::RawRows;
+
 /// Wrapper for the libmdbx transaction.
 #[derive(Debug)]
 pub struct MdbxTx {
@@ -355,6 +357,25 @@ impl Database for MdbxDatabase {
             .last::<Vec<u8>, Vec<u8>>()
             .ok()?
             .map(|(k, v)| (decode_key::<T::Key>(&k), decode::<T::Value>(&v)))
+    }
+}
+
+impl RawRows for MdbxDatabase {
+    fn for_each_raw_row<T: Table>(&self, mut visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
+        let mut cursor = self.read_txn()?.cursor::<T>()?;
+        while let Some((key, value)) = cursor.next::<Vec<u8>, Vec<u8>>()? {
+            visit(&key, &value);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn insert_raw_row<T: Table>(&self, key: &[u8], value: &[u8]) -> eyre::Result<()> {
+        let txn = self.inner.begin_rw_txn()?;
+        let dbi = txn.open_db(Some(T::NAME))?.dbi();
+        txn.put(dbi, key, value, WriteFlags::UPSERT)?;
+        txn.commit()?;
+        Ok(())
     }
 }
 

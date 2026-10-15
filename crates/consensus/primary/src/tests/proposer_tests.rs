@@ -998,3 +998,107 @@ async fn test_drain_digests_rotates_across_headers_when_lanes_exceed_cap() {
         proposer.drain_digests_for_header().iter().map(|digest| digest.worker_id).collect();
     assert_eq!(second, vec![10, 11, 0], "the cursor rotates the walk to the unserved lanes");
 }
+
+/// One unsigned parent certificate at `round` and `epoch` for each of the first `count`
+/// authorities in fixture order.
+///
+/// The proposer takes its parents as already certified and reads only their epoch, round and
+/// origin when deciding whether to advance, so these carry no votes.
+fn parents_at(
+    fixture: &CommitteeFixture<MemDatabase>,
+    round: Round,
+    epoch: Epoch,
+    count: usize,
+) -> Vec<Certificate> {
+    let committee = fixture.committee();
+    fixture
+        .authorities()
+        .take(count)
+        .map(|authority| {
+            let header = HeaderBuilder::default()
+                .author(authority.id())
+                .round(round)
+                .epoch(epoch)
+                .parents(BTreeSet::new())
+                .build();
+            Certificate::new_unsigned_for_test(&committee, header, Vec::new())
+                .expect("unsigned parent certificate")
+        })
+        .collect()
+}
+
+/// An epoch 9 proposer at round 0 with genesis parents, plus its committee fixture and bus.
+fn proposer_in_epoch_nine(
+    task_manager: &TaskManager,
+) -> (CommitteeFixture<MemDatabase>, ConsensusBus, Proposer<MemDatabase>) {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).epoch(9).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config();
+    let cb = ConsensusBus::new();
+    let proposer = Proposer::new(
+        config.clone(),
+        config.authority_id().expect("authority"),
+        cb.clone(),
+        LeaderSchedule::new(committee, LeaderSwapTable::default()),
+        task_manager.get_spawner(),
+    );
+    (fixture, cb, proposer)
+}
+
+/// A full quorum of parents from the previous epoch must not move a freshly started proposer.
+///
+/// Rounds restart every epoch. A certificate store that still holds epoch 8's rows when epoch 9
+/// starts replays epoch 8's last round to the proposer as a quorum of parents. Following it jumps
+/// the round from 0 to 21 and proposes an epoch 9 header with epoch 8 parents, which every voter
+/// rejects. The same quorum built in epoch 9 does advance the round, so the stale set is refused
+/// for its epoch and nothing else.
+#[tokio::test]
+async fn test_parents_from_another_epoch_do_not_advance_round() {
+    let task_manager = TaskManager::default();
+    let (fixture, cb, mut proposer) = proposer_in_epoch_nine(&task_manager);
+    let genesis: Vec<_> = proposer.last_parents.iter().map(|cert| cert.digest()).collect();
+    let all = fixture.authorities().count();
+
+    proposer.process_parents(parents_at(&fixture, 21, 8, all), 21).unwrap();
+    assert_eq!(proposer.round, 0, "stale-epoch parents must not advance the round");
+    assert_eq!(cb.app().primary_round(), 0, "stale-epoch parents must not publish a round");
+    assert_eq!(
+        proposer.last_parents.iter().map(|cert| cert.digest()).collect::<Vec<_>>(),
+        genesis,
+        "stale-epoch parents must not replace the genesis parents"
+    );
+
+    let current = parents_at(&fixture, 21, 9, all);
+    proposer.process_parents(current.clone(), 21).unwrap();
+    assert_eq!(proposer.round, 21, "a current-epoch quorum advances the round");
+    assert_eq!(cb.app().primary_round(), 21);
+    assert_eq!(proposer.last_parents, current);
+}
+
+/// A batch that mixes epochs advances the round only when its current-epoch part is a quorum on
+/// its own, and only that part becomes the next header's parents.
+///
+/// The aggregator counts certificates by origin, regardless of epoch, so a quorum it reports can
+/// lean on stale members. Of four authorities, one current-epoch certificate beside three stale
+/// ones is below the quorum of three and must leave the round alone; three beside one stale one
+/// is a quorum and advances it without the stale parent.
+#[tokio::test]
+async fn test_mixed_epoch_parents_need_a_current_epoch_quorum() {
+    let task_manager = TaskManager::default();
+    let (fixture, _cb, mut proposer) = proposer_in_epoch_nine(&task_manager);
+    let committee = fixture.committee();
+    assert_eq!(committee.size(), 4, "the thresholds below assume four authorities");
+
+    let stale = parents_at(&fixture, 5, 8, 4);
+    let current = parents_at(&fixture, 5, 9, 4);
+
+    let below_quorum =
+        vec![current[0].clone(), stale[1].clone(), stale[2].clone(), stale[3].clone()];
+    proposer.process_parents(below_quorum, 5).unwrap();
+    assert_eq!(proposer.round, 0, "one current-epoch parent is not a quorum");
+
+    let quorum = vec![current[0].clone(), current[1].clone(), current[2].clone(), stale[3].clone()];
+    proposer.process_parents(quorum, 5).unwrap();
+    assert_eq!(proposer.round, 5, "three current-epoch parents are a quorum");
+    assert_eq!(proposer.last_parents, current[..3], "the stale parent is not kept");
+}
