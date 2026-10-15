@@ -213,7 +213,7 @@ static UPSTREAM_ERROR_WARNINGS: PerRoute =
 
 /// Every per-request (or, for a PROXY header, per-connection) warning
 /// throttle, summarized by [`telemetry::run_throttle_summaries`].
-pub(crate) static WARNING_THROTTLES: [&Throttle; 13] = [
+pub(crate) static WARNING_THROTTLES: [&Throttle; 15] = [
     &HOP_LOOP_WARNINGS,
     &REDIRECT_LOOP_WARNINGS,
     &UNREADABLE_BATCH_WARNINGS,
@@ -227,6 +227,8 @@ pub(crate) static WARNING_THROTTLES: [&Throttle; 13] = [
     &UPSTREAM_ERROR_WARNINGS.worker,
     &UPSTREAM_ERROR_WARNINGS.query,
     &PROXY_HEADER_WARNINGS,
+    &crate::server::ACCEPT_ERROR_WARNINGS,
+    &crate::server::PROBE_ACCEPT_ERROR_WARNINGS,
 ];
 
 /// The JSON-RPC call [`chain_id_request`] builds: the startup chain-id check
