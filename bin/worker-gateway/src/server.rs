@@ -8025,11 +8025,13 @@ mod tests {
         let (worker, _worker_seen, _worker) = named_mock("worker").await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
-        // one request a second with no burst headroom, so the second POST is
-        // shed by the rate limiter, the layer just inside the nosniff one
+        // one request a second with a burst of two: the probe-path PUT (no
+        // longer exempt, only GET and HEAD are) and the first POST take the two
+        // tokens, so the second POST is shed by the rate limiter, the layer just
+        // inside the nosniff one; the GET probes are exempt
         let limiters = RateLimiters::new(
             None,
-            Some(RateLimit::new(nz(1), nz(1))),
+            Some(RateLimit::new(nz(1), nz(2))),
             None,
             16,
             PrefixPolicy::default(),
@@ -8048,6 +8050,7 @@ mod tests {
         let client = Client::new();
         let url = |path: &str| format!("http://{gateway}{path}");
         let cases = [
+            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
             ("proxied", client.post(url("/")).body(call("eth_chainId", 1)), StatusCode::OK),
             (
                 "rate limited",
@@ -8056,7 +8059,6 @@ mod tests {
             ),
             ("liveness", client.get(url("/health")), StatusCode::OK),
             ("readiness", client.get(url("/ready")), StatusCode::OK),
-            ("method refused", client.put(url("/health")), StatusCode::METHOD_NOT_ALLOWED),
         ];
         for (case, request, status) in cases {
             let response = request.send().await.expect("send");
