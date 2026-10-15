@@ -1638,7 +1638,7 @@ mod tests {
             allow_faucet_on_chain_487: false,
         }
         .execute(datadir)
-            .expect_err("load-state must refuse while a node holds the lock");
+        .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
     }
 

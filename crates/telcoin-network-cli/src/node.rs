@@ -314,13 +314,8 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
         } = self;
 
         // set up reth node config for engine components
-        let node_config = RethConfig::new(
-            reth,
-            instance,
-            &tn_datadir,
-            with_unused_ports,
-            chain_spec,
-        );
+        let node_config =
+            RethConfig::new(reth, instance, &tn_datadir, with_unused_ports, chain_spec);
 
         // Refuse a second node on this datadir before opening the execution database a live node
         // may hold; the node keeps the lock for its lifetime (handed over in the builder).
@@ -356,9 +351,9 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
 ///   in `etc/genesis.sh`) opt in explicitly.
 /// - Genesis identity: with the opt-in set, a genesis whose block hash equals the embedded
 ///   [`MAINNET_GENESIS`] is still refused. The check compares genesis block hashes rather than
-///   [`Genesis`] structs because the fork-config fields (`config`) sit outside the genesis
-///   header preimage: a genesis differing from mainnet only in such a field still computes
-///   mainnet's genesis block hash, and could join mainnet consensus, while comparing unequal.
+///   [`Genesis`] structs because the fork-config fields (`config`) sit outside the genesis header
+///   preimage: a genesis differing from mainnet only in such a field still computes mainnet's
+///   genesis block hash, and could join mainnet consensus, while comparing unequal.
 ///
 /// Adiri/testnet (2017) is faucet-intended and passes both checks; the `adiri` feature guard at
 /// the call site in [`NodeCommand::execute`] covers it separately.
@@ -772,10 +767,11 @@ mod tests {
         let passphrase = keygen.resolve_bls_passphrase(None)?;
         keygen.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))?;
 
-        let args = ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
-            .into_iter()
-            .chain(["--datadir", datadir])
-            .chain(extra.iter().copied());
+        let args =
+            ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
+                .into_iter()
+                .chain(["--datadir", datadir])
+                .chain(extra.iter().copied());
         let node = Cli::<NoArgs>::try_parse_args_from(args)?;
         let passphrase = node.resolve_bls_passphrase(None)?;
         node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))

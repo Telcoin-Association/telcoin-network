@@ -97,8 +97,9 @@ mod tests {
             .expect("long version has a Build Features line");
         let listed = features.split(',').any(|feature| feature.trim() == "faucet");
         assert_eq!(listed, cfg!(feature = "faucet"), "Build Features: {features}");
-        if listed {
-            assert!(tn_reth::FAUCET_ENABLED, "faucet listed but tn-reth was built without it");
-        }
+        assert!(
+            !listed || tn_reth::FAUCET_ENABLED,
+            "faucet listed but tn-reth was built without it"
+        );
     }
 }

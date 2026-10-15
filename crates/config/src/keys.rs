@@ -1146,8 +1146,8 @@ mod tests {
     fn read_config_with_passphrase_and_no_keys_names_the_encrypted_keyfile() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
-        let err = KeyConfig::read_config(&datadir, Some("passphrase".to_string()))
-            .expect_err("no keys");
+        let err =
+            KeyConfig::read_config(&datadir, Some("passphrase".to_string())).expect_err("no keys");
         assert!(err.to_string().contains(BLS_WRAPPED_KEYFILE), "{err}");
     }
 
@@ -1187,6 +1187,8 @@ mod tests {
         let loaded = KeyConfig::read_config(&datadir, None).expect("cleartext read");
         assert!(loaded.bls_key_is_cleartext());
         assert_eq!(loaded.primary_public_key(), stale.primary_public_key());
-        assert!(!KeyConfig::read_config(&datadir, pp).expect("wrapped read").bls_key_is_cleartext());
+        assert!(!KeyConfig::read_config(&datadir, pp)
+            .expect("wrapped read")
+            .bls_key_is_cleartext());
     }
 }
