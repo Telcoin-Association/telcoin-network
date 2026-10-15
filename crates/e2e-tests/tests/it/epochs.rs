@@ -1,5 +1,7 @@
 //! Test the epoch boundary and validator shuffles.
 
+mod failure_logs;
+
 use super::common::{
     assert_epoch_records_verify, create_genesis_for_test, fetch_verified_epoch_record,
     generate_new_validator_txs, get_block_commit_time, loop_epochs, read_consensus_headers,
@@ -769,6 +771,7 @@ fn pin_fork_epoch_override(var: &str, fork_epoch: Epoch, read: impl Fn() -> Opti
 /// `test` names both the temp-dir prefix and the `test_logs/` directory, so callers running the
 /// same scenario under different fork epochs keep separate node logs. Keep it short: every node's
 /// IPC socket path is built under the temp dir, and a unix socket path is capped at ~104 bytes.
+/// On a returned error, retain the datadir and attach the restarted node's logs before teardown.
 async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
     // create validator and governance wallets for adding new validator later
     let new_validator = TransactionFactory::new_random_from_seed(&mut StdRng::seed_from_u64(6));
@@ -800,7 +803,7 @@ async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
     // Guard ensures processes are killed on drop (normal return, error, or panic).
     let mut guard = ProcessGuard::new(procs);
 
-    let epochs = test_epoch_sync_inner(
+    let result = test_epoch_sync_inner(
         &mut guard,
         2,
         &[("validator-3", Address::from_slice(&[0x33; 20]))],
@@ -809,9 +812,20 @@ async fn run_epoch_sync_scenario(test: &str) -> eyre::Result<Range<Epoch>> {
         test,
         &mut endpoints,
     )
-    .await?;
-    guard.finish();
-    Ok(epochs)
+    .await;
+    result.inspect(|_| guard.finish()).map_err(|error| {
+        let log_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("test_logs").join(test);
+        // Capture before ProcessGuard's graceful shutdown adds teardown errors to these logs.
+        let logs = failure_logs::capture_failure_logs(&log_dir, "validator-3");
+        let retained_datadir = temp_dir.keep();
+        let context = format!(
+            "epoch-sync scenario {test} failed: {error:#}; retained datadir: {}; \
+             node logs: {}; log snapshot before teardown:\n{logs}",
+            retained_datadir.display(),
+            log_dir.display(),
+        );
+        error.wrap_err(context)
+    })
 }
 
 #[ignore = "only run independently from all other it tests"]
