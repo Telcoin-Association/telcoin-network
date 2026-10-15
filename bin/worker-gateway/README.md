@@ -728,7 +728,8 @@ The check runs once; a query URL that changes chains later is not detected.
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
 - `OPTIONS`, with `--cors-allowed-origins` set: a CORS preflight, answered by the gateway and never forwarded, on every path but `/ready/any` (see [CORS](#cors)).
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
-  On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts only their `GET` and `HEAD`, so JSON-RPC sent to `/health`, `/ready` or `/ready/any` is rate-limited and then refused, never proxied past the limits.
+  On the client listener (`--listen-addr`), on `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included, refused with the message "only GET and HEAD are accepted on this path" and `Allow: GET,HEAD`: the rate limiter exempts only their `GET` and `HEAD`, so JSON-RPC sent to `/health`, `/ready` or `/ready/any` is rate-limited and then refused, never proxied past the limits.
+  The `--probe-addr` listener answers such a request with a bare `405` and `Allow: GET,HEAD`, without the JSON-RPC envelope, and counts nothing.
 
 The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
@@ -873,9 +874,12 @@ Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
-A request to `/health`, `/ready` or `/ready/any` with a method other than
-`GET` or `HEAD` is refused with the `405`, counted as a `method_not_post`
-rejection, and is not rate-limited.
+On the client listener (`--listen-addr`), a request to `/health`, `/ready`
+or `/ready/any` with a method other than `GET` or `HEAD` is rate-limited like
+any other request, then refused with the `405` and counted as a
+`method_not_post` rejection.
+The `--probe-addr` listener answers such a request with a bare `405` and
+`Allow: GET,HEAD`, without the JSON-RPC envelope, and counts nothing.
 `tn_worker_gateway_connections_refused_total` is the exception: it counts connections before any request is read, so a probe connection to the client listener refused at the per-client cap is counted with the rest (the `--probe-addr` listener has no per-client cap).
 
 Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
