@@ -17,7 +17,7 @@ With `--redirect-queries` set, WG-11 is closed, the gateway keeps serving reads 
 The post-change review found that this moves the shared failure point rather than removing it: a public RPC that stalls holds every gateway's connection slots and starves submissions on all of them, which #1625 (merged into this branch) fixes for WG-01 and WG-09, and a resolver that hangs on the public RPC's name can make readiness flap, which #1630 (merged into this branch) fixes (see [Post-change review](#post-change-review)).
 Every other finding of Medium or higher is fixed by a follow-up PR merged into this branch or covered by operator guidance in the plan below (see the [Summary](#summary), refreshed on 2026-10-15).
 WG-02 and WG-08 were small fixes recommended before any public deployment; #1642 and #1643 (merged into this branch) fix them.
-No High finding remains open; the one residual is WG-05's: one client prefix's share of the in-flight byte budget is still uncapped, and capping it needs a design decision before general availability.
+No High finding remains open; the one residual is WG-05's: one client prefix's share of the in-flight byte budget stays uncapped by decision (2026-10-13 ruling: not unless large request caps must be supported on internet-facing gateways), and startup warns when one prefix can hold the whole budget (#1670).
 A review of the whole branch on 2026-10-13 found one High and eight Medium issues of its own (#1658 to #1666); the follow-up PR for that review fixes all nine, and the Summary names the issue and the commit under each row they bear on.
 
 ## Scope and method
@@ -110,7 +110,7 @@ Calibration rules: a mechanism that works per replica stays High even when it ca
 
 ## Summary
 
-Statuses were refreshed on 2026-10-13, after the follow-up PRs merged into this branch, and on 2026-10-15 for the follow-up PR that closes the whole-branch review of 2026-10-13: a row fixed there names the commit (its sha on that PR's branch) and the issue it was filed under (#1658-#1676); `file:line` evidence anchors still refer to the original evidence commit (`02fe2a1e`, or the branch head named in the post-change review).
+Statuses were refreshed on 2026-10-13, after the follow-up PRs merged into this branch, and on 2026-10-15 for the follow-up PR that closes the whole-branch review of 2026-10-13: a row fixed there names the issue it was filed under (#1658-#1676) and the commit by its subject, not by its sha, which a squash-merge would not keep; `file:line` evidence anchors still refer to the original evidence commit (`02fe2a1e`, or the branch head named in the post-change review).
 Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P27), which name the commit in this PR or the follow-up issue.
 
 | ID | Title | Severity | Status | Effort |
@@ -119,13 +119,13 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 | WG-02 | Reject paths build an attacker-sized `id` as a `Value`; one request OOMs a gateway | High | #1595 (P3): fixed by #1642 (merged into this branch) | S |
 | WG-03 | A batch costs one token, skips the screen and has no length cap | High | #1600 (P10): fixed by #1627 (merged into this branch) | M |
 | WG-04 | The gateway-to-worker hop is plaintext only | High | #1601 (P11): fixed by #1629 (merged into this branch) | M-L |
-| WG-05 | Request bodies up to 25 MiB are buffered whole on up to 500 connections | High | partly fixed in this PR (P6); #1597 (P7): fixed by #1631 (merged into this branch); `--max-request-bytes 0` and the one-prefix warning: fixed by `6ee6ceacb` (issue #1662) and `9de5e1975` (issue #1670) in the follow-up PR; still open: one client prefix's share of the byte budget, which needs a design decision | S + M |
-| WG-06 | No per-IP connection cap; one host holds every slot | High | #1599 (P9): fixed by #1633 (merged into this branch); a `/0` per-IP prefix: fixed by `aad6ae569` in the follow-up PR (issue #1666) | M |
+| WG-05 | Request bodies up to 25 MiB are buffered whole on up to 500 connections | High | partly fixed in this PR (P6); #1597 (P7): fixed by #1631 (merged into this branch); `--max-request-bytes 0`: fixed in the follow-up PR, in #1662, `fix(worker-gateway): reject --max-request-bytes 0 and warn below one submission`; no per-prefix share by decision (2026-10-13 ruling: not unless large request caps must be supported on internet-facing gateways); the startup warning for one prefix holding the budget is #1670, `fix(worker-gateway): warn when one client prefix can hold the byte budget` | S + M |
+| WG-06 | No per-IP connection cap; one host holds every slot | High | #1599 (P9): fixed by #1633 (merged into this branch); a `/0` per-IP prefix: fixed in the follow-up PR, in #1666, `fix(worker-gateway): reject a /0 per-IP prefix and warn below /16 and /32` | M |
 | WG-07 | Health probes share the client connection permits | High | #1598 (P8): fixed by #1628 (merged into this branch) | M |
 | WG-08 | The global token is spent before the per-IP check | High | #1596 (P4): fixed by #1643 (merged into this branch) | S |
-| WG-09 | Reads and submissions share every limit | High | #1594 (P2): fixed by #1625 (merged into this branch); a held submission answer and a cut progressing answer: fixed by `0084a57da` (issue #1659) and `0b3b12302` (issue #1660) in the follow-up PR | M |
+| WG-09 | Reads and submissions share every limit | High | #1594 (P2): fixed by #1625 (merged into this branch); a held submission answer and a cut progressing answer: fixed in the follow-up PR, in #1659, `fix(worker-gateway): hold the in-flight guards until a buffered submission answer is taken`, and #1660, `fix(worker-gateway): bound an upstream answer by its idle time, not a total deadline` | M |
 | WG-10 | Upstream clients follow HTTP redirects and honour proxy variables | High | fixed for the proxy client in this PR (P5); rest in #1612 (P25): fixed by #1641 (merged into this branch) | S |
-| WG-11 | Every method reaches the worker, including `tn_*` | Medium | closed in this PR when `--redirect-queries` is set (P1); #1602 (P15): fixed by #1636 (merged into this branch); a positional batch element past the deny list: fixed by `0b34afd64` in the follow-up PR (issue #1658) | S |
+| WG-11 | Every method reaches the worker, including `tn_*` | Medium | closed in this PR when `--redirect-queries` is set (P1); #1602 (P15): fixed by #1636 (merged into this branch); a positional batch element past the deny list: fixed in the follow-up PR, in #1658, `fix(worker-gateway): check a positional batch element's method against the deny list` | S |
 | WG-12 | Readiness has no hysteresis | Medium | #1605 (P18): fixed by #1624 (merged into this branch) | S |
 | WG-13 | The node health listener is serial and unauthenticated | Medium | documented in this PR (P14) | S |
 | WG-14 | Readiness gates reads as well as submissions | Medium | closed for reads at the gateway in this PR when `--redirect-queries` is set (P1); fronts that act on `/ready` in #1613 (P26): fixed by #1628 (merged into this branch) | S |
@@ -134,26 +134,26 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 | WG-17 | Every budget is per process | Medium | documented in this PR (P14) | S |
 | WG-18 | Client identity is the TCP peer | Medium | #1607 (P20): fixed by #1623 (merged into this branch) | M |
 | WG-19 | The reference manifest polls the wrong readiness URL | Medium | fixed in this PR (P12) | S |
-| WG-20 | Shutdown does not drain | Medium | partly fixed in this PR (P12); #1606 (P19): fixed by #1637 (merged into this branch); the drain default below the request deadline: fixed by `0c1113f0d` in the follow-up PR (issue #1670) | S + M |
+| WG-20 | Shutdown does not drain | Medium | partly fixed in this PR (P12); #1606 (P19): fixed by #1637 (merged into this branch); the drain default below the request deadline: fixed in the follow-up PR, in #1670, `fix(worker-gateway): default the shutdown drain to the request deadline` | S + M |
 | WG-21 | Round-robin DNS has no health feedback | Medium | documented in this PR (P14) | S |
 | WG-22 | Non-JSON upstream errors are relayed and counted as forwarded | Medium | #1603 (P16): fixed by #1626 (merged into this branch) | S |
 | WG-23 | Pending-state reads miss the worker's pool under the redirect | Medium | documented in this PR (P14); #1608 (P21): fixed by #1632 (merged into this branch) | M |
 | WG-24 | Redirected reads leave from one egress IP with a spoofable XFF | Medium | documented in this PR (P14); #1609 (P22): fixed by #1635 (merged into this branch) | M |
 | WG-25 | The upstream transport error cause is dropped | Medium | fixed in this PR (P13) | S |
-| WG-26 | No access log or client dimension | Medium | #1610 (P23): fixed by #1640 (merged into this branch); the access log's line-rate ceiling: fixed by `4104d2e07` in the follow-up PR (issue #1671) | M |
+| WG-26 | No access log or client dimension | Medium | #1610 (P23): fixed by #1640 (merged into this branch); the access log's line-rate ceiling: fixed in the follow-up PR, in #1671, `feat(worker-gateway): cap access-log lines per second and count the suppressed ones` | M |
 | WG-27 | CORS cannot work | Medium | #1604 (P17): fixed by #1638 (merged into this branch) | S |
 | WG-28 | The readiness poller polls serially and reads the body unbounded | Low | #1612 (P25): fixed by #1624 (merged into this branch) | S |
-| WG-29 | The per-IP table fails open when full; IPv6 /64 keys | Low | #1612 (P25): fixed by #1643 (merged into this branch); the overflow-bucket lockout: fixed by `a951affc5`, `704b89233` and `0bed104a4` in the follow-up PR (issue #1661) | S |
-| WG-30 | The 408 rewrite misreports | Low | #1612 (P25): fixed by #1634 (merged into this branch); the deadline after forwarding is a `504` since `1c5cbd552` in the follow-up PR (issue #1671) | S |
+| WG-29 | The per-IP table fails open when full; IPv6 /64 keys | Low | #1612 (P25): fixed by #1643 (merged into this branch); the overflow-bucket lockout: fixed in the follow-up PR, in #1661, `fix(worker-gateway): insert a first-seen client's bucket only once its class is charged`, `feat(worker-gateway): add --rate-limit-per-ip-max-entries` and `fix(worker-gateway): evict an idle per-IP entry when the table is full` | S |
+| WG-30 | The 408 rewrite misreports | Low | #1612 (P25): fixed by #1634 (merged into this branch); the deadline after forwarding is a `504` since the follow-up PR, in #1671, `fix(worker-gateway): answer the deadline with 504 once the request was forwarded` | S |
 | WG-31 | The lifetime cap cuts an in-flight request | Low | #1612 (P25): fixed by #1634 (merged into this branch) | S |
 | WG-32 | The screen skips the Sync method, escaped names and other param shapes | Low | #1612 (P25): fixed by #1627 (merged into this branch); named params are still left to the worker | S |
-| WG-33 | A mid-stream upstream failure gives a truncated `200` | Low | #1612 (P25): partly fixed by #1626 (merged into this branch); the upstream's `Content-Length`: fixed by `ee5ee0e70` in the follow-up PR (issue #1668) | S |
+| WG-33 | A mid-stream upstream failure gives a truncated `200` | Low | #1612 (P25): partly fixed by #1626 (merged into this branch); the upstream's `Content-Length`: fixed in the follow-up PR, in #1668, `feat(worker-gateway): pass the upstream's Content-Length on a streamed answer` | S |
 | WG-34 | The binary hop marker breaks gateway chaining and is client-settable | Low | redirect hop addressed in this PR (P1); the rest accepted as the design (chaining gateways on the worker path is unsupported; documented in the README) and closed in the follow-up PR by `docs(worker-gateway): accept the client-settable hop marker as the design` (issue #1673) | S |
-| WG-35 | Upstream URLs with credentials in debug logs and startup errors | Low | #1612 (P25): partly fixed by #1641 (merged into this branch); clap's echo and `Cli`'s `Debug`: fixed by `3fc5cd6de` and `5a7f76e61` in the follow-up PR (issue #1670) | S |
-| WG-36 | The shipped feature set and image are never built in CI | Low | #1612 (P25): fixed by #1639 (merged into this branch); the image's missing COPY sources and their CI guard: fixed by `58fb89906` (issue #1663) and `c3ffa3f79` (issue #1672) in the follow-up PR | S |
+| WG-35 | Upstream URLs with credentials in debug logs and startup errors | Low | #1612 (P25): partly fixed by #1641 (merged into this branch); clap's echo and `Cli`'s `Debug`: fixed in the follow-up PR, in #1670, `fix(worker-gateway): keep worker URLs and stray tokens out of clap's errors` and `fix(worker-gateway): redact URLs and the query header in Cli's Debug` | S |
+| WG-36 | The shipped feature set and image are never built in CI | Low | #1612 (P25): fixed by #1639 (merged into this branch); the image's missing COPY sources and their CI guard: fixed in the follow-up PR, in #1663, `fix(worker-gateway): copy examples/ and patches/ into the image and guard its COPY set in CI`, and #1672, `ci(worker-gateway): check the gateway alone instead of building it` | S |
 | WG-37 | Image build not `--locked`, unpinned base images, `:latest` tag | Low | #1612 (P25): fixed by #1639 (merged into this branch) | S |
 | WG-38 | Large transitive dependency graph | Low | #1612 (P25): partly fixed by #1639 (merged into this branch); still open: `tn-types` and `tn-metrics` remain, tracked in #1676 | M |
-| WG-39 | TLS pitfalls: an empty root store builds silently | Low | #1612 (P25): fixed by #1629 (merged into this branch); a custom CA over an empty root store: fixed by `c24476cc3` in the follow-up PR (issue #1670) | S |
+| WG-39 | TLS pitfalls: an empty root store builds silently | Low | #1612 (P25): fixed by #1629 (merged into this branch); a custom CA over an empty root store: fixed in the follow-up PR, in #1670, `fix(worker-gateway): warn when a custom CA meets an empty system root store` | S |
 | WG-40 | CLI validation gaps (zero durations, duplicate ids, mapped IPv6) | Low | #1612 (P25): fixed by #1641 (merged into this branch) | S |
 | WG-41 | The screen's rejected types match the pool by convention only | Low | #1612 (P25): fixed by #1627 (merged into this branch) | S |
 | WG-42 | Not every error is a JSON-RPC envelope; every HTTP method is forwarded | Low | #1612 (P25): fixed by #1634 (merged into this branch) | S |
@@ -265,8 +265,8 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** default to 1 MiB, document the sizing rule, size the reference manifest to match, and budget total in-flight request bytes.
 - **Effort:** S for the default, M for the byte budget.
 - **Status:** partly fixed in this PR by `fix(worker-gateway): lower the default request body cap to 1 MiB` (P6): the default is 1 MiB, the README states the sizing rule, and the reference memory limit is 1Gi; the byte budget is #1597 (P7), fixed by #1631 (merged into this branch), which also caps hyper's per-connection read buffer (`--http1-max-buf-size`).
-  The branch review of 2026-10-13 found two more gaps, both fixed in the follow-up PR: `--max-request-bytes 0` passed startup and then refused every body (issue #1662, fixed by `6ee6ceacb`: rejected at startup, with a warning below one submission), and the startup warning never said that one client prefix can hold the whole budget (issue #1670, fixed by `9de5e1975`).
-  Still open: one client prefix's share of the byte budget is uncapped; capping it needs a design decision.
+  The branch review of 2026-10-13 found two more gaps, both fixed in the follow-up PR: `--max-request-bytes 0` passed startup and then refused every body (issue #1662, fixed by `fix(worker-gateway): reject --max-request-bytes 0 and warn below one submission`), and the startup warning never said that one client prefix can hold the whole budget (issue #1670, fixed by `fix(worker-gateway): warn when one client prefix can hold the byte budget`).
+  Not done, by decision: no per-prefix share of the byte budget (2026-10-13 ruling: not unless large request caps must be supported on internet-facing gateways); the startup warning for one prefix holding the budget is #1670.
 
 ### WG-06 No per-IP connection cap; one host holds every slot — High
 
@@ -286,7 +286,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** cap concurrent connections per client prefix at accept time.
 - **Effort:** M.
 - **Status:** #1599 (P9): fixed by #1633 (merged into this branch): `--max-connections-per-ip`.
-  The branch review of 2026-10-13 found a per-IP prefix of `/0` accepted, merging every client of one address family into one connection count and one bucket; issue #1666, fixed by `aad6ae569` in the follow-up PR: `/0` is a startup error, and a prefix below `/16` (IPv4) or `/32` (IPv6) logs a warning.
+  The branch review of 2026-10-13 found a per-IP prefix of `/0` accepted, merging every client of one address family into one connection count and one bucket; issue #1666, fixed in the follow-up PR by `fix(worker-gateway): reject a /0 per-IP prefix and warn below /16 and /32`: `/0` is a startup error, and a prefix below `/16` (IPv4) or `/32` (IPv6) logs a warning.
 
 ### WG-07 Health probes share the client connection permits — High
 
@@ -334,7 +334,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** per-route in-flight caps and a budget reserved for submissions (the same change as WG-01).
 - **Effort:** M.
 - **Status:** #1594 (P2): fixed by #1625 (merged into this branch).
-  The branch review of 2026-10-13 found two gaps in the per-route caps, both fixed in the follow-up PR: a buffered submission answer outlived its in-flight gauge and class slot (issue #1659, fixed by `0084a57da`), and the upstream request timeout cut a streamed answer that was still arriving (issue #1660, fixed by `0b3b12302`: the timeout now bounds the wait for the head and every gap in the body, not the whole answer).
+  The branch review of 2026-10-13 found two gaps in the per-route caps, both fixed in the follow-up PR: a buffered submission answer outlived its in-flight gauge and class slot (issue #1659, fixed by `fix(worker-gateway): hold the in-flight guards until a buffered submission answer is taken`), and the upstream request timeout cut a streamed answer that was still arriving (issue #1660, fixed by `fix(worker-gateway): bound an upstream answer by its idle time, not a total deadline`: the timeout now bounds the wait for the head and every gap in the body, not the whole answer).
 
 ### WG-10 Upstream clients follow HTTP redirects and honour proxy variables — High
 
@@ -363,7 +363,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** set `--redirect-queries` on validators; without it, refuse `tn_*`, `debug_*`, `trace_*` and `admin_*` by default.
 - **Effort:** S.
 - **Status:** closed in this PR by `feat(worker-gateway): serve non-submission calls from --redirect-queries` when `--redirect-queries` is set (P1); the allowlist is #1602 (P15), fixed by #1636 (merged into this branch): without a redirect, `--denied-method-prefixes` refuses `tn_`, `debug_`, `trace_` and `admin_` by default.
-  The branch review of 2026-10-13 (V1, High) found that a positional (array) batch element reached the worker with a denied method; issue #1658, fixed by `0b34afd64` in the follow-up PR, which checks such an element's method against the deny list.
+  The branch review of 2026-10-13 (V1, High) found that a positional (array) batch element reached the worker with a denied method; issue #1658, fixed in the follow-up PR by `fix(worker-gateway): check a positional batch element's method against the deny list`.
 
 ### WG-12 Readiness has no hysteresis — Medium
 
@@ -477,7 +477,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 - **Recommendation:** a `preStop` sleep now; later, a shutdown delay during which `/ready` returns `503` while the listener keeps accepting.
 - **Effort:** S for `preStop`, M for drain-aware shutdown.
 - **Status:** partly fixed in this PR by `fix(worker-gateway): poll the node healthcheck in the reference manifest` (P12, a 5 s `preStop` sleep); drain-aware shutdown is #1606 (P19), fixed by #1637 (merged into this branch), which replaces the `preStop` sleep with `--shutdown-delay`: the reference manifest sets a 5 s delay, a 45 s `--graceful-shutdown-timeout` and `terminationGracePeriodSeconds` 55.
-  The branch review of 2026-10-13 found the CLI default `--graceful-shutdown-timeout` (30 s) below the default 45 s request deadline, so a gateway run without the manifest's value could cut a request short at shutdown; issue #1670, fixed by `0c1113f0d` in the follow-up PR: the default is now the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s at the defaults), and a value set below it logs a startup warning.
+  The branch review of 2026-10-13 found the CLI default `--graceful-shutdown-timeout` (30 s) below the default 45 s request deadline, so a gateway run without the manifest's value could cut a request short at shutdown; issue #1670, fixed in the follow-up PR by `fix(worker-gateway): default the shutdown drain to the request deadline`: the default is now the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s at the defaults), and a value set below it logs a startup warning.
 
 ### WG-21 Round-robin DNS has no health feedback — Medium
 
@@ -557,7 +557,7 @@ New with `--redirect-queries`.
 - **Recommendation:** an optional sampled access log (client prefix, method class, route, status, latency) and a bounded per-prefix rejection view.
 - **Effort:** M.
 - **Status:** #1610 (P23): fixed by #1640 (merged into this branch): `--access-log-sample`.
-  The branch review of 2026-10-13 found no ceiling on the lines written per second beyond the sample fraction; issue #1671, fixed by `4104d2e07` in the follow-up PR: `--access-log-max-lines-per-second` (1000 by default, `0` for none) and `tn_worker_gateway_access_log_suppressed_total` for the lines it drops.
+  The branch review of 2026-10-13 found no ceiling on the lines written per second beyond the sample fraction; issue #1671, fixed in the follow-up PR by `feat(worker-gateway): cap access-log lines per second and count the suppressed ones`: `--access-log-max-lines-per-second` (1000 by default, `0` for none) and `tn_worker_gateway_access_log_suppressed_total` for the lines it drops.
 
 ### WG-27 CORS cannot work — Medium
 
@@ -585,7 +585,7 @@ New with `--redirect-queries`.
 - **Recommendation:** refuse or share a bucket for untracked clients when the table is full, and document it.
 - **Effort:** S.
 - **Status:** #1612 (P25): fixed by #1643 (merged into this branch): a full table no longer admits new clients untracked; they share one overflow bucket with the per-IP rate and burst.
-  The branch review of 2026-10-13 found that a client holding about 100,000 prefixes could fill the table and starve every untracked client in that overflow bucket; issue #1661, fixed in the follow-up PR: a first-seen client's entry is inserted only once a shared bucket has admitted its request (`a951affc5`), the table's size is `--rate-limit-per-ip-max-entries` (`704b89233`), and a full table evicts an idle entry for a new client (`0bed104a4`).
+  The branch review of 2026-10-13 found that a client holding about 100,000 prefixes could fill the table and starve every untracked client in that overflow bucket; issue #1661, fixed in the follow-up PR: a first-seen client's entry is inserted only once a shared bucket has admitted its request (`fix(worker-gateway): insert a first-seen client's bucket only once its class is charged`), the table's size is `--rate-limit-per-ip-max-entries` (`feat(worker-gateway): add --rate-limit-per-ip-max-entries`), and a full table evicts an idle entry for a new client (`fix(worker-gateway): evict an idle per-IP entry when the table is full`).
 
 ### WG-30 The 408 rewrite misreports — Low
 
@@ -595,7 +595,7 @@ New with `--redirect-queries`.
 - **Recommendation:** rewrite only the timeout layer's own `408`, and say in the error that delivery is unknown.
 - **Effort:** S.
 - **Status:** #1612 (P25): fixed by #1634 (merged into this branch).
-  The branch review of 2026-10-13 found that client stacks such as OkHttp resend the deadline's `408` on their own, a request that may have reached the upstream included; issue #1671, fixed by `1c5cbd552` in the follow-up PR: a deadline that passes after the request was forwarded is answered `504` / `-32005`, and the `408` is kept for a request never forwarded.
+  The branch review of 2026-10-13 found that client stacks such as OkHttp resend the deadline's `408` on their own, a request that may have reached the upstream included; issue #1671, fixed in the follow-up PR by `fix(worker-gateway): answer the deadline with 504 once the request was forwarded`: a deadline that passes after the request was forwarded is answered `504` / `-32005`, and the `408` is kept for a request never forwarded.
 
 ### WG-31 The lifetime cap cuts an in-flight request — Low
 
@@ -623,7 +623,7 @@ New with `--redirect-queries`.
 - **Impact:** the client sees a framing error; metrics overcount success.
 - **Recommendation:** log and count body-stream failures; preserve the upstream's `Content-Length`.
 - **Effort:** S.
-- **Status:** #1612 (P25): partly fixed by #1626 (merged into this branch), which logs and counts a body-stream failure (`result="body_failed"`); the upstream's `Content-Length` is passed on since `ee5ee0e70` in the follow-up PR (issue #1668), so the client sees a body shorter than the declared length, or, when the upstream sent none, a chunked response without its final chunk.
+- **Status:** #1612 (P25): partly fixed by #1626 (merged into this branch), which logs and counts a body-stream failure (`result="body_failed"`); the upstream's `Content-Length` is passed on since the follow-up PR's `feat(worker-gateway): pass the upstream's Content-Length on a streamed answer` (issue #1668), so the client sees a body shorter than the declared length, or, when the upstream sent none, a chunked response without its final chunk.
 
 ### WG-34 The binary hop marker breaks gateway chaining and is client-settable — Low
 
@@ -642,7 +642,7 @@ New with `--redirect-queries`.
 - **Recommendation:** print origins only.
 - **Effort:** S.
 - **Status:** #1612 (P25): partly fixed by #1641 (merged into this branch): readiness logs and startup errors name an upstream by origin only, and since #1639 (merged into this branch) a malformed upstream YAML file is reported by path and position only.
-  The rest is fixed in the follow-up PR (issue #1670): clap's errors no longer echo a worker URL or a stray token and `--help` hides the URL variables' values (`3fc5cd6de`), and `Cli`'s `Debug` prints the URLs by origin only and redacts the query header (`5a7f76e61`; `Settings` keeps its derived `Debug`).
+  The rest is fixed in the follow-up PR (issue #1670): clap's errors no longer echo a worker URL or a stray token and `--help` hides the URL variables' values (`fix(worker-gateway): keep worker URLs and stray tokens out of clap's errors`), and `Cli`'s `Debug` prints the URLs by origin only and redacts the query header (`fix(worker-gateway): redact URLs and the query header in Cli's Debug`; `Settings` keeps its derived `Debug`).
 
 ### WG-36 The shipped feature set and image are never built in CI — Low
 
@@ -652,7 +652,7 @@ New with `--redirect-queries`.
 - **Recommendation:** a CI step that builds the gateway alone with `--locked`, and optionally the image.
 - **Effort:** S.
 - **Status:** #1612 (P25): fixed by #1639 (merged into this branch).
-  The branch review of 2026-10-13 found that the image still could not build, since the Dockerfile copied neither `examples/` nor `patches/`; issue #1663, fixed by `58fb89906` in the follow-up PR, which copies both and adds a CI check that resolves the workspace from exactly the paths the Dockerfile copies, and the lane now checks the gateway alone with `cargo check` instead of building it (`c3ffa3f79`, issue #1672).
+  The branch review of 2026-10-13 found that the image still could not build, since the Dockerfile copied neither `examples/` nor `patches/`; issue #1663, fixed in the follow-up PR by `fix(worker-gateway): copy examples/ and patches/ into the image and guard its COPY set in CI`, which copies both and adds a CI check that resolves the workspace from exactly the paths the Dockerfile copies, and the lane now checks the gateway alone with `cargo check` instead of building it (`ci(worker-gateway): check the gateway alone instead of building it`, issue #1672).
   The image itself is still not built in CI.
 
 ### WG-37 Image build not `--locked`, unpinned base images, `:latest` tag — Low
@@ -682,7 +682,7 @@ New with `--redirect-queries`.
 - **Recommendation:** check at startup that the root store is not empty when an `https` URL is configured.
 - **Effort:** S.
 - **Status:** #1612 (P25): fixed by #1629 (merged into this branch).
-  The branch review of 2026-10-13 found the root-store check skipped whenever any `--upstream-ca-cert` is given, though another `https` upstream may need the public roots; issue #1670, fixed by `c24476cc3` in the follow-up PR: the store is loaded whenever an upstream is `https`, and a custom CA over an empty store starts with a warning.
+  The branch review of 2026-10-13 found the root-store check skipped whenever any `--upstream-ca-cert` is given, though another `https` upstream may need the public roots; issue #1670, fixed in the follow-up PR by `fix(worker-gateway): warn when a custom CA meets an empty system root store`: the store is loaded whenever an upstream is `https`, and a custom CA over an empty store starts with a warning.
 
 ### WG-40 CLI validation gaps — Low
 
@@ -878,7 +878,7 @@ WG-02 and WG-08 (P3, P4) were small and recommended before any public deployment
 | P21 | WG-23 | Consistent pending-state reads under the redirect | `eth_getTransactionCount(.., "pending")` through the gateway counts a submission made through it immediately before | follow-up: worker-gateway: pending-state reads under redirect — #1608, fixed by #1632 (merged into this branch) |
 | P22 | WG-24 | An authentication header for the query upstream and a chain-id consistency check | the header reaches the query mock and never the worker mock; startup warns when the redirect's `eth_chainId` differs from the worker's | follow-up: worker-gateway: public RPC auth header + chain-id consistency warning — #1609, fixed by #1635 (merged into this branch) |
 | P23 | WG-26 | An optional sampled access log | with the option on, a sampled request logs one structured line with client prefix, method class, route, status and latency | follow-up: worker-gateway: sampled access log — #1610, fixed by #1640 (merged into this branch) |
-| P24 | (design) | Split mixed batches between the two upstreams and merge the answers in order | a mixed batch's submissions reach the worker, its reads the query mock, and the client gets one array in request order | follow-up: worker-gateway: split-and-merge mixed batches — #1611; only if `tn_worker_gateway_mixed_batches_total` shows real use, so it stays open until that counter gives evidence; the dashboard charts the counter since `4a56b5652` in the follow-up PR for the branch review (issue #1672) |
+| P24 | (design) | Split mixed batches between the two upstreams and merge the answers in order | a mixed batch's submissions reach the worker, its reads the query mock, and the client gets one array in request order | follow-up: worker-gateway: split-and-merge mixed batches — #1611; only if `tn_worker_gateway_mixed_batches_total` shows real use, so it stays open until that counter gives evidence; the dashboard charts the counter since `feat(worker-gateway): chart mixed batches sent to the query upstream` in the follow-up PR for the branch review (issue #1672) |
 | P25 | WG-28 to WG-52 | The Low findings, as one checklist | each item's recommendation above | follow-up: worker-gateway: low-severity hardening — #1612; fixed in part by #1623, #1624, #1626, #1627, #1629, #1634, #1639, #1641 and #1643 (merged into this branch), with parts of WG-32 and WG-38 still open; the follow-up PR for the branch review of 2026-10-13 fixes the rest of WG-33 and WG-35 (issues #1668 and #1670) and closes WG-34 as the design (issue #1673) |
 | P26 | WG-14, post-rev-1 | A probe that keeps a redirecting gateway in rotation while its worker is down | with the worker down and the query upstream up, the new probe returns `200` while `/ready` returns `503`; the reference `readinessProbe` uses it | follow-up: worker-gateway: probe that keeps redirecting gateways in rotation while the worker is down — #1613, fixed by #1628 (merged into this branch) |
 | P27 | post-dos-2 | Cache upstream addresses and cap concurrent DNS lookups | with a resolver that delays the query host by 10 s and 100 reads per second, `/ready` and submissions stay `200` | follow-up: worker-gateway: bound and cache DNS lookups for upstream hosts — #1614, fixed by #1630 (merged into this branch) |
