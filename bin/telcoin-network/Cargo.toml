@@ -26,10 +26,11 @@ adiri = ["telcoin-network-cli/adiri", "tn-node/adiri"]
 rocksdb = ["telcoin-network-cli/rocksdb", "tn-node/rocksdb"]
 
 # Faucet build (devnet). Propagates `faucet` down to `tn-reth`, the only crate with faucet-gated
-# code (the unrestricted `mint` precompile used by faucets). Enabled for the `docker-devnet` image
-# via a Docker build arg; default/mainnet builds omit it. `adiri` already implies faucet at the
-# `tn-reth` level, so this is only needed for a faucet-without-adiri build. See `make test-faucet`.
-faucet = ["tn-node/faucet"]
+# code (the unrestricted `mint` precompile used by faucets), through `telcoin-network-cli` so the
+# `--version` "Build Features" line lists it. Enabled for the `docker-devnet` image via a Docker
+# build arg; default/mainnet builds omit it. `adiri` already implies faucet, so this is only
+# needed for a faucet-without-adiri build. See `make test-faucet`.
+faucet = ["telcoin-network-cli/faucet", "tn-node/faucet"]
 
 [lints]
 workspace = true
