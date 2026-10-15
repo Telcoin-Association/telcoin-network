@@ -22,7 +22,7 @@ use crate::{
         client_builder, fetch_chain_id, proxy_client, readiness_client, QueryHeader, Route,
         UpstreamOrigin, WARNING_THROTTLES,
     },
-    ratelimit::{run_gc, RateLimiters, DEFAULT_MAX_PER_IP_ENTRIES},
+    ratelimit::{run_gc, RateLimiters},
     readiness::{run_poller, GatewayReadiness, QueryProbe, ReadinessThresholds},
     server::{
         inflight_slots, serve, serve_probes, AccessLog, AppState, CorsOrigins, RecentSubmissions,
@@ -101,6 +101,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies,
         proxy_protocol,
         rate_limit_submissions,
+        rate_limit_per_ip_max_entries,
         shutdown_delay,
         graceful_shutdown_timeout,
         metrics_addr,
@@ -140,7 +141,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         rate_limit_per_ip,
         rate_limit_global,
         rate_limit_submissions,
-        DEFAULT_MAX_PER_IP_ENTRIES,
+        rate_limit_per_ip_max_entries.get(),
         rate_limit_prefix,
     );
     let trusted_proxies = Arc::new(trusted_proxies);

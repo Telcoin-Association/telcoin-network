@@ -161,6 +161,7 @@ Every flag has an environment-variable fallback.
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
 | `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv6 client into one bucket and one connection count), and startup warns below `/32`. |
 | `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv4 client into one bucket and one connection count), and startup warns below `/16`. |
+| `--rate-limit-per-ip-max-entries` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES` | `100000` | Most client prefixes tracked by the per-IP limiter; beyond it new clients share one overflow bucket (see [Rate limiting](#rate-limiting)). |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
 | `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
@@ -373,7 +374,8 @@ The probe listener (`--probe-addr`) has no rate limit at all.
 
 Per-IP state is bounded: idle buckets are swept every minute and the number of
 tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
-limit. Once the table is full (100,000 entries), a newly seen client gets no
+limit. Once the table is full (`--rate-limit-per-ip-max-entries`, default 100,000), a newly seen client gets no
+
 bucket of its own: every client the table cannot track shares one overflow
 bucket with the per-client rate and burst, so together they get one client's
 budget however many prefixes they spread over. One IPv6 `/48` (65,536 `/64`s)

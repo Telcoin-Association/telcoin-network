@@ -59,7 +59,7 @@ use std::{
     collections::HashMap,
     fmt,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
-    num::NonZeroU32,
+    num::{NonZeroU32, NonZeroUsize},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, MutexGuard, PoisonError,
@@ -84,10 +84,12 @@ use crate::{
 /// How often the background sweep reclaims idle per-IP buckets.
 pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Default ceiling on tracked per-IP buckets. Bounds the per-IP map so a wide
-/// spread of source IPs cannot grow it without limit; ~10 MB at the cap, and
-/// idle buckets are reclaimed between sweeps by [`RateLimiters::gc`].
-pub(crate) const DEFAULT_MAX_PER_IP_ENTRIES: usize = 100_000;
+/// Default ceiling on tracked per-IP buckets (`--rate-limit-per-ip-max-entries`).
+/// Bounds the per-IP map so a wide spread of source IPs cannot grow it without
+/// limit; ~10 MB at the cap, and idle buckets are reclaimed between sweeps by
+/// [`RateLimiters::gc`].
+pub(crate) const DEFAULT_MAX_PER_IP_ENTRIES: NonZeroUsize =
+    NonZeroUsize::new(100_000).expect("the default per-IP table size is not zero");
 
 /// A source of monotonic time, injectable so the limiters can be driven
 /// deterministically in tests.

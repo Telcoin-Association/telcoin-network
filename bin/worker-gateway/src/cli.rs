@@ -520,6 +520,17 @@ pub(crate) struct Cli {
     /// per-IP limit still applies to both.
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS", default_value_t = 0)]
     pub(crate) rate_limit_submissions: u32,
+
+    /// Most client prefixes the per-IP rate limiter tracks at once (default
+    /// 100,000); a first-seen client beyond it shares one overflow bucket with
+    /// every other untracked client (see the README's Rate limiting section).
+    /// Ignored when the per-IP rate limit is disabled.
+    #[arg(
+        long,
+        env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES",
+        default_value_t = crate::ratelimit::DEFAULT_MAX_PER_IP_ENTRIES
+    )]
+    pub(crate) rate_limit_per_ip_max_entries: NonZeroUsize,
     /// Comma-separated IPv4/IPv6 CIDR ranges of the proxies in front of the
     /// gateway (a bare address is a single host). A request whose TCP peer is
     /// inside one is attributed to the right-most `X-Forwarded-For` address that
@@ -721,6 +732,8 @@ pub(crate) struct Settings {
     pub(crate) rate_limit_global: Option<RateLimit>,
     /// Gateway-wide rate budget for submissions, or `None` when disabled.
     pub(crate) rate_limit_submissions: Option<RateLimit>,
+    /// Most client prefixes the per-IP rate limiter tracks at once.
+    pub(crate) rate_limit_per_ip_max_entries: NonZeroUsize,
     /// Proxies whose `X-Forwarded-For` identifies the client; empty when no
     /// proxy is trusted.
     pub(crate) trusted_proxies: TrustedProxies,
@@ -1065,6 +1078,7 @@ impl Cli {
             rate_limit_global,
             // no burst flag: the burst derives like a `0` burst on the others
             rate_limit_submissions: resolve_rate_limit(self.rate_limit_submissions, 0),
+            rate_limit_per_ip_max_entries: self.rate_limit_per_ip_max_entries,
             trusted_proxies,
             proxy_protocol,
             shutdown_delay: self.shutdown_delay,
@@ -2441,6 +2455,44 @@ mod tests {
         let submissions = settings.rate_limit_submissions.expect("submission budget on");
         assert_eq!((submissions.rate().get(), submissions.burst().get()), (50, 100));
         Ok(())
+    }
+
+    #[test]
+    fn per_ip_max_entries_defaults_to_one_hundred_thousand() -> eyre::Result<()> {
+        let default = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(default.rate_limit_per_ip_max_entries.get(), 100_000);
+        let set = cli_with_flags(&["--rate-limit-per-ip-max-entries=2"]).into_settings()?;
+        assert_eq!(set.rate_limit_per_ip_max_entries.get(), 2);
+        Ok(())
+    }
+
+    /// The flag declares its `WORKER_GATEWAY_*` alias. Read from the parser's
+    /// definition rather than by setting the variable, which would leak into
+    /// every other test in the process.
+    #[test]
+    fn per_ip_max_entries_reads_its_env_alias() {
+        use clap::CommandFactory as _;
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|arg| arg.get_long() == Some("rate-limit-per-ip-max-entries"))
+            .expect("the flag is declared");
+        assert_eq!(
+            arg.get_env().and_then(|env| env.to_str()),
+            Some("WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES")
+        );
+    }
+
+    #[test]
+    fn per_ip_max_entries_rejects_zero() {
+        let argv = [
+            "worker-gateway",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+            "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
+            "--rate-limit-per-ip-max-entries=0",
+        ];
+        let err = Cli::try_parse_from(argv).err().expect("a zero-entry table was accepted");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 
     #[test]
