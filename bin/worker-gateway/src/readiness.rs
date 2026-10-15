@@ -55,9 +55,12 @@ use crate::{
     proxy::{chain_id_request, QueryHeader, Route, UpstreamOrigin},
 };
 
-/// Readiness envelope version the gateway targets. Newer versions still parse,
-/// because unknown fields are ignored (see [`NodeReadiness`]); this is only used
-/// to log a heads-up when the shape may have changed.
+/// Readiness envelope version the gateway targets. Other versions still parse,
+/// best-effort, because unknown fields are ignored (see [`NodeReadiness`]);
+/// this is only used to log a heads-up when the shape may have changed: at
+/// warn for the first poll of a run of such answers from one upstream, at
+/// debug for the rest of the run (see
+/// [`UpstreamReadiness::record_envelope_version`]).
 const READINESS_VERSION: u32 = 1;
 
 /// Largest readiness body the poller reads, in bytes. The node's payload is a
