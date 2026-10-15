@@ -99,6 +99,21 @@ spec:
             # gateway refuses to start until you do.
             - name: WORKER_GATEWAY_REDIRECT_QUERIES
               value: "https://<PUBLIC_RPC_HOST>"
+            # Client identity. The Service is a ClusterIP, so clients arrive
+            # through a front, and until this is set the gateway sees the
+            # front as every client: all of them share one
+            # --max-connections-per-ip (32) and --rate-limit-per-ip (100/s)
+            # budget per front address. Behind an ingress controller or other
+            # HTTP proxy, replace <FRONT_CIDRS> with the narrowest ranges that
+            # cover the proxy pods (not the whole pod network). Behind an L4
+            # balancer that terminates TCP, use WORKER_GATEWAY_PROXY_PROTOCOL
+            # and WORKER_GATEWAY_PROXY_PROTOCOL_FROM instead. Remove it only
+            # behind a front that preserves client addresses
+            # (externalTrafficPolicy: Local). Until you do one of these, the
+            # placeholder does not parse and the gateway refuses to start. See
+            # README.md, "Deployment".
+            - name: WORKER_GATEWAY_TRUSTED_PROXIES
+              value: "<FRONT_CIDRS>"
             # After SIGTERM, keep serving for 5s while /ready and /ready/any
             # answer 503 ("draining": true) on both listeners: long enough for
             # the pod's removal from the Service endpoints to reach kube-proxy

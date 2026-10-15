@@ -49,6 +49,11 @@ A Grafana dashboard for the metrics these expose lives at
 - **Query upstream** (`deployment.yaml`): `WORKER_GATEWAY_REDIRECT_QUERIES` (equivalently `--redirect-queries`) sends every call except `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to a public JSON-RPC endpoint for the same chain, so the validator's worker receives only submissions (see the README's "Query redirect" section).
   Replace `<PUBLIC_RPC_HOST>` with that endpoint, preferably over `https`; until you do, the URL does not parse and the gateway exits at startup.
   Remove the variable only for a gateway that should send every call to its worker, never in front of a validator.
+- **Client identity** (`deployment.yaml`): the Service is a `ClusterIP`, so clients arrive through a front, and until `WORKER_GATEWAY_TRUSTED_PROXIES` (equivalently `--trusted-proxies`) or PROXY protocol is set the gateway sees the front as every client: all of them share one `--max-connections-per-ip` (32) and `--rate-limit-per-ip` (100/s) budget per front address.
+  Behind an ingress controller or another HTTP proxy, replace `<FRONT_CIDRS>` with the narrowest ranges that cover the proxy pods (not the whole pod network), and have the proxy append the address it received the connection from to `X-Forwarded-For` (see the README's "Client identity behind a front" section).
+  Behind an L4 load balancer that terminates TCP, enable PROXY protocol v2 on it and replace the variable with `WORKER_GATEWAY_PROXY_PROTOCOL` and `WORKER_GATEWAY_PROXY_PROTOCOL_FROM` (equivalently `--proxy-protocol` and `--proxy-protocol-from`) set to the addresses the balancer connects from.
+  Until you do one of these, `<FRONT_CIDRS>` does not parse and the gateway exits at startup.
+  Remove the variable without a replacement only behind a front that preserves client addresses, such as a `LoadBalancer` Service with `externalTrafficPolicy: Local`.
 
 ## Ports and endpoints
 
