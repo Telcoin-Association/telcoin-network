@@ -9,7 +9,7 @@ placeholders below and adapt them to your cluster before applying.
 deploy/
   k8s/
     deployment.yaml      # apps/v1 Deployment (2 replicas, hardened pod securityContext)
-    service.yaml         # v1 ClusterIP Service (rpc 8545, metrics 9100)
+    service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
     hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests
 ```
@@ -154,10 +154,11 @@ flapping when traffic dips) and a 30s scale-up window (react quickly to load).
 
 ## Security note: the metrics port is unauthenticated
 
-The `/metrics` endpoint on port `9100` has **no authentication**. Keep it
-cluster-internal: the Service is `ClusterIP` (not exposed externally), and you
-should not add an Ingress or LoadBalancer in front of the metrics port. Consider
-a NetworkPolicy that only admits your Prometheus scraper to `9100`, for example:
+The `/metrics` endpoint on port `9100` has **no authentication**.
+Keep it cluster-internal: only its own `ClusterIP` Service, `worker-gateway-metrics`, carries the port, and the ServiceMonitor selects that Service by its `app.kubernetes.io/component: metrics` label.
+Never change that Service's type or put an Ingress or LoadBalancer in front of it.
+The client Service, `worker-gateway`, carries only `rpc`, so changing its type to reach clients does not publish `9100`.
+Any pod in the cluster can still reach `9100` on the pod IP, so consider a NetworkPolicy that only admits your Prometheus scraper to it, for example:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
