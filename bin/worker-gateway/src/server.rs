@@ -67,10 +67,7 @@ use crate::{
     identity::{
         identify, read_proxy_header, ClientAddr, LocalConnection, ProxyHeader, TrustedProxies,
     },
-    proxy::{
-        proxy, reject_non_post, AccessRecord, ForwardingStarted, QueryHeader,
-        OVERSIZED_BODY_WARNINGS,
-    },
+    proxy::{proxy, AccessRecord, ForwardingStarted, QueryHeader, OVERSIZED_BODY_WARNINGS},
     ratelimit::{rate_limit, PrefixPolicy, RateLimiters},
     readiness::GatewayReadiness,
     telemetry::{self, Throttle},
@@ -737,8 +734,11 @@ async fn set_nosniff(mut response: Response) -> Response {
 }
 
 /// Answer a probe path requested with a method other than `GET` or `HEAD`.
+/// axum adds `Allow: GET,HEAD` to the response, and the message names the
+/// same methods.
 async fn probe_method_not_allowed(method: Method) -> Response {
-    reject_non_post(&method)
+    debug!(target: "gateway::server", %method, "rejecting non-GET request to a probe path");
+    error_response(&GatewayError::ProbeNonGetMethod, b"")
 }
 
 /// Build the CORS layer for `origins`: a JSON-RPC client only ever needs
@@ -8288,12 +8288,14 @@ mod tests {
         let client = Client::new();
         // a POST to a probe path is refused too: the rate limiter exempts
         // those paths, so it must not reach the proxy
-        for (method, path, allow) in [
-            (Method::GET, "/", "POST"),
-            (Method::PUT, "/", "POST"),
-            (Method::DELETE, "/x", "POST"),
-            (Method::PUT, "/health", "GET,HEAD"),
-            (Method::POST, "/ready", "GET,HEAD"),
+        const NON_POST: &str = "only POST is accepted";
+        const NON_GET: &str = "only GET and HEAD are accepted on this path";
+        for (method, path, allow, message) in [
+            (Method::GET, "/", "POST", NON_POST),
+            (Method::PUT, "/", "POST", NON_POST),
+            (Method::DELETE, "/x", "POST", NON_POST),
+            (Method::PUT, "/health", "GET,HEAD", NON_GET),
+            (Method::POST, "/ready", "GET,HEAD", NON_GET),
         ] {
             let response = client
                 .request(method.clone(), format!("http://{gateway}{path}"))
@@ -8309,7 +8311,7 @@ mod tests {
             );
             let body: serde_json::Value = response.json().await.expect("json error body");
             assert_eq!(body["error"]["code"], -32600, "{method} {path}");
-            assert_eq!(body["error"]["message"], "only POST is accepted", "{method} {path}");
+            assert_eq!(body["error"]["message"], message, "{method} {path}");
             assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
         }
         assert_eq!(worker_seen.hits(), 0, "a non-POST request must never reach the upstream");
@@ -8317,6 +8319,51 @@ mod tests {
         // the probes still answer GET
         let response = client.get(format!("http://{gateway}/health")).send().await.expect("send");
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// Every probe path refuses a method other than `GET` or `HEAD` with a
+    /// message that agrees with its `Allow: GET,HEAD`, not the proxy's "only
+    /// POST is accepted", and never forwards it.
+    #[tokio::test]
+    async fn probe_paths_refuse_other_methods_with_a_get_head_message() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(router(
+            state,
+            Duration::from_secs(5),
+            1024,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        let client = Client::new();
+        for path in [HEALTH_PATH, READY_PATH, READY_ANY_PATH] {
+            for method in [Method::POST, Method::DELETE] {
+                let response = client
+                    .request(method.clone(), format!("http://{gateway}{path}"))
+                    .body(call("eth_chainId", 1))
+                    .send()
+                    .await
+                    .expect("send");
+                assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+                assert_eq!(
+                    response.headers().get(header::ALLOW),
+                    Some(&HeaderValue::from_static("GET,HEAD")),
+                    "{method} {path}"
+                );
+                let body: serde_json::Value = response.json().await.expect("json error body");
+                assert_eq!(body["error"]["code"], -32600, "{method} {path}");
+                assert_eq!(
+                    body["error"]["message"], "only GET and HEAD are accepted on this path",
+                    "{method} {path}"
+                );
+                assert_eq!(body["id"], serde_json::Value::Null, "{method} {path}");
+            }
+        }
+        assert_eq!(worker_seen.hits(), 0, "a probe-path request must never reach the upstream");
     }
 
     /// A query upstream that answers every POST with an HTML page labelled

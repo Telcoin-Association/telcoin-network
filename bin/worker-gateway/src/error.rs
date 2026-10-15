@@ -154,6 +154,11 @@ pub(crate) enum GatewayError {
     /// `POST` only, so the request is answered locally, without reading its
     /// body or forwarding it.
     NonPostMethod,
+    /// A probe path (`/health`, `/ready`, `/ready/any`) was requested with a
+    /// method other than `GET` or `HEAD`. It shares `NonPostMethod`'s status,
+    /// code and reason label, so the metric contract is unchanged; only the
+    /// message differs, to agree with the response's `Allow: GET,HEAD`.
+    ProbeNonGetMethod,
 }
 
 /// The `Retry-After` value, in seconds, on the capacity `503`s
@@ -190,7 +195,7 @@ impl GatewayError {
             Self::UnreadableBody => StatusCode::BAD_REQUEST,
             Self::Overloaded => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamError { status } => *status,
-            Self::NonPostMethod => StatusCode::METHOD_NOT_ALLOWED,
+            Self::NonPostMethod | Self::ProbeNonGetMethod => StatusCode::METHOD_NOT_ALLOWED,
         }
     }
 
@@ -209,7 +214,9 @@ impl GatewayError {
             Self::UnsupportedTransactionType(_) => code::UNSUPPORTED_TRANSACTION_TYPE,
             Self::InflightBytesExhausted => code::INFLIGHT_BYTES_EXHAUSTED,
             Self::MethodNotAllowed => code::METHOD_NOT_ALLOWED,
-            Self::UnreadableBody | Self::NonPostMethod => code::INVALID_REQUEST,
+            Self::UnreadableBody | Self::NonPostMethod | Self::ProbeNonGetMethod => {
+                code::INVALID_REQUEST
+            }
             Self::Overloaded => code::OVERLOADED,
             Self::UpstreamError { .. } => code::UPSTREAM_ERROR,
         }
@@ -267,6 +274,7 @@ impl GatewayError {
                     .into();
             }
             Self::NonPostMethod => "only POST is accepted",
+            Self::ProbeNonGetMethod => "only GET and HEAD are accepted on this path",
         };
         Cow::Borrowed(message)
     }
@@ -294,7 +302,7 @@ impl GatewayError {
             Self::UnreadableBody => "unreadable_body",
             Self::Overloaded => "overloaded",
             Self::UpstreamError { .. } => "upstream_error",
-            Self::NonPostMethod => "method_not_post",
+            Self::NonPostMethod | Self::ProbeNonGetMethod => "method_not_post",
         }
     }
 }
@@ -1001,6 +1009,7 @@ mod tests {
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
         assert_eq!(GatewayError::UpstreamAnswerLost.code(), -32013);
         assert_eq!(GatewayError::NonPostMethod.code(), -32600);
+        assert_eq!(GatewayError::ProbeNonGetMethod.code(), -32600);
     }
 
     /// An over-length batch shares the "too large" code and status with an
@@ -1100,6 +1109,7 @@ mod tests {
             "upstream_error"
         );
         assert_eq!(GatewayError::NonPostMethod.reason(), "method_not_post");
+        assert_eq!(GatewayError::ProbeNonGetMethod.reason(), "method_not_post");
     }
 
     #[tokio::test]
@@ -1177,6 +1187,17 @@ mod tests {
         assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(err.code(), -32600);
         assert_eq!(err.message(), "only POST is accepted");
+        assert_eq!(err.reason(), "method_not_post");
+    }
+
+    #[test]
+    fn probe_non_get_code_and_reason_are_stable() {
+        // a probe path's 405 keeps the non-POST status, code and reason label
+        // (the metric contract) but names the methods its `Allow` lists
+        let err = GatewayError::ProbeNonGetMethod;
+        assert_eq!(err.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(err.code(), -32600);
+        assert_eq!(err.message(), "only GET and HEAD are accepted on this path");
         assert_eq!(err.reason(), "method_not_post");
     }
 
