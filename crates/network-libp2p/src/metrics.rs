@@ -711,6 +711,14 @@ impl Drop for QuicGaugeLifetime {
     }
 }
 
+/// Convert native counts to correctly rounded gauges without truncating large ceilings.
+fn quic_gauge_value(count: usize) -> f64 {
+    let count = u64::try_from(count).unwrap_or(u64::MAX);
+    let high = u32::try_from(count >> u32::BITS).unwrap_or(u32::MAX);
+    let low = u32::try_from(count & u64::from(u32::MAX)).unwrap_or(u32::MAX);
+    f64::from(high).mul_add(f64::from(u32::MAX) + 1.0, f64::from(low))
+}
+
 impl SwarmMetrics {
     /// Record effective transport ceilings using only the configured network label.
     pub(crate) fn with_capacity(
@@ -803,10 +811,10 @@ impl SwarmMetrics {
             .iter()
             .for_each(|(outcome, counter)| counter.publish(stats.count(*outcome)));
         let endpoint = stats.endpoint();
-        self.handles.quic_incoming_queued.set(endpoint.queued());
-        self.handles.quic_incoming_limit.set(endpoint.limit());
-        self.handles.quic_incoming_endpoints.set(endpoint.endpoints());
-        self.handles.quic_incoming_handshakes.set(stats.handshakes());
+        self.handles.quic_incoming_queued.set(quic_gauge_value(endpoint.queued()));
+        self.handles.quic_incoming_limit.set(quic_gauge_value(endpoint.limit()));
+        self.handles.quic_incoming_endpoints.set(quic_gauge_value(endpoint.endpoints()));
+        self.handles.quic_incoming_handshakes.set(quic_gauge_value(stats.handshakes()));
         [
             stats.retried(),
             stats.accepted(),
@@ -1066,6 +1074,16 @@ impl PeerManagerMetrics {
 mod tests {
     use super::*;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+    /// Counts beyond u32 retain their magnitude instead of saturating the effective ceiling.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn quic_metrics_preserve_large_ceilings() -> Result<(), std::num::TryFromIntError> {
+        let count = usize::try_from(u64::from(u32::MAX) + 2)?;
+        assert_eq!(quic_gauge_value(count), 4_294_967_297.0);
+        assert_eq!(quic_gauge_value(usize::MAX), 18_446_744_073_709_551_616.0);
+        Ok(())
+    }
 
     /// Recreating a transport retains prior process totals and does not lose the new lifetime.
     #[test]

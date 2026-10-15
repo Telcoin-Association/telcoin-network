@@ -28,6 +28,8 @@ def cases(suite):
                  ["tests::valid_and_replayed_validation_tokens", "tests::malformed_and_wrong_ip_validation_tokens",
                   "tests::expired_retry_has_no_accepted_event"])]
     return [
+        (metrics, "f64::from(high).mul_add(f64::from(u32::MAX) + 1.0, f64::from(low))",
+         "f64::from(low)", ["metrics::tests::quic_metrics_preserve_large_ceilings"]),
         (metrics, "self.counter.increment(current.saturating_sub(previous))",
          "self.counter.absolute(current)", ["metrics::tests::quic_metrics_accumulate_across_swarm_restarts"]),
         (metrics, '"tn_network.quic_incoming_outcomes_total"',

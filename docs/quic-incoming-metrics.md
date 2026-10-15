@@ -29,6 +29,7 @@ protocol mutation sites. Export sampling occurs after network loop events and at
 per second while the event loop can run, including periods with only pre-swarm traffic.
 Short queue spikes can fall between samples; cap-denial counters retain saturation evidence.
 Gauges are independent relaxed atomic observations, not a transactionally consistent snapshot.
+Very large native counts follow Prometheus floating-point rounding without u32 truncation.
 The process total is the sum of the primary and worker series, not another transport limit.
 Service-permit gauges describe application admission and are independent of all these resources.
 
@@ -115,6 +116,12 @@ When node_exporter provides host UDP counters, inspect `rate(node_netstat_Udp_Rc
 and `rate(node_netstat_Udp_InErrors[5m])` alongside these panels. They are host-wide datagrams,
 reset on host restart, and cannot attribute loss to a worker. Keep missing host counters absent.
 Use client-side packet capture or the isolated interoperability fixtures to locate wire loss.
+
+Packet parsing and version negotiation also have outcomes before these observation sites.
+Short or undecodable packets, unsupported versions, invalid reserved bits and early destination
+CID errors have no dedicated series in this observer. Use endpoint tracing or packet capture
+for those gaps. They must not be represented by synthetic zero counters. The incoming-cap
+check precedes token parsing, so a cap-denied Initial has a cap outcome without a token outcome.
 
 ## Dependency and verification
 
