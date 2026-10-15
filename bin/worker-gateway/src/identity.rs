@@ -306,9 +306,10 @@ impl std::error::Error for CidrError {}
 ///
 /// Only `set_nosniff` wraps it; it runs before the access log, CORS and the
 /// rate limiter (see `crate::server::router`), so each of them sees the
-/// resolved client. A request without `ConnectInfo` (never the case behind the
-/// accept loop) gets neither: the rate limiter then skips its per-IP bucket,
-/// as it did before. A request on a [`LocalConnection`] is attributed to its
+/// resolved client. A request without `ConnectInfo` gets neither extension,
+/// and the proxy handler, which requires [`Forwarding`], then fails it with a
+/// `500`; the accept loop always inserts `ConnectInfo`, so only test harnesses
+/// serve without it. A request on a [`LocalConnection`] is attributed to its
 /// peer, the front.
 pub(crate) async fn identify(
     State(trusted): State<Arc<TrustedProxies>>,
