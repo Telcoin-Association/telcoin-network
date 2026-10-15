@@ -1004,7 +1004,9 @@ pub(crate) async fn rate_limit(
 }
 
 /// Whether a request skips the rate limiter: a `GET` or `HEAD` on a probe
-/// path (`/health`, `/ready`). `/ready/any` never reaches this layer.
+/// path (`/health`, `/ready`). A `GET` or `HEAD` on `/ready/any` never
+/// reaches this layer; its other methods are routed through it and limited
+/// like any request.
 fn is_exempt(method: &Method, path: &str) -> bool {
     (path == HEALTH_PATH || path == READY_PATH) && matches!(*method, Method::GET | Method::HEAD)
 }
