@@ -15,9 +15,10 @@ The reference manifest never becomes ready (WG-19), every method including `tn_*
 This PR fixes the manifest's readiness URL, adds a `preStop` hook (since replaced by `--shutdown-delay` in #1637), logs the cause of upstream transport errors with the URL redacted, lowers the default request body cap to 1 MiB, and adds `--redirect-queries`, which takes every non-submission call off the worker and refuses upstream HTTP redirects.
 With `--redirect-queries` set, WG-11 is closed, the gateway keeps serving reads while the worker is down (WG-14, as long as nothing in front of it acts on `/ready`), and slow reads no longer reach the worker (WG-01).
 The post-change review found that this moves the shared failure point rather than removing it: a public RPC that stalls holds every gateway's connection slots and starves submissions on all of them, which #1625 (merged into this branch) fixes for WG-01 and WG-09, and a resolver that hangs on the public RPC's name can make readiness flap, which #1630 (merged into this branch) fixes (see [Post-change review](#post-change-review)).
-Every other finding of Medium or higher has a follow-up issue or operator guidance in the plan below.
+Every other finding of Medium or higher is fixed by a follow-up PR merged into this branch or covered by operator guidance in the plan below (see the [Summary](#summary), refreshed on 2026-10-15).
 WG-02 and WG-08 were small fixes recommended before any public deployment; #1642 and #1643 (merged into this branch) fix them.
-The remaining High findings should be closed before general availability.
+No High finding remains open; the one residual is WG-05's: one client prefix's share of the in-flight byte budget is still uncapped, and capping it needs a design decision before general availability.
+A review of the whole branch on 2026-10-13 found one High and eight Medium issues of its own (#1658 to #1666); the follow-up PR for that review fixes all nine, and the Summary names the issue and the commit under each row they bear on.
 
 ## Scope and method
 
