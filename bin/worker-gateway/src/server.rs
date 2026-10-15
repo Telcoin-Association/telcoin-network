@@ -4598,7 +4598,11 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
 
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY, "nothing listens on the freed port");
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "nothing should listen on the freed port {addr}; another process may have taken it"
+        );
 
         // the worker answers once on the same port, then goes away again
         let listener = TcpListener::bind(addr).await.unwrap_or_else(|err| {
@@ -4615,7 +4619,12 @@ mod tests {
         // one refused forward after the response: the run restarted, so the
         // count is 1, below the threshold of 2
         let (status, _) = post_rpc(gateway, None, call("eth_chainId", 3)).await;
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "nothing should listen on the freed port {addr} again; another process may have \
+             taken it"
+        );
         assert_eq!(ready_status(gateway).await, StatusCode::OK, "the response reset the count");
     }
 
