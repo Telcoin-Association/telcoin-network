@@ -126,6 +126,11 @@ spec:
               port: probe
             initialDelaySeconds: 5
             periodSeconds: 10
+            # The probe shares the gateway's one runtime thread (limits.cpu
+            # "1"), so a CPU-saturating flood can delay it. Restart only
+            # after a minute of silence, not three slow answers.
+            timeoutSeconds: 5
+            failureThreshold: 6
           readinessProbe:
             # /ready/any is 200 while the gateway can serve any route: an
             # upstream worker is ready, or the WORKER_GATEWAY_REDIRECT_QUERIES
