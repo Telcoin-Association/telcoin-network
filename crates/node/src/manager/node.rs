@@ -1944,7 +1944,8 @@ fn check_restore_consistency(
 ///
 /// A record closes its epoch, so `next_committee` belongs to the following epoch. A record at or
 /// ahead of the local committee can veto validator status; an older record cannot veto a later
-/// admission. Records never promote a local observer or overwrite an inactive validator.
+/// admission. An eligible validator whose local epoch precedes the record must catch up before
+/// voting. Records never promote a local observer or overwrite an inactive validator.
 fn node_mode_from_epoch_record(
     initial_mode: NodeMode,
     local_epoch: Epoch,
@@ -1958,10 +1959,12 @@ fn node_mode_from_epoch_record(
                 record.epoch.saturating_add(1) < local_epoch
                     || record.next_committee.contains(public_key)
             });
-            if eligible {
-                NodeMode::CvvActive
-            } else {
+            if !eligible {
                 NodeMode::Observer
+            } else if record.is_some_and(|record| record.epoch > local_epoch) {
+                NodeMode::CvvInactive
+            } else {
+                NodeMode::CvvActive
             }
         }
     }
@@ -2079,6 +2082,33 @@ mod tests {
                 std::mem::discriminant(&mode),
                 std::mem::discriminant(&expected),
                 "{mode:?}"
+            );
+        });
+    }
+
+    /// A retained validator starts catch-up when the record tip proves its local epoch is stale.
+    #[test]
+    fn epoch_record_mode_demotes_retained_validator_behind_record_tip() {
+        let public_key = worker_key_config().primary_public_key();
+        let record =
+            EpochRecord { epoch: 5, next_committee: vec![public_key], ..Default::default() };
+        let genesis = EpochRecord { next_committee: vec![public_key], ..Default::default() };
+        [
+            (NodeMode::CvvActive, 3, &record, NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 4, &record, NodeMode::CvvInactive),
+            (NodeMode::CvvActive, 5, &record, NodeMode::CvvActive),
+            (NodeMode::CvvActive, 6, &record, NodeMode::CvvActive),
+            (NodeMode::CvvActive, 0, &genesis, NodeMode::CvvActive),
+            (NodeMode::Observer, 3, &record, NodeMode::Observer),
+            (NodeMode::CvvInactive, 3, &record, NodeMode::CvvInactive),
+        ]
+        .into_iter()
+        .for_each(|(initial, epoch, record, expected)| {
+            let mode = node_mode_from_epoch_record(initial, epoch, &public_key, Some(record));
+            assert_eq!(
+                std::mem::discriminant(&mode),
+                std::mem::discriminant(&expected),
+                "local epoch {epoch}: {mode:?}"
             );
         });
     }

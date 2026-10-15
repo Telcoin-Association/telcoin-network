@@ -213,6 +213,9 @@ where
                 .await?
                 .apply(&gas_accumulator);
         }
+        // Deactivate removed workers before recovery, replay, and peer discovery can await.
+        // The submission guard already rejects these ids as soon as the resize above runs.
+        engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
         // The task manager that resets every epoch and manages
         // short-running tasks for the lifetime of the epoch.
         let mut epoch_task_manager = TaskManager::new(EPOCH_TASK_MANAGER);
@@ -463,6 +466,10 @@ where
                     target_hash,
                 )
                 .await?;
+
+                // Deactivate removed workers before writing records or exporting execution state.
+                // Admission is already closed by the accumulator resize inside close_epoch.
+                engine.deactivate_workers_above(gas_accumulator.num_workers()).await;
 
                 // e2e fault injection, always false without `tn-types/test-utils`: the closing
                 // block is executed and canonical, the record and the tables clear are not done

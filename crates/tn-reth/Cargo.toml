@@ -68,7 +68,8 @@ tracing = { workspace = true }
 eyre = { workspace = true }
 # `json-rpc` exposes the request/response packet types the size-capped forwarder transport
 # implements `Service` over (issue #1275).
-alloy = { workspace = true, features = ["genesis", "json-rpc"] }
+# `rpc-types-mev` exposes the signed-bundle request and response types used by the epoch-fee adapter.
+alloy = { workspace = true, features = ["genesis", "json-rpc", "rpc-types-mev"] }
 alloy-evm = { workspace = true }
 tempfile = { workspace = true }
 serde_json = { workspace = true }
