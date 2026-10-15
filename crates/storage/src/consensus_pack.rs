@@ -45,7 +45,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::{
     archive::{
-        data_file::{create_dir_synced, fsync_directory},
+        data_file::{create_dir_synced, fsync_directory, fsync_file},
         digest_index::HdxIndex,
         error::{
             fetch::FetchError,
@@ -2373,7 +2373,7 @@ impl Inner {
         // original: a directory fsync alone makes the new entries durable, not their contents.
         let copy_synced = |from: &Path, to: &Path| -> io::Result<()> {
             std::fs::copy(from, to)?;
-            std::fs::File::open(to)?.sync_all()
+            fsync_file(&std::fs::File::open(to)?)
         };
         let data = base_dir.join(crate::certificate_pack::DATA_NAME);
         if data.is_file() {

@@ -46,7 +46,7 @@ use tokio::{
 use tracing::{error, warn};
 
 use crate::{
-    archive::data_file::fsync_directory,
+    archive::data_file::{fsync_directory, fsync_file},
     consensus_pack::{install_dir_rename_aside, ConsensusPack, PackError, DATA_NAME},
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -217,8 +217,10 @@ impl LatestConsensus {
 
         let (tx, mut rx) = mpsc::channel(1000);
         let handle = std::thread::spawn(move || {
-            fn sync_all_with_log(f: &File) {
-                if let Err(e) = f.sync_all() {
+            // `fsync_file`, not `File::sync_all`: on macOS that is `F_FULLFSYNC`, a whole drive
+            // flush on every output (see `fsync_file`); on Linux the two are the same.
+            fn fsync_with_log(f: &File) {
+                if let Err(e) = fsync_file(f) {
                     error!(target: "consensus_chain", ?e, "failed to sync a file");
                 }
             }
@@ -242,22 +244,22 @@ impl LatestConsensus {
                             continue;
                         }
                         if old_epoch != epoch {
-                            sync_all_with_log(f);
+                            fsync_with_log(f);
                         }
                     }
                     LatestConsensusCommand::Persist(tx) => {
-                        sync_all_with_log(&slot1);
-                        sync_all_with_log(&slot2);
+                        fsync_with_log(&slot1);
+                        fsync_with_log(&slot2);
                         let _ = tx.send(());
                     }
                     LatestConsensusCommand::Shutdown => {
-                        sync_all_with_log(&slot1);
-                        sync_all_with_log(&slot2);
+                        fsync_with_log(&slot1);
+                        fsync_with_log(&slot2);
                         break;
                     }
                     LatestConsensusCommand::AsyncShutdown(tx) => {
-                        sync_all_with_log(&slot1);
-                        sync_all_with_log(&slot2);
+                        fsync_with_log(&slot1);
+                        fsync_with_log(&slot2);
                         let _ = tx.send(());
                         break;
                     }
@@ -1566,9 +1568,9 @@ impl ConsensusChain {
             .open(base_path.join("consensus_slot1"))?;
         slot.seek(SeekFrom::Start(0))?;
         slot.write_all(&buffer)?;
-        slot.sync_all()?;
+        fsync_file(&slot)?;
         // Durably link the (possibly newly-created) `consensus_slot1` entry into `base_path`:
-        // `sync_all` flushes the file, not the parent directory entry that names it, so a crash
+        // syncing the file flushes it, not the parent directory entry that names it, so a crash
         // right after `db load-state` could otherwise lose the slot and reset resume to genesis.
         fsync_directory(base_path)?;
         Ok(())

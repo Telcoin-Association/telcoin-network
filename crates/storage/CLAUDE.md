@@ -105,6 +105,10 @@ and remember that everything after `mod test` is tests (more than half of `conse
   - a panic inside the write lock (`Shared::mutate`) takes the state out and drops it unsealed,
     so the next open recovers it;
   - a failed save rolls back, and the next open rebuilds the indexes (README design decision 17).
+  - `CertificatePack`, `EpochRecordDb` and `LatestConsensus` stay actor threads by decision: their
+    traffic is too low for locks to pay, and an actor keeps their order, backpressure and panic
+    containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is updated on its thread,
+    after a successful save.
 - **Encode changes must keep the bytes on disk identical.** Prove it the way
   `stored_append_matches_append` and `test_split_encoding_matches_one_lane` do.
 - **Sub-dag serde is fork-gated** (fields written only after their fork). Cache what a pack read
