@@ -540,6 +540,18 @@ pub(crate) mod test_utils {
                 .collect()
         }
     }
+
+    /// Whether this test has a process of its own (nextest's model), so a
+    /// process-wide static it reads (an env var, a warning throttle) is
+    /// touched by no other test.
+    ///
+    /// A test that needs this returns early, with an `eprintln!` naming the
+    /// reason, when it is false: under `cargo test` every test shares one
+    /// process, so a warning another test already admitted, or an env var
+    /// another test reads, would make it fail by order.
+    pub(crate) fn process_per_test() -> bool {
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test")
+    }
 }
 
 #[cfg(test)]

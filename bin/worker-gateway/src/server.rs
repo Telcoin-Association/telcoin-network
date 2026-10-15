@@ -1651,7 +1651,7 @@ mod tests {
         },
         ratelimit::RateLimit,
         readiness::{run_poller, QueryProbe, ReadinessThresholds},
-        telemetry::test_utils::CapturedMetrics,
+        telemetry::test_utils::{process_per_test, CapturedMetrics},
     };
     use axum::{
         body::Bytes,
@@ -3716,6 +3716,10 @@ mod tests {
     /// not go unnoticed.
     #[tokio::test]
     async fn json_redirect_from_an_upstream_is_logged() {
+        if !process_per_test() {
+            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -4193,6 +4197,10 @@ mod tests {
     #[tokio::test]
     async fn bad_proxy_headers_are_counted_and_warned_once_per_window() {
         const WARNING: &str = "missing, malformed or late PROXY protocol header";
+        if !process_per_test() {
+            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         let mut metrics = CapturedMetrics::install();
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
@@ -7073,6 +7081,10 @@ mod tests {
     /// names the connect stage.
     #[tokio::test]
     async fn stalled_connection_setup_counts_against_the_worker() {
+        if !process_per_test() {
+            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -8946,6 +8958,12 @@ mod tests {
         assert_eq!((worker_seen.hop_marker(), worker_seen.redirect_marker()), (3, 0));
     }
 
+    /// Why a test that asserts a throttled warning skips outside nextest: the
+    /// throttles are process-wide statics, so under `cargo test` another test
+    /// may already have used up the window and the warning never appears.
+    const THROTTLED_WARNING_SKIP: &str = "reads a warning a process-wide throttle admits once per \
+                                          10s, so it needs nextest's process-per-test model";
+
     /// A `MakeWriter` that appends every formatted log line to a shared
     /// buffer.
     #[derive(Clone, Default)]
@@ -8983,6 +9001,10 @@ mod tests {
     /// through the same thread-local subscriber.
     #[tokio::test]
     async fn header_value_never_appears_in_logs() {
+        if !process_per_test() {
+            eprintln!("skipped: {THROTTLED_WARNING_SKIP}");
+            return;
+        }
         let logs = CapturedLogs::default();
         let subscriber = tracing_subscriber::fmt()
             .with_writer(logs.clone())
@@ -10416,7 +10438,7 @@ mod tests {
     /// other runner skips it.
     #[tokio::test]
     async fn clients_ignore_proxy_environment() {
-        if std::env::var("NEXTEST_EXECUTION_MODE").as_deref() != Ok("process-per-test") {
+        if !process_per_test() {
             eprintln!(
                 "skipped: clients_ignore_proxy_environment needs nextest's process-per-test model"
             );
