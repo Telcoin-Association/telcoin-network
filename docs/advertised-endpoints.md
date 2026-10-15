@@ -131,7 +131,8 @@ their existing committee-window lifetime for routing; this alone does not establ
 Submit observations additionally require a matching, unexpired signed DHT record under the existing
 record-expiry policy. Cached URLs, expired records, and local stubs cannot establish coverage. A newer
 verified refresh can restore coverage without restarting the node. Polling also retries missing
-required records; replaying identical records does not extend their expiry.
+required records. Expiry follows the existing DHT store policy, including its handling of identical
+republishes; these observations impose no new age threshold on signed timestamps.
 
 Observer monitors run immediately and every five seconds on each active worker's epoch task spawner,
 even with no transactions. Each snapshot reads membership and advertisements on one swarm iteration,
