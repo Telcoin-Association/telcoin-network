@@ -163,7 +163,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
 | WG-46 | `upstream_ready{worker_id}` collides; in-flight gauge misses streaming | Low | #1612 (P25): fixed by #1626 (merged into this branch) | S |
 | WG-47 | Unthrottled warns on some rejects; none on others | Low | #1612 (P25): fixed by #1626 (merged into this branch) | S |
 | WG-48 | A never-ready gateway logs no reason at info | Low | #1612 (P25): fixed by #1624 (merged into this branch) | S |
-| WG-49 | Docs contradict the code in several places | Low | #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch | S |
+| WG-49 | Docs contradict the code in several places | Low | #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch; the `User-Agent` that doc still left out of the upstream hop's additions: fixed in the follow-up PR by `docs(worker-gateway): list the User-Agent among the upstream hop's additions` (issue #1673) | S |
 | WG-50 | ANSI escapes in non-TTY logs; no structured format | Low | #1612 (P25): fixed by #1639 (merged into this branch) | S |
 | WG-51 | The Grafana datasource uid is hard-coded | Low | #1612 (P25): fixed by #1639 (merged into this branch) | S |
 | WG-52 | An EIP-7702 rejection is reported as "EIP-4844 blob" | Low | #1612 (P25): fixed by #1627 (merged into this branch) | S |
@@ -772,7 +772,7 @@ New with `--redirect-queries`.
 - **Impact:** misleads sizing; the underlying issues have their own ids.
 - **Recommendation:** correct each item.
 - **Effort:** S.
-- **Status:** #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch.
+- **Status:** #1612 (P25): fixed by #1639 (merged into this branch), and the last stale line, in the `src/proxy.rs` module doc, on this branch; the `User-Agent` that doc still left out of the upstream hop's additions: fixed in the follow-up PR by `docs(worker-gateway): list the User-Agent among the upstream hop's additions` (issue #1673).
 
 ### WG-50 ANSI escapes in non-TTY logs; no structured format — Low
 

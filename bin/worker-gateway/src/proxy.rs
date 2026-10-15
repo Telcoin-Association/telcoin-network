@@ -4,11 +4,13 @@
 //! first ready upstream worker and returns the upstream's status, body, and
 //! content type; a request with any other method is answered locally with a
 //! `405` error envelope before its body is read. Other headers are not
-//! forwarded in either direction, with three deliberate additions on the
+//! forwarded in either direction, with four deliberate additions on the
 //! upstream hop: `X-Forwarded-For` / `X-Forwarded-Proto` (client identity for
-//! the upstream's logs and any per-client limits it applies) and the
+//! the upstream's logs and any per-client limits it applies), the
 //! `X-TN-Gateway` hop marker (loop protection; an inbound request that already
-//! carries it is rejected instead of forwarded). The two identity headers are
+//! carries it is rejected instead of forwarded), and a `User-Agent` of
+//! `tn-worker-gateway/<version>` (see [`USER_AGENT`]), so a query upstream's
+//! operator can identify the gateway. The two identity headers are
 //! built from the client the gateway resolved, never copied from the request:
 //! `X-Forwarded-For` names the peer, or the forwarded client and then the
 //! trusted proxy that vouched for it, and `X-Forwarded-Proto` is `http` unless
