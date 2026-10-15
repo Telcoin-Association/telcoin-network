@@ -290,6 +290,11 @@ sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
 request that already carries it is rejected (HTTP `508`), so a misconfigured
 upstream or VIP that points back at a gateway breaks the loop at the first
 revisit instead of exhausting file descriptors.
+The marker is not authenticated: a client that sends it gets the `508` and
+raises the throttled loop warning, at the cost of a rate-limit token per
+attempt, and two gateways cannot be chained on the worker path, which is
+unsupported by design (the redirect hop has its own marker,
+`X-TN-Gateway-Redirect`).
 
 ## Edge protections
 
