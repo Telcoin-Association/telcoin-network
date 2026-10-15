@@ -12,7 +12,7 @@ license = "MIT OR Apache-2.0"
 [dependencies]
 libp2p-identity = { version = "=0.3.0", features = ["ed25519", "rand"] }
 libp2p-tls = "=0.7.0"
-rustls = { version = "=0.23.45", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"] }
+rustls = { version = "=0.23.46", default-features = false, features = ["std", "aws_lc_rs", "prefer-post-quantum"] }
 serde_json = "1"
 # Pin the cryptographic implementation to the node's current lockfile too.
 aws-lc-rs = "=1.18.1"
