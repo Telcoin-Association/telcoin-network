@@ -9012,13 +9012,26 @@ pub(crate) mod test {
     }
 
     /// The levels of the warnings and errors logged on this thread while `f` runs.
+    ///
+    /// The capturing subscriber is the test binary's global default, installed once, and records
+    /// only the threads capturing at the time. A thread-local (`with_default`) subscriber would
+    /// miss events: tests run in parallel, and another thread's subscriber coming or going can
+    /// rebuild tracing's global level filter without this one.
     pub(crate) fn warnings_and_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<tracing::Level>) {
-        use tracing::{span, Event, Level, Metadata, Subscriber};
-        /// Records each warning's and error's level.
-        struct Levels(Arc<parking_lot::Mutex<Vec<Level>>>);
-        impl Subscriber for Levels {
-            fn enabled(&self, _: &Metadata<'_>) -> bool {
-                true
+        use tracing::{level_filters::LevelFilter, span, Event, Level, Metadata, Subscriber};
+        thread_local! {
+            /// The levels logged on this thread while it captures.
+            static CAPTURED: std::cell::RefCell<Option<Vec<Level>>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        /// Records each warning's and error's level, for the thread that logged it.
+        struct Capture;
+        impl Subscriber for Capture {
+            fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+                *metadata.level() <= Level::WARN
+            }
+            fn max_level_hint(&self) -> Option<LevelFilter> {
+                Some(LevelFilter::WARN)
             }
             fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
                 span::Id::from_u64(1)
@@ -9027,16 +9040,23 @@ pub(crate) mod test {
             fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
             fn event(&self, event: &Event<'_>) {
                 let level = *event.metadata().level();
-                if level <= Level::WARN {
-                    self.0.lock().push(level);
-                }
+                CAPTURED.with(|captured| {
+                    if let Some(levels) = captured.borrow_mut().as_mut() {
+                        levels.push(level);
+                    }
+                });
             }
             fn enter(&self, _: &span::Id) {}
             fn exit(&self, _: &span::Id) {}
         }
-        let levels = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let result = tracing::subscriber::with_default(Levels(Arc::clone(&levels)), f);
-        let levels = levels.lock().clone();
+        static INSTALLED: std::sync::Once = std::sync::Once::new();
+        INSTALLED.call_once(|| {
+            tracing::subscriber::set_global_default(Capture)
+                .expect("no other global subscriber in this test binary");
+        });
+        CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+        let result = f();
+        let levels = CAPTURED.with(|captured| captured.borrow_mut().take()).unwrap_or_default();
         (result, levels)
     }
 

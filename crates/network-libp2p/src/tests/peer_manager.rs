@@ -438,6 +438,79 @@ async fn trusted_hub_lookups_back_off_and_skip_bootstrap_keys() -> eyre::Result<
     Ok(())
 }
 
+/// Exercise status-only recovery through the manager, including its independent ban cache.
+async fn assert_trusted_hub_status_only_ban_recovers(duration: Duration) -> eyre::Result<()> {
+    let mut config = NetworkConfig::default();
+    config.peer_config_mut().excess_peers_reconnection_timeout = duration;
+    let mut manager = create_test_peer_manager(Some(config));
+    let (bls, endpoint) = configured_hub(5);
+    let id: PeerId = endpoint.network_key.clone().into();
+    manager.add_trusted_peers([(bls, endpoint.clone())].into_iter().collect());
+    assert_eq!(manager.peer_score(&id), Some(ScoreConfig::default().default_score));
+    manager.dial_requests.clear();
+    assert!(manager.register_peer_connection(
+        &id,
+        ConnectionType::IncomingConnection { multiaddr: endpoint.network_address }
+    ));
+    (0..4).for_each(|_| manager.process_penalty(id, Penalty::Medium));
+    assert!(manager
+        .events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::DisconnectPeer(peer_id) if *peer_id == id) }));
+    manager.register_disconnected(&id);
+    assert!(manager
+        .peers
+        .get_peer(&id)
+        .is_some_and(|peer| matches!(peer.connection_status(), ConnectionStatus::Banned { .. })));
+    assert!(manager.temporarily_banned.contains(&id));
+    manager.retry_trusted_peers();
+    assert!(manager.dial_requests.is_empty());
+
+    // Tokio drives retry scheduling, but both ban records use std::time::Instant. Model cache
+    // expiry with an empty cache and age the status explicitly, without a wall-clock sleep.
+    // Cache expiry itself is covered by its injected-clock tests in cache_peers.rs.
+    tokio::time::advance(duration + manager.heartbeat.period()).await;
+    manager.temporarily_banned =
+        BannedPeerCache::new(duration, manager.config.max_temporarily_banned_peers);
+    let expired = std::time::Instant::now()
+        .checked_sub(duration)
+        .ok_or_else(|| eyre::eyre!("ban duration exceeds monotonic clock range"))?;
+    manager
+        .peers
+        .get_peer_mut(&id)
+        .ok_or_else(|| eyre::eyre!("missing hub"))?
+        .set_connection_status(ConnectionStatus::Banned { instant: expired });
+    manager.events.clear();
+    manager.heartbeat();
+    assert!(manager.peers.get_peer(&id).is_some_and(|peer| matches!(
+        peer.connection_status(),
+        ConnectionStatus::Disconnected { .. }
+    )));
+    assert!(!manager.peer_banned(&id));
+    assert!(manager
+        .events
+        .iter()
+        .any(|event| { matches!(event, PeerEvent::Unbanned(peer_id) if *peer_id == id) }));
+    manager.retry_trusted_peers();
+    assert!(manager.dial_requests.iter().any(|request| request.peer_id == id));
+    Ok(())
+}
+
+/// Four Medium penalties must not permanently strand a configured, non-committee hub.
+#[tokio::test(start_paused = true)]
+async fn trusted_hub_status_only_ban_recovers() -> eyre::Result<()> {
+    assert_trusted_hub_status_only_ban_recovers(
+        tn_config::PeerConfig::default().excess_peers_reconnection_timeout,
+    )
+    .await
+}
+
+/// The manager passes its configured timeout through to status recovery.
+#[tokio::test(start_paused = true)]
+async fn trusted_hub_status_only_ban_recovers_with_custom_timeout() -> eyre::Result<()> {
+    assert_trusted_hub_status_only_ban_recovers(Duration::from_secs(17)).await
+}
+
 /// A hub outside the committee keeps its protocol ban across rotation and reinstall, and
 /// committee admission forgives it because committee members are exempt for now.
 #[tokio::test(start_paused = true)]
@@ -1908,6 +1981,80 @@ async fn test_self_advertised_stale_record_ignored() {
         "stale self-advertised record must not regress the cache"
     );
     assert_eq!(cached.timestamp, 1_000, "cached timestamp unchanged");
+}
+
+#[tokio::test]
+async fn test_self_advertised_identical_record_rebinds_evicted_member() {
+    // A committee member whose record was evicted pushes the SAME record again over its own
+    // connection. The cache drops it as not newer, so only the re-bind from the cached record
+    // restores its identity (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([47; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut record = random_network_info();
+    record.timestamp = 1_000;
+    let source: PeerId = record.pubkey.clone().into();
+    peer_manager.add_self_advertised_peer(source, bls, record.clone());
+    assert_eq!(peer_manager.peer_to_bls(&source), Some(bls));
+
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&source), None);
+
+    // a relayed copy cannot bind the member's key to the relayer, nor restore the member
+    let relayer = PeerId::random();
+    peer_manager.add_self_advertised_peer(relayer, bls, record.clone());
+    assert_eq!(peer_manager.peer_to_bls(&relayer), None);
+    assert_eq!(peer_manager.peer_to_bls(&source), None);
+
+    peer_manager.add_self_advertised_peer(source, bls, record);
+    assert_eq!(peer_manager.peer_to_bls(&source), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&source));
+    assert_eq!(
+        peer_manager.known_peers.get(&bls).map(|info| info.timestamp),
+        Some(1_000),
+        "cached record unchanged"
+    );
+}
+
+#[tokio::test]
+async fn test_discovered_identical_record_rebinds_evicted_member() {
+    // Kad variant: a query result carrying the cached record again restores the evicted binding
+    // (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([53; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let mut record = random_network_info();
+    record.timestamp = 1_000;
+    let peer_id: PeerId = record.pubkey.clone().into();
+    peer_manager.add_discovered_peer(bls, record.clone());
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), None);
+
+    peer_manager.add_discovered_peer(bls, record);
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&peer_id));
+}
+
+#[tokio::test]
+async fn test_update_committees_rebinds_evicted_member() {
+    // A slot member evicted while its cached record stayed is bound and trusted again at the next
+    // committee update (issue #1649).
+    let mut peer_manager = create_test_peer_manager(None);
+    let bls = *BlsKeypair::generate(&mut StdRng::from_seed([59; 32])).public();
+    peer_manager.update_committees(HashSet::new(), HashSet::from([bls]), HashSet::new());
+
+    let record = random_network_info();
+    let peer_id: PeerId = record.pubkey.clone().into();
+    peer_manager.add_discovered_peer(bls, record);
+    assert!(peer_manager.peers.evict_confirmed(bls).is_some(), "member record evicted");
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), None);
+
+    // the member rotates from the current slot into the previous slot
+    peer_manager.update_committees(HashSet::from([bls]), HashSet::new(), HashSet::new());
+    assert_eq!(peer_manager.peer_to_bls(&peer_id), Some(bls), "binding restored from the cache");
+    assert!(peer_manager.peers.is_peer_validator(&peer_id));
 }
 
 #[tokio::test]

@@ -22,6 +22,9 @@ pub mod consensus_pack;
 /// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
 #[cfg(test)]
 mod db_bench;
+/// The check of the MDBX epoch environment's header-bearing rows before the migration copies them.
+#[cfg(feature = "reth-libmdbx")]
+mod epoch_db_recovery;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
@@ -229,6 +232,7 @@ pub(crate) fn migrate_from_mdbx(
     tndb_root: &std::path::Path,
     db: &tndb::SplitDatabase,
 ) -> eyre::Result<usize> {
+    use eyre::WrapErr as _;
     use std::io::Write as _;
 
     let marker = tndb_root.join(tndb::MDBX_MIGRATED);
@@ -251,6 +255,11 @@ pub(crate) fn migrate_from_mdbx(
         ["epoch", "kad", "cache"].into_iter().filter(|dir| present(dir)).collect();
     if read.contains(&"epoch") {
         let src = open_mdbx_env(store_path, MdbxEnv::Epoch)?;
+        // Before the copy below, whose typed reads panic on a row this binary cannot decode: it
+        // removes the header this node proposed for a sub-second fork epoch on an older binary,
+        // and refuses (MDBX kept) any other undecodable epoch row.
+        epoch_db_recovery::discard_seconds_only_proposal(&src)
+            .wrap_err("Cannot check database (epoch)")?;
         copied += copy_table::<LastProposed, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<Votes, _>(&src, db, ROWS_PER_TXN)?;
         copied += copy_table::<Certificates, _>(&src, db, ROWS_PER_TXN)?;

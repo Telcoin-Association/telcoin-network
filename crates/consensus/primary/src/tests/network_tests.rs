@@ -519,17 +519,188 @@ async fn test_retrieve_consensus_output() {
         assert!(!bytes.is_empty(), "served output {number} bytes must not be empty");
     }
 
-    // A number we do not have is a benign miss: it errors and carries no penalty.
+    // A number past the local tip is a benign miss: it is reported unknown before any pack read
+    // and carries no penalty.
     let err =
         handler.consensus_output_bytes(999).await.expect_err("unknown consensus output must error");
-    assert_matches!(
-        err,
-        PrimaryNetworkError::ConsensusChainError(ConsensusChainError::PackError(
-            PackError::ConsensusNumberTooHigh
-        ))
-    );
+    assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(999));
     let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
     assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+}
+
+/// An output one to three positions past the local tip is reported unknown at once (issue #1646).
+///
+/// The serve holds a sync-stream permit, so it must not poll for the output to arrive. The clock
+/// is paused: any retry sleep would auto-advance it, so an unchanged clock proves that no retry
+/// timer ran.
+#[tokio::test(start_paused = true)]
+async fn test_consensus_output_past_tip_is_unknown_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+    let sub_dag = |number: u64| {
+        let cert = Certificate::default();
+        CommittedSubDag::new(
+            vec![cert.clone()],
+            cert,
+            number,
+            ReputationScores::new(&committee_obj),
+            None,
+            tn_types::EpochSeedChainValue::genesis_placeholder(),
+        )
+    };
+
+    // store outputs 1..=3 so the local tip is 3
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag(1)).await;
+    handler.consensus_chain().write_subdag_for_test(2, sub_dag(2)).await;
+    handler.consensus_chain().write_subdag_for_test(3, sub_dag(3)).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 3);
+
+    // each miss is unknown, carries no penalty, and runs no retry timer
+    macro_rules! assert_unknown_without_waiting {
+        ($number:expr) => {{
+            let start = tokio::time::Instant::now();
+            let err = handler
+                .consensus_output_bytes($number)
+                .await
+                .expect_err("an output past the local tip must be unknown");
+            assert_eq!(tokio::time::Instant::now(), start, "output {} must not wait", $number);
+            assert_matches!(err, PrimaryNetworkError::UnknownConsensusOutput(n) if n == $number);
+            let penalty: Option<tn_network_libp2p::Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unknown consensus output must not penalize the peer");
+        }};
+    }
+    assert_unknown_without_waiting!(4u64);
+    assert_unknown_without_waiting!(5u64);
+    assert_unknown_without_waiting!(6u64);
+
+    // the stored tip is still served
+    let bytes = handler.consensus_output_bytes(3).await.expect("stored tip output is served");
+    assert!(!bytes.is_empty(), "served tip output bytes must not be empty");
+}
+
+/// Save a minimal certificate for `record` (a valid BLS signature reused from a vote, empty signer
+/// bitmap). The epoch-record serve does not verify the certificate, so this makes the record
+/// available.
+async fn certify_epoch_record(
+    handler: &RequestHandler<MemDatabase>,
+    committee: &CommitteeFixture<MemDatabase>,
+    record: &EpochRecord,
+) {
+    let auth = committee.authorities().next().expect("committee has authorities");
+    let key_config = auth.consensus_config().key_config().clone();
+    let cert = EpochCertificate {
+        epoch_hash: record.digest(),
+        signature: record.sign_vote(&key_config).signature,
+        signed_authorities: RoaringBitmap::new(),
+    };
+    handler
+        .consensus_chain()
+        .epochs()
+        .save_certificate(record.digest(), cert)
+        .await
+        .expect("store epoch certificate");
+}
+
+/// An epoch record without its certificate is reported unavailable at once, by number and by
+/// digest (issue #1646).
+///
+/// The serve holds an epoch-record permit, so it must not wait for the certificate. The old code
+/// waited 1.5 s before it reported the miss. The clock is real: the lookup runs on the epoch
+/// database thread, so a paused clock could advance to an unrelated timer.
+#[tokio::test]
+async fn test_uncertified_epoch_record_is_unavailable_without_waiting() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+
+    // each miss is unavailable, carries no penalty, and returns before the old wait
+    macro_rules! assert_unavailable_without_waiting {
+        ($epoch:expr, $hash:expr, $($expected:tt)+) => {{
+            let start = Instant::now();
+            let err = handler
+                .retrieve_epoch_record($epoch, $hash)
+                .await
+                .expect_err("an uncertified epoch record must be unavailable");
+            assert!(start.elapsed() < Duration::from_secs(1), "an uncertified record must not wait");
+            assert_matches!(err, $($expected)+);
+            let penalty: Option<Penalty> = (&err).into();
+            assert!(penalty.is_none(), "an unavailable epoch record must not penalize the peer");
+        }};
+    }
+    assert_unavailable_without_waiting!(Some(0), None, PrimaryNetworkError::UnavailableEpoch(0));
+    assert_unavailable_without_waiting!(
+        None,
+        Some(record.digest()),
+        PrimaryNetworkError::UnavailableEpochDigest(digest) if digest == record.digest()
+    );
+
+    // with its certificate saved, the record is served by number and by digest
+    certify_epoch_record(&handler, &committee, &record).await;
+    let by_number = handler.retrieve_epoch_record(Some(0), None).await;
+    let by_digest = handler.retrieve_epoch_record(None, Some(record.digest())).await;
+    [by_number, by_digest].into_iter().for_each(|response| {
+        assert_matches!(
+            response,
+            Ok(PrimaryResponse::EpochRecord { record: served, certificate })
+                if served.digest() == record.digest() && certificate.epoch_hash == record.digest()
+        );
+    });
+}
+
+/// A sync request for the output one past the local tip is shed with `Deny(Unavailable)` at once
+/// (issue #1646), so the requester retries another peer. The bytes are resolved as in
+/// `process_sync_consensus_output_stream`.
+#[tokio::test]
+async fn test_sync_consensus_output_past_tip_denies() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let committee_obj = committee.committee();
+
+    // store output 1 so the local tip is 1
+    let cert = Certificate::default();
+    let sub_dag = CommittedSubDag::new(
+        vec![cert.clone()],
+        cert,
+        1,
+        ReputationScores::new(&committee_obj),
+        None,
+        tn_types::EpochSeedChainValue::genesis_placeholder(),
+    );
+    handler.consensus_chain().write_subdag_for_test(1, sub_dag).await;
+    assert_eq!(handler.consensus_chain().latest_consensus_number(), 1);
+
+    // the output at tip + 1 is unavailable, and the serve sheds it
+    let bytes = handler.consensus_output_bytes(2).await.ok();
+    assert!(bytes.is_none(), "the output past the local tip must be unavailable");
+    let mut out: Vec<u8> = Vec::new();
+    crate::network::sync_codec::send_sync_consensus_output_over_stream(
+        &mut out,
+        bytes,
+        Duration::from_secs(5),
+        BlsPublicKey::default(),
+        2,
+    )
+    .await
+    .expect("serving an unavailable output sheds cleanly without erroring");
+
+    // the first (and only) frame must be Deny(Unavailable)
+    let (mut dec, mut comp) = (Vec::new(), Vec::new());
+    let frame = tn_network_libp2p::read_frame::<_, tn_network_libp2p::PrimarySyncRequest>(
+        &mut futures::io::Cursor::new(out),
+        &mut dec,
+        &mut comp,
+        crate::network::sync_codec::MAX_SYNC_PACK_FRAME_SIZE,
+    )
+    .await
+    .expect("read deny frame");
+    assert_matches!(
+        frame,
+        tn_network_libp2p::SyncFrame::Deny(tn_network_libp2p::DenyReason::Unavailable)
+    );
 }
 
 #[tokio::test]
@@ -2907,8 +3078,9 @@ fn test_epoch_record_admission_enforces_per_peer_cap() {
 
 /// `EpochRecord` request-response admission must cap the concurrent serve count across all peers
 /// at [`MAX_CONCURRENT_EPOCH_RECORD_REQUESTS`] and free the budget when serves end
-/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn and, since a permit is held for the
-/// serve's lifetime, the total in-flight certificate-wait budget as well.
+/// (GHSA-vc2r-9cp2-w74j). This bounds the global task-spawn. A permit is held for the serve's
+/// lifetime, which is only the lookup and the response (an uncertified record is answered as
+/// unavailable at once, without a wait).
 #[test]
 fn test_epoch_record_admission_enforces_global_cap() {
     let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
@@ -2942,6 +3114,68 @@ fn test_epoch_record_admission_enforces_global_cap() {
     assert!(
         try_admit_epoch_record(&semaphore, &peers, extra).is_some(),
         "dropping in-flight serves must free global concurrency"
+    );
+}
+
+/// Uncertified epoch-record serves release their admission permits at once (issue #1646).
+///
+/// Every global permit is held by a serve that answers an uncertified record, and a further peer
+/// is shed while they are held. When the serves end, the global budget and the per-peer counts
+/// are free again, and a certified record is served under a new permit. The per-peer cap is
+/// covered by `test_epoch_record_admission_enforces_per_peer_cap`.
+#[tokio::test]
+async fn test_epoch_record_permits_release_after_unavailable_serves() {
+    let temp_dir = TempDir::new().unwrap();
+    let TestTypes { committee, handler, task_manager: _task_manager, .. } =
+        create_test_types(temp_dir.path()).await;
+    let record = seed_uncertified_epoch0(&handler, &committee).await;
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_EPOCH_RECORD_REQUESTS));
+    let peers = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let mut rng = StdRng::seed_from_u64(3);
+
+    // one serve per distinct peer holds every global permit
+    let peer_pool: Vec<_> = (0..MAX_CONCURRENT_EPOCH_RECORD_REQUESTS)
+        .map(|_| *BlsKeypair::generate(&mut rng).public())
+        .collect();
+    let held: Vec<_> = peer_pool
+        .iter()
+        .map(|peer| {
+            try_admit_epoch_record(&semaphore, &peers, *peer)
+                .expect("a global permit must be available while the budget is not exhausted")
+        })
+        .collect();
+
+    // a further peer is shed while every permit is held
+    let extra = *BlsKeypair::generate(&mut rng).public();
+    assert!(
+        try_admit_epoch_record(&semaphore, &peers, extra).is_none(),
+        "a fresh peer must be shed while every epoch-record permit is held"
+    );
+
+    // each held serve answers the uncertified record as unavailable, without a wait
+    let start = Instant::now();
+    let served = futures::future::join_all(
+        held.iter().map(|_permit| handler.retrieve_epoch_record(Some(0), None)),
+    )
+    .await;
+    assert!(start.elapsed() < Duration::from_secs(1), "uncertified serves must not wait");
+    served.into_iter().for_each(|response| {
+        assert_matches!(response, Err(PrimaryNetworkError::UnavailableEpoch(0)));
+    });
+
+    // ending the serves frees the global budget and every per-peer count
+    drop(held);
+    assert_eq!(semaphore.available_permits(), MAX_CONCURRENT_EPOCH_RECORD_REQUESTS);
+    assert!(peers.lock().is_empty(), "ended serves must leave no per-peer count");
+
+    // a new serve is admitted, and a certified record is served under its permit
+    certify_epoch_record(&handler, &committee, &record).await;
+    let _permit = try_admit_epoch_record(&semaphore, &peers, extra)
+        .expect("a freed budget must admit a new serve");
+    assert_matches!(
+        handler.retrieve_epoch_record(Some(0), None).await,
+        Ok(PrimaryResponse::EpochRecord { record: served, .. })
+            if served.digest() == record.digest()
     );
 }
 

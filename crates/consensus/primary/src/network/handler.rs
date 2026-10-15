@@ -1252,24 +1252,19 @@ where
     /// The bytes are streamed to the requesting peer over the typed sync protocol (see
     /// `process_sync_consensus_output_stream`), because a single output can exceed the
     /// request/response message-size limit.
+    ///
+    /// The answer comes only from data that is available now. A number past the local consensus
+    /// tip is reported as [`PrimaryNetworkError::UnknownConsensusOutput`] at once, without a pack
+    /// read and without a wait. The caller holds a sync-stream permit, so a wait here would hold
+    /// that permit while it waits. The requester retries the output (with its own backoff) at
+    /// another peer. The storage layer saves an output before it advances the latest consensus
+    /// number, so this check never hides a saved output.
     pub(super) async fn consensus_output_bytes(
         &self,
         number: u64,
     ) -> PrimaryNetworkResult<Vec<u8>> {
-        let mut my_number = self.consensus_chain.latest_consensus_number();
-        // If we are behind then wait up to two seconds to catch up.
-        let mut count = 0;
-        if number.saturating_sub(my_number) < 4 {
-            // Only wait if we are close.
-            while my_number < number {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                my_number = self.consensus_chain.latest_consensus_number();
-                if count >= 20 {
-                    // Don't wait more than 2 seconds for this to show up.
-                    return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
-                }
-                count += 1;
-            }
+        if number > self.consensus_chain.latest_consensus_number() {
+            return Err(PrimaryNetworkError::UnknownConsensusOutput(number));
         }
         match self.consensus_chain.consensus_output_bytes_by_number(number).await {
             Ok(Some(bytes)) => Ok(bytes),
@@ -1294,50 +1289,39 @@ where
         Ok(PrimaryResponse::EpochRecord { record, certificate })
     }
 
-    /// Retrieve the consensus header by number.
+    /// Retrieve the epoch record and its certificate by epoch number.
+    ///
+    /// A record without its certificate is reported as [`PrimaryNetworkError::UnavailableEpoch`]
+    /// at once, without a wait, so the serve does not hold its epoch-record permit while the
+    /// certificate is missing. The requester retries (with its own backoff).
     async fn get_epoch_by_number(
         &self,
         epoch: Epoch,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_chain.epochs().get_epoch_by_number(epoch).await {
-            Some((record, Some(cert))) => Ok((record, cert)),
-            Some((_record, None)) => {
-                // If we have the record but not the cert then wait a beat for it to show up.
-                for _ in 0..5 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if let Some((record, Some(cert))) =
-                        self.consensus_chain.epochs().get_epoch_by_number(epoch).await
-                    {
-                        return Ok((record, cert));
-                    }
-                }
-                Err(PrimaryNetworkError::UnavailableEpoch(epoch))
-            }
-            None => Err(PrimaryNetworkError::UnavailableEpoch(epoch)),
-        }
+        self.consensus_chain
+            .epochs()
+            .get_epoch_by_number(epoch)
+            .await
+            .and_then(|(record, cert)| cert.map(|cert| (record, cert)))
+            .ok_or(PrimaryNetworkError::UnavailableEpoch(epoch))
     }
 
-    /// Retrieve the consensus header by hash
+    /// Retrieve the epoch record and its certificate by epoch-record digest.
+    ///
+    /// A record without its certificate is reported as
+    /// [`PrimaryNetworkError::UnavailableEpochDigest`] at once, without a wait, so the serve does
+    /// not hold its epoch-record permit while the certificate is missing. The requester retries
+    /// (with its own backoff).
     async fn get_epoch_by_hash(
         &self,
         hash: EpochDigest,
     ) -> PrimaryNetworkResult<(EpochRecord, EpochCertificate)> {
-        match self.consensus_chain.epochs().get_epoch_by_hash(hash).await {
-            Some((record, Some(cert))) => Ok((record, cert)),
-            Some((_record, None)) => {
-                // If we have the record but not the cert then wait a beat for it to show up.
-                for _ in 0..5 {
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    if let Some((record, Some(cert))) =
-                        self.consensus_chain.epochs().get_epoch_by_hash(hash).await
-                    {
-                        return Ok((record, cert));
-                    }
-                }
-                Err(PrimaryNetworkError::UnavailableEpochDigest(hash))
-            }
-            None => Err(PrimaryNetworkError::UnavailableEpochDigest(hash)),
-        }
+        self.consensus_chain
+            .epochs()
+            .get_epoch_by_hash(hash)
+            .await
+            .and_then(|(record, cert)| cert.map(|cert| (record, cert)))
+            .ok_or(PrimaryNetworkError::UnavailableEpochDigest(hash))
     }
 
     /// Number of tracked consensus-result digests. Test-only accessor used to assert the
@@ -1514,8 +1498,8 @@ where
     ///
     /// The exchange has already been admitted against the concurrency caps and its
     /// opening `Req(ConsensusOutput { number })` frame read by the caller. This
-    /// resolves the output bytes (with the same brief catch-up wait as before, via
-    /// [`Self::consensus_output_bytes`]) and streams them with
+    /// resolves the output bytes from local data only, without a wait (via
+    /// [`Self::consensus_output_bytes`]), and streams them with
     /// [`send_sync_consensus_output_over_stream`]: an available output is sent as
     /// `Ack` + `Data`* + `End`; a benign miss (unknown number, or one not yet built
     /// during catch-up) sheds with a [`SyncFrame::Deny`]`(Unavailable)` frame so the

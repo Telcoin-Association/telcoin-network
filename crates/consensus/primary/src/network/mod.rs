@@ -60,12 +60,12 @@ pub const MAX_CONCURRENT_EPOCH_STREAMS: usize = 5;
 /// Maximum number of concurrent `EpochRecord` request-response serves across all peers.
 ///
 /// The `EpochRecord` request-response arm is reachable by any peer whose identity resolves
-/// (not committee membership), and each serve does real work: a database lookup plus, for the
-/// in-progress epoch, an up-to-1.5s certificate-wait. Without a bound a peer could spawn
-/// unbounded concurrent, penalty-free serve tasks. A dedicated semaphore (separate from
-/// `MAX_CONCURRENT_EPOCH_STREAMS` so an epoch-record flood and the stream-serving paths never
-/// starve one another) caps the concurrent serve count and, with it, the total in-flight
-/// certificate-wait budget. See GHSA-vc2r-9cp2-w74j.
+/// (not committee membership), and each serve does real work: a database lookup. A record
+/// without its certificate is answered as unavailable at once (no wait), so a permit is held only
+/// for the lookup and the response. Without a bound a peer could spawn unbounded concurrent,
+/// penalty-free serve tasks. A dedicated semaphore (separate from `MAX_CONCURRENT_EPOCH_STREAMS`
+/// so an epoch-record flood and the stream-serving paths never starve one another) caps the
+/// concurrent serve count. See GHSA-vc2r-9cp2-w74j.
 pub const MAX_CONCURRENT_EPOCH_RECORD_REQUESTS: usize = 5;
 
 /// Hard cap on the number of distinct pending consensus results tracked in the
@@ -1599,11 +1599,11 @@ where
         // Admission control: bound concurrent epoch-record serving globally and per peer.
         //
         // This request-response arm is reachable by any peer whose identity resolves (not
-        // committee membership) and each serve does real work (a database read plus, for the
-        // in-progress epoch, an up-to-1.5s certificate-wait) while returning no penalty for an
-        // unavailable epoch. Without a bound a peer could spawn unbounded, penalty-free serve
-        // tasks. The permit is held for the serve's lifetime, so the concurrency cap also bounds
-        // the total in-flight certificate-wait budget. See GHSA-vc2r-9cp2-w74j.
+        // committee membership) and each serve does real work (a database read) while returning
+        // no penalty for an unavailable epoch. Without a bound a peer could spawn unbounded,
+        // penalty-free serve tasks. The permit is held for the serve's lifetime. A record without
+        // its certificate is answered as unavailable at once (no wait), so that lifetime is only
+        // the lookup and the response. See GHSA-vc2r-9cp2-w74j.
         let Some(permit) =
             try_admit_epoch_record(&self.epoch_record_semaphore, &self.epoch_record_peers, peer)
         else {

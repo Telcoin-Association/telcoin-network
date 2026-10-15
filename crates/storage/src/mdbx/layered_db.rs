@@ -1529,6 +1529,7 @@ mod test {
     /// awaited only after the insert is queued, which pins this order: if `persist` queued its
     /// barrier on first poll, the barrier would queue behind the faulted insert, see the latch, and
     /// this test would fail.
+    /// A barrier acknowledges earlier writes even when a later insert faults its physical commit.
     #[tokio::test]
     async fn test_barrier_covers_only_writes_queued_before_it() {
         let temp_dir = tempdir().expect("failed to create temp dir");
