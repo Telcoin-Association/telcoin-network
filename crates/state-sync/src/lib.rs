@@ -937,9 +937,12 @@ mod tests {
         .await?;
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
-        let metrics = ::metrics::with_local_recorder(&recorder, StateSyncMetrics::default);
+        let metrics = ::metrics::with_local_recorder(&recorder, || {
+            StateSyncMetrics::new_with_labels(Vec::<::metrics::Label>::new())
+        });
         let mut from = ConsensusHeader::default();
-        let mut catch_up = Box::pin(catch_up_consensus_from_to(
+        // Ignore cooperative yields so Pending means the next delivery is backpressured.
+        let mut catch_up = Box::pin(tokio::task::unconstrained(catch_up_consensus_from_to(
             &consensus_bus,
             &mut from,
             block2.consensus_header(),
@@ -947,15 +950,21 @@ mod tests {
             &chain,
             fixture.committee().epoch(),
             &metrics,
-        ));
-        assert!(futures::poll!(catch_up.as_mut()).is_pending());
+        )));
+        assert!(
+            futures::poll!(catch_up.as_mut()).is_pending(),
+            "catch-up must remain blocked on its second delivery"
+        );
         drop(catch_up);
         assert_eq!(from.number, 1, "only the delivered header may advance progress");
         let counter =
             snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
                 (key.key().name() == "tn_state_sync.headers_fetched_total").then_some(value)
             });
-        assert!(matches!(counter, Some(DebugValue::Counter(1))));
+        assert!(
+            matches!(counter, Some(DebugValue::Counter(1))),
+            "the delivered header must be counted before cancellation: {counter:?}"
+        );
         Ok(())
     }
 
