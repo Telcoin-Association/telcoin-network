@@ -13,7 +13,7 @@ use std::{
 use tn_config::{Config, KeyConfig, PidLock, TelcoinDirs as _};
 use tn_node::engine::TnBuilder;
 use tn_reth::{parse_socket_address, RethChainSpec, RethCommand, RethConfig, FAUCET_ENABLED};
-use tn_types::{BlsPublicKey, BootstrapServer, Genesis, B256, MAINNET_GENESIS};
+use tn_types::{BlsPublicKey, BootstrapServer, Genesis, ADIRI_CHAIN_ID, B256, MAINNET_GENESIS};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
@@ -232,7 +232,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             },
         )?;
         #[cfg(not(feature = "adiri"))]
-        if tn_config.genesis().config.chain_id == 2017 {
+        if tn_config.genesis().config.chain_id == ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
@@ -240,7 +240,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ));
         }
         #[cfg(feature = "adiri")]
-        if tn_config.genesis().config.chain_id != 2017 {
+        if tn_config.genesis().config.chain_id != ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
