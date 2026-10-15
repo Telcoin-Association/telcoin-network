@@ -650,13 +650,12 @@ async fn run_poller_until_listener_closes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cli::Cli, proxy::UpstreamClientBuilder};
+    use crate::{cli::try_parse_test_argv, proxy::UpstreamClientBuilder};
     use axum::{
         http::{HeaderMap, StatusCode},
         routing::{get, post},
         Json, Router,
     };
-    use clap::Parser as _;
     use std::{
         net::SocketAddr,
         sync::atomic::{AtomicBool, Ordering},
@@ -670,7 +669,7 @@ mod tests {
 
     fn settings(flags: &[&str]) -> Settings {
         let argv = std::iter::once("worker-gateway").chain(flags.iter().copied());
-        Cli::parse_from(argv).into_settings().expect("settings")
+        try_parse_test_argv(argv).expect("argv parses").into_settings().expect("settings")
     }
 
     #[test]

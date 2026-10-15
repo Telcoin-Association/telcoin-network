@@ -1853,6 +1853,28 @@ fn url_host_ips(url: &Url) -> Option<Vec<IpAddr>> {
     })
 }
 
+/// The command `main` parses, with every arg's `env` fallback removed.
+#[cfg(test)]
+fn test_command() -> clap::Command {
+    use clap::CommandFactory as _;
+
+    Cli::command().mut_args(|arg| arg.env(None))
+}
+
+/// Parse `argv` as `main` does, minus clap's `env` fallbacks, so an ambient
+/// `WORKER_GATEWAY_*` variable cannot change a test's outcome.
+#[cfg(test)]
+pub(crate) fn try_parse_test_argv<I, T>(argv: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    use clap::FromArgMatches as _;
+
+    let mut matches = test_command().try_get_matches_from(argv)?;
+    Cli::from_arg_matches_mut(&mut matches).map_err(|err| err.format(&mut test_command()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1872,7 +1894,7 @@ mod tests {
         if let Some(url) = readiness {
             argv.push(format!("--upstream-readiness-url={url}"));
         }
-        Cli::parse_from(argv)
+        try_parse_test_argv(argv).expect("argv parses")
     }
 
     #[test]
@@ -1889,13 +1911,14 @@ mod tests {
 
     #[test]
     fn zero_disables_write_path_guards() -> eyre::Result<()> {
-        let settings = Cli::parse_from([
+        let settings = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
             "--tcp-user-timeout=0s",
             "--max-connection-duration=0",
         ])
+        .expect("argv parses")
         .into_settings()?;
         assert_eq!(settings.tcp_user_timeout, None);
         assert_eq!(settings.max_connection_duration, None);
@@ -1921,22 +1944,24 @@ mod tests {
         // (whole-request deadline) = 55s; a cap of the bare whole-request
         // deadline (45s) could still cut off a request whose headers took the
         // full header window to arrive.
-        let result = Cli::parse_from([
+        let result = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
             "--max-connection-duration=45s",
         ])
+        .expect("argv parses")
         .into_settings();
         assert!(result.is_err(), "a cap below the single-request bound must be a startup error");
 
         // The boundary itself is accepted.
-        let boundary = Cli::parse_from([
+        let boundary = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://127.0.0.1:8544",
             "--upstream-readiness-url=http://127.0.0.1:8551/health/workers",
             "--max-connection-duration=55s",
         ])
+        .expect("argv parses")
         .into_settings();
         assert!(boundary.is_ok(), "a cap equal to the single-request bound must be accepted");
     }
@@ -1957,7 +1982,7 @@ mod tests {
     #[test]
     fn thresholds_of_zero_are_rejected_at_startup() {
         for flag in ["--readiness-failure-threshold=0", "--readiness-success-threshold=0"] {
-            let result = Cli::try_parse_from([
+            let result = try_parse_test_argv([
                 "worker-gateway",
                 "--upstream-rpc-url=http://10.0.0.7:8545",
                 "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
@@ -2007,7 +2032,7 @@ mod tests {
     #[test]
     fn worker_id_conflicts_with_config() {
         let result =
-            Cli::try_parse_from(["worker-gateway", "--config=gateway.yaml", "--worker-id=3"]);
+            try_parse_test_argv(["worker-gateway", "--config=gateway.yaml", "--worker-id=3"]);
         assert!(result.is_err(), "--worker-id alongside --config must error, not be ignored");
     }
 
@@ -2039,8 +2064,29 @@ mod tests {
 
     #[test]
     fn inline_requires_both_urls() {
-        let result = cli_with(None, Some("http://127.0.0.1:8545"), None).into_settings();
-        assert!(result.is_err());
+        let message = match cli_with(None, Some("http://127.0.0.1:8545"), None).into_settings() {
+            Ok(_) => panic!("an inline upstream without a readiness URL must be rejected"),
+            Err(err) => format!("{err:?}"),
+        };
+        assert!(
+            message.contains(
+                "provide --config, or both --upstream-rpc-url and --upstream-readiness-url"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_argv_has_no_env_fallbacks() {
+        use clap::CommandFactory as _;
+
+        let with_env = |command: clap::Command| {
+            command.get_arguments().filter(|arg| arg.get_env().is_some()).count()
+        };
+        // every flag `main` parses has a WORKER_GATEWAY_* fallback ...
+        assert!(with_env(Cli::command()) > 40, "{}", with_env(Cli::command()));
+        // ... and the command the tests parse has none
+        assert_eq!(with_env(test_command()), 0);
     }
 
     #[test]
@@ -2370,23 +2416,25 @@ mod tests {
             ("0.0.0.0:8545", "http://[::ffff:127.0.0.1]:8545/", ready),
             ("0.0.0.0:8545", "http://[::ffff:0.0.0.0]:8545/", ready),
         ] {
-            let result = Cli::parse_from([
+            let result = try_parse_test_argv([
                 "worker-gateway".to_string(),
                 format!("--listen-addr={listen}"),
                 format!("--upstream-rpc-url={rpc}"),
                 format!("--upstream-readiness-url={readiness}"),
             ])
+            .expect("argv parses")
             .into_settings();
             assert!(result.is_err(), "{rpc} / {readiness} is the gateway on {listen}");
         }
         // a mapped address of another host, or on another port, is accepted
         for rpc in ["http://[::ffff:10.0.0.7]:8545/", "http://[::ffff:127.0.0.1]:8544/"] {
-            Cli::parse_from([
+            try_parse_test_argv([
                 "worker-gateway".to_string(),
                 "--listen-addr=127.0.0.1:8545".to_string(),
                 format!("--upstream-rpc-url={rpc}"),
                 format!("--upstream-readiness-url={ready}"),
             ])
+            .expect("argv parses")
             .into_settings()?;
         }
         Ok(())
@@ -2408,7 +2456,7 @@ mod tests {
                 format!("--upstream-readiness-url={ready}"),
             ];
             argv.extend(redirect.map(|url| format!("--redirect-queries={url}")));
-            Cli::parse_from(argv).into_settings()
+            try_parse_test_argv(argv).expect("argv parses").into_settings()
         };
         for (listen, url) in [
             ("[::]:8545", "http://127.0.0.1:8545/"),
@@ -2453,13 +2501,14 @@ mod tests {
     #[test]
     fn localhost_redirect_matches_a_worker_on_either_loopback() -> eyre::Result<()> {
         let flags = |rpc: &str, redirect: &str| {
-            Cli::parse_from([
+            try_parse_test_argv([
                 "worker-gateway".to_string(),
                 "--listen-addr=10.0.0.5:8545".to_string(),
                 format!("--upstream-rpc-url={rpc}"),
                 format!("--upstream-readiness-url={rpc}health/workers"),
                 format!("--redirect-queries={redirect}"),
             ])
+            .expect("argv parses")
             .into_settings()
         };
         for (rpc, redirect) in [
@@ -2488,7 +2537,7 @@ mod tests {
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
         ];
         argv.extend(extra.iter().map(|flag| (*flag).to_string()));
-        Cli::parse_from(argv)
+        try_parse_test_argv(argv).expect("argv parses")
     }
 
     #[test]
@@ -2999,7 +3048,7 @@ mod tests {
     fn max_request_bytes_zero_is_rejected() {
         // `0` would refuse every body, so clap refuses it rather than letting
         // it read as "unlimited" the way the sibling caps do
-        let err = Cli::try_parse_from([
+        let err = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://10.0.0.7:8545",
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
@@ -3130,7 +3179,7 @@ mod tests {
 
     #[test]
     fn zero_dns_lookup_cap_is_rejected() {
-        let result = Cli::try_parse_from([
+        let result = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://10.0.0.7:8545",
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
@@ -3157,7 +3206,7 @@ mod tests {
         let equal = cli_with_flags(&["--max-inflight-request-bytes=1048576"]).into_settings();
         assert!(equal.is_ok(), "a budget equal to --max-request-bytes must be accepted");
         // one permit per byte, counted in a u32
-        let past_u32 = Cli::try_parse_from([
+        let past_u32 = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://10.0.0.7:8545",
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
@@ -3366,7 +3415,7 @@ mod tests {
             ("http://user:s3cr3t@/k3y?token=t0k3n", "empty host"),
             ("user:s3cr3t@rpc.example.com/k3y?token=t0k3n", "unsupported URL scheme"),
         ] {
-            let cli = Cli::try_parse_from([
+            let cli = try_parse_test_argv([
                 "worker-gateway".to_string(),
                 "--upstream-rpc-url=http://10.0.0.7:8545".to_string(),
                 "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string(),
@@ -3507,12 +3556,13 @@ mod tests {
             assert!(result.is_err(), "{url} is the worker and must be rejected");
         }
         // and the other way round: a worker written as a mapped literal
-        let result = Cli::parse_from([
+        let result = try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=http://[::ffff:10.0.0.7]:8545",
             "--upstream-readiness-url=http://[::ffff:10.0.0.7]:8551/health/workers",
             "--redirect-queries=http://10.0.0.7:8545/",
         ])
+        .expect("argv parses")
         .into_settings();
         assert!(result.is_err(), "10.0.0.7:8545 is the mapped worker and must be rejected");
     }
@@ -3759,14 +3809,14 @@ mod tests {
         };
 
         for unknown in ["yaml", "JSON", "logfmt", ""] {
-            let err = Cli::try_parse_from(argv(Some(unknown)))
+            let err = try_parse_test_argv(argv(Some(unknown)))
                 .expect_err("an unknown --log-format must fail to parse");
             assert_eq!(err.kind(), clap::error::ErrorKind::InvalidValue, "{unknown:?}");
         }
 
-        assert_eq!(Cli::try_parse_from(argv(None))?.log_format, LogFormat::Text);
-        assert_eq!(Cli::try_parse_from(argv(Some("text")))?.log_format, LogFormat::Text);
-        assert_eq!(Cli::try_parse_from(argv(Some("json")))?.log_format, LogFormat::Json);
+        assert_eq!(try_parse_test_argv(argv(None))?.log_format, LogFormat::Text);
+        assert_eq!(try_parse_test_argv(argv(Some("text")))?.log_format, LogFormat::Text);
+        assert_eq!(try_parse_test_argv(argv(Some("json")))?.log_format, LogFormat::Json);
         Ok(())
     }
 
@@ -3781,7 +3831,7 @@ mod tests {
             ("--upstream-readiness-url", [rpc, format!("--upstream-readiness-url={URL}")]),
         ] {
             let cli =
-                Cli::try_parse_from(std::iter::once("worker-gateway".to_string()).chain(argv))
+                try_parse_test_argv(std::iter::once("worker-gateway".to_string()).chain(argv))
                     .expect("clap takes the worker URL as a string");
             let message = match cli.into_settings() {
                 Ok(_) => panic!("{flag}: a malformed URL must be rejected"),
@@ -3815,7 +3865,7 @@ mod tests {
 
     #[test]
     fn unquoted_header_value_is_not_echoed() {
-        let err = Cli::try_parse_from([
+        let err = try_parse_test_argv([
             "worker-gateway",
             "--redirect-queries=https://rpc.example",
             "--redirect-queries-header",
@@ -3844,7 +3894,7 @@ mod tests {
             ),
             (["worker-gateway", "--log-format=s3cret"], ErrorKind::InvalidValue, "--log-format"),
         ] {
-            let err = Cli::try_parse_from(argv).expect_err("an unparsable value must fail");
+            let err = try_parse_test_argv(argv).expect_err("an unparsable value must fail");
             assert_eq!(err.kind(), kind, "{flag}");
             // control: clap's own message quotes the value
             assert!(err.to_string().contains("s3cret"), "{err}");
@@ -3858,12 +3908,12 @@ mod tests {
     #[test]
     fn help_and_version_are_left_to_clap() {
         for flag in ["--help", "--version"] {
-            let err = Cli::try_parse_from(["worker-gateway", flag])
+            let err = try_parse_test_argv(["worker-gateway", flag])
                 .expect_err("help and version stop the parse");
             assert_eq!(redacted_parse_error(&err), None, "{flag}");
         }
         // a conflict carries only flag names, so clap prints it as is
-        let err = Cli::try_parse_from([
+        let err = try_parse_test_argv([
             "worker-gateway",
             "--config=gateway.yaml",
             "--upstream-rpc-url=http://10.0.0.7:8545",

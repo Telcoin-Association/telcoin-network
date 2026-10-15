@@ -106,8 +106,7 @@ fn demand(settings: &Settings) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::Cli;
-    use clap::Parser as _;
+    use crate::cli::try_parse_test_argv;
     use std::{error::Error, fmt, io};
 
     /// Settings for an inline worker on another host plus `extra` flags.
@@ -118,7 +117,7 @@ mod tests {
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
         ];
         argv.extend_from_slice(extra);
-        Cli::try_parse_from(argv).expect("argv parses").into_settings().expect("settings resolve")
+        try_parse_test_argv(argv).expect("argv parses").into_settings().expect("settings resolve")
     }
 
     #[test]
