@@ -579,13 +579,16 @@ pub(crate) struct Cli {
     pub(crate) shutdown_delay: Duration,
 
     /// How long to drain in-flight requests on SIGTERM before forcing close.
+    /// Default: the request deadline, `--upstream-request-timeout` +
+    /// `--header-read-timeout` (45s at the defaults), so a request accepted just
+    /// before shutdown can finish; an explicit value is kept as given, and one
+    /// below the deadline logs a startup warning.
     #[arg(
         long,
         env = "WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT",
-        default_value = "30s",
         value_parser = humantime::parse_duration
     )]
-    pub(crate) graceful_shutdown_timeout: Duration,
+    pub(crate) graceful_shutdown_timeout: Option<Duration>,
 
     /// Address to expose Prometheus metrics on (`GET /metrics`), on a listener
     /// separate from the client JSON-RPC port. Unset (the default) disables the
@@ -829,12 +832,11 @@ impl Cli {
         // PROXY header. A connection cap below this bound could cut off a
         // request the gateway still considers live, so reject the combination
         // at startup.
+        let deadline = request_deadline(self.upstream_request_timeout, self.header_read_timeout);
         let proxy_header_bound =
             if self.proxy_protocol { self.header_read_timeout } else { Duration::ZERO };
-        let single_request_bound = self
-            .header_read_timeout
-            .saturating_add(self.upstream_request_timeout.saturating_add(self.header_read_timeout))
-            .saturating_add(proxy_header_bound);
+        let single_request_bound =
+            self.header_read_timeout.saturating_add(deadline).saturating_add(proxy_header_bound);
         max_connection_duration.map_or(Ok(()), |cap| {
             eyre::ensure!(
                 cap >= single_request_bound,
@@ -1002,6 +1004,20 @@ impl Cli {
             humantime::format_duration(self.shutdown_delay),
             humantime::format_duration(MAX_SHUTDOWN_DELAY),
         );
+        // the drain defaults to the request deadline so a request accepted just
+        // before shutdown can finish; a shorter explicit value is the
+        // operator's choice, so it is kept, with a warning
+        let graceful_shutdown_timeout = self.graceful_shutdown_timeout.unwrap_or(deadline);
+        if graceful_shutdown_timeout < deadline {
+            warn!(
+                target: "gateway",
+                graceful_shutdown_timeout = %humantime::format_duration(graceful_shutdown_timeout),
+                request_deadline = %humantime::format_duration(deadline),
+                "--graceful-shutdown-timeout is shorter than the request deadline \
+                 (--upstream-request-timeout + --header-read-timeout), so a request accepted just \
+                 before shutdown can be cut with no response"
+            );
+        }
         let cors_allowed_origins =
             self.cors_allowed_origins.as_deref().map(resolve_cors_origins).transpose()?;
         // `contains` is false for NaN too, so every value that is not a
@@ -1052,7 +1068,7 @@ impl Cli {
             trusted_proxies,
             proxy_protocol,
             shutdown_delay: self.shutdown_delay,
-            graceful_shutdown_timeout: self.graceful_shutdown_timeout,
+            graceful_shutdown_timeout,
             metrics_addr: self.metrics_addr,
             cors_allowed_origins,
             access_log_sample: self.access_log_sample,
@@ -1196,6 +1212,19 @@ fn ensure_unique_worker_ids(upstreams: &[UpstreamWorker]) -> eyre::Result<()> {
 /// flag's disabled sentinel, mirroring the `0`-disables rate-limit flags).
 fn resolve_optional_duration(value: Duration) -> Option<Duration> {
     (!value.is_zero()).then_some(value)
+}
+
+/// The service's whole-request deadline: the upstream hop's own
+/// `upstream_request_timeout` plus a `header_read_timeout`-sized budget for
+/// reading the body, so a trickled body cannot hold a request slot without
+/// bound. It is also the default drain on shutdown
+/// (`--graceful-shutdown-timeout`), so a request accepted just before it can
+/// finish.
+pub(crate) fn request_deadline(
+    upstream_request_timeout: Duration,
+    header_read_timeout: Duration,
+) -> Duration {
+    upstream_request_timeout.saturating_add(header_read_timeout)
 }
 
 /// `--query-request-timeout` when it is not set, unless the worker's deadline
@@ -2795,6 +2824,36 @@ mod tests {
     fn max_request_bytes_is_configurable() -> eyre::Result<()> {
         let settings = cli_with_flags(&["--max-request-bytes=1024"]).into_settings()?;
         assert_eq!(settings.max_request_bytes, 1_024);
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_shutdown_defaults_to_the_request_deadline() -> eyre::Result<()> {
+        let settings = cli_with_flags(&[]).into_settings()?;
+        assert_eq!(settings.graceful_shutdown_timeout, Duration::from_secs(45));
+        let settings =
+            cli_with_flags(&["--upstream-request-timeout=20s", "--header-read-timeout=5s"])
+                .into_settings()?;
+        assert_eq!(settings.graceful_shutdown_timeout, Duration::from_secs(25));
+        Ok(())
+    }
+
+    #[test]
+    fn graceful_shutdown_explicit_value_is_kept_and_warns_below_the_deadline() -> eyre::Result<()> {
+        const WARNING: &str = "--graceful-shutdown-timeout is shorter than the request deadline";
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--graceful-shutdown-timeout=30s"]));
+        assert_eq!(settings?.graceful_shutdown_timeout, Duration::from_secs(30));
+        assert!(logs.contains(WARNING), "{logs}");
+        assert!(logs.contains("request_deadline=45s"), "{logs}");
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--graceful-shutdown-timeout=60s"]));
+        assert_eq!(settings?.graceful_shutdown_timeout, Duration::from_secs(60));
+        assert!(!logs.contains(WARNING), "{logs}");
+        // the derived default is the deadline itself, so it never warns
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[]));
+        settings?;
+        assert!(!logs.contains(WARNING), "{logs}");
         Ok(())
     }
 

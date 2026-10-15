@@ -15,7 +15,7 @@ use tracing::{info, warn};
 use url::Url;
 
 use crate::{
-    cli::{submission_reserve, Settings},
+    cli::{request_deadline, submission_reserve, Settings},
     config::UpstreamWorker,
     dns::{LookupHost, SystemLookup},
     proxy::{
@@ -319,7 +319,7 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         // the body read gets a header-scale budget on top, so a trickled body
         // cannot hold a request slot indefinitely. (`into_settings` guarantees
         // any connection-lifetime cap is at least this deadline.)
-        request_deadline: upstream_request_timeout.saturating_add(header_read_timeout),
+        request_deadline: request_deadline(upstream_request_timeout, header_read_timeout),
         max_connections,
         max_connections_per_ip,
         // The per-client cap keys clients by the rate limiter's prefix
