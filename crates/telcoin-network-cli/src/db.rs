@@ -9,7 +9,7 @@ use crate::{
     node::{validate_faucet_build, NamedChain},
     version::SHORT_VERSION,
 };
-use clap::{Args, Parser, Subcommand};
+use clap::{builder::BoolishValueParser, Args, Parser, Subcommand};
 use comfy_table::{Cell, Row, Table as ComfyTable};
 use eyre::{bail, eyre};
 use human_bytes::human_bytes;
@@ -690,6 +690,18 @@ pub struct DbLoadStateArgs {
     /// datadir config. Genesis is the trust root and must match the chain the pack came from.
     #[arg(long)]
     pub chain: Option<NamedChain>,
+
+    /// Let a faucet build load state for a chain id 487 genesis. Devnet only.
+    ///
+    /// The same opt-in as `node --allow-faucet-on-chain-487`: a faucet build refuses chain id 487
+    /// without it and refuses the embedded mainnet genesis even with it.
+    #[arg(
+        long,
+        env = "TN_ALLOW_FAUCET_ON_CHAIN_487",
+        value_parser = BoolishValueParser::new(),
+        hide_short_help = true
+    )]
+    pub allow_faucet_on_chain_487: bool,
 }
 
 impl DbLoadStateArgs {
@@ -718,7 +730,11 @@ impl DbLoadStateArgs {
 
         // A faucet-compiled binary must not prepare mainnet chain data either: same guard as
         // the node command, refused before any datadir mutation.
-        validate_faucet_build(tn_reth::FAUCET_ENABLED, tn_config.genesis())?;
+        validate_faucet_build(
+            tn_reth::FAUCET_ENABLED,
+            tn_config.genesis(),
+            self.allow_faucet_on_chain_487,
+        )?;
 
         // Reject a non-resumable bundle BEFORE `restore_pack` mutates the datadir, so a refusal
         // leaves the target untouched.
@@ -1616,8 +1632,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let datadir = dir.path().to_path_buf();
         let _held = PidLock::acquire(&datadir).expect("acquire datadir lock");
-        let err = super::DbLoadStateArgs { pack: dir.path().join("bundle"), chain: None }
-            .execute(datadir)
+        let err = super::DbLoadStateArgs {
+            pack: dir.path().join("bundle"),
+            chain: None,
+            allow_faucet_on_chain_487: false,
+        }
+        .execute(datadir)
             .expect_err("load-state must refuse while a node holds the lock");
         assert!(err.to_string().contains("another telcoin process"), "unexpected error: {err}");
     }
@@ -2499,6 +2519,7 @@ mod tests {
         let args = super::DbLoadStateArgs {
             pack: bundle.path().to_path_buf(),
             chain: Some(super::NamedChain::Adiri),
+            allow_faucet_on_chain_487: false,
         };
         let err = args
             .execute(datadir_path.clone())
