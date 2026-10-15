@@ -69,23 +69,23 @@ telcoin-network keytool generate observer \
 
 The `--bls-passphrase-source` global flag controls how the BLS private key is encrypted at rest. It applies to `keytool generate` (encryption) and `node` (decryption).
 
-| Value           | Behavior                                                                                                                                                                                 |
-| --------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `env` (default) | Read passphrase from `TN_BLS_PASSPHRASE` environment variable. The variable is cleared from the process environment immediately after reading; on Linux its value bytes are zeroed first |
-| `stdin`         | Read the first line from stdin until EOF. All trailing whitespace, including the newline, is trimmed                                                                                     |
-| `ask`           | Prompt interactively on the terminal (foreground TTY required)                                                                                                                           |
-| `no-passphrase` | Store the key unencrypted. Testing only; never use in production                                                                                                                         |
-| `credential`    | Read the systemd credential named by `--bls-passphrase-credential` from `$CREDENTIALS_DIRECTORY`. Removes one final `\n` or `\r\n` only; other whitespace is kept                        |
+| Value           | Behavior                                                                                                                                                                                                                                                                               |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `env` (default) | Read passphrase from `TN_BLS_PASSPHRASE` environment variable. The variable is removed from the process environment immediately after reading; on Linux the value bytes of every `TN_BLS_PASSPHRASE=` entry are zeroed first, and only the name stays visible in `/proc/<pid>/environ` |
+| `stdin`         | Read the first line from stdin until EOF. All trailing whitespace, including the newline, is trimmed                                                                                                                                                                                   |
+| `ask`           | Prompt interactively on the terminal (foreground TTY required)                                                                                                                                                                                                                         |
+| `no-passphrase` | Store the key unencrypted. Testing only; never use in production                                                                                                                                                                                                                       |
+| `credential`    | Read the systemd credential named by `--bls-passphrase-credential` from `$CREDENTIALS_DIRECTORY`. Removes one final `\n` or `\r\n` only; other whitespace is kept                                                                                                                      |
 
-`stdin` and `credential` treat whitespace differently. `stdin` trims all trailing whitespace from the line, while `credential` removes only the final line ending. A passphrase that ends in a space works with `credential` and `env`, but `stdin` cuts the space off. The `credential` source fails when `CREDENTIALS_DIRECTORY` is unset, or when the credential file is missing or empty.
+`stdin` and `credential` treat whitespace differently. `stdin` trims all trailing whitespace from the line, while `credential` removes only the final line ending. A passphrase that ends in a space works with `credential` and `env`, but `stdin` cuts the space off. The `credential` source fails when `CREDENTIALS_DIRECTORY` is unset or empty, when the credential file is missing or unreadable, when its content is not valid UTF-8, or when it is empty once the line ending is removed. Commands that need no passphrase (`db`, `keytool set-rpc`) do not read the credential.
 
 #### Running under systemd
 
 With systemd 250 or newer, store the passphrase as an encrypted credential and let the unit hand it to the node:
 
 ```bash
-# type the passphrase, then press Ctrl-D; a trailing newline is fine
-systemd-creds encrypt --name=bls-passphrase - /etc/telcoin/bls-passphrase.cred
+# prompts for the passphrase without echoing it; -n leaves off the trailing newline
+systemd-ask-password -n "BLS passphrase:" | systemd-creds encrypt --name=bls-passphrase - /etc/telcoin/bls-passphrase.cred
 ```
 
 ```ini
@@ -94,7 +94,7 @@ LoadCredentialEncrypted=bls-passphrase:/etc/telcoin/bls-passphrase.cred
 ExecStart=/usr/local/bin/telcoin-network --bls-passphrase-source credential node --datadir /var/lib/telcoin --http
 ```
 
-systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`.
+systemd decrypts the credential when the unit starts and places it in the unit's credential directory, which it names in `CREDENTIALS_DIRECTORY`. The node reads the passphrase from there, so it never appears on the command line, in the unit's `Environment=`, or in the process environment. `LoadCredential=bls-passphrase:<path>` works the same way for an unencrypted file. To use another credential name, pass `--bls-passphrase-credential <NAME>` or set `TN_BLS_PASSPHRASE_CREDENTIAL`; an empty value keeps the default, `bls-passphrase`. The name is checked only when the `credential` source reads it.
 
 Encrypted keys use AES-256-GCM-SIV with PBKDF2-HMAC-SHA256 key derivation (1,000,000 iterations). The encrypted file is saved as `node-keys/bls.kw`; unencrypted keys are saved as `node-keys/bls.key`.
 
@@ -327,30 +327,30 @@ telcoin-network node \
 
 ### node flags
 
-| Flag                     | Default        | Description                                                                                                                  |
-| ------------------------ | -------------- | ---------------------------------------------------------------------------------------------------------------------------- |
-| `--chain`                | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                                                       |
-| `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the genesis fallback |
-| `--bootstrap-peers-file` | none           | Read the `--bootstrap-peers` map from a file (same format; checked at argument parsing). Conflicts with `--bootstrap-peers`  |
-| `--instance`             | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup)                               |
-| `--metrics`              | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                                                     |
-| `--healthcheck`          | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                                                           |
-| `--node-name`            | auto-generated | Name for OpenTelemetry service identification                                                                                |
-| `--tracing-url`          | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`                                          |
-| `--with-unused-ports`    | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                                                           |
+| Flag                     | Default        | Description                                                                                                                                                                                         |
+| ------------------------ | -------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `--chain`                | none           | Join a named network (`adiri`, `test-net`, `main-net`)                                                                                                                                              |
+| `--bootstrap-peers`      | none           | Bootstrap dial hints as a YAML or JSON map keyed by BLS public key, for this process only. `{}` selects the genesis fallback                                                                        |
+| `--bootstrap-peers-file` | none           | Read the `--bootstrap-peers` map from a file (same format; checked at argument parsing). Conflicts with `--bootstrap-peers`. A relative path resolves from the working directory, `/` under systemd |
+| `--instance`             | none           | Instance number (1-200) for port offsetting. See [Multi-instance setup](#multi-instance-setup)                                                                                                      |
+| `--metrics`              | none           | Enable Prometheus metrics at this socket address (e.g. `127.0.0.1:9101`)                                                                                                                            |
+| `--healthcheck`          | none           | TCP health check port. Env: `HEALTHCHECK_TCP_PORT`                                                                                                                                                  |
+| `--node-name`            | auto-generated | Name for OpenTelemetry service identification                                                                                                                                                       |
+| `--tracing-url`          | none           | OpenTelemetry collector URL (e.g. `http://192.168.1.2:4317`). Env: `TN_TRACING_URL`                                                                                                                 |
+| `--with-unused-ports`    | `false`        | Let the OS assign all ports (mutually exclusive with `--instance`)                                                                                                                                  |
 
 ### global flags
 
 These flags apply to all subcommands:
 
-| Flag                          | Default                 | Description                                                                            |
-| ----------------------------- | ----------------------- | -------------------------------------------------------------------------------------- |
-| `--datadir`                   | OS-specific (see below) | Path to the data directory                                                             |
-| `--bls-passphrase-source`     | `env`                   | How to obtain the BLS passphrase: `env`, `stdin`, `ask`, `no-passphrase`, `credential` |
-| `--bls-passphrase-credential` | `bls-passphrase`        | Credential name the `credential` source reads. Env: `TN_BLS_PASSPHRASE_CREDENTIAL`     |
-| `-v` ... `-vvvvv`             | none                    | Verbosity level (info, debug, trace, etc.)                                             |
-| `--log.stdout.format`         | default                 | Log output format (e.g. `log-fmt`)                                                     |
-| `--color`                     | `auto`                  | Color mode: `always`, `auto`, `never`                                                  |
+| Flag                          | Default                 | Description                                                                                                   |
+| ----------------------------- | ----------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `--datadir`                   | OS-specific (see below) | Path to the data directory                                                                                    |
+| `--bls-passphrase-source`     | `env`                   | How to obtain the BLS passphrase: `env`, `stdin`, `ask`, `no-passphrase`, `credential`                        |
+| `--bls-passphrase-credential` | `bls-passphrase`        | Credential name the `credential` source reads; empty selects the default. Env: `TN_BLS_PASSPHRASE_CREDENTIAL` |
+| `-v` ... `-vvvvv`             | none                    | Verbosity level (info, debug, trace, etc.)                                                                    |
+| `--log.stdout.format`         | default                 | Log output format (e.g. `log-fmt`)                                                                            |
+| `--color`                     | `auto`                  | Color mode: `always`, `auto`, `never`                                                                         |
 
 Default data directory by platform:
 
@@ -364,17 +364,17 @@ Default data directory by platform:
 
 ### Environment variables
 
-| Variable                       | Used by          | Description                                                             |
-| ------------------------------ | ---------------- | ----------------------------------------------------------------------- |
-| `TN_BLS_PASSPHRASE`            | keytool, node    | BLS key passphrase (cleared from env after read; value zeroed on Linux) |
-| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node    | Credential name for `--bls-passphrase-source credential`                |
-| `CREDENTIALS_DIRECTORY`        | keytool, node    | Set by systemd; where the `credential` source looks                     |
-| `EXECUTION_ADDRESS`            | keytool generate | Fee recipient address                                                   |
-| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate | External multiaddr for primary P2P                                      |
-| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate | External multiaddrs for worker P2P (comma-separated)                    |
-| `TN_TRACING_URL`               | node             | OpenTelemetry collector endpoint                                        |
-| `HEALTHCHECK_TCP_PORT`         | node             | TCP health check port                                                   |
-| `RUST_LOG`                     | all              | Standard Rust log filter directive (e.g. `info,evm=debug`)              |
+| Variable                       | Used by          | Description                                                                                                          |
+| ------------------------------ | ---------------- | -------------------------------------------------------------------------------------------------------------------- |
+| `TN_BLS_PASSPHRASE`            | keytool, node    | BLS key passphrase (removed from env after read; on Linux the value bytes of every entry are zeroed, the name stays) |
+| `TN_BLS_PASSPHRASE_CREDENTIAL` | keytool, node    | Credential name for `--bls-passphrase-source credential`                                                             |
+| `CREDENTIALS_DIRECTORY`        | keytool, node    | Set by systemd; where the `credential` source looks                                                                  |
+| `EXECUTION_ADDRESS`            | keytool generate | Fee recipient address                                                                                                |
+| `TN_EXTERNAL_PRIMARY_ADDR`     | keytool generate | External multiaddr for primary P2P                                                                                   |
+| `TN_EXTERNAL_WORKER_ADDRS`     | keytool generate | External multiaddrs for worker P2P (comma-separated)                                                                 |
+| `TN_TRACING_URL`               | node             | OpenTelemetry collector endpoint                                                                                     |
+| `HEALTHCHECK_TCP_PORT`         | node             | TCP health check port                                                                                                |
+| `RUST_LOG`                     | all              | Standard Rust log filter directive (e.g. `info,evm=debug`)                                                           |
 
 ## Data directory layout
 

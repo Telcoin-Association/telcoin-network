@@ -45,7 +45,9 @@ telcoin-network node --bootstrap-peers-file bootstrap-peers.yaml
 ```
 
 The file is read and checked while arguments are parsed, so a missing or invalid
-file stops the node before it starts. The two flags cannot be combined.
+file stops the node before it starts. The two flags cannot be combined. A relative
+path resolves from the node's working directory, which is `/` for a systemd
+service unless the unit sets `WorkingDirectory=`, so give units an absolute path.
 
 The CLI map takes precedence over `network-config` and is never written back to
 disk. An explicitly empty CLI map restores the genesis fallback even when

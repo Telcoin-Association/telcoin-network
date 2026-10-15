@@ -28,7 +28,7 @@ pub enum PassSource {
     /// Only do this for testing, one offs, etc.
     NoPassphrase,
     /// Read the passphrase from the systemd credential named by --bls-passphrase-credential
-    /// (LoadCredential= or LoadCredentialEncrypted=). Removes one trailing newline only.
+    /// (LoadCredential= or LoadCredentialEncrypted=). Removes one final \n or \r\n only.
     Credential,
 }
 
