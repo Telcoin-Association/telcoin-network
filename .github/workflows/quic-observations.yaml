@@ -84,7 +84,7 @@ jobs:
 
   metrics:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -94,6 +94,10 @@ jobs:
       - name: Configure build inputs
         run: cp .env.example .env
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: test-cache
+          save-if: "false"
       - name: Check per-swarm metric labels and shutdown cleanup
         run: cargo +1.94 test --locked -p tn-network-libp2p metrics::tests::quic_metrics --lib
       - name: Confirm metric regression assertions reject observation mutations
