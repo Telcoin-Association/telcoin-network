@@ -2,12 +2,19 @@
 //! and external binaries that embed the TN CLI (e.g. ExEx host binaries).
 
 use crate::cli::{Cli, Commands, PassSource};
-use eyre::bail;
-use std::fmt;
+use eyre::{bail, eyre};
+use std::{ffi::OsString, fmt, fs::File, io::Read as _, path::Path};
 use zeroize::Zeroizing;
 
 /// Environment variable read (and cleared) at process start for the BLS key passphrase.
 pub const BLS_PASSPHRASE_ENVVAR: &str = "TN_BLS_PASSPHRASE";
+
+/// Environment variable systemd sets to the directory holding a unit's credentials
+/// (`LoadCredential=`, `LoadCredentialEncrypted=`).
+pub const CREDENTIALS_DIRECTORY_ENVVAR: &str = "CREDENTIALS_DIRECTORY";
+
+/// Default credential name read by `--bls-passphrase-source credential`.
+pub const DEFAULT_BLS_PASSPHRASE_CREDENTIAL: &str = "bls-passphrase";
 
 /// Read the bls key passphrase from then incoming environment if set.
 /// This also will remove the key once read to avoid leaks in future.
@@ -59,6 +66,58 @@ fn read_passphrase() -> Option<Zeroizing<String>> {
         println!("Passphrases do not match, retry.");
     }
     None
+}
+
+/// Read the BLS passphrase from the systemd credential `name` in `credentials_dir`.
+///
+/// Removes exactly one trailing `\n`, and a `\r` directly before it, the line ending an
+/// editor or `echo` leaves behind. Nothing else is trimmed: unlike the stdin source, a
+/// passphrase may end in whitespace on purpose. An unset or empty `credentials_dir`, a
+/// missing or unreadable file, and an empty passphrase are all errors.
+fn read_credential(
+    credentials_dir: Option<OsString>,
+    name: &str,
+) -> eyre::Result<Zeroizing<String>> {
+    let Some(dir) = credentials_dir.filter(|dir| !dir.is_empty()) else {
+        bail!(
+            "{CREDENTIALS_DIRECTORY_ENVVAR} is not set: not running under a systemd credential \
+             directory (LoadCredential= or LoadCredentialEncrypted=)"
+        );
+    };
+    let path = Path::new(&dir).join(name);
+    let mut passphrase = Zeroizing::new(String::new());
+    File::open(&path).and_then(|mut file| file.read_to_string(&mut passphrase)).map_err(|err| {
+        eyre!("could not read BLS passphrase credential {}: {err}", path.display())
+    })?;
+    // pop shortens in place, so no uncleared copy of the passphrase is made
+    if passphrase.ends_with('\n') {
+        passphrase.pop();
+        if passphrase.ends_with('\r') {
+            passphrase.pop();
+        }
+    }
+    if passphrase.is_empty() {
+        bail!("BLS passphrase credential {} is empty", path.display());
+    }
+    Ok(passphrase)
+}
+
+/// Clap value parser for `--bls-passphrase-credential`.
+///
+/// Accepts only names systemd itself accepts for a credential: printable ASCII, at most 255
+/// bytes, no `/` or `:`, and not `.` or `..`. This also keeps the joined path inside
+/// `$CREDENTIALS_DIRECTORY`.
+pub(crate) fn parse_credential_name(name: &str) -> Result<String, String> {
+    let valid = !name.is_empty()
+        && name.len() <= 255
+        && name != "."
+        && name != ".."
+        && name.bytes().all(|b| (b' '..=b'~').contains(&b) && b != b'/' && b != b':');
+    if valid {
+        Ok(name.to_owned())
+    } else {
+        Err(format!("{name:?} is not a valid systemd credential name"))
+    }
 }
 
 impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
@@ -115,6 +174,12 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
             PassSource::NoPassphrase => {
                 passphrase = None;
             }
+            PassSource::Credential => {
+                passphrase = Some(read_credential(
+                    std::env::var_os(CREDENTIALS_DIRECTORY_ENVVAR),
+                    &self.bls_passphrase_credential,
+                )?);
+            }
         }
         // The `db` subcommand is a read-only inspection tool and `keytool set-rpc`
         // only edits public config; neither needs the BLS key passphrase.
@@ -138,9 +203,26 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
 mod tests {
     use super::*;
     use crate::cli::Cli;
+    use std::sync::{Mutex, MutexGuard, PoisonError};
+
+    /// Serializes the tests in this module that read or write the process environment, which
+    /// is process-global while `cargo test` runs tests on concurrent threads.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_args_from(args).expect("cli parses")
+    }
+
+    /// Write `contents` as the `bls-passphrase` credential in a fresh credentials directory and
+    /// read it back through [`read_credential`].
+    fn read_credential_file(contents: &[u8]) -> eyre::Result<Zeroizing<String>> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bls-passphrase"), contents).expect("write credential");
+        read_credential(Some(dir.path().into()), "bls-passphrase")
     }
 
     #[test]
@@ -202,13 +284,109 @@ mod tests {
         );
     }
 
-    /// The ONLY test allowed to touch the environment: `cargo test` runs tests
-    /// concurrently in one process, and the env is process-global.
     #[test]
     fn test_env_preload_reads_and_clears_var() {
+        let _env = env_lock();
         std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
         assert_eq!(get_bls_passphrase_from_env(), Some(Zeroizing::new("sekrit".into())));
         assert!(std::env::var(BLS_PASSPHRASE_ENVVAR).is_err());
         assert_eq!(get_bls_passphrase_from_env(), None);
+    }
+
+    #[test]
+    fn test_credential_strips_one_trailing_newline_only() {
+        assert_eq!(read_credential_file(b"sekrit\n").unwrap().as_str(), "sekrit");
+        assert_eq!(read_credential_file(b"sekrit").unwrap().as_str(), "sekrit");
+        assert_eq!(read_credential_file(b"sekrit\n\n").unwrap().as_str(), "sekrit\n");
+    }
+
+    #[test]
+    fn test_credential_keeps_trailing_whitespace() {
+        assert_eq!(read_credential_file(b"sekrit \n").unwrap().as_str(), "sekrit ");
+        assert_eq!(read_credential_file(b"sekrit\t").unwrap().as_str(), "sekrit\t");
+        assert_eq!(read_credential_file(b" sekrit").unwrap().as_str(), " sekrit");
+    }
+
+    #[test]
+    fn test_credential_strips_crlf() {
+        assert_eq!(read_credential_file(b"sekrit\r\n").unwrap().as_str(), "sekrit");
+        // a lone carriage return is not a line ending and stays part of the passphrase
+        assert_eq!(read_credential_file(b"sekrit\r").unwrap().as_str(), "sekrit\r");
+    }
+
+    #[test]
+    fn test_credential_empty_file_errors() {
+        for contents in [b"".as_ref(), b"\n", b"\r\n"] {
+            let err = read_credential_file(contents).unwrap_err();
+            assert!(err.to_string().contains("is empty"), "{err}");
+        }
+    }
+
+    #[test]
+    fn test_credential_missing_file_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let err = read_credential(Some(dir.path().into()), "bls-passphrase").unwrap_err();
+        assert!(err.to_string().contains("could not read BLS passphrase credential"), "{err}");
+    }
+
+    #[test]
+    fn test_credential_unset_directory_errors() {
+        for dir in [None, Some(OsString::new())] {
+            let err = read_credential(dir, "bls-passphrase").unwrap_err();
+            assert!(
+                err.to_string().contains("not running under a systemd credential directory"),
+                "{err}"
+            );
+        }
+    }
+
+    /// The credential source reads `$CREDENTIALS_DIRECTORY/<NAME>`, takes the name from
+    /// `TN_BLS_PASSPHRASE_CREDENTIAL`, and replaces any value preloaded from the env source.
+    #[test]
+    fn test_credential_source_reads_credentials_directory() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("node-pass"), b"from credential\n").expect("write");
+        let _env = env_lock();
+        std::env::set_var(CREDENTIALS_DIRECTORY_ENVVAR, dir.path());
+        std::env::set_var("TN_BLS_PASSPHRASE_CREDENTIAL", "node-pass");
+        let cli = cli(&["tn", "node", "--bls-passphrase-source", "credential"]);
+        let resolved = cli.resolve_bls_passphrase_with_reader(
+            Some(Zeroizing::new("from env".into())),
+            std::io::Cursor::new(b"from stdin\n".as_ref()),
+        );
+        std::env::remove_var("TN_BLS_PASSPHRASE_CREDENTIAL");
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENVVAR);
+        assert_eq!(resolved.unwrap(), Some(Zeroizing::new("from credential".into())));
+        assert_eq!(cli.bls_passphrase_credential, "node-pass");
+    }
+
+    #[test]
+    fn test_credential_source_without_credentials_directory_errors() {
+        let _env = env_lock();
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENVVAR);
+        let cli = cli(&["tn", "node", "--bls-passphrase-source", "credential"]);
+        let err = cli.resolve_bls_passphrase(None).unwrap_err();
+        assert!(err.to_string().contains("not running under a systemd credential directory"));
+    }
+
+    #[test]
+    fn test_credential_name_defaults_and_rejects_paths() {
+        let _env = env_lock();
+        assert_eq!(cli(&["tn", "node"]).bls_passphrase_credential, "bls-passphrase");
+        assert_eq!(
+            cli(&["tn", "--bls-passphrase-credential", "tn.pass", "node"])
+                .bls_passphrase_credential,
+            "tn.pass"
+        );
+        for name in ["", ".", "..", "../bls-passphrase", "/etc/shadow", "a/b", "a:b", "a\tb"] {
+            let err = Cli::<crate::NoArgs>::try_parse_args_from([
+                "tn",
+                "node",
+                "--bls-passphrase-credential",
+                name,
+            ])
+            .unwrap_err();
+            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{name:?}");
+        }
     }
 }
