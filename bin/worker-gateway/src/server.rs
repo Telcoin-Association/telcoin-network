@@ -2459,14 +2459,14 @@ mod tests {
 
     #[tokio::test]
     async fn lifetime_cap_lets_the_inflight_request_finish() {
-        // A worker that answers 150ms after it is asked, and counts the asks.
+        // A worker that answers 400ms after it is asked, and counts the asks.
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
         let mock = Router::new().route(
             "/",
             post(move || async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(150)).await;
+                tokio::time::sleep(Duration::from_millis(400)).await;
                 r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
             }),
         );
@@ -2487,10 +2487,10 @@ mod tests {
             body.len()
         );
 
-        // The request starts at 250ms, inside the 300ms cap, and its answer
-        // comes at about 400ms, past it.
+        // The request is written at once, well inside the 300ms cap, and its
+        // answer comes at about 400ms, past it: the cap always fires while the
+        // exchange is in flight (both deadlines share the runtime clock).
         let mut stream = TcpStream::connect(gateway).await.expect("connect");
-        tokio::time::sleep(Duration::from_millis(250)).await;
         stream.write_all(request.as_bytes()).await.expect("write");
 
         // The exchange in flight finishes, then the connection closes.
