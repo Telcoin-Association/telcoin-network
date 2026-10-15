@@ -208,6 +208,12 @@ fn warn_if_key_permissions_are_loose(
 ) {
 }
 
+/// Whether the key file at `path` exists. An error checking (for example an unreadable keys
+/// directory) is returned rather than read as "absent", so it is reported against the real path.
+fn key_file_exists(path: &std::path::Path) -> eyre::Result<bool> {
+    std::fs::exists(path).map_err(|e| eyre::eyre!("cannot check key file {}: {e}", path.display()))
+}
+
 /// Private key material and derivation inputs shared by a key manager.
 struct KeyConfigInner {
     /// DO NOT expose the private key to other code. Tests provide their own primary key.
@@ -346,14 +352,23 @@ impl KeyConfig {
         let keys_dir = tn_datadir.node_keys_path();
         // Without a wrapped file only a passphrase-less read falls back to the cleartext file: a
         // supplied passphrase means the key is expected wrapped, so its absence is an error.
-        let passphrase = if std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).unwrap_or(false) {
+        let passphrase = if key_file_exists(&keys_dir.join(BLS_WRAPPED_KEYFILE))? {
             passphrase
         } else if passphrase.is_some() {
-            return Err(eyre::eyre!(
-                "a BLS key passphrase was supplied but there is no encrypted key file {}; \
-                 refusing to load the cleartext {BLS_KEYFILE} in its place",
-                keys_dir.join(BLS_WRAPPED_KEYFILE).display()
-            ));
+            let cleartext = keys_dir.join(BLS_KEYFILE);
+            return Err(if key_file_exists(&cleartext)? {
+                eyre::eyre!(
+                    "a BLS key passphrase was supplied but there is no encrypted key file {}; \
+                     refusing to load the cleartext {BLS_KEYFILE} in its place",
+                    keys_dir.join(BLS_WRAPPED_KEYFILE).display()
+                )
+            } else {
+                eyre::eyre!(
+                    "a BLS key passphrase was supplied but no key files found in {}: neither \
+                     {BLS_WRAPPED_KEYFILE} nor {BLS_KEYFILE} exists; generate the node keys first",
+                    keys_dir.display()
+                )
+            });
         } else {
             None
         };
@@ -1141,14 +1156,52 @@ mod tests {
         assert!(loaded.bls_key_is_cleartext());
     }
 
-    /// An empty key directory with a passphrase reports the missing encrypted key file.
+    /// An empty key directory with a passphrase says that no key files were found, naming both
+    /// files, instead of pointing at a cleartext file that is not there either.
     #[test]
-    fn read_config_with_passphrase_and_no_keys_names_the_encrypted_keyfile() {
+    fn read_config_with_passphrase_and_no_keys_says_no_key_files_found() {
         let tmp_dir = TempDir::new().expect("tmp dir");
         let datadir = tmp_dir.path().to_path_buf();
         let err =
             KeyConfig::read_config(&datadir, Some("passphrase".to_string())).expect_err("no keys");
-        assert!(err.to_string().contains(BLS_WRAPPED_KEYFILE), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("no key files found"), "{msg}");
+        assert!(msg.contains(BLS_WRAPPED_KEYFILE) && msg.contains(BLS_KEYFILE), "{msg}");
+        assert!(!msg.contains("refusing to load the cleartext"), "{msg}");
+    }
+
+    /// An unreadable keys directory is reported as an error on that directory, not as a missing
+    /// encrypted key file, with or without a passphrase.
+    #[cfg(unix)]
+    #[test]
+    fn read_config_reports_an_unreadable_keys_dir() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tmp_dir = TempDir::new().expect("tmp dir");
+        let datadir = tmp_dir.path().to_path_buf();
+        KeyConfig::generate_and_save_with_rounds(
+            &datadir,
+            Some("passphrase".to_string()),
+            TEST_ONLY_INSECURE_ROUNDS,
+        )
+        .expect("wrapped key");
+        let keys_dir = datadir.node_keys_path();
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o000))
+            .expect("lock keys dir");
+        // root reads through a mode 000 directory, so there is nothing to check as root
+        let locked = std::fs::exists(keys_dir.join(BLS_WRAPPED_KEYFILE)).is_err();
+        let results = [Some("passphrase".to_string()), None]
+            .map(|passphrase| KeyConfig::read_config(&datadir, passphrase).map(|_| ()));
+        std::fs::set_permissions(&keys_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("unlock keys dir");
+        if !locked {
+            return;
+        }
+        for result in results {
+            let msg = result.expect_err("unreadable keys dir").to_string();
+            assert!(msg.contains("cannot check key file"), "{msg}");
+            assert!(!msg.contains("no encrypted key file"), "{msg}");
+        }
     }
 
     /// `bls_key_is_cleartext` reports how the key is kept on disk on both the generate and the
