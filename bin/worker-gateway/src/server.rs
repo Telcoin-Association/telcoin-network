@@ -4270,14 +4270,19 @@ mod tests {
 
     #[tokio::test]
     async fn slow_proxy_header_neither_stalls_accept_nor_outlives_the_header_timeout() {
+        let header_read_timeout = Duration::from_secs(2);
         let (worker, _worker) = forwarding_echo().await;
         let state = redirect_state(worker, None);
         state.readiness.set_ready(0, true);
         let (gateway, _shutdown) =
-            spawn_proxy_protocol(state, None, "127.0.0.1/32", Duration::from_secs(2)).await;
+            spawn_proxy_protocol(state, None, "127.0.0.1/32", header_read_timeout).await;
 
-        // a trusted peer sends half a header and stalls
+        // a trusted peer sends half a header and stalls; the clock starts
+        // just before it connects, because the header read timeout is armed
+        // when the connection's task first runs, which can come before the
+        // write returns
         let header = proxy_v2_header(socket("198.51.100.1:4711"), &[]);
+        let started = tokio::time::Instant::now();
         let mut stalled = TcpStream::connect(gateway).await.expect("connect");
         stalled.write_all(&header[..8]).await.expect("write");
         // the header is read on the stalled connection's own task, so another
@@ -4287,12 +4292,30 @@ mod tests {
                 .await
                 .expect("accept must not wait for the stalled header");
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        // and the stalled connection is closed at the header read timeout
-        let mut buf = [0_u8; 16];
-        let read = tokio::time::timeout(Duration::from_secs(5), stalled.read(&mut buf))
-            .await
-            .expect("connection should be closed by the header read timeout");
-        assert_eq!(read.expect("read"), 0, "expected EOF from the server");
+
+        // and the stalled connection is closed at the header read timeout, not
+        // before it and not at some later bound. Once the test has no other
+        // socket to wait on, the clock is paused (see
+        // [`drain_during_proxy_headers`]) and stepped to just before the
+        // timeout and to a margin past it; the timeout was armed after
+        // `started`, so it fires in between. The socket is checked without
+        // waiting on it: a paused clock skips ahead to the next pending timer
+        // whenever the runtime parks, so a read that waits could be answered
+        // by a later bound. `yield_now` lets the runtime take in the socket's
+        // events without moving the clock.
+        tokio::time::sleep(SETTLE).await;
+        tokio::time::pause();
+        tokio::time::sleep_until(started + header_read_timeout - Duration::from_millis(100)).await;
+        tokio::task::yield_now().await;
+        let before = stalled.try_read(&mut [0_u8; 1]);
+        assert!(
+            matches!(&before, Err(err) if err.kind() == std::io::ErrorKind::WouldBlock),
+            "closed before the header read timeout: {before:?}"
+        );
+        tokio::time::sleep_until(started + header_read_timeout + Duration::from_millis(500)).await;
+        tokio::task::yield_now().await;
+        let after = stalled.try_read(&mut [0_u8; 1]);
+        assert!(matches!(after, Ok(0)), "still open 500ms past the header read timeout: {after:?}");
     }
 
     /// The accept loop for the probe-only `/health` router with PROXY protocol
