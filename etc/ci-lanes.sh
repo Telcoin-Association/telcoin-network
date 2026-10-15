@@ -91,11 +91,52 @@ lane_clippy() {
     echo "clippy for workspace: default and all features passed"
 }
 
+# Rebuild the gateway image's build context from HEAD and resolve the workspace in it.
+# bin/worker-gateway/Dockerfile copies only the paths it names (etc/Dockerfile copies
+# everything), and cargo cannot load the workspace when an explicit member or a
+# [patch.crates-io] path source is missing, even for `-p`. The metadata call resolves
+# dependencies on purpose: `--no-deps` would hide a missing patch source. Takes an optional
+# Dockerfile path so the check can be pointed at another copy of the file.
+check_gateway_image_context() {
+    local dockerfile=${1:-bin/worker-gateway/Dockerfile}
+    local line word tmp
+    local -a words paths=()
+    # `COPY [--flag]... <src>... <dest>`: keep the sources. A `COPY --from=` line copies out
+    # of another build stage, not out of the context, so it is skipped.
+    while read -r line; do
+        read -r -a words <<<"$line"
+        [[ " ${words[*]} " == *" --from="* ]] && continue
+        for word in "${words[@]:1:${#words[@]}-2}"; do
+            [[ $word == --* ]] || paths+=("$word")
+        done
+    done < <(grep -E '^COPY[[:space:]]' "$dockerfile")
+    if ((${#paths[@]} == 0)); then
+        echo "check_gateway_image_context: no COPY sources in $dockerfile" >&2
+        return 1
+    fi
+    tmp=$(mktemp -d)
+    # A subshell, so its EXIT trap removes the copy when cargo fails as well as when it passes.
+    (
+        trap 'rm -rf -- "$tmp"' EXIT
+        # The sources go to git quoted, so git, not the shell, expands a glob such as
+        # `Cargo*`. The tn-contracts submodule archives as an empty directory, which is all
+        # cargo metadata needs.
+        git archive HEAD -- "${paths[@]}" | tar -x -C "$tmp"
+        # --offline needs every locked crate source in CARGO_HOME.
+        run cargo fetch --locked
+        run cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
+    )
+    echo "gateway image context resolves: ${paths[*]}"
+}
+
 lane_test_default() {
     run python3 -B -I -m unittest discover -s tools/network-budget -p 'test_*.py'
     # Keep this library-only: workspace tests unify dev-dependency features and can
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
+    # The gateway image copies only the paths its Dockerfile names, so a new workspace
+    # member or patch source missing from that COPY list fails here.
+    check_gateway_image_context
     # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
     # -p), but the workspace build below unifies features across every member, so a
     # feature the gateway needs and does not enable on its own dependencies still

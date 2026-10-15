@@ -43,6 +43,10 @@ COPY bin/ ./bin/
 COPY crates/ ./crates/
 COPY chain-configs/ ./chain-configs/
 COPY tn-contracts/ ./tn-contracts/
+# Workspace members and [patch.crates-io] path sources named by the root
+# Cargo.toml; cargo cannot load the workspace without them, even for -p.
+COPY examples/ ./examples/
+COPY patches/ ./patches/
 
 # Build only the gateway binary, then move it out of the cache mount so the
 # runtime stage can COPY it. --locked makes the build fail instead of resolving
