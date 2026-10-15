@@ -39,6 +39,7 @@ use std::{
 use axum::{
     body::HttpBody as _,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
+    handler::Handler as _,
     http::{header, HeaderValue, Method, StatusCode},
     middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
@@ -757,12 +758,16 @@ impl Drop for ClientSlot {
 /// same `405` as any other method but `POST`.
 ///
 /// `/ready/any` is added after every layer but the `nosniff` one, the identity,
-/// access-log and CORS layers included, so it answers from memory with none of
-/// them applied: it is never rate limited, metered, logged, charged against
-/// the byte budget or deadline-bound, like `/health` and `/ready`, and it never
-/// carries a CORS header (an `OPTIONS` to it gets the probes' `405`). `/health` and
-/// `/ready` sit inside the CORS layer, which answers an `OPTIONS` to them and
-/// adds `Access-Control-Allow-Origin` to their answers for an allowed `Origin`.
+/// access-log and CORS layers included, so its `GET` and `HEAD` answer from
+/// memory with none of them applied: they are never rate limited, metered,
+/// logged, charged against the byte budget or deadline-bound, like `/health`
+/// and `/ready`, and never carry a CORS header. Any other method there (an
+/// `OPTIONS` included) passes the identity and rate-limit layers on its own
+/// before it gets the probes' `405`, so, as on the other probe paths, it
+/// spends the client's tokens and is refused with a `429` once they run out.
+/// `/health` and `/ready` sit inside the CORS layer, which answers an
+/// `OPTIONS` to them and adds `Access-Control-Allow-Origin` to their answers
+/// for an allowed `Origin`.
 pub(crate) fn router(
     state: AppState,
     request_deadline: Duration,
@@ -786,8 +791,8 @@ pub(crate) fn router(
         .layer(from_fn_with_state(byte_budget, reserve_request_bytes));
     // Add the rate-limit layer after the body, deadline and byte-budget layers
     // so it runs ahead of the reservation and the body read.
-    let router = match layers.rate_limiters {
-        Some(limiters) => router.layer(from_fn_with_state(limiters, rate_limit)),
+    let router = match &layers.rate_limiters {
+        Some(limiters) => router.layer(from_fn_with_state(Arc::clone(limiters), rate_limit)),
         None => router,
     };
     // Add CORS after the rate limiter so it runs before it: a preflight is
@@ -812,13 +817,23 @@ pub(crate) fn router(
     let router = router.layer(from_fn(count_cancelled));
     // Add the identity layer after the access-log, CORS and rate-limit layers
     // so it runs before them: they read the client address this layer stores.
-    let router = router.layer(from_fn_with_state(trusted_proxies, identify));
-    // a layer wraps only the routes added before it, so this probe, like
-    // `/health` and `/ready` (exempt in `crate::ratelimit`), is never rate
-    // limited; it stays the last route added, outside every layer but the
-    // `nosniff` one, and refuses other methods like the two probes above
+    let router = router.layer(from_fn_with_state(Arc::clone(&trusted_proxies), identify));
+    // a layer wraps only the routes added before it, so this probe's `GET` and
+    // `HEAD`, like those on `/health` and `/ready` (exempt in
+    // `crate::ratelimit`), are never rate limited; it stays the last route
+    // added, outside every layer but the `nosniff` one, and refuses other
+    // methods like the two probes above, through the same rate limiter, which
+    // needs the identity layer's client address
+    let ready_any_route = match layers.rate_limiters {
+        Some(limiters) => get(ready_any).fallback(
+            probe_method_not_allowed
+                .layer(from_fn_with_state(limiters, rate_limit))
+                .layer(from_fn_with_state(trusted_proxies, identify)),
+        ),
+        None => get(ready_any).fallback(probe_method_not_allowed),
+    };
     router
-        .route(READY_ANY_PATH, get(ready_any).fallback(probe_method_not_allowed))
+        .route(READY_ANY_PATH, ready_any_route)
         // Outermost, so every response the service produces carries it, the
         // identity, CORS and rate-limit layers' included.
         .layer(map_response(set_nosniff))
@@ -6199,6 +6214,40 @@ mod tests {
         for _ in 0..5 {
             assert_eq!(get_probe(addr, READY_ANY_PATH).await.0, StatusCode::OK);
         }
+    }
+
+    /// A method other than `GET` or `HEAD` on `/ready/any` is charged against
+    /// the client's bucket like any request before it gets its `405`, and a
+    /// `429` once the bucket is empty; `GET` and `HEAD` are never charged.
+    #[tokio::test]
+    async fn ready_any_charges_other_methods_against_the_rate_limit() {
+        let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let app = identity_router(state, one_request_per_ip(), "127.0.0.1/32");
+        let (gateway, _shutdown) = spawn(app).await;
+        let url = format!("http://{gateway}{READY_ANY_PATH}");
+        let client = Client::new();
+        let status = |method: Method| {
+            let request = client.request(method, &url).body(call("eth_chainId", 1));
+            async move { request.send().await.expect("send").status() }
+        };
+
+        // probes spend nothing, so the only token is still there for the POST
+        for _ in 0..3 {
+            assert_eq!(status(Method::GET).await, StatusCode::OK);
+            assert_eq!(status(Method::HEAD).await, StatusCode::OK);
+        }
+        assert_eq!(status(Method::POST).await, StatusCode::METHOD_NOT_ALLOWED);
+        // the POST took the client's only token
+        assert_eq!(status(Method::POST).await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(status(Method::PUT).await, StatusCode::TOO_MANY_REQUESTS);
+        let (status_rpc, _) = post_rpc(gateway, None, call("eth_chainId", 2)).await;
+        assert_eq!(status_rpc, StatusCode::TOO_MANY_REQUESTS, "the bucket is the client's");
+        // and the probes still answer with the bucket empty
+        assert_eq!(status(Method::GET).await, StatusCode::OK);
+        assert_eq!(status(Method::HEAD).await, StatusCode::OK);
+        assert_eq!(worker_seen.hits(), 0, "a probe path must never reach the upstream");
     }
 
     /// A throwaway certificate authority for the TLS upstream tests.
