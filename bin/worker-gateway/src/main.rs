@@ -64,7 +64,12 @@ fn try_main() -> eyre::Result<()> {
         .enable_time()
         .build()?;
 
-    runtime.block_on(app::run(settings))
+    let result = runtime.block_on(app::run(settings));
+    // a getaddrinfo still running on the blocking pool cannot be cancelled, and
+    // dropping the runtime would wait for it without limit; the drain has
+    // already finished, so give blocking work a short grace and exit
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 /// Whether log lines carry colour codes: only when stdout is a terminal and
