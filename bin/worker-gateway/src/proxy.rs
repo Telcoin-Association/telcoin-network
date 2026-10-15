@@ -430,6 +430,9 @@ pub(crate) async fn proxy(
         limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
     if let Err(err) = charged {
+        if let Some(Extension(budget)) = &submission_budget {
+            budget.refund(class == Class::Submission);
+        }
         return error_response(&err, b"");
     }
 

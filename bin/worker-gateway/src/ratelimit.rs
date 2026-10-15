@@ -45,8 +45,10 @@
 //! charges its first call to the global bucket for a query or to the
 //! submission bucket for a submission, and a refusal there refunds the per-IP
 //! token to the bucket the edge charged: a refused submission spends no global
-//! token and a refused query no submission token. Without the flag the edge
-//! check is [`RateLimiters::check`].
+//! token and a refused query no submission token. A batch whose calls beyond
+//! the first the later per-call charge refuses gets its class token back; its
+//! per-IP token stays spent. Without the flag the edge check is
+//! [`RateLimiters::check`].
 //!
 //! With the flag, a first-seen client's per-IP bucket is inserted only once a
 //! shared bucket has admitted its request: the class charge, or, for a request
@@ -233,6 +235,12 @@ impl GlobalLimiter {
         let mut bucket = lock(&self.bucket);
         let now = clock.now();
         bucket.try_admit(now, self.limit.tokens_per_sec(), self.limit.capacity(), cost)
+    }
+
+    /// Give back `cost` tokens spent on a request a later check refused, never
+    /// past capacity.
+    fn refund(&self, cost: f64) {
+        lock(&self.bucket).refund(cost, self.limit.capacity());
     }
 }
 
@@ -772,7 +780,9 @@ impl<C: Clock> RateLimiters<C> {
     /// other request to the global bucket (either always admits when it is
     /// off). A refusal refunds the per-IP token `edge` names, so neither shared
     /// bucket is spent on a request the other refused and the client pays
-    /// nothing for a refusal it did not cause.
+    /// nothing for a refusal it did not cause. A batch whose calls beyond the
+    /// first [`Self::charge_batch`] then refuses gets its class token back
+    /// through [`Self::refund_class`]; its per-IP token stays spent.
     ///
     /// A first-seen client's bucket ([`PerIpReceipt::Fresh`]) is inserted only
     /// when the class bucket admits the request; a refused one leaves no entry.
@@ -788,6 +798,17 @@ impl<C: Clock> RateLimiters<C> {
         } else {
             self.refund_per_ip(edge, 1.0);
             Err(GatewayError::RateLimited)
+        }
+    }
+
+    /// Give back the class token [`Self::charge_class`] took for a request
+    /// that a later charge refused: to the submission bucket for a submission,
+    /// to the global bucket otherwise. Either is a no-op when that bucket is
+    /// off.
+    fn refund_class(&self, submission: bool) {
+        let bucket = if submission { &self.submissions } else { &self.global };
+        if let Some(bucket) = bucket {
+            bucket.refund(1.0);
         }
     }
 
@@ -883,6 +904,14 @@ impl<C: Clock> SubmissionBudget<C> {
     pub(crate) fn charge(&self, submission: bool) -> Result<(), GatewayError> {
         self.inner.charged.store(true, Ordering::Relaxed);
         self.inner.limiters.charge_class(self.inner.edge, submission)
+    }
+
+    /// Give back the class token [`Self::charge`] took, for a batch whose
+    /// calls beyond the first [`RateLimiters::charge_batch`] then refused;
+    /// `submission` is the class it was charged as. The per-IP token the edge
+    /// spent stays spent.
+    pub(crate) fn refund(&self, submission: bool) {
+        self.inner.limiters.refund_class(submission);
     }
 }
 
@@ -1033,6 +1062,11 @@ mod tests {
         /// The tokens left in the global bucket, if it is enabled.
         fn global_tokens(&self) -> Option<f64> {
             self.global.as_ref().map(|global| lock(&global.bucket).tokens)
+        }
+
+        /// The tokens left in the submission bucket, if it is enabled.
+        fn submission_tokens(&self) -> Option<f64> {
+            self.submissions.as_ref().map(|submissions| lock(&submissions.bucket).tokens)
         }
 
         /// When the global bucket last refilled, if it is enabled.
@@ -1421,6 +1455,56 @@ mod tests {
             limiters.check_edge(Some(ip(2))).is_ok(),
             "a refused request kept its overflow token"
         );
+    }
+
+    /// A submission batch the global bucket refuses for its extra calls gets
+    /// its submission token back, never past the burst; its per-IP token
+    /// stays spent.
+    #[test]
+    fn batch_refusal_refunds_the_class_token() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 10)),
+            Some(limit(1, 1)),
+            limit(1, 2),
+        );
+        let read = limiters.check_edge(None).expect("edge").expect("a budget");
+        assert!(read.charge(false).is_ok(), "the global bucket's only token");
+        let batch = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(batch.charge(true).is_ok());
+        assert_eq!(limiters.submission_tokens(), Some(1.0));
+        assert!(matches!(limiters.charge_batch(Some(ip(1)), 2), Err(GatewayError::RateLimited)));
+        batch.refund(true);
+        assert_eq!(limiters.submission_tokens(), Some(2.0), "the refused batch kept its token");
+        batch.refund(true);
+        assert_eq!(
+            limiters.submission_tokens(),
+            Some(2.0),
+            "a refund lifted the bucket past its burst"
+        );
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(9.0), "the edge token came back");
+        assert_eq!(limiters.global_tokens(), Some(0.0));
+    }
+
+    /// The same for a query batch, refused by its own per-IP bucket: the
+    /// global token its first call took comes back.
+    #[test]
+    fn query_batch_refusal_refunds_the_global_token() {
+        let limiters = limiters_with_submissions(
+            ManualClock::new(),
+            Some(limit(1, 2)),
+            Some(limit(1, 4)),
+            limit(1, 1),
+        );
+        let batch = limiters.check_edge(Some(ip(1))).expect("edge").expect("a budget");
+        assert!(batch.charge(false).is_ok());
+        assert_eq!(limiters.global_tokens(), Some(3.0));
+        // one per-IP token left, two needed: refused before the global bucket
+        assert!(matches!(limiters.charge_batch(Some(ip(1)), 2), Err(GatewayError::RateLimited)));
+        batch.refund(false);
+        assert_eq!(limiters.global_tokens(), Some(4.0), "the refused batch kept its global token");
+        assert_eq!(limiters.per_ip_tokens(ip(1)), Some(1.0), "the edge token came back");
+        assert_eq!(limiters.submission_tokens(), Some(1.0));
     }
 
     /// The README's bound: with the submission budget on, every call that
