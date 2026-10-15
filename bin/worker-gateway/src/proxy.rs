@@ -2733,19 +2733,40 @@ mod tests {
     /// reaches the parse, and under the previous code that parse built a `Value`
     /// tree an order of magnitude larger than the request. It must still reach
     /// the same verdict (forwarded, since `method` is not the raw-transaction
-    /// call) without materializing the tree.
+    /// call) without materializing the tree. The forward verdict and route are
+    /// pinned, and a variant whose member ends in `1e400` fails a reader that
+    /// builds the member as a `Value` (serde_json's in-place skip accepts the
+    /// number, a `Value` refuses it); no allocation is measured.
     #[test]
     fn oversized_unrelated_member_is_handled_without_building_a_tree() {
         let filler = "1,".repeat(400_000);
-        let body = format!(
-            r#"{{"method":"eth_chainId","note":"eth_sendRawTransaction","junk":[{}0],"id":1}}"#,
-            filler
-        )
-        .into_bytes();
+        let body_ending_in = |last: &str| {
+            format!(
+                r#"{{"method":"eth_chainId","note":"eth_sendRawTransaction","junk":[{filler}{last}],"id":1}}"#
+            )
+            .into_bytes()
+        };
+        let body = body_ending_in("0");
         assert!(body.len() > 800_000, "fixture should be large: {}", body.len());
 
         assert_eq!(verdict(screen_raw_transaction(&body)), None);
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
+
+        // one query, forwarded, with no hash or pool read, and no method the
+        // shipped policy denies
+        let assert_outcome = |body: &[u8]| {
+            let scan = scan(body, None);
+            assert!(scan.rejection.is_none(), "forwarded");
+            assert_eq!(
+                (scan.len, scan.calls, scan.submitted, scan.pool_read),
+                (1, Calls::Queries, None, None)
+            );
+            assert!(!calls_denied_method(body, &default_denied()), "not denied");
+        };
+        assert_outcome(&body);
+        let sentinel = body_ending_in("1e400");
+        assert!(serde_json::from_slice::<Value>(&sentinel).is_err(), "a tree build fails");
+        assert_outcome(&sentinel);
     }
 
     /// The review payload for this commit: all of the bulk in `id`, past the
@@ -2753,24 +2774,54 @@ mod tests {
     /// reader `id` was the one member still materialized as a full `Value`, so
     /// this shape rebuilt the amplification the screen fix removed, eagerly,
     /// for an id that was then dropped unused. The verdicts must still match
-    /// the old parse; the id is never touched on the forward path.
+    /// the old parse; the id is never touched on the forward path. The forward
+    /// verdict and route are pinned, and a variant whose id ends in `1e400`
+    /// fails a reader that builds the id as a `Value` (serde_json's in-place
+    /// skip accepts the number, a `Value` refuses it); no allocation is
+    /// measured.
     #[test]
     fn oversized_id_is_skipped_on_the_forward_path() {
         let filler = "1,".repeat(400_000);
-        let bodies = [
-            // The method name only as data: forwarded without reading the id.
-            format!(r#"{{"x":"eth_sendRawTransaction","id":[{filler}0]}}"#).into_bytes(),
-            // A real, valid submission: forwarded on its merits, id unread.
-            format!(
-                r#"{{"method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":[{filler}0]}}"#
-            )
-            .into_bytes(),
-        ];
+        let bodies_ending_in = |last: &str| {
+            [
+                // The method name only as data: forwarded without reading the id.
+                format!(r#"{{"x":"eth_sendRawTransaction","id":[{filler}{last}]}}"#).into_bytes(),
+                // A real, valid submission: forwarded on its merits, id unread.
+                format!(
+                    r#"{{"method":"eth_sendRawTransaction","params":["{EIP155_LEGACY_TX}"],"id":[{filler}{last}]}}"#
+                )
+                .into_bytes(),
+            ]
+        };
+        let bodies = bodies_ending_in("0");
         bodies.iter().for_each(|body| {
             assert!(body.len() > 800_000, "fixture should be large: {}", body.len());
             assert_eq!(verdict(screen_raw_transaction(body)), None);
             assert_eq!(verdict(screen_raw_transaction(body)), verdict(reference_screen(body)));
         });
+
+        // the method-less body is one query; the submission goes to the worker
+        // and hands back its hash; neither names a method the shipped policy
+        // denies
+        let raw = decode_hex(EIP155_LEGACY_TX).expect("fixture hex");
+        let expected = [
+            (1, Calls::Queries, None, None),
+            (1, Calls::Submissions, Some(tn_types::keccak256(raw)), None),
+        ];
+        let assert_outcomes = |bodies: &[Vec<u8>; 2]| {
+            for (body, expected) in bodies.iter().zip(expected) {
+                let scan = scan(body, None);
+                assert!(scan.rejection.is_none(), "forwarded");
+                assert_eq!((scan.len, scan.calls, scan.submitted, scan.pool_read), expected);
+                assert!(!calls_denied_method(body, &default_denied()), "not denied");
+            }
+        };
+        assert_outcomes(&bodies);
+        let sentinels = bodies_ending_in("1e400");
+        for sentinel in &sentinels {
+            assert!(serde_json::from_slice::<Value>(sentinel).is_err(), "a tree build fails");
+        }
+        assert_outcomes(&sentinels);
     }
 
     /// The same shape, but a real submission carrying a large trailing params
