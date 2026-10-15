@@ -13,13 +13,14 @@
 //! `X-Forwarded-For` names the peer, or the forwarded client and then the
 //! trusted proxy that vouched for it, and `X-Forwarded-Proto` is `http` unless
 //! a trusted proxy reported `https` (see [`crate::identity`]). The upstream
-//! response body is streamed through, never buffered whole, except the small
-//! answer to a submission whose hash the gateway would remember (see
-//! [`submission_accepted`]). When no upstream is ready, or the upstream cannot
-//! be reached / times out, the client receives a well-formed JSON-RPC error
-//! instead (see [`crate::error`]). So does a client whose upstream answers an
-//! error status without a JSON body (a worker's `429` text/plain, say): it
-//! keeps the upstream's status, with a JSON-RPC error in place of the body.
+//! response body is streamed through, never buffered whole, except the answer
+//! to a submission whose hash the gateway would remember, read whole up to the
+//! request's length plus 4 KiB (see [`submission_accepted`]). When no upstream
+//! is ready, or the upstream cannot be reached / times out, the client receives
+//! a well-formed JSON-RPC error instead (see [`crate::error`]). So does a
+//! client whose upstream answers an error status without a JSON body (a
+//! worker's `429` text/plain, say): it keeps the upstream's status, with a
+//! JSON-RPC error in place of the body.
 //!
 //! With `--redirect-queries` set, transaction submissions go to the worker,
 //! and so do the few single reads only its pool can answer: a nonce at the
@@ -605,7 +606,11 @@ pub(crate) async fn proxy(
             // `result` counts: the answer is read whole to tell, and only on
             // this path. it is read here, while the in-flight guard, the class
             // slot and the byte reservation are still held (the worker slot no
-            // longer is); they drop when this returns
+            // longer is). the in-flight guard and the class slot then travel
+            // with the answer until the client has taken it (see
+            // [`HeldAnswer`]); the byte reservation does not, and drops when
+            // this returns, which keeps it within the request deadline (45 s
+            // by default) whether or not the client reads
             let remember = recent
                 .zip(scan.submitted)
                 .filter(|_| route == Route::Worker && upstream.status().is_success());
@@ -616,6 +621,8 @@ pub(crate) async fn proxy(
                     body.as_ref(),
                     recent,
                     hash,
+                    in_flight,
+                    class_slot,
                 )
                 .await;
             }
@@ -719,12 +726,18 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// timeout) is lost: the client gets `502` / `-32001`, and the forward counts
 /// once, as `routed_requests_total{route="worker", result="body_failed"}`,
 /// never as `forwarded`.
+///
+/// An answer that was read goes out as a [`HeldAnswer`], which keeps
+/// `in_flight` and `class_slot` until the client has taken it, as a streamed
+/// answer keeps them (see [`relay`]); a lost answer drops them on return.
 async fn relay_submission_answer(
     upstream: reqwest::Response,
     upstream_url: &Url,
     request_body: &[u8],
     recent: &RecentSubmissions,
     hash: B256,
+    in_flight: telemetry::RequestInFlight,
+    class_slot: telemetry::InFlightSlot,
 ) -> Response {
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
@@ -736,7 +749,8 @@ async fn relay_submission_answer(
             }
             telemetry::record_forwarded();
             telemetry::record_routed(Route::Worker.label(), "forwarded");
-            upstream_response(status, content_type, Body::from(answer))
+            let answer = HeldAnswer { answer, _in_flight: in_flight, _class_slot: class_slot };
+            upstream_response(status, content_type, Body::new(answer))
         }
         Err(lost) => {
             telemetry::record_routed(Route::Worker.label(), "body_failed");
@@ -787,6 +801,65 @@ impl fmt::Display for AnswerLost {
             Self::TooLong => f.write_str("answer longer than the read cap"),
             Self::Failed(err) => ErrorChain(err).fmt(f),
         }
+    }
+}
+
+/// A submission's answer, read whole by [`relay_submission_answer`], on its way
+/// to the client, holding the request's in-flight guard and class slot until
+/// the client has taken it.
+///
+/// [`proxy`] returns as soon as the answer has been read, but the answer then
+/// waits in hyper for a client that may read it slowly, or not at all, until
+/// the connection-layer guards close the connection. Holding the guards keeps
+/// that request in the in-flight gauge (the autoscaling signal) and its
+/// duration, and on `--max-inflight-submissions`, as [`UpstreamBody`] does for
+/// a streamed answer. The byte reservation is not held: it drops when
+/// [`proxy`] returns, so the request-byte budget stays bounded by the request
+/// deadline.
+///
+/// The answer goes out in copies of at most [`HeldAnswer::MAX_FRAME`] bytes,
+/// with an exact size hint, so hyper still sends its `Content-Length`. A
+/// single frame would share the answer's allocation, which hyper can keep in
+/// its write queue after it has dropped the body and with it the guards; a
+/// copy leaves the allocation with the body, so it never outlives the guards.
+struct HeldAnswer {
+    /// The part of the answer not yet handed to hyper.
+    answer: Bytes,
+    /// Holds the request in the in-flight gauge and its duration timer until
+    /// the answer has been taken, or is dropped because the client went away
+    /// or the connection closed.
+    _in_flight: telemetry::RequestInFlight,
+    /// The request's slot on `--max-inflight-submissions`.
+    _class_slot: telemetry::InFlightSlot,
+}
+
+impl HeldAnswer {
+    /// The largest frame handed to hyper at a time.
+    const MAX_FRAME: usize = 16 * 1024;
+}
+
+impl hyper::body::Body for HeldAnswer {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
+        if self.answer.is_empty() {
+            return Poll::Ready(None);
+        }
+        let len = self.answer.len().min(Self::MAX_FRAME);
+        let frame = Bytes::copy_from_slice(&self.answer.split_to(len));
+        Poll::Ready(Some(Ok(hyper::body::Frame::data(frame))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.answer.is_empty()
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        hyper::body::SizeHint::with_exact(u64::try_from(self.answer.len()).unwrap_or(u64::MAX))
     }
 }
 
@@ -4179,5 +4252,41 @@ mod tests {
         ] {
             assert_eq!(parse_chain_id(answer.as_bytes()), expected, "{answer}");
         }
+    }
+
+    /// A held submission answer goes out in copies of at most
+    /// [`HeldAnswer::MAX_FRAME`] bytes that add up to the answer, its exact
+    /// size hint shrinking to zero as they are taken, and it keeps its class
+    /// slot until the body itself is dropped.
+    #[tokio::test]
+    async fn held_answer_yields_bounded_frames() {
+        let answer: Vec<u8> = (0..40 * 1024).map(|i| (i % 251) as u8).collect();
+        let slots = inflight_slots(1);
+        let mut held = HeldAnswer {
+            answer: Bytes::from(answer.clone()),
+            _in_flight: telemetry::RequestInFlight::enter(),
+            _class_slot: telemetry::InFlightSlot::route(&slots, "submission").expect("free slot"),
+        };
+        assert_eq!(hyper::body::Body::size_hint(&held).exact(), Some(40 * 1024));
+        assert!(!hyper::body::Body::is_end_stream(&held));
+
+        let mut taken = Vec::new();
+        let mut frames = 0;
+        while let Some(frame) =
+            std::future::poll_fn(|cx| hyper::body::Body::poll_frame(Pin::new(&mut held), cx)).await
+        {
+            let data = frame.expect("infallible").into_data().expect("a data frame");
+            assert!(!data.is_empty() && data.len() <= HeldAnswer::MAX_FRAME, "{}", data.len());
+            taken.extend_from_slice(&data);
+            frames += 1;
+            let remaining = u64::try_from(answer.len() - taken.len()).expect("fits");
+            assert_eq!(hyper::body::Body::size_hint(&held).exact(), Some(remaining));
+        }
+        assert_eq!(taken, answer);
+        assert_eq!(frames, 3, "16 KiB + 16 KiB + 8 KiB");
+        assert!(hyper::body::Body::is_end_stream(&held));
+        assert_eq!(slots.available_permits(), 0, "the slot is held until the body drops");
+        drop(held);
+        assert_eq!(slots.available_permits(), 1);
     }
 }

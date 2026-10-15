@@ -259,7 +259,7 @@ Every other connection counts, the `/health`, `/ready` and `/ready/any` probes o
 > Across prefixes only `--max-connections` bounds the total, so absorb wide floods in front of the gateway (see [DNS and the DDoS front](#dns-and-the-ddos-front)).
 
 Upstream response bodies are streamed through, never buffered whole (except
-the short, capped answer to a submission whose hash is remembered; see
+the capped answer to a submission whose hash is remembered; see
 [Reads kept on the worker](#reads-kept-on-the-worker)), so
 response size does not translate into gateway memory. A stalled *upstream* is
 bounded by the upstream request timeout; a stalled or slow-reading *client*
@@ -532,6 +532,8 @@ Size it from both ends:
   Each open connection also keeps a read buffer of up to `--http1-max-buf-size`.
   So peak request memory is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming; keep that under the container's memory limit.
   With the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
+  With `--redirect-queries`, a single submission's answer is read whole and waits for its client after the byte reservation is released, so add up to `--max-connections` × (`--max-request-bytes` + 4 KiB) for answers clients have not read yet.
+  A connection holds a request body or such an answer, never both, so at the defaults the two stay within the figure above, while `--max-inflight-request-bytes` / `--max-request-bytes` below `--max-connections` lets the answers alone reach that product (about 1 GiB at `--max-connections 1000`).
   In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process over five runs, about 1.3 times the budget.
   That excess includes the read buffers of the client's, the gateway's and the upstream's connections, whose number the test scales with the budget, so the gateway's own share was not measured separately.
   Each extra connection adds at most `--http1-max-buf-size`.
@@ -667,7 +669,7 @@ The rule is exact:
   A block parameter given any other way, such as `{"blockNumber": "pending"}`, or left out (which means `latest`) sends the nonce read to the query URL.
 - Every other read at `pending`, such as `eth_call`, `eth_getBalance` and `eth_estimateGas`, still goes to the query URL and can lag the worker's pool.
 - A hash is remembered only for a single `eth_sendRawTransaction` that passed the [transaction screen](#transaction-screening) and that the worker accepted: a `2xx` answer carrying a JSON-RPC `result`.
-  The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's short answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
+  The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
   An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost: the client gets `502` / `-32001`, and the forward counts as `body_failed` (see [Behaviour on failure](#behaviour-on-failure)).
   A submission inside a batch, an `eth_sendRawTransactionSync` (which returns the receipt itself), and a submission the worker rejected, with an HTTP error status or a JSON-RPC `error`, are not remembered.
 - The gateway remembers at most 10,000 hashes and forgets the oldest first, so a flood of submissions can push a hash out early, and its lookups then go to the query URL.

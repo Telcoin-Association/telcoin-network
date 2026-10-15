@@ -7392,6 +7392,71 @@ mod tests {
         assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 1.0);
     }
 
+    /// The worker's answer to a remembered submission is read whole before
+    /// `proxy()` returns and then waits in the response body for the client:
+    /// until the client has taken it, the request stays in the in-flight gauge
+    /// and keeps its submission slot, as a streamed answer does.
+    #[tokio::test]
+    async fn buffered_submission_answer_holds_its_guards_until_taken() {
+        let mut metrics = CapturedMetrics::install();
+        let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
+        let mut state = redirect_state(worker, None);
+        state.submission_slots = inflight_slots(1);
+        state.readiness.set_ready(0, true);
+        let recent = state.recent_submissions.clone().expect("hash routing on");
+        let slots = Arc::clone(&state.submission_slots);
+        let forwarding = TrustedProxies::default()
+            .resolve("127.0.0.1".parse().expect("peer"), &HeaderMap::new());
+
+        let response = proxy(
+            State(state),
+            Extension(forwarding),
+            crate::proxy::PostOnly,
+            None,
+            None,
+            None,
+            Request::new(axum::body::Body::from(submission(1))),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // the handler has returned, but nothing has taken the answer yet
+        let inflight = "tn_worker_gateway_inflight_requests";
+        let class = [("route", "submission")];
+        assert_eq!(slots.available_permits(), 0, "the submission slot is still held");
+        assert_eq!(metrics.value(inflight, &[]), 1.0);
+        assert_eq!(metrics.value("tn_worker_gateway_route_inflight", &class), 1.0);
+
+        let answer =
+            axum::body::to_bytes(response.into_body(), usize::MAX).await.expect("the answer");
+        assert_eq!(answer.as_ref(), ACCEPTED.as_bytes());
+        assert_eq!(slots.available_permits(), 1, "taking the answer frees the slot");
+        assert_eq!(metrics.value(inflight, &[]), 0.0);
+        assert_eq!(metrics.value("tn_worker_gateway_route_inflight", &class), 0.0);
+        assert!(recent.contains(&submitted_hash()));
+    }
+
+    /// The held answer keeps an exact size, so the client gets it with a
+    /// `Content-Length`, as it did when the answer went out in one piece.
+    #[tokio::test]
+    async fn buffered_submission_answer_keeps_its_content_length() {
+        let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(submission(1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        let length = u64::try_from(ACCEPTED.len()).expect("fits");
+        assert_eq!(response.content_length(), Some(length));
+        assert_eq!(response.bytes().await.expect("bytes").as_ref(), ACCEPTED.as_bytes());
+    }
+
     #[tokio::test]
     async fn batches_keep_the_existing_classification() {
         let (worker, worker_seen, _worker) = accepting_worker_mock().await;
