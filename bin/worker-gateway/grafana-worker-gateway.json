@@ -2,7 +2,7 @@
   "annotations": {
     "list": []
   },
-  "description": "Telcoin Network worker gateway metrics: traffic, rejections, latency, upstream readiness, and process resource use. Scraped from the gateway's --metrics endpoint; node/instance labels are attached externally by the collector.",
+  "description": "Telcoin Network worker gateway metrics: traffic, rejections, latency, upstream readiness, and process resource use. Scraped from the gateway's --metrics endpoint. Every panel is scoped to the Prometheus job picked in the Job variable, so the process panels do not also draw a node scraped by the same Prometheus; per-replica panels tell the gateways apart by the instance label the collector attaches.",
   "editable": true,
   "graphTooltip": 1,
   "links": [],
@@ -39,7 +39,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total[5m]))",
+          "expr": "sum by (outcome) (rate(tn_worker_gateway_requests_total{job=\"$job\"}[5m]))",
           "refId": "A",
           "legendFormat": "{{outcome}}"
         }
@@ -74,9 +74,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "tn_worker_gateway_inflight_requests",
+          "expr": "tn_worker_gateway_inflight_requests{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "in-flight"
+          "legendFormat": "in-flight {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -121,7 +121,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total[5m]))",
+          "expr": "sum by (reason) (rate(tn_worker_gateway_rejections_total{job=\"$job\"}[5m]))",
           "refId": "A",
           "legendFormat": "{{reason}}"
         }
@@ -162,7 +162,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(tn_worker_gateway_requests_total{outcome=~\"rejected|upstream_error\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total[5m])), 1)",
+          "expr": "sum(rate(tn_worker_gateway_requests_total{job=\"$job\",outcome=~\"rejected|upstream_error\"}[5m])) / clamp_min(sum(rate(tn_worker_gateway_requests_total{job=\"$job\"}[5m])), 1)",
           "refId": "A",
           "legendFormat": "reject ratio"
         }
@@ -217,7 +217,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "A",
           "legendFormat": "p50"
         },
@@ -226,7 +226,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.9, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "B",
           "legendFormat": "p90"
         },
@@ -235,7 +235,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket[5m])))",
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(tn_worker_gateway_request_duration_seconds_bucket{job=\"$job\"}[5m])))",
           "refId": "C",
           "legendFormat": "p99"
         }
@@ -282,9 +282,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "tn_worker_gateway_upstream_ready",
+          "expr": "tn_worker_gateway_upstream_ready{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "worker {{worker_id}} @ {{upstream}}"
+          "legendFormat": "worker {{worker_id}} @ {{upstream}} ({{instance}})"
         }
       ],
       "fieldConfig": {
@@ -330,9 +330,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(reth_process_cpu_seconds_total[5m])",
+          "expr": "rate(reth_process_cpu_seconds_total{job=\"$job\"}[5m])",
           "refId": "A",
-          "legendFormat": "cpu cores"
+          "legendFormat": "cpu cores {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -365,9 +365,9 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "reth_process_resident_memory_bytes",
+          "expr": "reth_process_resident_memory_bytes{job=\"$job\"}",
           "refId": "A",
-          "legendFormat": "rss"
+          "legendFormat": "rss {{instance}}"
         }
       ],
       "fieldConfig": {
@@ -402,6 +402,29 @@
         "refresh": 1,
         "regex": "",
         "skipUrlSync": false
+      },
+      {
+        "name": "job",
+        "label": "Job",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${datasource}"
+        },
+        "query": {
+          "query": "label_values(tn_worker_gateway_upstream_ready, job)",
+          "refId": "job"
+        },
+        "definition": "label_values(tn_worker_gateway_upstream_ready, job)",
+        "current": {},
+        "hide": 0,
+        "includeAll": false,
+        "multi": false,
+        "options": [],
+        "refresh": 2,
+        "regex": "",
+        "skipUrlSync": false,
+        "sort": 1
       }
     ]
   },
