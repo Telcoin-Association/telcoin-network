@@ -82,7 +82,8 @@ const INFLIGHT_REQUESTS: &str = "tn_worker_gateway_inflight_requests";
 const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 
 /// Rejected and upstream-error proxied requests by `reason` (the
-/// `GatewayError` reason label).
+/// `GatewayError` reason label). Of the two alike, `method_not_allowed` is the
+/// `403` method policy and `method_not_post` HTTP's `405`.
 const REJECTIONS_TOTAL: &str = "tn_worker_gateway_rejections_total";
 
 /// End-to-end proxied-request duration, in seconds, until the response body has

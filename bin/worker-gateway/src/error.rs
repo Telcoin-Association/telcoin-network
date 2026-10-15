@@ -14,7 +14,7 @@ use axum::{
     response::Response,
 };
 use serde::{
-    de::{IgnoredAny, MapAccess, SeqAccess, Visitor},
+    de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor},
     Deserialize, Deserializer,
 };
 use serde_json::{json, Value};
@@ -286,6 +286,11 @@ impl GatewayError {
     /// `tn_worker_gateway_rejections_total` metric. It is kept in lockstep with
     /// the variants; a rename is a metrics-contract change, so the labels are
     /// pinned by a test.
+    ///
+    /// Two labels read alike: `method_not_allowed` is the `403` the method
+    /// policy (`--denied-method-prefixes`) answers, and `method_not_post` is
+    /// HTTP's `405 Method Not Allowed`, for a method other than `POST`, or than
+    /// `GET` and `HEAD` on a probe path.
     fn reason(&self) -> &'static str {
         match self {
             Self::NoUpstreamReady => "no_upstream_ready",
@@ -503,15 +508,49 @@ impl<'de> Visitor<'de> for IdMemberVisitor {
         // A repeated `id` keeps the last occurrence, which is how a full parse
         // into `Value` resolves a duplicated member.
         std::iter::from_fn(|| {
-            members.next_key::<Cow<'_, str>>().transpose().map(|member| {
-                member.and_then(|member| match member.as_ref() {
-                    "id" => members.next_value::<BoundedId>().map(|id| Some(id.0)),
-                    _ => members.next_value::<IgnoredAny>().map(|_| None),
+            members.next_key_seed(IsIdKey).transpose().map(|is_id| {
+                is_id.and_then(|is_id| {
+                    if is_id {
+                        members.next_value::<BoundedId>().map(|id| Some(id.0))
+                    } else {
+                        members.next_value::<IgnoredAny>().map(|_| None)
+                    }
                 })
             })
         })
         .try_fold(Value::Null, |id, member| member.map(|found| found.unwrap_or(id)))
         .map(IdMember)
+    }
+}
+
+/// Key seed behind [`IdMemberVisitor`]: whether a member's name is `id`,
+/// compared where the parser holds it. serde's `Cow<str>` key always copies the
+/// name into a `String`; this reads a name without escapes straight from the
+/// body and one with escapes from the parser's reused scratch buffer, so no
+/// member name gets an allocation of its own.
+struct IsIdKey;
+
+impl<'de> DeserializeSeed<'de> for IsIdKey {
+    type Value = bool;
+
+    fn deserialize<D: Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+        deserializer.deserialize_str(IsIdKeyVisitor)
+    }
+}
+
+/// Visitor behind [`IsIdKey`]. serde forwards a borrowed and an owned string
+/// to `visit_str`, so every form of the name is compared here.
+struct IsIdKeyVisitor;
+
+impl<'de> Visitor<'de> for IsIdKeyVisitor {
+    type Value = bool;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a member name")
+    }
+
+    fn visit_str<E>(self, name: &str) -> Result<Self::Value, E> {
+        Ok(name == "id")
     }
 }
 
@@ -554,6 +593,11 @@ impl<'de> Visitor<'de> for BoundedIdVisitor {
         Ok(BoundedId(Value::from(id)))
     }
 
+    /// A fractional id, and also an integer id outside the `i64`/`u64` range
+    /// or one written with an exponent: those echo in float form
+    /// (`18446744073709551616` as `1.8446744073709552e19`, `1e2` as `100.0`),
+    /// so a client comparing ids as text or as big integers will not match
+    /// its call.
     fn visit_f64<E>(self, id: f64) -> Result<Self::Value, E> {
         Ok(BoundedId(Value::from(id)))
     }
@@ -605,6 +649,22 @@ mod tests {
         let body =
             format!(r#"{{"method":"eth_sendRawTransaction","params":["{payload}"],"id":11}}"#);
         assert_eq!(recovered(body.as_bytes()), json!(11));
+    }
+
+    /// A member name written with an escape (`"\u0069d"` is `id`) is decoded
+    /// before it is compared, so its id is still recovered, in a single call
+    /// and in a batch element alike.
+    #[test]
+    fn id_recovery_reads_an_escaped_id_key() {
+        assert_eq!(recovered(br#"{"method":"eth_chainId","\u0069d":5}"#), json!(5));
+        assert_eq!(recovered(br#"{"i\u0064":"abc","method":"eth_chainId"}"#), json!("abc"));
+        assert_eq!(
+            RequestId::recover_element(br#"[{"id":1},{"\u0069d":2}]"#, 1).0,
+            json!(2),
+            "the escaped key of a batch element"
+        );
+        // an escaped name that decodes to something other than `id` is skipped
+        assert_eq!(recovered(br#"{"\u0069dx":5}"#), Value::Null);
     }
 
     #[test]
