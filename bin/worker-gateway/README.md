@@ -24,7 +24,7 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
 - Header forwarding is minimal.
   Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)), the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the `--redirect-queries-header` header when one is set; see [Query upstream header](#query-upstream-header)), and `User-Agent: tn-worker-gateway/<version>`, so a query upstream's operator can identify the gateway.
-  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL an answer passes only with a JSON `Content-Type` (`application/json` or an `application/*+json` type), and an answer with any other `Content-Type`, or none, a `2xx` included, gets the `-32012` error instead of being relabelled.
+  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body, and a `1xx` or `304`, which cannot carry a body, gets that error with status `502`; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL an answer passes only with a JSON `Content-Type` (`application/json` or an `application/*+json` type), and an answer with any other `Content-Type`, or none, a `2xx` included, gets the `-32012` error instead of being relabelled.
   All other headers are dropped in both directions.
   With `--cors-allowed-origins` set the gateway adds CORS headers of its own (see [CORS](#cors)); without it, browser dApps on another origin need CORS handled at the ingress.
   Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
@@ -224,6 +224,7 @@ An invalid entry, an empty entry, and a `*` beside other entries all fail startu
 With the flag set, the gateway answers every `OPTIONS` preflight itself, ahead of the `POST`-only rule, and never forwards it; without the flag an `OPTIONS` gets the same `405` as any other method but `POST` (see [Gateway endpoints](#gateway-endpoints)).
 The answer allows `POST` with a `Content-Type` header, and the browser may cache it for an hour (`Access-Control-Max-Age: 3600`); a page that sends any other request header, such as `Authorization`, fails its preflight.
 A request from an allowed origin gets `Access-Control-Allow-Origin` on its response (the origin itself, or `*` with the wildcard), gateway error responses included.
+Responses also expose `Retry-After` (`Access-Control-Expose-Headers`), so a page can read how long a capacity `503` asks it to wait; a browser hides any response header outside the CORS-safelisted few unless it is exposed.
 Origins match exactly, so `https://app.example.com` does not allow `http://app.example.com`, `https://app.example.com:8443` or `https://www.app.example.com`.
 A request from any other origin is still served, like a request without `Origin`, but its response carries no `Access-Control-Allow-Origin`, so the browser withholds it from the page.
 A preflight from such an origin still lists the allowed method and header and the max age, which grant nothing without `Access-Control-Allow-Origin`.
@@ -639,6 +640,7 @@ The marker says only that some gateway redirected the request, so it cannot tell
 With A redirecting to B and B redirecting to C, every query through A gets `508` from B; point A at C, or run B without the flag.
 The two markers count under their own reasons in `tn_worker_gateway_rejections_total`: `loop_detected` for `X-TN-Gateway`, `redirect_loop_detected` for `X-TN-Gateway-Redirect`.
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
+A `304`, which cannot carry a body, is the exception: the client gets `502` with the `-32012` error, whatever its content type.
 Every `3xx` logs a warning naming the upstream by origin, whatever its body: an upstream behind a front that redirects is a misconfiguration no client can fix.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
@@ -779,25 +781,12 @@ Hyper answers an unparseable request head itself, before the request reaches the
 
 The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
-An upstream error answer with a JSON body (`application/json` or any `+json`
-subtype) is the upstream's own JSON-RPC error and passes through unchanged:
-status, body and content type. Any other non-2xx answer (a worker's `403`,
-`415` or `429` text/plain, or a `3xx`) keeps its status but has its body
-replaced by the `-32012` error, which echoes the request `id`. A `1xx` or
-`304`, which cannot carry a body, gets the same error with status `502`,
-whatever its content type. The
-`upstream_error` outcome also covers refusals a client can cause (a request
-whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
-itself a worker-saturation signal.
+An upstream error answer with a JSON body (`application/json` or any `+json` subtype) is the upstream's own JSON-RPC error and passes through unchanged: status, body and content type.
+Any other non-2xx answer (a worker's `403`, `415` or `429` text/plain, or a `3xx`) keeps its status but has its body replaced by the `-32012` error, which echoes the request `id`.
+A `1xx` or `304`, which cannot carry a body, gets the same error with status `502`, whatever its content type.
+The `upstream_error` outcome also covers refusals a client can cause (a request whose `Content-Type` is not JSON gets the worker's `415`), so it is not by itself a worker-saturation signal.
 
-An upstream body that fails after the status and headers have gone out (the
-upstream closes or resets mid-stream, or sends nothing for the route's request
-timeout) cannot be turned into an error any more:
-the client gets the upstream's status with a truncated body (shorter than
-the upstream's `Content-Length`, which the gateway passes on, or a chunked
-response without its final chunk), and the gateway logs the failure at debug
-and counts it as `result="body_failed"` in
-`tn_worker_gateway_routed_requests_total`.
+An upstream body that fails after the status and headers have gone out (the upstream closes or resets mid-stream, or sends nothing for the route's request timeout) cannot be turned into an error any more: the client gets the upstream's status with a truncated body (shorter than the upstream's `Content-Length`, which the gateway passes on, or a chunked response without its final chunk), and the gateway logs the failure at debug and counts it as `result="body_failed"` in `tn_worker_gateway_routed_requests_total`.
 The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `forwarded` and then `body_failed`, like a streamed answer.
 
 The request deadline's answer says whether the request may have been delivered.
@@ -862,11 +851,11 @@ the same Prometheus stay out of it.
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests from their buffered body until the relayed response's body has finished streaming (or the gateway's own error); the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget) are not counted. The intended autoscaling signal. |
-| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error` / `cancelled`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream answered an error status without a JSON body, and `cancelled` is a request whose connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
+| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error` / `cancelled`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream's answer the gateway replaced with the `-32012` error (an error status without a JSON body, an answer from the query URL without one, or a `1xx` or `304`), a submission whose answer was lost after the worker's `2xx` counts as `rejected` under the reason of the error it gets (`upstream_answer_lost` or `upstream_timeout`), and `cancelled` is a request whose connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | Time from a proxied request's buffered body to the end of its response body (or the gateway's own error); not end-to-end, as it leaves out the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget). |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`, and a worker's answer to a submission that was lost while the gateway read it whole, without one (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed, in addition to its `forwarded`: a streamed body that failed mid-stream, or a worker's answer to a submission that was lost while the gateway read it whole (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls (an element that is not a call object counts as another call). |
 | `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
