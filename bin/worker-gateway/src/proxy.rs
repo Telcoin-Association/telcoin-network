@@ -1641,7 +1641,7 @@ struct Scan {
 ///
 /// Screening: a submission, alone or in a batch made only of submissions, is
 /// refused when the raw transaction in its first positional param cannot be
-/// decoded or decodes to a type the network does not accept (see
+/// decoded or is of a type the network does not accept (see
 /// [`screen_transaction`]). In a batch the first refused element answers for
 /// the whole batch, with its own id, and later elements are not decoded.
 /// Every other request is forwarded unchanged: other methods, a mixed batch,
@@ -2408,7 +2408,9 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
-/// would have accepted (no false rejections). From here the payload is
+/// would have accepted (no false rejections). A typed envelope of a type the
+/// network does not accept is refused from its type byte, before the decode
+/// copies a blob sidecar or hashes anything. From here the payload is
 /// unambiguously a raw transaction, so a decode failure is a real rejection
 /// rather than a reason to forward.
 ///
@@ -2421,6 +2423,14 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 /// gets an answer.
 fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, GatewayError> {
     let raw = raw.bytes().ok_or(GatewayError::InvalidTransaction)?;
+    // a typed envelope starts with its type byte, 0x01..=0x7f; a legacy
+    // transaction is an rlp list, from 0xc0
+    let refused = raw.first().copied().filter(|&ty| {
+        (1..=0x7f).contains(&ty) && !tn_types::batch_allowlisted_tx_type(&EnvelopeType(ty))
+    });
+    if let Some(ty) = refused {
+        return Err(GatewayError::UnsupportedTransactionType(ty));
+    }
     let mut buf = raw.as_ref();
     match PooledTransaction::decode_2718(&mut buf) {
         Err(_) => Err(GatewayError::InvalidTransaction),
@@ -2428,6 +2438,17 @@ fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, Gat
             Err(GatewayError::UnsupportedTransactionType(tx.ty()))
         }
         Ok(tx) => Ok(tx),
+    }
+}
+
+/// An EIP-2718 type byte on its own, so [`screen_transaction`] can ask
+/// [`tn_types::batch_allowlisted_tx_type`] about a typed envelope before it
+/// decodes the transaction, and the allowlist keeps one definition.
+struct EnvelopeType(u8);
+
+impl Typed2718 for EnvelopeType {
+    fn ty(&self) -> u8 {
+        self.0
     }
 }
 
@@ -2881,12 +2902,12 @@ mod tests {
 
     #[test]
     fn blob_typed_payload_is_not_forwarded() {
-        // A type-`0x03` (EIP-4844) prefix with a truncated body cannot decode as
-        // a pooled transaction, so it is rejected rather than forwarded. Real
-        // blob submissions decode and hit the `is_eip4844` reject; either way a
-        // blob-typed payload never reaches an upstream.
+        // A type-`0x03` (EIP-4844) prefix with a truncated body: the `0x03`
+        // type byte is refused before the truncated body is decoded, so a
+        // blob-typed payload never reaches an upstream, whether or not its body
+        // would decode.
         let err = screen_err(&send_raw(r#"["0x03c0"]"#));
-        assert!(err.is_some());
+        assert!(matches!(err, Some(GatewayError::UnsupportedTransactionType(3))), "{err:?}");
     }
 
     /// The previously untested reject arm: a payload that decodes cleanly but
@@ -2908,6 +2929,9 @@ mod tests {
         assert_eq!(verdict(screen_raw_transaction(&body)), verdict(reference_screen(&body)));
     }
 
+    // the pool's admission set, by EIP-2718 type byte
+    const POOL_ADMITS: [u8; 3] = [0, 1, 2];
+
     /// WG-41: the screen must refuse exactly the transaction types the
     /// worker's pool refuses. The pool's set is fixed by its validator in
     /// `crates/tn-reth/src/txn_pool.rs` (`.no_eip4844().no_eip7702()`: it
@@ -2917,8 +2941,6 @@ mod tests {
     /// this test instead of letting the two sets drift apart by convention.
     #[test]
     fn screen_verdicts_match_the_pool_allowlist() {
-        // the pool's admission set, by EIP-2718 type byte
-        const POOL_ADMITS: [u8; 3] = [0, 1, 2];
         let transactions = one_transaction_per_type();
         let types = transactions.each_ref().map(Typed2718::ty);
         assert_eq!(types, [0, 1, 2, 3, 4], "one transaction of every pooled type");
@@ -2937,6 +2959,37 @@ mod tests {
                     "type {ty} must be refused as unsupported: {verdict:?}"
                 );
             }
+        }
+    }
+
+    /// The refusal of a type the network does not accept is decided from the
+    /// type byte, so a refused type is refused even when its body cannot
+    /// decode, while an admitted type whose body cannot decode is refused as
+    /// undecodable.
+    #[test]
+    fn refused_type_is_refused_from_its_type_byte() {
+        for ty in 1..=0x7f_u8 {
+            // the type byte and an empty rlp list, which no type decodes
+            let verdict = screen_err(&send_raw(&format!("[\"0x{ty:02x}c0\"]")));
+            if POOL_ADMITS.contains(&ty) {
+                assert!(
+                    matches!(verdict, Some(GatewayError::InvalidTransaction)),
+                    "type {ty} must be refused as undecodable: {verdict:?}"
+                );
+            } else {
+                assert!(
+                    matches!(verdict, Some(GatewayError::UnsupportedTransactionType(refused)) if refused == ty),
+                    "type {ty} must be refused as unsupported: {verdict:?}"
+                );
+            }
+        }
+        // neither is a typed envelope of a refused type
+        for hex in ["0x00c0", "0xc0"] {
+            let verdict = screen_err(&send_raw(&format!("[\"{hex}\"]")));
+            assert!(
+                matches!(verdict, Some(GatewayError::InvalidTransaction)),
+                "{hex} must be refused as undecodable: {verdict:?}"
+            );
         }
     }
 
@@ -3093,10 +3146,14 @@ mod tests {
             screen_err(&as_array(&eip7702_raw_hex())),
             Some(GatewayError::UnsupportedTransactionType(4))
         ));
-        for params in ["[[222,173,190,239]]", "[[]]", "[[123]]"] {
+        for params in ["[[222,173,190,239]]", "[[]]"] {
             let err = screen_err(&send_raw(params));
             assert!(matches!(err, Some(GatewayError::InvalidTransaction)), "{params}");
         }
+        // a lone byte in 0x01..=0x7f is the type byte of a refused typed
+        // envelope
+        let err = screen_err(&send_raw("[[123]]"));
+        assert!(matches!(err, Some(GatewayError::UnsupportedTransactionType(123))), "{err:?}");
         for params in ["[[1,256]]", "[[-1]]", "[[1.0]]", r#"[[1,"2"]]"#, "[[[1]]]", "[[null]]"] {
             assert!(screen_err(&send_raw(params)).is_none(), "{params}");
         }
