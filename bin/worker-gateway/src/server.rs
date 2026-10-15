@@ -1473,12 +1473,14 @@ async fn proxy_header(
 /// Build the probe-only router served on `--probe-addr`: the health, readiness
 /// and read-availability routes and nothing else (any other path is a `404`,
 /// another method on a probe path a `405`), with no rate limit, body limit or
-/// request deadline, since the handlers answer from memory.
+/// request deadline, since the handlers answer from memory. Every response
+/// carries `X-Content-Type-Options: nosniff`, as on the client listener.
 fn probe_router(state: AppState) -> Router {
     Router::new()
         .route(HEALTH_PATH, get(liveness))
         .route(READY_PATH, get(readiness))
         .route(READY_ANY_PATH, get(ready_any))
+        .layer(map_response(set_nosniff))
         .with_state(state)
 }
 
@@ -5798,6 +5800,25 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "{path}");
         }
         drop(held);
+    }
+
+    /// The probe listener marks its responses `nosniff` like the client
+    /// listener, a probe's answer and a `404` alike.
+    #[tokio::test]
+    async fn probe_listener_responses_carry_nosniff() {
+        let state = test_state(&[upstream("127.0.0.1:1".parse().expect("addr"))]);
+        let (probe_addr, _probes) = spawn_probes(state).await;
+
+        for path in [READY_PATH, "/not-a-probe"] {
+            let response =
+                Client::new().get(format!("http://{probe_addr}{path}")).send().await.expect("send");
+            assert_eq!(
+                response.headers().get(header::X_CONTENT_TYPE_OPTIONS),
+                Some(&HeaderValue::from_static("nosniff")),
+                "{path} answered {}",
+                response.status()
+            );
+        }
     }
 
     #[tokio::test]
