@@ -341,7 +341,7 @@ At startup, before these checks, the node logs one INFO line with the build feat
 node build: faucet=false adiri=false chain_id=487 genesis_hash=0x...
 ```
 
-`faucet` is true for any binary that carries the faucet mint, including `adiri` builds. `telcoin-network --version` lists the same features on its `Build Features:` line, so a faucet build lists `faucet` there and an adiri build lists both `adiri` and `faucet`.
+`faucet` is true for any binary that carries the faucet mint, however the feature was enabled, including `adiri` builds. `telcoin-network --version` lists the cli crate's own features on its `Build Features:` line, so it agrees with the startup line for the supported builds: a `faucet` build lists `faucet`, and an `adiri` build lists both `adiri` and `faucet`. A build that enables `tn-node/faucet` or `tn-reth/faucet` directly logs `faucet=true` at startup but does not list `faucet` in `--version`, so use the startup line to check for the faucet mint.
 
 ### global flags
 
