@@ -1,7 +1,7 @@
 //! Implement the libp2p network behavior to manage peers in the swarm.
 
 use super::{manager::PeerManager, types::DialRequest, PeerEvent};
-use crate::peers::types::ConnectionType;
+use crate::{diagnostics::bounded_error, peers::types::ConnectionType};
 use libp2p::{
     core::{transport::PortUse, ConnectedPoint, Endpoint},
     swarm::{
@@ -14,7 +14,7 @@ use libp2p::{
     Multiaddr, PeerId,
 };
 use std::task::{Context, Poll};
-use tracing::{debug, error, info, trace};
+use tracing::{debug, info, trace};
 
 /// A policy denial owned by the peer manager, preserved through libp2p's error wrapper.
 #[derive(Debug, Clone, Copy)]
@@ -156,7 +156,7 @@ impl NetworkBehaviour for PeerManager {
             return Err(ConnectionDenied::new("self-connection: remote peer id is our own"));
         }
         if self.peer_banned(&peer) {
-            error!(target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
+            bounded_error!(PeerAdmission, target: "peer-manager", ?peer, ?addr, "established outbound connection with banned peer - disconnecting...");
             return Err(ConnectionDenied::new("peer is banned"));
         }
 

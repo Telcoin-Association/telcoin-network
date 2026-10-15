@@ -32,6 +32,8 @@ pub(crate) fn network_label(network_type: &NetworkType) -> String {
 #[derive(Metrics, Clone)]
 #[metrics(scope = "tn_network")]
 struct SwarmMetricHandles {
+    /// Recoverable listener errors, including events whose diagnostic was suppressed.
+    listener_errors_total: Counter,
     /// Current established connections across both directions and all peer classes.
     established_connections: Gauge,
     /// Configured established-connection ceiling; zero denotes the legacy unbounded total.
@@ -694,6 +696,11 @@ impl SwarmMetrics {
             labeled: LabeledHandles::new(&network),
             network,
         }
+    }
+
+    /// Count every recoverable listener error independently of diagnostic suppression.
+    pub(crate) fn record_listener_error(&self) {
+        self.handles.listener_errors_total.increment(1);
     }
 
     /// Record a successfully published gossip message.
