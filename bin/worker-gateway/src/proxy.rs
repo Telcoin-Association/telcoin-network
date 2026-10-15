@@ -1558,15 +1558,42 @@ impl QueryHeader {
     /// Parse one `Name: value` line, trimming whitespace around the line, the
     /// name and the value.
     ///
-    /// Errors name the problem but never echo any part of the line, which can
-    /// hold a credential even when it is malformed.
+    /// A framing or hop-by-hop name, or one the gateway sets on the query hop
+    /// itself, is refused: reqwest appends the header rather than replacing
+    /// one already set, so it would go out twice or mis-frame the body.
+    ///
+    /// Errors name the problem but never echo the value or a malformed line,
+    /// either of which can hold a credential; a refused name is named, in its
+    /// lowercase form, since it is one of a fixed list.
     pub(crate) fn parse(line: &str) -> eyre::Result<Self> {
+        const RESERVED: [HeaderName; 14] = [
+            header::CONTENT_LENGTH,
+            header::TRANSFER_ENCODING,
+            header::HOST,
+            header::CONNECTION,
+            header::TE,
+            header::TRAILER,
+            header::UPGRADE,
+            header::CONTENT_TYPE,
+            X_FORWARDED_FOR,
+            X_FORWARDED_PROTO,
+            HOP_HEADER,
+            REDIRECT_HEADER,
+            HeaderName::from_static("keep-alive"),
+            HeaderName::from_static("proxy-connection"),
+        ];
         let (name, value) = line
             .trim()
             .split_once(':')
             .ok_or_else(|| eyre::eyre!("expected one `Name: value` line, found no `:`"))?;
         let name = HeaderName::from_bytes(name.trim().as_bytes())
             .map_err(|_| eyre::eyre!("the header name is not a valid HTTP header name"))?;
+        eyre::ensure!(
+            !RESERVED.contains(&name),
+            "the header name `{}` is one the gateway sets itself or a hop-by-hop header; use \
+             another name",
+            name.as_str()
+        );
         let value = value.trim();
         eyre::ensure!(!value.is_empty(), "the header value is empty");
         let mut value = HeaderValue::from_str(value).map_err(|_| {
@@ -4478,6 +4505,44 @@ mod tests {
             let (response, record) = looped_request(marker.clone(), &body).await;
             assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "{marker}");
             assert_eq!(record.class(), Some(("submission", bytes_in)), "{marker}");
+        }
+    }
+
+    /// A query header may not use a framing or hop-by-hop name, or one the
+    /// gateway sets on the query hop itself, in any letter case; the error
+    /// names the header in lowercase but never its value.
+    #[test]
+    fn reserved_query_header_names_are_refused() {
+        for name in [
+            "Content-Length",
+            "TRANSFER-ENCODING",
+            "Host",
+            "connection",
+            "Te",
+            "Trailer",
+            "UpGrade",
+            "Content-type",
+            "X-Forwarded-For",
+            "x-FORWARDED-proto",
+            "X-TN-Gateway",
+            "X-Tn-Gateway-Redirect",
+            "Keep-Alive",
+            "Proxy-Connection",
+        ] {
+            let err = QueryHeader::parse(&format!(" {name}: s3cr3t ")).expect_err(name).to_string();
+            assert!(err.contains(&format!("`{}`", name.to_ascii_lowercase())), "{name}: {err}");
+            assert!(!err.contains("s3cr3t"), "{name}: {err}");
+        }
+    }
+
+    /// The names a public RPC takes a key in still parse.
+    #[test]
+    fn ordinary_query_header_names_parse() {
+        for name in ["X-Api-Key", "Authorization"] {
+            let header = QueryHeader::parse(&format!("{name}: s3cr3t")).expect(name);
+            let (parsed, value) = header.parts();
+            assert_eq!(parsed.as_str(), name.to_ascii_lowercase());
+            assert_eq!(value, "s3cr3t");
         }
     }
 

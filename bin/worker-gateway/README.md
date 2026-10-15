@@ -693,6 +693,7 @@ Issue a key limited to what this endpoint should serve publicly (no archive, `de
 For a secret, use `--redirect-queries-header-file <path>` instead: the file holds the same line (a mounted secret, for example), which keeps the value out of the process arguments and environment, and whitespace around the line, a trailing newline included, is trimmed.
 Either flag requires `--redirect-queries`, and setting both is a startup error.
 A line that is not one valid `Name: value` header also stops startup, with an error that names the problem but never the value.
+So does a name the gateway sets on the query hop itself or a hop-by-hop name, in any letter case: `Content-Length`, `Transfer-Encoding`, `Host`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Content-Type`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-TN-Gateway` and `X-TN-Gateway-Redirect` are refused, since the header is added next to the gateway's own and would send them twice or mis-frame the body.
 On a command line, quote the whole line: unquoted, the shell splits it at the space after the colon, and the argument parser rejects the value as a stray argument and prints it in that error, before the gateway's own checks run.
 
 The value is never logged: the startup line records only whether a header is configured, debug output of the gateway's settings and state prints `<redacted>` in its place, and `--help` hides the environment variable's value.

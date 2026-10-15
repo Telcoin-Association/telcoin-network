@@ -117,7 +117,9 @@ pub(crate) struct Cli {
     /// public RPC's API key, so it can meter this gateway by key rather than by
     /// the one address all redirected reads share. Every client's redirected
     /// call carries it, so use a key scoped to public reads, and quote the
-    /// whole line on a command line. Requires `--redirect-queries`; set this or
+    /// whole line on a command line. Names the gateway sets itself, such as
+    /// `Content-Type`, `Host` or `X-Forwarded-For`, and hop-by-hop names are
+    /// refused at startup. Requires `--redirect-queries`; set this or
     /// `--redirect-queries-header-file`, not both. The value is never logged.
     /// Prefer `--redirect-queries-header-file`, which keeps the secret out of
     /// the process arguments, the environment and any argument error.
