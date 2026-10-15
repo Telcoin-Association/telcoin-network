@@ -20,9 +20,9 @@ have no application labels; Prometheus supplies target labels such as `job` and 
 | `tn_primary_last_commit_timestamp_seconds` | Local Unix time of the last successful subdag handoff to the consensus output channel in this observer's lifetime; 0 until the first handoff. |
 
 A certificate is observed only after the local Bullshark driver accepts it, after the epoch check.
-Genesis and rounds at or below the recovered committed round are excluded. Within a round, each
-current committee author contributes its `Authority::voting_power()` once, even if duplicate blocks
-or equivocations are submitted. The sum is compared with `Committee::quorum_threshold()`, rather
+Genesis and rounds at or below the highest recovered DAG or committed round are excluded. Within
+a round, each current committee author contributes its `Authority::voting_power()` once, even if
+duplicate blocks or equivocations are submitted. The sum is compared with `Committee::quorum_threshold()`, rather
 than with a guessed number of certificates or a count of certificate signers. With equal voting
 power this is `floor(2n / 3) + 1` distinct-author blocks, or `2f + 1` when `n = 3f + 1`.
 The current authority API gives every member one vote. If weighted voting is introduced, the
@@ -54,8 +54,10 @@ rounds, or epochs become metric labels.
 - **Startup:** Before an active consensus driver starts, observation is inactive and timestamps
   are zero. Once active, the start timestamp is set and the commit timestamp remains zero until
   a successful output handoff. Give the first commit an explicit startup grace period.
-- **Recovery and catch-up:** Already committed history recovered from storage does not establish
-  fresh progress or populate observations. Accepted rounds above that recovery baseline are
+- **Recovery and catch-up:** The observer starts beyond the highest round in the restored DAG
+  or committed cursor. This also excludes restored uncommitted rounds: counting only their
+  post-restart arrivals would miss authors already in the DAG and create false shortfalls.
+  Recovered history does not populate observations. Accepted rounds above that baseline are
   measured locally, including replay during active catch-up; their timing does not prove that
   the rest of the network is live. Inactive validators and followers do not run this observer.
 - **Epoch changes:** Shutdown, task error, or cancellation sets observation inactive and drops the
@@ -142,7 +144,11 @@ at one. Shutdown must clear the active gauge.
 
 The `quorum_` unit tests also pin the exact deadline, quorum threshold, duplicate identities,
 weighted accumulation, round jumps, recovered-history exclusion, old-epoch rejection, rollover,
-and absence of metric labels. Run the regression set with the repository's pinned toolchain:
+and absence of metric labels. The staging workflow confirms every new regression rejects a
+targeted mutation, restores the original source, and reruns the healthy regression set. It
+distinguishes test failures from compilation or test-selection errors.
+
+Run the regression set with the repository's pinned toolchain:
 
 ```sh
 testledger -- cargo +1.94 test --locked -p tn-primary --lib quorum_

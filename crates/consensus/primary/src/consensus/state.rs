@@ -524,10 +524,11 @@ impl<DB: Database> Consensus<DB> {
         mut rx_new_certificates: impl TnReceiver<Certificate>,
     ) -> Result<(), ConsensusError> {
         self.active = self.consensus_bus.is_active_cvv();
-        let mut observer = RoundQuorumObserver::new(
+        let mut observer = RoundQuorumObserver::from_recovered_dag(
             self.committee.clone(),
             self.consensus_bus.app().metrics().clone(),
             self.state.last_round.committed_round,
+            &self.state.dag,
         );
         let mut observation_tick = tokio::time::interval(Duration::from_secs(1));
         observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

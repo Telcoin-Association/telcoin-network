@@ -59,3 +59,51 @@ jobs:
           save-if: "false"
       - name: Run quorum regression tests with workspace feature unification
         run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(tn-primary) & test(quorum_)'
+      - name: Confirm each new regression test rejects an in-diff mutation
+        run: |
+          python3 -I -B - <<'PY'
+          from pathlib import Path
+          import subprocess
+
+          root = Path("crates/consensus/primary/src/consensus")
+          mutations = [
+              ("liveness.rs", "if self.authors.insert(author.clone()) {", "if true {", [
+                  "quorum_timeout_deduplicates_authors_polls_and_late_arrivals",
+                  "quorum_voting_power_is_unique_author_weight",
+                  "quorum_round_state_is_bounded_and_recovery_skips_history",
+              ]),
+              ("liveness.rs", "< self.committee.quorum_threshold()", "<= self.committee.quorum_threshold()", [
+                  "quorum_threshold_and_higher_round_boundary",
+                  "quorum_epoch_rollover_and_commit_signal_lifecycle",
+              ]),
+              ("liveness.rs", ">= QUORUM_OBSERVATION_WINDOW", "> QUORUM_OBSERVATION_WINDOW", [
+                  "quorum_deadline_is_fixed_at_first_arrival",
+              ]),
+              ("liveness.rs", ".max(committed_round)", ".min(committed_round)", [
+                  "quorum_recovered_uncommitted_authors_are_not_sampled_again",
+              ]),
+              ("state.rs", "observer.record_commit();", "/* mutation: omit commit progress */", [
+                  "quorum_loss_and_recovery_through_consensus_driver",
+              ]),
+          ]
+          for filename, before, after, tests in mutations:
+              path = root / filename
+              original = path.read_text()
+              if original.count(before) != 1:
+                  raise RuntimeError(f"mutation anchor must occur once: {filename}: {before}")
+              try:
+                  path.write_text(original.replace(before, after, 1))
+                  for test in tests:
+                      print(f"Confirming mutation is rejected by {test}", flush=True)
+                      result = subprocess.run([
+                          "cargo", "nextest", "run", "--locked", "--workspace",
+                          "--no-tests=fail", "-E", f"package(tn-primary) & test({test})",
+                      ], check=False)
+                      # Nextest distinguishes assertion failures (100) from build errors (101).
+                      if result.returncode != 100:
+                          raise RuntimeError(f"{test}: expected test failure 100, got {result.returncode}")
+              finally:
+                  path.write_text(original)
+          PY
+      - name: Verify restored implementation passes
+        run: cargo nextest run --locked --workspace --no-fail-fast -E 'package(tn-primary) & test(quorum_)'

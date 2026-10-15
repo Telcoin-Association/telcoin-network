@@ -5,6 +5,39 @@ use metrics_util::debugging::{DebugValue, DebuggingRecorder};
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 
+/// Restored uncommitted rounds retain authors that post-restart arrivals cannot reconstruct.
+#[test]
+fn quorum_recovered_uncommitted_authors_are_not_sampled_again() {
+    use tn_types::{Certificate, Hash as _};
+    let recorder = DebuggingRecorder::new();
+    let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
+    let authors: Vec<_> = committee.authorities().iter().map(|authority| authority.id()).collect();
+    let genesis = Certificate::genesis(&committee).iter().map(|cert| cert.digest()).collect();
+    let (certificates, _) =
+        crate::test_utils::make_optimal_certificates(&committee, 1..=2, &genesis, &authors);
+    let dag = certificates.into_iter().fold(Dag::new(), |mut dag, cert| {
+        dag.entry(cert.round()).or_default().insert(cert.origin().clone(), (cert.digest(), cert));
+        dag
+    });
+    let mut observer = RoundQuorumObserver::from_recovered_dag(
+        committee.clone(),
+        test_metrics(&recorder),
+        0,
+        &dag,
+    );
+    let now = Instant::now();
+    authors.iter().take(1).for_each(|author| {
+        observer.observe(committee.epoch(), 2, author, now);
+    });
+    assert!(observer.pending.is_none());
+    authors.iter().take(3).for_each(|author| {
+        observer.observe(committee.epoch(), 3, author, now);
+    });
+    observer.evaluate_expired(now + QUORUM_OBSERVATION_WINDOW);
+    assert_counter(&recorder, "tn_primary.rounds_evaluated_total", 1);
+    assert_counter(&recorder, "tn_primary.round_quorum_shortfalls_total", 0);
+}
+
 /// Read a recorded metric without relying on process-global recorder installation.
 fn metric(recorder: &DebuggingRecorder, name: &str) -> Option<DebugValue> {
     recorder

@@ -4,7 +4,7 @@
 //! after its first certificate, whichever is serviced first. Late arrivals cannot revise the
 //! result. Missing round numbers are not synthesized as failures.
 
-use crate::metrics::PrimaryMetrics;
+use crate::{consensus::Dag, metrics::PrimaryMetrics};
 use std::{
     collections::BTreeSet,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -42,8 +42,8 @@ impl RoundObservation {
 
 /// Owns one pending round and a monotonic watermark for one active consensus task and epoch.
 ///
-/// Counters live for the process lifetime. The watermark starts at the recovered committed
-/// round so replay of already committed history is not fresh liveness evidence.
+/// Counters live for the process lifetime. The watermark starts at the highest recovered DAG
+/// or committed round so partially replayed history cannot appear to have missing authors.
 pub(super) struct RoundQuorumObserver {
     /// Committee supplying membership, epoch and the actual quorum rule.
     committee: Committee,
@@ -56,6 +56,18 @@ pub(super) struct RoundQuorumObserver {
 }
 
 impl RoundQuorumObserver {
+    /// Exclude all restored rounds, including uncommitted rounds with pre-existing authors.
+    pub(super) fn from_recovered_dag(
+        committee: Committee,
+        metrics: PrimaryMetrics,
+        committed_round: Round,
+        dag: &Dag,
+    ) -> Self {
+        let recovered_round =
+            dag.last_key_value().map(|(round, _)| *round).unwrap_or_default().max(committed_round);
+        Self::new(committee, metrics, recovered_round)
+    }
+
     /// Start an active observer after recovery, resetting epoch-local gauges and cursors.
     pub(super) fn new(
         committee: Committee,
