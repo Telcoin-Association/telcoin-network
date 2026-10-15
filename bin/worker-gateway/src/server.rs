@@ -73,9 +73,28 @@ use crate::{
     telemetry::{self, Throttle},
 };
 
-/// Pause before re-polling `accept()` after it fails, so a persistent accept
-/// error (e.g. fd exhaustion) cannot spin the loop hot.
+/// Pause before re-polling `accept()` after it fails with an error that is
+/// not about the one connection being accepted (see [`is_connection_error`]),
+/// so a persistent accept error (e.g. fd exhaustion) cannot spin the loop hot.
 const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(100);
+
+/// Linux `ENONET`: the peer's machine is not on the network. With the four
+/// below, one of the errors `accept(2)` documents as already pending on the
+/// new socket, so it is about that connection alone; `std::io::ErrorKind` has
+/// no kind for these and `libc` is not a dependency, hence the raw values.
+const ENONET: i32 = 64;
+
+/// Linux `EPROTO`: protocol error on the connection being accepted.
+const EPROTO: i32 = 71;
+
+/// Linux `ENOPROTOOPT`: protocol option not available on the new socket.
+const ENOPROTOOPT: i32 = 92;
+
+/// Linux `EOPNOTSUPP`: operation not supported on the new socket.
+const EOPNOTSUPP: i32 = 95;
+
+/// Linux `EHOSTDOWN`: the peer's host is down.
+const EHOSTDOWN: i32 = 112;
 
 /// Liveness probe path. Exempt from rate limiting (see [`crate::ratelimit`]).
 pub(crate) const HEALTH_PATH: &str = "/health";
@@ -123,6 +142,16 @@ const REFUSED_PROXY_HEADER: &str = "proxy_header";
 /// misconfigured front has every connection closed this way, so the warning
 /// shows at the default log level, once per window.
 pub(crate) static PROXY_HEADER_WARNINGS: Throttle = Throttle::new("proxy_header");
+
+/// Throttle for the warning on a failed `accept()` on the client listener. A
+/// persistent failure such as fd exhaustion repeats every
+/// [`ACCEPT_RETRY_DELAY`], so the warning shows once per window, carrying the
+/// count it skipped.
+pub(crate) static ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("accept");
+
+/// Throttle for the warning on a failed `accept()` on the `--probe-addr`
+/// listener, kept apart from the client listener's so each shows.
+pub(crate) static PROBE_ACCEPT_ERROR_WARNINGS: Throttle = Throttle::new("probe_accept");
 
 /// How long a browser may cache the gateway's answer to a CORS preflight
 /// (`Access-Control-Max-Age`).
@@ -1060,11 +1089,21 @@ async fn accept_loop(
             () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((mut stream, peer_addr)) = accepted.inspect_err(|err| {
-            warn!(target: "gateway::server", %err, "failed to accept connection");
-        }) else {
-            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            continue;
+        let (mut stream, peer_addr) = match accepted {
+            Ok(accepted) => accepted,
+            // the next connection is unaffected, so accept it at once; the
+            // permit is released and taken again
+            Err(err) if is_connection_error(&err) => {
+                debug!(target: "gateway::server", %err, "accept: connection error, retrying");
+                continue;
+            }
+            Err(err) => {
+                if let Some(suppressed) = ACCEPT_ERROR_WARNINGS.admit() {
+                    warn!(target: "gateway::server", %err, suppressed, "failed to accept connection");
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
         };
 
         // Nagle + delayed-ACK can add ~40ms to small JSON-RPC responses; the
@@ -1393,11 +1432,24 @@ async fn probe_accept_loop(
             () = &mut stop_accepting => break,
             accepted = listener.accept() => accepted,
         };
-        let Ok((stream, _)) = accepted.inspect_err(|err| {
-            warn!(target: "gateway::server", %err, "failed to accept probe connection");
-        }) else {
-            tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
-            continue;
+        let stream = match accepted {
+            Ok((stream, _)) => stream,
+            Err(err) if is_connection_error(&err) => {
+                debug!(target: "gateway::server", %err, "probe accept: connection error, retrying");
+                continue;
+            }
+            Err(err) => {
+                if let Some(suppressed) = PROBE_ACCEPT_ERROR_WARNINGS.admit() {
+                    warn!(
+                        target: "gateway::server",
+                        %err,
+                        suppressed,
+                        "failed to accept probe connection"
+                    );
+                }
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
         };
         let connection = graceful.watch(
             connection_builder
@@ -1418,6 +1470,29 @@ async fn probe_accept_loop(
         debug!(target: "gateway::server", "probe connections still open at shutdown");
     }
     Ok(())
+}
+
+/// Whether an `accept()` error is about the one connection being accepted
+/// (its peer refused, aborted or reset it, or the network to the peer failed)
+/// rather than about the listener or the process (fd exhaustion, out of
+/// memory). Such an error says nothing about the next connection, so the
+/// accept loops retry at once instead of backing off. The raw `errno` values
+/// are Linux's and are only consulted there.
+fn is_connection_error(err: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::ConnectionReset
+            | ErrorKind::NetworkDown
+            | ErrorKind::NetworkUnreachable
+            | ErrorKind::HostUnreachable
+    ) || (cfg!(any(target_os = "android", target_os = "linux"))
+        && matches!(
+            err.raw_os_error(),
+            Some(ENONET | EPROTO | ENOPROTOOPT | EOPNOTSUPP | EHOSTDOWN)
+        ))
 }
 
 /// Arm `TCP_USER_TIMEOUT` on an accepted connection: the kernel forcibly
@@ -8364,6 +8439,24 @@ mod tests {
             }
         }
         assert_eq!(worker_seen.hits(), 0, "a probe-path request must never reach the upstream");
+    }
+
+    /// An accept error about the one connection (its peer aborted it, or a
+    /// network error already pending on it) is retried at once; one about the
+    /// process (fd exhaustion, out of memory) takes the back-off.
+    #[test]
+    fn accept_connection_errors_are_retried_at_once() {
+        use std::io::{Error, ErrorKind};
+        assert!(is_connection_error(&Error::from(ErrorKind::ConnectionAborted)));
+        assert!(is_connection_error(&Error::from(ErrorKind::ConnectionReset)));
+        // `EPROTO`, a pending network error `accept(2)` returns on Linux
+        assert_eq!(
+            is_connection_error(&Error::from_raw_os_error(71)),
+            cfg!(any(target_os = "android", target_os = "linux"))
+        );
+        // `EMFILE`
+        assert!(!is_connection_error(&Error::from_raw_os_error(24)));
+        assert!(!is_connection_error(&Error::from(ErrorKind::OutOfMemory)));
     }
 
     /// A query upstream that answers every POST with an HTML page labelled

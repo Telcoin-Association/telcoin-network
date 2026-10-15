@@ -869,8 +869,8 @@ Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
 ready upstream, an oversized body, a worker's answer to a submission that
 could not be read whole, and, per route, a forwarding failure or an
-upstream error or redirect answer), and the per-connection warning on a missing,
-malformed or late PROXY header, are throttled per call site, so neither clients nor a
+upstream error or redirect answer), the per-connection warning on a missing,
+malformed or late PROXY header, and an accept error on either listener, are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
