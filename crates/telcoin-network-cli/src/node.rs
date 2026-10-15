@@ -246,8 +246,15 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
                 }
             },
         )?;
+        let chain_id = tn_config.genesis().config.chain_id;
+        // built once here and handed to reth below; the genesis hash comes from the same spec the
+        // node boots with
+        let chain_spec = Arc::new(tn_config.chain_spec());
+        // one fixed-format line naming the compiled features and the loaded chain, so operators
+        // and deployment checks can confirm both from the log before any guard below refuses
+        info!(target: "cli", "{}", node_build_line(chain_id, chain_spec.genesis_hash()));
         #[cfg(not(feature = "adiri"))]
-        if tn_config.genesis().config.chain_id == ADIRI_CHAIN_ID {
+        if chain_id == ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
@@ -255,7 +262,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             ));
         }
         #[cfg(feature = "adiri")]
-        if tn_config.genesis().config.chain_id != ADIRI_CHAIN_ID {
+        if chain_id != ADIRI_CHAIN_ID {
             // If we are trying to start an Adiri node without the adiri feature flag then error
             // out.
             return Err(eyre::eyre!(
@@ -292,7 +299,7 @@ impl<Ext: clap::Args + fmt::Debug> NodeCommand<Ext> {
             instance,
             &tn_datadir,
             with_unused_ports,
-            Arc::new(tn_config.chain_spec()),
+            chain_spec,
         );
 
         // Refuse a second node on this datadir before opening the execution database a live node
@@ -357,6 +364,19 @@ pub(crate) fn validate_faucet_build(
         ));
     }
     Ok(())
+}
+
+/// The startup line naming the compiled build features and the loaded chain:
+/// `node build: faucet=<bool> adiri=<bool> chain_id=<n> genesis_hash=<0x..>`.
+///
+/// `faucet` is the runtime `FAUCET_ENABLED` value, so it reports the faucet mint however the
+/// feature reached tn-reth; `adiri` is this crate's `adiri` feature.
+fn node_build_line(chain_id: u64, genesis_hash: B256) -> String {
+    format!(
+        "node build: faucet={FAUCET_ENABLED} adiri={} chain_id={chain_id} \
+         genesis_hash={genesis_hash}",
+        cfg!(feature = "adiri")
+    )
 }
 
 /// The genesis block hash of `genesis`: the hash of the sealed genesis header, covering
@@ -589,6 +609,26 @@ mod tests {
                 FAUCET_ENABLED
             );
         }
+        Ok(())
+    }
+
+    /// The startup line has the fixed format deployment checks read, and its genesis hash is the
+    /// genesis block hash the faucet guard compares.
+    #[test]
+    fn node_build_line_reports_features_chain_and_genesis_hash() -> eyre::Result<()> {
+        let mainnet: Genesis = serde_yaml::from_str(MAINNET_GENESIS)?;
+        let hash = Arc::new(RethChainSpec::from(mainnet.clone())).genesis_hash();
+        assert_eq!(hash, genesis_block_hash(mainnet));
+        let line = node_build_line(MAINNET_CHAIN_ID, hash);
+        assert_eq!(
+            line,
+            format!(
+                "node build: faucet={FAUCET_ENABLED} adiri={} chain_id=487 genesis_hash={hash:#x}",
+                cfg!(feature = "adiri")
+            )
+        );
+        let hex = line.rsplit("genesis_hash=0x").next().unwrap_or_default();
+        assert!(hex.len() == 64 && hex.chars().all(|c| c.is_ascii_hexdigit()), "{line}");
         Ok(())
     }
 
