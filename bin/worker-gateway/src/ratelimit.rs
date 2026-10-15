@@ -83,8 +83,11 @@ use crate::{
     server::{HEALTH_PATH, READY_PATH},
 };
 
-/// How often the background sweep reclaims idle per-IP buckets.
-pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the background sweep reclaims idle per-IP buckets: every second,
+/// so a client whose bucket has refilled frees its slot within a second. A
+/// sweep walks the whole table under the map lock (about 1 ms over 100,000
+/// entries).
+pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Least time between two sweeps of a full per-IP table made inline for a
 /// first-seen client (see [`PerIpLimiter::make_room`]). A sweep walks the whole
@@ -942,8 +945,8 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// Periodically reclaim idle per-IP buckets until `shutdown` fires. Runs as a
 /// managed task alongside the server; a missed interval is skipped rather than
 /// firing catch-up sweeps back to back.
-pub(crate) async fn run_gc(
-    limiters: Arc<RateLimiters>,
+pub(crate) async fn run_gc<C: Clock>(
+    limiters: Arc<RateLimiters<C>>,
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
     let mut ticker = tokio::time::interval(GC_INTERVAL);
@@ -1073,6 +1076,32 @@ mod tests {
         fn global_last_refill(&self) -> Option<Instant> {
             self.global.as_ref().map(|global| lock(&global.bucket).last_refill)
         }
+    }
+
+    /// The background task sweeps once per [`GC_INTERVAL`]: an entry idle by
+    /// the limiter's clock survives until the interval has passed, then goes.
+    #[tokio::test(start_paused = true)]
+    async fn run_gc_sweeps_once_per_interval() {
+        let clock = ManualClock::new();
+        let limiters = Arc::new(limiters(clock.clone(), Some(limit(10, 2)), None, 16));
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        clock.advance(Duration::from_secs(1));
+        let shutdown = tn_types::Notifier::new();
+        let task = tokio::spawn(run_gc(Arc::clone(&limiters), shutdown.subscribe()));
+        // the task starts its ticker and takes the immediate first tick
+        tokio::task::yield_now().await;
+        tokio::time::advance(GC_INTERVAL - Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(limiters.per_ip_len(), 1, "swept before the interval had passed");
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(limiters.per_ip_len(), 0, "the idle entry survived the sweep");
+        shutdown.notify();
+        assert!(matches!(task.await, Ok(Ok(()))), "the sweep task did not stop cleanly");
     }
 
     /// A [`ManualClock`] whose first reading once `armed` is set stalls: it

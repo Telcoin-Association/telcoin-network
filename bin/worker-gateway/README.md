@@ -372,7 +372,7 @@ Service, set `externalTrafficPolicy: Local` to keep their addresses).
 The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
 The probe listener (`--probe-addr`) has no rate limit at all.
 
-Per-IP state is bounded: idle buckets are swept every minute and the number of tracked client prefixes is capped by `--rate-limit-per-ip-max-entries` (default 100,000), so a wide spread of source IPs cannot grow memory without limit.
+Per-IP state is bounded: idle buckets are swept every second and the number of tracked client prefixes is capped by `--rate-limit-per-ip-max-entries` (default 100,000), so a wide spread of source IPs cannot grow memory without limit.
 A newly seen client that finds the table full first frees its idle entries (a bucket that has refilled carries no state), checked at most once a second, and gets a bucket of its own if that frees a slot; a busy entry is never evicted.
 Only while every tracked entry is busy does a new client go without a bucket of its own: every client the table cannot track then shares one overflow bucket with the per-client rate and burst, so together they get one client's budget however many prefixes they spread over.
 One IPv6 `/48` (65,536 `/64`s) still fits in the default table with a bucket per `/64`; the overflow bucket meters only the prefixes beyond the cap.
