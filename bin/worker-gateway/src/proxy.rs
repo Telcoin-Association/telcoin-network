@@ -1658,15 +1658,18 @@ struct Scan {
 /// force, empty with a redirect. A body is denied when any call in it, alone
 /// or anywhere in a batch, names a method that starts with one of the
 /// prefixes, matched case-sensitively from the first character as jsonrpsee
-/// matches names, after unicode escapes are decoded. A `method` that is not a
-/// string, and a batch element that is not an object, name nothing. With a
-/// list in force the pass reads every call: neither the single-call fast path
-/// nor the skip of a mixed batch's remaining elements is taken. A body that
-/// starts with `{` or `[` but that the pass cannot read (short of the length
-/// cap) is denied too: the worker's server decodes each batch element on its
-/// own and runs the calls around one it cannot decode, so an unreadable body
-/// is no proof that no denied call runs. A body that starts with anything
-/// else is refused unread by the worker's server, and is not denied.
+/// matches names, after unicode escapes are decoded. A batch element that is
+/// an array names the method jsonrpsee would run from it, its third member
+/// when that is a string (see [`Element::Positional`]); a `method` that is not
+/// a string, and a batch element that is neither an object nor an array, name
+/// nothing. With a list in force the pass reads every call: neither the
+/// single-call fast path nor the skip of a mixed batch's remaining elements is
+/// taken. A body that starts with `{` or `[` but that the pass cannot read
+/// (short of the length cap) is denied too: the worker's server decodes each
+/// batch element on its own and runs the calls around one it cannot decode, so
+/// an unreadable body is no proof that no denied call runs. A body that starts
+/// with anything else is refused unread by the worker's server, and is not
+/// denied.
 ///
 /// Cost: one deserializer reads the body, and every member the gateway does
 /// not act on is skipped in place, so the cost is a scan of the bytes rather
@@ -1763,8 +1766,8 @@ struct ScanState<'p> {
     /// The method policy's prefixes, empty when no policy is in force (a
     /// redirect, or an empty `--denied-method-prefixes`).
     denied_prefixes: &'p [String],
-    /// A call read so far names a method that starts with one of
-    /// `denied_prefixes`.
+    /// A call read so far, a positional batch element included, names a
+    /// method that starts with one of `denied_prefixes`.
     denied: bool,
     /// Calls read so far: 1 for a single call, the elements read for a batch.
     len: usize,
@@ -1793,16 +1796,23 @@ impl ScanState<'_> {
         } else {
             self.other = true;
         }
-        let prefixes = self.denied_prefixes;
-        self.denied |= call
-            .name
-            .as_deref()
-            .is_some_and(|name| prefixes.iter().any(|prefix| name.starts_with(prefix.as_str())));
+        self.denied |= self.denies(call.name.as_deref());
+    }
+
+    /// Whether the method policy denies a call named `name`: the name starts
+    /// with one of `denied_prefixes`, matched case-sensitively from the first
+    /// character. A call that names nothing is never denied.
+    fn denies(&self, name: Option<&str>) -> bool {
+        name.is_some_and(|name| {
+            self.denied_prefixes.iter().any(|prefix| name.starts_with(prefix.as_str()))
+        })
     }
 
     /// Record one batch element; one that is not an object counts as another
-    /// call. A submission is screened while the batch can still be all
-    /// submissions, up to the first one the screen refuses.
+    /// call, and an array is checked against the method policy by the name
+    /// jsonrpsee would read from it (see [`Element::Positional`]). A
+    /// submission is screened while the batch can still be all submissions,
+    /// up to the first one the screen refuses.
     fn record_element(&mut self, element: Element<'_>) {
         match element {
             Element::Call(call) => {
@@ -1810,6 +1820,10 @@ impl ScanState<'_> {
                 if !self.other && self.rejection.is_none() {
                     self.rejection = call.screen().err().map(|err| (err, Some(self.len)));
                 }
+            }
+            Element::Positional(name) => {
+                self.other = true;
+                self.denied |= self.denies(name.as_deref());
             }
             Element::Other => self.other = true,
         }
@@ -2078,18 +2092,42 @@ impl<'de> Deserialize<'de> for Member {
     }
 }
 
-/// A batch element: a call object, or anything else.
+/// A batch element: a call object, an array, or anything else.
 enum Element<'de> {
     /// A call object.
     Call(Call<'de>),
-    /// An element that is not an object; the upstream answers it as an
-    /// invalid request.
+    /// An array. jsonrpsee's derived `Request` reads one positionally,
+    /// `[jsonrpc, id, method, params]`, and runs it when it has exactly four
+    /// elements, so its `method` (when a string, escapes decoded) is kept
+    /// for the method policy. It still routes as another call and is not
+    /// screened.
+    Positional(Option<Cow<'de, str>>),
+    /// Any other element; the upstream answers it as an invalid request.
     Other,
 }
 
 impl<'de> Lenient<'de> for Element<'de> {
     fn other() -> Self {
         Self::Other
+    }
+
+    fn array<A: SeqAccess<'de>>(mut elements: A) -> Result<Self, A::Error> {
+        // the third member is the `method` jsonrpsee reads; a name read from
+        // a shape it refuses (another length, a bad `jsonrpc`) still denies
+        // the batch, although the worker would answer that element as an
+        // invalid request: the check errs toward refusing
+        let mut name = None;
+        for index in 0usize.. {
+            let more = if index == 2 {
+                elements.next_element::<MaybeStr<'de>>()?.map(|method| name = method.0).is_some()
+            } else {
+                elements.next_element::<IgnoredAny>()?.is_some()
+            };
+            if !more {
+                break;
+            }
+        }
+        Ok(Self::Positional(name))
     }
 
     fn object<A: MapAccess<'de>>(members: A) -> Result<Self, A::Error> {
@@ -3647,6 +3685,10 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"eth_sendRawTransaction","params":["\udc00"],"id":1}"#
                 .to_string(),
             r#"{"jsonrpc":"2.0","method":"eth_chainId","params":[[1e400]],"id":1}"#.to_string(),
+            // a positional element's method slot is read too, so a value the
+            // typed readers refuse there ends the scan
+            r#"["2.0",1,1e400,[]]"#.to_string(),
+            r#"["2.0",1,"\ud800",[]]"#.to_string(),
         ];
         for trigger in &triggers {
             for body in [
@@ -3835,7 +3877,15 @@ mod tests {
         let prefixes = default_denied();
         let denied = call("tn_getStuff");
         let deep = format!("{}{}", "[".repeat(512), "]".repeat(512));
-        for body in [
+        // jsonrpsee's derived `Request` reads a four-element array
+        // positionally, `[jsonrpc, id, method, params]`, and runs it
+        let positional = [
+            r#"[["2.0",1,"tn_info",[]]]"#.to_string(),
+            r#"[["2.0",1,"debug_traceBlockByNumber",["latest",{}]]]"#.to_string(),
+            r#"[["2.0",null,"tn_info",null]]"#.to_string(),
+            format!(r#"[{},["2.0",1,"tn_info",[]]]"#, call("eth_call")),
+        ];
+        let mut denied_bodies = vec![
             r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
             format!("[1,{denied}]"),
             format!(r#"["tn_x",null,true,1.5,{{"method":7}},{denied}]"#),
@@ -3853,11 +3903,13 @@ mod tests {
             format!("[{denied},1e999]"),
             format!(r#"[{{"method":-1e400}},{denied}]"#),
             format!("[{denied},{}]", "9".repeat(400)),
-        ] {
+        ];
+        denied_bodies.extend(positional.iter().cloned());
+        for body in &denied_bodies {
             assert!(calls_denied_method(body.as_bytes(), &prefixes), "{body}");
         }
         // nothing the worker could run as a denied call is refused
-        for body in [
+        let allowed_bodies = vec![
             "not json, tn_getStuff".to_string(),
             r#"{"method":["tn_x"],"id":1}"#.to_string(),
             r#""tn_x""#.to_string(),
@@ -3865,10 +3917,38 @@ mod tests {
             r#"{"jsonrpc":"2.0","method":"eth_call","params":["tn_x"],"id":1}"#.to_string(),
             format!("[{deep}]"),
             format!("[{},{}]", call("eth_call"), call("eth_blockNumber")),
-        ] {
+            r#"[["2.0",1,"eth_call",[]]]"#.to_string(),
+            // a denied-looking string outside the method slot names nothing
+            r#"[["tn_x",1,"eth_call",[]]]"#.to_string(),
+        ];
+        for body in &allowed_bodies {
             assert!(!calls_denied_method(body.as_bytes(), &prefixes), "{body}");
         }
         assert!(!calls_denied_method(denied.as_bytes(), &[]), "an empty list denies nothing");
+
+        // the policy's model of the worker agrees with jsonrpsee's own reader:
+        // every body the worker would run a denied call from is denied
+        let runs_a_denied_call = |body: &[u8]| {
+            let calls = match worker_reads(body) {
+                WorkerReads::Refused => Vec::new(),
+                WorkerReads::Single(call) => vec![call],
+                WorkerReads::Batch(calls) => calls,
+            };
+            calls
+                .iter()
+                .flatten()
+                .any(|method| prefixes.iter().any(|prefix| method.starts_with(prefix.as_str())))
+        };
+        for body in &positional {
+            assert!(runs_a_denied_call(body.as_bytes()), "jsonrpsee runs a denied call: {body}");
+        }
+        for body in denied_bodies.iter().chain(&allowed_bodies) {
+            assert!(
+                !runs_a_denied_call(body.as_bytes())
+                    || calls_denied_method(body.as_bytes(), &prefixes),
+                "{body}"
+            );
+        }
     }
 
     /// The method policy reads every call in the one pass that counts, routes
