@@ -782,19 +782,32 @@ mod tests {
         Ok(())
     }
 
+    /// The faucet opt-in's argument id, the one node argument read from a `TN_ALLOW_*` variable.
+    const FAUCET_OPT_IN: &str = "allow_faucet_on_chain_487";
+
+    /// Parse `args` as the node command with the faucet opt-in's environment binding removed, so
+    /// a `TN_ALLOW_FAUCET_ON_CHAIN_487` in the developer's shell cannot change the result.
+    fn parse_node_without_env(args: &[&str]) -> Result<NodeCommand<NoArgs>, clap::Error> {
+        use clap::{CommandFactory as _, FromArgMatches as _};
+
+        let command = NodeCommand::<NoArgs>::command()
+            .mut_arg(FAUCET_OPT_IN, |arg| arg.env(None::<&'static str>));
+        NodeCommand::from_arg_matches(&command.try_get_matches_from(args)?)
+    }
+
     /// `--allow-faucet-on-chain-487` defaults off, parses as a bare flag, reads its documented
     /// environment variable, and stays out of the short help.
     #[test]
     fn allow_faucet_flag_parses_and_is_devnet_only() -> eyre::Result<()> {
         use clap::CommandFactory as _;
 
-        assert!(!NodeCommand::<NoArgs>::try_parse_from(["node"])?.allow_faucet_on_chain_487);
-        let set = NodeCommand::<NoArgs>::try_parse_from(["node", "--allow-faucet-on-chain-487"])?;
+        assert!(!parse_node_without_env(&["node"])?.allow_faucet_on_chain_487);
+        let set = parse_node_without_env(&["node", "--allow-faucet-on-chain-487"])?;
         assert!(set.allow_faucet_on_chain_487);
         let mut command = NodeCommand::<NoArgs>::command();
         let arg = command
             .get_arguments()
-            .find(|arg| arg.get_id() == "allow_faucet_on_chain_487")
+            .find(|arg| arg.get_id() == FAUCET_OPT_IN)
             .ok_or_else(|| eyre::eyre!("flag registered"))?;
         assert_eq!(
             arg.get_env().and_then(|env| env.to_str()),
@@ -837,7 +850,6 @@ mod tests {
         // a variable no other test reads, bound onto the flag in place of the real one so the
         // test runs clap's env path without depending on the developer's shell
         const VAR: &str = "TN_TEST_FAUCET_OPT_IN_ENV_VALUE";
-        let flag = "allow_faucet_on_chain_487";
         let cases = [
             ("", Ok(false)),
             ("TRUE", Ok(true)),
@@ -847,14 +859,15 @@ mod tests {
         for (raw, expected) in cases {
             std::env::set_var(VAR, raw);
             let node = NodeCommand::<NoArgs>::command()
-                .mut_arg(flag, |arg| arg.env(VAR))
+                .mut_arg(FAUCET_OPT_IN, |arg| arg.env(VAR))
                 .try_get_matches_from(["node"]);
             let load_state =
                 crate::db::DbLoadStateArgs::augment_args(clap::Command::new("load-state"))
-                    .mut_arg(flag, |arg| arg.env(VAR))
+                    .mut_arg(FAUCET_OPT_IN, |arg| arg.env(VAR))
                     .try_get_matches_from(["load-state", "pack"]);
             for (command, matches) in [("node", node), ("db load-state", load_state)] {
-                let parsed = matches.map(|m| m.get_flag(flag)).map_err(|error| error.kind());
+                let parsed =
+                    matches.map(|m| m.get_flag(FAUCET_OPT_IN)).map_err(|error| error.kind());
                 assert_eq!(parsed, expected, "{command} with {VAR}={raw:?}");
             }
         }
@@ -905,8 +918,8 @@ mod tests {
     fn allow_cleartext_flag_parses_and_is_hidden_from_short_help() -> eyre::Result<()> {
         use clap::CommandFactory as _;
 
-        assert!(!NodeCommand::<NoArgs>::try_parse_from(["node"])?.allow_cleartext_bls_key);
-        let set = NodeCommand::<NoArgs>::try_parse_from(["node", "--allow-cleartext-bls-key"])?;
+        assert!(!parse_node_without_env(&["node"])?.allow_cleartext_bls_key);
+        let set = parse_node_without_env(&["node", "--allow-cleartext-bls-key"])?;
         assert!(set.allow_cleartext_bls_key);
         let mut command = NodeCommand::<NoArgs>::command();
         let arg = command
@@ -945,17 +958,24 @@ mod tests {
 
     /// Run `node --chain main-net` (chain id 487) with `--bls-passphrase-source no-passphrase`
     /// plus `extra` node arguments on `datadir`, through the same passphrase resolution and
-    /// launcher plumbing as the binary.
+    /// launcher plumbing as the binary. The faucet opt-in's environment binding is removed, so
+    /// the developer's shell cannot change the outcome.
     #[cfg(not(feature = "adiri"))]
     fn run_mainnet_node_with_cleartext_key(datadir: &str, extra: &[&str]) -> eyre::Result<()> {
         use crate::cli::Cli;
+        use clap::{CommandFactory as _, FromArgMatches as _};
 
         let args =
             ["tn", "node", "--bls-passphrase-source", "no-passphrase", "--chain", "main-net"]
                 .into_iter()
                 .chain(["--datadir", datadir])
                 .chain(extra.iter().copied());
-        let node = Cli::<NoArgs>::try_parse_args_from(args)?;
+        // seeded before the command is built, as `Cli::try_parse_args_from` does
+        tn_reth::init_reth_defaults();
+        let command = Cli::<NoArgs>::command().mut_subcommand("node", |node| {
+            node.mut_arg(FAUCET_OPT_IN, |arg| arg.env(None::<&'static str>))
+        });
+        let node = Cli::<NoArgs>::from_arg_matches(&command.try_get_matches_from(args)?)?;
         let passphrase = node.resolve_bls_passphrase(None)?;
         node.run(passphrase, |_, _, _, _, _| tokio::spawn(async { Ok(()) }))
     }
@@ -997,17 +1017,32 @@ mod tests {
         Ok(())
     }
 
-    /// With `--allow-cleartext-bls-key` the same node starts and reaches the launcher. Skipped
-    /// when the build carries the faucet mint, which refuses chain id 487 on its own.
+    /// With `--allow-cleartext-bls-key` the same node passes the cleartext key check. A default
+    /// build then starts and reaches the launcher. A build that carries the faucet mint is still
+    /// refused on chain id 487: by the chain id check without `--allow-faucet-on-chain-487`, and
+    /// by the mainnet genesis check with it; neither refusal changes the datadir.
     #[cfg(not(feature = "adiri"))]
     #[test]
-    fn node_starts_on_chain_487_with_cleartext_opt_in() -> eyre::Result<()> {
-        if FAUCET_ENABLED {
-            return Ok(());
-        }
+    fn node_on_chain_487_with_cleartext_opt_in() -> eyre::Result<()> {
         let dir = tempfile::tempdir()?;
         let datadir = dir.path().to_str().ok_or_else(|| eyre::eyre!("utf-8 temp path"))?;
         generate_cleartext_keys(datadir)?;
+        if FAUCET_ENABLED {
+            let before = datadir_listing(dir.path())?;
+            let err = run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])
+                .expect_err("a faucet build is refused on chain id 487");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("--allow-faucet-on-chain-487"), "{msg}");
+            let err = run_mainnet_node_with_cleartext_key(
+                datadir,
+                &["--allow-cleartext-bls-key", "--allow-faucet-on-chain-487"],
+            )
+            .expect_err("a faucet build is refused on the mainnet genesis");
+            let msg = format!("{err:#}");
+            assert!(msg.contains("Telcoin mainnet"), "{msg}");
+            assert_eq!(datadir_listing(dir.path())?, before);
+            return Ok(());
+        }
         run_mainnet_node_with_cleartext_key(datadir, &["--allow-cleartext-bls-key"])?;
         // past every startup guard: the bundled committee and the execution database were
         // written for the launcher
