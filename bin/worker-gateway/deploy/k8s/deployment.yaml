@@ -130,14 +130,18 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 64Mi
+              # Covers the bound computed under limits below, so the pod is
+              # scheduled for what clients can make it hold; below it, under
+              # node memory pressure the kubelet evicts the gateways first.
+              memory: 768Mi
             limits:
               cpu: "1"
               # Sized for the gateway's defaults: buffered request bodies are
               # bounded by --max-inflight-request-bytes (512 MiB), plus a read
               # buffer of up to --http1-max-buf-size per connection:
               # 512 MiB + 500 x 64 KiB + 64 MiB for the process is about
-              # 608 MiB. Recompute it if you change those flags (see
+              # 608 MiB. The request and the limit both follow this formula;
+              # recompute both if you change those flags (see
               # deploy/README.md, "Memory limit").
               memory: 1Gi
           securityContext:
