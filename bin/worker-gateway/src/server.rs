@@ -927,7 +927,10 @@ fn cors_layer(origins: CorsOrigins) -> CorsLayer {
 ///
 /// The line's fields are `client` (the resolved client's [`ClientAddr`]
 /// masked to its network prefix, as the rate limiter keys it, so behind a
-/// trusted front it names the forwarded client, never the front), `class`
+/// trusted front it names the forwarded client, or the front itself when the
+/// front forwarded no usable client: no, an empty or an unparsable
+/// `X-Forwarded-For`, a chain of only trusted addresses, or a PROXY `LOCAL`
+/// connection), `class`
 /// and `route` (from the [`AccessRecord`] the proxy keeps in the request's
 /// [`AccessSampled`] slot, or `unknown` and `rejected` for a request answered
 /// or dropped before the proxy read its body: a rate-limit `429`, a byte
@@ -10302,8 +10305,9 @@ mod tests {
     }
 
     /// Behind a trusted front the line names the client the front forwarded
-    /// for, masked to the rate limiter's prefix, as the limiter keys it; never
-    /// the front's own address.
+    /// for, masked to the rate limiter's prefix, as the limiter keys it, not
+    /// the front's own address (which it names only when the front forwarded
+    /// no usable client).
     #[tokio::test]
     async fn access_log_names_the_forwarded_client_behind_a_trusted_proxy() {
         let (lines, _capture) = AccessLines::capture();
