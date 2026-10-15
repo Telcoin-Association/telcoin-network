@@ -372,23 +372,15 @@ Service, set `externalTrafficPolicy: Local` to keep their addresses).
 The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
 The probe listener (`--probe-addr`) has no rate limit at all.
 
-Per-IP state is bounded: idle buckets are swept every minute and the number of
-tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
-limit. Once the table is full (`--rate-limit-per-ip-max-entries`, default 100,000), a newly seen client gets no
+Per-IP state is bounded: idle buckets are swept every minute and the number of tracked client prefixes is capped by `--rate-limit-per-ip-max-entries` (default 100,000), so a wide spread of source IPs cannot grow memory without limit.
+A newly seen client that finds the table full first frees its idle entries (a bucket that has refilled carries no state), checked at most once a second, and gets a bucket of its own if that frees a slot; a busy entry is never evicted.
+Only while every tracked entry is busy does a new client go without a bucket of its own: every client the table cannot track then shares one overflow bucket with the per-client rate and burst, so together they get one client's budget however many prefixes they spread over.
+One IPv6 `/48` (65,536 `/64`s) still fits in the default table with a bucket per `/64`; the overflow bucket meters only the prefixes beyond the cap.
+A client keeps its own bucket only while it is busy: a sweep drops every bucket that has refilled, and a client that returns while every entry is busy shares the overflow bucket too.
 
-bucket of its own: every client the table cannot track shares one overflow
-bucket with the per-client rate and burst, so together they get one client's
-budget however many prefixes they spread over. One IPv6 `/48` (65,536 `/64`s)
-still fits in the table with a bucket per `/64`; the overflow bucket meters only
-the prefixes beyond the cap. A client keeps its own bucket only while it is
-busy: the sweep drops every bucket that has refilled, and a client that returns
-while the table is full shares the overflow bucket too.
-
-> **Residual limitation.** A source holding more than 100,000 prefixes (two
-> `/48`s, or one `/47`) can refill the table after each sweep and then keep the
-> overflow bucket empty, so clients without an entry get `429` until the next
-> sweep while the global bucket looks healthy. If that matters for your
-> deployment, limit new source prefixes at the ingress.
+> **Residual limitation.** A source holding more prefixes than the table tracks (more than 100,000 at the default: two `/48`s, or one `/47`) can keep the overflow bucket empty only while it also keeps every tracked entry busy.
+> That costs it at least one request per tracked prefix every second, each charged to the global limit too, so it is out of reach while `--rate-limit-global` is well below the table size; with the global limit raised that far or disabled, clients without an entry get `429` for as long as the source keeps that up.
+> If that matters for your deployment, limit new source prefixes at the ingress.
 
 #### Client identity behind a front
 

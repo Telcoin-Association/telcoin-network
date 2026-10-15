@@ -84,6 +84,12 @@ use crate::{
 /// How often the background sweep reclaims idle per-IP buckets.
 pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Least time between two sweeps of a full per-IP table made inline for a
+/// first-seen client (see [`PerIpLimiter::make_room`]). A sweep walks the whole
+/// table under the map lock (about 1 ms over 100,000 entries), so this bounds
+/// its cost under a stream of new clients.
+const INLINE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
 /// Default ceiling on tracked per-IP buckets (`--rate-limit-per-ip-max-entries`).
 /// Bounds the per-IP map so a wide spread of source IPs cannot grow it without
 /// limit; ~10 MB at the cap, and idle buckets are reclaimed between sweeps by
@@ -382,15 +388,21 @@ pub(crate) fn mask_v6(addr: Ipv6Addr, prefix: PrefixLen) -> Ipv6Addr {
 }
 
 /// Per-client-prefix buckets, bounded in cardinality; idle buckets are reclaimed
-/// by [`RateLimiters::gc`]. The map is keyed on the *masked* client address (see
-/// [`PrefixPolicy`]), so address rotation inside one allocation shares a bucket.
+/// by [`RateLimiters::gc`], and from a full table by a first-seen client (see
+/// [`PerIpLimiter::make_room`]). The map is keyed on the *masked* client
+/// address (see [`PrefixPolicy`]), so address rotation inside one allocation
+/// shares a bucket.
 #[derive(Debug)]
 struct PerIpLimiter {
     /// The rate and burst every per-client bucket is built with.
     limit: RateLimit,
-    /// Ceiling on tracked buckets; a first-seen client beyond it spends from
-    /// `overflow` instead of getting a bucket of its own.
+    /// Ceiling on tracked buckets; a first-seen client that meets a full table
+    /// with no idle entry to free spends from `overflow` instead of getting a
+    /// bucket of its own.
     max_entries: usize,
+    /// When a first-seen client last swept the full table of its idle entries
+    /// (see [`Self::make_room`]). Taken only while the map lock is held.
+    last_inline_sweep: Mutex<Instant>,
     /// Live buckets, keyed on the prefix-masked client address.
     buckets: Mutex<HashMap<IpAddr, Bucket>>,
     /// One bucket, built with `limit`, shared by every client the full table
@@ -431,9 +443,10 @@ impl PerIpLimiter {
     ///
     /// The map lock is held until `then` has answered, so the refund lands on
     /// the bucket this request charged even if a sweep runs concurrently. Lock
-    /// order is always this map, then the overflow bucket, then the global
-    /// bucket (the only lock a `then` takes); [`RateLimiters::gc`] takes only
-    /// this map.
+    /// order is always this map, then the inline-sweep clock
+    /// (`last_inline_sweep`), then the overflow bucket, then the global bucket
+    /// (the only lock a `then` takes); [`RateLimiters::gc`] takes only this
+    /// map.
     ///
     /// Returns the bucket that was charged when the request is admitted, so a
     /// caller that learns later that it must refuse the request can refund it
@@ -476,15 +489,23 @@ impl PerIpLimiter {
     /// unclassified, admits it (see [`RateLimiters::charge_class`]), so the
     /// guarantee holds in both modes.
     ///
-    /// A new IP with the table already full is not tracked and spends from the
-    /// shared overflow bucket instead, rather than evicting a live bucket or
-    /// going unmetered: every client the table cannot track shares that one
-    /// bucket, so together they get one client's budget however many prefixes
-    /// they spread over. A `/48` holds 65,536 `/64`s, so one still fits with a
-    /// bucket per `/64` and the overflow meters only the prefixes beyond the cap.
-    /// Bounded memory is still chosen over perfect per-IP fairness: an honest
-    /// client first seen while the table is full shares that budget until the
-    /// GC sweep frees a slot.
+    /// A new IP that meets a full table first sweeps the table's idle entries
+    /// (see [`Self::make_room`]), at most once per [`INLINE_SWEEP_INTERVAL`],
+    /// and gets a bucket of its own if that frees a slot. An idle entry carries
+    /// no state a fresh bucket would not; a busy one is never evicted. An
+    /// entry goes idle once it has refilled, within `burst / rate` seconds of
+    /// its last request, so holding the table full against new clients costs
+    /// at least one request per tracked prefix per sweep.
+    ///
+    /// When the sweep frees nothing, or ran less than an interval ago, the new
+    /// IP is not tracked and spends from the shared overflow bucket instead,
+    /// rather than evicting a busy bucket or going unmetered: every client the
+    /// table cannot track shares that one bucket, so together they get one
+    /// client's budget however many prefixes they spread over. A `/48` holds
+    /// 65,536 `/64`s, so one still fits with a bucket per `/64` and the overflow
+    /// meters only the prefixes beyond the cap. Bounded memory is still chosen
+    /// over perfect per-IP fairness: an honest client first seen while every
+    /// tracked entry is busy shares that budget until a sweep frees a slot.
     fn admit_new_ip(
         &self,
         buckets: &mut HashMap<IpAddr, Bucket>,
@@ -496,7 +517,7 @@ impl PerIpLimiter {
     ) -> Option<PerIpReceipt> {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
-        if buckets.len() < self.max_entries {
+        if self.make_room(buckets, now) {
             let mut bucket = Bucket::full(now, capacity);
             if !bucket.try_admit_then(now, rate, capacity, cost, then) {
                 return None;
@@ -507,8 +528,8 @@ impl PerIpLimiter {
             buckets.insert(ip, bucket);
             Some(PerIpReceipt::Own(ip))
         } else {
-            // Table full: share the overflow bucket (bounded memory over per-IP
-            // fairness).
+            // Table full of busy entries: share the overflow bucket (bounded
+            // memory over per-IP fairness).
             lock(&self.overflow)
                 .try_admit_then(now, rate, capacity, cost, then)
                 .then_some(PerIpReceipt::Overflow)
@@ -544,8 +565,9 @@ impl PerIpLimiter {
     /// If the prefix has a bucket by now, a concurrent first request from it
     /// was inserted first, and this request's `cost` is spent from that bucket
     /// instead; its verdict is ignored, since the request is already admitted.
-    /// If the table is full by now, nothing is inserted and the prefix stays
-    /// untracked until its next request.
+    /// If the table is full by now and [`Self::make_room`] frees no slot,
+    /// nothing is inserted and the prefix stays untracked until its next
+    /// request.
     fn insert_fresh(&self, now: Instant, key: IpAddr, at: Instant, cost: f64) {
         let rate = self.limit.tokens_per_sec();
         let capacity = self.limit.capacity();
@@ -553,10 +575,31 @@ impl PerIpLimiter {
         if let Some(bucket) = buckets.get_mut(&key) {
             // the request is admitted already: this only records what it spent
             bucket.try_admit(now, rate, capacity, cost);
-        } else if buckets.len() < self.max_entries {
+        } else if self.make_room(&mut buckets, now) {
             // the bucket the edge charged, refilling from when it was charged
             buckets.insert(key, Bucket { tokens: capacity - cost, last_refill: at });
         }
+    }
+
+    /// Whether `buckets` (the locked map) has room for a first-seen client.
+    /// A full table is first swept of its idle entries, the same sweep as
+    /// [`RateLimiters::gc`], unless an inline sweep ran less than
+    /// [`INLINE_SWEEP_INTERVAL`] ago; a busy entry is never evicted.
+    fn make_room(&self, buckets: &mut HashMap<IpAddr, Bucket>, now: Instant) -> bool {
+        if buckets.len() < self.max_entries {
+            return true;
+        }
+        {
+            let mut last_sweep = lock(&self.last_inline_sweep);
+            if now.saturating_duration_since(*last_sweep) < INLINE_SWEEP_INTERVAL {
+                return false;
+            }
+            *last_sweep = now;
+        }
+        let rate = self.limit.tokens_per_sec();
+        let capacity = self.limit.capacity();
+        buckets.retain(|_, bucket| !bucket.is_idle(now, rate, capacity));
+        buckets.len() < self.max_entries
     }
 }
 
@@ -610,6 +653,7 @@ impl<C: Clock> RateLimiters<C> {
         let per_ip = per_ip.map(|limit| PerIpLimiter {
             limit,
             max_entries: max_per_ip_entries.max(1),
+            last_inline_sweep: Mutex::new(now),
             buckets: Mutex::new(HashMap::new()),
             overflow: Mutex::new(Bucket::full(now, limit.capacity())),
             prefix,
@@ -1510,6 +1554,64 @@ mod tests {
         // ip(3) spent its own bucket, not the overflow one, which still has the
         // token it refilled for the next untracked client.
         assert!(limiters.check(Some(ip(4))).is_ok());
+        assert_eq!(limiters.per_ip_len(), 1);
+    }
+
+    #[test]
+    fn full_table_evicts_an_idle_entry_for_a_new_client() {
+        let clock = ManualClock::new();
+        let limiters = limiters(clock.clone(), Some(limit(1, 2)), None, 2);
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(2))).is_ok());
+        // both buckets refill and go idle; a sweep may run inline again
+        clock.advance(INLINE_SWEEP_INTERVAL);
+        assert!(limiters.check(Some(ip(3))).is_ok());
+        // the sweep freed every idle entry, so the new client has its own bucket
+        assert_eq!(limiters.per_ip_tokens(ip(3)), Some(1.0), "the new client was not tracked");
+        assert_eq!(limiters.per_ip_len(), 1);
+        // and the next new client a slot of its own too, within the cap
+        assert!(limiters.check(Some(ip(4))).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(4)), Some(1.0));
+        assert_eq!(limiters.per_ip_len(), 2);
+    }
+
+    #[test]
+    fn full_table_never_evicts_a_busy_entry() {
+        let clock = ManualClock::new();
+        let limiters = limiters(clock.clone(), Some(limit(1, 2)), None, 2);
+        for client in [ip(1), ip(1), ip(2), ip(2)] {
+            assert!(limiters.check(Some(client)).is_ok());
+        }
+        // a sweep may run, but after a second each bucket holds 1 of its 2
+        // tokens: both are busy
+        clock.advance(INLINE_SWEEP_INTERVAL);
+        assert!(limiters.check(Some(ip(3))).is_ok(), "the overflow bucket refused");
+        assert_eq!(limiters.per_ip_tokens(ip(3)), None, "a busy entry was evicted");
+        assert_eq!(limiters.per_ip_len(), 2);
+        assert!(limiters.per_ip_tokens(ip(1)).is_some() && limiters.per_ip_tokens(ip(2)).is_some());
+    }
+
+    #[test]
+    fn inline_sweep_runs_at_most_once_per_interval() {
+        let clock = ManualClock::new();
+        // 2 tokens/s with a burst of 1: a spent bucket is idle 500 ms later
+        let limiters = limiters(clock.clone(), Some(limit(2, 1)), None, 2);
+        clock.advance(INLINE_SWEEP_INTERVAL);
+        assert!(limiters.check(Some(ip(1))).is_ok());
+        assert!(limiters.check(Some(ip(2))).is_ok());
+        // this sweep finds both entries busy, frees nothing, and starts the
+        // interval; ip(3) spends the overflow bucket
+        assert!(limiters.check(Some(ip(3))).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(3)), None);
+        // both entries go idle, but within the interval no sweep runs again
+        clock.advance(Duration::from_millis(600));
+        assert!(limiters.check(Some(ip(4))).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(4)), None, "a sweep ran within the interval");
+        assert_eq!(limiters.per_ip_len(), 2);
+        // once the interval has passed, the next new client sweeps them
+        clock.advance(Duration::from_millis(400));
+        assert!(limiters.check(Some(ip(5))).is_ok());
+        assert_eq!(limiters.per_ip_tokens(ip(5)), Some(0.0), "the idle entries were not swept");
         assert_eq!(limiters.per_ip_len(), 1);
     }
 
