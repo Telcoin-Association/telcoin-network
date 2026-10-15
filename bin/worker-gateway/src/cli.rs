@@ -2690,7 +2690,7 @@ mod tests {
             "--upstream-readiness-url=http://10.0.0.7:8551/health/workers",
             "--rate-limit-per-ip-max-entries=0",
         ];
-        let err = Cli::try_parse_from(argv).err().expect("a zero-entry table was accepted");
+        let err = try_parse_test_argv(argv).expect_err("a zero-entry table was accepted");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
     }
 

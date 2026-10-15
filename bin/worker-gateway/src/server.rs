@@ -1440,7 +1440,7 @@ mod tests {
     use super::*;
     use crate::{
         app::{check_chain_ids, log_chain_id_check, ChainIdCheck, UpstreamClients},
-        cli::{Cli, LogFormat, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
+        cli::{LogFormat, Settings, DEFAULT_DENIED_METHOD_PREFIXES},
         config::UpstreamWorker,
         dns::{self, lookup_fn, SystemLookup},
         identity::proxy_v2_header,
@@ -1457,7 +1457,6 @@ mod tests {
         http::{header, HeaderMap},
         routing::{any, post},
     };
-    use clap::Parser as _;
     use rcgen::{
         BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair,
         KeyUsagePurpose,
@@ -5785,7 +5784,7 @@ mod tests {
             format!("--upstream-readiness-url={scheme}://{readiness}/health/workers"),
         ];
         argv.extend(flags.iter().cloned());
-        Cli::parse_from(argv).into_settings().expect("settings")
+        crate::cli::try_parse_test_argv(argv).expect("parse").into_settings().expect("settings")
     }
 
     /// The gateway state with the production upstream client built from
@@ -8284,13 +8283,14 @@ mod tests {
         let header = format!("--redirect-queries-header={}", api_key_line());
         let worker_flag = format!("--upstream-rpc-url=http://{worker}/");
         for redirect in [format!("http://{query}/"), "http://203.0.113.5:8545/".to_string()] {
-            let settings = Cli::parse_from([
+            let settings = crate::cli::try_parse_test_argv([
                 "worker-gateway",
                 worker_flag.as_str(),
                 "--upstream-readiness-url=http://127.0.0.1:1/health/workers",
                 format!("--redirect-queries={redirect}").as_str(),
                 header.as_str(),
             ])
+            .expect("parse")
             .into_settings()
             .expect("settings resolve");
             assert!(settings.query_header.is_some());

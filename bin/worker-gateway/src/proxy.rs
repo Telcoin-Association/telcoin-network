@@ -2503,7 +2503,6 @@ mod tests {
         eips::{eip4844::BlobTransactionSidecar, eip7594::BlobTransactionSidecarVariant},
     };
     use axum::http::StatusCode;
-    use clap::Parser as _;
     use serde_json::{value::RawValue, Value};
     use std::{cell::Cell, num::NonZeroU32, sync::Mutex};
     use tn_types::{Encodable2718, EthSignature, SignableTransaction, U256};
@@ -4146,11 +4145,12 @@ mod tests {
     fn rustls_backend_is_compiled_in() {
         let bare = Client::builder().use_rustls_tls().build();
         assert!(bare.is_ok(), "{bare:?}");
-        let settings = crate::cli::Cli::parse_from([
+        let settings = crate::cli::try_parse_test_argv([
             "worker-gateway",
             "--upstream-rpc-url=https://10.0.0.7:8545",
             "--upstream-readiness-url=https://10.0.0.7:8551/health/workers",
         ])
+        .expect("parse")
         .into_settings()
         .expect("settings");
         let proxy = proxy_client(
