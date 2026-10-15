@@ -1087,6 +1087,14 @@ impl ConsensusPack {
         std::mem::take(&mut *self.shared.save_phases.lock())
     }
 
+    /// Test-only: every batch read first sleeps `delay` (a large batch's decode, made slow).
+    #[cfg(test)]
+    fn slow_batch_reads(&self, delay: std::time::Duration) {
+        if let Some(inner) = self.shared.inner.write().as_mut() {
+            inner.batch_read_delay = Some(delay);
+        }
+    }
+
     /// Test-only: the next save panics once its records are appended and indexed.
     #[cfg(test)]
     pub(crate) fn panic_next_save(&self) {
@@ -1284,13 +1292,30 @@ impl ConsensusPack {
         None
     }
 
-    /// [`Self::batch`] for each of `digests`, in order, in one read.
+    /// [`Self::batch`] for each of `digests`, in order, in one blocking task. The read lock is
+    /// taken once per digest, not for the whole request: a batch read decompresses, decodes and
+    /// re-hashes up to a megabyte, and a peer may ask for hundreds, so one lock across them all
+    /// would hold a save's append (and, while it waits, every new reader) behind the request.
     pub async fn batches(&self, digests: Vec<BlockHash>) -> Vec<Option<Batch>> {
         let count = digests.len();
-        match self
-            .read(move |inner| digests.into_iter().map(|digest| inner.batch(digest)).collect())
-            .await
-        {
+        let shared = Arc::clone(&self.shared);
+        let read = tokio::task::spawn_blocking(move || {
+            digests
+                .into_iter()
+                .map(|digest| {
+                    shared
+                        .inner
+                        .read()
+                        .as_ref()
+                        .map(|inner| inner.batch(digest))
+                        .ok_or(PackError::SendFailed)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .await
+        .map_err(|_| PackError::ReceiveFailed)
+        .and_then(|read| read);
+        match read {
             Ok(batches) => batches,
             Err(_) => {
                 // A closed pack is not a real miss — surface it instead of a silent `None`.
@@ -1590,34 +1615,58 @@ impl<'a> PreparedOutput<'a> {
         batches: BTreeMap<BlockHash, Batch>,
         encoder: &'a mut OutputEncoder,
     ) -> Result<Self, PackError> {
-        let chunks = encoder.split(batches.into_iter().collect());
-        let lanes = encoder.lanes_for(chunks.len());
+        // Each run stays in its slot until its lane's thread takes it: a lane whose thread fails
+        // to start (the system out of threads for a moment) still has its run afterwards, and
+        // encodes it on this thread. The bytes are the same either way.
+        let mut runs: Vec<Option<_>> =
+            encoder.split(batches.into_iter().collect()).into_iter().map(Some).collect();
+        #[cfg(test)]
+        let fail_spawns = encoder.fail_spawns;
+        let lanes = encoder.lanes_for(runs.len());
         let (first, others) = lanes.split_first_mut().expect("an encoder has a lane");
-        let mut chunks = chunks.into_iter();
-        let first_chunk = chunks.next().unwrap_or_default();
+        let (first_run, other_runs) = runs.split_first_mut().expect("a split has a run");
         let header = PackRecord::Consensus(Box::new(consensus.consensus_header()));
-        let (header, encoded) = std::thread::scope(|scope| {
+        let (header, mut encoded) = std::thread::scope(|scope| {
             let started: Vec<_> = others
                 .iter_mut()
-                .zip(chunks)
-                .map(|(lane, chunk)| {
+                .zip(other_runs.iter_mut())
+                .map(|(lane, run)| {
+                    #[cfg(test)]
+                    if fail_spawns {
+                        return Err(io::Error::other("injected thread start failure"));
+                    }
                     std::thread::Builder::new()
                         .name("pack-encode".to_string())
-                        .spawn_scoped(scope, move || lane.encode_batches(chunk))
+                        .spawn_scoped(scope, move || {
+                            lane.encode_batches(run.take().unwrap_or_default())
+                        })
                 })
                 .collect();
             let header = first.encode(&header);
-            let mut encoded = vec![first.encode_batches(first_chunk)];
+            let mut encoded =
+                vec![Some(first.encode_batches(first_run.take().unwrap_or_default()))];
             for lane in started {
                 encoded.push(match lane {
-                    Ok(thread) => thread.join().unwrap_or_else(|panic| resume_unwind(panic)),
-                    Err(e) => Err(PackError::Append(format!("start a pack encode thread: {e}"))),
+                    Ok(thread) => Some(thread.join().unwrap_or_else(|panic| resume_unwind(panic))),
+                    Err(e) => {
+                        warn!(target: "consensus_pack", "encoding on the saving thread: start a pack encode thread: {e}");
+                        None
+                    }
                 });
             }
             (header, encoded)
         });
+        // The runs whose thread never started.
+        for ((done, lane), run) in encoded.iter_mut().skip(1).zip(others).zip(other_runs) {
+            if done.is_none() {
+                *done = Some(lane.encode_batches(run.take().unwrap_or_default()));
+            }
+        }
         let header = header?;
-        let encoded = encoded.into_iter().collect::<Result<Vec<_>, _>>()?;
+        let encoded = encoded
+            .into_iter()
+            .map(|done| done.expect("every run encoded"))
+            .collect::<Result<Vec<_>, _>>()?;
         let encoder: &'a OutputEncoder = encoder;
         let batches = encoded
             .into_iter()
@@ -1652,6 +1701,9 @@ struct OutputEncoder {
     /// `max_lanes`, so a small output is not split at all.
     lane_bytes: usize,
     lanes: Vec<Lane>,
+    /// Test-only: every lane thread fails to start.
+    #[cfg(test)]
+    fail_spawns: bool,
 }
 
 /// One compression lane: an encoder, and the buffer it encodes records into.
@@ -1706,7 +1758,15 @@ impl OutputEncoder {
         max_lanes: usize,
         lane_bytes: usize,
     ) -> Self {
-        Self { compression, max, max_lanes: max_lanes.max(1), lane_bytes, lanes: Vec::new() }
+        Self {
+            compression,
+            max,
+            max_lanes: max_lanes.max(1),
+            lane_bytes,
+            lanes: Vec::new(),
+            #[cfg(test)]
+            fail_spawns: false,
+        }
     }
 
     /// Split `batches` (in order) into one run per lane, each holding about an equal share of
@@ -1778,6 +1838,9 @@ struct Inner {
     /// Test-only: when set, the next save panics once its records are appended and indexed.
     #[cfg(test)]
     panic_save_after_append: bool,
+    /// Test-only: each batch read sleeps this long first, standing in for a large batch's decode.
+    #[cfg(test)]
+    batch_read_delay: Option<std::time::Duration>,
 }
 
 impl Inner {
@@ -2480,6 +2543,8 @@ impl Inner {
             fail_save_after_append: false,
             #[cfg(test)]
             panic_save_after_append: false,
+            #[cfg(test)]
+            batch_read_delay: None,
         };
         inner.persist().map_err(MigrateAbort::Fatal)?;
         // Drop seals every backing file (msync + truncate-to-`end` + clean-close sentinel).
@@ -3171,6 +3236,8 @@ impl Inner {
             fail_save_after_append: false,
             #[cfg(test)]
             panic_save_after_append: false,
+            #[cfg(test)]
+            batch_read_delay: None,
         })
     }
 
@@ -3253,6 +3320,8 @@ impl Inner {
             fail_save_after_append: false,
             #[cfg(test)]
             panic_save_after_append: false,
+            #[cfg(test)]
+            batch_read_delay: None,
         })
     }
 
@@ -3337,6 +3406,8 @@ impl Inner {
             fail_save_after_append: false,
             #[cfg(test)]
             panic_save_after_append: false,
+            #[cfg(test)]
+            batch_read_delay: None,
         })
     }
 
@@ -3436,6 +3507,8 @@ impl Inner {
             fail_save_after_append: false,
             #[cfg(test)]
             panic_save_after_append: false,
+            #[cfg(test)]
+            batch_read_delay: None,
         };
         // Fill the pack from the stream. Any error abandons the partial pack cheaply: a peer can
         // stream data and then send a bad record, and letting `pack` drop normally would msync +
@@ -4142,6 +4215,10 @@ impl Inner {
 
     /// Return the Batch for digest if found.
     fn batch(&self, digest: BlockHash) -> Option<Batch> {
+        #[cfg(test)]
+        if let Some(delay) = self.batch_read_delay {
+            std::thread::sleep(delay);
+        }
         let epoch = self.epoch_meta.epoch;
         let pos = self
             .batch_digests
@@ -5735,6 +5812,31 @@ pub(crate) mod test {
         }
     }
 
+    /// A lane whose thread fails to start (the system out of threads for a moment) has its batches
+    /// encoded on the saving thread instead of failing the save, which would stop the node: the
+    /// records are the same, in the same order.
+    #[test]
+    fn test_split_encoding_survives_a_failed_thread_start() {
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let output = make_wide_test_output(
+            &fixture.committee(),
+            chain,
+            1,
+            ConsensusHeader::default().digest(),
+            40,
+        );
+        let batches = batches_by_digest(&output);
+        let lanes =
+            |max_lanes| OutputEncoder::with_lanes(PackCompression::ZStd, u32::MAX, max_lanes, 1);
+        let (one, _) = encoded_records(&output, &batches, lanes(1)).expect("one lane");
+        let mut failing = lanes(4);
+        failing.fail_spawns = true;
+        let (split, used) = encoded_records(&output, &batches, failing).expect("no thread started");
+        assert_eq!(used, 4, "every lane still encoded its share");
+        assert!(one == split, "the same records in the same order");
+    }
+
     /// A record too large for the pack fails the whole encode, on the saving thread or on another
     /// lane, and the encoder then encodes the next output normally.
     #[test]
@@ -5806,6 +5908,43 @@ pub(crate) mod test {
         }
         one.close().await;
         split.close().await;
+    }
+
+    /// A request for many batches takes the pack's lock once per batch, so a save landing while it
+    /// runs waits for at most one batch read, not the whole request (a peer may ask for hundreds
+    /// of batches of up to a megabyte each, and the save is on the path to execution).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_consensus_pack_batch_reads_let_saves_in_between() {
+        let temp_dir = TempDir::with_prefix("test_pack_batch_reads_yield").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 6);
+        for output in &outputs[..5] {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        let digests: Vec<BlockHash> = outputs[..5].iter().flat_map(batch_digests_of).collect();
+        assert!(digests.len() >= 16, "enough batch reads to tell the two apart");
+        pack.slow_batch_reads(Duration::from_millis(25));
+        let reader = {
+            let pack = pack.clone();
+            let digests = digests.clone();
+            tokio::spawn(async move {
+                let batches = pack.batches(digests).await;
+                (batches, std::time::Instant::now())
+            })
+        };
+        // The request is under way: a few of its reads have run.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        pack.save_consensus_output(outputs[5].clone()).await.expect("a save beside the reads");
+        let saved = std::time::Instant::now();
+        let (batches, read_done) = reader.await.expect("reader");
+        assert!(batches.iter().all(Option::is_some), "every batch read back");
+        // Held behind the whole request, the save would finish as the reads do. Let in between two
+        // reads, it finishes long before: the request has hundreds of milliseconds of reads left.
+        let left = read_done.saturating_duration_since(saved);
+        assert!(
+            left > Duration::from_millis(150),
+            "the save waited for the whole request ({left:?} of reads were left when it finished)"
+        );
+        pack.close().await;
     }
 
     /// The split keeps the batches in order and gives each lane about an equal share of their

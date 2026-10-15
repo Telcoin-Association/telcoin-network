@@ -118,6 +118,19 @@ impl Node {
         buf[0] == PAGE_TYPE_LEAF
     }
 
+    /// Whether the page's tag is one a node can have: a leaf or internal type, with no more
+    /// entries than that type holds. Every slot access is bounded by the entry count, so a page
+    /// that passes this cannot index outside itself; one damaged at rest (a flipped count, a stray
+    /// write) fails here instead of panicking on an out-of-range slice. O(1): it reads the tag.
+    pub(crate) fn tag_ok(&self, buf: &[u8]) -> bool {
+        let count = self.entry_count(buf);
+        match buf[0] {
+            PAGE_TYPE_LEAF => count <= self.max_leaf_keys,
+            PAGE_TYPE_INTERNAL => count <= self.max_internal_keys,
+            _ => false,
+        }
+    }
+
     /// Number of live entries (keys) on the page.
     pub(crate) fn entry_count(&self, buf: &[u8]) -> usize {
         u16::from_le_bytes([buf[2], buf[3]]) as usize

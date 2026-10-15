@@ -1059,18 +1059,17 @@ async fn resolve_prior_epoch_record(
 /// current epoch's pack. The three `consensus_output` senders await `save_consensus` first, and
 /// startup replay and epoch-close phase 2 read the output back from the pack. Every reader of
 /// [`NodeBatchesCache`] that can meet a committed digest falls back to that pack, so the cache
-/// copies are redundant. Keeping them until the epoch-close clear makes the fixed-size cache map
-/// hold a whole epoch of batches, which overflows it under sustained load (issue #1443).
+/// copies are redundant. Keeping them until the epoch-close clear would hold a whole epoch of
+/// batches in the cache: that overflowed the previous backend's fixed-size map under sustained
+/// load (issue #1443), and it would grow the cache's log for nothing.
 ///
 /// Our own batches have reached execution, so they no longer need rebroadcasting either.
 ///
-/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) both tables live in
-/// the cache env, a [`LayeredDatabase`](tn_storage::layered_db::LayeredDatabase): each remove
-/// drops the key from the memory layer and queues the delete to that env's writer thread, which
-/// runs the backend write txn and its commit (an fsync under MDBX `Durable`). The caller pays a
-/// map remove and a channel send per key. Sharing one txn makes the writer commit at most once
-/// per output where bare removes would each commit on their own. A failure here is only logged,
-/// and a backend failure is reported on the writer thread instead. A batch left in
+/// Nothing here waits on disk. In [`DatabaseType`](tn_storage::DatabaseType) (a tndb
+/// `SplitDatabase`) both tables live in the cache environment, one shared log: the transaction's
+/// removes are appended to it as one batch at commit, and its commit thread makes them durable in
+/// the background (group commit; nothing here waits for it). Sharing one txn makes one batch per
+/// output where bare removes would each be their own. A failure here is only logged. A batch left in
 /// [`NodeBatchesCache`] holds space until the epoch-close clear; one left in
 /// [`OurNodeBatchesCache`] survives that clear and reaches `orphan_batches` as if it had never
 /// been committed.

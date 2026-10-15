@@ -206,6 +206,11 @@ impl PageSource for IndexSnapshot {
                 "published page {p} has an all-zero CRC (at-rest corruption)"
             )));
         }
+        if !self.node.tag_ok(buf) {
+            return Err(FetchError::CorruptIndex(format!(
+                "published page {p} has an impossible type or entry count (at-rest corruption)"
+            )));
+        }
         Ok(buf)
     }
 }
@@ -611,11 +616,19 @@ impl BtreeIndex {
         let buf = self.file.slice(Self::page_offset(p), PAGE_SIZE).ok_or_else(|| {
             FetchError::CorruptIndex(format!("page {p} is beyond the mapped index"))
         })?;
-        if crc_is_zero(buf) && !self.private.contains(p) {
-            return Err(FetchError::CorruptIndex(format!(
-                "page {p} has an all-zero CRC this handle did not write (at-rest corruption, not a \
-                 live unsynced write)"
-            )));
+        if !self.private.contains(p) {
+            if crc_is_zero(buf) {
+                return Err(FetchError::CorruptIndex(format!(
+                    "page {p} has an all-zero CRC this handle did not write (at-rest corruption, \
+                     not a live unsynced write)"
+                )));
+            }
+            // A page this handle is building may be mid-write; any other must be a whole node.
+            if !self.node.tag_ok(buf) {
+                return Err(FetchError::CorruptIndex(format!(
+                    "page {p} has an impossible type or entry count (at-rest corruption)"
+                )));
+            }
         }
         Ok(buf)
     }
@@ -631,9 +644,10 @@ impl BtreeIndex {
             .ok_or_else(|| FetchError::CorruptIndex(format!("page {p} is beyond the mapped index")))
     }
 
-    /// Allocate the next page number (append-only bump allocator; no free list), growing the
-    /// mapping to cover it. The grown region is zero-filled, so a fresh page reads as a zero-CRC
-    /// (dirty) page — recorded as written by this handle — until it is CRC'd at [`Index::sync`].
+    /// Allocate a page: a free page no snapshot can reach (zero-filled for reuse), else the next
+    /// page number, growing the mapping to cover it. Either way the page starts all zeros, a
+    /// zero-CRC (dirty) page recorded as written by this handle, until it is CRC'd at
+    /// [`Index::sync`].
     /// The page count only moves once the growth succeeded (a failed growth also poisons the file,
     /// so it never seals and is rebuilt on the next open).
     fn allocate_page(&mut self) -> Result<u32, io::Error> {
@@ -675,7 +689,16 @@ impl BtreeIndex {
             return Ok(p);
         }
         let mut copy = [0_u8; PAGE_SIZE];
-        copy.copy_from_slice(self.page(p).map_err(fetch_to_append)?);
+        let src = self.page(p).map_err(fetch_to_append)?;
+        // Every page outside `private` was CRC-stamped when it was published. Check it before
+        // copying: the copy is stamped afresh at the next publish, so copying a page damaged at
+        // rest would make the damage CRC-valid and invisible.
+        if crc_state(src) != CrcState::Valid {
+            return Err(fetch_to_append(FetchError::CorruptIndex(format!(
+                "page {p} fails its CRC (at-rest corruption); refusing to copy it"
+            ))));
+        }
+        copy.copy_from_slice(src);
         let q = self.allocate_page()?;
         let dst = self.page_mut(q).map_err(fetch_to_append)?;
         dst.copy_from_slice(&copy);
@@ -1331,6 +1354,91 @@ mod tests {
 
     use super::*;
     use crate::archive::{data_file::SENTINEL_LEN, pack::PackCompression};
+
+    /// XOR the byte at `offset` of `file` with `mask`, on disk (damage at rest).
+    fn xor_at(file: &Path, offset: u64, mask: u8) {
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+        let mut f = std::fs::OpenOptions::new().read(true).write(true).open(file).expect("open");
+        f.seek(SeekFrom::Start(offset)).expect("seek");
+        let mut byte = [0_u8; 1];
+        f.read_exact(&mut byte).expect("read");
+        byte[0] ^= mask;
+        f.seek(SeekFrom::Start(offset)).expect("seek");
+        f.write_all(&byte).expect("write");
+        f.sync_all().expect("sync");
+    }
+
+    /// A sealed index of keys `0..n` in `tmp`: its directory and data header, plus the root page,
+    /// the height, the leftmost leaf, and the root's first child.
+    fn sealed_index(tmp: &TempDir, n: u64) -> (PathBuf, DataHeader, [u32; 4]) {
+        let dir = tmp.path().join("idx");
+        let data_header = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx = BtreeIndex::open_btx_file(&dir, &data_header, 32, false).expect("open");
+        for i in 0..n {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        idx.sync().expect("sync");
+        let (root, height, node) = (idx.header.root_page, idx.header.height, idx.node);
+        let child0 = node.internal_child(idx.page(root).expect("root"), 0);
+        let mut leaf = root;
+        for _ in 1..height {
+            leaf = node.internal_child(idx.page(leaf).expect("page"), 0);
+        }
+        (dir, data_header, [root, height, leaf, child0])
+    }
+
+    /// A page damaged at rest so that its entry count is impossible (one flipped bit in the
+    /// count's high byte; the CRC trailer, now wrong, stays non-zero) is reported as
+    /// `CorruptIndex` on every path that reaches it, never a panic: a lookup through the writer
+    /// and through a published snapshot (tndb's read path), a scan, and a save (tndb's write path,
+    /// under its write lock). The same holds for an internal page above the leaves.
+    #[test]
+    fn test_archive_btx_impossible_page_counts_are_errors_not_panics() {
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, [root, height, leaf, _]) = sealed_index(&tmp, 2_000);
+        assert!(height == 2 && leaf != root, "a leaf below the root");
+        xor_at(&dir.join("index.btx"), BtreeIndex::page_offset(leaf) + 3, 0x80);
+        let smallest = (0..2_000).map(key_of).min().expect("keys");
+        let corrupt = |r: Result<u64, FetchError>| matches!(r, Err(FetchError::CorruptIndex(_)));
+
+        let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+        assert!(corrupt(idx.load(&smallest)), "a lookup through the writer");
+        let snapshot = idx.publish();
+        assert!(corrupt(snapshot.load(&smallest)), "a lookup through a snapshot");
+        drop(snapshot);
+        let save = idx.save(&[0_u8; 32], 7);
+        assert!(matches!(save, Err(AppendError::CorruptIndex(_))), "a save: {save:?}");
+        drop(idx);
+        let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, true).expect("open read-only");
+        let scan: Result<Vec<_>, _> = idx.iter().and_then(|scan| scan.collect());
+        assert!(matches!(scan, Err(FetchError::CorruptIndex(_))), "a scan");
+
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, [root, height, _, child0]) = sealed_index(&tmp, 30_000);
+        assert!(height >= 3 && child0 != root, "an internal page below the root");
+        xor_at(&dir.join("index.btx"), BtreeIndex::page_offset(child0) + 3, 0x80);
+        let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+        let smallest = (0..30_000).map(key_of).min().expect("keys");
+        assert!(corrupt(idx.load(&smallest)), "a lookup through a damaged internal page");
+    }
+
+    /// Copy-on-write refuses to copy a page that fails its CRC: the copy would be stamped valid at
+    /// the next publish, making damage at rest (here one flipped bit in a stored value) CRC-valid
+    /// and invisible to every later check.
+    #[test]
+    fn test_archive_btx_copy_on_write_refuses_a_damaged_page() {
+        let tmp = TempDir::new().expect("tmp");
+        let (dir, dh, [_, _, leaf, _]) = sealed_index(&tmp, 2_000);
+        let node = Node::new(32);
+        let first_value = BtreeIndex::page_offset(leaf) + (12 + node.max_leaf_keys() * 32) as u64;
+        xor_at(&dir.join("index.btx"), first_value, 0x01);
+        let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+        assert_eq!(idx.page_crc_scan().corrupt, 1, "the damage is visible");
+        let save = idx.save(&[0_u8; 32], 7);
+        assert!(matches!(save, Err(AppendError::CorruptIndex(_))), "{save:?}");
+        idx.sync().expect("sync");
+        assert_eq!(idx.page_crc_scan().corrupt, 1, "and stays visible: nothing was re-stamped");
+    }
 
     /// Deterministic 32-byte key from an integer.
     fn key_of(i: u64) -> [u8; 32] {

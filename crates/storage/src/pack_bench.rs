@@ -101,6 +101,8 @@
 //! - `TN_BENCH_PACK_NO_SLOTS`: 1 persists the pack alone, without the latest-consensus slot syncs
 //!   that `persist_current` runs beside it: a measurement of what the slots add, never a production
 //!   setting (default 0).
+//! - `TN_BENCH_PACK_BATCH_REQ`: batches per `get_batches` request (default 5, one header's); a
+//!   peer may ask for hundreds, served 200 at a time.
 //!
 //! The chain lives in a temp dir under `TMPDIR`. On Linux a tmpfs or ramfs `TMPDIR` is refused:
 //! `msync` is free there, so the durable rows would mean nothing.
@@ -681,6 +683,7 @@ impl Report {
 #[test]
 #[ignore = "on-demand pack-file (mmap) regression benchmark; run with --ignored --nocapture --test-threads 1"]
 fn pack_file_bench() {
+    crate::pack_bench::check_bench_temp_dir();
     // Mirror `db_bench`: a plain test driving the async pack API on a tokio runtime.
     let runtime = tokio::runtime::Runtime::new().expect("create tokio runtime");
     runtime.block_on(async {
@@ -750,6 +753,8 @@ struct WorkloadKnobs {
     /// Persist the pack alone, without the slot syncs `persist_current` runs beside it (a
     /// measurement only: production always syncs both).
     no_slots: bool,
+    /// Batches per `get_batches` request (one header's by default; a peer may ask for hundreds).
+    batch_request: usize,
 }
 
 impl WorkloadKnobs {
@@ -773,6 +778,7 @@ impl WorkloadKnobs {
             read_only: Duration::from_secs(var("TN_BENCH_PACK_READ_SECS", 15_u64)),
             readers: var("TN_BENCH_PACK_READERS", 1_u8) != 0,
             no_slots: var("TN_BENCH_PACK_NO_SLOTS", 0_u8) != 0,
+            batch_request: var("TN_BENCH_PACK_BATCH_REQ", WORKLOAD_BATCHES_PER_HEADER).max(1),
         }
     }
 
@@ -1397,6 +1403,7 @@ async fn read_once(
     chain: &ConsensusChain,
     epoch: Epoch,
     target: &SavedOutput,
+    batch_request: usize,
     seed: u64,
 ) {
     match kind {
@@ -1418,9 +1425,13 @@ async fn read_once(
                 x = mix(x);
                 x
             };
+            // `batch_request` digests from a header's first, wrapping round the output's batches
+            // (one header's by default).
             let headers = target.batches.len() / WORKLOAD_BATCHES_PER_HEADER;
             let first = (next() as usize % headers) * WORKLOAD_BATCHES_PER_HEADER;
-            let mut digests = target.batches[first..first + WORKLOAD_BATCHES_PER_HEADER].to_vec();
+            let want = batch_request.min(target.batches.len());
+            let mut digests: Vec<BlockHash> =
+                (0..want).map(|i| target.batches[(first + i) % target.batches.len()]).collect();
             let mut held = digests.len();
             for digest in &mut digests {
                 if next() % 100 < BATCH_MISS_PERCENT {
@@ -1446,6 +1457,7 @@ async fn read_once(
 /// started on schedule whether or not the earlier ones have returned, so a call queued behind a
 /// save waits as long as it would in production. Each latency is recorded under the phase its
 /// call started in.
+#[allow(clippy::too_many_arguments)]
 async fn run_reader(
     kind: ReadKind,
     chain: ConsensusChain,
@@ -1453,6 +1465,7 @@ async fn run_reader(
     recent: Recent,
     phase: Arc<AtomicU8>,
     period: Duration,
+    batch_request: usize,
     seed: u64,
 ) -> [Vec<Duration>; 2] {
     let mut samples: [Vec<Duration>; 2] = Default::default();
@@ -1480,7 +1493,7 @@ async fn run_reader(
         let (chain, seed) = (chain.clone(), mix(x ^ 1));
         calls.spawn(async move {
             let call = Instant::now();
-            read_once(kind, &chain, epoch, &target, seed).await;
+            read_once(kind, &chain, epoch, &target, batch_request, seed).await;
             (at, call.elapsed())
         });
     }
@@ -1489,6 +1502,12 @@ async fn run_reader(
         samples[usize::from(at)].push(latency);
     }
     samples
+}
+
+/// [`check_bench_filesystem`] for the temp dir (`TMPDIR`) the benches make their files in: every
+/// storage bench calls this first.
+pub(crate) fn check_bench_temp_dir() {
+    check_bench_filesystem(&std::env::temp_dir());
 }
 
 /// Refuse a RAM-backed temp dir on Linux, where `msync` and `fsync` are free and the durable rows
@@ -1673,6 +1692,7 @@ fn run_configuration(
                     recent.clone(),
                     phase.clone(),
                     knobs.reader_period(kind.per_output(shape.committee)),
+                    knobs.batch_request,
                     mix(i as u64 + 1),
                 ))
             })
@@ -1855,12 +1875,12 @@ fn consensus_pack_workload() {
                 n * ROUNDS_PER_OUTPUT as usize
             ),
             format!(
-                "reads per output interval: {} header_by_digest, {} get_batches of one header's \
-                 {WORKLOAD_BATCHES_PER_HEADER} batches ({BATCH_MISS_PERCENT}% absent), {} \
-                 output_bytes, of the newest {RECENT_OUTPUTS} outputs; \"reads only\" = the same \
-                 reads for {} s after the last save",
+                "reads per output interval: {} header_by_digest, {} get_batches of {} batches \
+                 ({BATCH_MISS_PERCENT}% absent), {} output_bytes, of the newest {RECENT_OUTPUTS} \
+                 outputs; \"reads only\" = the same reads for {} s after the last save",
                 ReadKind::HeaderByDigest.per_output(n),
                 ReadKind::Batches.per_output(n),
+                knobs.batch_request,
                 ReadKind::OutputBytes.per_output(n),
                 knobs.read_only.as_secs()
             ),

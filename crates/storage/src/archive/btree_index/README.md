@@ -241,13 +241,17 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   private.
 - **Publish/sync** stamps exactly the private pages (O(pages written), never a full scan). A page
   zeroed *at rest* is never re-stamped as valid, because it is not in the private set.
-- **Reads do not recompute the full CRC**, but two cheap checks turn damage into
-  `FetchError::CorruptIndex` instead of a wrong answer:
-  - the page number must be inside the tree (`1 ≤ p < page_count`), and
+- **Reads do not recompute the full CRC**, but three cheap checks turn damage into
+  `FetchError::CorruptIndex` instead of a wrong answer or a panic:
+  - the page number must be inside the tree (`1 ≤ p < page_count`);
   - an all-zero trailer is only legal on a page this handle wrote since its last publish. On a
-    published snapshot every page must be stamped.
-- **Writes into a damaged page are refused** (`page_mut` runs the same checks), so a sync never
-  stamps at-rest damage as valid.
+    published snapshot every page must be stamped;
+  - the page's tag must be a node's (`Node::tag_ok`): a leaf or internal type, with no more entries
+    than that type holds. Every slot access is bounded by the entry count, so a page with a damaged
+    count or type cannot be read outside its 4 KiB.
+- **Writes into a damaged page are refused.** `page_mut` runs the same checks, and copy-on-write
+  (`make_writable`) also verifies the source page's full CRC before copying it, so a publish or
+  sync never stamps at-rest damage as valid.
 - **`page_crc_scan()`** is the off-path full check: it classifies every data page as valid, dirty
   (unsynced writes: rebuild from the log) or corrupt (genuine on-disk corruption), in a
   `PageCrcReport { dirty, corrupt }`.

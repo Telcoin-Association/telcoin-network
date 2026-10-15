@@ -121,8 +121,8 @@ fn open_split_tndb(root: &Path, commit: CommitMode, compaction: CompactionConfig
     SplitDatabase::open_with(root, TnDbOptions { commit, compaction }).expect("open split tndb")
 }
 
-/// The node's consensus DB as production opens it today: `open_db`'s
-/// `CompositeDatabase<MdbxDatabase>`, with the production geometry and `Durable` sync.
+/// The consensus DB of the release before tndb: `open_db`'s `CompositeDatabase<MdbxDatabase>` of
+/// then, with its production geometry and `Durable` sync (the comparison tndb replaced).
 #[cfg(feature = "reth-libmdbx")]
 fn open_composite_mdbx_prod(root: &Path) -> CompositeDatabase<MdbxDatabase> {
     let env = |name: &str, tables, max_size, growth| {
@@ -863,6 +863,7 @@ impl Workload for ConsensusRounds {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_consensus_rounds() {
+    crate::pack_bench::check_bench_temp_dir();
     let rt = Runtime::new().expect("tokio runtime");
     for committee in [10, 50] {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -960,6 +961,7 @@ impl Workload for MixedRounds {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_mixed() {
+    crate::pack_bench::check_bench_temp_dir();
     let rt = Runtime::new().expect("tokio runtime");
     for (batch, rate) in [(256 << 10, None), (1 << 20, Some(25))] {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -983,9 +985,9 @@ fn workload_mixed() {
         let root = tmp.path().join("split_tndb");
         let db = open_split_tndb(&root, CommitMode::Group, CompactionConfig::default());
         cols.push(tndb_stats_column(&rt, &mut w, "Split<TnDb-group>", db, &root));
-        // Production today, for scale: beside the paced stream only. Its cache layer queues
-        // writes unbounded, and beside the unpaced one that queue held 39 GB (resident; an
-        // 86 GB footprint) on a Mac, enough to take a smaller machine down.
+        // The previous production DB, for scale: beside the paced stream only. Its cache layer
+        // queues writes unbounded, and beside the unpaced one that queue held 39 GB (resident;
+        // an 86 GB footprint) on a Mac, enough to take a smaller machine down.
         #[cfg(feature = "reth-libmdbx")]
         if rate.is_some() {
             let root = tmp.path().join("composite_mdbx_prod");
@@ -1019,6 +1021,7 @@ fn workload_mixed() {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_mixed_compaction() {
+    crate::pack_bench::check_bench_temp_dir();
     consensus_cost_pairs(
         "compaction's cost to consensus",
         ["Split-nocompact", "Split"],
@@ -1229,6 +1232,7 @@ impl Workload for BatchCache {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_batch_cache() {
+    crate::pack_bench::check_bench_temp_dir();
     let rt = Runtime::new().expect("tokio runtime");
     for (size, count) in [(16 * 1024, 4_000), (256 * 1024, 400)] {
         let tmp = tempfile::tempdir().expect("temp dir");
@@ -1414,6 +1418,7 @@ fn reload<DB: Database>(
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_startup_reload() {
+    crate::pack_bench::check_bench_temp_dir();
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut cols = Vec::new();
     // A leaked handle with its lock released, as after a crashed process. The raw columns only
@@ -1605,6 +1610,7 @@ impl Workload for ChurnWorkload {
 #[test]
 #[ignore = "on-demand production-workload benchmark; run with --ignored --nocapture --test-threads 1"]
 fn workload_compaction() {
+    crate::pack_bench::check_bench_temp_dir();
     let rt = Runtime::new().expect("tokio runtime");
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut w = ChurnWorkload;
@@ -1658,6 +1664,7 @@ fn workload_compaction() {
 #[test]
 #[ignore = "on-demand file-system probe; run with --ignored --nocapture"]
 fn msync_concurrency_probe() {
+    crate::pack_bench::check_bench_temp_dir();
     use crate::archive::{
         data_file::MmapFileOptions,
         pack::{Pack, PackCompression},

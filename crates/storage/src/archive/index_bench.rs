@@ -11,7 +11,7 @@
 //! Run it on demand (it is `#[ignore]`d out of the default suite):
 //!
 //! ```text
-//! cargo test -p tn-storage index_bench -- --ignored --nocapture --test-threads 1
+//! cargo test --release -p tn-storage index_bench -- --ignored --nocapture --test-threads 1
 //! ```
 //!
 //! It sweeps a set of index sizes `N` (env `INDEX_BENCH_N=200000,2000000` overrides; default
@@ -263,10 +263,11 @@ fn print_table(rows: &[String], cols: &[(&str, Vec<Duration>)]) {
 /// regression baseline and a head-to-head comparison of the ops they share.
 ///
 /// On-demand perf test (kept out of the default suite). Run with:
-/// `cargo test -p tn-storage index_bench -- --ignored --nocapture --test-threads 1`.
+/// `cargo test --release -p tn-storage index_bench -- --ignored --nocapture --test-threads 1`.
 #[test]
 #[ignore = "on-demand index perf-regression + comparison benchmark; run with --ignored --nocapture --test-threads 1"]
 fn index_bench() {
+    crate::pack_bench::check_bench_temp_dir();
     let header = DataHeader::new(0, PackCompression::None, 0);
     let sizes = n_sizes();
     let rows = row_labels(&sizes);

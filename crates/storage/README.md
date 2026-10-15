@@ -253,8 +253,8 @@ cargo test --release -p tn-storage --lib -- <path> --exact --ignored --nocapture
 ```
 
 - **Always `--release`.**
-- **The database files go under `TMPDIR`,** which must be on the disk under test. The workload
-  and pack benches refuse tmpfs, where syncs are free.
+- **The database files go under `TMPDIR`,** which must be on the disk under test. On Linux every
+  bench refuses tmpfs and ramfs, where syncs are free (`pack_bench::check_bench_temp_dir`).
 - **macOS `fsync` and `msync` don't flush the drive's cache,** so durability numbers come from
   Linux.
 - **Paced runs leave the machine idle between operations,** so on a laptop they include CPU and
@@ -274,7 +274,7 @@ cargo test --release -p tn-storage --lib -- <path> --exact --ignored --nocapture
 
 | path | measures | knobs |
 |---|---|---|
-| `pack_bench::consensus_pack_workload` | production-shaped `ConsensusChain` traffic: real signed outputs saved and persisted at 2/s while readers look up headers, batches and output bytes; the save (and its parts: check, encode, append+index), the persist (each sync half) and read latencies; compression | `TN_BENCH_PACK_{RATE,OUTPUTS,BATCH_KB,COMMITTEE,MAX_MB,READ_SECS}`; `TN_BENCH_PACK_READERS=0` (the writer alone), `TN_BENCH_PACK_NO_SLOTS=1` (persist the pack without the slot syncs; a measurement only) |
+| `pack_bench::consensus_pack_workload` | production-shaped `ConsensusChain` traffic: real signed outputs saved and persisted at 2/s while readers look up headers, batches and output bytes; the save (and its parts: check, encode, append+index), the persist (each sync half) and read latencies; compression | `TN_BENCH_PACK_{RATE,OUTPUTS,BATCH_KB,COMMITTEE,MAX_MB,READ_SECS}`; `TN_BENCH_PACK_READERS=0` (the writer alone), `TN_BENCH_PACK_NO_SLOTS=1` (persist the pack without the slot syncs; a measurement only), `TN_BENCH_PACK_BATCH_REQ` (batches per request, default 5) |
 | `pack_bench::pack_file_bench` | the `ConsensusPack` operations one at a time on small outputs, a regression baseline by output width | |
 | `workload_bench::workload_consensus_rounds` | consensus rounds on the epoch tables at two committee sizes: ms per round, durable vote and header latency | `TN_BENCH_COLUMNS` |
 | `workload_bench::workload_batch_cache` | the batch cache at two batch sizes: write MB/s, gets/s with 4 readers | `TN_BENCH_COLUMNS` |

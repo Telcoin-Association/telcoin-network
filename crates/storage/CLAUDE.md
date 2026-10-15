@@ -107,8 +107,8 @@ and remember that everything after `mod test` is tests (more than half of `conse
   - a failed save rolls back, and the next open rebuilds the indexes (README design decision 17).
   - `CertificatePack`, `EpochRecordDb` and `LatestConsensus` stay actor threads by decision: their
     traffic is too low for locks to pay, and an actor keeps their order, backpressure and panic
-    containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is updated on its thread,
-    after a successful save.
+    containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is rebuilt on its thread
+    from the stored records after every save, whatever its outcome (`sync_routing`).
 - **Encode changes must keep the bytes on disk identical.** Prove it the way
   `stored_append_matches_append` and `test_split_encoding_matches_one_lane` do.
 - **Sub-dag serde is fork-gated** (fields written only after their fork). Cache what a pack read
@@ -151,8 +151,8 @@ and remember that everything after `mod test` is tests (more than half of `conse
 - **The catalog:** the README's "Benchmarks" section (what each bench measures, its command and
   its knobs).
 - **How to run them:**
-  - always `--release`, with `TMPDIR` on the disk under test (on Linux the workload and pack
-    benches refuse tmpfs and ramfs);
+  - always `--release`, with `TMPDIR` on the disk under test (on Linux every bench refuses tmpfs
+    and ramfs);
   - macOS fsync and msync don't flush the drive, so durability numbers come from Linux.
 - **Two scripts:**
   - `etc/storage-baseline-bench.sh <dir>` runs the workload suite plus

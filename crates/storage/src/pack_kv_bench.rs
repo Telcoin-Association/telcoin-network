@@ -620,6 +620,7 @@ fn print_table(title: &str, legend: &str, rows: &[String], cols: &[(&str, Vec<Du
 #[test]
 #[ignore = "on-demand pack-file-KV vs MDBX comparison; run with --ignored --nocapture --test-threads 1"]
 fn pack_vs_mdbx_bench() {
+    crate::pack_bench::check_bench_temp_dir();
     // --- point-KV table: digest pack vs btree pack vs MDBX (the ops all three share) ---
     let rows = row_labels();
     let mut cols: Vec<(&str, Vec<Duration>)> = Vec::new();
@@ -919,6 +920,7 @@ fn print_rate_table(title: &str, legend: &str, rows: &[String], cols: &[(&str, V
 #[test]
 #[ignore = "on-demand concurrent read benchmark; run with --ignored --nocapture --test-threads 1"]
 fn kv_concurrent_read_bench() {
+    crate::pack_bench::check_bench_temp_dir();
     let mut cols: Vec<(&str, Vec<f64>)> = Vec::new();
     println!("  running tndb ...");
     cols.push((

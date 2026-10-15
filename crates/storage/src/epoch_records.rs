@@ -155,23 +155,21 @@ fn run_db_loop(
                 let _ = tx.send(res);
             }
             EpochDbMessage::SaveRecord(record, tx) => {
-                let route = (record.epoch, record.final_consensus.number);
                 let res = inner.save_record(record);
-                match &res {
-                    Ok(()) => route_stored_record(&final_numbers, route),
-                    Err(e) => error!(target: "epoch-db", %e, "failed to save epoch record"),
+                if let Err(e) = &res {
+                    error!(target: "epoch-db", %e, "failed to save epoch record");
                 }
+                // Whatever the outcome: a save can store its record and still fail (its
+                // certificate), and the routing follows what is stored.
+                sync_routing(&mut inner, &final_numbers);
                 let _ = tx.send(res);
             }
             EpochDbMessage::Save(record, cert, tx) => {
-                let route = (record.epoch, record.final_consensus.number);
                 let res = inner.save(record, cert);
-                match &res {
-                    Ok(()) => route_stored_record(&final_numbers, route),
-                    Err(e) => {
-                        error!(target: "epoch-db", %e, "failed to save epoch record and certificate")
-                    }
+                if let Err(e) = &res {
+                    error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
                 }
+                sync_routing(&mut inner, &final_numbers);
                 let _ = tx.send(res);
             }
             EpochDbMessage::SaveCertificate(digest, cert, tx) => {
@@ -256,19 +254,30 @@ fn run_db_loop(
     }
 }
 
-/// Route `(epoch, final number)` of a record the database now stores (saved, or already stored):
-/// a new epoch is appended, so the routing stays in epoch order, and an epoch already routed keeps
-/// its entry (first write wins, the record the database serves). Called on the database's thread
-/// before the save is answered, so a stored record is routed by the time its writer hears back,
-/// and a refused write never touches the routing.
-fn route_stored_record(final_numbers: &Mutex<Vec<u64>>, (epoch, number): (Epoch, u64)) {
+/// Extend the by-number routing to every epoch the database stores, each from its stored
+/// (first-write-wins) record, as [`EpochRecordDb::open`] builds it. Run on the database's thread
+/// after every record save, whatever its outcome (a save can store its record and then fail on its
+/// certificate), before the writer hears back: so a stored record is routed by then, a refused one
+/// never is, and the routing never has a gap. Records are stored contiguously in epoch order, so
+/// the routing stays sorted.
+fn sync_routing(inner: &mut Inner, final_numbers: &Mutex<Vec<u64>>) {
+    let stored_end = inner.start_epoch as usize + inner.epoch_idx.len();
     let mut finals = final_numbers.lock();
-    let epoch = epoch as usize;
-    if epoch >= finals.len() {
-        // Epochs are stored contiguously, so this is the next one; a gap (none is possible) is
-        // left as zero, as `EpochRecordDb::open` builds the routing.
-        finals.resize(epoch, 0);
-        finals.push(number);
+    if finals.is_empty() {
+        // Epochs before the first stored one route to it, as `open` leaves them.
+        finals.resize(inner.start_epoch as usize, 0);
+    }
+    while finals.len() < stored_end {
+        let epoch = finals.len() as Epoch;
+        match inner.try_record_by_epoch(epoch) {
+            Ok(Some(record)) => finals.push(record.final_consensus.number),
+            other => {
+                // Stop rather than leave a hole: a number past here routes to this epoch, and the
+                // next save tries again.
+                error!(target: "epoch-db", epoch, ?other, "stored epoch record unreadable; routing stops before it");
+                break;
+            }
+        }
     }
 }
 
@@ -488,7 +497,7 @@ impl EpochRecordDb {
         // Build `final_numbers` from the records the actor serves: the position index's
         // (first-write-wins) record for each epoch, not a raw walk of the log, where a duplicate
         // left by an interrupted save may differ from the indexed record. Index it by absolute
-        // epoch (matching `route_stored_record`). (Epochs are contiguous from the first stored one
+        // epoch (matching `sync_routing`). (Epochs are contiguous from the first stored one
         // by construction, so there are no gaps to leave as zero.)
         let mut final_numbers: Vec<u64> = Vec::with_capacity(inner.epoch_idx.len());
         for slot in 0..inner.epoch_idx.len() as u64 {
@@ -1184,9 +1193,8 @@ impl EpochRecordDb {
     /// Find the epoch for a consensus header number.
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
-    /// lookup. The vector is sorted because the database's thread appends an epoch's entry only
-    /// once its record is stored, and records are stored in epoch order
-    /// ([`route_stored_record`]). If `number` is beyond the last stored epoch, returns
+    /// lookup. The vector is sorted because the database's thread extends it from the stored
+    /// records, which are stored in epoch order ([`sync_routing`]). If `number` is beyond the last stored epoch, returns
     /// `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
         let finals = self.final_numbers.lock();
@@ -2801,6 +2809,68 @@ mod test {
         let reopened = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
         assert_eq!(*reopened.final_numbers.lock(), routing, "rebuilt from the stored records");
         reopened.close().await;
+    }
+
+    /// A save that stores its record and then fails on the certificate (here a certificates log
+    /// that refuses appends) still routes the record, so the next epoch's save leaves no gap: the
+    /// routing stays sorted and every number reaches its epoch, wherever the failure lands.
+    #[tokio::test]
+    async fn a_record_stored_by_a_failed_save_is_still_routed() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        for k in [3_u32, 5, 11] {
+            let dir = TempDir::with_prefix("failed_save_routing").expect("temp dir");
+            let mut parent = EpochDigest::default();
+            let pairs: Vec<_> = (0..k + 2)
+                .map(|epoch| {
+                    let pair = make_test_pair(epoch, &signers, parent);
+                    parent = pair.0.digest();
+                    pair
+                })
+                .collect();
+            {
+                let db = EpochRecordDb::open(dir.path()).expect("open db");
+                for (record, cert) in pairs[..k as usize].iter().cloned() {
+                    db.save(record, cert).await.expect("save");
+                }
+                db.persist().await.expect("persist");
+                db.close().await;
+            }
+            // Reopen with the certificates log refusing appends.
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open");
+            inner.certs.fail_next_append_for_test();
+            let finals: Vec<u64> = pairs[..k as usize]
+                .iter()
+                .map(|(record, _)| record.final_consensus.number)
+                .collect();
+            let (tx, rx) = tokio::sync::mpsc::channel(1000);
+            let final_numbers = Arc::new(parking_lot::Mutex::new(finals));
+            let routing = final_numbers.clone();
+            let handle = std::thread::spawn(move || super::run_db_loop(inner, rx, routing));
+            let db = EpochRecordDb {
+                tx,
+                handle: Arc::new(parking_lot::Mutex::new(Some(handle))),
+                final_numbers,
+                dead_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+
+            let (record_k, cert_k) = pairs[k as usize].clone();
+            db.save(record_k.clone(), cert_k).await.expect_err("the certificate append fails");
+            assert!(db.contains_epoch(k).await, "k={k}: the record is stored despite the error");
+            // Routed at once, not only at the next save: a number past epoch k's last is k + 1's.
+            let past_k = record_k.final_consensus.number + 1;
+            assert_eq!(db.number_to_epoch(past_k), k + 1, "k={k}: routed by the failed save");
+            db.save_record(pairs[k as usize + 1].0.clone()).await.expect("the next epoch's record");
+
+            let finals = db.final_numbers.lock().clone();
+            assert!(finals.windows(2).all(|w| w[0] <= w[1]), "k={k}: sorted routing {finals:?}");
+            assert_eq!(finals.len(), k as usize + 2, "k={k}: both new epochs routed");
+            for (epoch, (record, _)) in pairs.iter().enumerate() {
+                let last = record.final_consensus.number;
+                assert_eq!(db.number_to_epoch(last), epoch as Epoch, "k={k}: epoch {epoch}");
+            }
+            db.close().await;
+        }
     }
 
     #[test]

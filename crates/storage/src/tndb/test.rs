@@ -2089,6 +2089,85 @@ fn test_tndb_rollback_flushes_the_zeroed_batch() {
     db.insert::<TestTable>(&2, &"b".to_string()).expect("not latched: a later write works");
 }
 
+/// A database whose manifest (`<root>/tables`) is lost does not open as an empty one, which would
+/// drop its tables' rows and hand their ids to new tables: its log is replayed, and the first
+/// record, of a table no manifest names, fails the open. Nothing is deleted on the way.
+#[test]
+fn test_tndb_a_lost_manifest_fails_the_open() {
+    let tmp = TempDir::with_prefix("tndb_lost_manifest").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+        block_on(db.persist::<TestTable>()).expect("persist");
+    }
+    let manifest = tmp.path().join("tables");
+    assert!(manifest.exists(), "the manifest's path");
+    std::fs::remove_file(&manifest).expect("lose the manifest");
+    let before = files_under(tmp.path());
+    let reopened = TnDatabase::open_with(
+        tmp.path(),
+        TnDbOptions { commit: CommitMode::Group, ..Default::default() },
+    );
+    assert!(reopened.is_err(), "a log with records and no manifest must not open empty");
+    assert_eq!(files_under(tmp.path()), before, "and the failed open deleted nothing");
+
+    // A fresh database (no records) still opens without one.
+    let fresh = TempDir::with_prefix("tndb_fresh_no_manifest").expect("temp dir");
+    drop(open(fresh.path(), CommitMode::Group));
+    std::fs::remove_file(fresh.path().join("tables")).ok();
+    drop(open(fresh.path(), CommitMode::Group));
+}
+
+/// Every file path under `dir`, sorted.
+fn files_under(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(dir) = todo.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                todo.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// A rolled-back batch's flush is a sync of the log like a round's, and runs under the same lock:
+/// with a round in flight (its lock held here), the rollback waits for it instead of syncing beside
+/// it, where it could take a writeback error the round must see.
+#[test]
+fn test_tndb_rollback_flush_waits_for_a_running_sync_round() {
+    let tmp = TempDir::with_prefix("tndb_rollback_one_sync").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    let before = db.core().rollback_flushes();
+    db.core().fail_next_batch();
+    let db = &db;
+    std::thread::scope(|s| {
+        let round = db.core().sync_lock.lock();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer = s.spawn(move || {
+            let failed = db.insert::<TestTable>(&2, &"b".to_string());
+            let _ = done_tx.send(());
+            failed
+        });
+        assert!(
+            done_rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the rollback flushed beside a running sync round"
+        );
+        drop(round);
+        done_rx.recv_timeout(Duration::from_secs(10)).expect("the rollback finishes after it");
+        assert!(writer.join().expect("writer").is_err(), "the batch failed");
+    });
+    assert_eq!(db.core().rollback_flushes() - before, 1, "and its zeros were flushed");
+    db.insert::<TestTable>(&3, &"c".to_string()).expect("not latched: a later write works");
+}
+
 /// In `Sync` mode a write that changes nothing (removing an absent key) still waits until the
 /// state it observed is durable: here the key's removal by another writer, whose sync is paused.
 #[test]

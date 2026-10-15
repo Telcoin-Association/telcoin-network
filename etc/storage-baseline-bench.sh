@@ -75,8 +75,15 @@ if ! cargo test --release -p tn-storage --all-features --lib --no-run >"$build_l
     tail -30 "$build_log" >&2
     exit 1
 fi
-bin="$repo/$(grep -o 'target/release/deps/tn_storage-[0-9a-f]*' "$build_log" | head -1)"
+# The test binary cargo reports (under any CARGO_TARGET_DIR), made absolute.
+bin="$(grep -oE 'Executable unittests src/lib.rs \([^)]+\)' "$build_log" | tail -1 |
+    sed -E 's/.*\((.*)\)/\1/' || true)"
+case "$bin" in /*) ;; *) bin="$repo/$bin" ;; esac
 rm -f "$build_log"
+if [ ! -x "$bin" ]; then
+    echo "error: no tn-storage test binary found in cargo's output" >&2
+    exit 1
+fi
 tests="$("$bin" --list --ignored 2>/dev/null || true)"
 if ! grep -q 'workload_mixed_compaction' <<<"$tests" ||
     ! grep -q 'consensus_pack_workload' <<<"$tests"; then
@@ -112,7 +119,9 @@ kv free "$(df -h "$bench_dir" | awk 'NR==2 {print $4}')"
 if [ "$os" = "Linux" ]; then
     kv mount "$(try findmnt -n -o SOURCE,FSTYPE,OPTIONS -T "$bench_dir")"
     src="$(findmnt -n -o SOURCE -T "$bench_dir" 2>/dev/null || true)"
-    dev="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1)"
+    src="${src%%\[*}" # btrfs reports `/dev/x[/subvolume]`
+    # Not every source is a block device (ZFS, overlay): no device then, and the script goes on.
+    dev="$(lsblk -n -o PKNAME "$src" 2>/dev/null | head -1 || true)"
     [ -n "$dev" ] || dev="$(basename "$src")"
     kv device "$(try lsblk -d -n -o NAME,MODEL,ROTA,SIZE,TRAN "/dev/$dev")"
     kv scheduler "$(try cat "/sys/block/$dev/queue/scheduler")"

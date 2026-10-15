@@ -103,13 +103,19 @@ pub(crate) fn fsync_directory(path: &Path) -> Result<(), io::Error> {
 /// `fsync(2)` `file`: [`File::sync_all`] everywhere but macOS, where that is `F_FULLFSYNC`
 /// (see the module docs' Durability section) and this is a plain `fsync`.
 pub(crate) fn fsync_file(file: &File) -> io::Result<()> {
+    // Retried when a signal interrupts it, as `File::sync_all` does: every caller fail-stops on a
+    // sync error, and an interrupted call is not one.
     #[cfg(target_os = "macos")]
-    // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches no
-    // Rust memory.
-    let synced = if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::last_os_error())
+    let synced = loop {
+        // SAFETY: `fsync` on a file descriptor `file` owns and keeps open for the call; it touches
+        // no Rust memory.
+        if unsafe { libc::fsync(file.as_raw_fd()) } == 0 {
+            break Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            break Err(error);
+        }
     };
     #[cfg(not(target_os = "macos"))]
     let synced = file.sync_all();

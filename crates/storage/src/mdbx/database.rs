@@ -168,7 +168,52 @@ fn resolve_sync_mode(raw: Option<std::ffi::OsString>) -> eyre::Result<reth_libmd
     .map(|parsed| parsed.unwrap_or(BUILD_SYNC_MODE))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next [`MdbxDatabase::try_for_each`] on this thread to reach this many rows
+    /// fails there.
+    static FAIL_WALK_AFTER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Test-only: the next [`MdbxDatabase::try_for_each`] on this thread to reach `rows` rows fails
+/// there, as a cursor error part way through a table would (a shorter walk leaves it armed).
+#[cfg(test)]
+pub(crate) fn fail_next_walk_after(rows: usize) {
+    FAIL_WALK_AFTER.with(|fail| fail.set(Some(rows)));
+}
+
 impl MdbxDatabase {
+    /// Hand every row of table `T` to `row`, in key order, returning how many there were. Unlike
+    /// [`Database::iter`], whose iterator ends at the first cursor error, a failed read is returned
+    /// as an error, and the walk must see as many rows as MDBX's own statistics count for the
+    /// table: for copying a table out (the move to tndb), where a walk cut short would lose rows
+    /// without a word.
+    pub(crate) fn try_for_each<T: Table>(
+        &self,
+        mut row: impl FnMut(T::Key, T::Value) -> eyre::Result<()>,
+    ) -> eyre::Result<usize> {
+        let txn = self.read_txn()?;
+        let dbi = txn.get_dbi::<T>()?;
+        let expected = txn.inner.db_stat(dbi)?.entries();
+        let mut cursor = txn.inner.cursor_with_dbi(dbi)?;
+        #[cfg(test)]
+        let fail_after = FAIL_WALK_AFTER.with(std::cell::Cell::get);
+        let mut rows = 0;
+        while let Some((key, value)) = cursor.next::<Vec<u8>, Vec<u8>>()? {
+            #[cfg(test)]
+            if fail_after == Some(rows) {
+                FAIL_WALK_AFTER.with(|fail| fail.set(None));
+                eyre::bail!("injected cursor error in table {} after {rows} rows", T::NAME);
+            }
+            row(decode_key::<T::Key>(&key), decode::<T::Value>(&value))?;
+            rows += 1;
+        }
+        if rows != expected {
+            eyre::bail!("table {}: read {rows} rows, but MDBX counts {expected}", T::NAME);
+        }
+        Ok(rows)
+    }
+
     /// Creates a new database at the specified path if it doesn't exist. Does NOT create tables.
     /// Check `init_db`.
     pub fn open<P: AsRef<Path>>(

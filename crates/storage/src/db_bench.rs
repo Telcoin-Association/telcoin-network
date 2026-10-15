@@ -192,7 +192,7 @@ fn bench_small_commits<DB: Database>(rt: &Runtime, db: &DB) -> Duration {
     start.elapsed()
 }
 
-/// Like [`bench_small_commits`] but `sync_persist`s after each commit — the durable externalization
+/// Like [`bench_small_commits`] but awaits `persist` after each commit — the durable externalization
 /// pattern (proposer header / vote / proposed-cert), where losing a record across a crash would let
 /// an honest node equivocate. This is the row where async-layered and raw-durable diverge most.
 fn bench_durable_commits<DB: Database>(rt: &Runtime, db: &DB) -> Duration {
@@ -454,6 +454,7 @@ fn build_layered_mdbx_prod(path: &Path) -> LayeredDatabase<MdbxDatabase> {
 #[test]
 #[ignore = "on-demand DB performance comparison; run with --ignored --nocapture --test-threads 1"]
 fn db_backend_comparison() {
+    crate::pack_bench::check_bench_temp_dir();
     let tmp = tempfile::tempdir().expect("temp dir");
     let base = tmp.path();
     let mut suite = BenchSuite::new();

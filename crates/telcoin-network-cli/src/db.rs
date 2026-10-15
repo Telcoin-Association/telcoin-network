@@ -75,9 +75,9 @@ enum DbSubcommand {
     /// Load an EVM state-export pack into a new reth database under the datadir.
     LoadState(DbLoadStateArgs),
 
-    /// Report what the node's tndb consensus database holds (a node built with the `tndb`
-    /// feature): per environment, its generation, log, live and dead bytes, and each table's rows
-    /// and index state. Read-only (changes no file); refuses while the node has it open.
+    /// Report what the node's tndb consensus database holds: per environment, its generation,
+    /// log, live and dead bytes, and each table's rows and index state. Read-only (changes no
+    /// file); refuses while a node holds the datadir, as the other at-rest tools do.
     TndbStat,
 }
 
@@ -1506,6 +1506,10 @@ fn db_stats_table(db: &DatabaseEnv) -> eyre::Result<ComfyTable> {
 /// `db tndb-stat`: print the report of the node's tndb database (see
 /// [`tn_storage::tndb::inspect_split`]), failing if an environment could not be read.
 fn tndb_stat(datadir: &PathBuf) -> eyre::Result<()> {
+    // Held for the whole report, as the other at-rest tools hold it: a node starting meanwhile is
+    // refused at its datadir lock with a clear error, instead of panicking when it finds its
+    // databases locked.
+    let _pid_lock = PidLock::acquire(datadir)?;
     let root = datadir.consensus_db_path().join(tn_storage::tndb::TNDB_DIR);
     if !root.is_dir() {
         println!("(no tndb database at {})", root.display());

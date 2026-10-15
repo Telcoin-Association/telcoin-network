@@ -236,6 +236,15 @@ pub(crate) fn migrate_from_mdbx(
 
     let marker = tndb_root.join(tndb::MDBX_MIGRATED);
     if marker.exists() {
+        // Done before. An MDBX environment here now was made by an older binary run since (a
+        // downgrade): it is never read, so what that binary recorded (its votes, its last
+        // proposal) is not in tndb. Say so; it is the operator's to resolve.
+        for env in ["epoch", "kad", "cache"] {
+            let data = store_path.join(env).join("mdbx.dat");
+            if data.exists() {
+                tracing::error!(target: "tn::storage", "{} was written after this node moved to tndb (by an older binary?) and is not read; anything it holds is not in the consensus DB", data.display());
+            }
+        }
         return Ok(0);
     }
     // An environment exists only if its data file does: opening an absent one would create it.
@@ -266,6 +275,10 @@ pub(crate) fn migrate_from_mdbx(
         copied += copy_table::<OurNodeBatchesCache, _>(&src, db, 64)?;
     }
     db.wait_durable_blocking()?;
+    // The new tndb directories' own entries too (`<store>/tndb`, and its environments in it),
+    // before anything of MDBX's is deleted: a power loss must not keep the deletions but lose them.
+    archive::data_file::fsync_directory(tndb_root)?;
+    archive::data_file::fsync_directory(store_path)?;
     // Only now, with every row copied durable in tndb (and each environment closed).
     for dir in &read {
         remove_mdbx_env(store_path, dir)?;
@@ -287,9 +300,10 @@ pub(crate) fn migrate_from_mdbx(
     Ok(copied)
 }
 
-/// The files MDBX keeps in an environment's directory.
+/// The files MDBX keeps in an environment's directory, in the order they are deleted: the data
+/// file last, since its presence is what marks an environment still to move (and to delete).
 #[cfg(feature = "reth-libmdbx")]
-const MDBX_FILES: [&str; 2] = ["mdbx.dat", "mdbx.lck"];
+const MDBX_FILES: [&str; 2] = ["mdbx.lck", "mdbx.dat"];
 
 /// Delete the MDBX environment `dir` under `store_path`, whose rows are durably in tndb: MDBX's own
 /// files, then the directory if nothing else is in it. A file MDBX did not make is kept, with its
@@ -321,6 +335,8 @@ const ROWS_PER_TXN: usize = 10_000;
 
 /// Copy every row of table `T` from `src` into `dst`, in transactions of at most `rows_per_txn`
 /// rows (the whole copy is made durable, and marked done, by the caller). Returns the rows copied.
+/// A read error, or fewer rows than MDBX counts, is an error ([`MdbxDatabase::try_for_each`]):
+/// MDBX is deleted after the copy, so a copy cut short must never look complete.
 #[cfg(feature = "reth-libmdbx")]
 fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     src: &MdbxDatabase,
@@ -330,16 +346,17 @@ fn copy_table<T: tn_types::Table, D: tn_types::Database>(
     use tn_types::{Database as _, DbTxMut as _};
 
     src.open_table::<T>()?;
-    let mut rows = 0;
     let mut txn = dst.write_txn()?;
-    for (key, value) in src.iter::<T>() {
+    let mut in_txn = 0;
+    let rows = src.try_for_each::<T>(|key, value| {
         txn.insert::<T>(&key, &value)?;
-        rows += 1;
-        if rows % rows_per_txn == 0 {
-            txn.commit()?;
-            txn = dst.write_txn()?;
+        in_txn += 1;
+        if in_txn == rows_per_txn {
+            std::mem::replace(&mut txn, dst.write_txn()?).commit()?;
+            in_txn = 0;
         }
-    }
+        Ok(())
+    })?;
     txn.commit()?;
     Ok(rows)
 }
@@ -483,6 +500,32 @@ mod migrate_test {
         std::fs::remove_file(root.join(MDBX_MIGRATED)).expect("remove the marker");
         assert_eq!(migrate_from_mdbx(store, &root, &db).expect("rerun"), 0, "nothing left to copy");
         assert!(root.join(MDBX_MIGRATED).exists(), "the marker, written again");
+    }
+
+    /// A read error part way through a table fails the move, before anything of MDBX's is deleted
+    /// or the move is marked done: the next open copies again, from the intact MDBX.
+    #[test]
+    fn test_migrate_from_mdbx_keeps_mdbx_when_a_table_read_fails() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_read_error").expect("temp dir");
+        let store = tmp.path();
+        let vote = VoteInfo { epoch: 2, round: 9, vote_digest: VoteDigest::default() };
+        {
+            let mdbx = crate::_open_mdbx(store);
+            for i in 0..10 {
+                mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(i), &vote).expect("vote");
+            }
+            mdbx.sync_persist();
+        }
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        // `LastProposed` is copied first (empty), then `Votes`: fail its walk after 4 rows.
+        crate::mdbx::database::fail_next_walk_after(4);
+        let err = migrate_from_mdbx(store, &root, &db).expect_err("a read error fails the move");
+        assert!(err.to_string().contains("injected cursor error"), "{err}");
+        assert!(store.join("epoch").join("mdbx.dat").exists(), "MDBX is kept");
+        assert!(!root.join(MDBX_MIGRATED).exists(), "and the move is not marked done");
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("retry"), 10, "a retry copies all");
+        assert!(!store.join("epoch").exists(), "then MDBX is deleted");
     }
 
     /// A node with no MDBX data (a fresh node) copies nothing, and records that it is done.

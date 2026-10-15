@@ -567,15 +567,16 @@ impl Writer {
     /// Take a failed batch back: rewind the log to its start and revert each touched index to its
     /// last publish (which, under the write lock, is its state before the batch). A batch that
     /// cannot be taken back stops the writer.
-    fn rollback(&mut self, start: u64, touched: &[TableId]) {
+    fn rollback(&mut self, start: u64, touched: &[TableId], sync_lock: &Mutex<()>) {
         // A panic part way leaves the writer half-reverted: latched, nothing builds on it.
-        if catch_unwind(AssertUnwindSafe(|| self.revert(start, touched))).is_err() {
+        if catch_unwind(AssertUnwindSafe(|| self.revert(start, touched, sync_lock))).is_err() {
             self.stop("a failed batch's rollback panicked".to_string());
         }
     }
 
-    /// Take back a failed batch that began at `start` (see [`Self::rollback`]).
-    fn revert(&mut self, start: u64, touched: &[TableId]) {
+    /// Take back a failed batch that began at `start` (see [`Self::rollback`]). `sync_lock` is the
+    /// log's (`Core::sync_lock`): the rollback's flush is a sync of the log like a round's.
+    fn revert(&mut self, start: u64, touched: &[TableId], sync_lock: &Mutex<()>) {
         #[cfg(test)]
         if std::mem::take(&mut self.panic_in_rollback) {
             panic!("injected panic in a rollback");
@@ -590,6 +591,12 @@ impl Writer {
             // The batch's bytes may be on disk already (a sync round's msync of the page the
             // batch shares with the last published one, or the system's writeback): the zeros
             // must reach the disk too, or a power loss could bring the failed batch back.
+            //
+            // One sync of the log in flight at a time, this one included: a writeback error is
+            // reported once per open file, so a flush beside a sync round could take the error
+            // the round must see, and the round would acknowledge data the disk lost. Holding the
+            // round's lock across the flush and its latch, a round after it finds the failure.
+            let _one_sync = sync_lock.lock();
             if let Err(e) = self.view.msync(start, end) {
                 self.stop(format!("flush a failed batch's rollback: {e}"));
             }
@@ -615,8 +622,9 @@ impl Writer {
     }
 
     pub(super) fn stop(&mut self, cause: String) {
-        tracing::error!(target: "tndb", "{cause}; writes stop until a restart");
+        // Latched before anything else (logging included), so no sync can acknowledge past it.
         self.durability.fail(cause.clone());
+        tracing::error!(target: "tndb", "{cause}; writes stop until a restart");
         self.failed.get_or_insert(cause);
     }
 
@@ -795,10 +803,18 @@ impl Core {
         Manifest::remove_tmp(root);
         // An unfinished compaction is never a generation.
         remove_unfinished(root)?;
-        let manifest = Manifest::read(root)?.unwrap_or_default();
+        let manifest = Manifest::read(root)?;
+        // A log with records always has a manifest (it is written before a table's first record),
+        // so a missing one means it was lost. Its tables' records must not be dropped as an empty
+        // database, nor their ids reused: the log is replayed, and its first record (of a table
+        // the manifest no longer names) fails the open. A fresh database replays nothing.
+        let manifest_lost = manifest.is_none();
+        let manifest = manifest.unwrap_or_default();
         let (gen, mut log, older) = open_current_gen(root)?;
         let gen_path = gen_dir(root, gen);
-        remove_orphan_indexes(&gen_path, &manifest)?;
+        if !manifest_lost {
+            remove_orphan_indexes(&gen_path, &manifest)?;
+        }
         let header = *log.header();
 
         // Each table's index: a stale or damaged one is rebuilt from the log.
@@ -829,7 +845,7 @@ impl Core {
         }
         #[cfg(test)]
         let mut rebuilt = Vec::new();
-        if log.opened_unclean() || !stale.is_empty() {
+        if log.opened_unclean() || !stale.is_empty() || manifest_lost {
             let all = log.opened_unclean();
             let rebuild = |id: TableId| all || stale.contains(&id);
             #[cfg(test)]
@@ -1086,13 +1102,13 @@ impl Core {
         match outcome {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                writer.rollback(start, &touched);
+                writer.rollback(start, &touched, &self.sync_lock);
                 return Err(e);
             }
             Err(panic) => {
                 // Latched first, whatever the rollback then does.
                 writer.stop("a write panicked".to_string());
-                writer.rollback(start, &touched);
+                writer.rollback(start, &touched, &self.sync_lock);
                 drop(writer);
                 resume_unwind(panic);
             }
