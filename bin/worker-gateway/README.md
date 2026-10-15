@@ -854,7 +854,9 @@ internal interface, not the public edge.
 The endpoint reuses the node's `tn-metrics` recorder, so the gateway's
 `tn_worker_gateway_*` series render alongside a node's `tn_*` metrics under one
 Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
-`grafana-worker-gateway.json`.
+`grafana-worker-gateway.json`; its `job` variable (the jobs that scrape
+`tn_worker_gateway_upstream_ready`) scopes every panel, so a node's series in
+the same Prometheus stay out of it.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
@@ -897,7 +899,9 @@ counters above still count every request, including the rejections that log
 nothing per request (`405`, `429`, the deadline's `408` and `504`, `-32010`, `-32011` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
-shared recorder's reth-compatible naming.
+shared recorder's reth-compatible naming, so they share their names with a
+node's own process metrics; the dashboard tells them apart by its `job`
+variable, and its process panels show one series per replica.
 
 ### Access log
 
@@ -945,10 +949,10 @@ Every limit is per process, so the worker sees the sum over all gateways.
   Size `--rate-limit-global` as the worker's budget divided by that N.
   With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives submissions, up to N × `--rate-limit-submissions` requests per second, each carrying up to the batch cap; the calls beyond the first, and the [reads kept on the worker](#reads-kept-on-the-worker), count against `--rate-limit-global`; size that flag the same way.
   With `--rate-limit-submissions` set and no redirect, the worker receives both budgets, so keep N × (`--rate-limit-global` + `--rate-limit-submissions`) within the worker's budget.
-- **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
-  Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`.
-  The reference manifest does not on its own: its HPA allows 10 replicas, and 10 × 100 (the default cap) is 1000, above the worker's 500.
-  Lower the cap to 49 or less (10 × 49 = 490), lower `maxReplicas`, or raise the worker's `--rpc.max-connections` above N × the cap.
+- **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), which counts in-flight HTTP requests, not TCP connections; the worker answers `429` to everything over its limit.
+  Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`, where N counts every gateway that can hold worker requests at once: the HPA's `maxReplicas`, plus the pod a rollout is replacing while it drains.
+  At the default cap (100) the reference manifest's 10 replicas plus that one could hold 1100, above the worker's 500, so the manifest sets the cap to 45 (11 × 45 = 495).
+  For a higher replica ceiling lower the cap with it, or raise the worker's `--rpc.max-connections` above N × the cap.
   With `--redirect-queries` only submissions and the [reads kept on the worker](#reads-kept-on-the-worker) reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s (reth's `--rpc.send-raw-transaction-sync-timeout`, inside the gateway's 35 s `--upstream-request-timeout`); a gateway whose cap is full answers `503` / `-32009` itself instead of letting the worker refuse submissions from every gateway.
 - **Memory.** Peak request memory per gateway is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 
@@ -1013,15 +1017,17 @@ Build it from the repository root:
 docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
 ```
 
-Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, Service,
-ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
-`tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
+Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, a
+client Service carrying only the `rpc` port, a cluster-internal
+`worker-gateway-metrics` Service for `/metrics`, a ServiceMonitor, a
+HorizontalPodAutoscaler keyed on the `tn_worker_gateway_inflight_requests`
+gauge, and a PodDisruptionBudget). They are a starting point, not a
 turnkey install: see `deploy/README.md` for the placeholders to replace and the
 prometheus-adapter rule the autoscaler needs.
 
-The reference Service is a `ClusterIP`, so clients reach the gateways through a
-front, and the gateways see that front as every client's address until client
-identity is configured (see
+The reference client Service is a `ClusterIP`, so clients reach the gateways
+through a front, and the gateways see that front as every client's address
+until client identity is configured (see
 [Client identity behind a front](#client-identity-behind-a-front)):
 
 - **Behind an ingress controller or another HTTP proxy**, set `--trusted-proxies`
@@ -1035,9 +1041,11 @@ identity is configured (see
 - **Behind an L4 load balancer**, first check whether it preserves client
   addresses: a `LoadBalancer` or `NodePort` Service with
   `externalTrafficPolicy: Local` does, and the gateway then needs neither
-  mechanism. A balancer that terminates TCP needs PROXY protocol v2 enabled on
-  it, and the gateway started with `--proxy-protocol` and
-  `--proxy-protocol-from` (or `--trusted-proxies`) set to the addresses the
+  mechanism. Changing the client Service (`worker-gateway`) to such a type
+  publishes only its `rpc` port; `/metrics` stays on the cluster-internal
+  `worker-gateway-metrics` Service. A balancer that terminates TCP needs PROXY
+  protocol v2 enabled on it, and the gateway started with `--proxy-protocol`
+  and `--proxy-protocol-from` (or `--trusted-proxies`) set to the addresses the
   balancer connects from. Every connection from those addresses must then
   carry the header, so a kubelet probe on the `rpc` port from one of them is
   closed and the pod never turns ready: the probe listener (`--probe-addr`,

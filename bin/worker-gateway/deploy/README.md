@@ -66,7 +66,10 @@ A Grafana dashboard for the metrics these expose lives at
   A NetworkPolicy that admits only `8545` and `9100`, like the example below, shuts other pods out (on a network plugin that enforces NetworkPolicy) and still lets the kubelet's probes in, because a pod always accepts connections from its own node.
 - `metrics` / `9100` -- Prometheus `/metrics`, enabled by
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
-  **separate** listener from the client port.
+  **separate** listener from the client port, carried by its own
+  cluster-internal Service, `worker-gateway-metrics`, not by the client
+  Service, `worker-gateway`, which carries only `rpc` (see the security note
+  below).
 
 Whatever exposes the `rpc` port must preserve client addresses: the gateway keys `--max-connections-per-ip` and the per-IP rate limit (`--rate-limit-per-ip`) on the resolved client address (the PROXY source or the believed `X-Forwarded-For` entry), so behind an L4 front that neither keeps the source address nor sends a PROXY header (`--proxy-protocol`), both apply to the front's own address and every client shares one budget.
 A front listed in `--trusted-proxies` whose `X-Forwarded-For` is believed is not held to the connection cap; its requests are rate-limited per client.
@@ -117,9 +120,11 @@ The probe port is not counted in the formula: each open probe connection holds u
 `servicemonitor.yaml` uses `monitoring.coreos.com/v1`, which is provided by the
 **Prometheus Operator**. It requires the Operator's CRDs to be installed in the
 cluster and a Prometheus instance whose `serviceMonitorSelector` matches these
-labels. If you scrape Prometheus some other way (static config, annotations,
-Grafana Alloy, ...), delete this file and point your scraper at the `metrics`
-port / `/metrics` path instead.
+labels. It selects the `worker-gateway-metrics` Service by its
+`app.kubernetes.io/component: metrics` label and scrapes its `metrics` port. If
+you scrape Prometheus some other way (static config, annotations, Grafana
+Alloy, ...), delete this file and point your scraper at that Service's
+`metrics` port / `/metrics` path instead.
 
 ## Autoscaling (HPA + prometheus-adapter)
 
