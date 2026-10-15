@@ -174,7 +174,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         ?max_connections_per_ip,
         // the per-ip key's prefix widths (`v4`, `v6`), which also key
         // --max-connections-per-ip
-        ?rate_limit_prefix,
+        rate_limit_v4_prefix = rate_limit_prefix.v4_bits(),
+        rate_limit_v6_prefix = rate_limit_prefix.v6_bits(),
         max_request_bytes,
         ?max_batch_len,
         max_inflight_submissions,
