@@ -491,8 +491,10 @@ mod tests {
                 path.as_os_str(),
             ])
             .map(|_| ())
-            .map_err(|error| error.kind());
-            assert_eq!(result, Err(ErrorKind::ValueValidation), "{path:?}");
+            .map_err(|error| (error.kind(), error.to_string()));
+            let (kind, message) = result.expect_err("bad file must not parse");
+            assert_eq!(kind, ErrorKind::ValueValidation, "{path:?}");
+            assert!(message.contains(path.to_str().expect("utf-8 temp path")), "{message}");
         });
         Ok(())
     }

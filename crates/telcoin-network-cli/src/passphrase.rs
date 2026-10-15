@@ -383,6 +383,12 @@ mod tests {
     }
 
     #[test]
+    fn test_credential_non_utf8_errors() {
+        let err = read_credential_file(b"sek\xffrit\n").unwrap_err();
+        assert!(err.to_string().contains("could not read BLS passphrase credential"), "{err}");
+    }
+
+    #[test]
     fn test_credential_unset_directory_errors() {
         for dir in [None, Some(OsString::new())] {
             let err = read_credential(dir, "bls-passphrase").unwrap_err();
