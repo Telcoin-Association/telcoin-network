@@ -177,7 +177,7 @@ pub(crate) struct Cli {
 
     /// Per-poll timeout for the readiness endpoint and the `--redirect-queries`
     /// probe (a poll that overruns it counts as failed; see
-    /// `--readiness-failure-threshold`).
+    /// `--readiness-failure-threshold`). At most `--readiness-poll-interval`.
     #[arg(
         long,
         env = "WORKER_GATEWAY_READINESS_POLL_TIMEOUT",
@@ -776,6 +776,17 @@ impl Cli {
         ]
         .into_iter()
         .try_for_each(|(flag, value)| ensure_non_zero(flag, value))?;
+        // a poll cycle joins every upstream's poll and the query probe, so it
+        // lasts as long as the slowest, up to the timeout; past the interval
+        // the next cycle of every upstream waits for it
+        eyre::ensure!(
+            self.readiness_poll_timeout <= self.readiness_poll_interval,
+            "--readiness-poll-timeout ({}) must not be longer than --readiness-poll-interval ({}): \
+             a poll cycle lasts up to the timeout, so one hanging upstream or query probe would \
+             stretch every upstream's poll cadence",
+            humantime::format_duration(self.readiness_poll_timeout),
+            humantime::format_duration(self.readiness_poll_interval),
+        );
         // the request deadline covers connection setup too. one that is not
         // longer than the connect timeout ends a stalled connect first, and
         // reqwest reports that like a worker that is slow to answer, so passive
@@ -2271,6 +2282,26 @@ mod tests {
             Err(err) => format!("{err:?}"),
         };
         assert!(message.contains("--readiness-poll-interval"), "{message}");
+    }
+
+    #[test]
+    fn readiness_poll_timeout_above_interval_is_rejected() -> eyre::Result<()> {
+        let message =
+            match cli_with_flags(&["--readiness-poll-interval=1s", "--readiness-poll-timeout=3s"])
+                .into_settings()
+            {
+                Ok(_) => panic!("a poll timeout longer than the interval must fail startup"),
+                Err(err) => format!("{err:?}"),
+            };
+        for text in ["--readiness-poll-timeout (3s)", "--readiness-poll-interval (1s)"] {
+            assert!(message.contains(text), "{message}");
+        }
+        // equal is harmless: a cycle then never outlasts the interval
+        let settings =
+            cli_with_flags(&["--readiness-poll-interval=1s", "--readiness-poll-timeout=1s"])
+                .into_settings()?;
+        assert_eq!(settings.readiness_poll_timeout, Duration::from_secs(1));
+        Ok(())
     }
 
     #[test]
