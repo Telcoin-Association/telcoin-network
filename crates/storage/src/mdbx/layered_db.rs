@@ -779,8 +779,9 @@ impl DurableAck {
 /// Counter of failed layered-DB write operations, labeled by `env` and `op`.
 ///
 /// Prometheus renders the `.` as `_`, so the series is `tn_storage_write_failures_total`. The
-/// `env` label is the name given to [`LayeredDatabase::open_named`]: [`EPOCH_ENV`], [`KAD_ENV`] or
-/// [`CACHE_ENV`] for the layers of a [`CompositeDatabase`](crate::composite_db::CompositeDatabase),
+/// `env` label is the name given to [`LayeredDatabase::open_named`]: `epoch`, `kad` or `cache`
+/// (tndb's environment names) for the layers of a
+/// [`CompositeDatabase`](super::composite_db::CompositeDatabase),
 /// and [`UNNAMED_ENV`] for [`LayeredDatabase::open`]. The `op` label is a [`WriteOp::label`].
 /// Every op except `begin` is a write that failed to reach disk. A failed `begin` loses no write:
 /// the txn's writes go out as bare writes and are counted on their own if they fail, but they are
@@ -791,15 +792,6 @@ const WRITE_FAILURES_METRIC: &str = "tn_storage.write_failures_total";
 /// HELP text of [`WRITE_FAILURES_METRIC`].
 const WRITE_FAILURES_HELP: &str =
     "Layered-DB write operations that failed, by storage environment and operation.";
-
-/// The `env` label of the composite layer holding epoch-scoped tables.
-pub(crate) const EPOCH_ENV: &str = "epoch";
-
-/// The `env` label of the composite layer holding kademlia records.
-pub(crate) const KAD_ENV: &str = "kad";
-
-/// The `env` label of the composite layer holding cache tables, including the batch cache.
-pub(crate) const CACHE_ENV: &str = "cache";
 
 /// The `env` label of a layered DB opened with [`LayeredDatabase::open`].
 const UNNAMED_ENV: &str = "unnamed";

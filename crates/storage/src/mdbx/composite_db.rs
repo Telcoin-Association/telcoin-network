@@ -5,9 +5,8 @@ use std::{future::Future, sync::Arc};
 
 use tn_types::{Database, DbTx, DbTxMut, Table, TableHint};
 
-use crate::layered_db::{
-    LayeredDatabase, LayeredDbStats, LayeredDbTxMut, CACHE_ENV, EPOCH_ENV, KAD_ENV,
-};
+use super::layered_db::{LayeredDatabase, LayeredDbStats, LayeredDbTxMut};
+use crate::tndb::split::{CACHE_ENV, EPOCH_ENV, KAD_ENV};
 
 #[derive(Clone, Debug)]
 struct Inner<DB: Database> {
@@ -273,8 +272,7 @@ impl<DB: Database> DbTxMut for CompositeDbTxMut<DB> {
 #[cfg(test)]
 mod test {
     use crate::{
-        composite_db::CompositeDatabase,
-        mdbx::{database::MEGABYTE, MdbxDatabase},
+        mdbx::{composite_db::CompositeDatabase, database::MEGABYTE, MdbxDatabase},
         test::*,
     };
     use std::path::Path;

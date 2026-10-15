@@ -368,7 +368,9 @@ impl BenchSuite {
 
 // ---- backend construction (mirrors the module-local `open_*` helpers) ----
 
-use crate::{layered_db::LayeredDatabase, mem_db::MemDatabase, tndb::TnDatabase};
+#[cfg(feature = "reth-libmdbx")]
+use crate::mdbx::layered_db::LayeredDatabase;
+use crate::{mem_db::MemDatabase, tndb::TnDatabase};
 
 /// Open both bench tables on `db`; `open_table` propagates through the layered wrapper.
 fn open_bench_tables<DB: Database>(db: &DB) {
@@ -388,6 +390,8 @@ fn build_tndb(path: &Path) -> TnDatabase {
     db
 }
 
+// The layer lives with MDBX (the release before tndb put it over MDBX), and goes with it.
+#[cfg(feature = "reth-libmdbx")]
 fn build_layered_tndb(path: &Path) -> LayeredDatabase<TnDatabase> {
     let db = LayeredDatabase::open(TnDatabase::open(path).expect("open tndb"), true);
     open_bench_tables(&db);
@@ -465,10 +469,10 @@ fn db_backend_comparison() {
 
     suite.run(&runtime, build_mem(), "MemDb");
     suite.run(&runtime, build_tndb(&base.join("tndb")), "TnDb");
-    suite.run(&runtime, build_layered_tndb(&base.join("tndb_layered")), "Layered<TnDb>");
 
     #[cfg(feature = "reth-libmdbx")]
     {
+        suite.run(&runtime, build_layered_tndb(&base.join("tndb_layered")), "Layered<TnDb>");
         suite.run(&runtime, build_mdbx(&base.join("mdbx")), "MDBX");
         suite.run(&runtime, build_layered_mdbx(&base.join("mdbx_layered")), "Layered<MDBX>");
         suite.run(&runtime, build_mdbx_prod(&base.join("mdbx_prod")), "MDBX-prod");

@@ -16,7 +16,15 @@ use std::path::Path;
 use tn_types::{DBIter, Database, DbTx, DbTxMut, Table, TableHint};
 
 use super::database::{CompactionConfig, TnDatabase, TnDbOptions, TnDbTxMut};
-use crate::layered_db::{CACHE_ENV, EPOCH_ENV, KAD_ENV};
+
+/// The `env` label (metrics) of the environment holding epoch-scoped tables.
+pub(crate) const EPOCH_ENV: &str = "epoch";
+
+/// The `env` label of the environment holding kademlia records.
+pub(crate) const KAD_ENV: &str = "kad";
+
+/// The `env` label of the environment holding cache tables, including the batch cache.
+pub(crate) const CACHE_ENV: &str = "cache";
 
 /// The least log the cache environment compacts automatically at (a larger configured threshold
 /// is kept). The batch caches churn at the batch write rate: at the default 64 MiB, a heavy batch

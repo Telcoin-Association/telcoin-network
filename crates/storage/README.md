@@ -6,10 +6,10 @@ Persistent storage for telcoin-network. Two independent families live here:
    `exec_state_pack`) — the mmap-backed, CRC-checked, compressed WALs that hold consensus output,
    the epoch record/certificate chain, and EVM state snapshots. This is the crate's centre of
    gravity and the focus of most of this document.
-2. **Key/value stores** (`tndb`, `mdbx`, `layered_db`, `composite_db`, `mem_db`, `stores/`) — a
-   `Database` trait over tndb (the node's) or reth's MDBX (the release before, now only the
-   migration's source and a test backend), used for the primary/worker's live consensus state
-   (certificates, payloads, votes, proposer state) and libp2p/Kademlia records.
+2. **Key/value stores** (`tndb`, `mdbx` with its `layered_db` and `composite_db`, `mem_db`,
+   `stores/`) — a `Database` trait over tndb (the node's) or reth's MDBX (the release before, now
+   only the migration's source and a test backend), used for the primary/worker's live consensus
+   state (certificates, payloads, votes, proposer state) and libp2p/Kademlia records.
 
 > **Reviewers & automated scanners:** several patterns below look like bugs but are deliberate. See
 > [Intentional design decisions](#intentional-design-decisions--please-do-not-flag-these) before
@@ -193,9 +193,10 @@ A `Database` trait (in `tn-types::database_traits`: tables, read/write txns, `ge
 `iter`/`skip`) with two persistent backends: **`tndb`** below, the node's (`DatabaseType`), and
 **`MdbxDatabase`** (reth's MDBX, behind the default `reth-libmdbx` feature), the consensus DB of the
 release before tndb, now kept only as the migration's source and for tests and benches (the next
-release removes it). `LayeredDatabase` adds a write-through in-memory layer + a shared-txn guard;
-`CompositeDatabase` splits the workload into `epoch` / `kad` / `cache` sub-databases routed by a
-table hint (both served MDBX). A `redb` backend was removed: it was the slowest, and tndb
+release removes it). The layers that release put over MDBX live in the `mdbx` module and go with
+it: `LayeredDatabase` (`mdbx::layered_db`) adds a write-through in-memory layer and a shared-txn
+guard, and `CompositeDatabase` (`mdbx::composite_db`) splits the workload into `epoch` / `kad` /
+`cache` sub-databases routed by a table hint. A `redb` backend was removed: it was the slowest, and tndb
 replaces it. `MemDatabase` is an in-memory backend for tests. The typed `stores/` (`certificate_store`,
 `payload_store`, `proposer_store`, `vote_digest_store`) wrap the trait for primary/worker state.
 

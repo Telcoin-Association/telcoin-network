@@ -1,5 +1,5 @@
-//! Impermanent storage in memory: the in-memory layer of `LayeredDatabase` (which serves every row
-//! of the full-memory tables in production) and the database most tests run on.
+//! Impermanent storage in memory: the database most tests run on, and the in-memory layer of the
+//! MDBX-era `LayeredDatabase` (`mdbx::layered_db`).
 //!
 //! Each table keeps its rows (`Arc<[u8]>` keys and values, stored once) in two indexes: a sharded
 //! hash map for point reads (`get`, `contains_key`), so a lookup is O(1) and takes only the lock

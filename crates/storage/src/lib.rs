@@ -17,8 +17,6 @@ use tables::{
 };
 pub mod archive;
 pub mod certificate_pack;
-/// The `CompositeDatabase` backend that splits the workload into epoch/kad/cache sub-databases.
-pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
 /// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
@@ -27,10 +25,9 @@ mod db_bench;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
-/// `LayeredDatabase`: a write-behind memory layer whose writer thread commits to a backend.
-pub mod layered_db;
 /// The reth MDBX key/value backend: the consensus DB of the release before tndb (the migration's
-/// source), and a backend for tests and benches.
+/// source), and a backend for tests and benches. With it, the layers that release put over it
+/// (`layered_db`, `composite_db`), which nothing else uses.
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
@@ -51,7 +48,7 @@ pub mod tndb;
 pub use tn_types::error::StoreError;
 
 #[cfg(all(test, feature = "reth-libmdbx"))]
-use crate::composite_db::CompositeDatabase;
+use crate::mdbx::composite_db::CompositeDatabase;
 
 /// Key type for the proposer's last-proposed-header table.
 pub type ProposerKey = u32;

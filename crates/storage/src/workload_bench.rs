@@ -8,8 +8,8 @@
 //!   environment (epoch, kad, batch cache) committing in group mode, so `persist` acks once the
 //!   writes queued before it are durable. The MDBX columns model the release before it: a
 //!   `CompositeDatabase<MdbxDatabase>` routing each table to one of three `LayeredDatabase`s, each
-//!   with one background thread applying writes in order (`db_run` in `layered_db.rs`), the epoch
-//!   and kad layers holding every row in memory and the cache layer only unwritten rows.
+//!   with one background thread applying writes in order (`db_run` in `mdbx/layered_db.rs`), the
+//!   epoch and kad layers holding every row in memory and the cache layer only unwritten rows.
 //! - **A consensus round** (committee N, [`BATCHES_PER_HEADER`] batches per header), all on the
 //!   epoch layer:
 //!   - N certificate writes, each one transaction of the certificate and its by-round and by-origin
@@ -93,15 +93,15 @@ use tokio::{runtime::Runtime, task::JoinSet};
 
 #[cfg(feature = "reth-libmdbx")]
 use crate::{
-    composite_db::CompositeDatabase,
     db_bench::open_mdbx_prod,
     mdbx::{
+        composite_db::CompositeDatabase,
         database::{PROD_CACHE_GROWTH, PROD_CACHE_MAX, PROD_EPOCH_MAX, PROD_GROWTH, PROD_KAD_MAX},
+        layered_db::LayeredDatabase,
         MdbxDatabase,
     },
 };
 use crate::{
-    layered_db::LayeredDatabase,
     mem_db::MemDatabase,
     tndb::{
         stats as tndb_stats, CommitMode, CompactionConfig, SplitDatabase, TnDatabase, TnDbOptions,
@@ -1365,31 +1365,30 @@ fn count_epoch_rows<DB: Database>(db: &DB) -> usize {
         + db.iter::<Payload>().count()
 }
 
-/// Populate a late-epoch database with `open`, close it, then time two reopens: the raw backend
-/// (open plus `open_table`) and the full-memory layer over it (which loads every row into memory).
-/// With `crash` (how to abandon an open handle as a crashed process would, so the next open
-/// recovers), also time both reopens after a crash. Returns the raw and layered report columns.
-/// Every reopen finds the files just written, in the page cache: the times are the open's own
-/// work, not a cold read from the drive (which a restart after a reboot also pays).
+/// Populate a late-epoch database at `dir` with `open`, then close it: its row count.
+fn populate_for_reload<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> usize {
+    println!("  populating {name} ...");
+    let db = open(dir);
+    open_epoch_tables(&db);
+    populate_late_epoch(&db)
+}
+
+/// Populate a late-epoch database with `open`, close it, then time its reopen (open plus
+/// `open_table`). With `crash` (how to abandon an open handle as a crashed process would, so the
+/// next open recovers), also time a reopen after a crash. Every reopen finds the files just
+/// written, in the page cache: the times are the open's own work, not a cold read from the drive
+/// (which a restart after a reboot also pays).
 fn reload<DB: Database>(
     name: &str,
     dir: &Path,
     open: impl Fn(&Path) -> DB,
     crash: Option<fn(DB)>,
-) -> [Column; 2] {
-    let layered_name = format!("Layered<{name}>");
-    if !column_wanted(name) && !column_wanted(&layered_name) {
+) -> Column {
+    if !column_wanted(name) {
         println!("  skipping {name} (not in TN_BENCH_COLUMNS)");
-        return [(name.to_string(), Vec::new()), (layered_name, Vec::new())];
+        return (name.to_string(), Vec::new());
     }
-    println!("  populating {name} ...");
-    let rows = {
-        let db = open(dir);
-        open_epoch_tables(&db);
-        populate_late_epoch(&db)
-    };
-    let disk = disk_bytes(dir);
-
+    let rows = populate_for_reload(name, dir, &open);
     let start = Instant::now();
     let db = open(dir);
     open_epoch_tables(&db);
@@ -1397,14 +1396,7 @@ fn reload<DB: Database>(
     assert_eq!(count_epoch_rows(&db), rows, "{name}: every row readable after a reopen");
     drop(db);
 
-    let start = Instant::now();
-    let db = LayeredDatabase::open(open(dir), true);
-    open_epoch_tables(&db);
-    let layered = start.elapsed();
-    assert_eq!(count_epoch_rows(&db), rows, "{name}: every row loaded into the memory layer");
-    drop(db);
-
-    // After a crash: the files are left unclosed (the handle is leaked), so each reopen recovers.
+    // After a crash: the files are left unclosed (the handle is leaked), so the reopen recovers.
     let crashed = crash.map(|crash| {
         let db = open(dir);
         open_epoch_tables(&db);
@@ -1415,30 +1407,45 @@ fn reload<DB: Database>(
         let raw = start.elapsed();
         assert_eq!(count_epoch_rows(&db), rows, "{name}: every row recovered after a crash");
         crash(db);
-        let start = Instant::now();
-        let db = LayeredDatabase::open(open(dir), true);
-        open_epoch_tables(&db);
-        let layered = start.elapsed();
-        assert_eq!(count_epoch_rows(&db), rows, "{name}: every row recovered and loaded");
-        drop(db);
-        (raw, layered)
+        raw
     });
+    (name.to_string(), reload_cells(raw, crashed, rows, disk_bytes(dir)))
+}
 
-    let cells = |time: Duration, crashed: Option<Duration>| {
-        vec![
-            Cell::ms("reopen ms (warm cache)", time),
-            crashed.map_or_else(
-                || Cell::new("crash reopen ms (warm cache)", Better::Lower, "-".to_string()),
-                |d| Cell::ms("crash reopen ms (warm cache)", d),
-            ),
-            Cell::count("rows", rows),
-            Cell::mb("disk MB", Some(disk)),
-        ]
-    };
-    let keep = |name: &str, cells: Vec<Cell>| if column_wanted(name) { cells } else { Vec::new() };
-    [
-        (name.to_string(), keep(name, cells(raw, crashed.map(|(raw, _)| raw)))),
-        (layered_name.clone(), keep(&layered_name, cells(layered, crashed.map(|(_, l)| l)))),
+/// The full-memory layer of the release before tndb over the database at `dir` (populated by
+/// [`reload`] for `name`, or here when that column was skipped): its reopen loads every row into
+/// memory.
+#[cfg(feature = "reth-libmdbx")]
+fn reload_layered<DB: Database>(name: &str, dir: &Path, open: impl Fn(&Path) -> DB) -> Column {
+    let layered_name = format!("Layered<{name}>");
+    if !column_wanted(&layered_name) {
+        println!("  skipping {layered_name} (not in TN_BENCH_COLUMNS)");
+        return (layered_name, Vec::new());
+    }
+    let rows = if column_wanted(name) { None } else { Some(populate_for_reload(name, dir, &open)) };
+    let start = Instant::now();
+    let db = LayeredDatabase::open(open(dir), true);
+    open_epoch_tables(&db);
+    let layered = start.elapsed();
+    let loaded = count_epoch_rows(&db);
+    if let Some(rows) = rows {
+        assert_eq!(loaded, rows, "{name}: every row loaded into the memory layer");
+    }
+    drop(db);
+    let cells = reload_cells(layered, None, loaded, disk_bytes(dir));
+    (layered_name, cells)
+}
+
+/// A reload column's cells.
+fn reload_cells(time: Duration, crashed: Option<Duration>, rows: usize, disk: u64) -> Vec<Cell> {
+    vec![
+        Cell::ms("reopen ms (warm cache)", time),
+        crashed.map_or_else(
+            || Cell::new("crash reopen ms (warm cache)", Better::Lower, "-".to_string()),
+            |d| Cell::ms("crash reopen ms (warm cache)", d),
+        ),
+        Cell::count("rows", rows),
+        Cell::mb("disk MB", Some(disk)),
     ]
 }
 
@@ -1453,40 +1460,36 @@ fn workload_startup_reload() {
     crate::pack_bench::check_bench_temp_dir();
     let tmp = tempfile::tempdir().expect("temp dir");
     let mut cols = Vec::new();
-    // A leaked handle with its lock released, as after a crashed process. The raw columns only
-    // (no layer goes over tndb).
+    // A leaked handle with its lock released, as after a crashed process.
     let crash_tndb = |db: TnDatabase| {
         db.release_locks_for_crash();
         std::mem::forget(db);
     };
-    let [tndb, _] = reload(
+    cols.push(reload(
         "TnDb",
         &tmp.path().join("tndb"),
         |dir| open_tndb(dir, CommitMode::Sync),
         Some(crash_tndb),
-    );
-    cols.push(tndb);
-    let [tndb_group, _] = reload(
+    ));
+    cols.push(reload(
         "TnDb-group",
         &tmp.path().join("tndb_group"),
         |dir| open_tndb(dir, CommitMode::Group),
         Some(crash_tndb),
-    );
-    cols.push(tndb_group);
-    let [composite, _] = reload(
+    ));
+    cols.push(reload(
         "Split<TnDb-group>",
         &tmp.path().join("split_tndb"),
         |dir| open_split_tndb(dir, CommitMode::Group, CompactionConfig::default()),
         None,
-    );
-    cols.push(composite);
-    #[cfg(feature = "reth-libmdbx")]
-    cols.extend(reload(
-        "MDBX-prod",
-        &tmp.path().join("mdbx_prod"),
-        |dir| open_mdbx_prod(dir, 8, PROD_EPOCH_MAX, PROD_GROWTH),
-        None,
     ));
+    #[cfg(feature = "reth-libmdbx")]
+    {
+        let dir = tmp.path().join("mdbx_prod");
+        let open = |dir: &Path| open_mdbx_prod(dir, 8, PROD_EPOCH_MAX, PROD_GROWTH);
+        cols.push(reload("MDBX-prod", &dir, open, None));
+        cols.push(reload_layered("MDBX-prod", &dir, open));
+    }
     print_table(
         &format!(
             "startup reload: N={RELOAD_COMMITTEE}, {RELOAD_ROUNDS} rounds into the epoch \
