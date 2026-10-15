@@ -447,11 +447,13 @@ pub(crate) async fn run_poller(
     shutdown: Noticer,
 ) -> Result<(), TaskError> {
     let mut ticker = interval(poll_interval);
-    // Skip (do not burst) missed ticks: a cycle that overruns `poll_interval`
-    // (a hanging upstream with a `poll_timeout` longer than the interval) must
-    // not then fire back-to-back catch-up cycles, which would pile extra load
-    // onto already-failing upstreams. `Skip` keeps at least `poll_interval`
-    // spacing between cycles regardless of cycle duration.
+    // Skip (do not burst) missed ticks. A cycle lasts at most one
+    // `poll_timeout`, which startup keeps within `poll_interval`, so a cycle
+    // overruns its tick only when the two are equal or the runtime stalls;
+    // then `Skip` fires the overdue tick at once and snaps back to the
+    // `poll_interval` grid instead of firing back-to-back catch-up cycles,
+    // which would pile extra load onto already-failing upstreams. It does not
+    // keep a full `poll_interval` between cycles.
     ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
     loop {
         tokio::select! {
@@ -481,7 +483,9 @@ pub(crate) async fn run_poller(
 /// Run one poll cycle: poll every upstream at once, each bounded by
 /// `poll_timeout`, and apply each result as it lands. A cycle lasts at most one
 /// `poll_timeout`, however many upstreams hang, so one hanging upstream cannot
-/// delay the polls of the others.
+/// delay the polls of the others in its cycle, and startup keeps
+/// `poll_timeout` within `--readiness-poll-interval`, so it cannot stretch the
+/// cadence of later cycles either.
 ///
 /// [`run_poller`] runs one cycle per tick; tests call it directly to step the
 /// readiness state one cycle at a time.
