@@ -455,9 +455,9 @@ pub(crate) async fn run_poller(
             () = &shutdown => break,
             _ = ticker.tick() => {
                 // race the cycle against shutdown so teardown never waits on a
-                // slow poll; an abandoned cycle records nothing. The query
-                // upstream is probed alongside the workers, so a cycle still
-                // lasts at most one `poll_timeout`.
+                // slow poll; an abandoned cycle records only the polls that
+                // already finished. The query upstream is probed alongside the
+                // workers, so a cycle still lasts at most one `poll_timeout`.
                 let query = query_probe
                     .as_ref()
                     .map(|probe| poll_query_upstream(probe, &readiness, poll_timeout));
