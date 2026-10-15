@@ -3554,9 +3554,15 @@ mod tests {
     /// The throttles are process-wide statics, so this test relies on
     /// nextest's one-process-per-test model, which `make test`, the gate and
     /// CI use: under a single-process `cargo test`, another test failing a
-    /// forward on either route within 10 s suppresses the line this test reads.
+    /// forward on either route within 10 s suppresses the line this test
+    /// reads, so it skips itself outside that model, as the server's
+    /// throttle-dependent log tests do.
     #[tokio::test]
     async fn forwarding_failure_log_hides_the_url() {
+        if !crate::telemetry::test_utils::process_per_test() {
+            eprintln!("skipped: this test reads a throttled warning and needs nextest's process-per-test model");
+            return;
+        }
         let logs = CapturedLogs::default();
         let writer = logs.clone();
         let subscriber = tracing_subscriber::fmt()
