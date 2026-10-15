@@ -122,6 +122,10 @@ pub struct BtreeIndex {
     /// on open, so a read-only handle trusts no zero-trailer page; drained by each publish,
     /// which stamps exactly this set.
     private: PageSet,
+    /// Pages this handle CRC-stamped since it opened. Their bytes came from its own memory, so a
+    /// copy of one need not verify its CRC; a page read from disk (any other published page) is
+    /// verified before its first copy (see [`Self::make_writable`]).
+    stamped: PageSet,
     /// Published pages replaced by a copy (copy-on-write) since the last publish: no longer in the
     /// working tree, but still in the latest published state.
     superseded: Vec<u32>,
@@ -141,6 +145,9 @@ pub struct BtreeIndex {
     /// Test-only failure injector: the page allocation after this many more fails.
     #[cfg(test)]
     fail_allocs_after: Option<usize>,
+    /// Test-only: how many copies verified their source page's CRC.
+    #[cfg(test)]
+    cow_crc_checks: u64,
 }
 
 /// Held by every [`IndexSnapshot`] of one published state; the index keeps only a `Weak` to it. Its
@@ -401,6 +408,7 @@ impl BtreeIndex {
             synced: true,
             remove_on_drop: false,
             private,
+            stamped: PageSet::default(),
             superseded: Vec::new(),
             latest_pin: None,
             published_state: (!fresh).then_some((root, height, values)),
@@ -410,6 +418,8 @@ impl BtreeIndex {
             _index_dir: dir.to_owned(),
             #[cfg(test)]
             fail_allocs_after: None,
+            #[cfg(test)]
+            cow_crc_checks: 0,
         };
         // A cleanly-sealed tree's unreachable pages are free; an unclean one is rebuilt, not
         // trusted, and a read-only handle never allocates.
@@ -596,6 +606,7 @@ impl BtreeIndex {
         // change it in place instead of copying it.
         self.private.clear();
         self.private.insert(self.header.root_page);
+        self.stamped.clear();
         self.superseded.clear();
         self.published_state = None;
         self.latest_pin = None;
@@ -699,12 +710,19 @@ impl BtreeIndex {
         if self.private.contains(p) {
             return Ok(p);
         }
+        // Every page outside `private` was CRC-stamped when it was published. One read from disk
+        // (not stamped by this handle) is checked before it is copied: the copy is stamped afresh
+        // at the next publish, so copying a page damaged at rest would make the damage CRC-valid
+        // and invisible. A page this handle stamped is not re-verified: the check would cost a
+        // page's CRC on every copy, on the write path, under the write lock.
+        let verify = !self.stamped.contains(p);
+        #[cfg(test)]
+        if verify {
+            self.cow_crc_checks += 1;
+        }
         let mut copy = [0_u8; PAGE_SIZE];
         let src = self.page(p).map_err(fetch_to_append)?;
-        // Every page outside `private` was CRC-stamped when it was published. Check it before
-        // copying: the copy is stamped afresh at the next publish, so copying a page damaged at
-        // rest would make the damage CRC-valid and invisible.
-        if crc_state(src) != CrcState::Valid {
+        if verify && crc_state(src) != CrcState::Valid {
             return Err(fetch_to_append(FetchError::CorruptIndex(format!(
                 "page {p} fails its CRC (at-rest corruption); refusing to copy it"
             ))));
@@ -1107,6 +1125,7 @@ impl BtreeIndex {
             let p = p as u32; // inserted as a u32 page number
             if let Some(buf) = self.file.slice_mut(Self::page_offset(p), PAGE_SIZE) {
                 stamp_unstamped(buf);
+                self.stamped.insert(p);
             }
         }
     }
@@ -1452,6 +1471,39 @@ mod tests {
         assert!(matches!(save, Err(AppendError::CorruptIndex(_))), "{save:?}");
         idx.sync().expect("sync");
         assert_eq!(idx.page_crc_scan().corrupt, 1, "and stays visible: nothing was re-stamped");
+    }
+
+    /// Copy-on-write verifies a page read from disk before its first copy, and never one this
+    /// handle stamped itself: a session's writes cost no CRC per copy, and after a reopen each
+    /// page from disk is verified once (its copy is then this handle's own).
+    #[test]
+    fn test_archive_btx_copy_on_write_verifies_only_pages_from_disk() {
+        let tmp = TempDir::with_prefix("btx_cow_verify").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let dh = DataHeader::new(0, PackCompression::None, 0);
+        {
+            let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+            for round in 0..20_u64 {
+                for i in 0..200_u64 {
+                    idx.save(&key_of(i), round).expect("save");
+                }
+                let _ = idx.publish();
+            }
+            assert!(idx.header.height > 1, "a tree deep enough to copy paths");
+            assert_eq!(idx.cow_crc_checks, 0, "pages this handle stamped are copied unverified");
+            idx.sync().expect("sync");
+        }
+        let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("reopen");
+        idx.save(&key_of(0), 99).expect("save");
+        let first = idx.cow_crc_checks;
+        assert_eq!(
+            first,
+            u64::from(idx.header.height),
+            "each page on the path, from disk, verified"
+        );
+        let _ = idx.publish();
+        idx.save(&key_of(0), 100).expect("save");
+        assert_eq!(idx.cow_crc_checks, first, "its copies are this handle's own: not re-verified");
     }
 
     /// Deterministic 32-byte key from an integer.

@@ -9,13 +9,18 @@
 #                    crate README's Benchmarks section. Its module must exist in the before commit.
 #   AB_ROUNDS=1      one before and one after run instead of before/after/after/before
 #   AB_FEATURES=...  extra cargo flags for both builds, e.g. "--features adiri"
+#   AB_BENCH_FROM=checkout  run this checkout's copy of the bench on both sides, for a bench that
+#                    itself changed (what its timed region covers, say); its file must build
+#                    against the before commit
 #   Bench knobs (TN_BENCH_*, INDEX_BENCH_N) pass through the environment; the report lists them.
 #
 # The before tree is an export of the commit (`git archive`; no git writes) with this checkout's
 # `tn-contracts` submodule linked in. It runs its own copy of the bench when it has one (a newer
 # bench may call code the commit lacks), else this checkout's. It builds into its own target dir
-# under the bench dir, kept for reruns: cargo names a workspace's crates by their path within it,
-# so two trees sharing one target dir would reuse each other's artifacts. Each side's test binary
+# under the bench dir, one per commit and bench source, kept for reruns: cargo names a workspace's
+# crates by their path within it, so two trees sharing one target dir would reuse each other's
+# artifacts, and it judges freshness by mtime, which the export sets to the commit's time (another
+# tree's files can look older than its artifacts and be skipped). Each side's test binary
 # is run directly, its md5 and test count recorded, and the run refused if the two binaries match.
 # Needs a Rust toolchain, git, and room in the bench dir for a release build plus the bench's data.
 set -euo pipefail
@@ -56,14 +61,18 @@ git -C "$repo" archive "$before" | tar -x -C "$src_before"
 rm -rf "$src_before/tn-contracts"
 ln -s "$repo/tn-contracts" "$src_before/tn-contracts"
 [ -f "$src_before/$bench_file" ] || die "$before has no $bench_file"
-if grep -q "fn $bench_fn()" "$src_before/$bench_file"; then
+if [ "${AB_BENCH_FROM:-}" != checkout ] && grep -q "fn $bench_fn()" "$src_before/$bench_file"; then
     bench_before="the commit's own"
+    target_key="$(git -C "$repo" rev-parse --short "$before")"
 else
-    cp "$repo/$bench_file" "$src_before/$bench_file"
+    # Keeping the file's own mtime: a rerun with the same bench finds its build fresh, and an
+    # edited bench is newer than the artifacts, so it is rebuilt.
+    cp -p "$repo/$bench_file" "$src_before/$bench_file"
     bench_before="copied from this checkout"
+    target_key="$(git -C "$repo" rev-parse --short "$before")-checkout-bench"
 fi
 
-target_before="$bench_dir/target-before"
+target_before="$bench_dir/target-before-$target_key"
 target_after="${CARGO_TARGET_DIR:-$repo/target}"
 unset CARGO_TARGET_DIR
 export TMPDIR="$bench_dir"

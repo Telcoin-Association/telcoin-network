@@ -763,9 +763,9 @@ where
                 // Decompress (capped at `MAX_RECORD_SIZE`) into a buffer, then decode the slice:
                 // decoding from the decompressor itself would let a length prefix in a damaged
                 // record allocate up to the codec's sequence limit before the bytes ran out,
-                // where a slice's decode checks each length against the bytes it has. The buffer
-                // is per read; the packs that compress (epoch records, execution state) are read
-                // rarely.
+                // where a slice's decode checks each length against the bytes it has. It is also
+                // the faster decode for the consensus pack's reads (its batches are compressed):
+                // one decompression pass, then a slice decode instead of one through the reader.
                 let mut decompressed = Vec::new();
                 let bytes = decompress_checked(payload, &mut decompressed)?;
                 try_decode(bytes).map_err(|e| FetchError::DeserializeValue(e.to_string()))

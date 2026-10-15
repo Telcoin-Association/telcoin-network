@@ -249,9 +249,13 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   - the page's tag must be a node's (`Node::tag_ok`): a leaf or internal type, with no more entries
     than that type holds. Every slot access is bounded by the entry count, so a page with a damaged
     count or type cannot be read outside its 4 KiB.
-- **Writes into a damaged page are refused.** `page_mut` runs the same checks, and copy-on-write
-  (`make_writable`) also verifies the source page's full CRC before copying it, so a publish or
-  sync never stamps at-rest damage as valid.
+- **Writes into a damaged page are refused.** `page_mut` runs the same checks. Copy-on-write
+  (`make_writable`) also verifies the source page's full CRC before copying a page read from disk
+  (one this handle did not stamp), so a publish or sync never stamps at-rest damage as valid. A
+  page this handle stamped itself is copied unverified: checking it would cost a page's CRC on
+  every copy, under the write lock (about 5% of a write-heavy round). The cost of skipping it is
+  one case: a page this process wrote, evicted by the OS and then re-read from a silently
+  damaged sector.
 - **`page_crc_scan()`** is the off-path full check: it classifies every data page as valid, dirty
   (unsynced writes: rebuild from the log) or corrupt (genuine on-disk corruption), in a
   `PageCrcReport { dirty, corrupt }`.

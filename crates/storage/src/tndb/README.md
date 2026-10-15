@@ -502,10 +502,10 @@ environments and notes the MDBX migration's marker; `telcoin-network db tndb-sta
   generation. Under a tight limit a remap then fails and writes stop. Give the node an
   address-space limit above the reservations instead.
 - **A damaged record's length at open.** Replay reads the log record by record into a buffer, so
-  a damaged length prefix (a torn tail, in an unclean log) is read as far as it claims before its
-  CRC fails it: never past the log's end, and at most `MAX_RECORD` (1 GiB). That memory is
-  transient and only on an unclean open; replaying from the mapping instead would avoid it, at the
-  cost of a second read path for recovery.
+  for a damaged length prefix (a torn tail, in an unclean log) a buffer of the size it claims is
+  allocated and filled before the record's CRC fails it: never past the log's end, and at most
+  `MAX_RECORD` (1 GiB). That memory is transient and only on an unclean open; replaying from the
+  mapping instead would avoid it, at the cost of a second read path for recovery.
 - **`has_dead` at open.** A log with records is assumed to hold dead rows when it opens, so a
   restart can cost one compaction that frees little. It happens only when the log is already past
   its threshold and twice its base, so it is kept as is rather than recording a dead-row count.
