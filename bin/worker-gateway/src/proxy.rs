@@ -1330,19 +1330,20 @@ fn parse_chain_id(answer: &[u8]) -> Option<u64> {
 /// one is configured, no proxy, the upstream connect timeout, and a resolver
 /// over `lookup` (the system resolver, [`dns::SystemLookup`], outside tests).
 ///
-/// The forwarding client ([`proxy_client`]) and the readiness poller's client
-/// ([`readiness_client`]) both start here and can only be built from here, so
-/// a setting that governs how the gateway reaches an upstream cannot reach one
-/// hop and silently miss the other: an `https` worker URL and its readiness
-/// URL are verified the same way and see the same client certificate. Both
-/// finish the builder with redirects off, so neither hop follows a `3xx`
-/// anywhere. The forwarding client also
-/// serves the `--redirect-queries` route and the poller's probe of it (see
-/// [`crate::readiness::QueryProbe`]), so the extra CA certificates are trusted
-/// there too, and the client certificate goes to that endpoint if it asks for
-/// one (rustls sends it only on request). An upstream whose
-/// certificate chains to none of these roots fails the handshake: a forward to
-/// it fails and a poll marks it not ready, so a wrong CA fails closed.
+/// The forwarding clients ([`proxy_client`], one per route, see
+/// [`route_clients`]) and the readiness poller's client ([`readiness_client`])
+/// all start from this builder and can only be built from it, so a setting
+/// that governs how the gateway reaches an upstream cannot reach one hop and
+/// silently miss the other: an `https` worker URL and its readiness URL are
+/// verified the same way and see the same client certificate. All of them
+/// finish the builder with redirects off, so no hop follows a `3xx` anywhere.
+/// The query client serves the `--redirect-queries` route and the poller's
+/// probe of it (see [`crate::readiness::QueryProbe`]), so the extra CA
+/// certificates are trusted there too, and the client certificate goes to that
+/// endpoint if it asks for one (rustls sends it only on request). An upstream
+/// whose certificate chains to none of these roots fails the handshake: a
+/// forward to it fails and a poll marks it not ready, so a wrong CA fails
+/// closed.
 ///
 /// Proxies are off. reqwest otherwise sends every request through
 /// `HTTP_PROXY`, `HTTPS_PROXY` or `ALL_PROXY` from the environment, loopback
