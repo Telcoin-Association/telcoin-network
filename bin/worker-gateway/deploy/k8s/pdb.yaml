@@ -1,0 +1,18 @@
+# PodDisruptionBudget for the worker gateway: a node drain or cluster upgrade
+# evicts at most one gateway pod at a time. AlwaysAllow lets a pod that is not
+# ready be evicted even when the budget is spent, so a stuck pod cannot block
+# a drain (the field needs Kubernetes 1.27 or later).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: worker-gateway
+  labels:
+    app: worker-gateway
+    app.kubernetes.io/name: worker-gateway
+    app.kubernetes.io/part-of: telcoin-network
+spec:
+  maxUnavailable: 1
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app: worker-gateway

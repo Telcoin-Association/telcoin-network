@@ -8,11 +8,14 @@ placeholders below and adapt them to your cluster before applying.
 ```
 deploy/
   k8s/
-    deployment.yaml      # apps/v1 Deployment (2 replicas, hardened pod securityContext)
+    deployment.yaml      # apps/v1 Deployment (hardened pod securityContext, replicas spread over nodes and zones)
     service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
-    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests
+    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests (2 to 10 replicas)
+    pdb.yaml             # policy/v1 PodDisruptionBudget (at most one pod evicted at a time)
 ```
+
+The Deployment sets no `spec.replicas`, because the HPA owns the count; set `spec.replicas` if you do not install the HPA.
 
 A Grafana dashboard for the metrics these expose lives at
 `../grafana-worker-gateway.json`.

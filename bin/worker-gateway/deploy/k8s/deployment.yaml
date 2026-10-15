@@ -10,7 +10,7 @@ metadata:
     app.kubernetes.io/name: worker-gateway
     app.kubernetes.io/part-of: telcoin-network
 spec:
-  replicas: 2
+  # No replicas: the HPA (hpa.yaml) owns the count; set it if you do not install the HPA.
   # A rollout replaces one pod at a time and waits out the old pod's 51s
   # shutdown (minReadySeconds > 5s delay + 45s drain + 1s) before the next,
   # so at most maxReplicas + 1 gateways hold worker slots at once.
@@ -30,6 +30,24 @@ spec:
         app.kubernetes.io/name: worker-gateway
         app.kubernetes.io/part-of: telcoin-network
     spec:
+      # The gateway never calls the Kubernetes API.
+      automountServiceAccountToken: false
+      # Spread the replicas over nodes and zones, so one node drain or zone
+      # outage does not take them all; ScheduleAnyway still places a pod when
+      # the cluster has too few nodes or zones to spread over.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: worker-gateway
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app: worker-gateway
       # Longer than the gateway's --shutdown-delay (5s, set below) plus its
       # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin:
       # 5s + 45s + 1s = 51s, so the process can finish draining in-flight
