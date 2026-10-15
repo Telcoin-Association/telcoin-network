@@ -601,6 +601,41 @@
       },
       "options": {},
       "description": "Name resolutions per second by the upstream clients' caching resolvers, by result: hit (answered from the cache), miss (a lookup was started), error (a started lookup failed) or rejected (a lookup was needed but every lookup slot was busy)."
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Mixed batches sent to the query upstream",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum(rate(tn_worker_gateway_mixed_batches_total{job=\"$job\"}[5m]))",
+          "refId": "A",
+          "legendFormat": "mixed batches"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "reqps"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Batches per second sent whole to the query upstream because they mixed transaction submissions with other calls, so their submissions went to the query upstream instead of the worker. This is the evidence for or against the deferred split-and-merge of mixed batches (#1611): a flat zero means clients do not send them."
     }
   ],
   "refresh": "30s",
