@@ -87,13 +87,13 @@ pub(crate) struct Cli {
 
     /// Inline single upstream: the worker JSON-RPC base URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8545`).
-    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_RPC_URL")]
-    pub(crate) upstream_rpc_url: Option<Url>,
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_RPC_URL", hide_env_values = true)]
+    pub(crate) upstream_rpc_url: Option<String>,
 
     /// Inline single upstream: the node readiness URL, `http` or `https`
     /// (e.g. `http://127.0.0.1:8551/health/workers`).
-    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_READINESS_URL")]
-    pub(crate) upstream_readiness_url: Option<Url>,
+    #[arg(long, env = "WORKER_GATEWAY_UPSTREAM_READINESS_URL", hide_env_values = true)]
+    pub(crate) upstream_readiness_url: Option<String>,
 
     /// Inline single upstream: the worker id reported by the readiness endpoint.
     #[arg(long, env = "WORKER_GATEWAY_WORKER_ID", default_value_t = 0)]
@@ -109,7 +109,7 @@ pub(crate) struct Cli {
     /// mixes submissions with other calls, goes here, with no readiness gate
     /// and no fallback to the worker. Must not point at the gateway itself or
     /// at a worker's RPC or readiness host and port.
-    #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES")]
+    #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES", hide_env_values = true)]
     pub(crate) redirect_queries: Option<String>,
 
     /// Header sent on every request to the `--redirect-queries` endpoint and
@@ -119,6 +119,8 @@ pub(crate) struct Cli {
     /// call carries it, so use a key scoped to public reads, and quote the
     /// whole line on a command line. Requires `--redirect-queries`; set this or
     /// `--redirect-queries-header-file`, not both. The value is never logged.
+    /// Prefer `--redirect-queries-header-file`, which keeps the secret out of
+    /// the process arguments, the environment and any argument error.
     /// Default: none.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES_HEADER", hide_env_values = true)]
     pub(crate) redirect_queries_header: Option<String>,
@@ -811,7 +813,7 @@ impl Cli {
         let query_upstream = self
             .redirect_queries
             .map(|value| {
-                let url = parse_query_upstream(&value)?;
+                let url = parse_url_flag("--redirect-queries", &value)?;
                 ensure_query_upstream(self.listen_addr, &url, &upstreams).map(|()| url)
             })
             .transpose()?;
@@ -1100,8 +1102,8 @@ impl Cli {
             None => {
                 let (rpc_url, readiness_url) = self
                     .upstream_rpc_url
-                    .as_ref()
-                    .zip(self.upstream_readiness_url.as_ref())
+                    .as_deref()
+                    .zip(self.upstream_readiness_url.as_deref())
                     .ok_or_else(|| {
                         eyre::eyre!(
                             "provide --config, or both --upstream-rpc-url and --upstream-readiness-url"
@@ -1109,8 +1111,8 @@ impl Cli {
                     })?;
                 Ok(vec![UpstreamWorker {
                     worker_id: self.worker_id,
-                    rpc_url: rpc_url.clone(),
-                    readiness_url: readiness_url.clone(),
+                    rpc_url: parse_url_flag("--upstream-rpc-url", rpc_url)?,
+                    readiness_url: parse_url_flag("--upstream-readiness-url", readiness_url)?,
                 }])
             }
         }
@@ -1572,19 +1574,69 @@ fn rustls_accepts(
         .is_ok()
 }
 
-/// Parse the `--redirect-queries` value into a URL.
+/// Parse the value of the URL flag `flag` (`--upstream-rpc-url`,
+/// `--upstream-readiness-url` or `--redirect-queries`) into a URL.
 ///
-/// The flag is taken as a string and parsed here rather than by clap, because
-/// clap's parse error repeats the rejected value whole, and a hosted RPC URL
-/// can carry an API key in its userinfo, path or query. The error names what
-/// is wrong without echoing the value.
-fn parse_query_upstream(value: &str) -> eyre::Result<Url> {
+/// These flags are taken as strings and parsed here rather than by clap,
+/// because clap's parse error repeats the rejected value whole, and a worker or
+/// hosted RPC URL can carry a credential or an API key in its userinfo, path or
+/// query. The error names the flag and what is wrong without echoing the value.
+fn parse_url_flag(flag: &str, value: &str) -> eyre::Result<Url> {
     Url::parse(value).map_err(|err| {
-        eyre::eyre!(
-            "--redirect-queries is not a valid URL ({err}); write it as \
-             http(s)://host[:port][/path]"
-        )
+        eyre::eyre!("{flag} is not a valid URL ({err}); write it as http(s)://host[:port][/path]")
     })
+}
+
+/// A startup message for a clap parse error that does not repeat what was
+/// typed, or `None` when clap's own output is safe to print.
+///
+/// Clap quotes the offending token whole: the value of a flag it could not
+/// parse, and any argument it did not expect. An unquoted
+/// `--redirect-queries-header X-Api-Key: <key>` leaves the key behind as such
+/// a stray argument, so those kinds get a message that names the flag, or a
+/// similar flag clap suggests, and never the token. A value error keeps the
+/// parser's own reason: the flags that can carry a secret are taken as strings
+/// and parsed after clap, so the typed parsers only ever see durations,
+/// numbers, addresses and the like. Help, version and the kinds that carry
+/// only flag names (a missing or conflicting argument, for example) return
+/// `None`, and the caller lets clap print and exit as usual.
+pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
+    use clap::error::{ContextKind, ContextValue, ErrorKind};
+
+    let context = |kind| match err.get(kind) {
+        Some(ContextValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    };
+    match err.kind() {
+        ErrorKind::UnknownArgument | ErrorKind::InvalidSubcommand => {
+            let suggestion = context(ContextKind::SuggestedArg)
+                .map(|flag| format!("; a similar flag exists: {flag}"))
+                .unwrap_or_default();
+            Some(format!(
+                "unexpected argument (not repeated here, as it may be part of a \
+                 secret){suggestion}; quote a --redirect-queries-header line whole, as in \
+                 --redirect-queries-header 'Name: value', or use --redirect-queries-header-file; \
+                 see --help"
+            ))
+        }
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation | ErrorKind::TooManyValues => {
+            let arg = context(ContextKind::InvalidArg).unwrap_or("an argument");
+            let reason = std::error::Error::source(err)
+                .map(|source| format!(": {source}"))
+                .unwrap_or_default();
+            let possible = match err.get(ContextKind::ValidValue) {
+                Some(ContextValue::Strings(values)) if !values.is_empty() => {
+                    format!("; possible values: {}", values.join(", "))
+                }
+                _ => String::new(),
+            };
+            Some(format!(
+                "invalid value for '{arg}'{reason} (the value is not repeated here){possible}; \
+                 see --help"
+            ))
+        }
+        _ => None,
+    }
 }
 
 /// Validate the `--redirect-queries` URL: `http` or `https`, with a host and no
@@ -3685,5 +3737,108 @@ mod tests {
         assert_eq!(Cli::try_parse_from(argv(Some("text")))?.log_format, LogFormat::Text);
         assert_eq!(Cli::try_parse_from(argv(Some("json")))?.log_format, LogFormat::Json);
         Ok(())
+    }
+
+    #[test]
+    fn malformed_worker_url_is_not_echoed() {
+        // a credential in the userinfo and a typo in the port
+        const URL: &str = "https://gw:s3cret@worker-0.internal:85x45/";
+        let rpc = "--upstream-rpc-url=http://10.0.0.7:8545".to_string();
+        let readiness = "--upstream-readiness-url=http://10.0.0.7:8551/health/workers".to_string();
+        for (flag, argv) in [
+            ("--upstream-rpc-url", [format!("--upstream-rpc-url={URL}"), readiness]),
+            ("--upstream-readiness-url", [rpc, format!("--upstream-readiness-url={URL}")]),
+        ] {
+            let cli =
+                Cli::try_parse_from(std::iter::once("worker-gateway".to_string()).chain(argv))
+                    .expect("clap takes the worker URL as a string");
+            let message = match cli.into_settings() {
+                Ok(_) => panic!("{flag}: a malformed URL must be rejected"),
+                Err(err) => format!("{err:?}"),
+            };
+            assert!(message.contains(&format!("{flag} is not a valid URL")), "{message}");
+            for leak in ["s3cret", "worker-0.internal:85x45"] {
+                assert!(!message.contains(leak), "`{leak}` leaked into: {message}");
+            }
+        }
+    }
+
+    #[test]
+    fn url_env_values_are_hidden_from_help() {
+        use clap::CommandFactory as _;
+
+        let command = Cli::command();
+        for id in [
+            "upstream_rpc_url",
+            "upstream_readiness_url",
+            "redirect_queries",
+            "redirect_queries_header",
+        ] {
+            let arg = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == id)
+                .unwrap_or_else(|| panic!("no argument `{id}`"));
+            assert!(arg.is_hide_env_values_set(), "`{id}` must hide its env value in --help");
+        }
+    }
+
+    #[test]
+    fn unquoted_header_value_is_not_echoed() {
+        let err = Cli::try_parse_from([
+            "worker-gateway",
+            "--redirect-queries=https://rpc.example",
+            "--redirect-queries-header",
+            "X-Api-Key:",
+            "abc123",
+        ])
+        .expect_err("the stray half of an unquoted header line must fail to parse");
+        assert_eq!(err.kind(), clap::error::ErrorKind::UnknownArgument);
+        // control: clap's own message quotes the stray token
+        assert!(err.to_string().contains("abc123"), "{err}");
+
+        let message = redacted_parse_error(&err).expect("a stray token is redacted");
+        assert!(!message.contains("abc123"), "the header value leaked into: {message}");
+        assert!(message.contains("--redirect-queries-header"), "{message}");
+    }
+
+    #[test]
+    fn value_errors_are_redacted() {
+        use clap::error::ErrorKind;
+
+        for (argv, kind, flag) in [
+            (
+                ["worker-gateway", "--max-request-bytes=s3cret"],
+                ErrorKind::ValueValidation,
+                "--max-request-bytes",
+            ),
+            (["worker-gateway", "--log-format=s3cret"], ErrorKind::InvalidValue, "--log-format"),
+        ] {
+            let err = Cli::try_parse_from(argv).expect_err("an unparsable value must fail");
+            assert_eq!(err.kind(), kind, "{flag}");
+            // control: clap's own message quotes the value
+            assert!(err.to_string().contains("s3cret"), "{err}");
+
+            let message = redacted_parse_error(&err).expect("a value error is redacted");
+            assert!(message.contains(flag), "{message}");
+            assert!(!message.contains("s3cret"), "the value leaked into: {message}");
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_left_to_clap() {
+        for flag in ["--help", "--version"] {
+            let err = Cli::try_parse_from(["worker-gateway", flag])
+                .expect_err("help and version stop the parse");
+            assert_eq!(redacted_parse_error(&err), None, "{flag}");
+        }
+        // a conflict carries only flag names, so clap prints it as is
+        let err = Cli::try_parse_from([
+            "worker-gateway",
+            "--config=gateway.yaml",
+            "--upstream-rpc-url=http://10.0.0.7:8545",
+        ])
+        .expect_err("--config conflicts with the inline upstream flags");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        assert_eq!(redacted_parse_error(&err), None);
     }
 }

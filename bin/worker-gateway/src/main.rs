@@ -41,7 +41,15 @@ fn main() {
 /// Parse the CLI, initialize tracing, and run the gateway on a multi-thread
 /// runtime until SIGTERM / ctrl-c.
 fn try_main() -> eyre::Result<()> {
-    let cli = Cli::parse();
+    // clap's own error quotes the offending token, which can be a secret, so
+    // print a redacted message for the kinds that carry one
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => match cli::redacted_parse_error(&err) {
+            Some(message) => eyre::bail!(message),
+            None => err.exit(),
+        },
+    };
     let ansi = use_ansi(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR").as_deref());
     init_tracing(&cli.log_filter, cli.log_format, ansi);
     let fd_limit = fd::raise_limit();
