@@ -4629,11 +4629,11 @@ mod tests {
         let send = || client.post(format!("http://{addr}/")).body("{}").send();
 
         let stalled = send().await.expect("head");
-        let lost = read_answer(stalled, 1024).await.err().expect("a stalled answer is lost");
+        let lost = read_answer(stalled, 1024).await.expect_err("a stalled answer is lost");
         assert!(matches!(lost.error(), GatewayError::UpstreamTimeout), "{lost}");
 
         let broken = send().await.expect("head");
-        let lost = read_answer(broken, 1024).await.err().expect("a broken answer is lost");
+        let lost = read_answer(broken, 1024).await.expect_err("a broken answer is lost");
         assert!(matches!(lost, AnswerLost::Failed(_)), "{lost}");
         assert!(matches!(lost.error(), GatewayError::UpstreamAnswerLost), "{lost}");
 
