@@ -856,8 +856,11 @@ impl<C: Clock> RateLimiters<C> {
 /// The edge cannot tell a submission from a read (the body is not read yet), so
 /// it charges no shared bucket; the proxy charges the request's class with
 /// [`Self::charge`] once it has classified it. This keeps a read flood that
-/// drains the global bucket from refusing submissions, and a submission flood
-/// over its own budget from draining the global bucket.
+/// drains the global bucket from refusing single submissions, and a submission
+/// *request* over its own budget from draining the global bucket. The calls of
+/// a submission batch beyond its first are still charged to the global bucket
+/// (see [`RateLimiters::charge_batch`]), so the budget bounds submission
+/// requests, not submitted transactions.
 ///
 /// A request answered before it is classified (a `405`, an unreadable or
 /// over-length body, a denied method, a loop) never reaches [`Self::charge`].

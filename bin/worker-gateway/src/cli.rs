@@ -514,10 +514,13 @@ pub(crate) struct Cli {
 
     /// Sustained gateway-wide rate reserved for requests made only of
     /// transaction submissions, in requests per second, with a burst of twice
-    /// the rate (default `0` disables it). When set, submissions are metered by
-    /// this budget and every other request by the global rate limit, so a read
-    /// flood that empties the global bucket no longer refuses submissions; the
-    /// per-IP limit still applies to both.
+    /// the rate (default `0` disables it). When set, a submission request's
+    /// first call is metered by this budget and every other request by the
+    /// global rate limit; a submission batch's further calls are charged to
+    /// the per-IP and global limits like any batch's, so this bounds submission
+    /// requests, not submitted transactions. A read flood that empties the
+    /// global bucket no longer refuses single submissions; the per-IP limit
+    /// still applies to both.
     #[arg(long, env = "WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS", default_value_t = 0)]
     pub(crate) rate_limit_submissions: u32,
 
