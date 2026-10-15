@@ -5,6 +5,7 @@
 use crate::{
     codec::{PeerExchangeCodec, TNCodec, TNMessage},
     error::NetworkError,
+    gossip_config::gossipsub_config,
     kad::{node_record_key, KadStore},
     metrics::{
         ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
@@ -609,22 +610,9 @@ where
         // (GHSA-cc64-wfq5-56ph).
         let record_domain = RecordDomain::new(chain_id, network_type);
 
-        let gossipsub_config = gossipsub::ConfigBuilder::default()
-            // explicitly set default
-            .heartbeat_interval(Duration::from_secs(1))
-            // explicitly set default
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            // TN specific: filter against authorized_publishers for certain topics
-            .validate_messages()
-            // Gossipsub negotiates its own `/meshsub` protocol, independent of the
-            // req-res/kad/stream names below, so without this it is the one wire
-            // protocol two chains still share: namespacing the topics keeps their
-            // messages apart but still lets cross-chain peers negotiate a gossip
-            // substream. Folding the chain id into the protocol id closes that gap.
-            // The builder appends `/1.1.0` and `/1.0.0`, yielding
-            // `/tn-meshsub-{chain_id}/1.1.0` and `/tn-meshsub-{chain_id}/1.0.0`.
-            .protocol_id_prefix(crate::types::gossip_protocol_id_prefix(chain_id))
-            .build()?;
+        // Explicit frame limits and the order the library applies them: see
+        // `gossipsub_config` (issue #1655).
+        let gossipsub_config = gossipsub_config(chain_id)?;
         let gossipsub = gossipsub::Behaviour::new(
             gossipsub::MessageAuthenticity::Signed(keypair.clone()),
             gossipsub_config,
