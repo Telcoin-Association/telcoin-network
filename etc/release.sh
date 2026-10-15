@@ -81,9 +81,9 @@ ATTEST_SCRIPT=.github/scripts/verify_commit_hash.sh
 ANCHOR='<!-- ANCHOR: releases -->'
 MANIFEST_TYPES='application/vnd.oci.image.index.v1+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.docker.distribution.manifest.v2+json'
 
-# State. parse_tag sets TAG VERSION CHANNEL RC BASE FEATURES PRERELEASE ALIAS TARBALL; the
-# functions named in the comments own the rest.
-TAG='' VERSION='' CHANNEL='' RC='' BASE='' FEATURES='' PRERELEASE='' ALIAS='' TARBALL=''
+# State. parse_tag sets TAG VERSION CHANNEL RC BASE FEATURES PRERELEASE ALIAS TARBALL
+# CHAIN_CONFIGS; the functions named in the comments own the rest.
+TAG='' VERSION='' CHANNEL='' RC='' BASE='' FEATURES='' PRERELEASE='' ALIAS='' TARBALL='' CHAIN_CONFIGS=''
 WORK=            # setup: private temp dir, removed on exit
 ORIG_PWD=        # setup: directory the script was started from
 SELF=            # setup: absolute path of this script
@@ -246,12 +246,16 @@ parse_tag() {
     rc_suffix=${BASH_REMATCH[5]}
     RC=${rc_suffix#-rc}
     BASE=${TAG%"$rc_suffix"}
+    # CHAIN_CONFIGS: the directory of the channel's genesis, committee and parameters files,
+    # whose hashes SHA256SUMS carries. Adiri is chain-configs/testnet (chain-configs/README.md).
     if [ -n "${BASH_REMATCH[4]}" ]; then
         CHANNEL=adiri
         FEATURES=adiri
+        CHAIN_CONFIGS=chain-configs/testnet
     else
         CHANNEL=mainnet
         FEATURES=
+        CHAIN_CONFIGS=chain-configs/mainnet
     fi
     # Only a mainnet final is a full release; aliases move only for finals.
     PRERELEASE=true
@@ -268,8 +272,8 @@ parse_tag() {
 }
 
 print_parse() {
-    printf 'TAG=%s\nVERSION=%s\nCHANNEL=%s\nRC=%s\nBASE=%s\nFEATURES=%s\nPRERELEASE=%s\nALIAS=%s\nTARBALL=%s\n' \
-        "$TAG" "$VERSION" "$CHANNEL" "$RC" "$BASE" "$FEATURES" "$PRERELEASE" "$ALIAS" "$TARBALL"
+    printf 'TAG=%s\nVERSION=%s\nCHANNEL=%s\nRC=%s\nBASE=%s\nFEATURES=%s\nPRERELEASE=%s\nALIAS=%s\nTARBALL=%s\nCHAIN_CONFIGS=%s\n' \
+        "$TAG" "$VERSION" "$CHANNEL" "$RC" "$BASE" "$FEATURES" "$PRERELEASE" "$ALIAS" "$TARBALL" "$CHAIN_CONFIGS"
 }
 
 # X.Y.Z of the final (non-rc) tags among $1 (one per line) in TAG's channel, TAG excluded.
@@ -971,24 +975,73 @@ clear_release_dir() {
 # ---------------------------------------------------------------------------------------------
 # Artifact checks shared by build, sign and verify
 
-# SHA256SUMS: "<hex>  <name>" for IMAGE_DIGEST and the tarball, C-locale sorted by name.
+# The channel's chain-config files, by repository path, one per line.
+chain_config_files() {
+    local f
+    for f in committee genesis parameters; do printf '%s/%s.yaml\n' "$CHAIN_CONFIGS" "$f"; done
+}
+
+# Every name SHA256SUMS lists, one per line: IMAGE_DIGEST, the tarball and the chain-config
+# files. The chain-config lines carry repository paths, so `sha256sum --check` run from the
+# root of a checkout of the tag checks the files there.
+sums_names() {
+    printf '%s\n' IMAGE_DIGEST "$TARBALL"
+    chain_config_files
+}
+
+# Writes the chain-config files as committed at COMMIT under $1, at their repository paths.
+# cat-file gives the committed bytes, with no checkout filter or textconv applied.
+stage_chain_configs() {
+    local dir=$1 path
+    while IFS= read -r path; do
+        mkdir -p "$dir/${path%/*}"
+        git cat-file blob "$COMMIT:$path" >"$dir/$path" 2>/dev/null || die 1 "$path does not exist at $COMMIT"
+    done <<EOF
+$(chain_config_files)
+EOF
+}
+
+# "<hex>  <path>" for each chain-config file at COMMIT, staged under $1 first. Its output is
+# captured, and bash 3.2 runs $(...) without -e, so a failed hash exits explicitly.
+chain_config_sums() {
+    local dir=$1 path hex
+    stage_chain_configs "$dir"
+    while IFS= read -r path; do
+        hex=$(sha256_hex "$dir/$path") || exit
+        printf '%s  %s\n' "$hex" "$path"
+    done <<EOF
+$(chain_config_files)
+EOF
+}
+
+# SHA256SUMS: "<hex>  <name>" for every name sums_names lists, C-locale sorted by name.
 write_sums() {
-    local dir=$1 digest_hex tar_hex
+    local dir=$1 digest_hex tar_hex cc_lines
     digest_hex=$(sha256_hex "$dir/IMAGE_DIGEST")
     tar_hex=$(sha256_hex "$dir/$TARBALL")
-    printf '%s  %s\n%s  %s\n' "$digest_hex" IMAGE_DIGEST "$tar_hex" "$TARBALL" |
+    cc_lines=$(chain_config_sums "$dir") || exit
+    printf '%s  %s\n%s  %s\n%s\n' "$digest_hex" IMAGE_DIGEST "$tar_hex" "$TARBALL" "$cc_lines" |
         LC_ALL=C sort -k2 >"$dir/SHA256SUMS"
 }
 
-# SHA256SUMS names exactly IMAGE_DIGEST and the tarball, in the strict two-space format, and
-# every hash matches the file beside it.
-check_sums() {
-    local dir=$1 names want
-    awk '!/^[0-9a-f]+  [^ ]+$/ || length($1) != 64 { bad = 1 } END { exit bad }' "$dir/SHA256SUMS" ||
+# The SHA256SUMS file $1 is in the strict two-space format and names exactly what sums_names
+# lists, each once: IMAGE_DIGEST, the tarball and the channel's three chain-config files.
+check_sums_shape() {
+    local sums=$1 names want
+    awk '!/^[0-9a-f]+  [^ ]+$/ || length($1) != 64 { bad = 1 } END { exit bad }' "$sums" ||
         die 1 "SHA256SUMS has a malformed line"
-    names=$(awk '{ print $2 }' "$dir/SHA256SUMS" | LC_ALL=C sort)
-    want=$(printf '%s\n' IMAGE_DIGEST "$TARBALL" | LC_ALL=C sort)
-    [ "$names" = "$want" ] || die 1 "SHA256SUMS must name exactly IMAGE_DIGEST and $TARBALL"
+    names=$(awk '{ print $2 }' "$sums" | LC_ALL=C sort)
+    want=$(sums_names | LC_ALL=C sort)
+    [ "$names" = "$want" ] ||
+        die 1 "SHA256SUMS must name exactly IMAGE_DIGEST, $TARBALL and the committee, genesis and parameters files in $CHAIN_CONFIGS"
+}
+
+# SHA256SUMS in DIR has the right shape, and every hash matches: IMAGE_DIGEST and the tarball
+# beside it, and the chain-config files as committed at COMMIT, staged into DIR.
+check_sums() {
+    local dir=$1
+    check_sums_shape "$dir/SHA256SUMS"
+    stage_chain_configs "$dir"
     (cd "$dir" && sha256_check SHA256SUMS) >&2 || die 1 "SHA256SUMS does not match the files"
 }
 
@@ -1108,7 +1161,7 @@ section_body() {
 
 # Renders the release body for TAG at COMMIT to stdout; $1 is the image digest, if known.
 render_notes() {
-    local digest=$1 body handle fpr digest_cell features_cell alias_cell
+    local digest=$1 body handle fpr digest_cell features_cell alias_cell cc_lines
     git show "$COMMIT:CHANGELOG.md" >"$WORK/notes-changelog.md" 2>/dev/null ||
         die 1 "CHANGELOG.md does not exist at $COMMIT"
     body=$(section_body <"$WORK/notes-changelog.md")
@@ -1137,13 +1190,29 @@ render_notes() {
         Alias "$alias_cell"
     printf '\n'
 
+    # The chain-config lines of SHA256SUMS depend only on COMMIT, so the notes list them before
+    # the build has run.
+    cc_lines=$(chain_config_sums "$WORK/notes-chain-configs") || exit
+    sed -e "s|@CHAIN_CONFIGS@|$CHAIN_CONFIGS|g" <<'EOF'
+`SHA256SUMS` also lists the network's chain-config files, `committee.yaml`, `genesis.yaml` and `parameters.yaml` in `@CHAIN_CONFIGS@`, as committed at the tag and by their path in the repository:
+
+```text
+EOF
+    printf '%s\n' "$cc_lines"
+    cat <<'EOF'
+```
+
+The commands below extract these files from the tag and check them with the release files. To check copies you already have, run `grep '  chain-configs/' /path/to/SHA256SUMS | sha256sum --check` with the verified `SHA256SUMS`, from the directory that holds their `chain-configs/` folder, such as the root of a checkout of the tag; it must print `OK` for all three files.
+
+EOF
+
     # The verification block is the canonical one (the install page's Path A), with TAG and REPO
     # filled in. The heredocs are quoted, so $TAG, $2 and $NF reach the reader as written; only
     # the @NAME@ placeholders are substituted.
     sed -e "s|@TAG@|$TAG|g" -e "s|@REPO@|$REPO|g" <<'EOF'
 ## Verify
 
-Check the signed checksums before you extract or run anything. These commands take the maintainer keys from `main`, never from the tag, fetch the tag by its full name, download the release files, check the signature over `SHA256SUMS`, and check the hashes:
+Check the signed checksums before you extract or run anything. These commands take the maintainer keys from `main`, never from the tag, fetch the tag by its full name, extract the chain-config files from it, download the release files, check the signature over `SHA256SUMS`, and check the hashes:
 
 ```sh
 TAG=@TAG@
@@ -1151,6 +1220,7 @@ REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
@@ -1187,7 +1257,7 @@ git -C ../tn-main rev-parse "refs/tags/$TAG^{commit}"
 
 The first `--version` line is `telcoin-network-cli Version: @VERSION@`. `Commit SHA:` must be the commit that `git rev-parse` printed, and `Build Features:` must contain `adiri` for an `-adiri` tag and not for any other.
 
-Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`. These commands are the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
+Docker image: it needs only `SHA256SUMS`, `SHA256SUMS.asc`, `IMAGE_DIGEST` and the chain-config files. These commands are the block above without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line:
 
 ```sh
 TAG=@TAG@
@@ -1195,6 +1265,7 @@ REPO=@REPO@
 BASE="https://github.com/$REPO/releases/download/$TAG"
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
@@ -1223,6 +1294,7 @@ When a check fails, do not extract, install or run anything from this release:
 - `ERRSIG`: the signing key is not in the allowlist on `main`, or `TAG` is wrong. Check `TAG`; if it is right, report it.
 - `EXPKEYSIG` or `REVKEYSIG`: the signing subkey has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
 - `sha256sum` prints `FAILED` or `no file was verified`: a file differs from its signed hash, or none of the files is present. Check `TAG` and download once more; if it still fails, report it.
+- `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
 - A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.
 - `IMAGE_DIGEST does not name a telcoin-network image by digest`. Report it.
 - `Commit SHA` is not the tag's commit, or `Build Features` does not match the tag. Report it.

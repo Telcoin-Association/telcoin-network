@@ -174,6 +174,7 @@ make release-build TAG=v0.17.0-adiri
 It builds the `linux/amd64` image from a temporary worktree of the tag, without the build cache, and copies the binary out of the image.
 It runs `--version` in the image as a smoke test, packs the tarball, and pushes the image as `ghcr.io/telcoin-association/telcoin-network:v0.17.0-adiri`.
 It writes `IMAGE_DIGEST` and `SHA256SUMS` next to the tarball in `target/release-artifacts/v0.17.0-adiri/`, uploads the three files to the draft, and rewrites the draft's notes to include the image digest.
+`SHA256SUMS` lists `IMAGE_DIGEST`, the tarball, and the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their repository path (`chain-configs/testnet/` for an Adiri tag, `chain-configs/mainnet/` otherwise), hashed as committed at the tag.
 It then runs every check from step 6 except the signature count.
 The last line it prints is `SHA256SUMS sha256: <hex>`.
 Write that value down; step 5 shows it again before you sign.
@@ -193,7 +194,7 @@ make release-sign TAG=v0.17.0-adiri
 ```
 
 `release-sign` repeats the tag checks and downloads the draft's files into `target/release-artifacts/v0.17.0-adiri/`.
-It checks the hashes in `SHA256SUMS`, checks that `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, and checks that your key is allowlisted and has not signed this release yet.
+It checks the hashes in `SHA256SUMS`, the chain-config ones against the tagged commit, checks that `IMAGE_DIGEST` matches what the registry reports for `:v0.17.0-adiri`, and checks that your key is allowlisted and has not signed this release yet.
 It then shows the tag, the commit, the content of `SHA256SUMS` and its SHA-256, and waits for `yes`.
 Compare that SHA-256 with the value `release-build` printed in step 4 before you type `yes`, and stop if they differ.
 It signs `SHA256SUMS` with the key `release-tag` would use, adds the signature to `SHA256SUMS.asc`, uploads it, then downloads it again and checks that it is the file it uploaded and that it carries your signature.
@@ -212,7 +213,7 @@ docker logout ghcr.io
 
 - every tag check from step 3;
 - the draft holds exactly the tarball, `IMAGE_DIGEST`, `SHA256SUMS` and `SHA256SUMS.asc`;
-- the hashes in `SHA256SUMS` match the files;
+- `SHA256SUMS` names exactly `IMAGE_DIGEST`, the tarball and the network's three chain-config files, and every hash matches, the chain-config ones against the tagged commit;
 - enough distinct allowlisted maintainers signed: `RELEASE_SIG_THRESHOLD` if set, otherwise `MIN_SIGNATURES`, which is 1;
 - `IMAGE_DIGEST` matches the registry;
 - the tarball holds exactly the four expected files in its directory;

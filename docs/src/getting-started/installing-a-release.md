@@ -7,7 +7,7 @@ Each release is a signed git tag plus these files on the tag's [GitHub release](
 | --- | --- |
 | `telcoin-network-<TAG>-x86_64-unknown-linux-gnu.tar.gz` | The `telcoin-network` binary, with `LICENSE-APACHE`, `LICENSE-MIT` and `NOTICE` |
 | `IMAGE_DIGEST` | The `linux/amd64` image at `ghcr.io/telcoin-association/telcoin-network`, named by its content digest |
-| `SHA256SUMS` | The SHA-256 of the tarball and of `IMAGE_DIGEST` |
+| `SHA256SUMS` | The SHA-256 of the tarball, of `IMAGE_DIGEST`, and of the network's three chain-config files |
 | `SHA256SUMS.asc` | A maintainer's detached OpenPGP signature over `SHA256SUMS` |
 
 There are no release builds for other platforms.
@@ -32,7 +32,7 @@ GitHub marks every Adiri release and every release candidate as a pre-release, s
 
 ## What the signature proves
 
-`IMAGE_DIGEST` names the image by its content digest, and `SHA256SUMS` lists the SHA-256 of `IMAGE_DIGEST` and of the tarball, so one signature over `SHA256SUMS` covers both the binary and the image.
+`IMAGE_DIGEST` names the image by its content digest, and `SHA256SUMS` lists the SHA-256 of `IMAGE_DIGEST`, of the tarball and of the network's chain-config files, so one signature over `SHA256SUMS` covers the binary, the image, and the genesis, committee and parameters files built into them.
 `SHA256SUMS.asc` is made with a maintainer's OpenPGP key whose signing subkey is held on a YubiKey.
 The same key signs the git tag.
 The keys allowed to sign are in [`.github/maintainer-gpg-keys/`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/maintainer-gpg-keys/README.md) on `main`, and their fingerprints are in the maintainer release keys table in [`SECURITY.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/SECURITY.md#maintainer-release-keys).
@@ -62,7 +62,7 @@ The tag is fetched into the same checkout by its full name, `refs/tags/<TAG>`, b
 
 ## Path A: tarball
 
-These commands clone `main` for the maintainer keys, fetch the tag, download the four release files, check the signature over `SHA256SUMS`, and check both hashes:
+These commands clone `main` for the maintainer keys, fetch the tag, extract the chain-config files from it, download the four release files, check the signature over `SHA256SUMS`, and check every hash in it:
 
 ```sh
 TAG=v0.17.0-adiri
@@ -70,6 +70,7 @@ REPO=Telcoin-Association/telcoin-network
 BASE="https://github.com/$REPO/releases/download/$TAG"
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" "$BASE/telcoin-network-$TAG-x86_64-unknown-linux-gnu.tar.gz" &&
@@ -83,12 +84,25 @@ Each command runs only if the one before it passed.
 Expect:
 
 - `GOODSIG`, then `signed by primary key` followed by a fingerprint;
-- `sha256sum` to print `IMAGE_DIGEST: OK` and `telcoin-network-<TAG>-x86_64-unknown-linux-gnu.tar.gz: OK`;
+- `sha256sum` to print `OK` after `IMAGE_DIGEST`, after the three `chain-configs/` files and after `telcoin-network-<TAG>-x86_64-unknown-linux-gnu.tar.gz`;
 - `Signature and hashes verified` as the last line.
 
 gpgv prints `Good signature from` and exits 0 even when the signing subkey is revoked or expired, so the block reads gpgv's status lines instead and accepts only `GOODSIG`.
 If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not extract or run anything from this release, and report it.
 The lines above it show which check failed, and [When verification fails](#when-verification-fails) explains each one.
+
+### Chain-config files
+
+`SHA256SUMS` lists the network's `committee.yaml`, `genesis.yaml` and `parameters.yaml` by their path in the repository: `chain-configs/testnet/` for an `-adiri` tag and `chain-configs/mainnet/` for any other.
+These are the files built into the release's binary for `--chain`.
+The block extracts them from the tag into `chain-configs/`, so `sha256sum` checks them against their signed hashes, and you can use these copies.
+To check copies you already have, run this from the directory that holds their `chain-configs/` folder, such as the root of a checkout of the tag, with the path of the verified `SHA256SUMS`:
+
+```sh
+grep '  chain-configs/' /path/to/SHA256SUMS | sha256sum --check
+```
+
+It must print `OK` for all three files.
 
 ### Check the key fingerprints
 
@@ -140,7 +154,7 @@ Record the tarball's SHA-256 from `SHA256SUMS` and the `--version` output in you
 
 ## Path B: Docker image
 
-The image needs only three of the release files: `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`.
+The image needs only three of the release files, `SHA256SUMS`, `SHA256SUMS.asc` and `IMAGE_DIGEST`, and the chain-config files from the tag.
 These commands are the Path A block without the tarball, and with `--ignore-missing`, which makes `sha256sum` skip the tarball's line in `SHA256SUMS`:
 
 ```sh
@@ -149,6 +163,7 @@ REPO=Telcoin-Association/telcoin-network
 BASE="https://github.com/$REPO/releases/download/$TAG"
 git clone --quiet --depth 1 --branch main "https://github.com/$REPO.git" tn-main &&
 git -C tn-main fetch --quiet --depth 1 origin "refs/tags/$TAG:refs/tags/$TAG" &&
+git -C tn-main archive "refs/tags/$TAG" chain-configs | tar -xf - &&
 for k in tn-main/.github/maintainer-gpg-keys/*.asc; do gpg --dearmor < "$k"; done > tn-release-keys.gpg &&
 gpg --show-keys --with-fingerprint tn-main/.github/maintainer-gpg-keys/*.asc &&
 curl -fsSL --remote-name-all "$BASE/SHA256SUMS" "$BASE/SHA256SUMS.asc" "$BASE/IMAGE_DIGEST" &&
@@ -158,7 +173,7 @@ sha256sum --check --ignore-missing SHA256SUMS &&
 echo "Signature and hashes verified"
 ```
 
-Expect `GOODSIG`, then `signed by primary key` followed by a fingerprint, then `IMAGE_DIGEST: OK`, and `Signature and hashes verified` as the last line.
+Expect `GOODSIG`, then `signed by primary key` followed by a fingerprint, then `OK` after `IMAGE_DIGEST` and after the three `chain-configs/` files, and `Signature and hashes verified` as the last line.
 If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not pull or run the image, and report it.
 Then check the key fingerprints as in [Path A](#check-the-key-fingerprints), and stop if one is missing, different or revoked.
 
@@ -218,6 +233,7 @@ Never extract, install or run anything from a release that failed one of these c
 | `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing subkey has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key there. |
 | `sha256sum` prints `FAILED` | A file differs from its signed hash | Download it again once; if it still fails, report it. |
 | `sha256sum` prints `no file was verified` | None of the files named in `SHA256SUMS` is present | Check `TAG` and the downloaded file names. |
+| `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |
 | A fingerprint is missing from, or differs from, `SECURITY.md` or GitHub, or its `SECURITY.md` Status is `revoked` | The keys on `main` are not the current maintainer keys | Stop and report it. |
 | `IMAGE_DIGEST does not name a telcoin-network image by digest` | The signed `IMAGE_DIGEST` points outside the release repository | Stop and report it. |
 | `Commit SHA` differs from the tag's commit, or `Build Features` lacks `adiri` on an `-adiri` tag | The binary does not match the release | Stop and report it. |
