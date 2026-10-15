@@ -881,8 +881,10 @@ async fn probe_method_not_allowed(method: Method) -> Response {
 
 /// Build the CORS layer for `origins`: a JSON-RPC client only ever needs
 /// `POST` with a `Content-Type` header, and a browser may cache the preflight
-/// answer for [`CORS_MAX_AGE`]. Origins are matched exactly, byte for byte,
-/// against the request's `Origin`.
+/// answer for [`CORS_MAX_AGE`]. `Retry-After` is exposed so a page can read
+/// how long a capacity `503` asks it to wait; a browser hides every response
+/// header outside the CORS-safelisted few unless it is exposed. Origins are
+/// matched exactly, byte for byte, against the request's `Origin`.
 fn cors_layer(origins: CorsOrigins) -> CorsLayer {
     let allow_origin = match origins {
         CorsOrigins::Any => AllowOrigin::any(),
@@ -894,6 +896,7 @@ fn cors_layer(origins: CorsOrigins) -> CorsLayer {
         .allow_origin(allow_origin)
         .allow_methods([Method::POST])
         .allow_headers([header::CONTENT_TYPE])
+        .expose_headers([header::RETRY_AFTER])
         .max_age(CORS_MAX_AGE)
 }
 
@@ -9440,9 +9443,12 @@ mod tests {
     }
 
     /// A disallowed origin is still served, as a non-browser client would be,
-    /// but its `POST` gets no CORS header and its preflight no
+    /// but neither its `POST` nor its preflight gets
     /// `Access-Control-Allow-Origin`, so a browser withholds the response from
-    /// the page. Matching is exact: scheme, host and port must all agree.
+    /// the page. The `POST` carries only the `Access-Control-Expose-Headers`
+    /// the layer adds to every answer but a preflight, which grants nothing
+    /// without the origin. Matching is exact: scheme, host and port must all
+    /// agree.
     #[tokio::test]
     async fn disallowed_origin_gets_no_cors_headers() {
         let (gateway, worker_seen, _guards) =
@@ -9458,7 +9464,7 @@ mod tests {
         for origin in disallowed {
             let response = post_from(gateway, origin).await;
             assert_eq!(response.status(), StatusCode::OK, "{origin}");
-            assert_eq!(cors_headers(&response), Vec::<String>::new(), "{origin}");
+            assert_eq!(cors_headers(&response), ["access-control-expose-headers"], "{origin}");
             assert_eq!(response.text().await.expect("text"), "worker", "{origin}");
 
             // the preflight is still answered locally, without allowing the
@@ -9477,6 +9483,23 @@ mod tests {
             );
         }
         assert_eq!(worker_seen.hits(), disallowed.len(), "only the posts are forwarded");
+    }
+
+    /// An allowed page can read `Retry-After`: the browser hides a response
+    /// header from the page unless the CORS answer exposes it.
+    #[tokio::test]
+    async fn cors_response_exposes_retry_after() {
+        let origin = "https://app.example";
+        let (gateway, _worker_seen, _guards) = cors_gateway(cors_list(&[origin])).await;
+
+        let response = post_from(gateway, origin).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(header_value(&response, header::ACCESS_CONTROL_ALLOW_ORIGIN), origin);
+        let exposed = header_value(&response, header::ACCESS_CONTROL_EXPOSE_HEADERS);
+        assert!(
+            exposed.split(',').any(|name| name.trim().eq_ignore_ascii_case("retry-after")),
+            "exposed: {exposed:?}"
+        );
     }
 
     #[tokio::test]
