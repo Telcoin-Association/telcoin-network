@@ -796,7 +796,7 @@ A `408` with "request did not complete within the gateway's deadline" means the 
 A `504` with "request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
 Both carry `-32005`, which tells the deadline's `504` from the upstream timeout's `504` (`-32002`).
 The answer after forwarding is not a `408` because client stacks such as OkHttp resend a `408` on their own, and the client would never see that message.
-An upstream's own `408` is not rewritten; the client gets it with the upstream's status and body.
+An upstream's own `408` is not turned into the gateway's deadline error: it keeps its status, with its body if that is JSON and the `-32012` error otherwise, like any other upstream error status.
 Nor does the deadline cut a request whose upstream has already answered: the client gets that answer.
 
 Neither `504` (`-32002` or `-32005`), nor a `502`, means the request was not delivered: the gateway may already have sent it when the upstream or the deadline timed out, or the connection failed.
@@ -804,7 +804,8 @@ With the default timeouts a slow worker produces the upstream timeout's `504`, n
 Treat any of them like the deadline's `504` and look a submission up by hash before sending it again.
 
 A gateway error answering a batch (a JSON array) is one error object, not an array of per-call errors, and its `id` is `null`, except for a screen rejection inside a batch made only of submissions, which carries the refused element's `id` (see [Transaction screening](#transaction-screening)).
-The gateway refuses a batch only as a whole: it never splits one, and it decides a `405` or `429` before reading the body.
+The gateway refuses a batch only as a whole: it never splits one.
+A `405`, and a `429` from the edge rate limit, come before the body is read; a `429` for a batch's extra tokens, or with `--rate-limit-submissions` from its class's bucket, comes after it, still for the whole batch.
 That is the shape JSON-RPC 2.0 prescribes when a batch cannot be taken as a whole (invalid JSON or an empty array).
 A batch the upstream answers comes back as the upstream sent it.
 

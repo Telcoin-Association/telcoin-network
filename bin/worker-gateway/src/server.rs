@@ -712,10 +712,11 @@ impl Drop for ClientSlot {
 /// `request_deadline` bounds each whole request, and an overrun is answered
 /// with the gateway's own JSON-RPC error envelope, a `408` before the request
 /// was forwarded and a `504` after (see [`enforce_request_deadline`]); a `408`
-/// from an upstream passes through untouched. Streamed *response* bodies are written after the
+/// from an upstream passes through this layer unchanged, relayed like any other
+/// upstream error status. Streamed *response* bodies are written after the
 /// handler returns, outside this deadline; they are bounded by the accept loop's
 /// transport-stall deadline and connection-lifetime cap (the upstream
-/// client's total timeout is only checked when the body is polled, which a
+/// client's read timeout is only checked when the body is polled, which a
 /// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
 /// caps the buffered request body.
 ///
@@ -978,7 +979,7 @@ async fn log_access(
 ///
 /// Only an overrun of this deadline produces the envelope; the response of a
 /// request that finishes in time, an upstream's own `408` included, passes
-/// through unchanged. The request `id` is not recovered (the body may never
+/// through this layer unchanged. The request `id` is not recovered (the body may never
 /// have finished arriving), so it echoes as `null`, per spec. The message
 /// says whether the request may have reached an upstream, from the
 /// [`ForwardingStarted`] marker the proxy sets just before it forwards.
