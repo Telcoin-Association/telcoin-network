@@ -21,6 +21,11 @@ jobs:
       fail-fast: false
       matrix:
         lane: [fmt, clippy, test-default, test-adiri]
+    env:
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings -D unused_extern_crates"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -84,12 +89,16 @@ jobs:
                ".filter(|(key, _)| self.known_peers.contains_key(key))"),
               ("crates/network-libp2p/src/consensus.rs", "tn-network-libp2p",
                "committee_convergence_excludes_stale_records",
-               "CommitteeRpcSnapshot::new(snapshot.members().clone(), rpcs)",
-               "CommitteeRpcSnapshot::new(snapshot.members().clone(), rpcs.into_iter().chain(snapshot.rpcs().iter().cloned()).collect())"),
+               ".and_then(|record| NodeRecord::try_decode_compat(&record.value))\n                    .is_some_and(|record| {",
+               ".and_then(|record| NodeRecord::try_decode_compat(&record.value))\n                    .is_none_or(|record| {"),
               ("crates/tn-reth/src/forward.rs", "tn-reth",
                "committee_convergence_submit_coverage",
                "!self.unreachable.contains_key(endpoint)",
                "self.providers.contains_key(endpoint)"),
+              ("crates/tn-reth/src/forward.rs", "tn-reth",
+               "committee_convergence_submit_coverage",
+               "self.cached_providers(&current_advertisements)",
+               "self.cached_providers(&current_rpcs)"),
           ]
           for filename, package, test, original, mutation in mutants:
               path = Path(filename)

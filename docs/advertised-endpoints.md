@@ -142,6 +142,8 @@ record changes, and rotation appear on the next snapshot. Unresolved or missing 
 the denominator; previous/next members and pinned non-members never enter submit coverage. Observers
 are outside the current committee, so their submit denominator needs no self exclusion. These
 observations describe admission eligibility under existing policy, without an additional HTTP probe.
+The complete advertisement set drives cache retention separately from fresh coverage candidates, so
+record expiry cannot erase a still-advertised endpoint's transport cooldown.
 
 A missing reply or stalled command channel clears coverage after a five-second timeout. Monitor
 cancellation clears all three submit gauges; new epochs start unavailable. Zero members, absent

@@ -1884,12 +1884,10 @@ impl PeerManager {
 
     /// Snapshot membership and learned advertisements without racing committee rotation.
     pub(crate) fn committee_rpc_snapshot(&mut self) -> CommitteeRpcSnapshot {
-        let rpcs = self
-            .current_committee_rpcs()
-            .into_iter()
-            .filter(|(key, _)| !self.record_unlearned(key))
-            .collect();
-        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs)
+        let advertisements = self.current_committee_rpcs();
+        let rpcs =
+            advertisements.iter().filter(|(key, _)| !self.record_unlearned(key)).cloned().collect();
+        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs, advertisements)
     }
 
     /// Observe required remote identities in each slot using the resolution consumer's state.

@@ -776,6 +776,7 @@ where
                                     coverage.worker,
                                     snapshot.members(),
                                     snapshot.rpcs(),
+                                    snapshot.advertisements(),
                                 )
                             },
                         );

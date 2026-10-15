@@ -523,15 +523,21 @@ impl WorkerRpcForwarder {
     /// Refresh observer coverage using an atomic network membership/advertisement snapshot.
     /// Learned records retain the existing committee-window lifetime. Usability additionally
     /// requires this consumer's URL policy and demotion checks, without probing remote servers.
+    /// `advertisements` supplies the complete consumer set; `rpcs` supplies fresh candidates.
     pub fn observe_submit_coverage(
         &self,
         worker: WorkerId,
         members: &HashSet<BlsPublicKey>,
         rpcs: &[(BlsPublicKey, RpcInfo)],
+        advertisements: &[(BlsPublicKey, RpcInfo)],
     ) {
         let current_rpcs: Vec<_> =
             rpcs.iter().filter(|(key, _)| members.contains(key)).cloned().collect();
-        self.cached_providers(&current_rpcs);
+        let current_advertisements: Vec<_> =
+            advertisements.iter().filter(|(key, _)| members.contains(key)).cloned().collect();
+        // Preserve the exact advertisement lifecycle used by forwarding. A record becoming
+        // ineligible for coverage must not erase an endpoint's admission cooldown.
+        let _ = self.cached_providers(&current_advertisements);
         let mut cache = self.cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         cache.coverage = Some(SubmitCoverage {
             worker,
@@ -1578,21 +1584,18 @@ mod tests {
             assert_eq!(gauge("tn_worker_submit_observed_timestamp_seconds", "worker-0"), Some(0.0));
             // Cache an old URL, then omit it from the authoritative snapshot.
             forwarder.cached_providers(&[(departed, rpc.clone())]);
-            forwarder.observe_submit_coverage(0, &members, &[]);
+            forwarder.observe_submit_coverage(0, &members, &[], &[]);
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
-            forwarder.observe_submit_coverage(
-                0,
-                &members,
-                &[
-                    (member, rpc.clone()),
-                    (member, second.clone()),
-                    (refused, private),
-                    (departed, rpc.clone()),
-                ],
-            );
+            let advertised = [
+                (member, rpc.clone()),
+                (member, second.clone()),
+                (refused, private),
+                (departed, rpc.clone()),
+            ];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(3.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
-            other_worker.observe_submit_coverage(1, &HashSet::from([missing]), &[]);
+            other_worker.observe_submit_coverage(1, &HashSet::from([missing]), &[], &[]);
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-1"), Some(1.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-1"), Some(0.0));
             forwarder
@@ -1602,7 +1605,13 @@ mod tests {
                 .demote_endpoint(second.http.as_str());
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
             // A refresh while demoted must retain enough consumer state to observe recovery.
-            forwarder.observe_submit_coverage(0, &members, &[(member, second.clone())]);
+            let advertised = [(member, second.clone())];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
+            // Losing record freshness must not retire an endpoint's advertised cooldown.
+            forwarder.observe_submit_coverage(0, &members, &[], &advertised);
+            assert!(forwarder.cached_providers(&advertised).is_empty());
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             forwarder
                 .cache
@@ -1610,14 +1619,17 @@ mod tests {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recover_endpoint(second.http.as_str());
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
-            forwarder.observe_submit_coverage(
-                0,
-                &members,
-                &[(member, rpc.clone()), (missing, rpc.clone()), (refused, rpc)],
-            );
+            let advertised = [(member, rpc.clone()), (missing, rpc.clone()), (refused, rpc)];
+            forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(3.0));
             // Rotation removes departed identities even if their URL is supplied again.
-            forwarder.observe_submit_coverage(0, &HashSet::from([missing]), &[(member, second)]);
+            let advertised = [(member, second)];
+            forwarder.observe_submit_coverage(
+                0,
+                &HashSet::from([missing]),
+                &advertised,
+                &advertised,
+            );
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(1.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             forwarder.clear_submit_coverage(0);

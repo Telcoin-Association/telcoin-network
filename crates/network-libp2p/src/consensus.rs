@@ -1605,7 +1605,11 @@ where
             })
             .cloned()
             .collect();
-        crate::types::CommitteeRpcSnapshot::new(snapshot.members().clone(), rpcs)
+        crate::types::CommitteeRpcSnapshot::new(
+            snapshot.members().clone(),
+            rpcs,
+            snapshot.advertisements().to_vec(),
+        )
     }
 
     /// Refill required rows after ownership updates, even if the restored peer cache already

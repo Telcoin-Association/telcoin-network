@@ -22,21 +22,27 @@ pub type NetworkResult<T> = Result<T, NetworkError>;
 
 /// One atomic view of current membership and its learned submit advertisements.
 ///
-/// Membership includes unresolved identities. Advertisements follow the peer manager's
-/// verified-record policy, exclude configuration stubs and expired store rows, and do not
-/// imply endpoint usability.
+/// Membership includes unresolved identities. Coverage candidates exclude configuration
+/// stubs and expired store rows. The complete consumer advertisement set is retained separately
+/// so observing freshness cannot retire an advertised endpoint's transport cooldown.
 #[derive(Clone, Debug)]
 pub struct CommitteeRpcSnapshot {
     /// Current committee identities from authoritative epoch state.
     members: HashSet<BlsPublicKey>,
     /// Learned RPC advertisements belonging to these members.
     rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+    /// Complete current advertisements used by forwarding, including cached records.
+    advertisements: Vec<(BlsPublicKey, RpcInfo)>,
 }
 
 impl CommitteeRpcSnapshot {
     /// Construct a snapshot on the swarm loop, without an intervening committee update.
-    pub(crate) fn new(members: HashSet<BlsPublicKey>, rpcs: Vec<(BlsPublicKey, RpcInfo)>) -> Self {
-        Self { members, rpcs }
+    pub(crate) fn new(
+        members: HashSet<BlsPublicKey>,
+        rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+        advertisements: Vec<(BlsPublicKey, RpcInfo)>,
+    ) -> Self {
+        Self { members, rpcs, advertisements }
     }
 
     /// Current identities, including members without an RPC advertisement.
@@ -44,9 +50,14 @@ impl CommitteeRpcSnapshot {
         &self.members
     }
 
-    /// Learned advertisements; callers must still apply their endpoint admission policy.
+    /// Fresh verified coverage candidates; callers must still apply endpoint admission policy.
     pub fn rpcs(&self) -> &[(BlsPublicKey, RpcInfo)] {
         &self.rpcs
+    }
+
+    /// Complete advertisement set, matching the forwarding consumer's cache lifecycle.
+    pub fn advertisements(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.advertisements
     }
 }
 
