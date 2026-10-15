@@ -2,7 +2,7 @@
 
 use std::{
     collections::BTreeSet,
-    fs,
+    fmt, fs,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
@@ -58,7 +58,7 @@ const MIN_QUIET_V4_PREFIX: u8 = 16;
 const MIN_QUIET_V6_PREFIX: u8 = 32;
 
 /// Mostly stateless reverse proxy in front of Telcoin Network worker JSON-RPC.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 pub(crate) struct Cli {
     /// Address the gateway listens on for client JSON-RPC, and for its own
@@ -643,6 +643,38 @@ pub(crate) struct Cli {
     /// `json` never does. Any other value is rejected at startup.
     #[arg(long, env = "WORKER_GATEWAY_LOG_FORMAT", value_enum, default_value_t = LogFormat::Text)]
     pub(crate) log_format: LogFormat,
+}
+
+/// Prints only the flags that identify a deployment: the three URL flags by
+/// origin (see [`UpstreamOrigin`]), since a worker or hosted RPC URL can carry
+/// a credential in its userinfo, path or query, and `--redirect-queries-header`
+/// as `<redacted>`. Every other field, a flag added later included, is left out
+/// rather than printed.
+impl fmt::Debug for Cli {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let origin = |value: &Option<String>| {
+            value.as_deref().map(|value| {
+                Url::parse(value).map_or_else(
+                    |_| String::from("<invalid url>"),
+                    |url| UpstreamOrigin(&url).to_string(),
+                )
+            })
+        };
+        f.debug_struct("Cli")
+            .field("listen_addr", &self.listen_addr)
+            .field("probe_addr", &self.probe_addr)
+            .field("config", &self.config)
+            .field("upstream_rpc_url", &origin(&self.upstream_rpc_url))
+            .field("upstream_readiness_url", &origin(&self.upstream_readiness_url))
+            .field("worker_id", &self.worker_id)
+            .field("redirect_queries", &origin(&self.redirect_queries))
+            .field(
+                "redirect_queries_header",
+                &self.redirect_queries_header.as_ref().map(|_| "<redacted>"),
+            )
+            .field("redirect_queries_header_file", &self.redirect_queries_header_file)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Fully-resolved runtime settings, derived from [`Cli`].
@@ -3855,6 +3887,50 @@ mod tests {
         assert_eq!(try_parse_test_argv(argv(None))?.log_format, LogFormat::Text);
         assert_eq!(try_parse_test_argv(argv(Some("text")))?.log_format, LogFormat::Text);
         assert_eq!(try_parse_test_argv(argv(Some("json")))?.log_format, LogFormat::Json);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_debug_redacts_urls_and_header() -> eyre::Result<()> {
+        let cli = try_parse_test_argv([
+            "worker-gateway",
+            "--upstream-rpc-url=https://gw:s3cret@worker-0.internal:8545/rpc-path?key=qsecret1",
+            "--upstream-readiness-url=https://gw:s3cret@worker-0.internal/ready-path?key=qsecret2",
+            "--redirect-queries=https://user:pw0rd@rpc.example.com/v2/apikey123?key=qsecret3",
+            "--redirect-queries-header=X-Api-Key: hdrsecret",
+        ])?;
+        let debug = format!("{cli:?}");
+        for shown in [
+            "https://worker-0.internal:8545",
+            "https://worker-0.internal:443",
+            "https://rpc.example.com:443",
+            "<redacted>",
+        ] {
+            assert!(debug.contains(shown), "`{shown}` missing from: {debug}");
+        }
+        for secret in [
+            "s3cret",
+            "pw0rd",
+            "rpc-path",
+            "ready-path",
+            "apikey123",
+            "qsecret",
+            "hdrsecret",
+            "X-Api-Key",
+        ] {
+            assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
+        }
+        // a flag the impl does not name is left out, never printed
+        assert!(!debug.contains("log_filter"), "{debug}");
+
+        // a value that does not parse is not printed either
+        let cli = try_parse_test_argv([
+            "worker-gateway",
+            "--upstream-rpc-url=https://gw:s3cret@worker-0.internal:85x45/",
+        ])?;
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("<invalid url>"), "{debug}");
+        assert!(!debug.contains("s3cret"), "{debug}");
         Ok(())
     }
 
