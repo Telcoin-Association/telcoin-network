@@ -547,7 +547,7 @@ A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls
 
 - **Length cap.** `--max-batch-len` (default 50, `0` means unlimited) caps the calls in one batch.
   The effective cap is the smaller of `--max-batch-len` and the smallest enabled rate-limit burst, and startup logs a warning when a burst lowers it.
-  A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before it is screened or forwarded, whichever upstream it would go to.
+  A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before its screen verdict is applied or it is forwarded, whichever upstream it would go to.
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
   The first token is taken before the body is read (with `--rate-limit-submissions`, only its per-IP part, see [Rate limiting](#rate-limiting)); the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.

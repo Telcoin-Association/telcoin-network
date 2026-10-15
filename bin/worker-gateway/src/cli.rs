@@ -391,10 +391,10 @@ pub(crate) struct Cli {
 
     /// Maximum number of calls in one JSON-RPC batch (default 50; `0` means
     /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
-    /// long" error (`413`, `-32003`) before it is screened or forwarded, on
-    /// either route. The effective cap never exceeds the smallest enabled
-    /// rate-limit burst: a batch needs one token per call at once, so a longer
-    /// one could never pass.
+    /// long" error (`413`, `-32003`) before its screen verdict is applied or
+    /// it is forwarded, on either route. The effective cap never exceeds the
+    /// smallest enabled rate-limit burst: a batch needs one token per call at
+    /// once, so a longer one could never pass.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_BATCH_LEN",
