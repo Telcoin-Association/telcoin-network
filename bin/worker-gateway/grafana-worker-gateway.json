@@ -140,7 +140,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Rejected and upstream-error requests per second by reason (no_upstream_ready, upstream_unreachable, upstream_timeout, request_too_large, loop_detected, request_timeout, rate_limited, invalid_transaction, unsupported_transaction_type, unreadable_body, upstream_error)."
+      "description": "Rejected and upstream-error requests per second by reason. The panel plots every reason label the gateway emits; the worker-gateway README's \"Behaviour on failure\" table lists them and what each means."
     },
     {
       "id": 6,
