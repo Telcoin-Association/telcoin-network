@@ -69,7 +69,7 @@ Trust boundaries:
 - **T2, L7 floods.**
   A single request OOMs a gateway (WG-02), concurrent large bodies do the same (WG-05), one host holds every connection (WG-06), probes queue behind it (WG-07), one source drains the global budget (WG-08), and reads crowd out submissions (WG-09).
   Batches carry many calls for one token (WG-03), and expensive reads including `tn_*` reach the worker (WG-11) and drive WG-01.
-  Slow-loris is bounded by the 10 s header-read timeout and the 40 s request deadline, and slow readers by `TCP_USER_TIMEOUT` and the 10-minute connection lifetime.
+  Slow-loris is bounded by the 10 s header-read timeout and the whole-request deadline (40 s at the base commit; 45 s at the current defaults, `--upstream-request-timeout` 35 s + `--header-read-timeout` 10 s), and slow readers by `TCP_USER_TIMEOUT` and the 10-minute connection lifetime.
 - **T3, amplification toward the validator.**
   One token per batch (WG-03), N replicas times the global budget (WG-17), the HPA growing N with upstream latency (WG-16), the shared permit pool (WG-01), and N gateways polling a listener that serves one connection at a time (WG-13).
   The gateway never retries a forward; HTTP redirect-following was the only replay path (WG-10).
@@ -277,7 +277,7 @@ Status refers to the rows of the [plan](#plan-to-address-medium-and-above) (P1-P
   };
   ```
 - **Reproduction:** with `--max-connections 8`, eight keep-alive connections from 127.0.0.2 sending 1.6 requests/s left 127.0.0.3 without a response for 30 s, and `curl -m 1 /health` timed out.
-  Trickled bodies hold a slot for the 40 s request deadline.
+  Trickled bodies hold a slot for the whole-request deadline (40 s at the base commit; 45 s at the current defaults, `--upstream-request-timeout` 35 s + `--header-read-timeout` 10 s).
   An idle keep-alive connection closed at 10.00 s, so the holder has to keep sending; at the default 500 slots that is about 56 requests/s from one host.
 - **Impact:** one host starves every other client of one gateway, submissions included.
   It works per replica and can be repeated against all N; the redirect does not change it.
@@ -792,12 +792,12 @@ New with `--redirect-queries`.
 ### WG-53 No WebSocket, HTTP/2, TLS termination or auth, by design — Info
 
 - **Evidence:** `README.md` Scope; `src/server.rs:207` (HTTP/1 only).
-- **Impact:** subscriptions and TLS termination belong to a front; readiness can be stale by the poll interval plus up to 2 s per upstream polled before it.
+- **Impact:** subscriptions and TLS termination belong to a front; readiness can be stale: since #1624 every upstream is polled at once, so readiness lags a change by up to `--readiness-failure-threshold` (3) or `--readiness-success-threshold` (2) polls at `--readiness-poll-interval` (5 s), each bounded by `--readiness-poll-timeout` (2 s).
 - **Status:** no action.
 
 ## What is already good
 
-- The hand-rolled accept loop gives a header-read deadline and a whole-request deadline (`src/server.rs:207-208`, `130`; 30 s + 10 s, `src/app.rs:139`).
+- The hand-rolled accept loop gives a header-read deadline and a whole-request deadline (`src/server.rs:207-208`, `130`; 30 s + 10 s, `src/app.rs:139`, at the base commit; 35 s + 10 s at the current defaults).
 - Slow readers are bounded by `TCP_USER_TIMEOUT` and the connection lifetime cap (`src/server.rs:245-249`, `263-266`).
 - Responses are streamed, never buffered whole (`src/proxy.rs:177`).
 - Request members other than `id` are skipped in place, without building a `Value` tree (`src/error.rs:263-279`); the `id` itself is the exception (WG-02).
@@ -854,7 +854,7 @@ WG-02 and WG-08 (P3, P4) were small and recommended before any public deployment
 | P9 | WG-06 | A per-IP concurrent connection cap | one IP holding the cap's worth of idle sockets does not stop a second IP from getting `200` | follow-up: worker-gateway: per-IP concurrent connection cap — #1599, fixed by #1633 (merged into this branch) |
 | P10 | WG-03 | Charge one token per batch element, cap batch length, screen every element of an all-submission batch | an over-length batch gets `413` / `-32003`; a batch of K costs K tokens; a bad element inside an all-submission batch is refused | follow-up: worker-gateway: per-element batch charging, max batch length, per-element submission screening — #1600, fixed by #1627 (merged into this branch) |
 | P11 | WG-04 | TLS (optionally mTLS) for worker upstreams, or a documented tunnel | an `https` worker URL is accepted, and forwarding and readiness work against a test server with a custom CA | follow-up: worker-gateway: TLS/mTLS or tunnel for worker upstreams — #1601, fixed by #1629 (merged into this branch) |
-| P12 | WG-19, WG-20 | The reference manifest polls `/health/workers` on the node's healthcheck port and gains a 5 s `preStop` sleep | the manifest's readiness URL path is `/health/workers`; the unedited port placeholder fails at startup; `preStop` + drain + join margin (36 s) fits the 40 s grace period | this PR: `fix(worker-gateway): poll the node healthcheck in the reference manifest` |
+| P12 | WG-19, WG-20 | The reference manifest polls `/health/workers` on the node's healthcheck port and gains a 5 s `preStop` sleep | the manifest's readiness URL path is `/health/workers`; the unedited port placeholder fails at startup; `preStop` + drain + join margin (36 s) fits the 40 s grace period (at the base commit; #1637 replaced the sleep with `--shutdown-delay`, and the manifest now budgets 5 s + 45 s + 1 s = 51 s within a 55 s grace period) | this PR: `fix(worker-gateway): poll the node healthcheck in the reference manifest` |
 | P13 | WG-25 | Log the transport error cause and the upstream origin, never the URL | `upstream_origin_drops_userinfo_path_and_query`, `error_chain_joins_every_source` and `forwarding_failure_log_fields_hide_the_url` pass | this PR: `fix(worker-gateway): log the upstream transport error cause` |
 | P14 | WG-13, WG-16, WG-17, WG-21, WG-23, WG-24 | Operator guidance: firewall the health listener, size budgets for N gateways and the HPA maximum, use health-checked DNS, state the split-routing caveats | the README states each rule with the numbers to plug in | this PR: `docs(worker-gateway): document query redirect topology and record post-change review` |
 | P15 | WG-11 | Without `--redirect-queries`, refuse `tn_*`, `debug_*`, `trace_*` and `admin_*` by default | by default those calls get a JSON-RPC method-not-allowed error and never reach the worker mock | follow-up: worker-gateway: method allowlist when no redirect is configured — #1602, fixed by #1636 (merged into this branch) |
@@ -904,9 +904,9 @@ Point it at an `https` public RPC that serves the same chain.
 
 **Sizing for N gateways.**
 
-- Budgets are per process (WG-17): the worker receives up to N × `--rate-limit-global`.
+- Budgets are per process (WG-17): the worker receives up to N × `--rate-limit-global`, and with `--rate-limit-submissions` set up to N × that budget more in submissions; the README's "Sizing for N gateways" section gives the rule for each combination with `--redirect-queries`.
   Size `--rate-limit-global` as the worker's budget divided by the largest N that can run, which is the HPA's `maxReplicas` if the HPA is installed (WG-16).
-- Connections: since #1625 (P2, merged into this branch) each gateway holds at most `--max-upstream-inflight` (100 by default) concurrent requests to the worker, so keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections` (500 by default); the reference manifest sets 49 for its 10-replica ceiling.
+- Connections: since #1625 (P2, merged into this branch) each gateway holds at most `--max-upstream-inflight` (100 by default) concurrent requests to the worker, so keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections` (500 by default); the reference manifest sets 45, since N counts its 10-replica ceiling plus the pod a rollout is replacing (11 × 45 = 495).
   With that sizing, a flood of `eth_sendRawTransactionSync` calls, each of which can hold a worker permit for up to 30 s, fills only its own gateway's share.
 - Memory: since #1631 (P7, merged into this branch), peak request memory is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB, about 608 MiB at the defaults, under the reference 1Gi limit; the README's "Request size" section and the deploy README's "Memory limit" section give the rule.
   #1642 (P3, merged into this branch) removes WG-02's amplification, which was about 34× the request size.
