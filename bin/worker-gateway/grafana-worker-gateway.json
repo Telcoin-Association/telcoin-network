@@ -636,6 +636,41 @@
       },
       "options": {},
       "description": "Batches per second sent whole to the query upstream because they mixed transaction submissions with other calls, so their submissions went to the query upstream instead of the worker. This is the evidence for or against the deferred split-and-merge of mixed batches (#1611): a flat zero means clients do not send them."
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "Open client connections",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 12,
+        "y": 70
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "tn_worker_gateway_open_connections{job=\"$job\"}",
+          "refId": "A",
+          "legendFormat": "{{instance}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {},
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {},
+      "description": "Client-listener connections holding a --max-connections slot, per gateway. Compared with --max-connections (500 by default), a flat line at the cap means new connections are waiting in the kernel's accept backlog."
     }
   ],
   "refresh": "30s",
