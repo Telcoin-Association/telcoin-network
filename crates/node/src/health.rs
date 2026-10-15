@@ -7,7 +7,8 @@
 //! - any path except the readiness routes -> liveness: a fixed `200 OK` (the process is up),
 //!   matching the original unconditional behavior.
 //! - `GET /health/workers` -> readiness: a `200 OK` carrying a JSON envelope that reports, per
-//!   worker, whether the worker is accepting transactions.
+//!   worker, whether the worker is accepting transactions. The flag is also false while the node's
+//!   mode refuses submissions (an inactive validator), matching RPC admission.
 //!
 //! The `/health/workers` readiness route is the contract a stateless worker gateway polls to
 //! decide whether to forward RPC traffic to this node (see issue #712). The
@@ -70,7 +71,9 @@ pub(crate) struct WorkerReadiness {
     /// Whether the worker is up and accepting transactions.
     ///
     /// True only while the worker's RPC listeners are running, its id is
-    /// in the current committee's worker range, and that epoch has not shut down.
+    /// in the current committee's worker range, that epoch has not shut down,
+    /// and the node's mode admits submissions. An inactive validator reports
+    /// false because its RPC handlers refuse every submission (issue #1514).
     /// Persistent components alone do not imply current readiness.
     accepting_transactions: bool,
 }
