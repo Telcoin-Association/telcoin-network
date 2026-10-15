@@ -1074,6 +1074,12 @@ where
     }
 
     /// Process events from the swarm.
+    ///
+    /// Non-blocking invariant (issue #1656): the swarm task never waits for a gossip publish or
+    /// for a slow peer. This function does not publish and does not await. It gives received
+    /// gossip to the application with `try_send_outcome`, which does not wait when the
+    /// application channel is full. [`Self::process_command`] states the publish half of the
+    /// invariant. `test_publish_to_stalled_peer_never_blocks_swarm` protects it.
     #[instrument(level = "trace", target = "network::events", skip(self), fields(topics = ?self.authorized_publishers.keys()))]
     async fn process_event(
         &mut self,
@@ -1192,6 +1198,16 @@ where
     }
 
     /// Process commands for the network.
+    ///
+    /// Non-blocking invariant (issue #1656): this function is synchronous, so the swarm task
+    /// never awaits a command. `NetworkCommand::Publish` calls `gossipsub.publish`, which puts
+    /// the message in the send queue of each recipient connection or fails at once. When the
+    /// send queue of every recipient is full, the result is `PublishError::AllQueuesFull`. The
+    /// swarm task sends each result, success or failure, to the caller in the same loop
+    /// iteration and does not retry a failed publish. The caller decides whether to publish
+    /// again. `test_publish_to_stalled_peer_never_blocks_swarm` protects this invariant, and
+    /// `test_full_command_channel_publish_waits_then_resolves` records what a caller sees when
+    /// the command channel is full.
     fn process_command(&mut self, command: NetworkCommand<Req, Res>) -> NetworkResult<()> {
         match command {
             NetworkCommand::StartListening { multiaddr, reply } => {
@@ -1327,6 +1343,10 @@ where
                 };
                 if res.is_ok() {
                     self.metrics.record_gossip_published();
+                }
+                // No retry here: the failure goes back to the caller with the result.
+                if matches!(res, Err(PublishError::AllQueuesFull(_))) {
+                    self.metrics.record_gossip_publish_queue_full();
                 }
                 send_or_log_error!(reply, res, "Publish");
             }

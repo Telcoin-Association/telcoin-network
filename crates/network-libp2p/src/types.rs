@@ -682,7 +682,36 @@ where
         Ok(was_subscribed.await?)
     }
 
+    /// The free and total slots of the command channel.
+    ///
+    /// `test_full_command_channel_publish_waits_then_resolves` reads it to see when the channel
+    /// is full.
+    #[cfg(test)]
+    pub(crate) fn command_channel_slots(&self) -> (usize, usize) {
+        (self.sender.capacity(), self.sender.max_capacity())
+    }
+
     /// Publish a message on a certain topic.
+    ///
+    /// The swarm task never waits for a peer during a publish (see
+    /// `ConsensusNetwork::process_command`). The caller can wait at two points only:
+    ///
+    /// - The send on the command channel waits while the channel holds its 100 commands. This
+    ///   occurs only when the swarm task is behind, and the swarm task drains the channel at its
+    ///   loop rate.
+    /// - The reply comes in the loop iteration that takes the command from the channel. It holds
+    ///   the gossipsub result, for example `PublishError::AllQueuesFull` when the send queue of
+    ///   every recipient peer is full. The swarm task does not retry a failed publish.
+    ///
+    /// The callers that wait here are the certifier (certificates), the executor subscriber
+    /// (consensus output), the epoch-vote manager (epoch votes) and the worker (batch digests).
+    /// None of them runs on the swarm task, so a wait delays that caller and never the swarm
+    /// task. The wait has no timeout, and the send is not `try_send`, by decision (issue #1656):
+    /// both would drop a message during a short burst that the swarm task drains, and neither
+    /// helps when the swarm task stalls, because every other [`NetworkHandle`] call uses the
+    /// same channel. A timeout on the reply also does not cancel a publish that is already in
+    /// the channel. `test_full_command_channel_publish_waits_then_resolves` records what a
+    /// caller sees when the channel is full.
     pub async fn publish(&self, topic: String, msg: Vec<u8>) -> NetworkResult<MessageId> {
         let (reply, published) = oneshot::channel();
         self.sender.send(NetworkCommand::Publish { topic, msg, reply }).await?;
