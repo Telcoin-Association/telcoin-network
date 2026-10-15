@@ -185,7 +185,10 @@ impl GatewayError {
             Self::UpstreamAnswerLost => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected | Self::RedirectLoopDetected => StatusCode::LOOP_DETECTED,
-            Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
+            Self::RequestTimeout { forwarding_started: false } => StatusCode::REQUEST_TIMEOUT,
+            // the request reached the upstream: a 408 ("you were too slow to
+            // send") would invite OkHttp and Chromium to resend it on their own
+            Self::RequestTimeout { forwarding_started: true } => StatusCode::GATEWAY_TIMEOUT,
             Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::InvalidTransaction | Self::UnsupportedTransactionType(_) => {
                 StatusCode::BAD_REQUEST
@@ -967,6 +970,11 @@ mod tests {
             error_response(&GatewayError::RequestTimeout { forwarding_started: false }, b"{}")
                 .status(),
             StatusCode::REQUEST_TIMEOUT
+        );
+        assert_eq!(
+            error_response(&GatewayError::RequestTimeout { forwarding_started: true }, b"{}")
+                .status(),
+            StatusCode::GATEWAY_TIMEOUT
         );
         assert_eq!(
             error_response(&GatewayError::UnreadableBody, b"{}").status(),

@@ -643,10 +643,10 @@ impl Drop for ClientSlot {
 /// Build the gateway router: health/readiness routes plus the proxy fallback.
 ///
 /// `request_deadline` bounds each whole request, and an overrun is answered
-/// with the gateway's own `408` JSON-RPC error envelope (see
-/// [`enforce_request_deadline`]); a `408` from an upstream passes through
-/// untouched. Streamed *response* bodies are written after the handler
-/// returns, outside this deadline; they are bounded by the accept loop's
+/// with the gateway's own JSON-RPC error envelope, a `408` before the request
+/// was forwarded and a `504` after (see [`enforce_request_deadline`]); a `408`
+/// from an upstream passes through untouched. Streamed *response* bodies are written after the
+/// handler returns, outside this deadline; they are bounded by the accept loop's
 /// transport-stall deadline and connection-lifetime cap (the upstream
 /// client's total timeout is only checked when the body is polled, which a
 /// slow-reading client can prevent; see [`accept_loop`]). `max_request_bytes`
@@ -677,7 +677,8 @@ impl Drop for ClientSlot {
 ///
 /// The access log sits outside every layer that can answer a request itself,
 /// so a request answered there is logged like a proxied one: a `429`, a
-/// byte-budget `413` or `503`, a `405`, a `408` and, with CORS on, a preflight.
+/// byte-budget `413` or `503`, a `405`, the deadline's `408` or `504` and, with
+/// CORS on, a preflight.
 /// `/health` and `/ready` are exempt by path, as from the rate limiter.
 ///
 /// The CORS layer answers every `OPTIONS` itself as a preflight, so a
@@ -840,7 +841,11 @@ async fn log_access(
 }
 
 /// Bound a whole request by `deadline`, answering an overrun with the
-/// gateway's `408` JSON-RPC error envelope.
+/// gateway's JSON-RPC error envelope: a `408` while the request has not been
+/// forwarded, and a `504` once it has. A `408` says the request never fully
+/// arrived, and client stacks such as OkHttp and Chromium resend one on their
+/// own, so a request that may have reached the upstream is never answered
+/// with it.
 ///
 /// Only an overrun of this deadline produces the envelope; the response of a
 /// request that finishes in time, an upstream's own `408` included, passes
@@ -2134,8 +2139,13 @@ mod tests {
         assert_eq!(body["id"], serde_json::Value::Null);
     }
 
+    /// The deadline fired after the request went upstream is a `504`, not a
+    /// `408` a client stack would resend on its own; its code, `-32005`, tells
+    /// it from the upstream timeout's `504` (`-32002`). The deadline before
+    /// forwarding keeps its `408` (see
+    /// `gateway_408_before_forwarding_says_not_delivered`).
     #[tokio::test]
-    async fn gateway_408_after_forwarding_says_delivery_unknown() {
+    async fn deadline_after_forwarding_is_a_504() {
         // A worker slower than the whole-request deadline: the request reaches
         // it, then the deadline fires while the gateway waits for the answer.
         let hits = Arc::new(AtomicUsize::new(0));
@@ -2165,7 +2175,7 @@ mod tests {
         .await;
 
         let (status, text) = post_rpc(gateway, None, call("eth_sendRawTransaction", 3)).await;
-        assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
         let body: serde_json::Value = serde_json::from_str(&text).expect("json error body");
         assert_eq!(body["error"]["code"], -32005);
         assert_eq!(
@@ -9909,7 +9919,7 @@ mod tests {
         let (gateway, _shutdown) = spawn(app).await;
 
         let body = call("eth_chainId", 1);
-        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::REQUEST_TIMEOUT);
+        assert_eq!(post_rpc(gateway, None, body.clone()).await.0, StatusCode::GATEWAY_TIMEOUT);
         assert_eq!(worker_seen.hits(), 1, "the request was forwarded");
         let lines = lines.lines();
         assert_eq!(lines.len(), 1, "{lines:?}");
@@ -9917,7 +9927,7 @@ mod tests {
         assert_eq!(
             [&lines[0]["class"], &lines[0]["route"], &lines[0]["status"], &lines[0]["bytes_in"]]
                 .map(String::as_str),
-            ["query", "worker", "408", size.as_str()]
+            ["query", "worker", "504", size.as_str()]
         );
     }
 

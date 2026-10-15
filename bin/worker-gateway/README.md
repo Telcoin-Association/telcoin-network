@@ -738,7 +738,7 @@ The error carries the HTTP status in the table below and a JSON-RPC error object
 A client library that treats every non-`2xx` status as a transport failure reports these as HTTP errors, so read the body whatever the status.
 The request `id` is echoed when it can be recovered from the body.
 It is `null` for a batch (see below), except that a screen rejection inside a batch made only of submissions echoes the refused element's `id` (see [Transaction screening](#transaction-screening)).
-It is always `null` on a `405`, `408`, `413`, the `503` for an exhausted byte budget (`-32010`), the `400` for an unreadable body, and a `429` from the edge rate limits or from a batch's extra tokens (see [Batches](#batches)), which the gateway answers without recovering the id.
+It is always `null` on a `405`, the request deadline's `408` and `504`, `413`, the `503` for an exhausted byte budget (`-32010`), the `400` for an unreadable body, and a `429` from the edge rate limits or from a batch's extra tokens (see [Batches](#batches)), which the gateway answers without recovering the id.
 With `--rate-limit-submissions` set, the global bucket's verdict is settled after the body is read (see [Rate limiting](#rate-limiting)), so the `429` it gives a single call, and the one the submission bucket gives, echo the `id` like any other error.
 An `id` that is an array, an object, a boolean or a string over 256 bytes is echoed as `null` on every path, a refused batch element's included.
 
@@ -755,7 +755,8 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | Batch longer than `--max-batch-len` | `413` | `-32003` |
 | Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
 | Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`; reason `redirect_loop_detected`) | `508` | `-32004` |
-| Request deadline exceeded | `408` | `-32005` |
+| Request deadline exceeded before the request was sent upstream | `408` | `-32005` |
+| Request deadline exceeded after the request was sent upstream | `504` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
 | Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
@@ -789,15 +790,17 @@ and counts it as `result="body_failed"` in
 `tn_worker_gateway_routed_requests_total`.
 The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `forwarded` and then `body_failed`, like a streamed answer.
 
-The `408` message says whether the request may have been delivered.
-"request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
-"request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
+The request deadline's answer says whether the request may have been delivered.
+A `408` with "request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
+A `504` with "request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
+Both carry `-32005`, which tells the deadline's `504` from the upstream timeout's `504` (`-32002`).
+The answer after forwarding is not a `408` because client stacks such as OkHttp resend a `408` on their own, and the client would never see that message.
 An upstream's own `408` is not rewritten; the client gets it with the upstream's status and body.
 Nor does the deadline cut a request whose upstream has already answered: the client gets that answer.
 
-A `504`, and a `502`, do not mean the request was not delivered: the gateway may already have sent it when the upstream timed out or the connection failed.
-With the default timeouts a slow worker produces the `504`, not the `408`.
-Treat either like the second `408` message and look a submission up by hash before sending it again.
+Neither `504` (`-32002` or `-32005`), nor a `502`, means the request was not delivered: the gateway may already have sent it when the upstream or the deadline timed out, or the connection failed.
+With the default timeouts a slow worker produces the upstream timeout's `504`, not the deadline's.
+Treat any of them like the deadline's `504` and look a submission up by hash before sending it again.
 
 A gateway error answering a batch (a JSON array) is one error object, not an array of per-call errors, and its `id` is `null`, except for a screen rejection inside a batch made only of submissions, which carries the refused element's `id` (see [Transaction screening](#transaction-screening)).
 The gateway refuses a batch only as a whole: it never splits one, and it decides a `405` or `429` before reading the body.
@@ -877,7 +880,7 @@ then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
 by a line that names its call site (`site`) and the count it suppressed. The
 counters above still count every request, including the rejections that log
-nothing per request (`405`, `429`, `408`, `-32010`, `-32011` and an aborted body). The scrape also
+nothing per request (`405`, `429`, the deadline's `408` and `504`, `-32010`, `-32011` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
 shared recorder's reth-compatible naming.
@@ -891,7 +894,7 @@ A value outside that range, or one that is not a number, stops the gateway at st
 Sampling is deterministic and uses no random source.
 The gateway counts the requests and logs the `n`th one when `floor(n * rate)` is greater than `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n` requests are logged, evenly spread: at `0.5` every second request, at `0.25` every fourth.
 The probes are neither counted nor logged: `/health` and `/ready` are exempt by path, `/ready/any` is outside the log, and the `--probe-addr` listener has no access log.
-The log sits outside every layer that answers a request itself, so such a request is logged like any other: a `429` from the rate limiter, a `413` or `503` from the request-size checks, a `405` for a method other than `POST`, a `408`, and, with `--cors-allowed-origins` set, a CORS preflight.
+The log sits outside every layer that answers a request itself, so such a request is logged like any other: a `429` from the rate limiter, a `413` or `503` from the request-size checks, a `405` for a method other than `POST`, the deadline's `408` or `504`, and, with `--cors-allowed-origins` set, a CORS preflight.
 
 | Field | Meaning |
 | --- | --- |
