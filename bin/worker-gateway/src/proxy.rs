@@ -2447,11 +2447,10 @@ fn may_name_a_routed_method(body: &[u8]) -> bool {
     })
 }
 
-/// Decode a `0x`-prefixed (or bare) hex string into bytes, or `None` if it is
-/// not valid hex.
+/// Decode a hex string as the worker's `Bytes` parameter reads it (one
+/// lowercase `0x` prefix, or none), or `None` if the worker would refuse it.
 fn decode_hex(value: &str) -> Option<Vec<u8>> {
-    let trimmed = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")).unwrap_or(value);
-    tn_types::hex::decode(trimmed).ok()
+    tn_types::hex::decode(value).ok()
 }
 
 #[cfg(test)]
@@ -2886,6 +2885,33 @@ mod tests {
     fn non_hex_param_is_rejected() {
         let err = screen_err(&send_raw(r#"["not-hex"]"#));
         assert!(matches!(err, Some(GatewayError::InvalidTransaction)));
+    }
+
+    /// The worker's `Bytes` parameter strips one lowercase `0x` and nothing
+    /// else, so an upper-case or doubled prefix must be refused as
+    /// undecodable, not decoded and forwarded or refused for its type.
+    #[test]
+    fn hex_prefixes_the_worker_refuses_are_refused() {
+        let bare = &EIP155_LEGACY_TX[2..];
+        for hex in [EIP155_LEGACY_TX, bare] {
+            let verdict = screen_err(&send_raw(&format!("[\"{hex}\"]")));
+            assert!(verdict.is_none(), "{hex} must be forwarded: {verdict:?}");
+        }
+        for hex in
+            [format!("0X{bare}"), format!("0x{EIP155_LEGACY_TX}"), format!("0X{EIP155_LEGACY_TX}")]
+        {
+            assert!(decode_hex(&hex).is_none(), "{hex} must not decode");
+            let verdict = screen_err(&send_raw(&format!("[\"{hex}\"]")));
+            assert!(
+                matches!(verdict, Some(GatewayError::InvalidTransaction)),
+                "{hex} must be refused as undecodable: {verdict:?}"
+            );
+        }
+        // a refused type behind an upper-case prefix is undecodable to the
+        // worker, so it is not refused for its type
+        let upper = format!("0X{}", &eip7702_raw_hex()[2..]);
+        let verdict = screen_err(&send_raw(&format!("[\"{upper}\"]")));
+        assert!(matches!(verdict, Some(GatewayError::InvalidTransaction)), "{verdict:?}");
     }
 
     #[test]
