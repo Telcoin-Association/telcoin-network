@@ -1058,6 +1058,8 @@ fn is_json_content_type(content_type: Option<&HeaderValue>) -> bool {
 /// has gone out is still logged and counted against `route`, and `in_flight`
 /// and `class_slot` stay held until the body has streamed: the request stays
 /// in the in-flight gauge and its duration, and on its class's in-flight cap.
+/// An upstream's `Content-Length` goes out with the body; a chunked answer
+/// stays chunked.
 fn relay(
     upstream: reqwest::Response,
     route: Route,
@@ -1089,14 +1091,16 @@ fn relay(
     // the body and the poll-driven timeout never fires. That side is bounded
     // at the connection layer instead: `TCP_USER_TIMEOUT` plus the
     // connection-lifetime cap (see [`crate::server::accept_loop`]).
+    let remaining = upstream.content_length();
     let body = UpstreamBody {
         inner: upstream.bytes_stream(),
+        remaining,
         route,
         upstream_url,
         _in_flight: in_flight,
         _class_slot: class_slot,
     };
-    upstream_response(status, content_type, Body::from_stream(body))
+    upstream_response(status, content_type, Body::new(body))
 }
 
 /// The response passed on for an upstream's answer: its status and content
@@ -1119,8 +1123,9 @@ fn upstream_response(
 /// a failure mid-stream.
 ///
 /// By the time the body fails, its status and headers have gone to the
-/// client, which therefore sees a truncated response (a chunked body without
-/// its final chunk) whatever the gateway does. The failure is logged at debug,
+/// client, which therefore sees a truncated response (a body shorter than its
+/// `Content-Length`, or a chunked body without its final chunk) whatever the
+/// gateway does. The failure is logged at debug,
 /// naming the upstream by origin, and counted as
 /// `routed_requests_total{route, result="body_failed"}` next to the
 /// `forwarded` result the head already recorded.
@@ -1131,9 +1136,16 @@ fn upstream_response(
 /// that, holding an inbound connection. hyper drops the body once it has
 /// written the last chunk, or when the stream fails or the connection closes,
 /// and that releases them.
+///
+/// Its size hint is exact while the upstream's `Content-Length` is known, so
+/// hyper sends the same `Content-Length`; otherwise the answer goes out
+/// chunked.
 struct UpstreamBody<S> {
     /// The upstream's body stream.
     inner: S,
+    /// The bytes still to come under the upstream's `Content-Length`, or
+    /// `None` for a chunked answer.
+    remaining: Option<u64>,
     /// The route the request took.
     route: Route,
     /// The upstream the body comes from, only ever logged by origin.
@@ -1149,14 +1161,25 @@ struct UpstreamBody<S> {
     _class_slot: telemetry::InFlightSlot,
 }
 
-impl<S> Stream for UpstreamBody<S>
+impl<S> hyper::body::Body for UpstreamBody<S>
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Unpin,
 {
-    type Item = reqwest::Result<Bytes>;
+    type Data = Bytes;
+    type Error = reqwest::Error;
 
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<hyper::body::Frame<Bytes>, Self::Error>>> {
         match Pin::new(&mut self.inner).poll_next(cx) {
+            Poll::Ready(Some(Ok(chunk))) => {
+                if let Some(remaining) = &mut self.remaining {
+                    let len = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                    *remaining = remaining.saturating_sub(len);
+                }
+                Poll::Ready(Some(Ok(hyper::body::Frame::data(chunk))))
+            }
             Poll::Ready(Some(Err(err))) => {
                 // a reqwest error's display can carry the request url, so the
                 // cause is rendered with it removed
@@ -1171,8 +1194,14 @@ where
                 );
                 Poll::Ready(Some(Err(err)))
             }
-            polled => polled,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.remaining
+            .map_or_else(hyper::body::SizeHint::default, hyper::body::SizeHint::with_exact)
     }
 }
 

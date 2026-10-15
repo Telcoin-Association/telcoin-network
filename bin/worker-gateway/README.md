@@ -782,7 +782,8 @@ itself a worker-saturation signal.
 An upstream body that fails after the status and headers have gone out (the
 upstream closes or resets mid-stream, or sends nothing for the route's request
 timeout) cannot be turned into an error any more:
-the client gets the upstream's status with a truncated body (a chunked
+the client gets the upstream's status with a truncated body (shorter than
+the upstream's `Content-Length`, which the gateway passes on, or a chunked
 response without its final chunk), and the gateway logs the failure at debug
 and counts it as `result="body_failed"` in
 `tn_worker_gateway_routed_requests_total`.

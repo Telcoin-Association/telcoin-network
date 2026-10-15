@@ -5124,6 +5124,71 @@ mod tests {
         assert_eq!(error_code_and_id(&text), (-32012, serde_json::json!(6)));
     }
 
+    /// A streamed answer keeps the upstream's `Content-Length`, so the client
+    /// can tell a complete answer by its length rather than by a final chunk.
+    #[tokio::test]
+    async fn streamed_answer_keeps_the_upstream_content_length() {
+        let answer = "a".repeat(100 * 1024);
+        let sized = answer.clone();
+        let mock = Router::new().route(
+            "/",
+            post(move || async move { ([(header::CONTENT_TYPE, "application/json")], sized) }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), Some(102_400));
+        assert_eq!(response.text().await.expect("text"), answer);
+    }
+
+    /// An upstream answer without a `Content-Length` still goes out chunked.
+    #[tokio::test]
+    async fn chunked_upstream_answer_stays_chunked() {
+        let mock = Router::new().route(
+            "/",
+            post(|| async {
+                let pieces = futures::stream::iter(
+                    [r#"{"jsonrpc":"2.0","#, r#""result":"0x1","id":1}"#]
+                        .map(|piece| Ok::<_, std::io::Error>(axum::body::Bytes::from(piece))),
+                );
+                (
+                    [(header::CONTENT_TYPE, "application/json")],
+                    axum::body::Body::from_stream(pieces),
+                )
+            }),
+        );
+        let (worker, _worker) = spawn(mock).await;
+        let state = redirect_state(worker, None);
+        state.readiness.set_ready(0, true);
+        let (gateway, _shutdown) = spawn(test_router(state)).await;
+
+        let response = Client::new()
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_getLogs", 1))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.content_length(), None);
+        assert_eq!(
+            response.headers().get(header::TRANSFER_ENCODING).map(HeaderValue::as_bytes),
+            Some(b"chunked".as_slice())
+        );
+        assert_eq!(
+            response.text().await.expect("text"),
+            r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
+        );
+    }
+
     /// A relayed response stays in the in-flight gauge until its body has
     /// finished streaming, not just until the handler returns its head.
     #[tokio::test]
