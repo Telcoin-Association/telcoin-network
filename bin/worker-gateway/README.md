@@ -579,7 +579,7 @@ An element with more than one `method` member ends the read too: the worker refu
 
 ### Transaction screening
 
-Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions).
+Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions, and typed envelopes of an unknown type).
 This saves a wasted upstream round-trip.
 The decode uses the same pooled wire format the worker's RPC accepts and never recovers the signer, so it cannot reject a transaction the worker would accept.
 
@@ -601,6 +601,7 @@ The check runs after the length checks and before anything else is charged: a re
 
 Matching is case-sensitive and anchored at the start of the name, as the worker matches method names: under `tn_`, neither `TN_info` nor `eth_tn_x` is refused, and the worker answers both as unknown methods.
 The gateway reads method names the way the worker's server does: leading whitespace, form feed included, is skipped, a name spelled with unicode escapes is unescaped before the match, and a batch element that is not an object does not hide the calls around it.
+A batch element written in positional form, a JSON array that the worker's server reads as `[jsonrpc, id, method, params]`, is checked against the list by its third member when that is a string, whatever the array's length, so it cannot carry a denied method past the check.
 A body that does not start with `{` or `[` once leading whitespace is skipped, or whose `method` is not a string, is forwarded, and the worker rejects it on its own.
 A batch the gateway cannot read to its end is refused as unreadable before the policy runs, with `400` / `-32600` (see [Batches](#batches)), because the worker would still run the calls around the element it cannot read.
 A single call that starts with `{` but that the gateway cannot read, such as one holding a number out of range (`1e400`) or an unpaired surrogate escape, is refused like a denied call rather than forwarded unchecked.
@@ -768,7 +769,7 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | Request deadline exceeded after the request was sent upstream | `504` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
-| Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
+| Unsupported transaction type: an EIP-4844 blob, an EIP-7702 set-code or an unknown typed envelope (`0x05`..=`0x7f`), refused from its type byte, so a malformed type-3 or type-4 payload gets this code rather than `-32007` (the message names the type) | `400` | `-32008` |
 | Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` |
 | Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` |
 | In-flight cap reached (overloaded) | `503` | `-32009` |
