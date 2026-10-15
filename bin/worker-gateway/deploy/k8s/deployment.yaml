@@ -11,6 +11,15 @@ metadata:
     app.kubernetes.io/part-of: telcoin-network
 spec:
   replicas: 2
+  # A rollout replaces one pod at a time and waits out the old pod's 51s
+  # shutdown (minReadySeconds > 5s delay + 45s drain + 1s) before the next,
+  # so at most maxReplicas + 1 gateways hold worker slots at once.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 0
+      maxUnavailable: 1
+  minReadySeconds: 55
   selector:
     matchLabels:
       app: worker-gateway
@@ -91,13 +100,16 @@ spec:
             - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
               value: "45s"
             # Keep N x --max-upstream-inflight below the worker's
-            # --rpc.max-connections (500 by default): at the HPA's ceiling of
-            # 10 replicas, 49 each leaves 490 worker connections at most, so a
-            # fully scaled fleet never drives the worker into answering 429.
-            # Raise it when the worker's limit is raised; lower it for a higher
-            # replica ceiling (see README.md, "Sizing for N gateways").
+            # --rpc.max-connections (500 by default), which counts in-flight
+            # HTTP requests, not TCP connections. N counts every gateway that
+            # can hold worker requests at once: the HPA's ceiling of 10
+            # replicas plus the one pod a rollout is replacing (see strategy
+            # above), so 11 x 45 = 495 worker requests at most, below the
+            # worker's limit. Raise it when the worker's limit is raised; lower
+            # it for a higher replica ceiling (see README.md, "Sizing for N
+            # gateways").
             - name: WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT
-              value: "49"
+              value: "45"
           ports:
             - name: rpc
               containerPort: 8545
