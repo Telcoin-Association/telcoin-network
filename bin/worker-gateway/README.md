@@ -155,7 +155,7 @@ Every flag has an environment-variable fallback.
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). Must be greater than `0`; startup warns below 263168 (one hex-encoded 128 KiB transaction plus its envelope). |
-| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest enabled rate-limit burst; a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
+| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest per-IP or global burst (the submission budget does not lower it); a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
 | `--max-inflight-request-bytes` | `WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES` | `536870912` | Request-body bytes held across all in-flight requests (512 MiB; at least `--max-request-bytes`, at most 4294967295; `0` disables; see [Request size](#request-size)). |
 | `--http1-max-buf-size` | `WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE` | `65536` | Per-connection read buffer cap, in bytes (64 KiB; minimum 8192; a request head must fit in it; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
@@ -547,7 +547,7 @@ Size it from both ends:
 A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls it carries.
 
 - **Length cap.** `--max-batch-len` (default 50, `0` means unlimited) caps the calls in one batch.
-  The effective cap is the smaller of `--max-batch-len` and the smallest enabled rate-limit burst, and startup logs a warning when a burst lowers it.
+  The effective cap is the smaller of `--max-batch-len` and the smallest per-IP or global burst, and startup logs a warning when a burst lowers it.
   A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before its screen verdict is applied or it is forwarded, whichever upstream it would go to.
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.

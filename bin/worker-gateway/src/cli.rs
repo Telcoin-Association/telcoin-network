@@ -421,8 +421,9 @@ pub(crate) struct Cli {
     /// unlimited). A longer batch is refused whole with a JSON-RPC "batch too
     /// long" error (`413`, `-32003`) before its screen verdict is applied or
     /// it is forwarded, on either route. The effective cap never exceeds the
-    /// smallest enabled rate-limit burst: a batch needs one token per call at
-    /// once, so a longer one could never pass.
+    /// smallest per-IP or global burst: a batch needs one token per call at
+    /// once, so a longer one could never pass. The submission budget does not
+    /// lower it.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_BATCH_LEN",
@@ -1016,9 +1017,10 @@ impl Cli {
         let rate_limit_global =
             resolve_rate_limit(self.rate_limit_global, self.rate_limit_global_burst);
         // a batch of k calls needs k tokens at once and no bucket ever holds
-        // more than its burst, so a batch longer than the smallest enabled
-        // burst could only ever get a 429 that no retry satisfies; cap batches
-        // there so such a batch gets the final 413 instead
+        // more than its burst, so a batch longer than the smallest per-ip or
+        // global burst could only ever get a 429 that no retry satisfies; cap
+        // batches there so such a batch gets the final 413 instead. the
+        // submission budget charges only a batch's first call, so it is left out
         let smallest_burst = [rate_limit_per_ip, rate_limit_global]
             .iter()
             .flatten()
