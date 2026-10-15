@@ -635,8 +635,12 @@ pub(crate) async fn proxy(
             // tcp and tls, so a stalled setup always ends as a connect error
             // first. a lookup the gateway's own resolver refused because every
             // lookup slot was busy is a connect error too, but it says nothing
-            // about the worker, so it does not count either.
-            let connect_failed = source.is_connect() && !dns::is_saturated(&source);
+            // about the worker, so it does not count either. the gateway running
+            // out of file descriptors (EMFILE, ENFILE) fails the connect too, and
+            // says nothing about the worker either.
+            let connect_failed = source.is_connect()
+                && !dns::is_saturated(&source)
+                && !crate::fd::is_exhausted(&source);
             let result = if matches!(err, GatewayError::UpstreamTimeout) {
                 "timeout"
             } else {

@@ -16,6 +16,7 @@ mod cli;
 mod config;
 mod dns;
 mod error;
+mod fd;
 mod identity;
 mod proxy;
 mod ratelimit;
@@ -43,7 +44,11 @@ fn try_main() -> eyre::Result<()> {
     let cli = Cli::parse();
     let ansi = use_ansi(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR").as_deref());
     init_tracing(&cli.log_filter, cli.log_format, ansi);
+    let fd_limit = fd::raise_limit();
     let settings = cli.into_settings()?;
+    if let Some(limit) = fd_limit {
+        fd::warn_on_budget(&settings, limit);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("worker-gateway")
