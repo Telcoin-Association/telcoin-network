@@ -43,7 +43,7 @@ help:
 	@echo "    :::> Run all tests using cargo test (fallback if nextest not installed)." ;
 	@echo ;
 	@echo "make test-faucet" ;
-	@echo "    :::> Test faucet integration test in main binary." ;
+	@echo "    :::> Run the faucet e2e test (e2e-tests built with its faucet feature)." ;
 	@echo ;
 	@echo "make test-restarts" ;
 	@echo "    :::> Test restart integration tests." ;
@@ -134,9 +134,10 @@ test:
 test-cargo:
 	cargo test --workspace --no-fail-fast -- --show-output ;
 
-# run faucet integration test
+# run the faucet e2e test; `crates/e2e-tests/tests/it/faucet.rs` compiles only with the e2e-tests
+# `faucet` feature
 test-faucet:
-	cargo nextest run --package telcoin-network --features faucet --test it ;
+	cargo nextest run --package e2e-tests --features faucet --test it faucet:: ;
 
 # Build the node binary once so e2e test processes reuse it via TN_BIN_PATH instead of
 # rebuilding it through escargot (~3-10s of cargo overhead per test process). Built under the

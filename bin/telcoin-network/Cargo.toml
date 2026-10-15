@@ -29,7 +29,8 @@ rocksdb = ["telcoin-network-cli/rocksdb", "tn-node/rocksdb"]
 # code (the unrestricted `mint` precompile used by faucets), through `telcoin-network-cli` so the
 # `--version` "Build Features" line lists it. Enabled for the `docker-devnet` image via a Docker
 # build arg; default/mainnet builds omit it. `adiri` already implies faucet, so this is only
-# needed for a faucet-without-adiri build. See `make test-faucet`.
+# needed for a faucet-without-adiri build. The faucet e2e test (`make test-faucet`) builds the
+# e2e-tests crate with its own `faucet` feature, not this one.
 faucet = ["telcoin-network-cli/faucet", "tn-node/faucet"]
 
 [lints]
