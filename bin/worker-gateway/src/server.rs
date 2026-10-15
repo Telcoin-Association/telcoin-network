@@ -3027,8 +3027,8 @@ mod tests {
         let started = tokio::time::Instant::now();
         let (status, text) = post_rpc(gateway, None, submission(7)).await;
         let elapsed = started.elapsed();
-        assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(error_code_and_id(&text), (-32002, serde_json::json!(7)));
         assert!(elapsed < Duration::from_secs(2), "the answer was given up after {elapsed:?}");
         assert!(!recent.contains(&submitted_hash()));
     }
@@ -7521,7 +7521,8 @@ mod tests {
 
     /// An answer past the request's length plus the slack is not one a healthy
     /// worker sends; the gateway stops reading, so the answer is lost and the
-    /// client gets an unreachable-upstream error rather than a truncated body.
+    /// client gets the lost-answer error, which says the transaction may have
+    /// been accepted, rather than a truncated body.
     #[tokio::test]
     async fn submission_answer_past_the_cap_is_lost() {
         let padding = "p".repeat(64 * 1024);
@@ -7539,7 +7540,8 @@ mod tests {
 
         let (status, text) = post_rpc(gateway, None, submission(7)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert_eq!(error_code_and_id(&text), (-32013, serde_json::json!(7)));
+        assert!(text.contains("may have been accepted"), "{text}");
         assert!(!recent.contains(&submitted_hash()));
     }
 
@@ -7563,7 +7565,7 @@ mod tests {
         let (truncating, _truncating) = spawn(test_router(state)).await;
         let (status, text) = post_rpc(truncating, None, submission(7)).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error_code_and_id(&text), (-32001, serde_json::json!(7)));
+        assert_eq!(error_code_and_id(&text), (-32013, serde_json::json!(7)));
         assert!(!recent.contains(&submitted_hash()));
 
         let series = |result: &str| {
@@ -7579,6 +7581,8 @@ mod tests {
         let requests = "tn_worker_gateway_requests_total";
         assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
         assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 1.0);
+        let rejections = "tn_worker_gateway_rejections_total";
+        assert_eq!(metrics.value(rejections, &[("reason", "upstream_answer_lost")]), 1.0);
     }
 
     /// The worker's answer to a remembered submission is read whole before

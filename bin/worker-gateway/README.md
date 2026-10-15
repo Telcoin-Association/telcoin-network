@@ -670,7 +670,7 @@ The rule is exact:
 - Every other read at `pending`, such as `eth_call`, `eth_getBalance` and `eth_estimateGas`, still goes to the query URL and can lag the worker's pool.
 - A hash is remembered only for a single `eth_sendRawTransaction` that passed the [transaction screen](#transaction-screening) and that the worker accepted: a `2xx` answer carrying a JSON-RPC `result`.
   The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
-  An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost: the client gets `502` / `-32001`, and the forward counts as `body_failed` (see [Behaviour on failure](#behaviour-on-failure)).
+  An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost after the worker has answered, so the transaction may have been accepted: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `body_failed` (see [Behaviour on failure](#behaviour-on-failure)).
   A submission inside a batch, an `eth_sendRawTransactionSync` (which returns the receipt itself), and a submission the worker rejected, with an HTTP error status or a JSON-RPC `error`, are not remembered.
 - The gateway remembers at most 10,000 hashes and forgets the oldest first, so a flood of submissions can push a hash out early, and its lookups then go to the query URL.
 - Each gateway remembers only the submissions it forwarded itself, so a lookup that a load balancer sends to another gateway goes to the query URL.
@@ -749,6 +749,7 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | No upstream ready | `503` | `-32000` |
 | Upstream unreachable | `502` | `-32001` |
 | Upstream request timed out | `504` | `-32002` |
+| Upstream answered a submission, but its answer was lost (the transaction may have been accepted; reason `upstream_answer_lost`) | `502` | `-32013` |
 | Request body too large | `413` | `-32003` |
 | Batch longer than `--max-batch-len` | `413` | `-32003` |
 | Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
@@ -782,7 +783,7 @@ the client gets the upstream's status with a truncated body (a chunked
 response without its final chunk), and the gateway logs the failure at debug
 and counts it as `result="body_failed"` in
 `tn_worker_gateway_routed_requests_total`.
-The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32001`, and the forward counts as `body_failed` only, without a `forwarded`.
+The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `body_failed` only, without a `forwarded`.
 
 The `408` message says whether the request may have been delivered.
 "request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.

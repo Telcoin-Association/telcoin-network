@@ -70,6 +70,9 @@ mod code {
     /// The upstream answered with an error status and a body that is not
     /// JSON (a worker's `429` text/plain, for example).
     pub(super) const UPSTREAM_ERROR: i32 = -32012;
+    /// The worker answered a remembered submission `2xx`, but its answer
+    /// could not be read whole; the transaction may have been accepted.
+    pub(super) const UPSTREAM_ANSWER_LOST: i32 = -32013;
     /// The request body could not be read, or the request was not a `POST`.
     /// This is the spec-defined "Invalid Request" code, not a gateway-range
     /// code.
@@ -92,6 +95,9 @@ pub(crate) enum GatewayError {
     UpstreamUnreachable,
     /// The upstream did not answer within the request deadline.
     UpstreamTimeout,
+    /// The worker answered `2xx` but its answer to a remembered submission
+    /// could not be read whole; the transaction may have been accepted.
+    UpstreamAnswerLost,
     /// The request body exceeded the gateway's size limit.
     RequestTooLarge,
     /// A batch carried more calls than `--max-batch-len` allows.
@@ -168,6 +174,7 @@ impl GatewayError {
             Self::NoUpstreamReady => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamUnreachable => StatusCode::BAD_GATEWAY,
             Self::UpstreamTimeout => StatusCode::GATEWAY_TIMEOUT,
+            Self::UpstreamAnswerLost => StatusCode::BAD_GATEWAY,
             Self::RequestTooLarge | Self::BatchTooLong => StatusCode::PAYLOAD_TOO_LARGE,
             Self::LoopDetected | Self::RedirectLoopDetected => StatusCode::LOOP_DETECTED,
             Self::RequestTimeout { .. } => StatusCode::REQUEST_TIMEOUT,
@@ -190,6 +197,7 @@ impl GatewayError {
             Self::NoUpstreamReady => code::NO_UPSTREAM_READY,
             Self::UpstreamUnreachable => code::UPSTREAM_UNREACHABLE,
             Self::UpstreamTimeout => code::UPSTREAM_TIMEOUT,
+            Self::UpstreamAnswerLost => code::UPSTREAM_ANSWER_LOST,
             Self::RequestTooLarge | Self::BatchTooLong => code::REQUEST_TOO_LARGE,
             Self::LoopDetected | Self::RedirectLoopDetected => code::LOOP_DETECTED,
             Self::RequestTimeout { .. } => code::REQUEST_TIMEOUT,
@@ -213,6 +221,10 @@ impl GatewayError {
             Self::NoUpstreamReady => "no upstream worker is ready",
             Self::UpstreamUnreachable => "upstream unreachable",
             Self::UpstreamTimeout => "upstream request timed out",
+            Self::UpstreamAnswerLost => {
+                "upstream answered, but its answer was lost; the transaction may have been \
+                 accepted, so look it up by hash before sending it again"
+            }
             Self::RequestTooLarge => "request body too large",
             Self::BatchTooLong => "batch too long",
             Self::LoopDetected => {
@@ -265,6 +277,7 @@ impl GatewayError {
             Self::NoUpstreamReady => "no_upstream_ready",
             Self::UpstreamUnreachable => "upstream_unreachable",
             Self::UpstreamTimeout => "upstream_timeout",
+            Self::UpstreamAnswerLost => "upstream_answer_lost",
             Self::RequestTooLarge => "request_too_large",
             Self::BatchTooLong => "batch_too_long",
             Self::LoopDetected => "loop_detected",
@@ -983,6 +996,7 @@ mod tests {
         assert_eq!(GatewayError::InflightBytesExhausted.code(), -32010);
         assert_eq!(GatewayError::MethodNotAllowed.code(), -32011);
         assert_eq!(GatewayError::UpstreamError { status: StatusCode::FORBIDDEN }.code(), -32012);
+        assert_eq!(GatewayError::UpstreamAnswerLost.code(), -32013);
         assert_eq!(GatewayError::NonPostMethod.code(), -32600);
     }
 
@@ -1055,6 +1069,7 @@ mod tests {
         assert_eq!(GatewayError::NoUpstreamReady.reason(), "no_upstream_ready");
         assert_eq!(GatewayError::UpstreamUnreachable.reason(), "upstream_unreachable");
         assert_eq!(GatewayError::UpstreamTimeout.reason(), "upstream_timeout");
+        assert_eq!(GatewayError::UpstreamAnswerLost.reason(), "upstream_answer_lost");
         assert_eq!(GatewayError::RequestTooLarge.reason(), "request_too_large");
         assert_eq!(GatewayError::BatchTooLong.reason(), "batch_too_long");
         assert_eq!(GatewayError::LoopDetected.reason(), "loop_detected");

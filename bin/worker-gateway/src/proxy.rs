@@ -728,9 +728,12 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// [`SUBMISSION_ANSWER_SLACK`], within `read_within` (what is left of
 /// `--upstream-request-timeout` since the request was sent, so the whole
 /// exchange stays within it), and passed on unchanged with the worker's status
-/// and content type. An answer that cannot be read within the cap (longer than
-/// it, a body that fails, or one not read whole in time) is lost: the client
-/// gets `502` / `-32001`, and the forward counts once, as
+/// and content type. An answer that cannot be read whole is lost, after the
+/// worker has answered `2xx`, so the transaction may have been accepted: an
+/// answer longer than the cap or a body that fails gets `502` / `-32013`
+/// ([`GatewayError::UpstreamAnswerLost`]), and a read that runs out of time
+/// gets `504` / `-32002`, as a timeout on the forward does (see
+/// [`AnswerLost::error`]). The forward counts once, as
 /// `routed_requests_total{route="worker", result="body_failed"}`, never as
 /// `forwarded`.
 ///
@@ -774,7 +777,7 @@ async fn relay_submission_answer(
                     "reading the worker's answer to a submission failed"
                 );
             }
-            error_response(&GatewayError::UpstreamUnreachable, request_body)
+            error_response(&lost.error(), request_body)
         }
     }
 }
@@ -797,16 +800,32 @@ async fn read_answer(mut upstream: reqwest::Response, cap: usize) -> Result<Byte
     Ok(answer.into())
 }
 
-/// Why [`read_answer`] could not read an answer whole.
+/// Why [`read_answer`] could not read an answer whole, after the worker had
+/// answered `2xx`.
 enum AnswerLost {
-    /// The answer ran past the cap.
+    /// The answer ran past the cap. The client gets `502` / `-32013`.
     TooLong,
     /// The body failed, or sent nothing for the client's read timeout. The
-    /// error carries no url, so it can be logged.
+    /// error carries no url, so it can be logged. The client gets `504` /
+    /// `-32002` for a timeout and `502` / `-32013` for any other failure.
     Failed(reqwest::Error),
     /// The answer was not read whole within `--upstream-request-timeout` of
-    /// the request being sent.
+    /// the request being sent. The client gets `504` / `-32002`.
     TimedOut,
+}
+
+impl AnswerLost {
+    /// The error the client gets for the lost answer: a read that ran out of
+    /// time is a timeout, as the same timeout before the head is on the
+    /// forward path; any other loss is [`GatewayError::UpstreamAnswerLost`],
+    /// never "unreachable", since the worker did answer.
+    fn error(&self) -> GatewayError {
+        match self {
+            Self::TimedOut => GatewayError::UpstreamTimeout,
+            Self::Failed(err) if err.is_timeout() => GatewayError::UpstreamTimeout,
+            Self::TooLong | Self::Failed(_) => GatewayError::UpstreamAnswerLost,
+        }
+    }
 }
 
 impl fmt::Display for AnswerLost {
@@ -4455,5 +4474,53 @@ mod tests {
             assert_eq!(response.status(), StatusCode::LOOP_DETECTED, "{marker}");
             assert_eq!(record.class(), Some(("submission", bytes_in)), "{marker}");
         }
+    }
+
+    /// A worker's answer lost after its `2xx` head is a timeout when the body
+    /// stalls past the client's read timeout, as a stall before the head is on
+    /// the forward path, and the lost-answer error when the body breaks off or
+    /// runs past the cap; it is never "unreachable".
+    #[tokio::test]
+    async fn lost_answers_map_to_their_errors() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // each connection gets a head promising 100 bytes and one byte of
+        // body; the first connection then stalls, the second closes
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            for stall in [true, false] {
+                let (mut stream, _) = listener.accept().await.expect("accept");
+                tokio::spawn(async move {
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let head = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                content-length: 100\r\n\r\n{";
+                    stream.write_all(head.as_bytes()).await.expect("write");
+                    if stall {
+                        tokio::time::sleep(Duration::from_secs(10)).await;
+                    }
+                });
+            }
+        });
+        let client = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let send = || client.post(format!("http://{addr}/")).body("{}").send();
+
+        let stalled = send().await.expect("head");
+        let lost = read_answer(stalled, 1024).await.err().expect("a stalled answer is lost");
+        assert!(matches!(lost.error(), GatewayError::UpstreamTimeout), "{lost}");
+
+        let broken = send().await.expect("head");
+        let lost = read_answer(broken, 1024).await.err().expect("a broken answer is lost");
+        assert!(matches!(lost, AnswerLost::Failed(_)), "{lost}");
+        assert!(matches!(lost.error(), GatewayError::UpstreamAnswerLost), "{lost}");
+
+        assert!(matches!(AnswerLost::TooLong.error(), GatewayError::UpstreamAnswerLost));
+        assert!(matches!(AnswerLost::TimedOut.error(), GatewayError::UpstreamTimeout));
+        server.abort();
     }
 }
