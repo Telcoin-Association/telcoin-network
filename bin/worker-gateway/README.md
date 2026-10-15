@@ -921,7 +921,7 @@ The [production-readiness review](docs/production-readiness.md#operator-guidance
 ### Validators: always redirect queries
 
 Set `--redirect-queries` on every gateway in front of a validator.
-Without it, reads reach the worker, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+Without it, every read reaches the worker and holds one of its `--rpc.max-connections` permits while the worker computes the answer (not while the client reads it); one gateway's reads hold at most `--max-upstream-inflight` less a fifth, but N gateways together can fill the worker's limit (see [Sizing for N gateways](#sizing-for-n-gateways)).
 The [method policy](#method-policy) refuses the `tn_*` calls the node says a validator should not serve publicly, but every other read still lands on the validator.
 Point it at an `https` public RPC for the same chain.
 
