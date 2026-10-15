@@ -738,9 +738,11 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// answer longer than the cap or a body that fails gets `502` / `-32013`
 /// ([`GatewayError::UpstreamAnswerLost`]), and a read that runs out of time
 /// gets `504` / `-32002`, as a timeout on the forward does (see
-/// [`AnswerLost::error`]). The forward counts once, as
-/// `routed_requests_total{route="worker", result="body_failed"}`, never as
-/// `forwarded`.
+/// [`AnswerLost::error`]). The head counts as
+/// `routed_requests_total{route="worker", result="forwarded"}` when it
+/// arrives, before the read, and a lost answer adds `body_failed` after it, as
+/// a streamed answer that fails does; `requests_total` counts `forwarded`
+/// only for an answer passed on, and a lost one as the error it gets.
 ///
 /// An answer that was read goes out as a [`HeldAnswer`], which keeps
 /// `in_flight` and `class_slot` until the client has taken it, as a streamed
@@ -757,6 +759,9 @@ async fn relay_submission_answer(
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let cap = request_body.len().saturating_add(SUBMISSION_ANSWER_SLACK);
+    // the head is forwarded whatever comes of its body, as on the streamed
+    // path, so a lost answer below counts `body_failed` after it
+    telemetry::record_routed(Route::Worker.label(), "forwarded");
     // the worker client's read timeout bounds each gap in the answer, not the
     // whole read, so a worker that trickles its answer is cut here
     let answer = tokio::time::timeout(read_within, read_answer(upstream, cap)).await;
@@ -766,7 +771,6 @@ async fn relay_submission_answer(
                 recent.record(hash);
             }
             telemetry::record_forwarded();
-            telemetry::record_routed(Route::Worker.label(), "forwarded");
             let answer = HeldAnswer { answer, _in_flight: in_flight, _class_slot: class_slot };
             upstream_response(status, content_type, Body::new(answer))
         }

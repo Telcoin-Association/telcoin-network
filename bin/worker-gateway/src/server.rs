@@ -7661,11 +7661,13 @@ mod tests {
         assert!(!recent.contains(&submitted_hash()));
     }
 
-    /// A submission's answer read whole counts once: as `forwarded` when it
-    /// reaches the client, and as `body_failed` when it is lost, never as
-    /// `unreachable` and never next to a `forwarded`.
+    /// A submission's answer read whole counts like a streamed one: its head
+    /// as `forwarded` on `routed_requests_total`, and a lost answer as
+    /// `body_failed` after it, never as `unreachable`. `requests_total`
+    /// counts the answer passed on as `forwarded` and the lost one, once, as
+    /// `rejected`.
     #[tokio::test]
-    async fn submission_answers_are_counted_once() {
+    async fn submission_answers_count_like_streamed_answers() {
         let mut metrics = CapturedMetrics::install();
         let (worker, _worker_seen, _worker) = accepting_worker_mock().await;
         let state = redirect_state(worker, None);
@@ -7673,6 +7675,16 @@ mod tests {
         let (gateway, _shutdown) = spawn(test_router(state)).await;
         let (status, text) = post_rpc(gateway, None, submission(1)).await;
         assert_eq!((status, text.as_str()), (StatusCode::OK, ACCEPTED));
+        let series = |result: &str| {
+            vec![
+                ("result".to_string(), result.to_string()),
+                ("route".to_string(), "worker".to_string()),
+            ]
+        };
+        let routed = "tn_worker_gateway_routed_requests_total";
+        let requests = "tn_worker_gateway_requests_total";
+        assert_eq!(metrics.series(routed), vec![(series("forwarded"), 1.0)]);
+        assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
 
         // a worker whose answer breaks off mid-body
         let state = redirect_state(truncating_mock().await, None);
@@ -7684,17 +7696,12 @@ mod tests {
         assert_eq!(error_code_and_id(&text), (-32013, serde_json::json!(7)));
         assert!(!recent.contains(&submitted_hash()));
 
-        let series = |result: &str| {
-            vec![
-                ("result".to_string(), result.to_string()),
-                ("route".to_string(), "worker".to_string()),
-            ]
-        };
+        // the lost answer's head counts as forwarded, then its failure; on
+        // requests_total it counts only as rejected
         assert_eq!(
-            metrics.series("tn_worker_gateway_routed_requests_total"),
-            vec![(series("body_failed"), 1.0), (series("forwarded"), 1.0)]
+            metrics.series(routed),
+            vec![(series("body_failed"), 1.0), (series("forwarded"), 2.0)]
         );
-        let requests = "tn_worker_gateway_requests_total";
         assert_eq!(metrics.value(requests, &[("outcome", "forwarded")]), 1.0);
         assert_eq!(metrics.value(requests, &[("outcome", "rejected")]), 1.0);
         let rejections = "tn_worker_gateway_rejections_total";
