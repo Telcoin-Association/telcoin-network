@@ -3,7 +3,13 @@
 
 use crate::cli::{Cli, Commands, PassSource};
 use eyre::{bail, eyre};
-use std::{ffi::OsString, fmt, fs::File, io::Read as _, path::Path};
+use std::{
+    ffi::{OsStr, OsString},
+    fmt,
+    fs::File,
+    io::Read as _,
+    path::Path,
+};
 use zeroize::Zeroizing;
 #[cfg(target_os = "linux")]
 use {
@@ -170,22 +176,30 @@ fn read_credential(
     Ok(passphrase)
 }
 
-/// Clap value parser for `--bls-passphrase-credential`.
+/// The credential name the `credential` source reads, from `--bls-passphrase-credential` or
+/// `TN_BLS_PASSPHRASE_CREDENTIAL`.
 ///
-/// Accepts only names systemd itself accepts for a credential: printable ASCII, at most 255
-/// bytes, no `/` or `:`, and not `.` or `..`. This also keeps the joined path inside
-/// `$CREDENTIALS_DIRECTORY`.
-pub(crate) fn parse_credential_name(name: &str) -> Result<String, String> {
-    let valid = !name.is_empty()
-        && name.len() <= 255
-        && name != "."
-        && name != ".."
-        && name.bytes().all(|b| (b' '..=b'~').contains(&b) && b != b'/' && b != b':');
-    if valid {
-        Ok(name.to_owned())
-    } else {
-        Err(format!("{name:?} is not a valid systemd credential name"))
+/// An empty value, as an unset `${VAR}` in a unit or compose file produces, selects
+/// [`DEFAULT_BLS_PASSPHRASE_CREDENTIAL`]. Otherwise only names systemd itself accepts for a
+/// credential pass: printable ASCII, at most 255 bytes, no `/` or `:`, and not `.` or `..`. This
+/// also keeps the joined path inside `$CREDENTIALS_DIRECTORY`.
+fn credential_name(name: &OsStr) -> eyre::Result<&str> {
+    if name.is_empty() {
+        return Ok(DEFAULT_BLS_PASSPHRASE_CREDENTIAL);
     }
+    name.to_str()
+        .filter(|name| {
+            name.len() <= 255
+                && *name != "."
+                && *name != ".."
+                && name.bytes().all(|b| (b' '..=b'~').contains(&b) && b != b'/' && b != b':')
+        })
+        .ok_or_else(|| {
+            eyre!(
+                "{name:?} is not a valid systemd credential name (--bls-passphrase-credential or \
+                 TN_BLS_PASSPHRASE_CREDENTIAL)"
+            )
+        })
 }
 
 impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
@@ -245,7 +259,7 @@ impl<Ext: clap::Args + fmt::Debug> Cli<Ext> {
             PassSource::Credential => {
                 passphrase = Some(read_credential(
                     std::env::var_os(CREDENTIALS_DIRECTORY_ENVVAR),
-                    &self.bls_passphrase_credential,
+                    credential_name(&self.bls_passphrase_credential)?,
                 )?);
             }
         }
@@ -535,15 +549,50 @@ mod tests {
                 .bls_passphrase_credential,
             "tn.pass"
         );
-        for name in ["", ".", "..", "../bls-passphrase", "/etc/shadow", "a/b", "a:b", "a\tb"] {
-            let err = Cli::<crate::NoArgs>::try_parse_args_from([
-                "tn",
-                "node",
-                "--bls-passphrase-credential",
-                name,
-            ])
-            .unwrap_err();
-            assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation, "{name:?}");
+        assert_eq!(credential_name("".as_ref()).unwrap(), "bls-passphrase");
+        assert_eq!(credential_name("tn.pass".as_ref()).unwrap(), "tn.pass");
+        let too_long = "a".repeat(256);
+        for name in [".", "..", "../bls-passphrase", "/etc/shadow", "a/b", "a:b", "a\tb", &too_long]
+        {
+            let err = credential_name(name.as_ref()).unwrap_err();
+            assert!(err.to_string().contains("is not a valid systemd credential name"), "{name:?}");
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt as _;
+            assert!(credential_name(OsStr::from_bytes(b"sek\xffrit")).is_err());
+        }
+    }
+
+    /// `TN_BLS_PASSPHRASE_CREDENTIAL` is checked only by the credential source: an empty or
+    /// invalid value does not stop other subcommands and sources, and an empty value selects
+    /// the default name.
+    #[test]
+    fn test_credential_name_checked_only_for_credential_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("bls-passphrase"), b"default name\n").expect("write");
+        let _env = env_lock();
+        std::env::set_var(CREDENTIALS_DIRECTORY_ENVVAR, dir.path());
+
+        std::env::set_var("TN_BLS_PASSPHRASE_CREDENTIAL", "");
+        let db = Cli::<crate::NoArgs>::try_parse_args_from(["tn", "db", "stats"]);
+        let empty_default = cli(&["tn", "--bls-passphrase-source", "credential", "node"])
+            .resolve_bls_passphrase(None);
+        std::env::set_var("TN_BLS_PASSPHRASE_CREDENTIAL", "a/b");
+        let db_invalid = Cli::<crate::NoArgs>::try_parse_args_from(["tn", "db", "stats"]);
+        let invalid = cli(&["tn", "--bls-passphrase-source", "credential", "node"])
+            .resolve_bls_passphrase(None);
+        std::env::remove_var("TN_BLS_PASSPHRASE_CREDENTIAL");
+        std::env::remove_var(CREDENTIALS_DIRECTORY_ENVVAR);
+
+        let db = db.expect("db parses with an empty credential name");
+        assert!(matches!(db.bls_passphrase_source, PassSource::Env));
+        assert_eq!(db.bls_passphrase_credential, "");
+        db_invalid.expect("db parses with an invalid credential name");
+        assert_eq!(empty_default.unwrap(), Some(Zeroizing::new("default name".into())));
+        assert!(invalid
+            .unwrap_err()
+            .to_string()
+            .contains("is not a valid systemd credential name"));
     }
 }

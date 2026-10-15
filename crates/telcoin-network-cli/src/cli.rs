@@ -2,7 +2,7 @@
 use crate::{
     db, genesis, keytool, node,
     open_telemetry::init_opentracing_subscriber,
-    passphrase::{parse_credential_name, DEFAULT_BLS_PASSPHRASE_CREDENTIAL},
+    passphrase::DEFAULT_BLS_PASSPHRASE_CREDENTIAL,
     version::{LONG_VERSION, SHORT_VERSION},
     NoArgs,
 };
@@ -66,15 +66,16 @@ pub struct Cli<Ext: clap::Args + fmt::Debug = NoArgs> {
     ///
     /// Used with `--bls-passphrase-source credential`, which reads the file of this name in
     /// $CREDENTIALS_DIRECTORY (set by systemd for LoadCredential= and LoadCredentialEncrypted=).
+    /// An empty value selects the default. The name is checked only when the credential source
+    /// is selected, so other sources and subcommands ignore it.
     #[arg(
         long,
         value_name = "NAME",
         default_value = DEFAULT_BLS_PASSPHRASE_CREDENTIAL,
         env = "TN_BLS_PASSPHRASE_CREDENTIAL",
-        value_parser = parse_credential_name,
         global = true
     )]
-    pub bls_passphrase_credential: String,
+    pub bls_passphrase_credential: OsString,
 
     /// The path to the data dir for all telcoin-network files and subdirectories.
     ///
