@@ -230,6 +230,39 @@ impl UpstreamReadiness {
             "upstream worker became not-ready"
         );
     }
+
+    /// Note the envelope version a parsed poll answered with. A version other
+    /// than [`READINESS_VERSION`] is parsed best-effort, and may mean the node
+    /// changed what the fields mean, so the first poll of a run of such
+    /// answers logs it at warn, where the default filter shows it, and every
+    /// later poll of the run at debug. A poll that answers the expected
+    /// version ends the run.
+    fn record_envelope_version(&self, version: u32) {
+        let mut streak = self.streak();
+        if version == READINESS_VERSION {
+            streak.version_warned = false;
+        } else if streak.version_warned {
+            debug!(
+                target: "gateway::readiness",
+                worker_id = self.worker_id,
+                readiness = %UpstreamOrigin(&self.readiness_url),
+                version,
+                expected = READINESS_VERSION,
+                "unexpected readiness envelope version; parsing best-effort"
+            );
+        } else {
+            streak.version_warned = true;
+            warn!(
+                target: "gateway::readiness",
+                worker_id = self.worker_id,
+                upstream = %UpstreamOrigin(&self.rpc_url),
+                readiness = %UpstreamOrigin(&self.readiness_url),
+                version,
+                expected = READINESS_VERSION,
+                "unexpected readiness envelope version; parsing best-effort"
+            );
+        }
+    }
 }
 
 /// Shared readiness view over all configured upstreams.
@@ -451,8 +484,11 @@ pub(crate) async fn run_poller(
 /// readiness state one cycle at a time.
 async fn poll_cycle(readiness: &GatewayReadiness, client: &Client, poll_timeout: Duration) {
     let polls = readiness.upstreams.iter().map(|upstream| async move {
-        let result =
+        let (result, version) =
             poll_one(client, &upstream.readiness_url, upstream.worker_id, poll_timeout).await;
+        if let Some(version) = version {
+            upstream.record_envelope_version(version);
+        }
         upstream.record_poll(result, readiness.thresholds);
     });
     futures::future::join_all(polls).await;
@@ -526,30 +562,32 @@ async fn fetch_query_ready(
 }
 
 /// Poll a single upstream: `Ok` when the worker reports it is accepting
-/// transactions, otherwise the cause of the failed poll.
+/// transactions, otherwise the cause of the failed poll, with the envelope
+/// version when the payload was read and parsed.
 async fn poll_one(
     client: &Client,
     url: &Url,
     worker_id: u16,
     poll_timeout: Duration,
-) -> Result<(), NotReadyCause> {
-    let accepting = timeout(poll_timeout, fetch_readiness(client, url, worker_id))
-        .await
-        .map_err(|_elapsed| NotReadyCause::Timeout)??;
-    if accepting {
-        Ok(())
-    } else {
-        Err(NotReadyCause::NotAccepting)
-    }
+) -> (Result<(), NotReadyCause>, Option<u32>) {
+    let (accepting, version) =
+        match timeout(poll_timeout, fetch_readiness(client, url, worker_id)).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(cause)) => return (Err(cause), None),
+            Err(_elapsed) => return (Err(NotReadyCause::Timeout), None),
+        };
+    let result = if accepting { Ok(()) } else { Err(NotReadyCause::NotAccepting) };
+    (result, Some(version))
 }
 
 /// Fetch and parse one upstream's readiness payload, reading at most
-/// [`MAX_READINESS_BODY_BYTES`] of body.
+/// [`MAX_READINESS_BODY_BYTES`] of body: whether the worker is accepting
+/// transactions, and the envelope version.
 async fn fetch_readiness(
     client: &Client,
     url: &Url,
     worker_id: u16,
-) -> Result<bool, NotReadyCause> {
+) -> Result<(bool, u32), NotReadyCause> {
     let mut response = client.get(url.clone()).send().await.map_err(NotReadyCause::connection)?;
     let status = response.status();
     if !status.is_success() {
@@ -567,29 +605,23 @@ async fn fetch_readiness(
         }
         body.extend_from_slice(&chunk);
     }
-    parse_ready(&body, worker_id).ok_or(NotReadyCause::MalformedPayload)
+    parse_readiness(&body, worker_id).ok_or(NotReadyCause::MalformedPayload)
 }
 
-/// Parse a readiness payload, returning `Some(accepting)` for the requested
-/// worker (or `Some(false)` when it is absent), and `None` when the payload is
-/// not valid JSON of the expected shape.
-fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
+/// Parse a readiness payload, returning whether the requested worker is
+/// accepting transactions (`false` when it is absent) and the envelope's
+/// version, and `None` when the payload is not valid JSON of the expected
+/// shape. Any version is parsed best-effort; the caller logs a version other
+/// than [`READINESS_VERSION`] per upstream (see
+/// [`UpstreamReadiness::record_envelope_version`]).
+fn parse_readiness(bytes: &[u8], worker_id: u16) -> Option<(bool, u32)> {
     let readiness: NodeReadiness = serde_json::from_slice(bytes).ok()?;
-    if readiness.version != READINESS_VERSION {
-        debug!(
-            target: "gateway::readiness",
-            version = readiness.version,
-            expected = READINESS_VERSION,
-            "unexpected readiness envelope version; parsing best-effort"
-        );
-    }
-    Some(
-        readiness
-            .workers
-            .iter()
-            .find(|worker| worker.worker_id == worker_id)
-            .is_some_and(|worker| worker.accepting_transactions),
-    )
+    let accepting = readiness
+        .workers
+        .iter()
+        .find(|worker| worker.worker_id == worker_id)
+        .is_some_and(|worker| worker.accepting_transactions);
+    Some((accepting, readiness.version))
 }
 
 /// The run of consecutive poll results for one upstream.
@@ -602,6 +634,10 @@ struct PollStreak {
     /// Set once the upstream has been ready, or once its first failed poll
     /// has been logged at info.
     first_failure_logged: bool,
+    /// Set once a poll's unexpected envelope version has been logged at
+    /// warn; cleared by a poll that answers the expected version, so the
+    /// next mismatch warns again.
+    version_warned: bool,
 }
 
 /// Why an upstream is not ready: the cause of a failed poll, or a mark from the
@@ -665,6 +701,12 @@ mod tests {
     use std::{io, net::SocketAddr, sync::atomic::AtomicU8};
     use tn_types::Notifier;
     use tokio::net::TcpListener;
+
+    /// The accepting half of [`parse_readiness`], which the payload tests
+    /// below check.
+    fn parse_ready(bytes: &[u8], worker_id: u16) -> Option<bool> {
+        parse_readiness(bytes, worker_id).map(|(accepting, _version)| accepting)
+    }
 
     #[test]
     fn parses_ready_worker() {
@@ -990,6 +1032,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn version_mismatch_warns_once_per_upstream() {
+        const LINE: &str = "unexpected readiness envelope version";
+        let captured = Captured::default();
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // a worker whose envelope version the test switches between polls
+        let version = Arc::new(AtomicU32::new(2));
+        let served = Arc::clone(&version);
+        let app = Router::new().route(
+            "/health/workers",
+            get(move || {
+                let version = served.load(Ordering::SeqCst);
+                async move {
+                    format!(
+                        r#"{{"version":{version},"workers":[{{"worker_id":0,"accepting_transactions":true}}]}}"#
+                    )
+                }
+            }),
+        );
+        let addr = serve_mock(app).await;
+        let readiness = GatewayReadiness::new(&[upstream_at(0, addr)], thresholds(3, 1));
+        let client = Client::new();
+        let version_lines = || -> Vec<String> {
+            captured.lines().into_iter().filter(|line| line.contains(LINE)).collect()
+        };
+
+        // two mismatching polls: one warning, then the per-poll debug line;
+        // the payload still parses, so the upstream turns ready
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        assert!(readiness.any_ready(), "a mismatching version is parsed best-effort");
+        let lines = version_lines();
+        assert_eq!(lines.len(), 2, "{lines:#?}");
+        assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+        assert!(lines[0].contains("version=2") && lines[0].contains("expected=1"), "{}", lines[0]);
+        assert!(lines[0].contains(&format!("readiness=http://{addr}")), "{}", lines[0]);
+        assert!(!lines[0].contains("/health/workers"), "url leaked: {}", lines[0]);
+        assert!(lines[1].contains(" DEBUG "), "{}", lines[1]);
+
+        // a matching poll ends the run, so the next mismatch warns again
+        version.store(1, Ordering::SeqCst);
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        assert_eq!(version_lines().len(), 2, "a matching version logs nothing");
+        version.store(2, Ordering::SeqCst);
+        poll_cycle(&readiness, &client, STEP_TIMEOUT).await;
+        let lines = version_lines();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(lines[2].contains(" WARN "), "{}", lines[2]);
+        let warnings = lines.iter().filter(|line| line.contains(" WARN ")).count();
+        assert_eq!(warnings, 2, "{lines:#?}");
+    }
+
+    #[tokio::test]
     async fn rpc_path_mark_lasts_until_m_successful_polls() {
         let mode = Arc::new(AtomicU8::new(READY));
         let addr = mock_readiness(Arc::clone(&mode)).await;
@@ -1133,7 +1234,7 @@ mod tests {
         let poll = |path: &'static str| {
             let client = client.clone();
             let url = url(path);
-            async move { poll_one(&client, &url, 0, Duration::from_secs(2)).await }
+            async move { poll_one(&client, &url, 0, Duration::from_secs(2)).await.0 }
         };
 
         assert_eq!(poll("/at-cap").await, Ok(()), "a body at the cap is read whole");
