@@ -998,12 +998,13 @@ async fn enforce_request_deadline(
 /// "in-flight bytes exhausted" error at once instead of waiting. Neither can
 /// recover the request `id`, which sits in the unread body, so it echoes as
 /// `null`. The reservation is held across the inner call, which returns once
-/// the proxy has the upstream's response head; the buffered body is dropped by
-/// then. It cannot ride in the request extensions instead: the proxy drops the
-/// request's parts before it reads the body. Probes are exempt, as they are
-/// from rate limiting, and so is a request that is not a `POST`: it is refused
-/// with the `405` before its body is read (see [`crate::proxy::PostOnly`]), so
-/// it holds no bytes, and its `405` is not masked by a `413` or a `503`.
+/// the proxy has the upstream's response head, or, for a single submission,
+/// its whole answer; the buffered body is dropped by then. It cannot ride in
+/// the request extensions instead: the proxy drops the request's parts before
+/// it reads the body. Probes are exempt, as they are from rate limiting, and so
+/// is a request that is not a `POST`: it is refused with the `405` before its
+/// body is read (see [`crate::proxy::PostOnly`]), so it holds no bytes, and
+/// its `405` is not masked by a `413` or a `503`.
 async fn reserve_request_bytes(
     State(budget): State<Arc<RequestByteBudget>>,
     request: Request,
