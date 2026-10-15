@@ -93,5 +93,32 @@ jobs:
           TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-epochs
 
+      - name: Run direct SIGKILL epoch-boundary recovery tests
+        env:
+          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
+        run: make test-sigkill
+
+      - name: Archive retained data from a failed SIGKILL reproduction
+        if: failure()
+        run: |
+          mkdir -p validation-logs/failed-data
+          for marker in crates/e2e-tests/test_logs/sigkill*/retained-datadir.txt; do
+            [ -f "$marker" ] || continue
+            retained_dir="$(cat "$marker")"
+            case_name="$(basename "$(dirname "$marker")")"
+            tar -czf "validation-logs/failed-data/$case_name.tgz" -C "$retained_dir" .
+          done
+
+      - name: Preserve crash-recovery capture
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: sigkill-recovery-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            crates/e2e-tests/test_logs/sigkill*
+            validation-logs/failed-data
+          if-no-files-found: warn
+          retention-days: 15
+
       - name: Assert lockfile unchanged
         run: git diff --exit-code -- Cargo.lock

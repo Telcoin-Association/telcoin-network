@@ -54,6 +54,10 @@ pub(super) struct AllPeers {
     /// id is translated to the telcoin-domain identity that keys `peers`. It is kept in lockstep
     /// with the `Confirmed` entries in `peers`: an entry exists here iff the peer is stored under
     /// a [PeerIdentity::Confirmed] key.
+    ///
+    /// Committee identity is keyed on this index, so a committee member's record is exempt from
+    /// pruning, and the peer manager re-binds a member from its cached node record when a
+    /// refreshed copy of that record is dropped as stale or on a committee update (issue #1649).
     bls_by_peer_id: HashMap<PeerId, BlsPublicKey>,
     /// Members of the previous epoch's committee, keyed by [BlsPublicKey].
     ///
@@ -130,6 +134,10 @@ impl AllPeers {
     }
 
     /// Remove a peer from the collection, keeping the `bls_by_peer_id` resolution index in sync.
+    ///
+    /// Pruning never passes a committee record here (see [`Self::collect_excess_peers`]). A path
+    /// that does remove a committee member's record also removes its binding; the peer manager
+    /// restores it from its cached node record (issue #1649).
     fn evict(&mut self, identity: &PeerIdentity) -> Option<Peer> {
         let removed = self.peers.remove(identity);
         if let (PeerIdentity::Confirmed(_), Some(peer)) = (identity, removed.as_ref()) {
@@ -409,7 +417,10 @@ impl AllPeers {
     /// Peers that fail to connect within dial timeout are updated to
     /// `ConnectionStatus::Disconnected`. It's important these peers are disconnected because
     /// dialing peers are counted towards the limit on inbound connections.
-    pub(super) fn heartbeat_maintenance(&mut self) -> Vec<(PeerId, PeerAction)> {
+    pub(super) fn heartbeat_maintenance(
+        &mut self,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         let peers_to_disconnect: Vec<PeerId> = self
             .peers
             .iter()
@@ -437,7 +448,7 @@ impl AllPeers {
         }
 
         // update scores for all other peers
-        self.update_peer_scores()
+        self.update_peer_scores(Instant::now(), temporary_ban_duration)
     }
 
     /// Update scores for heartbeat interval.
@@ -446,8 +457,17 @@ impl AllPeers {
     /// updated. Peers are possibly unbanned, but penalties are not applied with this method.
     /// It's impossible for a peer to become banned during heartbeat maintenance.
     ///
-    /// See [Self::apply_penalty] for ban logic.
-    fn update_peer_scores(&mut self) -> Vec<(PeerId, PeerAction)> {
+    /// A disconnect-level penalty can ban the connection without banning the reputation. Recover
+    /// that status after the same timeout used by the manager's temporary-ban cache. Reputation
+    /// bans retain their score-decay lockout. The explicit instant keeps expiry tests
+    /// deterministic.
+    ///
+    /// See [Self::process_penalty] for ban logic.
+    fn update_peer_scores(
+        &mut self,
+        now: Instant,
+        temporary_ban_duration: Duration,
+    ) -> Vec<(PeerId, PeerAction)> {
         // filter peers that are eligible to become unbanned
         let previous = &self.previous_committee;
         let current = &self.current_committee;
@@ -476,7 +496,16 @@ impl AllPeers {
                     );
                     None
                 },
-                ReputationUpdate::None => None,
+                ReputationUpdate::None => {
+                    let expired_status_ban = matches!(
+                        peer.connection_status(),
+                        ConnectionStatus::Banned { instant }
+                            if now.saturating_duration_since(*instant) >= temporary_ban_duration
+                    );
+                    (expired_status_ban && !peer.reputation().banned())
+                        .then(|| Self::peer_id_for(id, peer))
+                        .flatten()
+                },
             }
         }).collect::<Vec<_>>();
 
@@ -1022,6 +1051,11 @@ impl AllPeers {
     /// entries, which keeps the freshest bans/disconnects and drops only stale ones (issue #799).
     /// Operator entries are bounded by configuration and retained with their reputation, so
     /// reconnect scheduling cannot recreate a pruned hub and erase its protocol ban.
+    /// Committee records (see [`Self::is_committee_record`]) are never collected either: evicting
+    /// one drops its `bls_by_peer_id` binding, and the member then loses its validator identity at
+    /// this node until it re-signs its record (issue #1649). The exempt set is bounded by the three
+    /// committee slots, so the memory bound behind the pruning caps still holds. Callers can
+    /// therefore receive fewer than `excess` entries.
     /// Used by Self::prune_banned_peers and Self::prune_disconnected_peers.
     fn collect_excess_peers<F>(
         &self,
@@ -1035,8 +1069,8 @@ impl AllPeers {
         let mut excess_peers = BinaryHeap::with_capacity(excess);
 
         for (id, peer) in &self.peers {
-            if let Some(instant) =
-                filter(peer.connection_status()).filter(|_| !peer.is_operator_allowlisted())
+            if let Some(instant) = filter(peer.connection_status())
+                .filter(|_| !peer.is_operator_allowlisted() && !self.is_committee_record(id))
             {
                 // max-heap by instant: the heap's top (peek) is the NEWEST collected peer
                 let entry = (instant, *id, peer.known_ip_addresses().collect::<Vec<_>>());
@@ -1086,6 +1120,13 @@ impl AllPeers {
     }
 
     /// Prune excess number of disconnected peers to prevent exhausting memory.
+    ///
+    /// Committee and operator records are exempt (see [`Self::collect_excess_peers`]), so a call
+    /// can evict fewer than `excess` records. `disconnected_peers` is decremented once per evicted
+    /// record only, so it keeps counting the exempt `Disconnected` records and the next call
+    /// computes the excess from the true total. Each call makes one bounded pass over the
+    /// collection and does not retry, so it terminates even when every `Disconnected` record is
+    /// exempt.
     fn prune_disconnected_peers(&mut self) {
         let excess = self.disconnected_peers.saturating_sub(self.max_disconnected_peers);
 
@@ -1180,6 +1221,32 @@ impl AllPeers {
         self.previous_committee.contains(bls_key)
             || self.current_committee.contains(bls_key)
             || self.next_committee.contains(bls_key)
+    }
+
+    /// Whether `identity` keys the `Confirmed` record of a member of any tracked committee slot
+    /// (previous, current, or next).
+    ///
+    /// Uses the same three slots as the validator scoring exemption and retention protection
+    /// ([`Self::is_peer_validator`]), so a member that keeps its validator privileges also keeps
+    /// the record and the `bls_by_peer_id` binding that back them. Pruning skips these records
+    /// (see [`Self::collect_excess_peers`]); the set is bounded by three committee sizes.
+    fn is_committee_record(&self, identity: &PeerIdentity) -> bool {
+        match identity {
+            PeerIdentity::Confirmed(bls_public_key) => self.is_committee_member(bls_public_key),
+            PeerIdentity::Unidentified(_) => false,
+        }
+    }
+
+    /// Whether a `Confirmed` record is stored for `bls_key`.
+    pub(super) fn has_confirmed_record(&self, bls_key: &BlsPublicKey) -> bool {
+        self.peers.contains_key(&PeerIdentity::Confirmed(*bls_key))
+    }
+
+    /// Evict the `Confirmed` record of `bls_key` through the same path as pruning, so tests can
+    /// cover re-binding after an eviction (issue #1649).
+    #[cfg(test)]
+    pub(super) fn evict_confirmed(&mut self, bls_key: BlsPublicKey) -> Option<Peer> {
+        self.evict(&PeerIdentity::Confirmed(bls_key))
     }
 
     /// Lazily apply committee membership to a single member the moment its network identity is

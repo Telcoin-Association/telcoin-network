@@ -38,6 +38,7 @@ use std::{
     collections::{HashMap, HashSet},
     num::NonZeroUsize,
     sync::Arc,
+    time::Duration,
 };
 use tn_config::{
     Config, ConfigFmt, ConfigTrait as _, ConsensusConfig, NetworkConfig, PriorEpoch, TelcoinDirs,
@@ -1320,23 +1321,31 @@ mod tests {
     use crate::manager::node::tests::reth_config_and_db_with_rpc_port;
     use std::num::NonZeroUsize;
 
-    /// Epoch entry joins worker peer waits concurrently and reuses worker pools across
+    /// Observer epoch entry joins worker peer waits concurrently and reuses worker pools across
     /// two-to-one-to-two transitions. Removed workers close transaction admission and keep their
     /// RPC listeners, so reactivation does not rebind, even with a partially received request.
+    /// Removed workers hand their transactions to worker 0 and reactivate over empty pools.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
     async fn epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
         assert_epoch_workers_are_reused(NodeMode::Observer).await
     }
 
-    /// Active validators subscribe each worker and refresh its components after regrowing.
+    /// Active CVVs retain worker components and their live fees across epoch entry.
     #[cfg(not(feature = "adiri"))]
     #[tokio::test]
-    async fn cvv_epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
+    async fn active_cvv_epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
         assert_epoch_workers_are_reused(NodeMode::CvvActive).await
     }
 
-    /// Exercise the production startup seam with changing worker counts and distinct epochs.
+    /// Inactive CVVs keep their sticky syncing mode while workers shrink and regrow.
+    #[cfg(not(feature = "adiri"))]
+    #[tokio::test]
+    async fn inactive_cvv_epoch_starts_all_workers_and_reuses_components() -> eyre::Result<()> {
+        assert_epoch_workers_are_reused(NodeMode::CvvInactive).await
+    }
+
+    /// Exercise startup, reuse, shrink, and regrow through the production worker seam.
     #[cfg(not(feature = "adiri"))]
     async fn assert_epoch_workers_are_reused(mode: NodeMode) -> eyre::Result<()> {
         use super::*;
@@ -1346,10 +1355,12 @@ mod tests {
         use std::time::Duration;
         use tn_config::KeyConfig;
         use tn_network_libp2p::{types::NetworkCommand, CommitteeUpdate};
-        use tn_reth::RethEnv;
+        use tn_reth::{recover_raw_transaction, test_utils::TransactionFactory, RethEnv};
         use tn_storage::mem_db::MemDatabase;
-        use tn_test_utils::CommitteeFixture;
-        use tn_types::{BlsKeypair, Committee, P2pNode, MIN_PROTOCOL_BASE_FEE};
+        use tn_test_utils::{wait_until, CommitteeFixture};
+        use tn_types::{
+            Address, BlsKeypair, Bytes, Committee, P2pNode, MIN_PROTOCOL_BASE_FEE, U256,
+        };
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
         /// The topic operation observed on one worker's network command channel.
@@ -1396,10 +1407,13 @@ mod tests {
             reth_config_and_db_with_rpc_port(&config, &committee, &datadir, Some(base_port))?;
         drop(base_port_reservation);
         drop(worker_port_reservation);
+        let chain = Arc::new(config.chain_spec());
         let network_tasks = TaskManager::default();
         let accumulator = GasAccumulator::new(2);
         let reth_env =
             RethEnv::new(&node_config, &network_tasks, reth_db.clone(), None, accumulator.clone())?;
+        let tip_header =
+            reth_env.sealed_header_by_number(0)?.ok_or_else(|| eyre!("genesis header"))?;
         let builder = TnBuilder::new(node_config, config.clone(), reth_db);
         let engine = ExecutionNode::new(&builder, reth_env)?;
         let db = MemDatabase::default();
@@ -1458,12 +1472,22 @@ mod tests {
 
         // Identify the role before worker startup, as create_consensus does in production.
         let consensus_bus = ConsensusBus::new_with_app(manager.consensus_bus.clone());
-        let identified_mode = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
-        assert_eq!(std::mem::discriminant(&identified_mode), std::mem::discriminant(&mode));
-        let (topic_sender, mut topic_changes) = mpsc::unbounded_channel();
         let (window_sender, mut window_changes) = mpsc::unbounded_channel();
+        if mode.is_cvv_inactive() {
+            manager.consensus_bus.node_mode().send_replace(NodeMode::CvvInactive);
+        }
+        let identified = manager.identify_node_mode(&consensus_config, &consensus_bus).await?;
+        assert!(
+            match mode {
+                NodeMode::Observer => identified.is_observer(),
+                NodeMode::CvvActive => identified.is_active_cvv(),
+                NodeMode::CvvInactive => identified.is_cvv_inactive(),
+            },
+            "expected {mode:?}, identified {identified:?}",
+        );
         // Neither worker can finish its first probe until both networks have entered their wait.
         let first_probes = Arc::new(tokio::sync::Barrier::new(2));
+        let (topic_sender, mut topic_receiver) = mpsc::unbounded_channel();
         manager.worker_network_handles = (0..2)
             .map(|worker_id| {
                 let (sender, receiver) = mpsc::channel(128);
@@ -1529,27 +1553,26 @@ mod tests {
             .map(|authority| *authority.protocol_key())
             .collect::<HashSet<_>>();
         let chain_id = consensus_config.chain_id();
-        let mut assert_topics = |active_workers| {
-            let expected =
-                [(0, format!("tn-worker-{chain_id}-0")), (1, format!("tn-worker-{chain_id}-1"))]
-                    .into_iter()
-                    .take(active_workers)
-                    .map(|(id, topic)| {
-                        if mode.is_observer() {
-                            BatchTopicChange::Unsubscribe(id, topic)
-                        } else {
-                            BatchTopicChange::Subscribe(id, topic, Some(publishers.clone()))
-                        }
-                    })
-                    .collect::<Vec<_>>();
-            let mut observed =
-                std::iter::from_fn(|| topic_changes.try_recv().ok()).collect::<Vec<_>>();
-            // Worker peer waits run concurrently, so topic commands can arrive in either order.
-            observed.sort_by_key(|change| match change {
-                BatchTopicChange::Subscribe(worker_id, ..)
-                | BatchTopicChange::Unsubscribe(worker_id, ..) => *worker_id,
-            });
-            assert_eq!(observed, expected);
+        let mut assert_topics = |active_workers: WorkerId| -> eyre::Result<()> {
+            let expected = (0..active_workers)
+                .map(|worker_id| {
+                    let topic = format!("tn-worker-{chain_id}-{worker_id}");
+                    if mode.is_observer() {
+                        BatchTopicChange::Unsubscribe(worker_id, topic)
+                    } else {
+                        BatchTopicChange::Subscribe(worker_id, topic, Some(publishers.clone()))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let actual = (0..active_workers)
+                .map(|_| topic_receiver.try_recv().map_err(Into::into))
+                .collect::<eyre::Result<Vec<_>>>()?;
+            assert!(
+                expected.iter().all(|change| actual.contains(change)),
+                "batch topics: {actual:?}"
+            );
+            assert!(topic_receiver.try_recv().is_err(), "unexpected batch-topic operation");
+            Ok(())
         };
         let key = manager.key_config.public_key();
         let rpc_context = WorkerRpcContext {
@@ -1585,7 +1608,7 @@ mod tests {
         let ids =
             futures::stream::iter(&workers).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
-        assert_topics(2);
+        assert_topics(2)?;
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1597,7 +1620,10 @@ mod tests {
         assert_eq!(engine.worker_http_local_address(&DEFAULT_WORKER_ID).await?, rpc_zero);
         let syncing: serde_json::Value =
             startup_client.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
-        assert_eq!(syncing, serde_json::Value::Bool(false));
+        assert_eq!(syncing.is_object(), mode.is_cvv_inactive());
+        if !mode.is_cvv_inactive() {
+            assert_eq!(syncing, serde_json::Value::Bool(false));
+        }
         assert_eq!(
             engine
                 .get_worker_transaction_pool(&DEFAULT_WORKER_ID)
@@ -1609,6 +1635,29 @@ mod tests {
         let rpc_one = engine.worker_http_local_address(&1).await?;
         let worker_one_address = rpc_one.ok_or_else(|| eyre!("worker one address"))?;
         let retained_pool = engine.get_worker_transaction_pool(&1).await?;
+        let mut factory = TransactionFactory::new();
+        let pending = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let pending_hash = *pending.hash();
+        retained_pool.add_recovered_transaction_external(pending).await?;
+        let parked = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            50_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let parked_hash = *parked.hash();
+        retained_pool.add_recovered_transaction_external(parked).await?;
+        assert_eq!(retained_pool.pool_size().pending, 1);
+        assert_eq!(retained_pool.pool_size().basefee, 1);
         let client = engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("worker one RPC"))?;
         let info: serde_json::Value = client.request("tn_info", jsonrpsee::rpc_params![]).await?;
         assert_eq!(
@@ -1643,7 +1692,7 @@ mod tests {
             )
             .await?;
         assert_eq!(repeated.len(), 2);
-        assert_topics(2);
+        assert_topics(2)?;
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_003);
@@ -1687,7 +1736,7 @@ mod tests {
         let ids =
             futures::stream::iter(&shrunk).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0]);
-        assert_topics(1);
+        assert_topics(1)?;
         // The retired worker keeps its listener, so it gets the same epoch-start window as
         // worker 0. The reply to this command proves the mock handled the earlier window command.
         manager
@@ -1712,10 +1761,36 @@ mod tests {
             ]
         );
         assert_eq!(engine.worker_state(1).await, WorkerState::Stopped);
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         assert!(engine.worker_http_client(&1).await.is_err());
-        assert!(engine.is_worker_initialized(0).await);
+        assert!(engine.is_worker_running(0).await);
         assert_eq!(retained_pool.block_info().pending_basefee, MIN_PROTOCOL_BASE_FEE);
+        // The relay drains the retired pool off the engine lock, so epoch entry did not wait.
+        let active_pool = engine.get_worker_transaction_pool(&DEFAULT_WORKER_ID).await?;
+        wait_until(Duration::from_secs(5), "retired pool handed to worker 0", || async {
+            Ok(active_pool.get(&pending_hash).is_some()
+                && active_pool.get(&parked_hash).is_some()
+                && retained_pool.get(&pending_hash).is_none()
+                && retained_pool.get(&parked_hash).is_none())
+        })
+        .await?;
+        assert_eq!(active_pool.pool_size().basefee, 1);
+
+        // Model a submission that passed the admission gate before it closed.
+        let late = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain.clone(),
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let late_hash = *late.hash();
+        retained_pool.add_recovered_transaction_external(late).await?;
+        wait_until(Duration::from_secs(5), "late retired admission handed to worker 0", || async {
+            Ok(active_pool.get(&late_hash).is_some() && retained_pool.get(&late_hash).is_none())
+        })
+        .await?;
         let inactive = client
             .request::<serde_json::Value, _>("eth_sendRawTransaction", jsonrpsee::rpc_params!["0x"])
             .await
@@ -1726,7 +1801,7 @@ mod tests {
         // Repeated deactivation and mode updates must not make the removed worker ready.
         engine.deactivate_workers_above(1).await;
         engine.set_workers_syncing(false).await;
-        assert!(!engine.is_worker_initialized(1).await);
+        assert!(!engine.is_worker_running(1).await);
         assert_eq!(
             manager
                 .worker_network_handles
@@ -1758,7 +1833,7 @@ mod tests {
         let ids =
             futures::stream::iter(&restarted).then(|worker| worker.id()).collect::<Vec<_>>().await;
         assert_eq!(ids, vec![0, 1]);
-        assert_topics(2);
+        assert_topics(2)?;
         assert_eq!(
             engine.worker_readiness().await,
             vec![
@@ -1766,11 +1841,25 @@ mod tests {
                 crate::health::WorkerReadiness::new(1, true),
             ]
         );
-        assert!(engine.is_worker_initialized(1).await);
+        assert!(engine.is_worker_running(1).await);
         assert_eq!(engine.worker_http_local_address(&1).await?, rpc_one);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(engine.worker_state(1).await, WorkerState::Running);
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_004);
+        assert!(retained_pool.pending_transactions().is_empty());
+        assert!(retained_pool.queued_transactions().is_empty());
+        let fresh = recover_raw_transaction(&factory.create_eip1559_encoded(
+            chain,
+            None,
+            200_000_000,
+            Some(Address::ZERO),
+            U256::ZERO,
+            Bytes::new(),
+        ))?;
+        let fresh_hash = *fresh.hash();
+        retained_pool.add_recovered_transaction_external(fresh).await?;
+        assert!(retained_pool.get(&fresh_hash).is_some());
+        assert!(active_pool.get(&fresh_hash).is_none());
         assert_eq!(
             manager
                 .worker_network_handles
@@ -1798,7 +1887,10 @@ mod tests {
             engine.worker_http_client(&1).await?.ok_or_else(|| eyre!("reactivated worker RPC"))?;
         let syncing: serde_json::Value =
             reactivated.request("eth_syncing", jsonrpsee::rpc_params![]).await?;
-        assert_eq!(syncing, serde_json::Value::Bool(false));
+        assert_eq!(syncing.is_object(), mode.is_cvv_inactive());
+        if !mode.is_cvv_inactive() {
+            assert_eq!(syncing, serde_json::Value::Bool(false));
+        }
         let history: serde_json::Value = reactivated
             .request("eth_feeHistory", jsonrpsee::rpc_params!["0x1", "latest", Vec::<f64>::new()])
             .await?;
@@ -1814,6 +1906,10 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), held_connection.read_to_end(&mut response))
             .await??;
         assert!(String::from_utf8(response)?.contains(&format!("0x{:x}", 100_000_004)));
+        // Simulate adjust_base_fees at close without the next entry's set_worker_base_fee.
+        accumulator.base_fee(1).set_base_fee(100_000_005);
+        retained_pool.update_canonical_state(&tip_header, Some(u128::MAX), vec![], vec![]).await?;
+        assert_eq!(retained_pool.block_info().pending_basefee, 100_000_005);
         regrow_config.shutdown().notify();
         assert_eq!(
             engine.worker_readiness().await,

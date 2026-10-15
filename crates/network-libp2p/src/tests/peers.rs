@@ -936,6 +936,100 @@ fn test_connected_peers_by_score() {
     assert!(peers_by_score.last().map(|peer| peer.1.is_routable()).unwrap())
 }
 
+/// Read the start of a ban without relying on elapsed wall-clock time in expiry assertions.
+fn banned_at(peer: &Peer) -> eyre::Result<Instant> {
+    match peer.connection_status() {
+        ConnectionStatus::Banned { instant } => Ok(*instant),
+        ConnectionStatus::Unknown
+        | ConnectionStatus::Connected { .. }
+        | ConnectionStatus::Disconnected { .. }
+        | ConnectionStatus::Disconnecting { .. }
+        | ConnectionStatus::Dialing { .. } => Err(eyre::eyre!("expected banned connection")),
+    }
+}
+
+/// Status-only bans expire at the configured boundary and update bookkeeping exactly once.
+#[test]
+fn status_only_ban_expires_at_configured_timeout() -> eyre::Result<()> {
+    [Duration::ZERO, Duration::from_secs(17), Duration::from_secs(600)].into_iter().try_for_each(
+        |duration| -> eyre::Result<()> {
+            let mut peers = create_all_peers(None);
+            let id = PeerId::random();
+            peers.update_connection_status(
+                &id,
+                NewConnectionStatus::Connected {
+                    multiaddr: create_multiaddr(None),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            (0..4).for_each(|_| {
+                peers.process_penalty(&id, Penalty::Medium);
+            });
+            let (action, pruned) = peers.register_disconnected(&id);
+            assert!(matches!(action, PeerAction::Ban(_)));
+            assert!(pruned.is_empty());
+            let peer = peers.get_peer(&id).ok_or_else(|| eyre::eyre!("missing banned peer"))?;
+            assert_eq!(peer.reputation(), Reputation::Disconnected);
+            let instant = banned_at(peer)?;
+            assert_eq!(peers.banned_peers.total(), 1);
+            assert_eq!(peers.disconnected_peers, 0);
+
+            if !duration.is_zero() {
+                let before_expiry = instant + duration - Duration::from_nanos(1);
+                assert!(peers.update_peer_scores(before_expiry, duration).is_empty());
+                assert_eq!(peers.banned_peers.total(), 1);
+            }
+            let actions = peers.update_peer_scores(instant + duration, duration);
+            assert!(
+                matches!(actions.as_slice(), [(peer_id, PeerAction::Unban(_))] if *peer_id == id)
+            );
+            assert!(peers.get_peer(&id).is_some_and(|peer| matches!(
+                peer.connection_status(),
+                ConnectionStatus::Disconnected { .. }
+            )));
+            assert_eq!(peers.banned_peers.total(), 0);
+            assert_eq!(peers.disconnected_peers, 1);
+            assert!(peers.update_peer_scores(instant + duration, duration).is_empty());
+            assert_eq!(peers.disconnected_peers, 1);
+            Ok(())
+        },
+    )
+}
+
+/// Expiring a connection ban cannot bypass a Fatal or accumulated reputation ban.
+#[test]
+fn status_only_ban_recovery_preserves_reputation_bans() -> eyre::Result<()> {
+    [vec![Penalty::Fatal], vec![Penalty::Medium; 10]].into_iter().try_for_each(
+        |penalties| -> eyre::Result<()> {
+            let mut peers = create_all_peers(None);
+            let id = PeerId::random();
+            peers.update_connection_status(
+                &id,
+                NewConnectionStatus::Connected {
+                    multiaddr: create_multiaddr(None),
+                    direction: ConnectionDirection::Incoming,
+                },
+            );
+            penalties.into_iter().for_each(|penalty| {
+                peers.process_penalty(&id, penalty);
+            });
+            peers.register_disconnected(&id);
+            let peer = peers.get_peer(&id).ok_or_else(|| eyre::eyre!("missing banned peer"))?;
+            assert_eq!(peer.reputation(), Reputation::Banned);
+            let instant = banned_at(peer)?;
+            let duration = PeerConfig::default().excess_peers_reconnection_timeout;
+            assert!(peers.update_peer_scores(instant + duration, duration).is_empty());
+            assert_eq!(peers.banned_peers.total(), 1);
+            assert_eq!(peers.disconnected_peers, 0);
+            assert!(peers.get_peer(&id).is_some_and(|peer| matches!(
+                peer.connection_status(),
+                ConnectionStatus::Banned { .. }
+            )));
+            Ok(())
+        },
+    )
+}
+
 #[test]
 fn test_heartbeat_maintenance() {
     let mut all_peers = create_all_peers(None);
@@ -954,7 +1048,8 @@ fn test_heartbeat_maintenance() {
     }
 
     // Run heartbeat maintenance
-    let _ = all_peers.heartbeat_maintenance();
+    let _ =
+        all_peers.heartbeat_maintenance(PeerConfig::default().excess_peers_reconnection_timeout);
 
     // The peer should now be disconnected
     let peer = all_peers.get_peer(&peer_id).unwrap();
@@ -981,7 +1076,8 @@ fn test_heartbeat_dial_timeout_notifies_caller() {
             instant: Instant::now() - Duration::from_secs(10),
         }); // Older than the 5s timeout
 
-    let _ = all_peers.heartbeat_maintenance();
+    let _ =
+        all_peers.heartbeat_maintenance(PeerConfig::default().excess_peers_reconnection_timeout);
 
     // the caller is notified of the genuine timeout
     let result = receiver.try_recv().expect("heartbeat must notify the dialer of the timeout");
@@ -1155,6 +1251,41 @@ fn test_prune_disconnected_evicts_oldest_not_newest() {
             assert!(retained, "recent disconnect (rank {rank}) must survive pruning");
         }
     }
+}
+
+/// A committee member's `Confirmed` record is exempt from disconnected pruning even when it is the
+/// oldest disconnect, so its `bls_by_peer_id` binding and validator identity survive (issue #1649).
+#[test]
+fn test_prune_disconnected_retains_committee_record() {
+    let config = PeerConfig::default();
+    let mut all_peers = create_all_peers(None);
+
+    let mut rng = StdRng::from_seed([7; 32]);
+    let bls = *BlsKeypair::generate(&mut rng).public();
+    let net: NetworkPublicKey = NetworkKeypair::generate_ed25519().public().into();
+    let validator_id: PeerId = net.clone().into();
+    all_peers.upsert_peer(bls, net, vec![]);
+    all_peers.current_committee.insert(bls);
+
+    // the member is the OLDEST disconnect, so pruning evicts it first without the exemption
+    all_peers.update_connection_status(&validator_id, NewConnectionStatus::Disconnected);
+    assert_eq!(all_peers.disconnected_peers, 1);
+    all_peers.get_peer_mut(&validator_id).into_iter().for_each(|peer| {
+        peer.set_connection_status(ConnectionStatus::Disconnected {
+            instant: Instant::now() - Duration::from_secs(10_000),
+        });
+    });
+    (0..config.max_disconnected_peers).for_each(|_| {
+        all_peers.update_connection_status(&PeerId::random(), NewConnectionStatus::Disconnected);
+    });
+
+    // the triggering disconnect takes the total to `max_disconnected_peers + 2`
+    all_peers.register_disconnected(&PeerId::random());
+
+    assert!(all_peers.get_peer(&validator_id).is_some(), "committee record must survive pruning");
+    assert_eq!(all_peers.bls_for_peer(&validator_id), Some(bls), "binding must survive pruning");
+    assert!(all_peers.is_peer_validator(&validator_id), "member keeps its validator identity");
+    assert_eq!(all_peers.disconnected_peers, config.max_disconnected_peers);
 }
 
 #[test]

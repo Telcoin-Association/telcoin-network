@@ -17,7 +17,7 @@ pub(crate) static STATE_SYNC_METRICS: LazyLock<StateSyncMetrics> =
 pub(crate) struct StateSyncMetrics {
     /// Catch-up iterations that made no progress (consensus header cache miss).
     pub(crate) no_progress_total: Counter,
-    /// Consensus headers applied during catch-up.
+    /// Consensus headers delivered to the subscriber during catch-up.
     pub(crate) headers_fetched_total: Counter,
     /// Epoch pack file fetches started.
     pub(crate) epoch_pack_fetches_total: Counter,
