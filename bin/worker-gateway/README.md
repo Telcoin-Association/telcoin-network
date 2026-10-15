@@ -24,7 +24,7 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
   The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
 - Header forwarding is minimal.
   Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)) and the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the `--redirect-queries-header` header when one is set; see [Query upstream header](#query-upstream-header)).
-  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
+  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL an answer passes only with a JSON `Content-Type` (`application/json` or an `application/*+json` type), and an answer with any other `Content-Type`, or none, a `2xx` included, gets the `-32012` error instead of being relabelled.
   All other headers are dropped in both directions.
   With `--cors-allowed-origins` set the gateway adds CORS headers of its own (see [CORS](#cors)); without it, browser dApps on another origin need CORS handled at the ingress.
   Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
@@ -764,7 +764,7 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | In-flight cap reached (overloaded) | `503` | `-32009` |
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
-| Upstream answered an error status without a JSON body | the upstream's, or `502` for a `1xx` or `304` | `-32012` |
+| Upstream answered an error status without a JSON body, or a `2xx` from the query URL without one | the upstream's, or `502` for a `1xx` or `304` | `-32012` |
 
 The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 

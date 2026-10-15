@@ -140,8 +140,9 @@ pub(crate) enum GatewayError {
     /// answers at once instead of queueing, so one saturated route cannot
     /// hold the connection slots the other route needs.
     Overloaded,
-    /// The upstream answered with a non-2xx `status` and a body that is not
-    /// JSON, so it carries no JSON-RPC answer to relay. The client gets the
+    /// The upstream answered with a non-2xx `status`, or, from the query
+    /// upstream, a `2xx`, and a body that is not JSON, so it carries no
+    /// JSON-RPC answer to relay. The client gets the
     /// upstream's status with a JSON-RPC error in place of the body, or `502`
     /// for a `1xx` or `304`, which can carry no body.
     UpstreamError {

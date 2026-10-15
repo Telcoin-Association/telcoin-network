@@ -29,8 +29,9 @@
 //! upstream, which is not readiness-gated, never falls back to the worker,
 //! gets the `X-TN-Gateway-Redirect` marker in place of `X-TN-Gateway`, plus the
 //! `--redirect-queries-header` header when one is configured (see
-//! [`QueryHeader`]; a worker never receives it), and has its response content
-//! type passed through only when it is JSON. Without `--redirect-queries`, a
+//! [`QueryHeader`]; a worker never receives it), and has any answer without a
+//! JSON content type, a `2xx` included, replaced by a JSON-RPC error. Without
+//! `--redirect-queries`, a
 //! call whose method starts with a `--denied-method-prefixes` entry is refused
 //! before forwarding (see [`Scan::denied`]).
 //!
@@ -569,15 +570,15 @@ pub(crate) async fn proxy(
                 state.readiness.record_rpc_success(&upstream_url);
             }
             // an error status without a json body (a worker's `429`
-            // text/plain, say) carries no json-rpc answer: replace it with the
-            // gateway's envelope, keeping the status and echoing the request's
-            // id. hyper's server sends a 1xx or 304 without a body (and closes
-            // the connection after a 101), so such an answer could carry no
-            // json-rpc response whatever its content type: it gets the
-            // envelope with a 502
+            // text/plain, say), or any query answer without one, carries no
+            // json-rpc answer: replace it with the gateway's envelope, keeping
+            // the status and echoing the request's id. hyper's server sends a
+            // 1xx or 304 without a body (and closes the connection after a
+            // 101), so such an answer could carry no json-rpc response
+            // whatever its content type: it gets the envelope with a 502
             let unservable = upstream.status().is_informational()
                 || upstream.status() == StatusCode::NOT_MODIFIED;
-            if unservable || is_non_json_error(&upstream) {
+            if unservable || is_non_json_answer(&upstream, route) {
                 let status = if unservable { StatusCode::BAD_GATEWAY } else { upstream.status() };
                 telemetry::record_routed(route.label(), "upstream_error");
                 if let Some(suppressed) = UPSTREAM_ERROR_WARNINGS.get(route).admit() {
@@ -1025,6 +1026,18 @@ fn is_non_json_error(upstream: &reqwest::Response) -> bool {
         && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
 }
 
+/// Whether an upstream answer on `route` carries no JSON body to pass on, so
+/// the gateway replaces it with its own JSON-RPC error: an error status
+/// without a JSON body from either upstream ([`is_non_json_error`]), or any
+/// answer without one from the query upstream, a `2xx` included (a CDN
+/// challenge or a captive page, say), which the client would otherwise get
+/// labelled as JSON. A worker's `2xx` passes whatever its content type.
+fn is_non_json_answer(upstream: &reqwest::Response, route: Route) -> bool {
+    is_non_json_error(upstream)
+        || (route == Route::Query
+            && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE)))
+}
+
 /// Whether a `Content-Type` names JSON: `application/json` or an
 /// `application/*+json` subtype, in any letter case and whatever its
 /// parameters (such as `charset`). A missing or unreadable header is not
@@ -1075,6 +1088,8 @@ fn relay(
     let upstream_content_type = upstream.headers().get(header::CONTENT_TYPE);
     let content_type = match route {
         Route::Worker => upstream_content_type.cloned(),
+        // `proxy` already answers a query upstream's non-json answer with the
+        // -32012 error, so this filter is a second line of defence
         Route::Query => Some(
             upstream_content_type
                 .filter(|content_type| is_json_content_type(Some(content_type)))

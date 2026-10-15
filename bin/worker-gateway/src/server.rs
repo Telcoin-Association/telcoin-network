@@ -2474,11 +2474,11 @@ mod tests {
                     let admitted = accept_submissions
                         && serde_json::from_slice::<serde_json::Value>(&body)
                             .is_ok_and(|call| call["method"] == "eth_sendRawTransaction");
-                    if admitted {
-                        ACCEPTED
-                    } else {
-                        name
-                    }
+                    // labelled json, as a real upstream's answer is: a query
+                    // upstream's 2xx without a json content type gets the
+                    // -32012 error in its place
+                    let answer = if admitted { ACCEPTED } else { name };
+                    ([(header::CONTENT_TYPE, "application/json")], answer)
                 }
             }),
         );
@@ -4494,7 +4494,8 @@ mod tests {
             "/",
             post(|| async {
                 let first = futures::stream::iter([Ok::<_, std::convert::Infallible>("partial")]);
-                axum::body::Body::from_stream(first.chain(futures::stream::pending()))
+                let body = axum::body::Body::from_stream(first.chain(futures::stream::pending()));
+                ([(header::CONTENT_TYPE, "application/json")], body)
             }),
         ))
         .await;
@@ -8353,6 +8354,9 @@ mod tests {
             .expect("send")
     }
 
+    /// A query upstream's `2xx` without a JSON content type (a CDN challenge
+    /// or a captive page, say) carries no JSON-RPC answer: the client gets the
+    /// upstream's status with the `-32012` error, labelled JSON, in its place.
     #[tokio::test]
     async fn query_route_non_json_content_type_is_replaced() {
         for content_type in [
@@ -8380,6 +8384,13 @@ mod tests {
                 Some(&HeaderValue::from_static("nosniff")),
                 "{content_type:?}"
             );
+            let text = response.text().await.expect("text");
+            assert_eq!(
+                error_code_and_id(&text),
+                (-32012, serde_json::json!(1)),
+                "{content_type:?}"
+            );
+            assert!(text.contains("upstream returned 200"), "{content_type:?}: {text}");
         }
     }
 
