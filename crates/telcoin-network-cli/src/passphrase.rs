@@ -39,8 +39,14 @@ pub const DEFAULT_BLS_PASSPHRASE_CREDENTIAL: &str = "bls-passphrase";
 /// first, so `/proc/<pid>/environ` keeps the variable name followed by zero bytes and no
 /// passphrase. Elsewhere the variable is only removed.
 ///
+/// # Precondition
+///
 /// Call this exactly once, as the FIRST statement of `main`, before any
 /// threads exist: it mutates the process environment, which is not thread safe.
+/// The in-place zeroing writes to the environment block without std's environment
+/// lock, so on Linux it runs only after `/proc/self/task` confirms the process has a
+/// single thread. With other threads present (or `/proc` unreadable) the value is not
+/// zeroed, the variable is still removed, and a warning is logged.
 pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
     let value = std::env::var_os(BLS_PASSPHRASE_ENVVAR)?;
     // `value` is now the only copy the node keeps, so wipe the originals
@@ -73,14 +79,26 @@ pub fn get_bls_passphrase_from_env() -> Option<Zeroizing<String>> {
 /// stays in the environment block the kernel set up, which `/proc/<pid>/environ` exposes to
 /// root and to the service user for the life of the process. `execve` does not de-duplicate
 /// names and `getenv` returns only the first match, so this walks every entry.
+///
+/// Skipped, with a warning, unless the process has a single thread: the write bypasses std's
+/// environment lock and libc's own environment functions.
 #[cfg(target_os = "linux")]
 fn scrub_env_values(name: &str) {
+    if !is_single_threaded() {
+        tracing::warn!(
+            target: "cli",
+            "{name} removed from the environment but not zeroed in place: other threads may \
+             exist (read it before starting threads)"
+        );
+        return;
+    }
     let prefix =
         CString::new(format!("{name}=")).expect("environment variable names contain no nul");
-    // SAFETY: called once at startup, before any other thread exists, so nothing reads or
-    // changes the environment concurrently. `environ` is the live array libc keeps: null or
-    // null-terminated, each entry a nul-terminated `NAME=value` string in writable memory (the
-    // initial process stack for an inherited variable, the heap for one set with `setenv`).
+    // SAFETY: this is the only thread, checked just above, and it does not start another
+    // before the call returns, so nothing reads or changes the environment concurrently.
+    // `environ` is the live array libc keeps: null or null-terminated, each entry a
+    // nul-terminated `NAME=value` string in writable memory (the initial process stack for an
+    // inherited variable, the heap for one set with `setenv`).
     unsafe { zero_env_values(environ, &prefix) }
 }
 
@@ -113,6 +131,13 @@ unsafe fn zero_env_values(env: *const *mut c_char, prefix: &CStr) {
             entry = entry.add(1);
         }
     }
+}
+
+/// Whether the process has exactly one thread, counted from the entries of `/proc/self/task`.
+/// `false` when that directory cannot be read.
+#[cfg(target_os = "linux")]
+fn is_single_threaded() -> bool {
+    std::fs::read_dir("/proc/self/task").map(|tasks| tasks.count() == 1).unwrap_or(false)
 }
 
 #[cfg(target_os = "linux")]
@@ -426,19 +451,20 @@ mod tests {
         }
     }
 
-    /// The original environment bytes are zeroed, not only unlinked from `environ`, for a UTF-8
-    /// value and for one that is not. Reading them back after removal relies on glibc never
-    /// freeing the strings `setenv` allocates, hence the `gnu` gate.
-    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    /// The live environment block is zeroed in place, for a UTF-8 value and for one that is
+    /// not. The test harness runs tests on their own threads, so this calls the zeroing
+    /// directly rather than through the single-thread check in [`get_bls_passphrase_from_env`].
+    #[cfg(target_os = "linux")]
     #[test]
     fn test_env_preload_scrubs_original_bytes() {
         use std::os::unix::ffi::OsStrExt as _;
         let _env = env_lock();
         let name = CString::new(BLS_PASSPHRASE_ENVVAR).expect("name");
+        let prefix = CString::new(format!("{BLS_PASSPHRASE_ENVVAR}=")).expect("prefix");
         for value in [b"sekrit".as_ref(), b"sek\xffrit"] {
             std::env::set_var(BLS_PASSPHRASE_ENVVAR, std::ffi::OsStr::from_bytes(value));
             // SAFETY: the env lock is held and the variable was set just above, so getenv
-            // returns a live, nul-terminated value.
+            // returns a live, nul-terminated value, which stays live until the remove below.
             let (ptr, len) = unsafe {
                 let ptr = libc::getenv(name.as_ptr());
                 assert!(!ptr.is_null());
@@ -446,18 +472,48 @@ mod tests {
             };
             assert_eq!(len, value.len());
 
-            let expected =
-                std::str::from_utf8(value).ok().map(|value| Zeroizing::new(value.into()));
-            assert_eq!(get_bls_passphrase_from_env(), expected);
-            assert!(std::env::var_os(BLS_PASSPHRASE_ENVVAR).is_none());
-            // SAFETY: glibc keeps every string setenv allocated for the life of the process, so
-            // the removed entry's `len` value bytes are still readable.
+            // SAFETY: the env lock is held and the harness's own threads never touch the
+            // environment, so nothing reads or changes it during the call.
+            unsafe { zero_env_values(environ, &prefix) };
+            // SAFETY: the entry is still in the environment, so its value bytes are readable.
             let scrubbed = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
             assert!(
                 scrubbed.iter().all(|byte| *byte == 0),
                 "value bytes left in place: {scrubbed:?}"
             );
+            std::env::remove_var(BLS_PASSPHRASE_ENVVAR);
         }
+    }
+
+    /// With another thread running, the in-place zeroing is skipped and the variable is still
+    /// removed. Reading the value bytes back after removal relies on glibc never freeing the
+    /// strings `setenv` allocates, hence the `gnu` gate.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    #[test]
+    fn test_env_preload_skips_zeroing_with_other_threads() {
+        let _env = env_lock();
+        let (release, parked) = std::sync::mpsc::channel::<()>();
+        let other = std::thread::spawn(move || parked.recv());
+        assert!(!is_single_threaded());
+
+        std::env::set_var(BLS_PASSPHRASE_ENVVAR, "sekrit");
+        let name = CString::new(BLS_PASSPHRASE_ENVVAR).expect("name");
+        // SAFETY: the env lock is held and the variable was set just above, so getenv returns
+        // a live, nul-terminated value.
+        let (ptr, len) = unsafe {
+            let ptr = libc::getenv(name.as_ptr());
+            assert!(!ptr.is_null());
+            (ptr, libc::strlen(ptr))
+        };
+        assert_eq!(get_bls_passphrase_from_env(), Some(Zeroizing::new("sekrit".into())));
+        assert!(std::env::var_os(BLS_PASSPHRASE_ENVVAR).is_none());
+        // SAFETY: glibc keeps every string setenv allocated for the life of the process, so the
+        // removed entry's `len` value bytes are still readable.
+        let left = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
+        assert_eq!(left, b"sekrit");
+
+        release.send(()).expect("other thread waiting");
+        other.join().expect("other thread").expect("released");
     }
 
     #[test]
