@@ -226,6 +226,25 @@ pub fn config_local_testnet_with_gc_depth(
     config_local_testnet_inner(temp_path, passphrase, accounts, None, &[], gc_depth)
 }
 
+/// Like [`config_local_testnet_with_gc_depth`], but also sets the epoch duration in seconds, so a
+/// restart test can cross epoch boundaries within the test budget.
+pub fn config_local_testnet_with_gc_depth_and_epoch_duration(
+    temp_path: &Path,
+    passphrase: Option<String>,
+    accounts: Option<Vec<(Address, GenesisAccount)>>,
+    gc_depth: u32,
+    epoch_duration_secs: u32,
+) -> eyre::Result<()> {
+    config_local_testnet_inner(
+        temp_path,
+        passphrase,
+        accounts,
+        Some(epoch_duration_secs),
+        &[],
+        Some(gc_depth),
+    )
+}
+
 /// Shared implementation for the `config_local_testnet*` helpers.
 ///
 /// Builds the genesis CLI argument vector, optionally appending `--epoch-duration-in-secs` and one
@@ -557,6 +576,38 @@ pub fn get_telcoin_network_binary() -> &'static TestBinary {
                 .expect("Failed to build telcoin-network binary"),
         )
     })
+}
+
+/// The older node binary from `TN_BIN_PATH_PREV`, resolved once for the whole test process;
+/// `None` when the variable is unset.
+static PREVIOUS_TELCOIN_BINARY: OnceLock<Option<TestBinary>> = OnceLock::new();
+
+/// Retrieve the node binary built from an older ref (a release, or the last commit before a
+/// fork landed), for the mixed-binary (rolling upgrade) tests that run an older node version
+/// beside the current one or upgrade a running network's binary in place.
+///
+/// Honors `TN_BIN_PATH_PREV`, a prebuilt binary only: unlike [`get_telcoin_network_binary`] there
+/// is no escargot fallback, because cargo can only build the tree in front of it, not an older
+/// ref. `make build-e2e-bin-prev` builds that binary (as does `make build-e2e-bin` run at the
+/// older ref), and the tests receive its path through `TN_BIN_PATH_PREV`. When the variable is
+/// unset this returns `None` and a test that needs the binary skips with a warning. A variable
+/// that is set but names no file panics, so a mistyped path cannot pass as a skipped run. The
+/// binary must come from `make build-e2e-bin` at the older ref, so it honors the same
+/// `TN_*_FORK_EPOCH` variables that [`TestBinary::command`] forwards (except any fork that ref
+/// does not know, which it ignores).
+pub fn get_previous_telcoin_network_binary() -> Option<&'static TestBinary> {
+    PREVIOUS_TELCOIN_BINARY
+        .get_or_init(|| {
+            let prebuilt = std::env::var("TN_BIN_PATH_PREV").ok()?;
+            let path = PathBuf::from(&prebuilt);
+            assert!(
+                path.is_file(),
+                "TN_BIN_PATH_PREV is set to {prebuilt:?} but no file exists there"
+            );
+            info!("using previous telcoin-network binary from TN_BIN_PATH_PREV: {prebuilt}");
+            Some(TestBinary::Prebuilt(path))
+        })
+        .as_ref()
 }
 
 // imports for traits used in faucet tests only
