@@ -128,8 +128,9 @@ spec:
             # deadline (--upstream-request-timeout 35s + --header-read-timeout
             # 10s), so a request accepted just before the listener closes,
             # such as an eth_sendRawTransactionSync waiting for its receipt,
-            # still finishes; the 30s default would cut it short. The drain
-            # ends as soon as the last request does.
+            # still finishes. The drain ends as soon as the last request does.
+            # 45s equals the default at these timeouts; it is set explicitly so
+            # the arithmetic for terminationGracePeriodSeconds stays visible.
             - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
               value: "45s"
             # Keep N x --max-upstream-inflight below the worker's
