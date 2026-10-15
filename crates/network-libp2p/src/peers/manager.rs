@@ -14,7 +14,7 @@ use crate::{
     peers::status::ConnectionStatus,
     send_or_log_error,
     source_admission::{AdmissionError, SourceAdmissionBudget, SourceConnections},
-    types::{NetworkInfo, NetworkResult, RpcInfo},
+    types::{CommitteeRpcSnapshot, NetworkInfo, NetworkResult, RpcInfo},
 };
 use libp2p::{
     core::ConnectedPoint, kad::PeerInfo, multiaddr::Protocol, swarm::ConnectionId, Multiaddr,
@@ -1880,6 +1880,30 @@ impl PeerManager {
                 self.known_peers.get(bls).and_then(|info| info.rpc.clone()).map(|rpc| (*bls, rpc))
             })
             .collect()
+    }
+
+    /// Snapshot membership and learned advertisements without racing committee rotation.
+    pub(crate) fn committee_rpc_snapshot(&mut self) -> CommitteeRpcSnapshot {
+        let rpcs = self
+            .current_committee_rpcs()
+            .into_iter()
+            .filter(|(key, _)| !self.record_unlearned(key))
+            .collect();
+        CommitteeRpcSnapshot::new(self.peers.current_committee().clone(), rpcs)
+    }
+
+    /// Observe required remote identities in each slot using the resolution consumer's state.
+    /// Self is excluded from both counts because it never needs remote discovery.
+    pub(crate) fn observe_committee_resolution(&self, local_key: BlsPublicKey) {
+        ["previous", "current", "next"].into_iter().zip(self.peers.committee_slots()).for_each(
+            |(slot, members)| {
+                let required = members.iter().filter(|key| **key != local_key);
+                let expected = required.clone().count();
+                let unresolved = required.filter(|key| self.record_unlearned(key)).count();
+                self.metrics.set_committee_resolution(slot, expected, unresolved);
+            },
+        );
+        self.metrics.mark_committee_observed();
     }
 
     /// Find the peer id for an authority.

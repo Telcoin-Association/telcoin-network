@@ -20,6 +20,36 @@ use tokio::sync::{mpsc, oneshot};
 /// The result for network operations.
 pub type NetworkResult<T> = Result<T, NetworkError>;
 
+/// One atomic view of current membership and its learned submit advertisements.
+///
+/// Membership includes unresolved identities. Advertisements follow the peer manager's
+/// verified-record policy, exclude configuration stubs and expired store rows, and do not
+/// imply endpoint usability.
+#[derive(Clone, Debug)]
+pub struct CommitteeRpcSnapshot {
+    /// Current committee identities from authoritative epoch state.
+    members: HashSet<BlsPublicKey>,
+    /// Learned RPC advertisements belonging to these members.
+    rpcs: Vec<(BlsPublicKey, RpcInfo)>,
+}
+
+impl CommitteeRpcSnapshot {
+    /// Construct a snapshot on the swarm loop, without an intervening committee update.
+    pub(crate) fn new(members: HashSet<BlsPublicKey>, rpcs: Vec<(BlsPublicKey, RpcInfo)>) -> Self {
+        Self { members, rpcs }
+    }
+
+    /// Current identities, including members without an RPC advertisement.
+    pub fn members(&self) -> &HashSet<BlsPublicKey> {
+        &self.members
+    }
+
+    /// Learned advertisements; callers must still apply their endpoint admission policy.
+    pub fn rpcs(&self) -> &[(BlsPublicKey, RpcInfo)] {
+        &self.rpcs
+    }
+}
+
 /// Helper trait to cast lib-specific results into RPC messages.
 pub trait IntoResponse<M> {
     /// Convert a [Result] into a [TNMessage] type.
@@ -496,6 +526,11 @@ where
         /// The reply to caller.
         reply: oneshot::Sender<Vec<(BlsPublicKey, RpcInfo)>>,
     },
+    /// Atomically read current membership and learned RPC advertisements.
+    GetCommitteeRpcSnapshot {
+        /// The reply to caller.
+        reply: oneshot::Sender<CommitteeRpcSnapshot>,
+    },
     /// Read a single record from the local kad store by BLS key.
     ///
     /// Test-only observation hook used to assert local-store eviction
@@ -856,6 +891,14 @@ where
     pub async fn get_all_validator_rpcs(&self) -> NetworkResult<Vec<(BlsPublicKey, RpcInfo)>> {
         let (reply, rx) = oneshot::channel();
         self.sender.send(NetworkCommand::GetAllValidatorRpcs { reply }).await?;
+        rx.await.map_err(Into::into)
+    }
+
+    /// Read current membership and learned RPC advertisements on the same swarm iteration.
+    /// Polling also retries discovery for unresolved members, including configuration stubs.
+    pub async fn get_committee_rpc_snapshot(&self) -> NetworkResult<CommitteeRpcSnapshot> {
+        let (reply, rx) = oneshot::channel();
+        self.sender.send(NetworkCommand::GetCommitteeRpcSnapshot { reply }).await?;
         rx.await.map_err(Into::into)
     }
 }

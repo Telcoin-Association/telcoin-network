@@ -2264,6 +2264,61 @@ async fn test_learned_pinned_record_not_regressed_by_older_query_result() {
     assert_eq!(cached.rpc, Some(rpc), "older query result must not drop the advertised rpc");
 }
 
+/// Resolution observations follow learned records, exclude self, and replace all three slots.
+#[tokio::test]
+async fn committee_convergence_tracks_resolution_and_rotation() {
+    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    let recorder = DebuggingRecorder::new();
+    let snapshotter = recorder.snapshotter();
+    let mut manager = create_test_peer_manager(None);
+    let [local, learned, stub, missing, incoming] = [101, 102, 103, 104, 105]
+        .map(|seed| *BlsKeypair::generate(&mut StdRng::from_seed([seed; 32])).public());
+    let (info, _) = random_network_info_with_rpc();
+    manager.add_restored_peer(learned, info);
+    let (stub_info, _) = random_network_info_with_rpc();
+    manager.add_known_peer(stub, stub_info.clone());
+    manager.update_committees(
+        HashSet::from([local, learned]),
+        HashSet::from([learned, stub, missing]),
+        HashSet::from([stub, incoming]),
+    );
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    let gauge = |name: &str, slot: &str| {
+        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+            (key.key().name() == name
+                && key.key().labels().count() == 2
+                && key.key().labels().any(|label| label.key() == "slot" && label.value() == slot))
+            .then_some(value)
+            .and_then(|value| match value {
+                DebugValue::Gauge(value) => Some(value.0),
+                DebugValue::Counter(_) | DebugValue::Histogram(_) => None,
+            })
+        })
+    };
+    assert_eq!(gauge("tn_network.committee_required_members", "previous"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "previous"), Some(0.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(3.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(2.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "next"), Some(2.0));
+    let snapshot = manager.committee_rpc_snapshot();
+    assert_eq!(snapshot.members().len(), 3);
+    assert_eq!(
+        snapshot.rpcs().iter().map(|(key, _)| *key).collect::<HashSet<_>>(),
+        HashSet::from([learned])
+    );
+    // Accepting verified metadata upgrades a stub without requiring a restart.
+    manager.add_restored_peer(stub, stub_info);
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(manager.committee_rpc_snapshot().rpcs().len(), 2);
+    manager.update_committees(HashSet::from([learned]), HashSet::from([incoming]), HashSet::new());
+    metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
+    assert_eq!(gauge("tn_network.committee_required_members", "next"), Some(0.0));
+    assert!(manager.committee_rpc_snapshot().rpcs().is_empty());
+}
+
 /// Build a [`NetworkInfo`] like [`random_network_info`], but advertising a valid [`RpcInfo`].
 fn random_network_info_with_rpc() -> (NetworkInfo, RpcInfo) {
     let rpc = RpcInfo {

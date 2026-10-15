@@ -65,6 +65,20 @@ use tn_worker::{WorkerNetwork, WorkerNetworkHandle};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
+/// Clears an epoch's observer observations when its monitor is cancelled or exits.
+struct SubmitCoverageMonitor {
+    /// Forwarder whose admission cache is the authoritative endpoint consumer.
+    forwarder: Arc<WorkerRpcForwarder>,
+    /// Configured worker swarm whose series this monitor owns.
+    worker: WorkerId,
+}
+
+impl Drop for SubmitCoverageMonitor {
+    fn drop(&mut self) {
+        self.forwarder.clear_submit_coverage(self.worker);
+    }
+}
+
 /// Worker-independent RPC state shared while initializing an epoch's workers.
 ///
 /// Each worker supplies its own network identity before constructing a complete [`RpcNodeInfo`].
@@ -733,6 +747,45 @@ where
             ),
             Some(engine.get_worker_transaction_pool(&worker_id).await?),
         ));
+
+        forwarder.clear_submit_coverage(worker_id);
+        let in_committee =
+            consensus_config.authority_id().is_some_and(|id| consensus_config.in_committee(&id));
+        if !in_committee {
+            let coverage =
+                SubmitCoverageMonitor { forwarder: forwarder.clone(), worker: worker_id };
+            let handle = network_handle.inner_handle().clone();
+            network_handle.get_task_spawner().spawn_task("Observer submit coverage", async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                futures::stream::unfold(
+                    (interval, coverage, handle),
+                    |(mut interval, coverage, handle)| async move {
+                        interval.tick().await;
+                        // Bound a stalled command channel and a lost reply. Missing observations
+                        // must not leave the last successful snapshot looking ready indefinitely.
+                        let observation = tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            handle.get_committee_rpc_snapshot(),
+                        )
+                        .await;
+                        observation.ok().and_then(Result::ok).map_or_else(
+                            || coverage.forwarder.clear_submit_coverage(coverage.worker),
+                            |snapshot| {
+                                coverage.forwarder.observe_submit_coverage(
+                                    coverage.worker,
+                                    snapshot.members(),
+                                    snapshot.rpcs(),
+                                )
+                            },
+                        );
+                        Some(((), (interval, coverage, handle)))
+                    },
+                )
+                .for_each(|()| std::future::ready(()))
+                .await;
+            });
+        }
 
         let worker = WorkerNode::new(
             worker_id,
