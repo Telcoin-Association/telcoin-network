@@ -173,7 +173,9 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(&self.consensus_chain)
+            .with_last_consensus_block(&self.consensus_chain, |h| {
+                (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+            })
             .await
             .inspect_err(|e| {
                 // A failed lookup is logged loudly but degrades to the same conservative
@@ -184,7 +186,6 @@ where
             })
             .ok()
             .flatten()
-            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.

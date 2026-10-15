@@ -8,10 +8,11 @@
 //!   - import and staging (`stream_import`, `import_partial_to_staging`,
 //!     `recover_incomplete_installs`, `install_imported_epoch_dir`);
 //!   - save and persist (`save_consensus_output`, `persist_current_timed`, `clamp_latest_to_pack`);
-//!   - the reads (`consensus_header_by_digest`, `consensus_output_by_number`, `get_batches`);
+//!   - the reads (`with_consensus_header_by_digest` and the recent-header cache,
+//!     `consensus_output_by_number`, `get_batches`);
 //!   - the static-pack cache and its read-side heal (`get_static`, `heal_static`).
-//! - `ReadSideHeal`, the `ConsensusChainReader`/`ConsensusChainWriter` impls,
-//!   `ConsensusChainError` and `ImportPath`, then `mod tests`.
+//! - `ReadSideHeal`, the `ConsensusChainReader`/`ConsensusChainWriter` impls, `ConsensusChainError`
+//!   and `ImportPath`, then `mod test`.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -443,15 +444,25 @@ pub struct ConsensusChain {
     /// also stages into a directory of its own, so clearing the installed pack never touches an
     /// import still streaming.
     staging_import: Arc<tokio::sync::Mutex<()>>,
-    /// The last few headers [`Self::consensus_header_by_digest`] read from a pack, newest last:
-    /// asked again (the primary asks for the last executed one on every gossiped certificate),
-    /// one is answered here instead of decompressing and decoding its whole sub-dag again. Each is
-    /// exactly what the pack returned.
-    recent_headers: Arc<Mutex<VecDeque<ConsensusHeader>>>,
+    /// The last few headers [`Self::with_consensus_header_by_digest`] read from a pack, newest
+    /// last: asked again (the primary asks for the last executed one on every gossiped
+    /// certificate), one is answered here instead of decompressing and decoding its whole sub-dag
+    /// again. Each is exactly what the pack returned.
+    recent_headers: Arc<Mutex<VecDeque<RecentHeader>>>,
+}
+
+/// A header [`ConsensusChain`] remembers, with the epoch and digest it is looked up by, computed
+/// once when it is remembered (a header's digest re-hashes its sub-dag).
+#[derive(Debug)]
+struct RecentHeader {
+    epoch: Epoch,
+    digest: ConsensusHeaderDigest,
+    header: ConsensusHeader,
 }
 
 impl ConsensusChain {
-    /// How many recently read headers [`Self::consensus_header_by_digest`] answers from memory.
+    /// How many recently read headers [`Self::with_consensus_header_by_digest`] answers from
+    /// memory.
     const RECENT_HEADERS: usize = 8;
 
     /// How many recently opened pack files to maintain.
@@ -522,25 +533,39 @@ impl ConsensusChain {
 
     /// Remember `header`, just read from a pack (see `recent_headers`).
     fn remember_header(&self, header: ConsensusHeader) {
+        let entry =
+            RecentHeader { epoch: header.sub_dag.leader_epoch(), digest: header.digest(), header };
         let mut recent = self.recent_headers.lock();
         if recent.len() == Self::RECENT_HEADERS {
             recent.pop_front();
         }
-        recent.push_back(header);
+        recent.push_back(entry);
     }
 
-    /// The remembered header of `epoch` with `digest`, if it is one of the last few read.
+    /// `f` of the remembered header of `epoch` with `digest`, if it is one of the last few read.
+    /// `f` runs under the cache lock, on the remembered header itself: nothing is copied.
+    /// Hands `f` back when the header is not remembered.
+    fn with_recent_header<R, F: FnOnce(&ConsensusHeader) -> R>(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+        f: F,
+    ) -> Result<R, F> {
+        let recent = self.recent_headers.lock();
+        match recent.iter().rev().find(|entry| entry.epoch == epoch && entry.digest == digest) {
+            Some(entry) => Ok(f(&entry.header)),
+            None => Err(f),
+        }
+    }
+
+    /// Test-only: a copy of the remembered header of `epoch` with `digest`, if any.
+    #[cfg(test)]
     fn recent_header(
         &self,
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
     ) -> Option<ConsensusHeader> {
-        let recent = self.recent_headers.lock();
-        recent
-            .iter()
-            .rev()
-            .find(|header| header.sub_dag.leader_epoch() == epoch && header.digest() == digest)
-            .cloned()
+        self.with_recent_header(epoch, digest, ConsensusHeader::clone).ok()
     }
 
     /// Create a new empty consensus chain with a dummy epoch 0 pack ready.
@@ -1187,14 +1212,30 @@ impl ConsensusChain {
         epoch: Epoch,
         digest: ConsensusHeaderDigest,
     ) -> Result<Option<ConsensusHeader>, ConsensusChainError> {
-        if let Some(header) = self.recent_header(epoch, digest) {
-            return Ok(Some(header));
-        }
-        let found = self.consensus_header_by_digest_from_packs(epoch, digest).await?;
-        if let Some(header) = &found {
-            self.remember_header(header.clone());
-        }
-        Ok(found)
+        self.with_consensus_header_by_digest(epoch, digest, ConsensusHeader::clone).await
+    }
+
+    /// `f` of the consensus header of `epoch` with `digest` (see
+    /// [`Self::consensus_header_by_digest`], whose absence and errors this shares), without
+    /// copying the header out: for a caller that needs a few of its fields, as the primary does for
+    /// the last executed header on every gossiped certificate. The last few headers read are
+    /// remembered, so asking again runs `f` on the remembered one.
+    pub async fn with_consensus_header_by_digest<R>(
+        &self,
+        epoch: Epoch,
+        digest: ConsensusHeaderDigest,
+        f: impl FnOnce(&ConsensusHeader) -> R,
+    ) -> Result<Option<R>, ConsensusChainError> {
+        let f = match self.with_recent_header(epoch, digest, f) {
+            Ok(found) => return Ok(Some(found)),
+            Err(f) => f,
+        };
+        let Some(header) = self.consensus_header_by_digest_from_packs(epoch, digest).await? else {
+            return Ok(None);
+        };
+        let found = f(&header);
+        self.remember_header(header);
+        Ok(Some(found))
     }
 
     /// [`Self::consensus_header_by_digest`], read from the packs.
@@ -2554,12 +2595,12 @@ mod test {
         assert_eq!(latest.number(), 0, "both slots corrupt -> fresh start");
     }
 
-    /// A header read by digest is remembered: asked again, it comes from memory, exactly what the
-    /// pack returned; asked under another epoch, it does not; and once the last few reads push it
-    /// out, a lookup reads the pack again, with the same answer.
-    #[tokio::test]
-    async fn test_consensus_header_by_digest_remembers_recent_reads() {
-        let temp_dir = TempDir::with_prefix("test_recent_headers").expect("temp dir");
+    /// A chain in `dir` with `count` outputs saved and persisted in epoch 0, and their header
+    /// digests in order.
+    async fn chain_with_outputs(
+        dir: &std::path::Path,
+        count: u64,
+    ) -> (ConsensusChain, Vec<ConsensusHeaderDigest>) {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let committee = fixture.committee();
@@ -2569,12 +2610,11 @@ mod test {
             next_committee: committee.bls_keys().iter().copied().collect(),
             ..Default::default()
         };
-        let consensus_chain =
-            ConsensusChain::new(temp_dir.path().to_owned(), committee.clone()).unwrap();
+        let consensus_chain = ConsensusChain::new(dir.to_owned(), committee.clone()).unwrap();
         consensus_chain.new_epoch(previous_epoch, committee.clone()).await.unwrap();
         let mut parent = ConsensusHeader::default().digest();
         let mut digests = Vec::new();
-        for i in 0..12u64 {
+        for i in 0..count {
             let output =
                 make_test_output(&committee, (i % 4) as usize, chain.clone(), i + 1, parent);
             parent = output.digest();
@@ -2582,6 +2622,16 @@ mod test {
             consensus_chain.save_consensus_output(output).await.unwrap();
         }
         consensus_chain.persist_current().await.unwrap();
+        (consensus_chain, digests)
+    }
+
+    /// A header read by digest is remembered: asked again, it comes from memory, exactly what the
+    /// pack returned; asked under another epoch, it does not; and once the last few reads push it
+    /// out, a lookup reads the pack again, with the same answer.
+    #[tokio::test]
+    async fn test_consensus_header_by_digest_remembers_recent_reads() {
+        let temp_dir = TempDir::with_prefix("test_recent_headers").expect("temp dir");
+        let (consensus_chain, digests) = chain_with_outputs(temp_dir.path(), 12).await;
         let last = *digests.last().expect("outputs");
 
         let first = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
@@ -2600,6 +2650,47 @@ mod test {
         assert_eq!(consensus_chain.recent_header(0, last), None, "pushed out");
         let reread = consensus_chain.consensus_header_by_digest(0, last).await.unwrap();
         assert_eq!(reread, Some(first), "read from the pack again");
+    }
+
+    /// `with_consensus_header_by_digest` hands its function the header `consensus_header_by_digest`
+    /// returns, read from the pack, then remembered; another epoch's or an unknown digest finds
+    /// none; and a remembered entry answers only for its own digest.
+    #[tokio::test]
+    async fn test_consensus_header_fields_by_digest() {
+        let temp_dir = TempDir::with_prefix("test_header_fields").expect("temp dir");
+        let (chain, digests) = chain_with_outputs(temp_dir.path(), 6).await;
+        let fields =
+            |h: &ConsensusHeader| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round());
+        let [older, last] = [digests[3], digests[5]];
+
+        // The pack (nothing remembered yet), then memory: the same fields as the full header.
+        let from_pack = chain.with_consensus_header_by_digest(0, last, fields).await.unwrap();
+        assert!(chain.recent_header(0, last).is_some(), "remembered");
+        let from_memory = chain.with_consensus_header_by_digest(0, last, fields).await.unwrap();
+        let expected = fields(&full_header(&chain, last).await);
+        assert_eq!(from_pack, Some(expected));
+        assert_eq!(from_memory, Some(expected));
+        assert_eq!(expected.0, 6);
+
+        // Another output's digest gets that output, not the remembered one.
+        let got = chain.with_consensus_header_by_digest(0, older, fields).await.unwrap();
+        assert_eq!(got, Some(fields(&full_header(&chain, older).await)));
+        assert_eq!(got_number(&chain, older).await, Some(4));
+
+        // Absent: another epoch, or a digest no output has.
+        assert_eq!(chain.with_consensus_header_by_digest(1, last, fields).await.unwrap(), None);
+        let unknown = ConsensusHeaderDigest::default();
+        assert_eq!(chain.with_consensus_header_by_digest(0, unknown, fields).await.unwrap(), None);
+    }
+
+    /// The full header of epoch 0 with `digest`.
+    async fn full_header(chain: &ConsensusChain, digest: ConsensusHeaderDigest) -> ConsensusHeader {
+        chain.consensus_header_by_digest(0, digest).await.unwrap().expect("held")
+    }
+
+    /// The number of the header of epoch 0 with `digest`, read as the primary reads it.
+    async fn got_number(chain: &ConsensusChain, digest: ConsensusHeaderDigest) -> Option<u64> {
+        chain.with_consensus_header_by_digest(0, digest, |h| h.number).await.unwrap()
     }
 
     #[tokio::test]

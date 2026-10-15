@@ -4086,7 +4086,6 @@ impl Inner {
     /// treats as "no durable tip" and clamps down to) rather than wrapping to `u64::MAX` in release
     /// and silently defeating
     /// [`ConsensusChain::clamp_latest_to_pack`](crate::consensus::ConsensusChain::clamp_latest_to_pack).
-    ///
     fn latest_consensus_number(&self) -> u64 {
         (self.epoch_meta.start_consensus_number + self.consensus_pos_idx.len() as u64)
             .saturating_sub(1)

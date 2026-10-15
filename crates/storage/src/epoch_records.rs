@@ -7,8 +7,8 @@
 //!
 //! ## Where things are
 //! - `EpochRecordDb`: the handle; `run_db_loop` is its actor thread.
-//! - Validation: `EpochRecordValidation`, `epoch_committee_valid`,
-//!   `validate_record_against_anchor` and `CertifiedRecordError`.
+//! - Validation: `EpochRecordValidation`, `epoch_committee_valid`, `validate_record_against_anchor`
+//!   and `CertifiedRecordError`.
 //! - `impl EpochRecordDb`: the API.
 //! - `impl Inner`: the two logs: open, recovery, appends and reads.
 //! - `EpochDbError` and the bundle helpers (`write_bounded_pack`, `append_bundle_increment`), then

@@ -65,8 +65,9 @@ and remember that everything after `mod test` is tests (more than half of `conse
      lanes compress a large output's batches on several threads);
   3. appends and indexes under the `RwLock`'s write side (`append_prepared`).
 - **Hot reads:**
-  - `consensus_header_by_digest` for every gossiped certificate (`ConsensusChain` keeps the
-    recent headers);
+  - the last executed header's number, leader epoch and round for every gossiped certificate
+    (`with_consensus_header_by_digest`: a hit on the recent headers `ConsensusChain` keeps
+    copies nothing);
   - `get_batches` for peers and cache misses;
   - output bytes for syncing peers.
 

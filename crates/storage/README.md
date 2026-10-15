@@ -115,8 +115,11 @@ no thread of its own.
   - **A panic** inside the write lock takes the state out, unsealed (the next open recovers it), and
     every later use of the pack fails.
 - **Closing** takes the state out under the write lock and seals it; a read after that fails.
-- **`ConsensusChain::consensus_header_by_digest`** remembers the last few headers it read, since the
-  primary asks for the last executed one on every gossiped certificate.
+- **`ConsensusChain::with_consensus_header_by_digest`** remembers the last few headers it read,
+  each with its epoch and digest, since the primary asks for the last executed one on every
+  gossiped certificate. A hit runs the caller's function on the remembered header (the primary
+  reads three fields), so it copies and re-hashes nothing; `consensus_header_by_digest` is the
+  same lookup returning a copy.
 
 **Open doors:**
 | door | mode | on damage |

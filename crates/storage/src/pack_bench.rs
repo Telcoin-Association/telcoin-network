@@ -76,13 +76,13 @@
 //!   state sync's `save_consensus` makes an output durable before forwarding it to execution. Their
 //!   sum is the time to forward.
 //! - **Reads**, on other tasks while the saves run, of the newest [`RECENT_OUTPUTS`] outputs:
-//!   `consensus_header_by_digest` N times per output interval (one per gossiped certificate),
-//!   `get_batches` for one header's batches N/2 times per interval with [`BATCH_MISS_PERCENT`]% of
-//!   the digests absent (peer batch requests and cache misses), and
-//!   `consensus_output_bytes_by_number` once per interval (a state-sync peer). Each call is its own
-//!   task, started on schedule whether or not the earlier ones have returned, so a call that
-//!   arrives during a save queues behind it as it would in production. The same reads then run
-//!   alone, with no saves, for comparison.
+//!   `with_consensus_header_by_digest` N times per output interval (one per gossiped certificate,
+//!   reading the fields the primary's falling-behind check reads), `get_batches` for one header's
+//!   batches N/2 times per interval with [`BATCH_MISS_PERCENT`]% of the digests absent (peer batch
+//!   requests and cache misses), and `consensus_output_bytes_by_number` once per interval (a
+//!   state-sync peer). Each call is its own task, started on schedule whether or not the earlier
+//!   ones have returned, so a call that arrives during a save queues behind it as it would in
+//!   production. The same reads then run alone, with no saves, for comparison.
 //! - **Compression**: for a sample of outputs, every record is BCS-encoded and zstd-compressed
 //!   outside the save, as the pack's append does, to show how much of a save is compression.
 //!
@@ -99,8 +99,8 @@
 //! - `TN_BENCH_PACK_READ_SECS`: length of the readers-only phase (default 15).
 //! - `TN_BENCH_PACK_READERS`: 0 runs no readers, to profile the writer alone (default 1).
 //! - `TN_BENCH_PACK_NO_SLOTS`: 1 persists the pack alone, without the latest-consensus slot syncs
-//!   that `persist_current` runs beside it: a measurement of what the slots add, never a
-//!   production setting (default 0).
+//!   that `persist_current` runs beside it: a measurement of what the slots add, never a production
+//!   setting (default 0).
 //!
 //! The chain lives in a temp dir under `TMPDIR`. On Linux a tmpfs or ramfs `TMPDIR` is refused:
 //! `msync` is free there, so the durable rows would mean nothing.
@@ -1360,7 +1360,8 @@ async fn run_writer(
 /// The read kinds: each the chain call a production reader makes.
 #[derive(Clone, Copy, Debug)]
 enum ReadKind {
-    /// `consensus_header_by_digest`, for every gossiped certificate.
+    /// `with_consensus_header_by_digest` of a header's number, leader epoch and round, as the
+    /// primary reads them for every gossiped certificate.
     HeaderByDigest,
     /// `get_batches`, a request for one header's batches.
     Batches,
@@ -1400,8 +1401,16 @@ async fn read_once(
 ) {
     match kind {
         ReadKind::HeaderByDigest => {
-            let header = chain.consensus_header_by_digest(epoch, target.header).await;
-            assert!(matches!(header, Ok(Some(_))), "a saved header is found by digest: {header:?}");
+            // The fields the primary's falling-behind check reads, as it reads them.
+            let fields = chain
+                .with_consensus_header_by_digest(epoch, target.header, |h| {
+                    (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+                })
+                .await;
+            assert!(
+                matches!(fields, Ok(Some((number, _, _))) if number == target.number),
+                "a saved header is found by digest: {fields:?}"
+            );
         }
         ReadKind::Batches => {
             let mut x = seed;
