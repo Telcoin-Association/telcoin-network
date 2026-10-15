@@ -40,7 +40,7 @@ use axum::{
     body::HttpBody as _,
     extract::{ConnectInfo, DefaultBodyLimit, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{from_fn_with_state, map_response, Next},
+    middleware::{from_fn, from_fn_with_state, map_response, Next},
     response::{IntoResponse, Response},
     routing::get,
     Extension, Json, Router,
@@ -669,7 +669,8 @@ impl Drop for ClientSlot {
 /// JSON-RPC `429` before its body is buffered or forwarded, and before it
 /// reserves any of the byte budget. Outside it are, innermost first, the CORS
 /// layer when `layers` holds allowed origins, the access log ([`log_access`])
-/// when it holds one, the identity middleware ([`identify`]), which resolves
+/// when it holds one, the cancellation counter ([`count_cancelled`]), the
+/// identity middleware ([`identify`]), which resolves
 /// the client address the rate limiter keys on, the access log names and the
 /// proxy forwards, believing `X-Forwarded-For` only from a peer in
 /// `trusted_proxies`, and, outermost, the `nosniff` layer ([`set_nosniff`]),
@@ -738,6 +739,11 @@ pub(crate) fn router(
         Some(log) => router.layer(from_fn_with_state(log, log_access)),
         None => router,
     };
+    // Add the cancellation counter after every layer that can answer a
+    // request itself, so a request dropped anywhere inside counts as
+    // cancelled while an answer from any of them (the deadline's included,
+    // counted `rejected`) is not counted twice.
+    let router = router.layer(from_fn(count_cancelled));
     // Add the identity layer after the access-log, CORS and rate-limit layers
     // so it runs before them: they read the client address this layer stores.
     let router = router.layer(from_fn_with_state(trusted_proxies, identify));
@@ -761,6 +767,42 @@ async fn set_nosniff(mut response: Response) -> Response {
         .headers_mut()
         .insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
     response
+}
+
+/// Axum middleware: count a request dropped before it was answered as
+/// `outcome="cancelled"` in `tn_worker_gateway_requests_total`.
+///
+/// A request's future is dropped mid-flight when its connection closes: a
+/// client disconnect, the connection-lifetime cap or shutdown. Every answer
+/// records its own outcome where it is built, so only this drop needs a
+/// guard, and the guard is disarmed once any response comes back. The probes
+/// `/health` and `/ready` are skipped, as they are by every request metric;
+/// `/ready/any` is added after this layer and never reaches it.
+async fn count_cancelled(request: Request, next: Next) -> Response {
+    let path = request.uri().path();
+    if path == HEALTH_PATH || path == READY_PATH {
+        return next.run(request).await;
+    }
+    let mut guard = OutcomeGuard { answered: false };
+    let response = next.run(request).await;
+    guard.answered = true;
+    response
+}
+
+/// Drop guard behind [`count_cancelled`]: records the `cancelled` outcome
+/// unless the request it covers was answered.
+struct OutcomeGuard {
+    /// Set once the inner service returned a response, whose outcome the
+    /// code that built it recorded.
+    answered: bool,
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        if !self.answered {
+            telemetry::record_cancelled();
+        }
+    }
 }
 
 /// Answer a probe path requested with a method other than `GET` or `HEAD`.
@@ -9894,6 +9936,80 @@ mod tests {
                 .map(String::as_str),
             ["query", "worker", "499", size.as_str()]
         );
+    }
+
+    /// A request whose client closes the connection while the gateway awaits
+    /// the worker is dropped without an answer; it counts as
+    /// `outcome="cancelled"`, so the outcomes still add up to every request.
+    #[tokio::test]
+    async fn cancelled_request_counts_outcome_cancelled() {
+        const REQUESTS: &str = "tn_worker_gateway_requests_total";
+        let mut metrics = CapturedMetrics::install();
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(10)).await;
+        let (gateway, _shutdown) = spawn(router(
+            ready_state(worker),
+            Duration::from_secs(30),
+            MAX_REQUEST_BYTES,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        // a complete request, then a close while the gateway awaits the worker
+        let body = call("eth_chainId", 1);
+        let mut stream = TcpStream::connect(gateway).await.expect("connect");
+        let request = format!(
+            "POST / HTTP/1.1\r\nHost: gateway\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(request.as_bytes()).await.expect("write");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while worker_seen.hits() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the request never reached the worker");
+        drop(stream);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while metrics.value(REQUESTS, &[("outcome", "cancelled")]) < 1.0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dropped request should count as cancelled");
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "cancelled")]), 1.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "forwarded")]), 0.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "rejected")]), 0.0);
+    }
+
+    /// The deadline's answer records `rejected` where it is built; the
+    /// cancellation counter sits outside the deadline layer and sees that
+    /// answer, so the request is not counted again as cancelled.
+    #[tokio::test]
+    async fn deadline_is_not_counted_as_cancelled() {
+        const REQUESTS: &str = "tn_worker_gateway_requests_total";
+        let mut metrics = CapturedMetrics::install();
+        let (worker, worker_seen, _worker) = counted_slow_mock(Duration::from_secs(10)).await;
+        let (gateway, _shutdown) = spawn(router(
+            ready_state(worker),
+            Duration::from_millis(300),
+            MAX_REQUEST_BYTES,
+            None,
+            RouterLayers::default(),
+            Arc::default(),
+        ))
+        .await;
+
+        let (status, _) = post_rpc(gateway, None, call("eth_chainId", 1)).await;
+        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(worker_seen.hits(), 1, "the request was forwarded");
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "rejected")]), 1.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "cancelled")]), 0.0);
+        assert_eq!(metrics.value(REQUESTS, &[("outcome", "forwarded")]), 0.0);
     }
 
     #[tokio::test]

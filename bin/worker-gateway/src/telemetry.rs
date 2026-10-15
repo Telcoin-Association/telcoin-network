@@ -7,7 +7,7 @@
 //! is installed and every macro below is a cheap no-op against the global noop
 //! recorder.
 //!
-//! Three recorders partition every proxied request:
+//! Four recorders partition every proxied request:
 //!
 //! - [`record_forwarded`] bumps `tn_worker_gateway_requests_total{outcome="forwarded"}` for a
 //!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint) whose answer is
@@ -18,11 +18,14 @@
 //! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
 //!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
 //!   upstream answered an error status without a JSON body, which the gateway replaced with a
-//!   JSON-RPC error.
+//!   JSON-RPC error;
+//! - [`record_cancelled`] bumps `tn_worker_gateway_requests_total{outcome="cancelled"}` for a
+//!   request whose connection closed before the gateway answered it (a client disconnect, the
+//!   connection-lifetime cap or shutdown dropped it mid-flight).
 //!
-//! Their sum is the total proxied-request count, and `rejections_total` breaks
-//! the non-forwarded side down by reason. The gateway's own `/health` and `/ready`
-//! probes are not proxied and are deliberately not counted, so the in-flight
+//! Their sum is the total proxied-request count, a cancelled request included,
+//! and `rejections_total` breaks the non-forwarded side down by reason. The gateway's own `/health`
+//! and `/ready` probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
 //!
 //! [`Throttle`] rate-limits a per-request log call site, so request volume
@@ -74,8 +77,8 @@ use crate::proxy::UpstreamOrigin;
 /// gateway's own CPU idle.
 const INFLIGHT_REQUESTS: &str = "tn_worker_gateway_inflight_requests";
 
-/// Proxied requests by terminal `outcome` (`forwarded`, `rejected` or
-/// `upstream_error`).
+/// Proxied requests by terminal `outcome` (`forwarded`, `rejected`,
+/// `upstream_error` or `cancelled`).
 const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 
 /// Rejected and upstream-error proxied requests by `reason` (the
@@ -281,6 +284,13 @@ pub(crate) fn record_rejection(reason: &'static str) {
 pub(crate) fn record_upstream_error(reason: &'static str) {
     counter!(REQUESTS_TOTAL, "outcome" => "upstream_error").increment(1);
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record a request dropped before the gateway answered it: its connection
+/// closed (a client disconnect, the connection-lifetime cap or shutdown)
+/// while the request was in flight, so no other outcome was recorded.
+pub(crate) fn record_cancelled() {
+    counter!(REQUESTS_TOTAL, "outcome" => "cancelled").increment(1);
 }
 
 /// Record one forward attempt on `route` (`worker` or `query`) with its
@@ -623,6 +633,17 @@ mod tests {
                 (2, 1)
             );
         });
+    }
+
+    /// `outcome="cancelled"` is part of the metrics contract like the
+    /// rejection reasons, but it is no `GatewayError`, so
+    /// `reason_labels_are_stable` cannot pin it; pin it here.
+    #[test]
+    fn record_cancelled_writes_outcome_cancelled() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_cancelled();
+        assert_eq!(metrics.value(REQUESTS_TOTAL, &[("outcome", "cancelled")]), 1.0);
+        assert_eq!(REQUESTS_TOTAL, "tn_worker_gateway_requests_total");
     }
 
     #[test]
