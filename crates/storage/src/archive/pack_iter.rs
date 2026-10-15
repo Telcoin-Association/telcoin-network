@@ -351,14 +351,15 @@ where
         self.version
     }
 
-    /// Read and decode the next record.
-    /// This expects the file cursor to be positioned at the record's first byte.
-    async fn read_record_file(
-        file: &mut R,
-        buffer: &mut Vec<u8>,
-        decompress_buffer: &mut Vec<u8>,
-        compression: PackCompression,
-    ) -> Result<V, FetchError> {
+    /// Return the compression of the underlying data.
+    pub fn compression(&self) -> PackCompression {
+        self.compression
+    }
+
+    /// Read the next record's frame, leaving its CRC-checked payload in `buffer` as stored
+    /// (compressed when the data is). A clean end of the reader at a record boundary is
+    /// `NotFound`.
+    async fn read_frame(file: &mut R, buffer: &mut Vec<u8>) -> Result<(), FetchError> {
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf).await {
             // An EOF here should be caused by no more records although it is possible there
@@ -383,28 +384,39 @@ where
         if calc_crc32 != read_crc32 {
             return Err(FetchError::CrcFailed);
         }
-        let decoded: &[u8] = match compression {
-            PackCompression::None => &buffer[..],
-            PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer)?,
-        };
-        try_decode::<V>(decoded).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        Ok(())
     }
 
     /// Return the next V when available.
     pub async fn next(&mut self) -> Option<Result<V, FetchError>> {
-        match Self::read_record_file(
-            &mut self.reader,
-            &mut self.buffer,
-            &mut self.decompress_buffer,
-            self.compression,
-        )
-        .await
-        {
-            Ok(val) => Some(Ok(val)),
-            Err(err) => match err {
-                FetchError::NotFound => None,
-                _ => Some(Err(err)),
+        let decoded = match Self::read_frame(&mut self.reader, &mut self.buffer).await {
+            Ok(()) => match self.compression {
+                PackCompression::None => Ok(&self.buffer[..]),
+                PackCompression::ZStd => {
+                    decompress_checked(&self.buffer[..], &mut self.decompress_buffer)
+                }
             },
+            Err(err) => Err(err),
+        };
+        match decoded.and_then(|payload| {
+            try_decode::<V>(payload).map_err(|e| FetchError::DeserializeValue(e.to_string()))
+        }) {
+            Ok(val) => Some(Ok(val)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
+        }
+    }
+
+    /// Return the next record's CRC-checked payload without decompressing or decoding it: the
+    /// bytes as stored, compressed when [`Self::compression`] says so (see
+    /// [`decompress_checked`]). `None` at a clean end. Lets a caller do a record's CPU work (the
+    /// decompress and the decode) elsewhere than where it reads the stream.
+    pub async fn next_frame(&mut self) -> Option<Result<Vec<u8>, FetchError>> {
+        let mut frame = Vec::new();
+        match Self::read_frame(&mut self.reader, &mut frame).await {
+            Ok(()) => Some(Ok(frame)),
+            Err(FetchError::NotFound) => None,
+            Err(err) => Some(Err(err)),
         }
     }
 

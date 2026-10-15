@@ -138,7 +138,7 @@ use tn_test_utils::{AuthorityFixture, CommitteeFixture};
 use tn_types::{
     encode_into_buffer, encoded_size, forks, now_ms, test_genesis, Address, AuthorityIdentifier,
     Batch, BlockHash, BlockNumHash, Bytes, Certificate, CertifiedBatch, CommittedSubDag, Committee,
-    ConsensusHeader, ConsensusHeaderDigest, ConsensusOutput, Epoch, EpochRecord,
+    ConsensusHeader, ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord,
     EpochSeedChainValue, Hash as _, HeaderBuilder, HeaderDigest, ReputationScores, Round,
     TimestampMs, B256, MIN_PROTOCOL_BASE_FEE, U256,
 };
@@ -179,7 +179,7 @@ trait BenchPack: Sized {
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        final_consensus_number: u64,
+        final_consensus: ConsensusNumHash,
         timeout: Duration,
     ) -> Result<Self, PackError>;
 
@@ -223,18 +223,11 @@ macro_rules! impl_bench_pack {
                 stream: R,
                 epoch: Epoch,
                 previous_epoch: &EpochRecord,
-                final_consensus_number: u64,
+                final_consensus: ConsensusNumHash,
                 timeout: Duration,
             ) -> Result<Self, PackError> {
-                <$ty>::stream_import(
-                    path,
-                    stream,
-                    epoch,
-                    previous_epoch,
-                    final_consensus_number,
-                    timeout,
-                )
-                .await
+                <$ty>::stream_import(path, stream, epoch, previous_epoch, final_consensus, timeout)
+                    .await
             }
             async fn save_consensus_output(
                 &mut self,
@@ -492,7 +485,12 @@ async fn bench_full_stream(data_path: &Path, end: u64) -> Duration {
 
 /// Receive side of state sync: replay a whole epoch's data into a fresh pack. The source is bounded
 /// to `end` (the real data length) so an open mmap pack's capacity padding is not streamed.
-async fn bench_stream_import<P: BenchPack>(fx: &Fixtures, data_path: &Path, end: u64) -> Duration {
+async fn bench_stream_import<P: BenchPack>(
+    fx: &Fixtures,
+    data_path: &Path,
+    end: u64,
+    final_consensus: ConsensusNumHash,
+) -> Duration {
     let dir = TempDir::with_prefix("pack_bench_import").expect("temp dir");
     let stream = tokio::fs::File::open(data_path).await.expect("open data file").take(end);
     let start = Instant::now();
@@ -501,7 +499,7 @@ async fn bench_stream_import<P: BenchPack>(fx: &Fixtures, data_path: &Path, end:
         stream,
         fx.committee.epoch(),
         &fx.previous_epoch,
-        NUM_OUTPUTS,
+        final_consensus,
         IMPORT_TIMEOUT,
     )
     .await
@@ -563,7 +561,9 @@ async fn run_battery<P: BenchPack>(fx: &Fixtures, width: usize) -> Column {
     let latest_header = bench_latest_header(&mut pack).await;
     let prefix_stream = bench_prefix_stream(&mut pack, &data_path).await;
     let full_stream = bench_full_stream(&data_path, data_len).await;
-    let stream_import = bench_stream_import::<P>(fx, &data_path, data_len).await;
+    let last = outputs.last().expect("outputs");
+    let final_consensus = ConsensusNumHash::new(last.number(), last.consensus_header_hash());
+    let stream_import = bench_stream_import::<P>(fx, &data_path, data_len, final_consensus).await;
 
     // Async-close (the production seal path) so the reopen sees a fully sealed pack. A plain
     // `drop(pack)` here would defer the seal to `spawn_blocking` on this multi-thread runtime and

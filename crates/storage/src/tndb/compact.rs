@@ -193,6 +193,11 @@ struct State {
     /// (or why it was abandoned).
     done: u64,
     last: Option<Result<bool, String>>,
+    /// Test-only: every finished compaction's outcome, in order. A waiter for the n-th reads the
+    /// n-th: a request decided before a switch and delivered after it can start one more (which
+    /// finds nothing due), and `last` may already be that one's.
+    #[cfg(test)]
+    outcomes: Vec<Result<bool, String>>,
 }
 
 impl Default for CompactShared {
@@ -206,6 +211,8 @@ impl Default for CompactShared {
                 backoff: AUTO_BACKOFF_MIN,
                 done: 0,
                 last: None,
+                #[cfg(test)]
+                outcomes: Vec::new(),
             }),
             wake: Condvar::new(),
             finished: Condvar::new(),
@@ -260,10 +267,10 @@ impl CompactShared {
         while state.done < target {
             self.finished.wait(&mut state);
         }
-        state.last.clone().expect("a compaction finished")
+        state.outcomes[target as usize - 1].clone()
     }
 
-    /// Test-only: wait until `n` compactions have finished.
+    /// Test-only: wait until `n` compactions have finished: the n-th one's outcome.
     #[cfg(test)]
     pub(super) fn wait_done(&self, n: u64) -> Option<Result<bool, String>> {
         let mut state = self.state.lock();
@@ -272,7 +279,7 @@ impl CompactShared {
                 return None;
             }
         }
-        state.last.clone()
+        state.outcomes.get(usize::try_from(n).ok()?.checked_sub(1)?).cloned()
     }
 
     /// Test-only: compactions finished so far.
@@ -1038,6 +1045,8 @@ fn run(core: &Core, rate: u64) {
             }
         }
         state.done += 1;
+        #[cfg(test)]
+        state.outcomes.push(last.clone());
         state.last = Some(last);
         shared.running.store(false, Ordering::Release);
         shared.finished.notify_all();

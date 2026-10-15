@@ -104,11 +104,17 @@ no thread of its own.
 - **Reads** take the state's read lock, any number at once, and run on tokio's blocking pool, or on
   the caller for a constant-time lookup. They never wait for a save's encoding or a persist's sync,
   and each copies or decodes what it returns before letting go of the lock (see `seal_now`).
-- **Writers** (a save, a persist, a flush, the close) take a writer lock, one at a time.
+  `get_consensus_output` copies the output's bytes under the lock and decodes them after releasing
+  it, still on the blocking pool. A cancelled `batches` request stops at the batch it is reading.
+- **Writers** (a save, a persist, a flush, the close) take a writer lock, one at a time. A save,
+  persist or flush that the OS failed returns `PackError::IO` with its `io::ErrorKind` kept (a full
+  disk is `StorageFull`).
   - **A save** checks the output under the read lock, encodes and compresses its records under the
     writer lock alone, then takes the write lock only to append them (`Pack::append_stored`) and
     index the output. A reader sees an output whole or not at all, and a failed save rolls back
-    under that same lock. The encoding (`OutputEncoder`) reuses its buffers from save to save, and
+    under that same lock. The encoding (`OutputEncoder`) reuses its buffers from save to save (at
+    most 16 MiB of them between saves, each lane's staging buffer counted, plus each lane's zstd
+    context, about 3.5 MiB, fixed by the compression level), and
     splits a large output's batches, in order, across threads that compress at once (each record
     is compressed on its own, so the bytes are the same).
   - **A persist** syncs under the read lock and stamps the commit marker under a brief write lock.
@@ -124,10 +130,10 @@ no thread of its own.
 **Open doors:**
 | door | mode | on damage |
 |------|------|-----------|
-| `open_append` | writable, creates | header-only ⇒ write+fsync meta; an existing meta must match the chain-derived one on the fields `verify_epoch_meta` authenticates (epochs, start number, genesis states, committee BLS keys), else refuses without writing a meta; then recover. The rest of the on-disk committee is not compared, and the opened pack keeps the chain-derived meta |
-| `open_append_exists` | writable, must exist | recover (truncate torn tail + rebuild indexes); loads the on-disk meta, so after a restart an imported epoch's committee fields outside the BLS keys are the peer's copy again, even if `open_append` reopened it with the chain-derived one |
-| `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; **refuses** (→ `db repair`) if the data log itself is torn |
-| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record (always written as v2, from a v1/v2 source; a v0 source is refused as `InvalidVersion`, no penalty). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic. A later `open_append` of the epoch compares only that authenticated subset, so the peer's other fields never block the reopen |
+| `open_append` | writable, creates | header-only ⇒ write+fsync meta (a pre-v2 data log holding only its header is removed with its empty indexes and the epoch's pack started afresh); a legacy (pre-v2) data log that reaches the writable open unmigrated (its read-only check failed) is refused with `InvalidVersion` before anything is written, and the next open migrates it; an existing meta must match the chain-derived one on the fields `verify_epoch_meta` authenticates (epochs, start number, genesis states, committee BLS keys), else refuses without writing a meta; then recover. The rest of the on-disk committee is not compared, and the opened pack keeps the chain-derived meta |
+| `open_append_exists` | writable, must exist | a legacy data log that reaches the writable open unmigrated is refused with `InvalidVersion`, as for `open_append`; recover (truncate torn tail + rebuild indexes); loads the on-disk meta, so after a restart an imported epoch's committee fields outside the BLS keys are the peer's copy again, even if `open_append` reopened it with the chain-derived one |
+| `open_static` | read-only (sealed past epoch) | refuses; `ConsensusChain::get_static` then heals read-side (see below): rebuilds derived indexes from the WAL if the data log is clean, migrates a legacy pack; a heal refuses (`CorruptPack`, remembered by the back-off) a pack whose leading record is not this epoch's meta, since `open_static` would still refuse it; **refuses** (→ `db repair`) if the data log itself is torn |
+| `stream_import` | writable, from a peer/byte stream | verify + append + fsync meta, then each output streamed record by record up to the certified `final_consensus`, whose digest is checked when its header is read (before its batches); earlier outputs are trusted through the parent links back from it (always written as v2, from a v1/v2 source; a v0 source is refused as `InvalidVersion`, no penalty). Only the stream reads run on the caller's task; each record's decompress, decode, digest and re-encode, and every write, run on the blocking pool. A failed or abandoned import is discarded (files removed, never sealed). Of the meta's committee only the BLS key set is authenticated; its other fields are the peer's and must not feed consensus-critical logic. A later `open_append` of the epoch compares only that authenticated subset, so the peer's other fields never block the reopen |
 
 ### 5. Recovery model — four invariants
 
@@ -165,14 +171,18 @@ index a crash left unsealed attests the same output boundaries it does to the wr
 
 Ties the epochs together under `<datadir>/consensus-db/epochs/`. It opens the **current** epoch
 writable (`open_append_exists`, which runs recovery on restart), serves **sealed past** epochs
-read-only via `open_static` (behind a small `recent_packs` cache; a legacy or index-damaged sealed epoch
+read-only via `open_static` (behind a small least-recently-used `recent_packs` cache; a legacy or index-damaged sealed epoch
 is healed read-side first — built off the async runtime and outside `pack_install` into a side directory,
 data log opened read-only, then swapped in by rename), imports a full epoch from peers with
 `stream_import` (into an `import-{N}/` dir, then an install-locked rename to `epoch-{N}/`; a read-only
 partial-prefix pack instead stages under its own `staging-{N}-{n}/` and is never renamed; either import
-stops with a local `StorageFull` error, not charged to the peer, before free space drops below a floor,
-since the peer's bytes are authenticated only at the final header; `db load-state`'s restore of a local
-bundle has no floor), and drives epoch handoff.
+authenticates the record's final output itself and stops with a local `StorageFull` error, not charged
+to the peer, before free space could drop below a floor (each check needs `IMPORT_FREE_HEADROOM` above
+it, for the growth the import's files may preallocate before the next check), since the peer's bytes
+are authenticated only at the final header; `db load-state`'s restore of a local bundle has no floor;
+the imported pack is sealed before `pack_install` is taken, and the live (writable) epoch is replaced
+only with its stored record's chain, anything else, such as a prefix's partial final, being refused as
+`LiveEpochImport`), and drives epoch handoff.
 `LatestConsensus` persists the tip `(epoch, number)` in double-buffered, CRC-checked
 `consensus_slot{1,2}` files — a non-authoritative hint; the pack files are ground truth.
 
@@ -183,8 +193,12 @@ synced length), and an empty position index beside a populated digest index is r
 Each write returns its own result to its caller (the handle is shared by concurrent writers, so a
 failure is never reported to someone else), and closing persists before the files are sealed. A stored
 epoch's record is never replaced: re-saving the same record is a no-op, and a different one is refused
-(`ConflictingRecord`), since epoch records are identical on every node. The by-number routing follows
-only what is stored. `certificate_pack` and `exec_state_pack` are per-epoch / per-snapshot packs for
+(`ConflictingRecord`), since epoch records are identical on every node. A stored certificate counts
+only if it reads back: one that does not is not certified (`first_missing_historical_cert` stops at
+it), and a re-save reports it (`Unreadable`) rather than skipping or replacing it; the cure is a
+re-sync. The by-number routing follows only what is stored: it is built at open and extended after
+each save by the same checked read (`extend_routing`), and a stored record that does not read back
+fails the open, naming its epoch. `certificate_pack` and `exec_state_pack` are per-epoch / per-snapshot packs for
 certificate bundles and EVM state exports.
 
 ### 7. Key/value stores (the other family)
@@ -226,6 +240,7 @@ commit (this engine was called `tnlog` while the two were compared). It exports
         bhash/{index.hdx,.odx} batch digest index (derived)
         cert_data              per-epoch certificate pack (CertificatePack)  ── + clean-close sentinel
         cert_hash/{index.hdx,.odx} certificate digest index (derived)
+        cert_lock              CertificatePack writer lock (flock, held while a writable pack is open)
       epochs.pack / epoch_certs.pack + sidecars   the EpochRecordDb chain
       consensus_slot{1,2}      latest-consensus hint (double-buffered)
       import-{N}/              full-epoch import target (renamed to epoch-{N}/ on install)
@@ -240,7 +255,11 @@ issues. `telcoin-network db repair [--epoch N] [--force]` repairs epoch packs **
 stopped): it truncates a torn tail and rebuilds indexes from the WAL for damaged epochs, dry-run by
 default, skipping the current/latest epoch unless named. Meta/mid-log corruption is reported for
 re-sync, never "fixed". A legacy (pre-v2) pack's torn tail is judged by the migration to v2 (which
-drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. A legacy v0
+drops an unacked tail), so `db validate`, `db repair` and `db migrate` agree on it. Only the newest
+epoch's legacy pack can drop an unacked tail: a past epoch (one with a later `epoch-N` directory) was
+complete when the next epoch began, so a tail its replay cannot reach is refused as damage by the
+read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
+length. A legacy v0
 (batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. `db repair`,
 `db migrate` and `db load-state` refuse to run while a live node holds the `<datadir>/telcoin.pid`
 lock (intentional-design item 9).
@@ -431,4 +450,6 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     **writable for the current epoch only** (an active CVV); a writable open rebuilds its index from
     its own WAL (INV3). Past-epoch cert packs are not reopened in production, so `db repair` has
     nothing to assess there. (A read-only cert-pack open does not self-heal — but no production path
-    takes one.)
+    takes one.) A writable open takes an exclusive `flock` on `epoch-{N}/cert_lock` and holds it until
+    its data and index have sealed, so a same-epoch reopen waits for a previous writer that is still
+    sealing.

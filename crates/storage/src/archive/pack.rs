@@ -876,6 +876,17 @@ impl RecordEncoder {
         Self { compression, zstd_ctx: None, stage: Vec::new(), max }
     }
 
+    /// The bytes the encoder's staging buffer holds on to (it grows to the largest value encoded).
+    pub(crate) fn stage_capacity(&self) -> usize {
+        self.stage.capacity()
+    }
+
+    /// Free the staging buffer (the next value encoded grows it again). The encoded bytes do not
+    /// depend on it.
+    pub(crate) fn free_stage(&mut self) {
+        self.stage = Vec::new();
+    }
+
     /// Append `value`'s stored bytes (what [`Pack::append`] would frame for it) to `out`, and
     /// return where they are in it. On an error `out` is left as it was.
     pub(crate) fn encode_into<V: Serialize>(

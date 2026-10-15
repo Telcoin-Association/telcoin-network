@@ -40,7 +40,10 @@ use tn_types::{
     ConsensusHeaderDigest, ConsensusNumHash, ConsensusOutput, Epoch, EpochRecord, Round, B256,
     MAX_GC_DEPTH, MAX_HEADER_NUM_OF_BATCHES,
 };
-use tokio::io::{AsyncRead, BufReader};
+use tokio::{
+    io::{AsyncRead, BufReader},
+    sync::oneshot,
+};
 use tracing::{debug, error, info, warn};
 
 use crate::{
@@ -48,7 +51,10 @@ use crate::{
         data_file::{create_dir_synced, fsync_directory, fsync_file},
         digest_index::HdxIndex,
         error::{
+            commit::CommitError,
             fetch::FetchError,
+            flush::FlushError,
+            insert::AppendError,
             load_header::LoadHeaderError,
             open::OpenError::{self, DataFileOpen},
         },
@@ -209,6 +215,9 @@ struct Shared {
     /// Test-only: how long each save's parts took, for the pack bench.
     #[cfg(test)]
     save_phases: Mutex<Vec<SavePhases>>,
+    /// Test-only: the thread the last [`ConsensusPack::get_consensus_output`] decoded on.
+    #[cfg(test)]
+    decoded_on: Mutex<Option<std::thread::ThreadId>>,
 }
 
 /// Test-only: how long one save's parts took (see [`Shared::save`]).
@@ -305,7 +314,7 @@ impl Shared {
             if inner.data.read_only() {
                 return Ok(());
             }
-            inner.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+            inner.data.commit().map_err(PackError::persist_failed)?;
         }
         // The commit marker, stamped after the sync so it never points past durable data.
         self.mutate(|inner| {
@@ -528,6 +537,8 @@ impl ConsensusPack {
             writer: Mutex::new(encoder),
             #[cfg(test)]
             save_phases: Mutex::default(),
+            #[cfg(test)]
+            decoded_on: Mutex::default(),
         });
         Self { shared, handles: Arc::new(()), epoch, committee, compression, is_static, version }
     }
@@ -605,7 +616,9 @@ impl ConsensusPack {
                 );
                 let staging =
                     Inner::heal_staging_name(&format!("epoch-{epoch}.heal"), ".migrating");
-                let (migrate_dir, _) = Inner::build_migration(path, epoch, &staging)
+                // Only a sealed past epoch is healed read-side, and a past epoch is complete:
+                // nothing of it may be dropped as an unacked tail.
+                let (migrate_dir, _) = Inner::build_migration(path, epoch, &staging, true)
                     .map_err(MigrateAbort::into_pack_error)?;
                 StaticHealKind::Migration(migrate_dir)
             }
@@ -735,7 +748,8 @@ impl ConsensusPack {
             Ok(p) if p.version() < SENTINEL_MIN_VERSION
         );
         if legacy {
-            match Inner::migrate_pack(epochs_dir, epoch, apply)? {
+            let expect_complete = has_later_epoch(epochs_dir, epoch)?;
+            match Inner::migrate_pack(epochs_dir, epoch, apply, expect_complete)? {
                 EpochMigrate::AlreadyCurrent => return Ok(EpochRepair::Healthy),
                 EpochMigrate::WouldMigrate(what) => return Ok(EpochRepair::WouldRepair(what)),
                 EpochMigrate::Corrupt(why) => return Ok(EpochRepair::Unrepairable(why)),
@@ -947,8 +961,9 @@ impl ConsensusPack {
     /// The source is validated as it is read: any record that fails to decode, a size-prefix that
     /// desyncs the walk past a committed output, or a v0 output whose batch count disagrees with
     /// its header, yields [`EpochMigrate::Corrupt`] with nothing changed on disk (the operator
-    /// re-syncs). An unacked crash tail of a header-first log is dropped, exactly as normal
-    /// recovery would.
+    /// re-syncs). An unacked crash tail of the newest epoch's header-first log is dropped, exactly
+    /// as normal recovery would; a past epoch (a later `epoch-{M}` directory exists) was complete,
+    /// so any tail its replay cannot reach is refused as damage.
     ///
     /// Runs on the blocking pool: it is synchronous file work with no live actor, and can rewrite a
     /// large log, so it must not stall an async worker.
@@ -958,19 +973,23 @@ impl ConsensusPack {
         apply: bool,
     ) -> Result<EpochMigrate, PackError> {
         let epochs_dir = epochs_dir.to_path_buf();
-        tokio::task::spawn_blocking(move || Inner::migrate_pack(&epochs_dir, epoch, apply))
-            .await
-            .map_err(|e| PackError::PersistError(format!("migrate task join error: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            let expect_complete = has_later_epoch(&epochs_dir, epoch)?;
+            Inner::migrate_pack(&epochs_dir, epoch, apply, expect_complete)
+        })
+        .await
+        .map_err(|e| PackError::PersistError(format!("migrate task join error: {e}")))?
     }
 
     /// Create a new set of epoch static files to write consensus output into, from a peer's
-    /// `stream`, leaving at least [`IMPORT_MIN_FREE_BYTES`] free on the filesystem.
+    /// `stream` that must end with the certified `final_consensus`, leaving at least
+    /// [`IMPORT_MIN_FREE_BYTES`] free on the filesystem.
     pub async fn stream_import<P: Into<PathBuf>, R: AsyncRead + Unpin>(
         path: P,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        final_consensus_number: u64,
+        final_consensus: ConsensusNumHash,
         timeout: Duration,
     ) -> Result<ConsensusPack, PackError> {
         Self::stream_import_with_floor(
@@ -978,7 +997,7 @@ impl ConsensusPack {
             stream,
             epoch,
             previous_epoch,
-            final_consensus_number,
+            final_consensus,
             timeout,
             IMPORT_MIN_FREE_BYTES,
         )
@@ -994,23 +1013,57 @@ impl ConsensusPack {
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        final_consensus_number: u64,
+        final_consensus: ConsensusNumHash,
         timeout: Duration,
         min_free: u64,
     ) -> Result<ConsensusPack, PackError> {
-        let path: PathBuf = path.into();
-        let inner = Inner::stream_import(
+        let (pack, ()) = Self::stream_import_leased(
             path,
             stream,
             epoch,
             previous_epoch,
-            final_consensus_number,
+            final_consensus,
             timeout,
             min_free,
+            (),
+        )
+        .await?;
+        Ok(pack)
+    }
+
+    /// [`Self::stream_import_with_floor`] that holds `lease` for as long as the import's files are
+    /// open: it comes back with the pack, and a failed or abandoned import drops it only after
+    /// its files are discarded. `ConsensusChain::stream_import` passes its import directory's
+    /// guard, so the directory is never removed (and an import of the same epoch never started in
+    /// it) while this one still writes there.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stream_import_leased<
+        P: Into<PathBuf>,
+        R: AsyncRead + Unpin,
+        L: Send + 'static,
+    >(
+        path: P,
+        stream: R,
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        final_consensus: ConsensusNumHash,
+        timeout: Duration,
+        min_free: u64,
+        lease: L,
+    ) -> Result<(ConsensusPack, L), PackError> {
+        let (inner, lease) = Inner::stream_import(
+            path.into(),
+            stream,
+            epoch,
+            previous_epoch,
+            final_consensus,
+            timeout,
+            min_free,
+            lease,
         )
         .await?;
         let committee = inner.epoch_meta.committee.clone();
-        Ok(Self::from_inner(inner, epoch, committee, true))
+        Ok((Self::from_inner(inner, epoch, committee, true), lease))
     }
 
     /// Is this packfile static- i.e. complete and read only.
@@ -1136,16 +1189,42 @@ impl ConsensusPack {
     }
 
     /// Load and return the consensus output form this epoch.
+    ///
+    /// Read and decoded on the blocking pool: the decode decompresses, decodes and hashes each
+    /// batch, milliseconds for a large output. The read lock is held only to copy the bytes.
     pub async fn get_consensus_output(&self, number: u64) -> Result<ConsensusOutput, PackError> {
-        let bytes = self.read(move |inner| inner.bytes_for_consensus(number)).await??;
-        decode_output_bytes(bytes, self.version, self.compression, &self.committee).await
+        let shared = Arc::clone(&self.shared);
+        let (version, compression) = (self.version, self.compression);
+        let committee = self.committee.clone();
+        tokio::task::spawn_blocking(move || {
+            let bytes = shared
+                .inner
+                .read()
+                .as_ref()
+                .map(|inner| inner.bytes_for_consensus(number))
+                .ok_or(PackError::SendFailed)??;
+            #[cfg(test)]
+            shared.decoded_on.lock().replace(std::thread::current().id());
+            // The bytes are in memory: the decode never waits on its reader.
+            tokio::runtime::Handle::current().block_on(decode_output_bytes(
+                bytes,
+                version,
+                compression,
+                &committee,
+            ))
+        })
+        .await
+        .map_err(|_| PackError::ReceiveFailed)?
     }
 
-    /// Decode pack-file `bytes` (as produced by [`Self::get_consensus_output_bytes`] / streamed via
-    /// `request_consensus_output`) into a [`ConsensusOutput`] using this pack's committee and
-    /// compression. The committee resolves each certificate author to an execution address, so the
-    /// pack must be for the same epoch as the bytes.
-    pub async fn decode_output(&self, bytes: Vec<u8>) -> Result<ConsensusOutput, PackError> {
+    /// Test-only (`test_golden_legacy_pack_stream_imports`): decode pack-file `bytes` (as produced
+    /// by [`Self::get_consensus_output_bytes`]) into a [`ConsensusOutput`] using this pack's
+    /// committee and compression. The committee resolves each certificate author to an execution
+    /// address, so the pack must be for the same epoch as the bytes. It checks the header against
+    /// nothing, so bytes from a peer go through [`Self::decode_output_stream`] instead, which
+    /// verifies the header's digest first.
+    #[cfg(all(test, feature = "adiri"))]
+    pub(crate) async fn decode_output(&self, bytes: Vec<u8>) -> Result<ConsensusOutput, PackError> {
         let cursor = Cursor::new(bytes);
         let reader = BufReader::new(cursor);
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
@@ -1303,26 +1382,29 @@ impl ConsensusPack {
     /// taken once per digest, not for the whole request: a batch read decompresses, decodes and
     /// re-hashes up to a megabyte, and a peer may ask for hundreds, so one lock across them all
     /// would hold a save's append (and, while it waits, every new reader) behind the request.
+    ///
+    /// A request whose caller is gone (cancelled) stops at the read under way: the rest would be
+    /// decoded for no one.
     pub async fn batches(&self, digests: Vec<BlockHash>) -> Vec<Option<Batch>> {
         let count = digests.len();
         let shared = Arc::clone(&self.shared);
-        let read = tokio::task::spawn_blocking(move || {
-            digests
-                .into_iter()
-                .map(|digest| {
-                    shared
-                        .inner
-                        .read()
-                        .as_ref()
-                        .map(|inner| inner.batch(digest))
-                        .ok_or(PackError::SendFailed)
-                })
-                .collect::<Result<Vec<_>, _>>()
-        })
-        .await
-        .map_err(|_| PackError::ReceiveFailed)
-        .and_then(|read| read);
-        match read {
+        let (tx, rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            let mut batches = Vec::with_capacity(digests.len());
+            for digest in digests {
+                if tx.is_closed() {
+                    return;
+                }
+                // A closed pack drops `tx` unanswered.
+                let Some(batch) = shared.inner.read().as_ref().map(|inner| inner.batch(digest))
+                else {
+                    return;
+                };
+                batches.push(batch);
+            }
+            let _ = tx.send(batches);
+        });
+        match rx.await {
             Ok(batches) => batches,
             Err(_) => {
                 // A closed pack is not a real miss — surface it instead of a silent `None`.
@@ -1485,13 +1567,18 @@ pub(crate) fn legacy_migration_refusal(data_path: &Path, epoch: Epoch) -> Option
 
 /// Read-only: a dry run of migrating the legacy (pre-v2) pack whose data log is `data_path` to v2
 /// (`db migrate` without `--force`). `Ok` with the number of outputs the migration would copy, or
-/// why it refuses: an unacked torn tail is dropped by the migration, while damage below the acked
-/// frontier is refused. This is the only check a legacy v0 pack gets, since it is only ever read
-/// by its migration.
+/// why it refuses: an unacked torn tail of the newest epoch is dropped by the migration, while
+/// damage below the acked frontier, or anywhere in a past epoch (see [`has_later_epoch`]), is
+/// refused. This is the only check a legacy v0 pack gets, since it is only ever read by its
+/// migration.
 pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, String> {
     let base_dir = data_path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", data_path.display()))?;
+    let expect_complete = match base_dir.parent() {
+        Some(epochs_dir) => has_later_epoch(epochs_dir, epoch).map_err(|e| e.to_string())?,
+        None => false,
+    };
     let src = Pack::<PackRecord>::open(
         data_path,
         epoch as u64,
@@ -1500,12 +1587,20 @@ pub fn legacy_migration_dry_run(data_path: &Path, epoch: Epoch) -> Result<u64, S
         PACK_VERSION,
     )
     .map_err(|e| PackError::from(e).to_string())?;
-    Inner::migrate_copy(&src, None, src.version(), base_dir, data_path, epoch).map_err(
-        |e| match e {
+    Inner::migrate_copy(&src, None, src.version(), base_dir, data_path, epoch, expect_complete)
+        .map_err(|e| match e {
             MigrateAbort::Corrupt(why) => why,
             MigrateAbort::Fatal(e) => e.to_string(),
-        },
-    )
+        })
+}
+
+/// Whether `epoch` is a past epoch of the pack tree in `epochs_dir`: an `epoch-{M}` directory with
+/// `M > epoch` exists there (the same "newest is current" rule `db repair` skips by). A past
+/// epoch's pack was complete when the next one began, so its legacy migration expects the whole
+/// log (see `Inner::migrate_consistent_end`); only the newest epoch can carry an unacked tail.
+fn has_later_epoch(epochs_dir: &Path, epoch: Epoch) -> io::Result<bool> {
+    let epochs_dir = if epochs_dir.as_os_str().is_empty() { Path::new(".") } else { epochs_dir };
+    Ok(ConsensusPack::epoch_dirs(epochs_dir)?.last().is_some_and(|&newest| newest > epoch))
 }
 
 /// The byte offset just past the last COMPLETE consensus output in a pack's data log, computed by a
@@ -1569,7 +1664,7 @@ pub(crate) fn install_dir_rename_aside(
     if had_old {
         std::fs::rename(live, aside)?;
     }
-    let installed = std::fs::rename(staged, live);
+    let installed = install_rename(staged, live);
     if installed.is_err() && had_old {
         if let Err(restore_err) = std::fs::rename(aside, live) {
             error!(
@@ -1583,12 +1678,49 @@ pub(crate) fn install_dir_rename_aside(
         }
     }
     installed?;
-    fsync_directory(parent)?;
+    fsync_install_dir(parent)?;
+    // The rename also removed `staged` from its own directory, which can differ from `parent` (an
+    // import staged under `import-N/`): sync that directory too, so the move is durable in both.
+    if let Some(staged_parent) = staged.parent().filter(|dir| *dir != parent) {
+        fsync_install_dir(staged_parent)?;
+    }
     if had_old {
         // Best-effort: a crash before this leaves the aside for startup cleanup to remove.
         let _ = std::fs::remove_dir_all(aside);
     }
     Ok(())
+}
+
+/// `fsync_directory` for [`install_dir_rename_aside`]; tests record which directories it syncs.
+fn fsync_install_dir(dir: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    INSTALL_DIR_SYNCS.with(|syncs| syncs.borrow_mut().push(dir.to_path_buf()));
+    fsync_directory(dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: the next `Inner::migrate_legacy_if_needed` on this thread skips its read-only
+    /// check, as if that open had failed, so a legacy pack reaches the writable open.
+    static SKIP_NEXT_LEGACY_CHECK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: the next [`install_rename`] on this thread fails.
+    static FAIL_NEXT_INSTALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: the next `Inner::build_migrated_pack` on this thread leaves its staged data log
+    /// unsealed, as a sync failing in its `Drop` does.
+    static FAIL_NEXT_MIGRATION_SEAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Test-only: the directories [`install_dir_rename_aside`] synced on this thread.
+    static INSTALL_DIR_SYNCS: std::cell::RefCell<Vec<PathBuf>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The rename that makes staged files live in an install (`install_dir_rename_aside`,
+/// `Inner::install_static_indexes`). Tests inject its failure.
+fn install_rename(from: &Path, to: &Path) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_NEXT_INSTALL.with(|fail| fail.replace(false)) {
+        return Err(io::Error::other("injected install failure"));
+    }
+    std::fs::rename(from, to)
 }
 
 #[derive(Debug)]
@@ -1748,8 +1880,10 @@ impl OutputEncoder {
     /// The most lanes on any machine. A save runs beside execution, so it uses at most half the
     /// cores.
     const MAX_LANES: usize = 8;
-    /// The most buffer the lanes keep between saves, together; a rare larger output's is freed
-    /// after it.
+    /// The most buffer the lanes keep between saves, together, each lane's encoder stage counted
+    /// with its buffer; a rare larger output's is freed after it. Each lane also keeps its zstd
+    /// context, about 3.5 MiB whatever the outputs (the compression level sets it), so an encoder
+    /// whose every lane has run holds up to [`Self::MAX_LANES`] of them beside this.
     const RETAIN_BYTES: usize = 16 * 1024 * 1024;
 
     /// The encoder for a pack of `compression` whose records are at most `max` bytes.
@@ -1822,15 +1956,18 @@ impl OutputEncoder {
     }
 
     /// Done with a save's records: empty the buffers, keeping them for the next save while they
-    /// fit [`Self::RETAIN_BYTES`] together (the first lanes first); an unusually large output's
-    /// are freed.
+    /// fit [`Self::RETAIN_BYTES`] together (the first lanes first), each lane's encoder stage
+    /// counted with its buffer; an unusually large output's are freed.
     fn release(&mut self) {
         let mut budget = Self::RETAIN_BYTES;
         for lane in &mut self.lanes {
             lane.bytes.clear();
-            match budget.checked_sub(lane.bytes.capacity()) {
+            match budget.checked_sub(lane.bytes.capacity() + lane.encoder.stage_capacity()) {
                 Some(left) => budget = left,
-                None => lane.bytes = Vec::new(),
+                None => {
+                    lane.bytes = Vec::new();
+                    lane.encoder.free_stage();
+                }
             }
         }
     }
@@ -2353,17 +2490,19 @@ impl Inner {
     }
 
     /// Migrate an `epoch-{epoch}` pack under `epochs_dir` from a pre-v2 format to v2. See
-    /// [`ConsensusPack::migrate_epoch`] for the operator-facing contract. Synchronous; no live
-    /// actor.
+    /// [`ConsensusPack::migrate_epoch`] for the operator-facing contract, and
+    /// [`Self::migrate_consistent_end`] for `expect_complete`. Synchronous; no live actor.
     fn migrate_pack(
         epochs_dir: &Path,
         epoch: Epoch,
         apply: bool,
+        expect_complete: bool,
     ) -> Result<EpochMigrate, PackError> {
         let base_dir = epochs_dir.join(format!("epoch-{epoch}"));
         let data_file = base_dir.join(Self::DATA_NAME);
-        // Read-only peek of the on-disk version. A pack already at (or past) the current format
-        // needs no migration.
+        // Read-only peek of the on-disk version. A sentinel-era pack needs no migration: the same
+        // gate every caller uses to call a pack legacy, so a later version bump never routes a
+        // sentinel-era pack through this legacy copy.
         let src = Pack::<PackRecord>::open(
             &data_file,
             epoch as u64,
@@ -2372,14 +2511,22 @@ impl Inner {
             PACK_VERSION,
         )?;
         let version = src.version();
-        if version >= PACK_VERSION {
+        if version >= SENTINEL_MIN_VERSION {
             return Ok(EpochMigrate::AlreadyCurrent);
         }
 
         // Dry run: validate and count without writing anything.
         if !apply {
             return Ok(
-                match Self::migrate_copy(&src, None, version, &base_dir, &data_file, epoch) {
+                match Self::migrate_copy(
+                    &src,
+                    None,
+                    version,
+                    &base_dir,
+                    &data_file,
+                    epoch,
+                    expect_complete,
+                ) {
                     Ok(n) => EpochMigrate::WouldMigrate(format!(
                         "v{version} -> v{PACK_VERSION}, {n} output(s)"
                     )),
@@ -2394,11 +2541,12 @@ impl Inner {
         // crash or an error leaves the legacy pack readable and re-migratable.
         drop(src);
         let staging = format!("epoch-{epoch}.migrating");
-        let (migrate_dir, n) = match Self::build_migration(epochs_dir, epoch, &staging) {
-            Ok(built) => built,
-            Err(MigrateAbort::Corrupt(why)) => return Ok(EpochMigrate::Corrupt(why)),
-            Err(MigrateAbort::Fatal(e)) => return Err(e),
-        };
+        let (migrate_dir, n) =
+            match Self::build_migration(epochs_dir, epoch, &staging, expect_complete) {
+                Ok(built) => built,
+                Err(MigrateAbort::Corrupt(why)) => return Ok(EpochMigrate::Corrupt(why)),
+                Err(MigrateAbort::Fatal(e)) => return Err(e),
+            };
         Self::install_migrated_dir(epochs_dir, epoch, &migrate_dir)?;
         Ok(EpochMigrate::Migrated(format!("v{version} -> v{PACK_VERSION}, {n} output(s)")))
     }
@@ -2407,11 +2555,12 @@ impl Inner {
     /// dir there (named `*.migrating`, so startup sweeps a leftover), not yet installed, carrying
     /// over the epoch's per-epoch certificate pack. Returns the staging directory and the
     /// number of outputs copied. On any error the staging directory is removed and the legacy
-    /// pack is untouched.
+    /// pack is untouched. See [`Self::migrate_consistent_end`] for `expect_complete`.
     fn build_migration(
         epochs_dir: &Path,
         epoch: Epoch,
         staging: &str,
+        expect_complete: bool,
     ) -> Result<(PathBuf, u64), MigrateAbort> {
         let base_dir = epochs_dir.join(format!("epoch-{epoch}"));
         let data_file = base_dir.join(Self::DATA_NAME);
@@ -2427,13 +2576,20 @@ impl Inner {
         let migrate_dir = epochs_dir.join(staging);
         let _ = std::fs::remove_dir_all(&migrate_dir);
         create_dir_synced(&migrate_dir).map_err(|e| MigrateAbort::Fatal(e.into()))?;
-        let built =
-            Self::build_migrated_pack(&src, version, &base_dir, &data_file, epoch, &migrate_dir)
-                .and_then(|n| {
-                    Self::copy_cert_pack(&base_dir, &migrate_dir)
-                        .map_err(|e| MigrateAbort::Fatal(e.into()))?;
-                    Ok(n)
-                });
+        let built = Self::build_migrated_pack(
+            &src,
+            version,
+            &base_dir,
+            &data_file,
+            epoch,
+            &migrate_dir,
+            expect_complete,
+        )
+        .and_then(|n| {
+            Self::copy_cert_pack(&base_dir, &migrate_dir)
+                .map_err(|e| MigrateAbort::Fatal(e.into()))?;
+            Ok(n)
+        });
         match built {
             Ok(n) => Ok((migrate_dir, n)),
             Err(e) => {
@@ -2473,6 +2629,52 @@ impl Inner {
         fsync_directory(migrate_dir)
     }
 
+    /// Remove a pre-v2 (legacy) pack that holds only its data header: the release before created a
+    /// new epoch's files, then stopped before writing the epoch meta. It holds nothing to migrate
+    /// (the migration refuses a pack with no meta) and its indexes are as empty, so `open_append`
+    /// starts the epoch's pack afresh, as for a new epoch. Any byte past the header keeps it, for
+    /// the migration to judge: the same proof `open_append` asks of a v2 file before initializing
+    /// it. The indexes go first and the data log last, so a crash part-way repeats this check.
+    /// True if it removed the pack.
+    fn remove_header_only_legacy(base_dir: &Path, epoch: Epoch) -> Result<bool, PackError> {
+        let data_file = base_dir.join(Self::DATA_NAME);
+        let header_only = match Pack::<PackRecord>::open(
+            &data_file,
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        ) {
+            Ok(data) => {
+                data.version() < SENTINEL_MIN_VERSION
+                    && !data.record_present_at(DATA_HEADER_BYTES as u64)
+                    && !data.any_content_after(DATA_HEADER_BYTES as u64)
+            }
+            // Whatever keeps it from opening, the migration's own check reports.
+            Err(_) => false,
+        };
+        if !header_only {
+            return Ok(false);
+        }
+        warn!(
+            target: "consensus::pack",
+            epoch,
+            "epoch pack {} is pre-v2 and holds only its data header (its writer stopped before the \
+             epoch meta); starting the epoch's pack afresh",
+            base_dir.display(),
+        );
+        for name in [Self::CONSENSUS_POS_NAME, Self::CONSENSUS_HASH_NAME, Self::BATCH_HASH_NAME] {
+            match std::fs::remove_dir_all(base_dir.join(name)) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        std::fs::remove_file(&data_file)?;
+        fsync_directory(base_dir)?;
+        Ok(true)
+    }
+
     /// If an existing `epoch-{epoch}` pack under `epochs_dir` is a pre-v2 format, migrate it up to
     /// v2 before it is opened for write — v2 is the only writable format, so writing v2
     /// records/sentinels onto a v0/v1-versioned header would produce an inconsistent
@@ -2484,15 +2686,32 @@ impl Inner {
         // (an unwritten all-zero first write, or a corrupt data header), migration does not apply —
         // leave it to the normal writable open path, which reinitializes an unwritten file or
         // surfaces its own error. A pack already at v2 is likewise left untouched.
+        // An environmental failure of this check (descriptor or memory exhaustion, permissions)
+        // says nothing about the pack's version: surface it rather than read it as "not legacy".
+        // Should the check still miss a legacy pack, the writable open refuses its version.
+        #[cfg(test)]
+        if SKIP_NEXT_LEGACY_CHECK.with(|skip| skip.replace(false)) {
+            return Ok(());
+        }
         let data_file = epochs_dir.join(format!("epoch-{epoch}")).join(Self::DATA_NAME);
-        let is_legacy = matches!(
-            Pack::<PackRecord>::open(&data_file, epoch as u64, true, PackCompression::ZStd, PACK_VERSION),
-            Ok(p) if p.version() < SENTINEL_MIN_VERSION
-        );
+        let is_legacy = match Pack::<PackRecord>::open(
+            &data_file,
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        ) {
+            Ok(p) => p.version() < SENTINEL_MIN_VERSION,
+            Err(DataFileOpen(LoadHeaderError::IO(e))) if io_error_is_environmental(&e) => {
+                return Err(PackError::IO(Arc::new(e)));
+            }
+            Err(_) => false,
+        };
         if !is_legacy {
             return Ok(());
         }
-        match Self::migrate_pack(epochs_dir, epoch, true)? {
+        // The writable door opens the newest epoch, which may carry an unacked tail to drop.
+        match Self::migrate_pack(epochs_dir, epoch, true, false)? {
             EpochMigrate::Migrated(what) => {
                 info!(target: "consensus_pack", epoch, %what, "migrated legacy pack to v2 on open");
             }
@@ -2500,6 +2719,18 @@ impl Inner {
             EpochMigrate::Corrupt(why) => return Err(PackError::CorruptPack(why)),
             // `apply == true` never returns a dry-run verdict.
             EpochMigrate::WouldMigrate(_) => {}
+        }
+        Ok(())
+    }
+
+    /// Refuse a data log the writable open found still legacy (pre-v2): the
+    /// [`Self::migrate_legacy_if_needed`] check before it missed the pack (its read-only open
+    /// failed). A writable open accepts the legacy header, but the pack's indexes use the old
+    /// digest placement, so serving it would miss present records. Nothing has been written yet;
+    /// the next open migrates it.
+    fn refuse_unmigrated_legacy(data: &Pack<PackRecord>) -> Result<(), PackError> {
+        if data.version() < SENTINEL_MIN_VERSION {
+            return Err(PackError::InvalidVersion(PACK_VERSION, data.version()));
         }
         Ok(())
     }
@@ -2513,6 +2744,7 @@ impl Inner {
         data_file: &Path,
         epoch: Epoch,
         migrate_dir: &Path,
+        expect_complete: bool,
     ) -> Result<u64, MigrateAbort> {
         let dst_file = migrate_dir.join(Self::DATA_NAME);
         let mut dst = Pack::<PackRecord>::open(
@@ -2523,7 +2755,15 @@ impl Inner {
             PACK_VERSION,
         )
         .map_err(|e| MigrateAbort::Fatal(e.into()))?;
-        let copied = Self::migrate_copy(src, Some(&mut dst), version, base_dir, data_file, epoch)?;
+        let copied = Self::migrate_copy(
+            src,
+            Some(&mut dst),
+            version,
+            base_dir,
+            data_file,
+            epoch,
+            expect_complete,
+        )?;
         dst.commit().map_err(|e| MigrateAbort::Fatal(PackError::PersistError(e.to_string())))?;
         // Load the freshly-written epoch meta (the first record) for the `Inner` we build to
         // rebuild the indexes and seal.
@@ -2563,15 +2803,42 @@ impl Inner {
             batch_read_delay: None,
         };
         inner.persist().map_err(MigrateAbort::Fatal)?;
+        #[cfg(test)]
+        if FAIL_NEXT_MIGRATION_SEAL.with(|fail| fail.replace(false)) {
+            inner.data.poison();
+        }
         // Drop seals every backing file (msync + truncate-to-`end` + clean-close sentinel).
         drop(inner);
+        // ...but a sync failing in `Drop` is swallowed and leaves that file unsealed. Reopen the
+        // staged pack read-only and require every file sealed and consistent, as `open_static`
+        // will: an unsealed copy must never replace the source.
+        let sealed = Pack::<PackRecord>::open(
+            &dst_file,
+            epoch as u64,
+            true,
+            PackCompression::ZStd,
+            PACK_VERSION,
+        )
+        .map_err(|e| MigrateAbort::Fatal(e.into()))
+        .and_then(|data| {
+            let (mut pos, cd, bd) = Self::try_open_indexes(migrate_dir, data.header(), true)
+                .map_err(MigrateAbort::Fatal)?;
+            Ok(Self::files_consistent(&data, &mut pos, &cd, &bd))
+        })?;
+        if !sealed {
+            return Err(MigrateAbort::Fatal(PackError::PersistError(format!(
+                "epoch {epoch}: the migrated v2 pack did not seal cleanly; nothing was installed \
+                 and the legacy pack is unchanged"
+            ))));
+        }
         Ok(count)
     }
 
     /// Walk the legacy `src` data log record-by-record, validating as it reads. When `dst` is
     /// `Some`, each record is re-appended to the fresh v2 log in header-first order (reordering a
     /// v0 batches-first log). When `dst` is `None` this only validates and counts (the dry-run
-    /// path). Returns the number of outputs.
+    /// path). Returns the number of outputs. See [`Self::migrate_consistent_end`] for
+    /// `expect_complete`.
     fn migrate_copy(
         src: &Pack<PackRecord>,
         mut dst: Option<&mut Pack<PackRecord>>,
@@ -2579,6 +2846,7 @@ impl Inner {
         base_dir: &Path,
         data_file: &Path,
         epoch: Epoch,
+        expect_complete: bool,
     ) -> Result<u64, MigrateAbort> {
         // For a header-first (v1) log, compute the safe consistent end with the same WAL replay +
         // committed-data guards recovery uses: an unacked crash tail past `end` is dropped, but a
@@ -2586,14 +2854,30 @@ impl Inner {
         // is validated by the reordering walk below and any decode failure is reported as
         // corruption (every v0 pack on disk is a sealed, complete historic epoch).
         let end = if version >= 1 {
-            Self::migrate_consistent_end(src, base_dir, data_file, epoch)?
+            Self::migrate_consistent_end(src, base_dir, data_file, epoch, expect_complete)?
         } else {
             u64::MAX
         };
+        if dst.is_some() && end < src.file_len() {
+            warn!(
+                target: "consensus::pack",
+                epoch,
+                dir = %base_dir.display(),
+                dropped_bytes = src.file_len() - end,
+                "legacy pack migration drops an unacked tail past the last complete output"
+            );
+        }
         let mut iter = src.raw_iter().map_err(|e| MigrateAbort::Fatal(DataFileOpen(e).into()))?;
-        // The first record must be the epoch meta.
+        // The first record must be the epoch meta, and for this epoch: `open_static` refuses a meta
+        // for another epoch, so migrating one would install a pack nothing can open.
         match iter.next() {
             Some(Ok(PackRecord::EpochMeta(m))) => {
+                if m.epoch != epoch {
+                    return Err(MigrateAbort::Corrupt(format!(
+                        "epoch {epoch}: the epoch meta is for epoch {}",
+                        m.epoch
+                    )));
+                }
                 if let Some(d) = dst.as_deref_mut() {
                     d.append(&PackRecord::EpochMeta(m))
                         .map_err(|e| MigrateAbort::Fatal(PackError::Append(e.to_string())))?;
@@ -2626,11 +2910,19 @@ impl Inner {
     /// acked frontier (never a silent truncate of committed data). Mirrors
     /// [`Self::recover_pack`]'s pass-1 guards, plus a length-attestation seal test that stands
     /// in for the clean-close sentinel a pre-v2 pack never carried.
+    ///
+    /// `expect_complete` is the caller's knowledge that the log is complete: a past epoch (only a
+    /// sealed past epoch is healed read-side, and `db migrate`/`db repair` pass it for every epoch
+    /// below the newest) was finished before the next one began, so it can hold no unacked tail.
+    /// A replay that stops short of its end is then damage to committed data even when the length
+    /// attestation cannot be read (a missing or unopenable index). Only the writable door and the
+    /// newest epoch pass `false`.
     fn migrate_consistent_end(
         src: &Pack<PackRecord>,
         base_dir: &Path,
         data_file: &Path,
         epoch: Epoch,
+        expect_complete: bool,
     ) -> Result<u64, MigrateAbort> {
         // A pre-v2 pack has no clean-close sentinel, so `replay_wal` (which reads "sealed" from the
         // sentinel) treats every legacy log as unclean and would truncate a damaged tail. Recover
@@ -2654,6 +2946,14 @@ impl Inner {
             return Err(MigrateAbort::Corrupt(format!(
                 "epoch {epoch}: a complete (length-consistent) legacy pack replays only to {end} of \
                  {}; committed data is damaged, not a truncatable tail. Re-sync the epoch from peers.",
+                src.file_len()
+            )));
+        }
+        if expect_complete && end < src.file_len() {
+            return Err(MigrateAbort::Corrupt(format!(
+                "epoch {epoch}: the legacy pack of a past epoch replays only to {end} of {}; a past \
+                 epoch is complete, so committed data is damaged, not a truncatable tail. Re-sync \
+                 the epoch from peers.",
                 src.file_len()
             )));
         }
@@ -2804,7 +3104,8 @@ impl Inner {
     /// and only removed after the new one is renamed in and the parent is fsync'd. On a rename
     /// failure the old dir is restored. A crash mid-swap leaves a `*.replaced` (and possibly the
     /// `*.migrating`) dir that startup cleanup sweeps. Mirrors
-    /// `ConsensusStore::install_imported_epoch_dir`.
+    /// `ConsensusStore::install_imported_epoch_dir`. A failed install removes `migrate_dir` (if it
+    /// was not renamed in), so a full v2 copy of the epoch is not left behind.
     fn install_migrated_dir(
         epochs_dir: &Path,
         epoch: Epoch,
@@ -2812,7 +3113,10 @@ impl Inner {
     ) -> Result<(), PackError> {
         let base_dir = epochs_dir.join(format!("epoch-{epoch}"));
         let aside = epochs_dir.join(format!("epoch-{epoch}.replaced"));
-        install_dir_rename_aside(epochs_dir, &base_dir, &aside, migrate_dir)?;
+        if let Err(e) = install_dir_rename_aside(epochs_dir, &base_dir, &aside, migrate_dir) {
+            let _ = std::fs::remove_dir_all(migrate_dir);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -2843,6 +3147,10 @@ impl Inner {
     ///
     /// The WAL is validated on its own first (`replay_wal` pass 1, nothing written); a sealed log
     /// with any tear is `CorruptPack`. The fresh indexes are synced and sealed before returning.
+    ///
+    /// A log whose leading record is not this epoch's meta is `CorruptPack` too: `open_static`
+    /// refuses it whatever its indexes, so a rebuild would "succeed" while the reopen kept failing,
+    /// and every read would rebuild again instead of backing off.
     fn build_static_indexes(
         base_dir: &Path,
         data_file: &Path,
@@ -2856,6 +3164,12 @@ impl Inner {
             PACK_VERSION,
         )?;
         if data.opened_unclean() || data.version() < SENTINEL_MIN_VERSION {
+            return Err(Self::corrupt_pack(base_dir));
+        }
+        if !matches!(
+            data.fetch(DATA_HEADER_BYTES as u64),
+            Ok(PackRecord::EpochMeta(meta)) if meta.epoch == epoch
+        ) {
             return Err(Self::corrupt_pack(base_dir));
         }
         let side = base_dir.join(Self::heal_staging_name(Self::REINDEX_DIR, ""));
@@ -2910,23 +3224,30 @@ impl Inner {
     /// last and back in first, so no crash point leaves it the only missing directory (a fresh,
     /// empty position index beside intact digest indexes is the one shape the writable open must
     /// recognise as lost rather than new; the digest markers are what force that rebuild).
+    ///
+    /// `side` and the parked directories are removed whatever the outcome: a failed swap leaves
+    /// the same shape a crash mid-swap does (index directories missing, rebuilt by the next read),
+    /// never a rebuilt copy left on disk until the next startup sweep.
     fn install_static_indexes(base_dir: &Path, side: &Path) -> Result<(), PackError> {
         let old = base_dir.join(Self::REINDEX_OLD_DIR);
-        let _ = std::fs::remove_dir_all(&old);
-        create_dir_synced(&old)?;
-        for name in Self::INDEX_DIRS.iter().rev() {
-            let live = base_dir.join(name);
-            if live.exists() {
-                std::fs::rename(&live, old.join(name))?;
+        let swapped = (|| -> Result<(), PackError> {
+            let _ = std::fs::remove_dir_all(&old);
+            create_dir_synced(&old)?;
+            for name in Self::INDEX_DIRS.iter().rev() {
+                let live = base_dir.join(name);
+                if live.exists() {
+                    std::fs::rename(&live, old.join(name))?;
+                }
             }
-        }
-        for name in Self::INDEX_DIRS {
-            std::fs::rename(side.join(name), base_dir.join(name))?;
-        }
-        fsync_directory(base_dir)?;
+            for name in Self::INDEX_DIRS {
+                install_rename(&side.join(name), &base_dir.join(name))?;
+            }
+            fsync_directory(base_dir)?;
+            Ok(())
+        })();
         let _ = std::fs::remove_dir_all(&old);
         let _ = std::fs::remove_dir_all(side);
-        Ok(())
+        swapped
     }
 
     /// Return the version of the underlying data pack file.
@@ -3120,15 +3441,23 @@ impl Inner {
         let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
         create_dir_synced(&base_dir)?;
         let pack_file = base_dir.join(Self::DATA_NAME);
-        let have_pack = std::fs::exists(&pack_file).unwrap_or_default();
-        // Migrate a pre-sentinel legacy pack up to v2 before we ever write to it. Skipped when the
-        // caller explicitly requests a legacy `version` (the test helper that *creates* v0/v1
-        // packs); production always requests `PACK_VERSION`.
+        let mut have_pack = std::fs::exists(&pack_file).unwrap_or_default();
+        // Migrate a pre-sentinel legacy pack up to v2 before we ever write to it (one holding only
+        // its header is started afresh instead). Skipped when the caller explicitly requests a
+        // legacy `version` (the test helper that *creates* v0/v1 packs); production always requests
+        // `PACK_VERSION`.
         if have_pack && version >= SENTINEL_MIN_VERSION {
-            Self::migrate_legacy_if_needed(path.as_ref(), epoch)?;
+            if Self::remove_header_only_legacy(&base_dir, epoch)? {
+                have_pack = false;
+            } else {
+                Self::migrate_legacy_if_needed(path.as_ref(), epoch)?;
+            }
         }
         let mut data: Pack<PackRecord> =
             Pack::open(&pack_file, epoch as u64, false, PackCompression::ZStd, version)?;
+        if version >= SENTINEL_MIN_VERSION {
+            Self::refuse_unmigrated_legacy(&data)?;
+        }
         let epoch_meta = EpochMeta {
             epoch,
             committee,
@@ -3285,6 +3614,7 @@ impl Inner {
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
+        Self::refuse_unmigrated_legacy(&data)?;
         // This door does not create the epoch directory, so the hint must not suggest removing it
         // (that would leave the node unable to start); it points at `db validate` only.
         let epoch_meta = data
@@ -3427,7 +3757,8 @@ impl Inner {
         })
     }
 
-    /// Create a new set of epoch static files and fill them from a peer's pack `stream`.
+    /// Create a new set of epoch static files under `path` and fill them from a peer's pack
+    /// `stream`, up to and including the certified `final_consensus`.
     ///
     /// The imported epoch is always written in the CURRENT format (`PACK_VERSION`): v2 is the only
     /// writable format, so an import never lands on disk as a legacy pack that a later read would
@@ -3436,33 +3767,40 @@ impl Inner {
     /// (`InvalidVersion`, no penalty): v0 is only ever migrated on disk, and an upgraded peer
     /// serves its v0 epochs migrated.
     ///
-    /// Nothing in the stream is authenticated until the chain reaches the certified final (checked
-    /// by the caller), so an output's header is only parent-linked here. Streaming keeps the
-    /// decoded memory for a hostile header that declares a huge batch fan-out bounded by a
-    /// single record rather than by the (committee-scaled, multi-GB) theoretical maximum output
-    /// size. Reading stops at `final_consensus_number`: anything a peer streams past it cannot
-    /// belong to this epoch's certified chain.
-    /// Import a full epoch (or a verifiable prefix) from a peer `stream` into a fresh pack under
-    /// `path`, stopping before the filesystem's free space drops below `min_free` (see
+    /// Of the outputs only the final is authenticated, by its digest against `final_consensus`,
+    /// the moment its header is read; every earlier output is trusted only through the parent
+    /// links that lead back from it. Streaming keeps the decoded memory for a hostile header that
+    /// declares a huge batch fan-out bounded by a single record rather than by the
+    /// (committee-scaled, multi-GB) theoretical maximum output size. Reading stops at the final:
+    /// anything a peer streams past it cannot belong to this epoch's certified chain, and a
+    /// stream that ends before it is the sender's (`NotConsensus`).
+    ///
+    /// The import stops before the filesystem's free space drops below `min_free` (see
     /// [`IMPORT_MIN_FREE_BYTES`]).
-    async fn stream_import<P: AsRef<Path>, R: AsyncRead + Unpin>(
-        path: P,
+    ///
+    /// Only the stream reads run here ([`pump_import_frames`]). Each record's CPU work
+    /// (decompress, decode, digest, re-encode) and every file write run on the blocking pool
+    /// ([`Self::import_records`]), fed the frames one at a time: a highly compressible record
+    /// costs far more to process than to send, and must not hold the caller's async worker.
+    /// Any failure, and an abandoned import (this future dropped), discards the partial pack
+    /// rather than sealing it ([`ImportGuard`]); `lease` comes back with the pack, and is dropped
+    /// only after a failed import's files are gone.
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_import<R: AsyncRead + Unpin, L: Send + 'static>(
+        path: PathBuf,
         stream: R,
         epoch: Epoch,
         previous_epoch: &EpochRecord,
-        final_consensus_number: u64,
+        final_consensus: ConsensusNumHash,
         timeout: Duration,
         min_free: u64,
-    ) -> Result<Self, PackError> {
-        let base_dir = path.as_ref().join(format!("epoch-{epoch}"));
-        create_dir_synced(&base_dir)?;
-        let mut floor = DiskFloor { dir: base_dir.clone(), min_free, checked_at: None };
-        floor.check(0)?;
+        lease: L,
+    ) -> Result<(Self, L), PackError> {
         // `AsyncPackIter::open` rejects a source newer than `PACK_VERSION` (its `max_version`).
         // A header that does not read (transport) or is from a newer build is no fault of the
         // sender's bytes; one that reads but is wrong (a failed CRC, another epoch's uid, a
         // foreign app number), or a stream that ends before its header is complete (see
-        // `next_output_record`), is.
+        // `record_read_error`), is.
         let mut stream_iter =
             AsyncPackIter::<PackRecord, R>::open(stream, epoch as u64, PACK_VERSION)
                 .await
@@ -3482,6 +3820,62 @@ impl Inner {
         if stream_iter.version() == 0 {
             return Err(PackError::InvalidVersion(PACK_VERSION, 0));
         }
+        // One frame in the channel: with the one in each half's hands, the import holds at most
+        // three undecoded records.
+        let (frames, receiver) = tokio::sync::mpsc::channel(1);
+        let records = ImportRecords {
+            frames: receiver,
+            compression: stream_iter.compression(),
+            payload: Vec::new(),
+        };
+        let previous_epoch = previous_epoch.clone();
+        let mut worker = tokio::task::spawn_blocking(move || {
+            // A failed import was discarded inside `import_records`, before `lease` drops here. A
+            // completed one stays guarded until this future takes it, so one abandoned at the
+            // last moment is discarded too (the guard drops before the lease).
+            Self::import_records(&path, epoch, &previous_epoch, final_consensus, min_free, records)
+                .map(|pack| (pack, lease))
+        });
+        // Read the stream until the blocking half finishes: it stops taking frames at the final
+        // (or on a failure), and a reader still waiting on the peer then is just dropped.
+        use std::{future::Future as _, pin::Pin, task::Poll};
+        let mut pump = std::pin::pin!(pump_import_frames(&mut stream_iter, timeout, frames));
+        let mut pumping = true;
+        let (pack, lease) = std::future::poll_fn(|cx| {
+            if let Poll::Ready(joined) = Pin::new(&mut worker).poll(cx) {
+                return Poll::Ready(joined);
+            }
+            if pumping && pump.as_mut().poll(cx).is_ready() {
+                pumping = false;
+            }
+            Poll::Pending
+        })
+        .await
+        .map_err(|e| PackError::PersistError(format!("stream import task join error: {e}")))??;
+        Ok((pack.keep(), lease))
+    }
+
+    /// The import's blocking half: check the stream's meta against `previous_epoch`, create the
+    /// pack under `path`, and fill it output by output from `records` up to and including the
+    /// certified `final_consensus`; the filled pack comes back still guarded. Any failure discards
+    /// the partial pack ([`ImportGuard`]).
+    fn import_records(
+        path: &Path,
+        epoch: Epoch,
+        previous_epoch: &EpochRecord,
+        final_consensus: ConsensusNumHash,
+        min_free: u64,
+        mut records: ImportRecords,
+    ) -> Result<ImportGuard, PackError> {
+        let base_dir = path.join(format!("epoch-{epoch}"));
+        create_dir_synced(&base_dir)?;
+        let mut floor = DiskFloor { dir: base_dir.clone(), min_free, checked_at: None };
+        floor.check(0)?;
+        let epoch_meta = match records.next()? {
+            Some(ImportRecord::Meta(meta)) => meta,
+            _ => return Err(PackError::NotEpoch),
+        };
+        verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
         let mut data = Pack::open(
             base_dir.join(Self::DATA_NAME),
             epoch as u64,
@@ -3489,31 +3883,25 @@ impl Inner {
             PackCompression::ZStd,
             PACK_VERSION,
         )?;
-        let epoch_meta = if let Some(meta) = next_output_record(&mut stream_iter, timeout).await? {
-            meta.into_epoch()?
-        } else {
-            return Err(PackError::NotEpoch);
+        let opened = (|| {
+            data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
+                .map_err(|e| PackError::Append(e.to_string()))?;
+            // Commit the meta immediately so the header+meta prefix is durable: a valid pack
+            // always has a durable meta, so a crash mid-import leaves a readable meta (or a
+            // header-only file that reinitializes), never a torn meta that open would reject.
+            data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+            let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
+            let digests = Self::open_digest_indexes(&base_dir, data.header(), false)?;
+            Ok::<_, PackError>((consensus_pos_idx, digests))
+        })();
+        let (consensus_pos_idx, (consensus_digests, batch_digests)) = match opened {
+            Ok(opened) => opened,
+            Err(e) => {
+                data.set_remove_on_drop();
+                return Err(e);
+            }
         };
-        verify_epoch_meta(epoch, previous_epoch, &epoch_meta)?;
-        data.append(&PackRecord::EpochMeta(epoch_meta.clone()))
-            .map_err(|e| PackError::Append(e.to_string()))?;
-        // Commit the meta immediately so the header+meta prefix is durable: a valid pack always has
-        // a durable meta, so a crash mid-import leaves a readable meta (or a header-only file that
-        // reinitializes), never a torn meta that open would reject.
-        data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
-        let consensus_pos_idx = Self::open_pdx_file(&base_dir, data.header(), false)?;
-        let (consensus_digests, batch_digests) =
-            Self::open_digest_indexes(&base_dir, data.header(), false)?;
-        let mut parent_digest_expectation = if epoch == 0 {
-            // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
-            // will fail (for instance epoch 0 final state will not verify). This can be set but
-            // doing so forces fork aware code here and verification will fail with an invalid value
-            // either way.
-            HeaderExpectation::None
-        } else {
-            HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
-        };
-        let mut pack = Self {
+        let mut pack = ImportGuard(Some(Self {
             data,
             consensus_pos_idx,
             consensus_digests,
@@ -3525,51 +3913,37 @@ impl Inner {
             panic_save_after_append: false,
             #[cfg(test)]
             batch_read_delay: None,
+        }));
+        let mut expectation = if epoch == 0 {
+            // Don't worry about consensus block 1 in epoch 0, if it is invalid other verifications
+            // will fail (for instance epoch 0 final state will not verify). This can be set but
+            // doing so forces fork aware code here and verification will fail with an invalid value
+            // either way.
+            HeaderExpectation::None
+        } else {
+            HeaderExpectation::Parent(previous_epoch.final_consensus.hash)
         };
-        // Fill the pack from the stream. Any error abandons the partial pack cheaply: a peer can
-        // stream data and then send a bad record, and letting `pack` drop normally would msync +
-        // seal (sentinel + fsync) the whole partial import on the tokio worker right before
-        // `ImportPath::drop` deletes it. `discard_import` marks every backing file remove-on-drop
-        // so the drop is cheap.
-        let fill: Result<(), PackError> = 'fill: {
-            loop {
-                // Each output's header is checked (parent link, number, final bound, batch fan-out)
-                // BEFORE any of its batches is read; `parent_digest_expectation` then advances to
-                // this output's digest for the next one.
-                let imported = pack
-                    .import_streamed_output(
-                        &mut stream_iter,
-                        timeout,
-                        parent_digest_expectation,
-                        final_consensus_number,
-                        &mut floor,
-                    )
-                    .await;
-                match imported {
-                    // Clean end of stream: no further output header.
-                    Ok(None) => break,
-                    // The requested final is in: stop reading. The caller verifies its digest
-                    // against the certified record.
-                    Ok(Some((_, number))) if number == final_consensus_number => break,
-                    Ok(Some((digest, _))) => {
-                        parent_digest_expectation = HeaderExpectation::Parent(digest)
-                    }
-                    Err(e) => break 'fill Err(e),
-                }
+        loop {
+            // Each output's header is checked (parent link, number, final bound, batch fan-out,
+            // and the final's digest) BEFORE any of its batches is read; the expectation then
+            // advances to this output's digest for the next one.
+            match pack.get().import_streamed_output(
+                &mut records,
+                expectation,
+                final_consensus,
+                &mut floor,
+            )? {
+                Some((_, number)) if number == final_consensus.number => return Ok(pack),
+                Some((digest, _)) => expectation = HeaderExpectation::Parent(digest),
+                // A clean end of stream before the certified final.
+                None => return Err(PackError::NotConsensus),
             }
-            Ok(())
-        };
-        if let Err(e) = fill {
-            pack.discard_import();
-            return Err(e);
         }
-        Ok(pack)
     }
 
     /// Abandon this partial, never-persisted import pack: mark every backing file to be removed
-    /// (not sealed) when it drops, so a failed/aborted `stream_import`'s drop skips the msync +
-    /// truncate + clean-close sentinel + fsync of data that is about to be deleted anyway (the
-    /// caller's `ImportPath::drop` removes the directory).
+    /// (not sealed) when it drops, so a failed/aborted import's drop skips the msync + truncate +
+    /// clean-close sentinel + fsync of data that is about to be deleted anyway.
     fn discard_import(&mut self) {
         self.data.set_remove_on_drop();
         self.consensus_digests.set_remove_on_drop();
@@ -3580,55 +3954,64 @@ impl Inner {
     /// Import the next output of a v1/v2 (header-first) peer stream straight into this import pack
     /// without ever buffering the output.
     ///
-    /// The header is read and checked first ([`check_header_expectation`] and
-    /// [`Self::check_import_header`]); then each batch is verified against the header's next
-    /// declared digest and the per-batch size cap and appended as it arrives. Decoded memory is
-    /// therefore one record, however large a batch fan-out the (not yet authenticated) header
-    /// declares. Returns the output's digest and number, or `None` at a clean end of stream.
-    /// Any error leaves a partial output behind; the caller discards the whole import pack.
-    /// `floor` is checked as the pack grows.
-    async fn import_streamed_output<R: AsyncRead + Unpin>(
+    /// The header is read and checked first ([`check_header_expectation`],
+    /// [`Self::check_import_header`], and for the final its digest against `final_consensus`);
+    /// then each batch is verified against the header's next declared digest and the per-batch
+    /// size cap and appended as it arrives. Decoded memory is therefore one record, however large
+    /// a batch fan-out the (not yet authenticated) header declares. Returns the output's digest
+    /// and number, or `None` at a clean end of stream. Any error leaves a partial output behind;
+    /// the caller discards the whole import pack. `floor` is checked as the pack grows.
+    fn import_streamed_output(
         &mut self,
-        stream_iter: &mut AsyncPackIter<PackRecord, R>,
-        timeout: Duration,
+        records: &mut ImportRecords,
         expectation: HeaderExpectation,
-        final_consensus_number: u64,
+        final_consensus: ConsensusNumHash,
         floor: &mut DiskFloor,
     ) -> Result<Option<(ConsensusHeaderDigest, u64)>, PackError> {
-        let header = match next_output_record(stream_iter, timeout).await? {
+        let header = match records.next()? {
             None => return Ok(None),
-            Some(PackRecord::Consensus(header)) => *header,
-            Some(PackRecord::EpochMeta(_)) => {
+            Some(ImportRecord::Header(header)) => *header,
+            Some(ImportRecord::Meta(_)) => {
                 return Err(PackError::UnexpectedRecord(
                     "unexpected epoch meta data found".to_string(),
                 ))
             }
-            Some(PackRecord::Batch(_)) => {
+            Some(ImportRecord::Batch(..)) => {
                 return Err(PackError::UnexpectedRecord("unexpected batch found".to_string()))
             }
         };
         check_header_expectation(&header, expectation)?;
         let (consensus_idx, declared) =
-            self.check_import_header(&header, final_consensus_number)?;
+            self.check_import_header(&header, final_consensus.number)?;
+        // The final is the one output the certified record authenticates: a wrong one fails
+        // here, before any of its batches is read.
+        if header.number == final_consensus.number {
+            let got = header.digest();
+            if got != final_consensus.hash {
+                return Err(PackError::UnexpectedConsensusDigest {
+                    expected: final_consensus.hash,
+                    got,
+                });
+            }
+        }
         let (header_pos, digest, number) = self.append_imported_header(header)?;
         floor.check(self.data.file_len())?;
         let max_bytes = max_batch_size(self.epoch_meta.committee.epoch());
         for expected in declared {
-            let batch = match next_output_record(stream_iter, timeout).await? {
-                Some(PackRecord::Batch(batch)) => batch,
+            let (batch, got) = match records.next()? {
+                Some(ImportRecord::Batch(batch, digest)) => (batch, digest),
                 None => return Err(PackError::MissingBatch),
-                Some(PackRecord::EpochMeta(_)) => {
+                Some(ImportRecord::Meta(_)) => {
                     return Err(PackError::UnexpectedRecord(
                         "unexpected epoch meta data found".to_string(),
                     ))
                 }
-                Some(PackRecord::Consensus(_)) => {
+                Some(ImportRecord::Header(_)) => {
                     return Err(PackError::UnexpectedRecord(
                         "unexpected consensusheader found".to_string(),
                     ))
                 }
             };
-            let got = batch.digest();
             if got != expected {
                 return Err(PackError::UnexpectedRecord(format!(
                     "unexpected batch found, expected {expected}, got {got}"
@@ -3898,16 +4281,14 @@ impl Inner {
     /// Append an output already encoded, in the header-first layout: the header, then its batches
     /// in digest order, each indexed, then the output's position entry.
     fn append_prepared_records(&mut self, prepared: &PreparedOutput<'_>) -> Result<u64, PackError> {
-        let position = self
-            .data
-            .append_stored(prepared.header)
-            .map_err(|e| PackError::Append(e.to_string()))?;
+        let position =
+            self.data.append_stored(prepared.header).map_err(PackError::append_failed)?;
         for (digest, stored) in &prepared.batches {
             let batch_position =
-                self.data.append_stored(stored).map_err(|e| PackError::Append(e.to_string()))?;
+                self.data.append_stored(stored).map_err(PackError::append_failed)?;
             self.batch_digests
                 .save(*digest, batch_position)
-                .map_err(|e| PackError::IndexAppend(format!("batch {e}")))?;
+                .map_err(|e| PackError::index_append_failed("batch", e))?;
             let len = self.data.file_len();
             self.consensus_digests.set_data_file_length(len);
             self.batch_digests.set_data_file_length(len);
@@ -3948,11 +4329,11 @@ impl Inner {
     ) -> Result<u64, PackError> {
         self.consensus_digests
             .save(consensus_digest.into(), position)
-            .map_err(|e| PackError::IndexAppend(format!("consensus {e}")))?;
+            .map_err(|e| PackError::index_append_failed("consensus", e))?;
         let len = self.data.file_len();
         self.consensus_pos_idx
             .save(consensus_idx, IndexPositions::new(position, output_start, len))
-            .map_err(|e| PackError::IndexAppend(format!("consensus number {e}")))?;
+            .map_err(|e| PackError::index_append_failed("consensus number", e))?;
         self.consensus_digests.set_data_file_length(len);
         self.batch_digests.set_data_file_length(len);
 
@@ -4088,7 +4469,7 @@ impl Inner {
 
     fn persist(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
-            self.data.commit().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.data.commit().map_err(PackError::persist_failed)?;
             // Note, we don't sync indexes.  The data file acts as a WAL we can use to clean up and
             // rebuild if we crash and it causes corruption.
             //
@@ -4105,7 +4486,7 @@ impl Inner {
     // Inner method (sibling of Inner::persist, consensus_pack.rs:1051) — flush only, no syncs:
     fn flush_data(&mut self) -> Result<(), PackError> {
         if !self.data.read_only() {
-            self.data.flush().map_err(|e| PackError::PersistError(e.to_string()))?;
+            self.data.flush().map_err(PackError::flush_failed)?;
         }
         Ok(())
     }
@@ -4230,6 +4611,10 @@ impl Inner {
     }
 
     /// Return the Batch for digest if found.
+    ///
+    /// As [`Self::consensus_header_by_digest`], `None` is both a quiet miss and an indexed record
+    /// that cannot be served, which is logged: a record that fails to load or decode at `error!`,
+    /// and one that hashes to another digest (an entry a rolled-back save left stale) at `warn!`.
     fn batch(&self, digest: BlockHash) -> Option<Batch> {
         #[cfg(test)]
         if let Some(delay) = self.batch_read_delay {
@@ -4252,11 +4637,24 @@ impl Inner {
         if pos >= self.data.file_len() {
             return None;
         }
-        let batch = self.data.fetch(pos).ok()?.into_batch().ok()?;
+        let batch = self
+            .data
+            .fetch(pos)
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed batch record exists but failed to load from the pack: {e}");
+            })
+            .ok()?
+            .into_batch()
+            .inspect_err(|e| {
+                error!(target: "consensus_pack", epoch, ?digest, pos, "indexed batch record exists but did not decode as a batch: {e}");
+            })
+            .ok()?;
         // Verify the digest.  There is an extremely unlikely edge case where
         // a repaired DB could write a new batch to the same location as an
         // old batch.  This makes sure the contract is always intact.
-        if batch.digest() != digest {
+        let got = batch.digest();
+        if got != digest {
+            warn!(target: "consensus_pack", epoch, ?digest, ?got, pos, "batch loaded from the pack does not hash to its indexed digest (a stale index entry)");
             return None;
         }
         Some(batch)
@@ -4351,6 +4749,14 @@ pub const IMPORT_MIN_FREE_BYTES: u64 = 256 << 20;
 /// How far an import's data log may grow between free-space checks.
 const IMPORT_FREE_CHECK_EVERY: u64 = 64 << 20;
 
+/// Free space a check needs beyond the floor: what the import's files may still take before the
+/// next check. Mmap growth preallocates real blocks up to one growth step
+/// ([`DEFAULT_MAX_MAP_SIZE`](crate::archive::data_file::DEFAULT_MAX_MAP_SIZE)) ahead of what a file
+/// holds, and the data log and the batch-digest index are the files an import grows by whole
+/// steps; the data log also grows by up to [`IMPORT_FREE_CHECK_EVERY`] between checks.
+const IMPORT_FREE_HEADROOM: u64 =
+    IMPORT_FREE_CHECK_EVERY + 2 * crate::archive::data_file::DEFAULT_MAX_MAP_SIZE;
+
 /// Stops a stream import before free space on `dir`'s filesystem drops below `min_free`. Falling
 /// short is a local condition, not the sending peer's fault (an honest epoch on a nearly full disk
 /// looks the same), so it is an [`io::ErrorKind::StorageFull`] I/O error that charges no penalty.
@@ -4363,23 +4769,32 @@ struct DiskFloor {
 
 impl DiskFloor {
     /// Check the free space once the import's data log has grown by [`IMPORT_FREE_CHECK_EVERY`]
-    /// since the last check (and on the first call). An unknown free space does not stop the
-    /// import: a real shortage still surfaces as a write error.
+    /// since the last check (and on the first call). A check needs [`IMPORT_FREE_HEADROOM`] above
+    /// the floor, so what the import's files take before the next check cannot carry the
+    /// filesystem below it. A floor of `0` (an operator's own restore) never stops the import, and
+    /// an unknown free space does not either: a real shortage still surfaces as a write error.
     fn check(&mut self, data_len: u64) -> Result<(), PackError> {
-        if self.checked_at.is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY)) {
+        if self.min_free == 0
+            || self
+                .checked_at
+                .is_some_and(|at| data_len < at.saturating_add(IMPORT_FREE_CHECK_EVERY))
+        {
             return Ok(());
         }
         self.checked_at = Some(data_len);
         match available_space(&self.dir) {
-            Ok(free) if free < self.min_free => Err(PackError::IO(Arc::new(io::Error::new(
-                io::ErrorKind::StorageFull,
-                format!(
-                    "stream import into {} stopped: {free} bytes free, below the {} bytes an \
-                     import must leave",
-                    self.dir.display(),
-                    self.min_free
-                ),
-            )))),
+            Ok(free) if free < self.min_free.saturating_add(IMPORT_FREE_HEADROOM) => {
+                Err(PackError::IO(Arc::new(io::Error::new(
+                    io::ErrorKind::StorageFull,
+                    format!(
+                        "stream import into {} stopped: {free} bytes free, below the {} bytes an \
+                         import must leave plus the {IMPORT_FREE_HEADROOM} its files may take \
+                         before the next check",
+                        self.dir.display(),
+                        self.min_free
+                    ),
+                ))))
+            }
             _ => Ok(()),
         }
     }
@@ -4402,6 +4817,99 @@ fn available_space(path: &Path) -> io::Result<u64> {
         stat.assume_init()
     };
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+/// An import pack that is discarded when it drops ([`Inner::discard_import`]: its files are
+/// removed, not sealed), unless [`Self::keep`] took it out once the import succeeded. Every way
+/// an import can stop short (an error, a reader that went away) leaves through a drop of this.
+struct ImportGuard(Option<Inner>);
+
+impl ImportGuard {
+    /// The pack being filled.
+    fn get(&mut self) -> &mut Inner {
+        self.0.as_mut().expect("an import pack is present until it is kept")
+    }
+
+    /// The completed import, taken out so that it is kept.
+    fn keep(mut self) -> Inner {
+        self.0.take().expect("an import pack is kept once")
+    }
+}
+
+impl Drop for ImportGuard {
+    fn drop(&mut self) {
+        if let Some(pack) = self.0.as_mut() {
+            pack.discard_import();
+        }
+    }
+}
+
+/// What an import's stream reader ([`pump_import_frames`]) hands its blocking half: a record's
+/// frame (CRC-checked, its payload still as stored), `None` at the stream's clean end, or the
+/// error that ended the stream.
+type ImportFrame = Result<Option<Vec<u8>>, PackError>;
+
+/// A record of an import stream, decoded by the import's blocking half. A batch comes with its
+/// digest, hashed from the record's payload ([`batch_payload_digest`]).
+enum ImportRecord {
+    Meta(EpochMeta),
+    Header(Box<ConsensusHeader>),
+    Batch(Batch, BlockHash),
+}
+
+/// The import's blocking half of the stream: the frames its reader sends, decompressed and
+/// decoded here, on the blocking pool.
+struct ImportRecords {
+    frames: tokio::sync::mpsc::Receiver<ImportFrame>,
+    compression: PackCompression,
+    /// The decompression buffer, reused from record to record.
+    payload: Vec<u8>,
+}
+
+impl ImportRecords {
+    /// The next record, or `None` at the stream's clean end. Bytes that do not decompress or
+    /// decode are the sender's ([`record_read_error`]). A reader that is gone without reporting an
+    /// end means the import was abandoned: its future was dropped.
+    fn next(&mut self) -> Result<Option<ImportRecord>, PackError> {
+        let Some(frame) = self.frames.blocking_recv() else {
+            return Err(PackError::ReadError("stream import abandoned".to_string()));
+        };
+        let Some(frame) = frame? else { return Ok(None) };
+        let payload = match self.compression {
+            PackCompression::None => &frame[..],
+            PackCompression::ZStd => {
+                crate::archive::pack_iter::decompress_checked(&frame, &mut self.payload)
+                    .map_err(record_read_error)?
+            }
+        };
+        let record = tn_types::try_decode::<PackRecord>(payload)
+            .map_err(|e| record_read_error(FetchError::DeserializeValue(e.to_string())))?;
+        Ok(Some(match record {
+            PackRecord::EpochMeta(meta) => ImportRecord::Meta(meta),
+            PackRecord::Consensus(header) => ImportRecord::Header(header),
+            PackRecord::Batch(batch) => ImportRecord::Batch(batch, batch_payload_digest(payload)),
+        }))
+    }
+}
+
+/// The bcs variant index of [`PackRecord::Batch`]: the first byte of a batch record's payload.
+const BATCH_RECORD_TAG: u8 = 1;
+
+/// The digest of the batch a [`PackRecord::Batch`] record holds, hashed straight from the record's
+/// (decompressed) `payload` instead of from a re-encode of the decoded batch.
+///
+/// `Batch::digest` hashes the batch's bcs encoding, and the payload is the bcs encoding of
+/// `PackRecord::Batch(batch)`: the variant index (one byte, [`BATCH_RECORD_TAG`]) and then the
+/// batch's own encoding. bcs is canonical and its decoder strict (minimal ULEB128 lengths and no
+/// trailing bytes), so the payload of a record that decoded into `batch` is exactly what encoding
+/// it would produce, and its bytes past the variant index hash to `batch.digest()`
+/// (`test_batch_payload_digest_matches_batch_digest`). Only call it on a payload that decoded as a
+/// batch.
+fn batch_payload_digest(payload: &[u8]) -> BlockHash {
+    debug_assert_eq!(payload.first(), Some(&BATCH_RECORD_TAG), "not a batch record");
+    let mut hasher = tn_types::DefaultHashFunction::new();
+    hasher.update(payload.get(1..).unwrap_or_default());
+    BlockHash::from_slice(hasher.finalize().as_bytes())
 }
 
 /// Verify a streamed [`EpochMeta`] record links correctly to the previous epoch's record.
@@ -4445,6 +4953,11 @@ pub(crate) fn verify_epoch_meta(
     previous_epoch: &EpochRecord,
     epoch_meta: &EpochMeta,
 ) -> Result<(), PackError> {
+    // The record must be the one right before `epoch` (epoch 0 has none: its callers pass a
+    // stand-in for epoch 0). Another is the caller's mismatch, whatever the meta says.
+    if epoch != 0 && previous_epoch.epoch.checked_add(1) != Some(epoch) {
+        return Err(PackError::LocalEpochMismatch { local: previous_epoch.epoch, found: epoch });
+    }
     if epoch != epoch_meta.epoch {
         return Err(PackError::InvalidEpoch(
             epoch,
@@ -4679,24 +5192,55 @@ async fn next_output_record<R: AsyncRead + Unpin>(
 ) -> Result<Option<PackRecord>, PackError> {
     match tokio::time::timeout(timeout, iter.next()).await {
         Ok(Some(Ok(rec))) => Ok(Some(rec)),
-        // Bytes that frame but fail their CRC, do not deserialize, or declare an oversized record
-        // are a fault of whoever produced them. A transport error (including a truncated stream,
-        // a throughput-floor cut or a peer abort) or a timeout says nothing about those bytes.
-        Ok(Some(Err(
-            e @ (FetchError::CrcFailed
-            | FetchError::DeserializeValue(_)
-            | FetchError::RequestedSizeTooLarge(..)
-            | FetchError::RequestedDecompressSizeTooLarge(_)),
-        ))) => Err(PackError::UndecodableRecord(e.to_string())),
+        Ok(Some(Err(e))) => Err(record_read_error(e)),
+        Ok(None) => Ok(None),
+        Err(_) => Err(PackError::ReadError("timeout".to_string())),
+    }
+}
+
+/// Who a failure to read a record from a consensus-output stream is charged to.
+fn record_read_error(error: FetchError) -> PackError {
+    match error {
+        // Bytes that frame but fail their CRC, do not decompress or deserialize, or declare an
+        // oversized record are a fault of whoever produced them. A transport error (including a
+        // truncated stream, a throughput-floor cut or a peer abort) says nothing about those
+        // bytes.
+        e @ (FetchError::CrcFailed
+        | FetchError::DeserializeValue(_)
+        | FetchError::RequestedSizeTooLarge(..)
+        | FetchError::RequestedDecompressSizeTooLarge(_)) => {
+            PackError::UndecodableRecord(e.to_string())
+        }
         // A stream that ENDS inside a record was cut short by whoever produced it: a peer's sync
         // reader reports a clean end only after the peer's own `End` frame (a dropped connection
         // is `ConnectionAborted`), and a local file is simply truncated.
-        Ok(Some(Err(FetchError::IO(e)))) if e.kind() == io::ErrorKind::UnexpectedEof => {
-            Err(PackError::UndecodableRecord(format!("record truncated: {e}")))
+        FetchError::IO(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+            PackError::UndecodableRecord(format!("record truncated: {e}"))
         }
-        Ok(Some(Err(e))) => Err(PackError::ReadError(e.to_string())),
-        Ok(None) => Ok(None),
-        Err(_) => Err(PackError::ReadError("timeout".to_string())),
+        e => PackError::ReadError(e.to_string()),
+    }
+}
+
+/// An import's stream reader: read `stream_iter`'s record frames, each within `timeout`, and hand
+/// them to the import's blocking half through `frames` ([`Inner::stream_import`]). Stops after the
+/// stream's end or failure (sent as the last frame), or once the blocking half stops taking frames
+/// (it has the final, or failed). Only CRCs are checked here; nothing is decompressed.
+async fn pump_import_frames<R: AsyncRead + Unpin>(
+    stream_iter: &mut AsyncPackIter<PackRecord, R>,
+    timeout: Duration,
+    frames: tokio::sync::mpsc::Sender<ImportFrame>,
+) {
+    loop {
+        let frame = match tokio::time::timeout(timeout, stream_iter.next_frame()).await {
+            Ok(Some(Ok(frame))) => Ok(Some(frame)),
+            Ok(Some(Err(e))) => Err(record_read_error(e)),
+            Ok(None) => Ok(None),
+            Err(_) => Err(PackError::ReadError("timeout".to_string())),
+        };
+        let last = !matches!(frame, Ok(Some(_)));
+        if frames.send(frame).await.is_err() || last {
+            return;
+        }
     }
 }
 
@@ -4727,6 +5271,15 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // An authenticated header (Digest) or a verified parent link (Parent) bounds everything that
     // follows to the batches the header declares; a wrong/forged header is rejected here.
     check_header_expectation(&consensus_header, expectation)?;
+    // The committee decodes the output (its batch bound, its authors). One of another epoch, as
+    // when the caller's epoch record lags the output, is the caller's state, not the sender's.
+    let output_epoch = consensus_header.sub_dag.leader_epoch();
+    if output_epoch != committee.epoch() {
+        return Err(PackError::LocalEpochMismatch {
+            local: committee.epoch(),
+            found: output_epoch,
+        });
+    }
     let parent_hash = consensus_header.parent_hash;
     let deliver = consensus_header.sub_dag;
     let num_blocks = deliver.num_primary_batches();
@@ -5014,6 +5567,16 @@ pub enum PackError {
     UndecodableRecord(String),
     /// A certificate author is not present in the pack's committee.
     MissingAuthority,
+    /// The local state an output or a pack was checked with belongs to another epoch: a committee
+    /// of epoch `local` given an output of epoch `found`, or the record of epoch `local` given as
+    /// the one before epoch `found`. The caller's state is behind or mismatched (for example an
+    /// epoch record that lags the output), so this is never charged to the sender.
+    LocalEpochMismatch {
+        /// The epoch of the caller's committee or previous-epoch record.
+        local: Epoch,
+        /// The epoch of the output or pack being checked.
+        found: Epoch,
+    },
     /// The consensus headers do not form a valid parent-linked chain.
     InvalidConsensusChain,
     /// An output carried more batches than its sub-dag references.
@@ -5136,6 +5699,53 @@ impl PackError {
                 )
         )
     }
+
+    /// A failed data-log append: [`Self::IO`] when the OS failed the write (see
+    /// [`Self::os_failed`]), else [`Self::Append`].
+    fn append_failed(error: AppendError) -> Self {
+        match error {
+            AppendError::WriteDataError(os) => Self::os_failed("data append", os),
+            error => Self::Append(error.to_string()),
+        }
+    }
+
+    /// A failed append to the `index` index: [`Self::IO`] when the OS failed the write, else
+    /// [`Self::IndexAppend`].
+    fn index_append_failed(index: &str, error: AppendError) -> Self {
+        match error {
+            AppendError::WriteDataError(os) => {
+                Self::os_failed(&format!("{index} index append"), os)
+            }
+            error => Self::IndexAppend(format!("{index} {error}")),
+        }
+    }
+
+    /// A failed persist (the data log's sync, or the write before it): [`Self::IO`] when the OS
+    /// failed it, else [`Self::PersistError`].
+    fn persist_failed(error: CommitError) -> Self {
+        match error {
+            CommitError::Flush(FlushError::WriteData(os))
+            | CommitError::DataFileSync(os)
+            | CommitError::IndexFileSync(os)
+            | CommitError::Failed(os) => Self::os_failed("persist", os),
+            error => Self::PersistError(error.to_string()),
+        }
+    }
+
+    /// A failed flush of the data log: [`Self::IO`] when the OS failed the write, else
+    /// [`Self::PersistError`].
+    fn flush_failed(error: FlushError) -> Self {
+        match error {
+            FlushError::WriteData(os) => Self::os_failed("flush", os),
+            error => Self::PersistError(error.to_string()),
+        }
+    }
+
+    /// The OS's failure of the write `step`, as [`Self::IO`] with its `io::ErrorKind` kept (a full
+    /// disk is not a failed device) and `step` in its message.
+    fn os_failed(step: &str, os: io::Error) -> Self {
+        Self::IO(Arc::new(io::Error::new(os.kind(), format!("{step}: {os}"))))
+    }
 }
 
 /// True for an I/O failure caused by the environment rather than by a file's contents: descriptor
@@ -5179,6 +5789,9 @@ impl Display for PackError {
             PackError::UnexpectedRecord(error) => write!(f, "Unexpected record ({error})"),
             PackError::UndecodableRecord(error) => write!(f, "Undecodable record ({error})"),
             PackError::MissingAuthority => write!(f, "Missing authority"),
+            PackError::LocalEpochMismatch { local, found } => {
+                write!(f, "epoch {found} data checked with local state of epoch {local}")
+            }
             PackError::InvalidConsensusChain => write!(f, "Broken consensus record chain"),
             PackError::ExtraBatches => write!(f, "Extra batches in pack file"),
             PackError::MissingBatches => write!(f, "Missing batches in pack file"),
@@ -5890,16 +6503,36 @@ pub(crate) mod test {
     }
 
     /// Between saves the lanes keep their buffers only up to a total, not each up to it: a large
-    /// output's buffers are freed after it, and an ordinary one's are kept for the next save.
+    /// output's buffers are freed after it, and an ordinary one's are kept for the next save. The
+    /// total counts each lane's encoder stage too, which grows to the largest record it encoded.
     #[test]
     fn test_released_lanes_keep_a_bounded_total() {
         let mut encoder = OutputEncoder::with_lanes(PackCompression::None, u32::MAX, 8, 1);
         let kept = |encoder: &OutputEncoder| {
-            encoder.lanes.iter().map(|lane| lane.bytes.capacity()).sum::<usize>()
+            encoder
+                .lanes
+                .iter()
+                .map(|lane| lane.bytes.capacity() + lane.encoder.stage_capacity())
+                .sum::<usize>()
         };
         for lane in encoder.lanes_for(8) {
             lane.bytes.reserve(OutputEncoder::RETAIN_BYTES / 2);
         }
+        encoder.release();
+        assert!(kept(&encoder) <= OutputEncoder::RETAIN_BYTES, "kept {}", kept(&encoder));
+        assert!(kept(&encoder) > 0, "the first lanes keep theirs");
+        // A 2 MiB record in each of eight lanes fills its buffer and its stage alike.
+        let mut encoder = OutputEncoder::with_lanes(PackCompression::None, u32::MAX, 8, 1);
+        let large = PackRecord::Batch(Batch::new_for_test(
+            vec![vec![7; 2 << 20]],
+            ExecHeader::default(),
+            0,
+            0,
+        ));
+        for lane in encoder.lanes_for(8) {
+            lane.encode(&large).expect("encode");
+        }
+        assert!(kept(&encoder) > 2 * OutputEncoder::RETAIN_BYTES, "kept {}", kept(&encoder));
         encoder.release();
         assert!(kept(&encoder) <= OutputEncoder::RETAIN_BYTES, "kept {}", kept(&encoder));
         assert!(kept(&encoder) > 0, "the first lanes keep theirs");
@@ -5948,6 +6581,21 @@ pub(crate) mod test {
         }
         one.close().await;
         split.close().await;
+    }
+
+    /// Decoding an output decompresses, decodes and hashes each of its batches (milliseconds for a
+    /// large one), so `get_consensus_output` decodes on the blocking pool, as it reads, never on
+    /// the caller's async worker.
+    #[tokio::test]
+    async fn test_get_consensus_output_decodes_off_the_caller() {
+        let temp_dir = TempDir::with_prefix("test_pack_decode_off_caller").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 1);
+        pack.save_consensus_output(outputs[0].clone()).await.expect("save");
+        let read = pack.get_consensus_output(1).await.expect("read back");
+        compare_outputs(&read, &outputs[0]);
+        let decoded_on = pack.shared.decoded_on.lock().expect("decoded");
+        assert_ne!(decoded_on, std::thread::current().id(), "decoded on the caller's thread");
+        pack.close().await;
     }
 
     /// A request for many batches takes the pack's lock once per batch, so a save landing while it
@@ -6014,6 +6662,37 @@ pub(crate) mod test {
         // Only a sealed pack opens static: `close` sealed it, not a later drop.
         let sealed = ConsensusPack::open_static(temp_dir.path(), 0).expect("sealed by close");
         sealed.close().await;
+    }
+
+    /// A cancelled request for many batches stops at the read under way, rather than decoding
+    /// the rest of them (up to a chunk's hundreds of batches) for no one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_consensus_pack_cancelled_batches_request_stops_reading() {
+        let temp_dir = TempDir::with_prefix("test_pack_cancelled_batches").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 3);
+        for output in &outputs {
+            pack.save_consensus_output(output.clone()).await.expect("save");
+        }
+        let digests: Vec<BlockHash> = outputs.iter().flat_map(batch_digests_of).collect();
+        assert!(digests.len() >= 8, "a request that outlasts the test's checks");
+        let delay = Duration::from_millis(50);
+        pack.slow_batch_reads(delay);
+        let reader = {
+            let pack = pack.clone();
+            tokio::spawn(async move { pack.batches(digests).await })
+        };
+        // The first read is under way; cancel its caller.
+        tokio::time::sleep(delay / 2).await;
+        reader.abort();
+        assert!(reader.await.is_err(), "cancelled");
+        // The blocking task holds the pack's state until it returns: soon after the read under
+        // way, not after every batch.
+        let deadline = std::time::Instant::now() + delay * 4;
+        while Arc::strong_count(&pack.shared) > 1 {
+            assert!(std::time::Instant::now() < deadline, "the cancelled request kept reading");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        pack.close().await;
     }
 
     /// The split keeps the batches in order and gives each lane about an equal share of their
@@ -6200,7 +6879,10 @@ pub(crate) mod test {
                 stream,
                 0,
                 &previous_epoch,
-                num_outputs as u64 * 2,
+                ConsensusNumHash::new(
+                    num_outputs as u64 * 2,
+                    outputs.last().expect("outputs").digest(),
+                ),
                 Duration::from_secs(5),
             )
             .await
@@ -6368,7 +7050,7 @@ pub(crate) mod test {
             stream,
             SHARED_BATCH_EPOCH,
             &previous_epoch,
-            2,
+            ConsensusNumHash::new(2, output_2.digest()),
             Duration::from_secs(5),
         )
         .await
@@ -6430,6 +7112,101 @@ pub(crate) mod test {
         .await;
         // New format will fail by starting with a batch.  This would be TooManyBatches with v0.
         assert!(matches!(res, Err(PackError::UnexpectedRecord(_))), "expected UnexpectedRecord");
+    }
+
+    /// The decoded footprint of the batches buffered for one output is capped: once it passes the
+    /// per-output budget the decode stops with `OutputTooLarge` instead of buffering on. The
+    /// budget is forced down so an ordinary output crosses it.
+    #[tokio::test]
+    async fn test_iter_to_output_caps_buffered_bytes() {
+        use crate::consensus_pack::{bytes_to_output, PackError};
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_buffer_budget").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let output = make_test_output(&committee, 0, chain, 1, ConsensusHeader::default().digest());
+        let path = temp_dir.path().join("one_output");
+        let len = {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(output.consensus_header())))
+                .expect("append header");
+            for batch in batches_by_digest(&output).into_values() {
+                pack.append(&PackRecord::Batch(batch)).expect("append batch");
+            }
+            pack.commit().expect("commit");
+            pack.file_len() as usize
+        };
+        let bytes = std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..len].to_vec();
+
+        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(Some(1)));
+        let res = bytes_to_output(
+            Cursor::new(bytes.clone()),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        super::TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.set(None));
+        assert!(
+            matches!(res, Err(PackError::OutputTooLarge { max: 1, .. })),
+            "expected OutputTooLarge, got {res:?}"
+        );
+        // Within the real budget the same output decodes.
+        bytes_to_output(
+            Cursor::new(bytes),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await
+        .expect("the output decodes within the real budget");
+    }
+
+    /// The committee decodes an output (its batch bound, its certificate authors), so a committee
+    /// of another epoch than the output's must not: that is the caller's state lagging the output
+    /// (for example its epoch record), a local `LocalEpochMismatch` never charged to the sender,
+    /// rather than an honest peer's bytes misjudged.
+    #[tokio::test]
+    async fn test_iter_to_output_refuses_another_epochs_committee() {
+        use crate::consensus_pack::{bytes_to_output, PackError};
+        use std::io::Cursor;
+
+        let temp_dir = TempDir::with_prefix("test_cp_other_epoch").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let batch = tn_reth::test_utils::batches(chain, 1).pop().expect("one batch");
+        let member = committee.authorities().first().expect("committee has authorities").id();
+        let mut leader = leader_with_batches(&committee, member, std::slice::from_ref(&batch));
+        leader.update_header_epoch_for_test(committee.epoch() + 1);
+        let header = header_with_leader(leader);
+        let path = temp_dir.path().join("next_epoch_output");
+        let len = {
+            let mut pack: Pack<PackRecord> =
+                Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                    .expect("open pack");
+            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
+            pack.append(&PackRecord::Batch(batch)).expect("append batch");
+            pack.commit().expect("commit");
+            pack.file_len() as usize
+        };
+        let bytes = std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..len].to_vec();
+
+        let res = bytes_to_output(
+            Cursor::new(bytes),
+            PackCompression::ZStd,
+            Duration::from_secs(5),
+            &committee,
+        )
+        .await;
+        assert!(
+            matches!(res, Err(PackError::LocalEpochMismatch { local: 0, found: 1 })),
+            "expected LocalEpochMismatch, got {res:?}"
+        );
     }
 
     /// CP1b: in the v1 (header-first) format a hostile header whose sub-dag declares more than the
@@ -7352,6 +8129,133 @@ pub(crate) mod test {
         assert!(!temp_dir.path().join("epoch-0.replaced").exists());
     }
 
+    /// The at-rest doors a sealed past epoch's legacy pack migrates through.
+    #[derive(Clone, Copy, Debug)]
+    enum LegacyDoor {
+        /// The read-side heal `ConsensusChain::get_static` runs.
+        Heal,
+        /// `db migrate --force`.
+        Migrate,
+        /// `db repair --force`.
+        Repair,
+    }
+
+    /// A 3-output legacy v1 pack at `epoch-0` with no sentinel and its `missing` index directory
+    /// removed, beside an `epoch-1` directory so epoch 0 is a past epoch. With `damage` the last
+    /// byte of the final output is flipped. Returns the data log's path.
+    async fn past_legacy_pack_missing_index(
+        temp_dir: &TempDir,
+        missing: &str,
+        damage: bool,
+    ) -> std::path::PathBuf {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let epoch_dir = temp_dir.path().join("epoch-0");
+        let data_path = epoch_dir.join(Inner::DATA_NAME);
+        strip_sentinel(&data_path);
+        std::fs::remove_dir_all(epoch_dir.join(missing)).expect("remove index");
+        std::fs::create_dir(temp_dir.path().join("epoch-1")).expect("later epoch dir");
+        if damage {
+            let mut bytes = std::fs::read(&data_path).expect("read data");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+            std::fs::write(&data_path, &bytes).expect("damage the final output");
+        }
+        data_path
+    }
+
+    /// A legacy past epoch whose final output is damaged, with one of its indexes missing (so its
+    /// length attestation cannot be read), is refused by every door: a past epoch is complete, so
+    /// a replay that stops short of the log's end is damage to committed data, never an unacked
+    /// tail to drop. Nothing is changed. The control (an index missing, no damage) migrates all
+    /// three outputs through every door.
+    #[tokio::test]
+    async fn test_legacy_past_epoch_damaged_final_output_is_refused() {
+        for door in [LegacyDoor::Heal, LegacyDoor::Migrate, LegacyDoor::Repair] {
+            for missing in Inner::INDEX_DIRS {
+                let temp_dir = TempDir::with_prefix("legacy_past_damaged").expect("temp dir");
+                let data_path = past_legacy_pack_missing_index(&temp_dir, missing, true).await;
+                let before = std::fs::read(&data_path).expect("read data");
+                let case = format!("{door:?}, `{missing}` missing");
+                match door {
+                    LegacyDoor::Heal => {
+                        match ConsensusPack::build_static_heal(temp_dir.path(), 0) {
+                            Err(super::PackError::CorruptPack(_)) => {}
+                            other => panic!("{case}: the heal must refuse, got {other:?}"),
+                        }
+                    }
+                    LegacyDoor::Migrate => {
+                        assert!(
+                            super::legacy_migration_dry_run(&data_path, 0).is_err(),
+                            "{case}: the dry run must refuse"
+                        );
+                        for apply in [false, true] {
+                            match ConsensusPack::migrate_epoch(temp_dir.path(), 0, apply).await {
+                                Ok(EpochMigrate::Corrupt(_)) => {}
+                                other => panic!("{case}, apply {apply}: got {other:?}"),
+                            }
+                        }
+                    }
+                    LegacyDoor::Repair => {
+                        match ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await {
+                            Ok(EpochRepair::Unrepairable(_)) => {}
+                            other => panic!("{case}: repair must refuse, got {other:?}"),
+                        }
+                    }
+                }
+                assert_eq!(std::fs::read(&data_path).expect("read"), before, "{case}: untouched");
+                let mut left: Vec<_> = std::fs::read_dir(temp_dir.path())
+                    .expect("list")
+                    .map(|e| e.expect("entry").file_name().into_string().expect("utf8"))
+                    .collect();
+                left.sort();
+                assert_eq!(left, ["epoch-0", "epoch-1"], "{case}: no staging left");
+
+                // The newest epoch may carry an unacked tail, which the migration drops.
+                std::fs::remove_dir(temp_dir.path().join("epoch-1")).expect("remove later epoch");
+                assert_eq!(super::legacy_migration_dry_run(&data_path, 0), Ok(2), "{case}");
+            }
+        }
+
+        for door in [LegacyDoor::Heal, LegacyDoor::Migrate, LegacyDoor::Repair] {
+            for missing in Inner::INDEX_DIRS {
+                let temp_dir = TempDir::with_prefix("legacy_past_control").expect("temp dir");
+                let data_path = past_legacy_pack_missing_index(&temp_dir, missing, false).await;
+                let case = format!("control {door:?}, `{missing}` missing");
+                match door {
+                    LegacyDoor::Heal => {
+                        let heal = ConsensusPack::build_static_heal(temp_dir.path(), 0)
+                            .unwrap_or_else(|e| panic!("{case}: {e:?}"))
+                            .expect("a legacy pack needs a heal");
+                        ConsensusPack::install_static_heal(temp_dir.path(), 0, heal)
+                            .unwrap_or_else(|e| panic!("{case}: install: {e:?}"));
+                    }
+                    LegacyDoor::Migrate => {
+                        match ConsensusPack::migrate_epoch(temp_dir.path(), 0, true).await {
+                            Ok(EpochMigrate::Migrated(_)) => {}
+                            other => panic!("{case}: got {other:?}"),
+                        }
+                    }
+                    LegacyDoor::Repair => {
+                        match ConsensusPack::repair_epoch(temp_dir.path(), 0, true).await {
+                            Ok(EpochRepair::Repaired(_)) => {}
+                            other => panic!("{case}: got {other:?}"),
+                        }
+                    }
+                }
+                assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "{case}");
+                let pack = ConsensusPack::open_static(temp_dir.path(), 0).expect("open migrated");
+                for i in 1..=3 {
+                    assert!(pack.get_consensus_output(i).await.is_ok(), "{case}: output {i}");
+                }
+                pack.close().await;
+            }
+        }
+    }
+
     /// A node reopening its current epoch for append after an upgrade migrates the legacy pack to
     /// v2 transparently through `open_append_exists`, then keeps appending: the pack becomes
     /// v2, the pre-upgrade outputs still read back, and a freshly appended output reads back
@@ -7386,6 +8290,110 @@ pub(crate) mod test {
             assert!(ro.get_consensus_output(i).await.is_ok(), "output {i} must read back");
         }
         ro.close().await;
+    }
+
+    /// The release before v2 could stop between writing a new epoch's data header and its meta,
+    /// leaving a legacy data log that holds only its header (and its empty indexes). There is
+    /// nothing in it to migrate: the writable open starts the epoch's pack afresh in the current
+    /// format, as for a brand-new epoch, rather than refusing the pack. The read-only doors keep
+    /// refusing it (a past epoch is never header-only).
+    #[tokio::test]
+    async fn test_open_append_restarts_a_header_only_legacy_pack() {
+        let temp_dir = TempDir::with_prefix("test_header_only_legacy").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 0, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        // What a stop before the meta leaves: the v1 header, then the grown capacity's zeros.
+        let mut header_only =
+            std::fs::read(&data_path).expect("read data")[..DATA_HEADER_BYTES].to_vec();
+        header_only.resize(DATA_HEADER_BYTES + 4096, 0);
+        std::fs::write(&data_path, &header_only).expect("write header-only legacy data");
+        assert_eq!(peek_pack_version(&data_path), 1, "precondition: a v1 data log");
+
+        let pack = ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone())
+            .expect("a header-only legacy pack restarts as a new epoch's pack");
+        let output =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        pack.save_consensus_output(output).await.expect("save into the restarted pack");
+        pack.persist().await.expect("persist");
+        pack.close().await;
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "the restarted pack is v2");
+        let ro = ConsensusPack::open_static(temp_dir.path(), 0).expect("the restarted pack seals");
+        assert!(ro.get_consensus_output(1).await.is_ok(), "its output reads back");
+        ro.close().await;
+
+        // A legacy pack whose meta's length prefix reads as zero but whose outputs remain past it
+        // is not header-only: it is kept, untouched, and refused, never started afresh.
+        let temp_dir = TempDir::with_prefix("test_header_only_legacy_held").expect("temp dir");
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        let mut data = std::fs::read(&data_path).expect("read data");
+        data[DATA_HEADER_BYTES..DATA_HEADER_BYTES + 4].fill(0);
+        std::fs::write(&data_path, &data).expect("write data");
+        assert!(
+            ConsensusPack::open_append(temp_dir.path(), previous_epoch, committee.clone()).is_err(),
+            "a legacy pack with data past a zeroed meta prefix is refused"
+        );
+        assert_eq!(std::fs::read(&data_path).expect("read data"), data, "and left untouched");
+    }
+
+    /// A legacy pack that reaches a writable open unmigrated (its read-only legacy check failed)
+    /// is refused by both writable doors, with nothing written: v2 is the only writable format.
+    /// The next open migrates it. An environmental failure of the check itself (here a permission
+    /// error) surfaces as that I/O error rather than being read as "not legacy".
+    #[tokio::test]
+    async fn test_writable_open_refuses_unmigrated_legacy_pack() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temp_dir = TempDir::with_prefix("test_writable_legacy").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        strip_sentinel(&data_path);
+        let before = std::fs::read(&data_path).expect("read data");
+
+        super::SKIP_NEXT_LEGACY_CHECK.with(|skip| skip.set(true));
+        match ConsensusPack::open_append_exists(temp_dir.path(), 0) {
+            Err(super::PackError::InvalidVersion(..)) => {}
+            other => panic!("open_append_exists must refuse a v1 pack, got {other:?}"),
+        }
+        super::SKIP_NEXT_LEGACY_CHECK.with(|skip| skip.set(true));
+        match ConsensusPack::open_append(temp_dir.path(), previous_epoch.clone(), committee.clone())
+        {
+            Err(super::PackError::InvalidVersion(..)) => {}
+            other => panic!("open_append must refuse a v1 pack, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&data_path).expect("read data"), before, "nothing written");
+
+        let set_mode = |mode| {
+            std::fs::set_permissions(&data_path, std::fs::Permissions::from_mode(mode))
+                .expect("chmod data")
+        };
+        set_mode(0o000);
+        if std::fs::File::open(&data_path).is_err() {
+            let result = ConsensusPack::open_append_exists(temp_dir.path(), 0);
+            set_mode(0o644);
+            match result {
+                Err(super::PackError::IO(e)) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::PermissionDenied)
+                }
+                other => panic!("expected the check's I/O error, got {other:?}"),
+            }
+        } else {
+            // Permissions are not enforced (running as root): nothing to exercise here.
+            set_mode(0o644);
+        }
+
+        let pack = ConsensusPack::open_append_exists(temp_dir.path(), 0).expect("migrate on open");
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "migrated");
+        pack.close().await;
     }
 
     /// `validate_pack_file` cross-checks every derived index entry against the data log, so a
@@ -8003,6 +9011,77 @@ pub(crate) mod test {
         assert!(pack.get_consensus_output(2).await.is_err(), "rolled-back output 2 must be absent");
     }
 
+    /// The levels of the warnings and errors logged on this thread while `f` runs.
+    pub(crate) fn warnings_and_errors<R>(f: impl FnOnce() -> R) -> (R, Vec<tracing::Level>) {
+        use tracing::{span, Event, Level, Metadata, Subscriber};
+        /// Records each warning's and error's level.
+        struct Levels(Arc<parking_lot::Mutex<Vec<Level>>>);
+        impl Subscriber for Levels {
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+                span::Id::from_u64(1)
+            }
+            fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+            fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+            fn event(&self, event: &Event<'_>) {
+                let level = *event.metadata().level();
+                if level <= Level::WARN {
+                    self.0.lock().push(level);
+                }
+            }
+            fn enter(&self, _: &span::Id) {}
+            fn exit(&self, _: &span::Id) {}
+        }
+        let levels = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let result = tracing::subscriber::with_default(Levels(Arc::clone(&levels)), f);
+        let levels = levels.lock().clone();
+        (result, levels)
+    }
+
+    /// A batch read that finds a stored record it cannot serve returns `None`, as a miss does, but
+    /// says so: an entry left stale by a rolled-back save (it points at another batch) is a
+    /// warning, and a record that fails its CRC is an error. Rot is otherwise silently treated as
+    /// absent: the worker re-fetches the batch from peers and serves peers a short answer.
+    #[test]
+    fn test_unservable_stored_batch_is_logged() {
+        use crate::archive::index::Index as _;
+        let temp_dir = TempDir::with_prefix("test_cp_batch_read_logged").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let output = make_test_output(&committee, 0, chain, 1, ConsensusHeader::default().digest());
+        let digests = batch_digests_of(&output);
+        assert!(digests.len() >= 2, "fixture has batches");
+        let mut inner =
+            Inner::open_append(temp_dir.path(), &previous_epoch, committee, PACK_VERSION)
+                .expect("open append");
+        inner.save_consensus_output(&output).expect("save");
+        let (read, logged) = warnings_and_errors(|| inner.batch(digests[0]));
+        assert!(read.is_some(), "a stored batch reads back");
+        assert!(logged.is_empty(), "a good read logs nothing: {logged:?}");
+
+        // A stale entry: a digest indexed at another batch's record.
+        let stale = BlockHash::repeat_byte(0xab);
+        let other = inner.batch_digests.get(digests[1]).expect("indexed");
+        inner.batch_digests.save(stale, other).expect("index the stale entry");
+        let (read, logged) = warnings_and_errors(|| inner.batch(stale));
+        assert!(read.is_none(), "a batch under another digest is not served");
+        assert_eq!(logged, [tracing::Level::WARN], "a stale entry is a warning");
+
+        // Rot: a byte of a sealed batch record flipped at rest.
+        let pos = inner.batch_digests.get(digests[0]).expect("indexed");
+        inner.persist().expect("persist");
+        drop(inner);
+        corrupt_byte_at(&temp_dir.path().join("epoch-0").join(Inner::DATA_NAME), pos + 8);
+        let inner = Inner::open_static(temp_dir.path(), 0).expect("open static");
+        let (read, logged) = warnings_and_errors(|| inner.batch(digests[0]));
+        assert!(read.is_none(), "a corrupt batch is not served");
+        assert_eq!(logged, [tracing::Level::ERROR], "a corrupt batch is an error");
+    }
+
     /// `ConsensusPack::close` is an async drop: it must fully SEAL the pack (commit the data, sync
     /// the indexes, write the clean-close sentinels) before returning — not merely persist the
     /// data. Proof: `open_static` requires a consistent, cleanly-sealed pack (it never
@@ -8164,6 +9243,180 @@ pub(crate) mod test {
         assert_eq!(staging(), 1, "the build stages its rebuilt indexes");
         drop(heal);
         assert_eq!(staging(), 0, "an uninstalled heal removes its staging");
+    }
+
+    /// A heal or migration whose install fails removes its staging directory instead of leaving
+    /// a rebuilt copy on disk until the next startup sweep, and a later attempt still installs.
+    /// Covers the index heal, the read-side legacy migration and `db migrate`'s install.
+    #[tokio::test]
+    async fn test_failed_install_removes_its_staging() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let entries = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("read dir")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let fail_next_install = || super::FAIL_NEXT_INSTALL.with(|fail| fail.set(true));
+
+        // The index heal of a sealed v2 epoch.
+        let temp_dir = TempDir::with_prefix("test_heal_install_fails").expect("temp dir");
+        build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+        let base_dir = temp_dir.path().join("epoch-0");
+        std::fs::remove_dir_all(base_dir.join(Inner::CONSENSUS_HASH_NAME)).expect("remove index");
+        let heal = ConsensusPack::build_static_heal(temp_dir.path(), 0)
+            .expect("build")
+            .expect("a missing index needs a heal");
+        fail_next_install();
+        assert!(ConsensusPack::install_static_heal(temp_dir.path(), 0, heal).is_err());
+        assert!(
+            !entries(&base_dir).iter().any(|name| name.starts_with(Inner::REINDEX_DIR)),
+            "a failed index install leaves no staging: {:?}",
+            entries(&base_dir)
+        );
+        let heal = ConsensusPack::build_static_heal(temp_dir.path(), 0)
+            .expect("rebuild")
+            .expect("the epoch still needs its heal");
+        ConsensusPack::install_static_heal(temp_dir.path(), 0, heal).expect("install");
+        ConsensusPack::open_static(temp_dir.path(), 0).expect("healed").close().await;
+
+        // The read-side migration of a legacy epoch, then `db migrate`'s.
+        let temp_dir = TempDir::with_prefix("test_migration_install_fails").expect("temp dir");
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        strip_sentinel(&data_path);
+        let heal = ConsensusPack::build_static_heal(temp_dir.path(), 0)
+            .expect("build")
+            .expect("a legacy pack needs a heal");
+        fail_next_install();
+        assert!(ConsensusPack::install_static_heal(temp_dir.path(), 0, heal).is_err());
+        assert_eq!(entries(temp_dir.path()), ["epoch-0"], "a failed migration install");
+        assert_eq!(peek_pack_version(&data_path), 1, "the legacy pack stays in place");
+        fail_next_install();
+        assert!(Inner::migrate_pack(temp_dir.path(), 0, true, false).is_err());
+        assert_eq!(entries(temp_dir.path()), ["epoch-0"], "a failed `db migrate` install");
+        assert_eq!(peek_pack_version(&data_path), 1, "the legacy pack stays in place");
+        match Inner::migrate_pack(temp_dir.path(), 0, true, false).expect("migrate") {
+            EpochMigrate::Migrated(_) => {}
+            other => panic!("expected Migrated, got {other:?}"),
+        }
+        assert_eq!(peek_pack_version(&data_path), PACK_VERSION, "migrated");
+    }
+
+    /// An install's rename moves the staged directory out of its own parent and into the live
+    /// one; when those differ (an import staged under `import-N/`), both are synced.
+    #[test]
+    fn test_install_syncs_both_directories_of_the_rename() {
+        let temp_dir = TempDir::with_prefix("test_install_syncs").expect("temp dir");
+        let parent = temp_dir.path();
+        let staging_parent = parent.join("import-0");
+        let staged = staging_parent.join("epoch-0");
+        let live = parent.join("epoch-0");
+        std::fs::create_dir_all(&staged).expect("staged dir");
+        std::fs::write(staged.join("data"), b"new").expect("staged file");
+        std::fs::create_dir(&live).expect("live dir");
+
+        super::INSTALL_DIR_SYNCS.with(|syncs| syncs.borrow_mut().clear());
+        super::install_dir_rename_aside(parent, &live, &parent.join("epoch-0.replaced"), &staged)
+            .expect("install");
+        let synced = super::INSTALL_DIR_SYNCS.with(|syncs| syncs.take());
+        assert!(synced.iter().any(|dir| dir == parent), "the live parent: {synced:?}");
+        assert!(synced.contains(&staging_parent), "the staged parent: {synced:?}");
+        assert_eq!(std::fs::read(live.join("data")).expect("installed"), b"new");
+        assert!(!staged.exists() && !parent.join("epoch-0.replaced").exists());
+    }
+
+    /// A migration whose staged v2 pack did not seal (its `Drop` swallows a failed sync) is not
+    /// installed: the legacy pack stays in place and the staging is removed, where installing it
+    /// would replace the source with a pack every read-only open refuses. A later attempt migrates.
+    #[tokio::test]
+    async fn test_migration_refuses_a_staged_pack_that_did_not_seal() {
+        let temp_dir = TempDir::with_prefix("test_migration_unsealed").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        build_test_pack_version(&temp_dir, &committee, &chain, &previous_epoch, 3, 1).await;
+        let data_path = temp_dir.path().join("epoch-0").join(Inner::DATA_NAME);
+        strip_sentinel(&data_path);
+
+        super::FAIL_NEXT_MIGRATION_SEAL.with(|fail| fail.set(true));
+        assert!(Inner::migrate_pack(temp_dir.path(), 0, true, false).is_err());
+        assert_eq!(peek_pack_version(&data_path), 1, "the legacy pack stays in place");
+        assert!(!temp_dir.path().join("epoch-0.migrating").exists(), "staging removed");
+
+        match Inner::migrate_pack(temp_dir.path(), 0, true, false).expect("migrate") {
+            EpochMigrate::Migrated(_) => {}
+            other => panic!("expected Migrated, got {other:?}"),
+        }
+        ConsensusPack::open_static(temp_dir.path(), 0).expect("migrated").close().await;
+    }
+
+    /// A read-side heal must refuse a pack whose leading epoch meta `open_static` would refuse
+    /// (missing, or for another epoch) rather than install a heal after which the open still
+    /// fails: a "successful" heal is never backed off, so every read would rerun it. The refusal
+    /// is a `CorruptPack`, which the heal back-off remembers. Covers the index rebuild of a sealed
+    /// v2 pack and the migration of a legacy one.
+    #[tokio::test]
+    async fn test_static_heal_refuses_a_pack_open_static_cannot_serve() {
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        // (data version, keep a meta (re-labelled to epoch 5) or drop it)
+        for (version, keep_meta) in [(PACK_VERSION, false), (PACK_VERSION, true), (1, true)] {
+            let case = format!("v{version}, meta kept: {keep_meta}");
+            let temp_dir = TempDir::with_prefix("test_heal_bad_meta").expect("temp dir");
+            build_test_pack(&temp_dir, &committee, &chain, &previous_epoch, 3).await;
+            let epoch_dir = temp_dir.path().join("epoch-0");
+            let data_path = epoch_dir.join(Inner::DATA_NAME);
+            let mut records: Vec<PackRecord> = {
+                let src = Pack::<PackRecord>::open(
+                    &data_path,
+                    0,
+                    true,
+                    PackCompression::ZStd,
+                    PACK_VERSION,
+                )
+                .expect("open data");
+                src.raw_iter().expect("iter").map(|r| r.expect("record")).collect()
+            };
+            match records.first_mut() {
+                Some(PackRecord::EpochMeta(meta)) if keep_meta => meta.epoch = 5,
+                Some(PackRecord::EpochMeta(_)) => {
+                    records.remove(0);
+                }
+                other => panic!("the first record is the meta, got {other:?}"),
+            }
+            // A sealed copy holding those records, in place of the data log.
+            let rewritten = epoch_dir.join("data.rewritten");
+            {
+                let mut dst =
+                    Pack::<PackRecord>::open(&rewritten, 0, false, PackCompression::ZStd, version)
+                        .expect("create data");
+                for record in &records {
+                    dst.append(record).expect("append");
+                }
+                dst.commit().expect("commit");
+            }
+            std::fs::rename(&rewritten, &data_path).expect("replace data");
+            if version < super::SENTINEL_MIN_VERSION {
+                strip_sentinel(&data_path);
+            }
+            for name in Inner::INDEX_DIRS {
+                std::fs::remove_dir_all(epoch_dir.join(name)).expect("remove index");
+            }
+
+            match ConsensusPack::build_static_heal(temp_dir.path(), 0) {
+                Err(super::PackError::CorruptPack(_)) => {}
+                other => panic!("{case}: the heal must refuse, got {other:?}"),
+            }
+        }
     }
 
     /// When what fails the read-only open's consistency check is the position index's own last
@@ -8500,6 +9753,21 @@ pub(crate) mod test {
         partial.push(dropped);
         pack.save_consensus_output(with_batches(partial)).await.expect("the full set saves");
         pack.close().await;
+    }
+
+    /// A save or a persist the OS failed is `PackError::IO`, keeping the `io::ErrorKind`, so a
+    /// caller can tell a full disk from a failed device.
+    #[tokio::test]
+    async fn test_failed_save_and_persist_keep_the_io_error_kind() {
+        let temp_dir = TempDir::with_prefix("test_save_io_kind").expect("temp dir");
+        let (pack, _, _, outputs) = pack_with_outputs(temp_dir.path(), 1);
+        let is_full_disk = |err: &super::PackError| matches!(err, super::PackError::IO(e) if e.kind() == std::io::ErrorKind::StorageFull);
+        pack.shared.inner.write().as_mut().expect("open").data.fail_next_append_for_test();
+        let err = pack.save_consensus_output(outputs[0].clone()).await.expect_err("injected");
+        assert!(is_full_disk(&err), "save: {err:?}");
+        // The failed write poisoned the data log, so the persist refuses with its error.
+        let err = pack.persist().await.expect_err("poisoned");
+        assert!(is_full_disk(&err), "persist: {err:?}");
     }
 
     /// An unclean pack can end in an incomplete output whose last record happens to end the file
@@ -10049,7 +11317,7 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            num_outputs as u64,
+            ConsensusNumHash::new(num_outputs as u64, outputs[num_outputs - 1].digest()),
             Duration::from_secs(5),
         )
         .await
@@ -10830,6 +12098,36 @@ pub(crate) mod test {
         assert!(matches!(err, PackError::InvalidEpoch(2, _)), "got {err:?}");
     }
 
+    /// `verify_epoch_meta` links a pack to the record of the epoch right before it. Given another
+    /// epoch's record, it refuses even a meta that agrees with that record on every field, as the
+    /// caller's mismatch (`LocalEpochMismatch`), not the sender's.
+    #[test]
+    fn test_verify_epoch_meta_requires_the_previous_epochs_record() {
+        use crate::consensus_pack::{verify_epoch_meta, EpochMeta, PackError};
+
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let rec0 = EpochRecord {
+            epoch: 0,
+            committee: committee.bls_keys().iter().copied().collect(),
+            next_committee: committee.bls_keys().iter().copied().collect(),
+            final_consensus: ConsensusNumHash::new(10, ConsensusHeaderDigest::default()),
+            ..Default::default()
+        };
+        let meta_for = |epoch: Epoch| EpochMeta {
+            epoch,
+            committee: committee.advance_epoch_for_test(epoch),
+            start_consensus_number: rec0.final_consensus.number + 1,
+            genesis_exec_state: rec0.final_state,
+            genesis_consensus: rec0.final_consensus,
+        };
+
+        verify_epoch_meta(1, &rec0, &meta_for(1)).expect("the next epoch links to its record");
+        let err = verify_epoch_meta(2, &rec0, &meta_for(2))
+            .expect_err("epoch 0's record is not the one before epoch 2");
+        assert!(matches!(err, PackError::LocalEpochMismatch { local: 0, found: 2 }), "got {err:?}");
+    }
+
     /// `verify_epoch_meta` pins the [`EpochMeta`]'s embedded committee to the record's own epoch.
     ///
     /// The committee's epoch is what selects its bcs layout, so a meta whose outer epoch and
@@ -11244,7 +12542,7 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
@@ -11363,7 +12661,7 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
@@ -11384,12 +12682,14 @@ pub(crate) mod test {
         let previous_epoch = test_previous_epoch(&fixture.committee());
         let is_storage_full = |e: &PackError| matches!(e, PackError::IO(io_err) if io_err.kind() == io::ErrorKind::StorageFull);
 
-        let Err(err) = Inner::stream_import(
-            temp_dir.path(),
-            &[][..],
+        let bytes = peer_stream_bytes(temp_dir.path(), &fixture.committee(), &previous_epoch, &[]);
+        let target = TempDir::with_prefix("test_import_floor_dst").expect("temp dir");
+        let Err(err) = ConsensusPack::stream_import_with_floor(
+            target.path(),
+            std::io::Cursor::new(bytes),
             0,
             &previous_epoch,
-            1,
+            ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
             u64::MAX,
         )
@@ -11398,12 +12698,43 @@ pub(crate) mod test {
             panic!("an import with no room must stop");
         };
         assert!(is_storage_full(&err), "got {err:?}");
+        assert_nothing_imported(&target);
 
         let mut floor =
             DiskFloor { dir: temp_dir.path().to_owned(), min_free: u64::MAX, checked_at: Some(0) };
         assert!(floor.check(IMPORT_FREE_CHECK_EVERY - 1).is_ok(), "no check within the interval");
         let err = floor.check(IMPORT_FREE_CHECK_EVERY).expect_err("checked after the interval");
         assert!(is_storage_full(&err), "got {err:?}");
+    }
+
+    /// A check passes only with the headroom above the floor that the import's files may still
+    /// take before the next check (their preallocated growth steps and the check interval), so
+    /// free space never ends up under the floor between two checks. A floor of zero (an operator's
+    /// own restore) never stops an import.
+    #[test]
+    fn test_import_floor_keeps_headroom_for_growth() {
+        use std::io;
+
+        use crate::consensus_pack::{available_space, DiskFloor, PackError, IMPORT_FREE_HEADROOM};
+        let temp_dir = TempDir::with_prefix("test_import_floor_headroom").expect("temp dir");
+        let dir = temp_dir.path().to_owned();
+        let free = available_space(&dir).expect("free space");
+        assert!(
+            free > 4 * IMPORT_FREE_HEADROOM,
+            "the test needs {} bytes free",
+            4 * IMPORT_FREE_HEADROOM
+        );
+        let check = |min_free| DiskFloor { dir: dir.clone(), min_free, checked_at: None }.check(0);
+
+        // Above the floor, but by less than the headroom (a margin either way for other writers).
+        let err =
+            check(free - IMPORT_FREE_HEADROOM / 2).expect_err("too little room above the floor");
+        assert!(
+            matches!(&err, PackError::IO(e) if e.kind() == io::ErrorKind::StorageFull),
+            "got {err:?}"
+        );
+        check(free - 2 * IMPORT_FREE_HEADROOM).expect("room for the headroom above the floor");
+        check(0).expect("no floor");
     }
 
     /// A streamed import builds a fresh pack strictly in order, so a header whose number does not
@@ -11468,7 +12799,7 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            5,
+            ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
@@ -11533,7 +12864,7 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            5,
+            ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
@@ -11550,12 +12881,485 @@ pub(crate) mod test {
             stream,
             0,
             &previous_epoch,
-            0,
+            ConsensusNumHash::new(0, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
         .expect_err("the next number past a stale final stops the import");
         assert!(matches!(err, PackError::ConsensusNumberTooHigh), "got {err:?}");
+    }
+
+    /// The records a peer streams for `outputs`: each header, then its batches in digest order.
+    fn output_records(outputs: &[ConsensusOutput]) -> Vec<PackRecord> {
+        outputs
+            .iter()
+            .flat_map(|output| {
+                std::iter::once(PackRecord::Consensus(Box::new(output.consensus_header())))
+                    .chain(batches_by_digest(output).into_values().map(PackRecord::Batch))
+            })
+            .collect()
+    }
+
+    /// The logical bytes of an epoch-0 pack holding the meta for `committee` (linked to
+    /// `previous_epoch`) and then `records`, as a peer streams them. Written under `dir`.
+    fn peer_stream_bytes(
+        dir: &Path,
+        committee: &Committee,
+        previous_epoch: &EpochRecord,
+        records: &[PackRecord],
+    ) -> Vec<u8> {
+        let path = dir.join("peer_stream");
+        // A fresh file each time: `Pack::open` appends to an existing one.
+        let _ = std::fs::remove_file(&path);
+        let mut pack: Pack<PackRecord> =
+            Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
+                .expect("open peer stream");
+        pack.append(&PackRecord::EpochMeta(EpochMeta {
+            epoch: 0,
+            committee: committee.clone(),
+            start_consensus_number: 1,
+            genesis_exec_state: previous_epoch.final_state,
+            genesis_consensus: previous_epoch.final_consensus,
+        }))
+        .expect("append meta");
+        for record in records {
+            pack.append(record).expect("append record");
+        }
+        pack.commit().expect("commit peer stream");
+        let len = pack.file_len() as usize;
+        drop(pack);
+        let mut bytes = std::fs::read(&path).expect("read peer stream");
+        bytes.truncate(len);
+        bytes
+    }
+
+    /// Import `bytes` as epoch 0 into a fresh directory, asking for the chain up to the certified
+    /// `final_consensus`. Returns the result and the directory, so a test can check what the
+    /// import left on disk.
+    async fn import_peer_stream(
+        bytes: Vec<u8>,
+        previous_epoch: &EpochRecord,
+        final_consensus: ConsensusNumHash,
+    ) -> (Result<ConsensusPack, super::PackError>, TempDir) {
+        let target = TempDir::with_prefix("test_peer_import").expect("temp dir");
+        let res = ConsensusPack::stream_import(
+            target.path(),
+            std::io::Cursor::new(bytes),
+            0,
+            previous_epoch,
+            final_consensus,
+            Duration::from_secs(5),
+        )
+        .await;
+        (res, target)
+    }
+
+    /// A rejected import leaves no pack behind: its data log was discarded, not sealed in place.
+    fn assert_nothing_imported(target: &TempDir) {
+        assert!(
+            !target.path().join("epoch-0").join(Inner::DATA_NAME).exists(),
+            "a rejected import must not leave its data log behind"
+        );
+    }
+
+    /// The backward walk: only the final header is authenticated (against the certified record),
+    /// so every earlier output is trusted only through the parent links that lead back from it.
+    /// An intermediate output replaced by another one (its own parent link intact) breaks the
+    /// link from the authentic output after it, and the import fails there with
+    /// `InvalidConsensusChain`. An authentic header followed by an altered batch fails at that
+    /// batch: its digest is not the next one the header declares (`UnexpectedRecord`).
+    #[tokio::test]
+    async fn test_stream_import_rejects_an_altered_intermediate_output() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_import_backward_walk").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let mut parent = ConsensusHeader::default().digest();
+        let outputs: Vec<ConsensusOutput> = (1..=3)
+            .map(|number| {
+                let output = make_test_output(
+                    &committee,
+                    number as usize % 4,
+                    chain.clone(),
+                    number,
+                    parent,
+                );
+                parent = output.digest();
+                output
+            })
+            .collect();
+        let certified = ConsensusNumHash::new(3, outputs[2].digest());
+
+        // The authentic chain imports (the control).
+        let authentic = peer_stream_bytes(
+            temp_dir.path(),
+            &committee,
+            &previous_epoch,
+            &output_records(&outputs),
+        );
+        let (res, _target) = import_peer_stream(authentic, &previous_epoch, certified).await;
+        res.expect("the authentic chain imports").close().await;
+
+        // Output 2 replaced by a different one that still links to output 1.
+        let forged = make_test_output(&committee, 0, chain.clone(), 2, outputs[0].digest());
+        assert_ne!(forged.digest(), outputs[1].digest(), "the forged output must differ");
+        let records = output_records(&[outputs[0].clone(), forged, outputs[2].clone()]);
+        let bytes = peer_stream_bytes(temp_dir.path(), &committee, &previous_epoch, &records);
+        let (res, target) = import_peer_stream(bytes, &previous_epoch, certified).await;
+        let err = res.expect_err("a replaced intermediate output must not import");
+        assert!(matches!(err, PackError::InvalidConsensusChain), "got {err:?}");
+        assert_nothing_imported(&target);
+
+        // Output 2's header authentic, one of its batches altered.
+        let mut records = output_records(&outputs);
+        // Records: output 1 is 0..=4 (header and 4 batches), output 2's header is 5.
+        let PackRecord::Batch(batch) = &mut records[6] else { panic!("record 6 is a batch") };
+        batch.worker_id += 1;
+        let bytes = peer_stream_bytes(temp_dir.path(), &committee, &previous_epoch, &records);
+        let (res, target) = import_peer_stream(bytes, &previous_epoch, certified).await;
+        let err = res.expect_err("an altered intermediate batch must not import");
+        assert!(matches!(err, PackError::UnexpectedRecord(_)), "got {err:?}");
+        assert_nothing_imported(&target);
+    }
+
+    /// A leader certificate for `committee`'s epoch whose payload declares `batches`, authored by
+    /// `author`.
+    fn leader_with_batches(
+        committee: &Committee,
+        author: tn_types::AuthorityIdentifier,
+        batches: &[Batch],
+    ) -> Certificate {
+        let mut leader = Certificate::default();
+        leader.update_header_author_for_test(author);
+        leader.update_header_for_test(
+            batches
+                .iter()
+                .fold(HeaderBuilder::from_header(leader.header()), |builder, batch| {
+                    builder.with_payload_batch(batch, 0_u16)
+                })
+                .build(),
+        );
+        leader.update_header_epoch_for_test(committee.epoch());
+        leader
+    }
+
+    /// Output 1 of epoch 0 with `leader` as its only certificate.
+    fn header_with_leader(leader: Certificate) -> ConsensusHeader {
+        ConsensusHeader {
+            parent_hash: Default::default(),
+            sub_dag: CommittedSubDag::new(
+                vec![leader.clone()],
+                leader,
+                1,
+                ReputationScores::default(),
+                None,
+                tn_types::EpochSeedChainValue::genesis_placeholder(),
+            ),
+            number: 1,
+            extra: Default::default(),
+        }
+    }
+
+    /// The import's per-output rejections, each before the offending bytes are written: a header
+    /// declaring more batches than any legitimate output (`TooManyBatches`), a batch over the
+    /// epoch's byte cap (`BatchTooLarge`), a certificate author outside the epoch's committee
+    /// (`UnexpectedRecord`), and a stream that ends cleanly while an output still owes batches
+    /// (`MissingBatch`). None leaves a pack behind.
+    #[tokio::test]
+    async fn test_stream_import_rejects_malformed_outputs() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_import_rejections").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let member = committee.authorities().first().expect("committee has authorities").id();
+        let reject = |records: Vec<PackRecord>| {
+            let bytes = peer_stream_bytes(temp_dir.path(), &committee, &previous_epoch, &records);
+            let previous_epoch = previous_epoch.clone();
+            async move {
+                let final_consensus = ConsensusNumHash::new(3, ConsensusHeaderDigest::default());
+                let (res, target) =
+                    import_peer_stream(bytes, &previous_epoch, final_consensus).await;
+                let err = res.expect_err("a malformed output must not import");
+                assert_nothing_imported(&target);
+                err
+            }
+        };
+
+        let wide = make_wide_test_output(
+            &committee,
+            chain.clone(),
+            1,
+            ConsensusHeader::default().digest(),
+            max_batches_per_output(&committee) + 1,
+        );
+        let err = reject(vec![PackRecord::Consensus(Box::new(wide.consensus_header()))]).await;
+        assert!(matches!(err, PackError::TooManyBatches(_)), "got {err:?}");
+
+        let oversized = Batch::new_for_test(
+            vec![vec![0_u8; tn_types::max_batch_size(committee.epoch()) + 1]],
+            ExecHeader::default(),
+            0,
+            committee.epoch(),
+        );
+        let header = header_with_leader(leader_with_batches(
+            &committee,
+            member,
+            std::slice::from_ref(&oversized),
+        ));
+        let err =
+            reject(vec![PackRecord::Consensus(Box::new(header)), PackRecord::Batch(oversized)])
+                .await;
+        assert!(matches!(err, PackError::BatchTooLarge { .. }), "got {err:?}");
+
+        let batch = tn_reth::test_utils::batches(chain.clone(), 1).pop().expect("one batch");
+        let foreign = tn_types::AuthorityIdentifier::default();
+        assert!(committee.authority(&foreign).is_none(), "the author must be foreign");
+        let header = header_with_leader(leader_with_batches(
+            &committee,
+            foreign,
+            std::slice::from_ref(&batch),
+        ));
+        let err =
+            reject(vec![PackRecord::Consensus(Box::new(header)), PackRecord::Batch(batch)]).await;
+        assert!(
+            matches!(&err, PackError::UnexpectedRecord(msg) if msg.contains("not in the epoch")),
+            "got {err:?}"
+        );
+
+        // Output 1 whole, then output 2's header and only two of its four batches.
+        let output1 =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest());
+        let mut records = output_records(&[output1, output2]);
+        records.truncate(records.len() - 2);
+        let err = reject(records).await;
+        assert!(matches!(err, PackError::MissingBatch), "got {err:?}");
+    }
+
+    /// The import authenticates the final header itself, the moment it is read: a final whose
+    /// digest is not the certified one fails before any of its batches is read (here the stream
+    /// carries none), and the partial import is discarded rather than sealed.
+    #[tokio::test]
+    async fn test_stream_import_checks_the_final_before_its_batches() {
+        use crate::consensus_pack::PackError;
+
+        let temp_dir = TempDir::with_prefix("test_import_final_check").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let output1 =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest());
+        let mut records = output_records(&[output1, output2.clone()]);
+        // Output 2's header only: its batches never arrive.
+        records.truncate(records.len() - 4);
+        let bytes = peer_stream_bytes(temp_dir.path(), &committee, &previous_epoch, &records);
+
+        let certified = ConsensusNumHash::new(2, ConsensusHeaderDigest::default());
+        let (res, target) = import_peer_stream(bytes, &previous_epoch, certified).await;
+        let err = res.expect_err("a final that is not the certified one must not import");
+        assert!(
+            matches!(
+                err,
+                PackError::UnexpectedConsensusDigest { expected, got }
+                    if expected == certified.hash && got == output2.digest()
+            ),
+            "got {err:?}"
+        );
+        assert_nothing_imported(&target);
+    }
+
+    /// An import whose future is dropped part way (a shutdown, or a caller that gives up) is
+    /// discarded: its data log is removed, never sealed in place.
+    #[tokio::test]
+    async fn test_abandoned_stream_import_is_discarded() {
+        use tokio::io::AsyncReadExt as _;
+
+        /// A peer that stops sending without closing the stream.
+        struct Stalled;
+        impl tokio::io::AsyncRead for Stalled {
+            fn poll_read(
+                self: std::pin::Pin<&mut Self>,
+                _cx: &mut std::task::Context<'_>,
+                _buf: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+
+        let temp_dir = TempDir::with_prefix("test_import_abandoned").expect("temp dir");
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let output1 =
+            make_test_output(&committee, 0, chain.clone(), 1, ConsensusHeader::default().digest());
+        let output2 = make_test_output(&committee, 1, chain.clone(), 2, output1.digest());
+        let bytes = peer_stream_bytes(
+            temp_dir.path(),
+            &committee,
+            &previous_epoch,
+            &output_records(&[output1, output2]),
+        );
+
+        let target = TempDir::with_prefix("test_import_abandoned_dst").expect("temp dir");
+        let data = target.path().join("epoch-0").join(Inner::DATA_NAME);
+        let import = ConsensusPack::stream_import(
+            target.path(),
+            std::io::Cursor::new(bytes).chain(Stalled),
+            0,
+            &previous_epoch,
+            ConsensusNumHash::new(5, ConsensusHeaderDigest::default()),
+            Duration::from_secs(60),
+        );
+        // Give up once the import has written its outputs and is waiting for more.
+        let written = async {
+            while !data.exists() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        // `select!` drops the import when the wait is over.
+        tokio::select! {
+            _ = written => {}
+            res = import => panic!("a stalled import must not finish: {res:?}"),
+        }
+
+        // The import's files go once it notices; it must not leave a sealed log behind.
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while data.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!data.exists(), "an abandoned import must be discarded, not sealed");
+    }
+
+    /// `batches` forged one-byte-pattern batches of `max_batch_size` each (distinct only by their
+    /// `epoch` field), under one epoch-0 header that declares them: a few dozen bytes each on the
+    /// wire, a megabyte each to decompress, decode, hash and re-encode.
+    fn forged_compressible_stream(
+        dir: &Path,
+        committee: &Committee,
+        previous_epoch: &EpochRecord,
+        batches: u32,
+    ) -> (Vec<u8>, ConsensusNumHash) {
+        let tx = vec![0x5a_u8; tn_types::max_batch_size(committee.epoch())];
+        let batches: Vec<Batch> = (0..batches)
+            .map(|epoch| Batch::new_for_test(vec![tx.clone()], ExecHeader::default(), 0, epoch))
+            .collect();
+        let member = committee.authorities().first().expect("committee has authorities").id();
+        let header = header_with_leader(leader_with_batches(committee, member, &batches));
+        let last = ConsensusNumHash::new(header.number, header.digest());
+        let records: Vec<PackRecord> = std::iter::once(PackRecord::Consensus(Box::new(header)))
+            .chain(batches_by_digest_list(batches).into_iter().map(PackRecord::Batch))
+            .collect();
+        (peer_stream_bytes(dir, committee, previous_epoch, &records), last)
+    }
+
+    /// `batches` in digest order, as the header-first layout stores an output's batches.
+    fn batches_by_digest_list(batches: Vec<Batch>) -> Vec<Batch> {
+        batches
+            .into_iter()
+            .map(|b| (b.digest(), b))
+            .collect::<BTreeMap<_, _>>()
+            .into_values()
+            .collect()
+    }
+
+    /// A peer stream of highly compressible batches costs the importer far more CPU than it
+    /// costs the peer to send, so the import's CPU work must not run on the caller's async worker:
+    /// on a current-thread runtime another task keeps running while it imports.
+    #[tokio::test]
+    async fn test_stream_import_does_not_starve_the_runtime() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let temp_dir = TempDir::with_prefix("test_import_starve").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let committee = fixture.committee();
+        let previous_epoch = test_previous_epoch(&committee);
+        let (bytes, last) =
+            forged_compressible_stream(temp_dir.path(), &committee, &previous_epoch, 64);
+        assert!(bytes.len() < 64 * 1024, "the forged stream is small on the wire");
+
+        let ticks = Arc::new(AtomicU64::new(0));
+        let ticker = tokio::spawn({
+            let ticks = ticks.clone();
+            async move {
+                loop {
+                    ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+        tokio::task::yield_now().await;
+        let before = ticks.load(Ordering::Relaxed);
+        let (res, _target) = import_peer_stream(bytes, &previous_epoch, last).await;
+        let during = ticks.load(Ordering::Relaxed) - before;
+        ticker.abort();
+        res.expect("the forged chain imports (its final is the one asked for)").close().await;
+        assert!(during >= 10, "another task ran only {during} times during the import");
+    }
+
+    /// The import hashes a batch record's payload instead of re-encoding the decoded batch
+    /// (`batch_payload_digest`), so the two must agree for every batch: here over varied batches
+    /// (real and one-byte transactions, lengths across the ULEB128 width steps, extreme field
+    /// values, a skipped field set), each through the record encode and decode. The premise is
+    /// pinned too: bcs refuses a non-canonical encoding of a batch and trailing bytes, so a payload
+    /// that decodes is the canonical encoding the digest is defined over.
+    #[test]
+    fn test_batch_payload_digest_matches_batch_digest() {
+        use crate::consensus_pack::{batch_payload_digest, BATCH_RECORD_TAG};
+
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let mut batches = tn_reth::test_utils::batches(chain, 4);
+        batches.push(Batch::new_for_test(vec![vec![1]], ExecHeader::default(), 0, 0));
+        batches.push(Batch::new_for_test(Vec::new(), ExecHeader::default(), 1, 2));
+        batches.push(Batch::new_for_test(
+            [1, 127, 128, 16_383, 16_384].iter().map(|&len| vec![0xa5; len]).collect(),
+            ExecHeader::default(),
+            u16::MAX,
+            u32::MAX,
+        ));
+        batches.push(Batch::new_for_test(
+            vec![vec![0x5a; tn_types::max_batch_size(0)]],
+            ExecHeader::default(),
+            3,
+            9,
+        ));
+        let mut odd = Batch::new_for_test(vec![vec![2; 65]], ExecHeader::default(), 7, 11);
+        odd.beneficiary = tn_types::Address::repeat_byte(0xee);
+        odd.base_fee_per_gas = u64::MAX;
+        odd.received_at = Some(42);
+        batches.push(odd);
+        for batch in batches {
+            let payload = tn_types::encode(&PackRecord::Batch(batch.clone()));
+            assert_eq!(payload[0], BATCH_RECORD_TAG, "a batch record starts with its tag");
+            let PackRecord::Batch(decoded) =
+                tn_types::try_decode::<PackRecord>(&payload).expect("the record decodes")
+            else {
+                panic!("a batch record decodes as a batch");
+            };
+            assert_eq!(batch_payload_digest(&payload), decoded.digest());
+            assert_eq!(decoded.digest(), batch.digest());
+        }
+
+        // A transaction count of 1 written as two ULEB128 bytes, and a trailing byte: neither
+        // decodes.
+        let batch = Batch::new_for_test(vec![vec![7; 3]], ExecHeader::default(), 0, 0);
+        let canonical = tn_types::encode(&PackRecord::Batch(batch));
+        assert_eq!(canonical[1], 1, "one transaction");
+        let mut padded = vec![canonical[0], 0x81, 0x00];
+        padded.extend_from_slice(&canonical[2..]);
+        assert!(tn_types::try_decode::<PackRecord>(&padded).is_err(), "non-canonical length");
+        let mut trailing = canonical;
+        trailing.push(0);
+        assert!(tn_types::try_decode::<PackRecord>(&trailing).is_err(), "trailing bytes");
     }
 
     /// Stream the logical bytes (`[0, end)`, without the clean-close sentinel) of the sealed
@@ -11591,7 +13395,7 @@ pub(crate) mod test {
                 epoch0_pack_stream(source.path()).await,
                 0,
                 &previous_epoch,
-                4,
+                ConsensusNumHash::new(4, outputs[3].digest()),
                 Duration::from_secs(5),
             )
             .await
@@ -11632,7 +13436,7 @@ pub(crate) mod test {
             epoch0_pack_stream(source.path()).await,
             0,
             &previous_epoch,
-            4,
+            ConsensusNumHash::new(4, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await
@@ -11656,8 +13460,15 @@ pub(crate) mod test {
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
         let v2_source = TempDir::with_prefix("test_import_stream_v2").expect("temp dir");
-        build_test_pack_version(&v2_source, &committee, &chain, &previous_epoch, 3, PACK_VERSION)
-            .await;
+        let outputs = build_test_pack_version(
+            &v2_source,
+            &committee,
+            &chain,
+            &previous_epoch,
+            3,
+            PACK_VERSION,
+        )
+        .await;
         {
             let original = ConsensusPack::open_static(v2_source.path(), 0).expect("open source");
             let output = original.get_consensus_output(1).await.expect("source output");
@@ -11675,7 +13486,7 @@ pub(crate) mod test {
             epoch0_pack_stream(v2_source.path()).await,
             0,
             &previous_epoch,
-            3,
+            ConsensusNumHash::new(3, outputs[2].digest()),
             Duration::from_secs(5),
         )
         .await;
@@ -11756,7 +13567,7 @@ pub(crate) mod test {
                     stream,
                     0,
                     &previous_epoch,
-                    3,
+                    ConsensusNumHash::new(3, ConsensusHeaderDigest::default()),
                     Duration::from_secs(5),
                 )
                 .await
@@ -11853,7 +13664,7 @@ pub(crate) mod test {
                 stream,
                 0,
                 previous_epoch,
-                1,
+                ConsensusNumHash::new(1, ConsensusHeaderDigest::default()),
                 Duration::from_secs(5),
             )
             .await
@@ -11943,8 +13754,9 @@ pub(crate) mod test {
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
         let previous_epoch = test_previous_epoch(&committee);
-        build_test_pack_version(&source, &committee, &chain, &previous_epoch, 5, PACK_VERSION)
-            .await;
+        let outputs =
+            build_test_pack_version(&source, &committee, &chain, &previous_epoch, 5, PACK_VERSION)
+                .await;
 
         let target = TempDir::with_prefix("test_import_final_dst").expect("temp dir");
         let pack = ConsensusPack::stream_import(
@@ -11952,7 +13764,7 @@ pub(crate) mod test {
             epoch0_pack_stream(source.path()).await,
             0,
             &previous_epoch,
-            3,
+            ConsensusNumHash::new(3, outputs[2].digest()),
             Duration::from_secs(5),
         )
         .await
@@ -12363,12 +14175,25 @@ pub(crate) mod test {
         let committee = legacy_pack_committee();
         let previous_epoch = legacy_pack_previous_epoch(&committee);
         let stream = tokio::fs::File::open(&source).await.expect("open peer stream");
+        // The frozen pack's last header: the final the import authenticates.
+        let last = crate::archive::pack_iter::PackIter::<PackRecord, _>::open(
+            std::io::BufReader::new(File::open(&source).expect("open frozen pack")),
+            LEGACY_PACK_EPOCH as u64,
+            frozen.len() as u64,
+        )
+        .expect("the frozen pack iterates")
+        .filter_map(|record| match record.expect("a frozen record") {
+            PackRecord::Consensus(header) => Some(header.digest()),
+            _ => None,
+        })
+        .last()
+        .expect("the frozen pack has outputs");
         let pack = ConsensusPack::stream_import(
             dir,
             stream,
             LEGACY_PACK_EPOCH,
             &previous_epoch,
-            LEGACY_PACK_LAST_CONSENSUS,
+            ConsensusNumHash::new(LEGACY_PACK_LAST_CONSENSUS, last),
             Duration::from_secs(5),
         )
         .await
@@ -12749,7 +14574,7 @@ pub(crate) mod test {
             stream,
             LEGACY_PACK_EPOCH,
             &EpochRecord::default(),
-            LEGACY_PACK_LAST_CONSENSUS,
+            ConsensusNumHash::new(LEGACY_PACK_LAST_CONSENSUS, ConsensusHeaderDigest::default()),
             Duration::from_secs(5),
         )
         .await;

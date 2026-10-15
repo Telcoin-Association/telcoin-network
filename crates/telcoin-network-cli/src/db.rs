@@ -1173,7 +1173,7 @@ fn restore_consensus_and_records(
             file,
             n,
             previous,
-            final_record.final_consensus.number,
+            final_record.final_consensus,
             STREAM_IMPORT_TIMEOUT,
             0,
         )

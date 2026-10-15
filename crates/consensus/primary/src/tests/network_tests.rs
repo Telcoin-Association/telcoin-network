@@ -3668,4 +3668,15 @@ fn test_import_fault_is_peer_caused_whitelist() {
     assert!(!peer_caused(ConsensusChainError::PrevCommitteeEpochMismatch));
     assert!(!peer_caused(ConsensusChainError::CrcError));
     assert!(!peer_caused(ConsensusChainError::NoCurrentEpoch));
+    // The caller's own state for the wrong epoch, or a refused in-place import of the live epoch.
+    for error in [
+        cc(PackError::LocalEpochMismatch { local: 1, found: 2 }),
+        ConsensusChainError::LiveEpochImport(3),
+    ] {
+        assert!(!peer_caused(error));
+    }
+    assert!(PrimaryNetworkHandle::consensus_chain_error_to_penalty(&cc(
+        PackError::LocalEpochMismatch { local: 1, found: 2 }
+    ))
+    .is_none());
 }

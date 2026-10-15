@@ -1275,6 +1275,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1295,6 +1297,7 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             // The documented cause is LOCAL state (a resume that collapsed this node's
             // "latest"), not peer misbehavior, so no penalty is charged to the peer.
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
@@ -1350,6 +1353,8 @@ impl PrimaryNetworkHandle {
                 | PackError::ReadOnly
                 | PackError::ReadError(_)
                 | PackError::MissingAuthority
+                // The caller's committee or previous record is for another epoch: local state.
+                | PackError::LocalEpochMismatch { .. }
                 | PackError::SendFailed
                 | PackError::ReceiveFailed
                 | PackError::PersistError(_)
@@ -1370,6 +1375,7 @@ impl PrimaryNetworkHandle {
             | ConsensusChainError::EpochDbError(_)
             | ConsensusChainError::InvalidPackEpoch(_, _)
             | ConsensusChainError::CantSaveAndNotAvailable(_)
+            | ConsensusChainError::LiveEpochImport(_)
             | ConsensusChainError::NonMonotonicConsensusNumber { .. }
             | ConsensusChainError::IO(_) => false,
         }

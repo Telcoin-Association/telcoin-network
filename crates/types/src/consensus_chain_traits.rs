@@ -123,9 +123,11 @@ pub trait ConsensusChainReader: Send + Sync + Clone + 'static {
     ) -> impl Future<Output = Vec<Batch>> + Send + 'a;
 
     /// Count leaders in the current pack's rewards counter that are below
-    /// `last_executed_round`.
+    /// `last_executed_round`. Errors, counting nothing, unless the current pack is
+    /// `expected_epoch`'s.
     fn count_leaders(
         &self,
+        expected_epoch: Epoch,
         last_executed_round: Round,
         rewards_counter: RewardsCounter,
     ) -> impl Future<Output = eyre::Result<()>> + Send;

@@ -64,6 +64,9 @@ and remember that everything after `mod test` is tests (more than half of `conse
   2. encodes it holding only the `writer` mutex (`PreparedOutput::encode`, whose `OutputEncoder`
      lanes compress a large output's batches on several threads);
   3. appends and indexes under the `RwLock`'s write side (`append_prepared`).
+- **Peer import:** `Inner::stream_import` reads raw frames on the caller's task
+  (`pump_import_frames`) and does all CPU and file work on the blocking pool (`import_records`).
+  Keep it there: compressible peer records cost far more to process than to send.
 - **Hot reads:**
   - the last executed header's number, leader epoch and round for every gossiped certificate
     (`with_consensus_header_by_digest`: a hit on the recent headers `ConsensusChain` keeps
@@ -107,8 +110,9 @@ and remember that everything after `mod test` is tests (more than half of `conse
   - a failed save rolls back, and the next open rebuilds the indexes (README design decision 17).
   - `CertificatePack`, `EpochRecordDb` and `LatestConsensus` stay actor threads by decision: their
     traffic is too low for locks to pay, and an actor keeps their order, backpressure and panic
-    containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is rebuilt on its thread
-    from the stored records after every save, whatever its outcome (`sync_routing`).
+    containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is built at open and
+    extended on its thread from the stored records after every save, whatever its outcome, by one
+    checked read (`extend_routing`; `sync_routing` after a save).
 - **Encode changes must keep the bytes on disk identical.** Prove it the way
   `stored_append_matches_append` and `test_split_encoding_matches_one_lane` do.
 - **Sub-dag serde is fork-gated** (fields written only after their fork). Cache what a pack read
@@ -144,7 +148,11 @@ and remember that everything after `mod test` is tests (more than half of `conse
   - `pack_with_outputs`, `make_test_output`, `make_wide_test_output`, `batches_by_digest`;
   - `CommitteeFixture` and `MemDatabase` for committees, `TempDir` for files.
 - **Pack test hooks:** `fail_next_save` (rollback), `panic_next_save` (the unsealed panic path),
-  `set_encode_lanes` (force the split encode).
+  `set_encode_lanes` (force the split encode), `slow_batch_reads` (slow batch reads, for
+  cancellation and lock-yield tests); thread-local `SKIP_NEXT_LEGACY_CHECK`, `FAIL_NEXT_INSTALL`,
+  `FAIL_NEXT_MIGRATION_SEAL` (a legacy pack reaching the writable open, a failed install rename, an
+  unsealed staged migration). `EpochRecordDb`: `fail_index_save_after_append`,
+  `fail_epoch_slot_save_after_digest`. Log assertions: `consensus_pack::test::warnings_and_errors`.
 - **Check a new test with a mutation:** break the code it guards, see it fail, restore.
 
 ## Benchmarks

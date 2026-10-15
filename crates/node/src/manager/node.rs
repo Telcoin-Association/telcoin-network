@@ -428,9 +428,15 @@ pub async fn catchup_accumulator(
 
         // count leaders from consensus db for the current epoch
         // NOTE: replay_missed_consensus catches up rounds above last_executed_round.
+        // The consensus chain refuses unless its current pack is `last_executed_epoch`'s: another
+        // epoch's leaders would become this epoch's rewards.
         if last_executed_round > 0 && last_executed_epoch == epoch_state.epoch {
             consensus_chain
-                .count_leaders(last_executed_round, gas_accumulator.rewards_counter().clone())
+                .count_leaders(
+                    last_executed_epoch,
+                    last_executed_round,
+                    gas_accumulator.rewards_counter().clone(),
+                )
                 .await?;
         }
     };
