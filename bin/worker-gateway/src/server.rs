@@ -7272,7 +7272,10 @@ mod tests {
             timed_raw_exchange(gateway, "POST / HTTP/1.1\r\nContent-Length: 204800", b"").await;
         assert_eq!(status, 503);
         assert_eq!(error_code_and_id(&body), (-32010, serde_json::Value::Null));
-        assert!(elapsed < Duration::from_millis(100), "answered after {elapsed:?}");
+        // a queued reservation, or one that read the body first, would wait
+        // out the 5s request deadline; 1s separates the two with room to spare
+        // on a loaded runner, like the other "must not wait" checks
+        assert!(elapsed < Duration::from_secs(1), "answered after {elapsed:?}");
         assert_eq!(hits.load(Ordering::SeqCst), 1, "the refused request must not be forwarded");
     }
 
