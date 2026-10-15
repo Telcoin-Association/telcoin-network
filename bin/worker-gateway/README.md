@@ -470,7 +470,8 @@ followed by the listed peer that vouched for it; the inbound chain is never
 copied. `X-Forwarded-Proto` is copied from a listed peer when its right-most
 value is `http` or `https`, and is `http` otherwise.
 
-The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is in `--trusted-proxies`, a front sending `X-Forwarded-For` or a listed front's `LOCAL` health check, is not counted, since its requests belong to many clients.
+The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is in `--trusted-proxies` (a front sending `X-Forwarded-For`, or a `LOCAL` health check from a front listed there) is not counted, since its requests belong to many clients.
+A `LOCAL` connection from a front listed only in `--proxy-protocol-from` counts against the front's own prefix like any other connection.
 
 ### Per-route capacity
 
