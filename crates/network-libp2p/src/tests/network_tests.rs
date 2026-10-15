@@ -1961,6 +1961,68 @@ async fn test_banned_peer_reconnection_attempt() -> eyre::Result<()> {
     Ok(())
 }
 
+/// Every signed endpoint gets a fresh QUIC window, and the caller survives intermediate timeouts.
+#[tokio::test]
+async fn serial_dial_reaches_last_live_signed_address() -> eyre::Result<()> {
+    let mut settings = NetworkConfig::default();
+    settings.peer_config_mut().heartbeat_interval = TEST_HEARTBEAT_INTERVAL;
+    // A legacy or explicitly short peer timeout must not race the transport's fallback sequence.
+    settings.peer_config_mut().dial_timeout = Duration::from_millis(1);
+    let fixture =
+        CommitteeFixture::builder(MemDatabase::default).with_network_config(settings).build();
+    let mut configs = fixture.authorities().take(2).map(|authority| authority.consensus_config());
+    let tasks = TaskManager::default();
+    let mut client =
+        trusted_hub_network(configs.next().ok_or_else(|| eyre!("client config"))?, &tasks)?;
+    let server =
+        trusted_hub_network(configs.next().ok_or_else(|| eyre!("server config"))?, &tasks)?;
+    // Bound UDP sockets stay silent without returning ICMP errors or rejecting a handshake.
+    let silent = futures::future::try_join_all(
+        (1..crate::consensus::MAX_ADVERTISED_MULTIADDRS)
+            .map(|_| tokio::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))),
+    )
+    .await?;
+    let addresses = silent
+        .iter()
+        .map(|socket| {
+            socket.local_addr().map_err(eyre::Report::from).and_then(|endpoint| {
+                format!("/ip4/{}/udp/{}/quic-v1", endpoint.ip(), endpoint.port())
+                    .parse::<Multiaddr>()
+                    .map_err(Into::into)
+            })
+        })
+        .chain(std::iter::once(Ok(server.config.primary_address())))
+        .collect::<eyre::Result<Vec<_>>>()?;
+    let server_network = server.network.with_advertised_addresses(addresses)?;
+    let server_id = *server_network.swarm.local_peer_id();
+    let server_bls = server.config.key_config().primary_public_key();
+    client
+        .network
+        .swarm
+        .behaviour_mut()
+        .peer_manager
+        .add_known_peer(server_bls, server_network.node_record.info.clone());
+    let client_task = tokio::spawn(client.network.run());
+    let server_task = tokio::spawn(server_network.run());
+    client.network_handle.start_listening(client.config.primary_address()).await?;
+    server.network_handle.start_listening(server.config.primary_address()).await?;
+    let handle = client.network_handle.clone();
+    let mut dial = tokio::spawn(async move { handle.dial_by_bls(server_bls).await });
+    let result = timeout(Duration::from_secs(45), async {
+        let first = silent.first().ok_or_else(|| eyre!("silent first endpoint"))?;
+        let mut datagram = [0_u8; 2048];
+        timeout(Duration::from_secs(5), first.recv_from(&mut datagram)).await??;
+        (&mut dial).await??;
+        assert!(client.network_handle.connected_peer_ids().await?.contains(&server_id));
+        Ok::<(), eyre::Report>(())
+    })
+    .await;
+    dial.abort();
+    client_task.abort();
+    server_task.abort();
+    result.map_err(eyre::Report::from).and_then(std::convert::identity)
+}
+
 #[tokio::test]
 async fn test_dial_timeout_behavior() -> eyre::Result<()> {
     let mut network_config = NetworkConfig::default();
