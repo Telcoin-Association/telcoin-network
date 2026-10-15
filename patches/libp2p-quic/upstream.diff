@@ -1,5 +1,5 @@
 diff --git upstream/Cargo.toml patched/Cargo.toml
-index 9f9bd3c..e0c3b86 100644
+index 9f9bd3ccddd5c1cbba003e6aff9be27787c5d8b8..e0c3b869e1c3a6de24690bf08d3c925aac063740 100644
 --- upstream/Cargo.toml
 +++ patched/Cargo.toml
 @@ -1,28 +1,32 @@
@@ -86,7 +86,7 @@ index 9f9bd3c..e0c3b86 100644
 +[lints.rust]
 +unreachable_pub = "warn"
 diff --git upstream/src/config.rs patched/src/config.rs
-index 0d514db..e67051f 100644
+index 0d514db57516b19062e9b1f35781b6c95841be4a..665ef0e70413684a8b3026a790cc02ad58794a72 100644
 --- upstream/src/config.rs
 +++ patched/src/config.rs
 @@ -25,6 +25,8 @@ use quinn::{
@@ -166,7 +166,7 @@ index 0d514db..e67051f 100644
 +            incoming_buffer_size,
 +            incoming_buffer_size_total,
 +            max_incoming_outcomes_per_poll: _,
-+            incoming_stats: _,
++            incoming_stats,
          } = config;
          let mut transport = quinn::TransportConfig::default();
          // Disable uni-directional streams.
@@ -189,16 +189,183 @@ index 0d514db..e67051f 100644
  
          let mut client_config = quinn::ClientConfig::new(client_tls_config);
          client_config.transport_config(transport);
+@@ -172,6 +237,7 @@ impl From<Config> for QuinnConfig {
+             })
+             .unwrap_or_default();
+ 
++        endpoint_config.incoming_stats(Arc::clone(incoming_stats.endpoint()));
+         if !support_draft_29 {
+             endpoint_config.supported_versions(vec![1]);
+         }
+diff --git upstream/src/connection/connecting.rs patched/src/connection/connecting.rs
+index b0e52410e1e338905f0aa156523191d8849d8d64..8dbdd422a886d445c45039055ce94c178a19e87f 100644
+--- upstream/src/connection/connecting.rs
++++ patched/src/connection/connecting.rs
+@@ -40,15 +40,26 @@ use crate::{Connection, ConnectionError, Error};
+ /// A QUIC connection currently being negotiated.
+ #[derive(Debug)]
+ pub struct Connecting {
++    /// Live inbound handshake observation, absent for outbound dials.
++    incoming: Option<crate::incoming::HandshakeGuard>,
++    /// The handshake raced against its configured deadline.
+     connecting: Select<quinn::Connecting, Delay>,
+ }
+ 
+ impl Connecting {
++    /// Race a QUIC handshake against the configured transport deadline.
+     pub(crate) fn new(connection: quinn::Connecting, timeout: Duration) -> Self {
+         Connecting {
++            incoming: None,
+             connecting: select(connection, Delay::new(timeout)),
+         }
+     }
++
++    /// Attach the incoming observation after accept succeeded, before the swarm event.
++    pub(crate) fn observe_incoming(mut self, stats: &std::sync::Arc<crate::IncomingStats>) -> Self {
++        self.incoming = Some(stats.handshake());
++        self
++    }
+ }
+ 
+ impl Connecting {
+@@ -82,7 +93,9 @@ impl Future for Connecting {
+     type Output = Result<(PeerId, Connection), Error>;
+ 
+     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+-        let connection = match futures::ready!(self.connecting.poll_unpin(cx)) {
++        let outcome = futures::ready!(self.connecting.poll_unpin(cx));
++        self.incoming.take();
++        let connection = match outcome {
+             Either::Right(_) => return Poll::Ready(Err(Error::HandshakeTimedOut)),
+             Either::Left((connection, _)) => connection.map_err(ConnectionError)?,
+         };
 diff --git patched/src/incoming.rs patched/src/incoming.rs
 new file mode 100644
-index 0000000..d30ad5b
+index 0000000000000000000000000000000000000000..9d0147dcbcd8399d2134efd0b33592bebe0d80dd
 --- /dev/null
 +++ patched/src/incoming.rs
-@@ -0,0 +1,113 @@
+@@ -0,0 +1,305 @@
 +//! Aggregate counters for the decisions a listener makes on incoming
 +//! connection attempts (vendored addition, see PATCH.md).
 +
-+use std::sync::atomic::{AtomicU64, Ordering};
++use std::sync::{
++    Arc,
++    atomic::{AtomicU64, AtomicUsize, Ordering},
++};
++
++/// Fixed stage and reason vocabulary for incoming outcomes, including pre-application work.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub enum IncomingOutcome {
++    /// The listener requested a Retry response for an unvalidated source.
++    Retried,
++    /// The listener started a handshake.
++    Accepted,
++    /// Quinn failed to accept an attempt, with or without a close response.
++    AcceptFailed,
++    /// An unvalidated attempt could not be retried and was refused.
++    RetryNotPermitted,
++    /// A failed Retry was ignored without another response.
++    RetryFailed,
++    /// The endpoint validated a returning Retry token.
++    RetryValidated,
++    /// The endpoint validated a NEW_TOKEN address token.
++    AddressValidated,
++    /// The endpoint rejected an invalid Retry token.
++    InvalidRetryToken,
++    /// A nonempty opaque token was treated as absent because it could not be decoded.
++    UndecodableToken,
++    /// A NEW_TOKEN token failed validation and was treated as absent.
++    InvalidAddressToken,
++    /// The endpoint dropped a new Initial at max_incoming.
++    QueueFull,
++    /// The endpoint dropped a new Initial due to exhausted connection IDs.
++    ConnectionIdsExhausted,
++    /// The endpoint dropped a buffered datagram at a byte cap.
++    BufferFull,
++    /// An application explicitly refused an attempt at the endpoint API.
++    Refused,
++    /// An application explicitly ignored an attempt at the endpoint API.
++    Ignored,
++}
++
++impl IncomingOutcome {
++    /// Complete bounded production vocabulary.
++    pub const ALL: [Self; 15] = [
++        Self::Retried,
++        Self::Accepted,
++        Self::AcceptFailed,
++        Self::RetryNotPermitted,
++        Self::RetryFailed,
++        Self::RetryValidated,
++        Self::AddressValidated,
++        Self::InvalidRetryToken,
++        Self::QueueFull,
++        Self::ConnectionIdsExhausted,
++        Self::BufferFull,
++        Self::UndecodableToken,
++        Self::InvalidAddressToken,
++        Self::Refused,
++        Self::Ignored,
++    ];
++
++    /// Stage at which the outcome becomes observable.
++    pub fn stage(self) -> &'static str {
++        match self {
++            Self::Retried | Self::Accepted | Self::RetryNotPermitted | Self::RetryFailed => {
++                "listener"
++            }
++            Self::RetryValidated
++            | Self::AddressValidated
++            | Self::InvalidRetryToken
++            | Self::UndecodableToken
++            | Self::InvalidAddressToken
++            | Self::QueueFull
++            | Self::ConnectionIdsExhausted
++            | Self::BufferFull
++            | Self::AcceptFailed
++            | Self::Refused
++            | Self::Ignored => "endpoint",
++        }
++    }
++
++    /// Fixed decision name, independent of transport errors or remote input.
++    pub fn decision(self) -> &'static str {
++        match self {
++            Self::Retried => "retry",
++            Self::Accepted => "accept",
++            Self::RetryNotPermitted | Self::InvalidRetryToken | Self::Refused => "refuse",
++            Self::AcceptFailed => "accept_error",
++            Self::RetryFailed
++            | Self::QueueFull
++            | Self::ConnectionIdsExhausted
++            | Self::BufferFull
++            | Self::Ignored => "ignore",
++            Self::RetryValidated | Self::AddressValidated => "validate",
++            Self::UndecodableToken | Self::InvalidAddressToken => "revalidate",
++        }
++    }
++
++    /// Fixed reason name. No addresses, peer IDs, or raw errors are retained.
++    pub fn reason(self) -> &'static str {
++        match self {
++            Self::Retried => "unvalidated_address",
++            Self::Accepted => "handshake_started",
++            Self::AcceptFailed => "accept_failed",
++            Self::RetryNotPermitted => "retry_not_permitted",
++            Self::RetryFailed => "retry_failed",
++            Self::RetryValidated => "retry_token",
++            Self::AddressValidated => "address_token",
++            Self::InvalidRetryToken => "invalid_retry_token",
++            Self::UndecodableToken => "undecodable_token",
++            Self::InvalidAddressToken => "invalid_address_token",
++            Self::QueueFull => "max_incoming",
++            Self::ConnectionIdsExhausted => "connection_ids",
++            Self::BufferFull => "incoming_buffer_bytes",
++            Self::Refused => "application_refuse",
++            Self::Ignored => "application_ignore",
++        }
++    }
++}
 +
 +/// Shared counters for the outcomes of incoming connection attempts.
 +///
@@ -207,14 +374,77 @@ index 0000000..d30ad5b
 +/// address or per-attempt data.
 +#[derive(Debug, Default)]
 +pub struct IncomingStats {
++    /// Protocol observations made before Endpoint::accept yields an incoming.
++    endpoint: Arc<quinn_proto::IncomingStats>,
++    /// Explicit policy refusals when Retry is not permitted.
++    retry_not_permitted: AtomicU64,
++    /// Accepted handshakes whose upgrade future has not resolved or been dropped.
++    handshakes: AtomicUsize,
++    /// Retry responses requested by the listener policy.
 +    retried: AtomicU64,
++    /// Handshakes successfully started by the listener.
 +    accepted: AtomicU64,
++    /// Legacy policy-refusal and accept-error aggregate.
 +    refused: AtomicU64,
++    /// Policy Retry failures followed by a silent ignore.
 +    ignored: AtomicU64,
++    /// Listener polls stopped by the fixed outcome budget.
 +    budget_yields: AtomicU64,
 +}
 +
 +impl IncomingStats {
++    /// Endpoint observations shared by every listener of this transport.
++    pub fn endpoint(&self) -> &Arc<quinn_proto::IncomingStats> {
++        &self.endpoint
++    }
++
++    /// Accepted inbound upgrade futures currently in flight, in handshakes.
++    pub fn handshakes(&self) -> usize {
++        self.handshakes.load(Ordering::Relaxed)
++    }
++
++    /// Read a fixed decision/reason counter, including protocol events before the app hook.
++    pub fn count(&self, outcome: IncomingOutcome) -> u64 {
++        use quinn_proto::IncomingEvent;
++        match outcome {
++            IncomingOutcome::Retried => self.retried(),
++            IncomingOutcome::Accepted => self.accepted(),
++            IncomingOutcome::AcceptFailed => self.endpoint.count(IncomingEvent::AcceptFailed),
++            IncomingOutcome::RetryNotPermitted => self.retry_not_permitted.load(Ordering::Relaxed),
++            IncomingOutcome::RetryFailed => self.ignored(),
++            IncomingOutcome::RetryValidated => self.endpoint.count(IncomingEvent::RetryValidated),
++            IncomingOutcome::AddressValidated => {
++                self.endpoint.count(IncomingEvent::AddressValidated)
++            }
++            IncomingOutcome::InvalidRetryToken => {
++                self.endpoint.count(IncomingEvent::InvalidRetryToken)
++            }
++            IncomingOutcome::UndecodableToken => {
++                self.endpoint.count(IncomingEvent::UndecodableToken)
++            }
++            IncomingOutcome::InvalidAddressToken => {
++                self.endpoint.count(IncomingEvent::InvalidAddressToken)
++            }
++            IncomingOutcome::QueueFull => self.endpoint.count(IncomingEvent::QueueFull),
++            IncomingOutcome::ConnectionIdsExhausted => {
++                self.endpoint.count(IncomingEvent::ConnectionIdsExhausted)
++            }
++            IncomingOutcome::BufferFull => self.endpoint.count(IncomingEvent::BufferFull),
++            IncomingOutcome::Refused => self.endpoint.count(IncomingEvent::Refused),
++            IncomingOutcome::Ignored => self.endpoint.count(IncomingEvent::Ignored),
++        }
++    }
++
++    /// Track one accepted upgrade through resolution, timeout, or cancellation.
++    pub(crate) fn handshake(self: &Arc<Self>) -> HandshakeGuard {
++        self.handshakes.fetch_add(1, Ordering::Relaxed);
++        HandshakeGuard(Arc::clone(self))
++    }
++
++    /// Count a failed accept separately while preserving the legacy refused aggregate.
++    pub(crate) fn inc_accept_failed(&self) {
++        self.refused.fetch_add(1, Ordering::Relaxed);
++    }
 +    /// Attempts answered with a QUIC Retry packet (address not yet validated).
 +    pub fn retried(&self) -> u64 {
 +        self.retried.load(Ordering::Relaxed)
@@ -225,9 +455,9 @@ index 0000000..d30ad5b
 +        self.accepted.load(Ordering::Relaxed)
 +    }
 +
-+    /// Attempts refused with a connection close: attempts the listener
-+    /// refuses, and attempts that fail in quinn `Incoming::accept` (quinn
-+    /// sends a close response for those).
++    /// Legacy aggregate of explicit policy refusals and failed `Incoming::accept` calls.
++    /// A failed accept may close the connection or silently discard a stale Initial.
++    /// Use [`IncomingOutcome`] for the distinct stage and reason counters.
 +    pub fn refused(&self) -> u64 {
 +        self.refused.load(Ordering::Relaxed)
 +    }
@@ -253,6 +483,7 @@ index 0000000..d30ad5b
 +
 +    pub(crate) fn inc_refused(&self) {
 +        self.refused.fetch_add(1, Ordering::Relaxed);
++        self.retry_not_permitted.fetch_add(1, Ordering::Relaxed);
 +    }
 +
 +    pub(crate) fn inc_ignored(&self) {
@@ -261,6 +492,17 @@ index 0000000..d30ad5b
 +
 +    pub(crate) fn inc_budget_yields(&self) {
 +        self.budget_yields.fetch_add(1, Ordering::Relaxed);
++    }
++}
++
++/// Releases an accepted handshake when its upgrade resolves or is abandoned.
++#[derive(Debug)]
++pub(crate) struct HandshakeGuard(Arc<IncomingStats>);
++
++impl Drop for HandshakeGuard {
++    /// Release exactly the handshake owned by this future.
++    fn drop(&mut self) {
++        self.0.handshakes.fetch_sub(1, Ordering::Relaxed);
 +    }
 +}
 +
@@ -309,7 +551,7 @@ index 0000000..d30ad5b
 +    }
 +}
 diff --git upstream/src/lib.rs patched/src/lib.rs
-index 65c61f6..43667c9 100644
+index 65c61f6e3bec84c85ea3ecce68b86592adb7427f..fe46fe8122a47ba40aeb2f6707fe2afda9ea6a90 100644
 --- upstream/src/lib.rs
 +++ patched/src/lib.rs
 @@ -63,6 +63,7 @@
@@ -324,12 +566,12 @@ index 65c61f6..43667c9 100644
  
  pub use config::Config;
  pub use connection::{Connecting, Connection, Stream};
-+pub use incoming::IncomingStats;
++pub use incoming::{IncomingOutcome, IncomingStats};
  pub use provider::Provider;
  #[cfg(feature = "tokio")]
  pub use provider::tokio;
 diff --git upstream/src/transport.rs patched/src/transport.rs
-index 78f633e..c1133f5 100644
+index 78f633eebe8b037469a32e62b526cfebfc7e068a..283f844f9aaa039b6a457e053a2021920ebcd386 100644
 --- upstream/src/transport.rs
 +++ patched/src/transport.rs
 @@ -52,6 +52,7 @@ use crate::{
@@ -391,7 +633,7 @@ index 78f633e..c1133f5 100644
      ) -> Result<Self, Error> {
          let if_watcher;
          let pending_event;
-@@ -491,9 +501,45 @@ impl<P: Provider> Listener<P> {
+@@ -491,9 +501,44 @@ impl<P: Provider> Listener<P> {
              pending_event,
              close_listener_waker: None,
              listening_addresses,
@@ -414,8 +656,7 @@ index 78f633e..c1133f5 100644
 +            Poll::Ready(Some(incoming)) => {
 +                let endpoint = self.endpoint.clone();
 +                self.accept = async move { endpoint.accept().await }.boxed();
-+                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated()
-+                {
++                if self.incoming_policy.retry_unvalidated && !incoming.remote_address_validated() {
 +                    self.incoming_policy.decide_unvalidated(incoming);
 +                    std::ops::ControlFlow::Continue(())
 +                } else {
@@ -437,7 +678,7 @@ index 78f633e..c1133f5 100644
      /// Report the listener as closed in a [`TransportEvent::ListenerClosed`] and
      /// terminate the stream.
      fn close(&mut self, reason: Result<(), Error>) {
-@@ -587,14 +633,12 @@ impl<P: Provider> Stream for Listener<P> {
+@@ -587,14 +632,12 @@ impl<P: Provider> Stream for Listener<P> {
                  return Poll::Ready(Some(event));
              }
  
@@ -450,11 +691,11 @@ index 78f633e..c1133f5 100644
                      let connecting = match incoming.accept() {
                          Ok(connecting) => connecting,
                          Err(error) => {
-+                            self.incoming_policy.stats.inc_refused();
++                            self.incoming_policy.stats.inc_accept_failed();
                              return Poll::Ready(Some(TransportEvent::ListenerError {
                                  listener_id: self.listener_id,
                                  error: Error::Connection(crate::ConnectionError(error)),
-@@ -602,6 +646,8 @@ impl<P: Provider> Stream for Listener<P> {
+@@ -602,12 +645,15 @@ impl<P: Provider> Stream for Listener<P> {
                          }
                      };
  
@@ -463,9 +704,17 @@ index 78f633e..c1133f5 100644
                      let local_addr = socketaddr_to_multiaddr(&self.socket_addr(), self.version);
                      let remote_addr = connecting.remote_address();
                      let send_back_addr = socketaddr_to_multiaddr(&remote_addr, self.version);
+ 
+                     let event = TransportEvent::Incoming {
+-                        upgrade: Connecting::new(connecting, self.handshake_timeout),
++                        upgrade: Connecting::new(connecting, self.handshake_timeout)
++                            .observe_incoming(&self.incoming_policy.stats),
+                         local_addr,
+                         send_back_addr,
+                         listener_id: self.listener_id,
 diff --git upstream/tests/stream_compliance.rs upstream/tests/stream_compliance.rs
 deleted file mode 100644
-index 8712ba1..0000000
+index 8712ba15e199a3a40aba95179d8583fef83c1e2d..0000000000000000000000000000000000000000
 --- upstream/tests/stream_compliance.rs
 +++ /dev/null
 @@ -1,84 +0,0 @@

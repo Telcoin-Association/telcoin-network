@@ -1,0 +1,105 @@
+name: QUIC incoming observations
+
+on:
+  pull_request:
+    paths:
+      - patches/**
+      - crates/network-libp2p/**
+      - testing/quic-interop/**
+      - etc/transport-patches/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/quic-observations.yaml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quic-observations-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_BUILD_JOBS: 2
+  CARGO_INCREMENTAL: 0
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
+  RUSTC_WRAPPER: ""
+
+jobs:
+  transport-evidence:
+    if: github.event_name == 'pull_request'
+    uses: ./.github/workflows/transport-patches.yaml
+
+  workspace-clippy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - name: Read nightly version
+        run: echo "RUST_NIGHTLY=$(cat rust-nightly)" >> $GITHUB_ENV
+      - name: Install repository lint toolchain
+        run: rustup toolchain install $RUST_NIGHTLY -c clippy,rustfmt,rust-src --profile minimal
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          prefix-key: v1-rust
+          shared-key: clippy-cache
+          save-if: "false"
+      - name: Check workspace formatting
+        run: ./etc/ci-lanes.sh fmt
+      - name: Check the full workspace dependency closure
+        run: ./etc/ci-lanes.sh clippy
+
+  observations:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal -c clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: |
+            patches/quinn-proto
+            testing/quic-interop/releases/candidate
+      - name: Exercise endpoint decision sites and occupancy cleanup
+        run: cargo +1.94 test --locked --manifest-path patches/quinn-proto/Cargo.toml --lib
+      - name: Exercise Retry behavior and observation consumers together
+        run: cargo +1.94 test --locked --manifest-path testing/quic-interop/releases/candidate/Cargo.toml --lib
+      - name: Confirm protocol and Retry regression assertions reject observation mutations
+        run: |
+          python3 -I testing/quic-interop/observation_mutations.py --suite protocol --output "$RUNNER_TEMP/quic-protocol-mutations"
+          python3 -I testing/quic-interop/observation_mutations.py --suite candidate --output "$RUNNER_TEMP/quic-candidate-mutations"
+      - name: Lint candidate and configuration source
+        run: cargo +1.94 clippy --locked --manifest-path testing/quic-interop/releases/candidate/Cargo.toml --all-targets --no-deps -- -D warnings
+      - name: Preserve source identity and version controls
+        run: python3 -I -m unittest discover -s etc/transport-patches -p 'test_*.py' -v
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: quic-observation-mutations
+          path: ${{ runner.temp }}/quic-*-mutations/
+
+  metrics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          submodules: true
+      - name: Install pinned toolchain
+        run: rustup toolchain install 1.94 --profile minimal
+      - name: Configure build inputs
+        run: cp .env.example .env
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Check per-swarm metric labels and shutdown cleanup
+        run: cargo +1.94 test --locked -p tn-network-libp2p metrics::tests::quic_metrics --lib
+      - name: Confirm metric regression assertions reject observation mutations
+        run: python3 -I testing/quic-interop/observation_mutations.py --suite metrics --output "$RUNNER_TEMP/quic-metrics-mutations"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: quic-metric-mutations
+          path: ${{ runner.temp }}/quic-metrics-mutations/
