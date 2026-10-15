@@ -177,7 +177,9 @@ impl Bucket {
     /// admitted.
     fn try_admit(&mut self, now: Instant, rate: f64, capacity: f64, cost: f64) -> bool {
         self.tokens = self.replenished(now, rate, capacity);
-        self.last_refill = now;
+        // never move the refill clock backwards: a stale `now` must not credit
+        // an interval twice
+        self.last_refill = self.last_refill.max(now);
         if self.tokens >= cost {
             self.tokens -= cost;
             true
@@ -1279,6 +1281,22 @@ mod tests {
         assert!(bucket.try_admit(now, rate, capacity, 1.0));
         assert!(bucket.try_admit(now, rate, capacity, 1.0));
         assert!(!bucket.try_admit(now, rate, capacity, 1.0));
+    }
+
+    /// A stale reading neither refills the bucket nor moves its refill clock
+    /// back, so the next refill credits only the time since the latest one.
+    #[test]
+    fn bucket_never_rewinds_its_refill_clock() {
+        let t1 = ManualClock::new().now();
+        let t2 = t1 + Duration::from_millis(100);
+        let t3 = t2 + Duration::from_millis(500);
+        let (rate, capacity) = (10.0, 10.0);
+        let mut bucket = Bucket::full(t1, capacity);
+        assert!(bucket.try_admit(t2, rate, capacity, capacity));
+        assert!(!bucket.try_admit(t1, rate, capacity, 1.0), "a stale reading refilled the bucket");
+        assert_eq!(bucket.last_refill, t2, "a stale reading moved the refill clock back");
+        // (t3 - t2) x rate = 5 tokens, not the 6 that t1..t3 would credit
+        assert_eq!(bucket.replenished(t3, rate, capacity), 5.0);
     }
 
     #[test]
