@@ -1049,8 +1049,8 @@ impl Cli {
                     target: "gateway",
                     max_batch_len = self.max_batch_len,
                     burst = burst.get(),
-                    "--max-batch-len is above the smallest rate-limit burst, and a batch needs \
-                     one token per call at once; capping batches at the burst"
+                    "--max-batch-len is above the smallest per-IP or global burst, and a batch \
+                     needs one token per call at once; capping batches at the burst"
                 );
                 Some(burst)
             }
@@ -1727,12 +1727,13 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
 /// worker's node land on the validator, which is the load the redirect exists
 /// to remove. It compares host and port whatever the scheme, so an `https` URL
 /// on a worker's `http` socket is caught too, an IPv4-mapped IPv6 literal
-/// matches the IPv4 address it names, and `localhost` either loopback address
-/// (see [`same_host`]). A URL on a worker's host but another port is accepted
-/// with a warning, since that port may serve a separate node on the
-/// validator's machine. Plain `http` to a host that is not an address literal
-/// unroutable from the internet (see [`plaintext_to_public_host`]) is accepted
-/// with a warning: the reads and their answers then cross the network
+/// matches the IPv4 address it names, and any loopback or unspecified host
+/// (`localhost`, `127.0.0.2`, `[::1]`, `0.0.0.0`) matches any other, since each
+/// names this machine (see [`same_host`]). A URL on a worker's host but another
+/// port is accepted with a warning, since that port may serve a separate node
+/// on the validator's machine. Plain `http` to a host that is not an address
+/// literal unroutable from the internet (see [`plaintext_to_public_host`]) is
+/// accepted with a warning: the reads and their answers then cross the network
 /// unencrypted. Messages name the URL by origin only, since a hosted RPC URL
 /// can carry an API key in its path.
 fn ensure_query_upstream(
@@ -3201,8 +3202,9 @@ mod tests {
     }
 
     /// A batch needs one token per call at once and no bucket holds more than
-    /// its burst, so the effective cap stops at the smallest enabled burst: a
-    /// longer batch gets the final `413`, not a `429` no retry can satisfy.
+    /// its burst, so the effective cap stops at the smallest per-IP or global
+    /// burst: a longer batch gets the final `413`, not a `429` no retry can
+    /// satisfy.
     #[test]
     fn max_batch_len_is_capped_at_the_smallest_burst() -> eyre::Result<()> {
         let settings = cli_with_flags(&[

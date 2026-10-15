@@ -624,7 +624,7 @@ A batch the gateway cannot read to its end is refused rather than routed (see [B
 
 The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
-The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and `localhost` as both loopback addresses.
+The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and any loopback or unspecified host (`localhost`, `127.0.0.2`, `[::1]`, `0.0.0.0`) as any other, since each names this machine.
 A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address.
 A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
