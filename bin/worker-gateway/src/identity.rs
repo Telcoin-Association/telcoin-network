@@ -899,14 +899,26 @@ mod tests {
             ("udp over ipv4", raw_header(0x21, 0x12, tcp4_block)),
             ("unspecified family", raw_header(0x21, 0x00, &[])),
             ("unix stream", raw_header(0x21, 0x31, &[0; 216])),
-            ("short ipv4 block", raw_header(0x21, PROXY_V2_TCP4, &tcp4_block[..8])),
-            ("short ipv6 block", raw_header(0x21, PROXY_V2_TCP6, tcp4_block)),
             ("truncated block", valid[..20].to_vec()),
             ("truncated tlv", truncated_tlv),
             ("empty", Vec::new()),
         ] {
             let (verdict, _) = read_header(&bytes).await;
             assert!(verdict.is_err(), "{case}");
+        }
+
+        // a short address block is refused by its length guard, not by running
+        // out of bytes: request bytes follow it, and without the guard the
+        // reader would take them as the rest of the block
+        let request = b"POST / HTTP/1.1\r\nHost: gateway\r\n\r\n";
+        for (case, header) in [
+            ("short ipv4 block", raw_header(0x21, PROXY_V2_TCP4, &tcp4_block[..8])),
+            ("short ipv6 block", raw_header(0x21, PROXY_V2_TCP6, tcp4_block)),
+        ] {
+            let bytes = [header, request.to_vec()].concat();
+            let (verdict, _) = read_header(&bytes).await;
+            let err = verdict.expect_err(case);
+            assert_eq!(err.to_string(), "PROXY protocol address block is too short", "{case}");
         }
     }
 }
