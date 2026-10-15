@@ -624,6 +624,8 @@ mod tests {
     #[test]
     fn test_credential_name_defaults_and_rejects_paths() {
         let _env = env_lock();
+        // the default only shows when the caller's environment does not name a credential
+        std::env::remove_var("TN_BLS_PASSPHRASE_CREDENTIAL");
         assert_eq!(cli(&["tn", "node"]).bls_passphrase_credential, "bls-passphrase");
         assert_eq!(
             cli(&["tn", "--bls-passphrase-credential", "tn.pass", "node"])
