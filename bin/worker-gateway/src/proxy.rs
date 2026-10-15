@@ -1936,7 +1936,8 @@ impl<'de> Call<'de> {
     /// any other body the scan cannot read, and a batch holding one is
     /// unreadable (see [`scan`]). A repeated `params` keeps its last
     /// occurrence, as a `Value` parse does; it decides no route, and
-    /// jsonrpsee refuses the call either way.
+    /// jsonrpsee refuses the call either way, though the screen may answer it
+    /// first with its own code (see [`screen_transaction`]).
     fn read<A: MapAccess<'de>>(mut members: A) -> Result<Self, A::Error> {
         let mut call =
             Self { method: RpcMethod::Other, name: None, raw_transaction: None, pending: false };
@@ -2407,10 +2408,17 @@ impl<'de, T: Lenient<'de>> Visitor<'de> for LenientVisitor<T> {
 ///
 /// The decode uses the same pooled wire format the worker's RPC accepts and
 /// never recovers the signer, so it cannot reject a transaction the worker
-/// would have accepted (no false rejections); it only front-runs a rejection
-/// the worker would issue anyway. From here the payload is unambiguously a
-/// raw transaction, so a decode failure is a real rejection rather than a
-/// reason to forward.
+/// would have accepted (no false rejections). From here the payload is
+/// unambiguously a raw transaction, so a decode failure is a real rejection
+/// rather than a reason to forward.
+///
+/// The screen answers for the transaction, not for the rest of the call:
+/// [`Call::read`] checks neither `jsonrpc` nor `id` and keeps the last of two
+/// `params`. So a submission the worker would refuse for another reason (a
+/// missing or wrong `jsonrpc`, a repeated `params`) gets the gateway's own
+/// code for its transaction where the worker would answer an invalid request,
+/// and a notification (no `id`), which the worker would run without answering,
+/// gets an answer.
 fn screen_transaction(raw: &RawTransaction<'_>) -> Result<PooledTransaction, GatewayError> {
     let raw = raw.bytes().ok_or(GatewayError::InvalidTransaction)?;
     let mut buf = raw.as_ref();
