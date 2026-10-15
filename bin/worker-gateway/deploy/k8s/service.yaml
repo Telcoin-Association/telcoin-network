@@ -1,7 +1,11 @@
-# ClusterIP Service fronting the worker gateway pods.
-# Exposes both the client JSON-RPC port and the (cluster-internal) metrics port.
-# The probe port (8546) is left out, which does not stop other pods from
-# reaching it on the pod IP; see the NetworkPolicy example in deploy/README.md.
+# ClusterIP Services fronting the worker gateway pods, one per audience.
+# worker-gateway carries only the client JSON-RPC port, so changing its type to
+# reach clients (a LoadBalancer or NodePort) publishes 8545 and nothing else.
+# worker-gateway-metrics carries only the unauthenticated metrics port, for
+# Prometheus inside the cluster.
+# The probe port (8546) is in neither, which does not stop other pods from
+# reaching it, or the metrics port, on the pod IP; see the NetworkPolicy
+# example in deploy/README.md.
 apiVersion: v1
 kind: Service
 metadata:
@@ -18,6 +22,24 @@ spec:
     - name: rpc
       port: 8545
       targetPort: rpc
+---
+# Cluster-internal Service for Prometheus only; the ServiceMonitor selects it
+# by its app.kubernetes.io/component label. Never change its type: /metrics is
+# unauthenticated.
+apiVersion: v1
+kind: Service
+metadata:
+  name: worker-gateway-metrics
+  labels:
+    app: worker-gateway
+    app.kubernetes.io/name: worker-gateway
+    app.kubernetes.io/part-of: telcoin-network
+    app.kubernetes.io/component: metrics
+spec:
+  type: ClusterIP
+  selector:
+    app: worker-gateway
+  ports:
     - name: metrics
       port: 9100
       targetPort: metrics

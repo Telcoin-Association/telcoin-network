@@ -306,9 +306,10 @@ impl std::error::Error for CidrError {}
 ///
 /// Only `set_nosniff` wraps it; it runs before the access log, CORS and the
 /// rate limiter (see `crate::server::router`), so each of them sees the
-/// resolved client. A request without `ConnectInfo` (never the case behind the
-/// accept loop) gets neither: the rate limiter then skips its per-IP bucket,
-/// as it did before. A request on a [`LocalConnection`] is attributed to its
+/// resolved client. A request without `ConnectInfo` gets neither extension,
+/// and the proxy handler, which requires [`Forwarding`], then fails it with a
+/// `500`; the accept loop always inserts `ConnectInfo`, so only test harnesses
+/// serve without it. A request on a [`LocalConnection`] is attributed to its
 /// peer, the front.
 pub(crate) async fn identify(
     State(trusted): State<Arc<TrustedProxies>>,
@@ -340,8 +341,12 @@ pub(crate) async fn identify(
 /// another version, an unknown command, an address block shorter than its
 /// family needs, and a `PROXY` header for anything but TCP over IPv4 or IPv6
 /// (a front sending one is misconfigured, and serving the connection as the
-/// front's own would merge its clients into the front's rate-limit key). The
-/// caller bounds the read with the header read timeout.
+/// front's own would merge its clients into the front's rate-limit key). That
+/// includes a `PROXY` header with family `UNSPEC`, which the PROXY v2
+/// specification has a receiver accept and serve under the real connection's
+/// endpoints; the gateway closes such a connection instead, on purpose, so a
+/// relayed client is never served under the front's key. The caller bounds the
+/// read with the header read timeout.
 pub(crate) async fn read_proxy_header<R>(stream: &mut R) -> io::Result<ProxyHeader>
 where
     R: AsyncRead + Unpin,
@@ -894,14 +899,26 @@ mod tests {
             ("udp over ipv4", raw_header(0x21, 0x12, tcp4_block)),
             ("unspecified family", raw_header(0x21, 0x00, &[])),
             ("unix stream", raw_header(0x21, 0x31, &[0; 216])),
-            ("short ipv4 block", raw_header(0x21, PROXY_V2_TCP4, &tcp4_block[..8])),
-            ("short ipv6 block", raw_header(0x21, PROXY_V2_TCP6, tcp4_block)),
             ("truncated block", valid[..20].to_vec()),
             ("truncated tlv", truncated_tlv),
             ("empty", Vec::new()),
         ] {
             let (verdict, _) = read_header(&bytes).await;
             assert!(verdict.is_err(), "{case}");
+        }
+
+        // a short address block is refused by its length guard, not by running
+        // out of bytes: request bytes follow it, and without the guard the
+        // reader would take them as the rest of the block
+        let request = b"POST / HTTP/1.1\r\nHost: gateway\r\n\r\n";
+        for (case, header) in [
+            ("short ipv4 block", raw_header(0x21, PROXY_V2_TCP4, &tcp4_block[..8])),
+            ("short ipv6 block", raw_header(0x21, PROXY_V2_TCP6, tcp4_block)),
+        ] {
+            let bytes = [header, request.to_vec()].concat();
+            let (verdict, _) = read_header(&bytes).await;
+            let err = verdict.expect_err(case);
+            assert_eq!(err.to_string(), "PROXY protocol address block is too short", "{case}");
         }
     }
 }

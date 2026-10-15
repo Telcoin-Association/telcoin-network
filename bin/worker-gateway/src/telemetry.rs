@@ -7,32 +7,36 @@
 //! is installed and every macro below is a cheap no-op against the global noop
 //! recorder.
 //!
-//! Three recorders partition every proxied request:
+//! Four recorders partition every proxied request:
 //!
 //! - [`record_forwarded`] bumps `tn_worker_gateway_requests_total{outcome="forwarded"}` for a
 //!   request handed to an upstream (a worker, or the `--redirect-queries` endpoint) whose answer is
 //!   relayed;
 //! - [`record_rejection`] bumps `tn_worker_gateway_requests_total{outcome="rejected"}` plus
 //!   `tn_worker_gateway_rejections_total{reason=...}` for a request the gateway answered with a
-//!   JSON-RPC error;
+//!   JSON-RPC error, a submission whose answer was lost after the worker's `2xx` included;
 //! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
 //!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
-//!   upstream answered an error status without a JSON body, which the gateway replaced with a
-//!   JSON-RPC error.
+//!   upstream's answer carried no JSON-RPC body to pass on (an error status without a JSON body, an
+//!   answer from the `--redirect-queries` endpoint without one, or a `1xx` or `304`), which the
+//!   gateway replaced with a JSON-RPC error;
+//! - [`record_cancelled`] bumps `tn_worker_gateway_requests_total{outcome="cancelled"}` for a
+//!   request whose connection closed before the gateway answered it (a client disconnect, the
+//!   connection-lifetime cap or shutdown dropped it mid-flight).
 //!
-//! Their sum is the total proxied-request count, and `rejections_total` breaks
-//! the non-forwarded side down by reason. The gateway's own `/health` and `/ready`
-//! probes are not proxied and are deliberately not counted, so the in-flight
+//! Their sum is the total proxied-request count, a cancelled request included,
+//! and `rejections_total` breaks the non-forwarded side down by reason. The gateway's own `/health`
+//! and `/ready` probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
 //!
 //! [`Throttle`] rate-limits a per-request log call site, so request volume
 //! cannot drive log volume; the counters above still count every request.
 //!
 //! [`record_routed`] counts every forward attempt by route and result, which
-//! splits the load between the worker and the query upstream (a relayed body
-//! that fails mid-stream is counted again, as `body_failed`, and a worker's
-//! answer to a submission that is lost while it is read whole counts as
-//! `body_failed` alone), and
+//! splits the load between the worker and the query upstream (a forwarded
+//! answer whose body then fails is counted again, as `body_failed`: a relayed
+//! body that fails mid-stream, or a worker's answer to a submission that is
+//! lost while it is read whole), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 //!
@@ -49,6 +53,11 @@
 //! [`record_connection_refused`] counts inbound connections the accept loop
 //! closed without serving, by `reason`. They never carry a request to the
 //! proxy, so they appear in neither request counter.
+//!
+//! [`ConnectionSlot`] pairs an accepted client connection's
+//! `--max-connections` permit with `tn_worker_gateway_open_connections`, so the
+//! gauge always equals the slots held; at the cap, new connections wait in the
+//! kernel's accept backlog.
 
 use std::{
     sync::{Arc, Mutex, PoisonError},
@@ -69,12 +78,13 @@ use crate::proxy::UpstreamOrigin;
 /// gateway's own CPU idle.
 const INFLIGHT_REQUESTS: &str = "tn_worker_gateway_inflight_requests";
 
-/// Proxied requests by terminal `outcome` (`forwarded`, `rejected` or
-/// `upstream_error`).
+/// Proxied requests by terminal `outcome` (`forwarded`, `rejected`,
+/// `upstream_error` or `cancelled`).
 const REQUESTS_TOTAL: &str = "tn_worker_gateway_requests_total";
 
 /// Rejected and upstream-error proxied requests by `reason` (the
-/// `GatewayError` reason label).
+/// `GatewayError` reason label). Of the two alike, `method_not_allowed` is the
+/// `403` method policy and `method_not_post` HTTP's `405`.
 const REJECTIONS_TOTAL: &str = "tn_worker_gateway_rejections_total";
 
 /// End-to-end proxied-request duration, in seconds, until the response body has
@@ -124,6 +134,15 @@ const DNS_LOOKUPS_TOTAL: &str = "tn_worker_gateway_dns_lookups_total";
 /// connections; `proxy_header`: a `--proxy-protocol` peer's PROXY header was
 /// missing, malformed or late).
 const CONNECTIONS_REFUSED_TOTAL: &str = "tn_worker_gateway_connections_refused_total";
+
+/// Client-listener connections holding a `--max-connections` slot. While it
+/// reads the cap, new connections wait in the kernel's accept backlog. The
+/// `--probe-addr` listener has no cap and is not counted.
+const OPEN_CONNECTIONS: &str = "tn_worker_gateway_open_connections";
+
+/// Sampled access-log lines the line ceiling
+/// (`--access-log-max-lines-per-second`) dropped.
+const ACCESS_LOG_SUPPRESSED_TOTAL: &str = "tn_worker_gateway_access_log_suppressed_total";
 
 /// How long a [`Throttle`] stays quiet after it lets a line through.
 const THROTTLE_WINDOW: Duration = Duration::from_secs(10);
@@ -200,6 +219,32 @@ impl Drop for InFlightSlot {
     }
 }
 
+/// RAII guard for one accepted client connection's `--max-connections` slot:
+/// the semaphore permit plus the open-connections gauge that counts it.
+///
+/// The accept loop builds it only once a connection is accepted, so a failed
+/// accept never counts, and the connection's task drops it when the
+/// connection ends, lowering the gauge as the permit goes back, so the gauge
+/// cannot drift from the slots actually held.
+pub(crate) struct ConnectionSlot {
+    /// The held permit; dropping it frees the slot.
+    _permit: OwnedSemaphorePermit,
+}
+
+impl ConnectionSlot {
+    /// Count the connection accepted under `permit` as open.
+    pub(crate) fn open(permit: OwnedSemaphorePermit) -> Self {
+        gauge!(OPEN_CONNECTIONS).increment(1.0);
+        Self { _permit: permit }
+    }
+}
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        gauge!(OPEN_CONNECTIONS).decrement(1.0);
+    }
+}
+
 /// RAII guard covering the bytes one request holds against the in-flight byte
 /// budget.
 ///
@@ -238,18 +283,26 @@ pub(crate) fn record_rejection(reason: &'static str) {
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
-/// Record a request whose upstream answered an error status without a JSON
-/// body, which the gateway replaced with a JSON-RPC error. It is kept apart
-/// from [`record_rejection`]'s `rejected` outcome because the gateway did
-/// forward it: the upstream refused it.
+/// Record a request whose upstream's answer carried no JSON-RPC body to pass
+/// on (an error status without a JSON body, an answer from the query upstream
+/// without one, or a `1xx` or `304`), which the gateway replaced with a
+/// JSON-RPC error. It is kept apart from [`record_rejection`]'s `rejected`
+/// outcome because the gateway did forward it and the upstream answered.
 pub(crate) fn record_upstream_error(reason: &'static str) {
     counter!(REQUESTS_TOTAL, "outcome" => "upstream_error").increment(1);
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
+/// Record a request dropped before the gateway answered it: its connection
+/// closed (a client disconnect, the connection-lifetime cap or shutdown)
+/// while the request was in flight, so no other outcome was recorded.
+pub(crate) fn record_cancelled() {
+    counter!(REQUESTS_TOTAL, "outcome" => "cancelled").increment(1);
+}
+
 /// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or a
-/// response whose body then failed (`body_failed`).
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or,
+/// after its `forwarded`, an answer whose body then failed (`body_failed`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }
@@ -264,6 +317,12 @@ pub(crate) fn record_mixed_batch() {
 /// by a stable machine-readable `reason`.
 pub(crate) fn record_connection_refused(reason: &'static str) {
     counter!(CONNECTIONS_REFUSED_TOTAL, "reason" => reason).increment(1);
+}
+
+/// Record a sampled access-log line dropped because the second's line ceiling
+/// was already reached.
+pub(crate) fn record_access_log_suppressed() {
+    counter!(ACCESS_LOG_SUPPRESSED_TOTAL).increment(1);
 }
 
 /// Record one name resolution with its `result` (`hit`, `miss`, `error` or
@@ -483,6 +542,18 @@ pub(crate) mod test_utils {
                 .collect()
         }
     }
+
+    /// Whether this test has a process of its own (nextest's model), so a
+    /// process-wide static it reads (an env var, a warning throttle) is
+    /// touched by no other test.
+    ///
+    /// A test that needs this returns early, with an `eprintln!` naming the
+    /// reason, when it is false: under `cargo test` every test shares one
+    /// process, so a warning another test already admitted, or an env var
+    /// another test reads, would make it fail by order.
+    pub(crate) fn process_per_test() -> bool {
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test")
+    }
 }
 
 #[cfg(test)]
@@ -587,6 +658,17 @@ mod tests {
                 (2, 1)
             );
         });
+    }
+
+    /// `outcome="cancelled"` is part of the metrics contract like the
+    /// rejection reasons, but it is no `GatewayError`, so
+    /// `reason_labels_are_stable` cannot pin it; pin it here.
+    #[test]
+    fn record_cancelled_writes_outcome_cancelled() {
+        let mut metrics = test_utils::CapturedMetrics::install();
+        record_cancelled();
+        assert_eq!(metrics.value(REQUESTS_TOTAL, &[("outcome", "cancelled")]), 1.0);
+        assert_eq!(REQUESTS_TOTAL, "tn_worker_gateway_requests_total");
     }
 
     #[test]

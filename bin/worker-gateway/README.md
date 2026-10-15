@@ -23,8 +23,8 @@ The [production-readiness review](docs/production-readiness.md) evaluates this g
 - TLS termination for clients and auth/API keys are out of scope; run the gateway behind your own ingress/mTLS.
   The hop to the workers can use TLS (see [TLS to workers](#tls-to-workers)).
 - Header forwarding is minimal.
-  Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)) and the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the `--redirect-queries-header` header when one is set; see [Query upstream header](#query-upstream-header)).
-  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL only a JSON `Content-Type` (`application/json` or an `application/*+json` type) passes, and anything else, or none, becomes `application/json`.
+  Upstream gets a `POST` with the request body and `Content-Type`, plus `X-Forwarded-For` / `X-Forwarded-Proto` (the client identity the gateway resolved, never the client's own values; see [Client identity behind a front](#client-identity-behind-a-front)), the `X-TN-Gateway` hop marker (loop protection; calls sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, plus the `--redirect-queries-header` header when one is set; see [Query upstream header](#query-upstream-header)), and `User-Agent: tn-worker-gateway/<version>`, so a query upstream's operator can identify the gateway.
+  The client gets the upstream status, body, and `Content-Type` (an error status without a JSON body gets a JSON-RPC error body, and a `1xx` or `304`, which cannot carry a body, gets that error with status `502`; see [Behaviour on failure](#behaviour-on-failure)); from the `--redirect-queries` URL an answer passes only with a JSON `Content-Type` (`application/json` or an `application/*+json` type), and an answer with any other `Content-Type`, or none, a `2xx` included, gets the `-32012` error instead of being relabelled.
   All other headers are dropped in both directions.
   With `--cors-allowed-origins` set the gateway adds CORS headers of its own (see [CORS](#cors)); without it, browser dApps on another origin need CORS handled at the ingress.
   Every response on `--listen-addr` carries `X-Content-Type-Options: nosniff`, so a browser never reads a body served on the validator's origin as HTML or script; the only exceptions are hyper's own protocol errors (see [Behaviour on failure](#behaviour-on-failure)).
@@ -100,8 +100,10 @@ the gateway's own listen address is rejected at startup, so defaults plus a
 loopback upstream fail fast instead of looping.
 
 The check holds across address families: a gateway listening on `[::]` takes IPv4 connections too, so `127.0.0.1` on its port is the gateway, and `localhost` counts as both `127.0.0.1` and `[::1]`.
+The check knows address literals and `localhost`, loopback and unspecified addresses included; it does not know the host's other interface addresses or a hostname that resolves to this machine, so an upstream URL naming the pod's own address passes startup, and the loop markers then stop every request to it with `508` (`loop_detected` or `redirect_loop_detected`).
 Startup also rejects a self-pointing upstream URL written as an IPv4-mapped IPv6 literal such as `[::ffff:127.0.0.1]`, an upstream list that names one worker id twice, and a zero `--readiness-poll-interval`, `--readiness-poll-timeout`, `--upstream-connect-timeout`, `--upstream-request-timeout` or `--header-read-timeout`, none of which has a disabled setting.
 It rejects an `--upstream-request-timeout` that is not longer than `--upstream-connect-timeout`: the request deadline includes connection setup, so it would end a stalled connect first, as a timeout that passive health cannot count.
+It rejects a `--readiness-poll-timeout` longer than `--readiness-poll-interval`: a poll cycle lasts up to the timeout, so one hanging upstream would slow every upstream's polls.
 
 The gateway ignores `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` and `NO_PROXY`: forwarded calls and readiness polls connect to the configured URLs directly.
 Neither follows an HTTP redirect: a readiness poll that gets a `3xx` counts as not ready, so only a `2xx` answer from the configured readiness URL can mark its worker ready.
@@ -133,45 +135,47 @@ Every flag has an environment-variable fallback.
 | `--recent-submission-ttl` | `WORKER_GATEWAY_RECENT_SUBMISSION_TTL` | `60s` | With `--redirect-queries`, how long lookups of a forwarded submission's hash go to the worker (`0` disables); see [Reads kept on the worker](#reads-kept-on-the-worker). |
 | `--denied-method-prefixes` | `WORKER_GATEWAY_DENIED_METHOD_PREFIXES` | `tn_,debug_,trace_,admin_` | Comma-separated method-name prefixes refused when `--redirect-queries` is unset (empty allows every method); see [Method policy](#method-policy). |
 | `--readiness-poll-interval` | `WORKER_GATEWAY_READINESS_POLL_INTERVAL` | `5s` | Readiness poll cadence. |
-| `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. |
+| `--readiness-poll-timeout` | `WORKER_GATEWAY_READINESS_POLL_TIMEOUT` | `2s` | Per-poll timeout. At most `--readiness-poll-interval`. |
 | `--readiness-failure-threshold` | `WORKER_GATEWAY_READINESS_FAILURE_THRESHOLD` | `3` | Failed polls in a row that turn a ready upstream not-ready (at least 1); see [Readiness contract](#readiness-contract). |
 | `--readiness-success-threshold` | `WORKER_GATEWAY_READINESS_SUCCESS_THRESHOLD` | `2` | Successful polls in a row that turn a not-ready upstream ready, at startup too (at least 1). |
 | `--upstream-failure-threshold` | `WORKER_GATEWAY_UPSTREAM_FAILURE_THRESHOLD` | `3` | Worker forwards in a row that fail to connect, a connect timeout included, before the upstream is marked not-ready (`0` disables); a timeout or failure after the request was sent neither counts nor resets the count, because the client's method and params decide how long the worker takes, and a worker that accepts connections but stops answering is left to the poller; see [Passive health on the RPC path](#passive-health-on-the-rpc-path). |
 | `--upstream-connect-timeout` | `WORKER_GATEWAY_UPSTREAM_CONNECT_TIMEOUT` | `2s` | Upstream connect timeout. |
-| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream per-request deadline, connection setup included, so it must be longer than `--upstream-connect-timeout`; the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
-| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Per-request deadline for the `--redirect-queries` URL (`0` = use `--upstream-request-timeout`); the default drops to `--upstream-request-timeout` when that is shorter, and a value set here must not exceed it. |
+| `--upstream-request-timeout` | `WORKER_GATEWAY_UPSTREAM_REQUEST_TIMEOUT` | `35s` | Upstream deadline for the response head, connection setup included, so it must be longer than `--upstream-connect-timeout`, and the longest a response body may go without data (a body that keeps arriving is never cut); the default outlasts reth's 30 s `eth_sendRawTransactionSync` wait. |
+| `--query-request-timeout` | `WORKER_GATEWAY_QUERY_REQUEST_TIMEOUT` | `10s` | Deadline for the `--redirect-queries` URL's response head, and the longest its response body may go without data (`0` = use `--upstream-request-timeout`); the default drops to `--upstream-request-timeout` when that is shorter, and a value set here must not exceed it. |
 | `--upstream-ca-cert` | `WORKER_GATEWAY_UPSTREAM_CA_CERT` | (none) | PEM file of extra CA certificates trusted for `https` upstreams, on top of the system roots; see [TLS to workers](#tls-to-workers). |
 | `--upstream-client-cert` | `WORKER_GATEWAY_UPSTREAM_CLIENT_CERT` | (none) | PEM client certificate chain presented to an `https` upstream that asks for one; requires `--upstream-client-key`. |
 | `--upstream-client-key` | `WORKER_GATEWAY_UPSTREAM_CLIENT_KEY` | (none) | Unencrypted PEM private key for `--upstream-client-cert`; requires `--upstream-client-cert`. |
 | `--dns-cache-ttl` | `WORKER_GATEWAY_DNS_CACHE_TTL` | `30s` | How long an upstream host's resolved addresses are reused (`0` disables the cache); see [DNS and the DDoS front](#dns-and-the-ddos-front). |
 | `--max-concurrent-dns-lookups` | `WORKER_GATEWAY_MAX_CONCURRENT_DNS_LOOKUPS` | `8` | Upstream DNS lookups that may run at once, for the proxy and the readiness poller each (at least `1`); a lookup over the cap fails at once and does not count toward `--upstream-failure-threshold`. |
 | `--header-read-timeout` | `WORKER_GATEWAY_HEADER_READ_TIMEOUT` | `10s` | Inbound header read deadline (slow-loris guard); a `--proxy-protocol` connection from a listed front gets one more for its PROXY header. |
-| `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. |
+| `--max-connections` | `WORKER_GATEWAY_MAX_CONNECTIONS` | `500` | Concurrent inbound connection cap. Each connection needs a file descriptor: the gateway raises its soft `RLIMIT_NOFILE` to the hard limit at startup and warns when this cap plus the upstream caps exceed it. |
 | `--max-connections-per-ip` | `WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP` | `32` | Concurrent inbound connections per client prefix, keyed on the resolved client (the PROXY header's source, else the peer); connections from `--trusted-proxies` are not counted (`0` disables; see [Connection handling](#connection-handling)). |
 | `--max-inflight-submissions` | `WORKER_GATEWAY_MAX_INFLIGHT_SUBMISSIONS` | `256` | In-flight cap for requests made only of submissions; over it the gateway answers `503` at once (`0` = unlimited). |
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
 | `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). With `--redirect-queries`, the reads kept on the worker may hold at most a fifth of it (20 by default; see [Per-route capacity](#per-route-capacity)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
 | `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
-| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). |
-| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest enabled rate-limit burst; a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
+| `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). Must be greater than `0`; startup warns below 263168 (one hex-encoded 128 KiB transaction plus its envelope). |
+| `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest per-IP or global burst (the submission budget does not lower it); a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
 | `--max-inflight-request-bytes` | `WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES` | `536870912` | Request-body bytes held across all in-flight requests (512 MiB; at least `--max-request-bytes`, at most 4294967295; `0` disables; see [Request size](#request-size)). |
 | `--http1-max-buf-size` | `WORKER_GATEWAY_HTTP1_MAX_BUF_SIZE` | `65536` | Per-connection read buffer cap, in bytes (64 KiB; minimum 8192; a request head must fit in it; see [Request size](#request-size)). |
 | `--rate-limit-per-ip` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP` | `100` | Per-IP requests/second (`0` disables). |
 | `--rate-limit-per-ip-burst` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_BURST` | `0` | Per-IP burst (`0` derives 2×rate). |
-| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
-| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count. |
+| `--rate-limit-per-ip-v6-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V6_PREFIX` | `64` | IPv6 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv6 client into one bucket and one connection count), and startup warns below `/32`. |
+| `--rate-limit-per-ip-v4-prefix` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_V4_PREFIX` | `32` | IPv4 prefix (bits) the client address is masked to before it keys its rate-limit bucket and its `--max-connections-per-ip` count; `0` is rejected (it does not disable masking, it would put every IPv4 client into one bucket and one connection count), and startup warns below `/16`. |
+| `--rate-limit-per-ip-max-entries` | `WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES` | `100000` | Most client prefixes tracked by the per-IP limiter; beyond it new clients share one overflow bucket (see [Rate limiting](#rate-limiting)). |
 | `--rate-limit-global` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL` | `3000` | Gateway-wide requests/second (`0` disables). |
 | `--rate-limit-global-burst` | `WORKER_GATEWAY_RATE_LIMIT_GLOBAL_BURST` | `0` | Global burst (`0` derives 2×rate). |
-| `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submissions, burst 2×rate (`0` disables; see [Rate limiting](#rate-limiting)). |
+| `--rate-limit-submissions` | `WORKER_GATEWAY_RATE_LIMIT_SUBMISSIONS` | `0` | Gateway-wide requests/second reserved for submission requests, burst 2×rate: it meters a submission request's first call, and a submission batch's further calls count against the per-IP and global limits like any batch's, so it bounds submission requests, not submitted transactions (`0` disables; see [Rate limiting](#rate-limiting)). |
 | `--trusted-proxies` | `WORKER_GATEWAY_TRUSTED_PROXIES` | (none) | Comma-separated CIDR ranges (a bare address is one host) of the fronts whose `X-Forwarded-For` and `X-Forwarded-Proto` the gateway believes, and, unless `--proxy-protocol-from` is set, that send a PROXY header under `--proxy-protocol`; unset trusts none. See [Client identity behind a front](#client-identity-behind-a-front). |
 | `--proxy-protocol` | `WORKER_GATEWAY_PROXY_PROTOCOL` | `false` | Expect a PROXY protocol v2 header on every connection from a `--proxy-protocol-from` peer (the env value is `true` or `false`); requires a non-empty `--proxy-protocol-from` or `--trusted-proxies`. |
 | `--proxy-protocol-from` | `WORKER_GATEWAY_PROXY_PROTOCOL_FROM` | `--trusted-proxies` | Comma-separated CIDR ranges of the peers that must open every connection with a PROXY protocol v2 header; unset or blank, the `--trusted-proxies` ranges. Listing a peer here does not make its `X-Forwarded-For` believed or exempt it from `--max-connections-per-ip`; requires `--proxy-protocol`. |
 | `--shutdown-delay` | `WORKER_GATEWAY_SHUTDOWN_DELAY` | `0s` | How long to keep serving after SIGTERM, with `/ready` and `/ready/any` reporting draining, before the listeners close (`0` disables; at most `60s`); see [Graceful shutdown](#graceful-shutdown). |
-| `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | `30s` | Drain deadline on SIGTERM. |
+| `--graceful-shutdown-timeout` | `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` | the request deadline (`45s` at the defaults) | Drain deadline on SIGTERM. Defaults to the request deadline, `--upstream-request-timeout` + `--header-read-timeout`, so a request accepted just before shutdown can finish; an explicit value is kept as given, and one below the deadline logs a startup warning. |
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
 | `--access-log-sample` | `WORKER_GATEWAY_ACCESS_LOG_SAMPLE` | `0` | Fraction of proxied requests written to the access log, from `0` to `1` (`0` disables); see [Access log](#access-log). |
+| `--access-log-max-lines-per-second` | `WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND` | `1000` | Most access-log lines written per second, after sampling (`0` = unlimited); lines over it are dropped and counted; see [Access log](#access-log). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 | `--log-format` | `WORKER_GATEWAY_LOG_FORMAT` | `text` | Log line format: `text` or `json` (one JSON object per line). `text` is coloured only when stdout is a terminal and `NO_COLOR` is unset or empty; `json` is never coloured. |
 
@@ -194,6 +198,7 @@ worker-gateway \
 
 - **System roots.** An `https` upstream is verified against the system CA certificates (or the bundle that `SSL_CERT_FILE` or `SSL_CERT_DIR` names), which the image installs.
   When an `https` URL is configured without `--upstream-ca-cert` and the system store holds no certificate, the gateway refuses to start instead of failing every call.
+  With `--upstream-ca-cert` it starts on an empty system store but warns that every `https` upstream, `--redirect-queries` included, must then chain to that CA.
 - **Custom CA.** `--upstream-ca-cert` adds every certificate in a PEM bundle to the trusted roots, so a worker certificate from a private CA needs only that CA's file.
   The system roots stay trusted alongside it.
   The certificate must name the host in the URL: a DNS name for a host name, an IP address entry for an IP literal.
@@ -219,6 +224,7 @@ An invalid entry, an empty entry, and a `*` beside other entries all fail startu
 With the flag set, the gateway answers every `OPTIONS` preflight itself, ahead of the `POST`-only rule, and never forwards it; without the flag an `OPTIONS` gets the same `405` as any other method but `POST` (see [Gateway endpoints](#gateway-endpoints)).
 The answer allows `POST` with a `Content-Type` header, and the browser may cache it for an hour (`Access-Control-Max-Age: 3600`); a page that sends any other request header, such as `Authorization`, fails its preflight.
 A request from an allowed origin gets `Access-Control-Allow-Origin` on its response (the origin itself, or `*` with the wildcard), gateway error responses included.
+Responses also expose `Retry-After` (`Access-Control-Expose-Headers`), so a page can read how long a capacity `503` asks it to wait; a browser hides any response header outside the CORS-safelisted few unless it is exposed.
 Origins match exactly, so `https://app.example.com` does not allow `http://app.example.com`, `https://app.example.com:8443` or `https://www.app.example.com`.
 A request from any other origin is still served, like a request without `Origin`, but its response carries no `Access-Control-Allow-Origin`, so the browser withholds it from the page.
 A preflight from such an origin still lists the allowed method and header and the max age, which grant nothing without `Access-Control-Allow-Origin`.
@@ -256,7 +262,7 @@ Every other connection counts, the `/health`, `/ready` and `/ready/any` probes o
 > Across prefixes only `--max-connections` bounds the total, so absorb wide floods in front of the gateway (see [DNS and the DDoS front](#dns-and-the-ddos-front)).
 
 Upstream response bodies are streamed through, never buffered whole (except
-the short, capped answer to a submission whose hash is remembered; see
+the capped answer to a submission whose hash is remembered; see
 [Reads kept on the worker](#reads-kept-on-the-worker)), so
 response size does not translate into gateway memory. A stalled *upstream* is
 bounded by the upstream request timeout; a stalled or slow-reading *client*
@@ -286,6 +292,11 @@ sent to the `--redirect-queries` URL carry `X-TN-Gateway-Redirect` instead, see
 request that already carries it is rejected (HTTP `508`), so a misconfigured
 upstream or VIP that points back at a gateway breaks the loop at the first
 revisit instead of exhausting file descriptors.
+The marker is not authenticated: a client that sends it gets the `508` and
+raises the throttled loop warning, at the cost of a rate-limit token per
+attempt, and two gateways cannot be chained on the worker path, which is
+unsupported by design (the redirect hop has its own marker,
+`X-TN-Gateway-Redirect`).
 
 ## Edge protections
 
@@ -307,13 +318,15 @@ never a bare reset.
 
 A batch costs one token per call, the first before its body is read and the rest once its calls are counted, in the same order and with the same refund; see [Batches](#batches).
 A third, optional bucket reserves rate for submissions.
-With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submissions, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses submissions, and a submission flood over its own budget no longer spends the read budget.
+With `--rate-limit-submissions` set (requests per second, burst twice the rate), `--rate-limit-global` governs queries and `--rate-limit-submissions` governs submission requests, using the classes of [Per-route capacity](#per-route-capacity), so a read flood that empties the global bucket no longer refuses single submissions, and a submission *request* over its own budget no longer spends the read budget.
+The calls of a submission batch beyond its first still come from the global bucket (see below), so the flag bounds submission requests, not submitted transactions.
 The edge cannot tell the classes apart before the body is read, so there it runs only the per-IP limit, which still covers both classes and still refuses an over-limit client before its body is read.
 Once the request is read and classified, its first call is charged to the global bucket for a query or to the submission bucket for a submission.
 A refusal there is a `429` and gives the per-IP token back, so a refused submission spends no global token and a refused query no submission token.
+A first-seen client gets its per-IP entry only once a shared bucket has admitted its request: its class bucket, or, for a request answered before it is classified (a `405`, an unreadable or over-length body, a denied method), the global bucket, which then charges it as a query; a request either bucket refuses leaves no entry, so with the flag as without it a flood the shared buckets refuse cannot fill the table.
 Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit.
 A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
-A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal leaves the first call's tokens spent, as it does without the flag.
+A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal gives the first call's class token back; its per-IP token stays spent.
 With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
 Without it the worker also receives every admitted query, mixed batches with their submissions included, so it sees up to N × (`--rate-limit-global` + `--rate-limit-submissions`) requests per second.
 Without the flag the edge check is unchanged.
@@ -336,7 +349,9 @@ global limit applies to it; a single IPv6 `/64` makes that trivial.
   IPv4 allocations.
 
 A prefix wider than its address family allows (`/33` for IPv4, `/129` for IPv6)
-is rejected at startup rather than clamped. On a dual-stack listener an IPv4
+is rejected at startup rather than clamped, and so is `/0`, which does not
+disable masking but would put a whole family into one bucket; startup warns
+below `/16` (IPv4) or `/32` (IPv6). On a dual-stack listener an IPv4
 peer is reported in the mapped `::ffff:a.b.c.d` form; those are unmapped and
 keyed by the **IPv4** prefix, so they are metered per address rather than all
 landing in one `/64`.
@@ -365,24 +380,18 @@ Service, set `externalTrafficPolicy: Local` to keep their addresses).
 > the ingress.
 
 The gateway's own `GET /health`, `GET /ready` and `GET /ready/any` probes are **exempt** from rate limiting, so an orchestrator's liveness/readiness checks keep succeeding under a flood (rate-limiting them would make the orchestrator kill or depool the pod at the worst possible moment).
+Only `GET` and `HEAD` on `/health`, `/ready` and `/ready/any` are exempt; any other method there is rate-limited like any request before it is refused.
 The probe listener (`--probe-addr`) has no rate limit at all.
 
-Per-IP state is bounded: idle buckets are swept every minute and the number of
-tracked IPs is capped, so a wide spread of source IPs cannot grow memory without
-limit. Once the table is full (100,000 entries), a newly seen client gets no
-bucket of its own: every client the table cannot track shares one overflow
-bucket with the per-client rate and burst, so together they get one client's
-budget however many prefixes they spread over. One IPv6 `/48` (65,536 `/64`s)
-still fits in the table with a bucket per `/64`; the overflow bucket meters only
-the prefixes beyond the cap. A client keeps its own bucket only while it is
-busy: the sweep drops every bucket that has refilled, and a client that returns
-while the table is full shares the overflow bucket too.
+Per-IP state is bounded: idle buckets are swept every second and the number of tracked client prefixes is capped by `--rate-limit-per-ip-max-entries` (default 100,000), so a wide spread of source IPs cannot grow memory without limit.
+A newly seen client that finds the table full first frees its idle entries (a bucket that has refilled carries no state), checked at most once a second, and gets a bucket of its own if that frees a slot; a busy entry is never evicted.
+Only while every tracked entry is busy does a new client go without a bucket of its own: every client the table cannot track then shares one overflow bucket with the per-client rate and burst, so together they get one client's budget however many prefixes they spread over.
+One IPv6 `/48` (65,536 `/64`s) still fits in the default table with a bucket per `/64`; the overflow bucket meters only the prefixes beyond the cap.
+A client keeps its own bucket only while it is busy: a sweep drops every bucket that has refilled, and a client that returns while every entry is busy shares the overflow bucket too.
 
-> **Residual limitation.** A source holding more than 100,000 prefixes (two
-> `/48`s, or one `/47`) can refill the table after each sweep and then keep the
-> overflow bucket empty, so clients without an entry get `429` until the next
-> sweep while the global bucket looks healthy. If that matters for your
-> deployment, limit new source prefixes at the ingress.
+> **Residual limitation.** A source holding more prefixes than the table tracks (more than 100,000 at the default: two `/48`s, or one `/47`) can keep the overflow bucket empty only while it also keeps every tracked entry busy.
+> That costs it at least one request per tracked prefix every second, each charged to the global limit too, so it is out of reach while `--rate-limit-global` is well below the table size; with the global limit raised that far or disabled, clients without an entry get `429` for as long as the source keeps that up.
+> If that matters for your deployment, limit new source prefixes at the ingress.
 
 #### Client identity behind a front
 
@@ -468,7 +477,8 @@ followed by the listed peer that vouched for it; the inbound chain is never
 copied. `X-Forwarded-Proto` is copied from a listed peer when its right-most
 value is `http` or `https`, and is `http` otherwise.
 
-The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is in `--trusted-proxies`, a front sending `X-Forwarded-For` or a listed front's `LOCAL` health check, is not counted, since its requests belong to many clients.
+The per-client connection cap (`--max-connections-per-ip`, see [Connection handling](#connection-handling)) keys on the same resolved address at connection level: the PROXY header's source counts against its own prefix, and a connection whose address is in `--trusted-proxies` (a front sending `X-Forwarded-For`, or a `LOCAL` health check from a front listed there) is not counted, since its requests belong to many clients.
+A `LOCAL` connection from a front listed only in `--proxy-protocol-from` counts against the front's own prefix like any other connection.
 
 ### Per-route capacity
 
@@ -531,13 +541,15 @@ Size it from both ends:
   Each open connection also keeps a read buffer of up to `--http1-max-buf-size`.
   So peak request memory is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming; keep that under the container's memory limit.
   With the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, which the 1Gi limit in the reference manifest (`deploy/k8s/deployment.yaml`) covers.
+  With `--redirect-queries`, a single submission's answer is read whole and waits for its client after the byte reservation is released, so add up to `--max-connections` × (`--max-request-bytes` + 4 KiB) for answers clients have not read yet.
+  A connection holds a request body or such an answer, never both, so at the defaults the two stay within the figure above, while `--max-inflight-request-bytes` / `--max-request-bytes` below `--max-connections` lets the answers alone reach that product (about 1 GiB at `--max-connections 1000`).
   In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process over five runs, about 1.3 times the budget.
   That excess includes the read buffers of the client's, the gateway's and the upstream's connections, whose number the test scales with the budget, so the gateway's own share was not measured separately.
   Each extra connection adds at most `--http1-max-buf-size`.
   Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
   About `--max-inflight-request-bytes` / `--max-request-bytes` such idle requests (512 at the defaults, 35 at a 15 MiB cap) make every other body-carrying request fail with `-32010`.
   On an internet-facing gateway keep that quotient at or above `--max-connections` (the gateway warns at startup otherwise); the per-client connection cap (`--max-connections-per-ip`) bounds how many of them one client can hold.
-  The budget is shared by every client and no client prefix's share of it is capped, so below that point a few clients together, or one client when the quotient is at or below `--max-connections-per-ip`, can hold all of it with idle requests.
+  The budget is shared by every client and no client prefix's share of it is capped, so below that point a few clients together, or one client when the quotient is at or below `--max-connections-per-ip`, can hold all of it with idle requests; startup warns in that case too.
   If the limit has to stay lower, lower the budget, for example `--max-inflight-request-bytes 268435456` (256 MiB) for about 352 MiB.
   A 256 MiB budget is exhausted by 256 idle requests, so on an internet-facing gateway lower `--max-connections` to 256 with it, which brings the figure to about 336 MiB.
 
@@ -546,8 +558,8 @@ Size it from both ends:
 A JSON-RPC batch (a JSON array of calls) is held to the same budget as the calls it carries.
 
 - **Length cap.** `--max-batch-len` (default 50, `0` means unlimited) caps the calls in one batch.
-  The effective cap is the smaller of `--max-batch-len` and the smallest enabled rate-limit burst, and startup logs a warning when a burst lowers it.
-  A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before it is screened or forwarded, whichever upstream it would go to.
+  The effective cap is the smaller of `--max-batch-len` and the smallest per-IP or global burst, and startup logs a warning when a burst lowers it.
+  A longer batch is refused whole with `413` / `-32003`, the message "batch too long" and a `null` id, before its screen verdict is applied or it is forwarded, whichever upstream it would go to.
   The gateway stops counting one element past the cap, so an oversized batch costs no more than the cap to read.
 - **One token per call.** A batch of K calls costs K rate-limit tokens, from the per-IP and the global bucket alike.
   The first token is taken before the body is read (with `--rate-limit-submissions`, only its per-IP part, see [Rate limiting](#rate-limiting)); the other K - 1 are charged once the body is read and its calls counted, and a refusal is a `429` / `-32006` with a `null` id.
@@ -568,7 +580,7 @@ An element with more than one `method` member ends the read too: the worker refu
 
 ### Transaction screening
 
-Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions).
+Every `eth_sendRawTransaction` and `eth_sendRawTransactionSync` call object, alone or in a batch made only of submissions, is decoded far enough to reject, at the edge, the two cases the worker would also reject: an undecodable payload, and a transaction type the network does not accept (EIP-4844 blob and EIP-7702 set-code transactions, and typed envelopes of an unknown type).
 This saves a wasted upstream round-trip.
 The decode uses the same pooled wire format the worker's RPC accepts and never recovers the signer, so it cannot reject a transaction the worker would accept.
 
@@ -590,6 +602,7 @@ The check runs after the length checks and before anything else is charged: a re
 
 Matching is case-sensitive and anchored at the start of the name, as the worker matches method names: under `tn_`, neither `TN_info` nor `eth_tn_x` is refused, and the worker answers both as unknown methods.
 The gateway reads method names the way the worker's server does: leading whitespace, form feed included, is skipped, a name spelled with unicode escapes is unescaped before the match, and a batch element that is not an object does not hide the calls around it.
+A batch element written in positional form, a JSON array that the worker's server reads as `[jsonrpc, id, method, params]`, is checked against the list by its third member when that is a string, whatever the array's length, so it cannot carry a denied method past the check.
 A body that does not start with `{` or `[` once leading whitespace is skipped, or whose `method` is not a string, is forwarded, and the worker rejects it on its own.
 A batch the gateway cannot read to its end is refused as unreadable before the policy runs, with `400` / `-32600` (see [Batches](#batches)), because the worker would still run the calls around the element it cannot read.
 A single call that starts with `{` but that the gateway cannot read, such as one holding a number out of range (`1e400`) or an unpaired surrogate escape, is refused like a denied call rather than forwarded unchecked.
@@ -611,7 +624,7 @@ A batch the gateway cannot read to its end is refused rather than routed (see [B
 
 The URL may be `http` or `https`, as worker URLs may.
 An `https` URL needs the system CA certificates, which the image installs; `--upstream-ca-cert` and the client certificate apply to it as well (see [TLS to workers](#tls-to-workers)).
-The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and `localhost` as both loopback addresses.
+The URL must not point at the gateway itself or at a worker's RPC or readiness host and port; an IPv4-mapped IPv6 literal such as `[::ffff:10.0.0.7]` counts as the IPv4 address it names, and any loopback or unspecified host (`localhost`, `127.0.0.2`, `[::1]`, `0.0.0.0`) as any other, since each names this machine.
 A URL on a worker's host at another port logs a warning at startup, and so does plain `http` to a host that is not a loopback, private, carrier-grade NAT (`100.64.0.0/10`) or link-local (`169.254.0.0/16`, `fe80::/10`) address.
 A value that is not a valid URL stops startup with an error that says what is wrong without repeating the value, which can carry an API key.
 
@@ -627,6 +640,7 @@ The marker says only that some gateway redirected the request, so it cannot tell
 With A redirecting to B and B redirecting to C, every query through A gets `508` from B; point A at C, or run B without the flag.
 The two markers count under their own reasons in `tn_worker_gateway_rejections_total`: `loop_detected` for `X-TN-Gateway`, `redirect_loop_detected` for `X-TN-Gateway-Redirect`.
 The gateway follows no HTTP redirects: a `3xx` from either upstream is passed to the client with its status, without its `Location` header (and, unless its body is JSON, with the `-32012` error as its body), so a query upstream cannot bounce a read onto the worker.
+A `304`, which cannot carry a body, is the exception: the client gets `502` with the `-32012` error, whatever its content type.
 Every `3xx` logs a warning naming the upstream by origin, whatever its body: an upstream behind a front that redirects is a misconfiguration no client can fix.
 Requests to either upstream carry a `tn-worker-gateway/<version>` user agent.
 
@@ -666,8 +680,8 @@ The rule is exact:
   A block parameter given any other way, such as `{"blockNumber": "pending"}`, or left out (which means `latest`) sends the nonce read to the query URL.
 - Every other read at `pending`, such as `eth_call`, `eth_getBalance` and `eth_estimateGas`, still goes to the query URL and can lag the worker's pool.
 - A hash is remembered only for a single `eth_sendRawTransaction` that passed the [transaction screen](#transaction-screening) and that the worker accepted: a `2xx` answer carrying a JSON-RPC `result`.
-  The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's short answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
-  An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost: the client gets `502` / `-32001`, and the forward counts as `body_failed` (see [Behaviour on failure](#behaviour-on-failure)).
+  The worker reports a rejected transaction as a JSON-RPC `error` inside a `200`, so the gateway reads the worker's answer to a single submission whole, up to the request's length plus 4 KiB, and passes it on unchanged; every other answer streams through.
+  An answer past that cap, or one whose body fails or runs past `--upstream-request-timeout`, is lost after the worker has answered, so the transaction may have been accepted: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `forwarded` and then `body_failed`, like a streamed answer (see [Behaviour on failure](#behaviour-on-failure)).
   A submission inside a batch, an `eth_sendRawTransactionSync` (which returns the receipt itself), and a submission the worker rejected, with an HTTP error status or a JSON-RPC `error`, are not remembered.
 - The gateway remembers at most 10,000 hashes and forgets the oldest first, so a flood of submissions can push a hash out early, and its lookups then go to the query URL.
 - Each gateway remembers only the submissions it forwarded itself, so a lookup that a load balancer sends to another gateway goes to the query URL.
@@ -690,6 +704,7 @@ Issue a key limited to what this endpoint should serve publicly (no archive, `de
 For a secret, use `--redirect-queries-header-file <path>` instead: the file holds the same line (a mounted secret, for example), which keeps the value out of the process arguments and environment, and whitespace around the line, a trailing newline included, is trimmed.
 Either flag requires `--redirect-queries`, and setting both is a startup error.
 A line that is not one valid `Name: value` header also stops startup, with an error that names the problem but never the value.
+So does a name the gateway sets on the query hop itself or a hop-by-hop name, in any letter case: `Content-Length`, `Transfer-Encoding`, `Host`, `Connection`, `TE`, `Trailer`, `Upgrade`, `Keep-Alive`, `Proxy-Connection`, `Content-Type`, `X-Forwarded-For`, `X-Forwarded-Proto`, `X-TN-Gateway` and `X-TN-Gateway-Redirect` are refused, since the header is added next to the gateway's own and would send them twice or mis-frame the body.
 On a command line, quote the whole line: unquoted, the shell splits it at the space after the colon, and the argument parser rejects the value as a stray argument and prints it in that error, before the gateway's own checks run.
 
 The value is never logged: the startup line records only whether a header is configured, debug output of the gateway's settings and state prints `<redacted>` in its place, and `--help` hides the environment variable's value.
@@ -717,7 +732,8 @@ The check runs once; a query URL that changes chains later is not detected.
   The path is not forwarded, so `POST /` and `POST /anything` are the same call.
 - `OPTIONS`, with `--cors-allowed-origins` set: a CORS preflight, answered by the gateway and never forwarded, on every path but `/ready/any` (see [CORS](#cors)).
 - Any other request gets the `405` / `-32600` error envelope, or the `429` when it is over a rate limit (see [Behaviour on failure](#behaviour-on-failure)), and reaches no upstream.
-  On `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included: the rate limiter exempts the probe paths, so JSON-RPC sent there is refused rather than proxied past the limits.
+  On the client listener (`--listen-addr`), on `/health`, `/ready` and `/ready/any` that means every method but `GET` and `HEAD`, `POST` included, refused with the message "only GET and HEAD are accepted on this path" and `Allow: GET,HEAD`: the rate limiter exempts only their `GET` and `HEAD`, so JSON-RPC sent to `/health`, `/ready` or `/ready/any` is rate-limited and then refused, never proxied past the limits.
+  The `--probe-addr` listener answers such a request with a bare `405` and `Allow: GET,HEAD`, without the JSON-RPC envelope, and counts nothing.
 
 The three probes answer on `--listen-addr`, exempt from rate limiting but inside the client connection cap.
 With `--probe-addr <addr>` set, they also answer on a listener of their own that serves nothing else (a request for any other path gets `404`), with no connection cap, no rate limit and no body limit.
@@ -734,7 +750,7 @@ The error carries the HTTP status in the table below and a JSON-RPC error object
 A client library that treats every non-`2xx` status as a transport failure reports these as HTTP errors, so read the body whatever the status.
 The request `id` is echoed when it can be recovered from the body.
 It is `null` for a batch (see below), except that a screen rejection inside a batch made only of submissions echoes the refused element's `id` (see [Transaction screening](#transaction-screening)).
-It is always `null` on a `405`, `408`, `413`, the `503` for an exhausted byte budget (`-32010`), the `400` for an unreadable body, and a `429` from the edge rate limits or from a batch's extra tokens (see [Batches](#batches)), which the gateway answers without recovering the id.
+It is always `null` on a `405`, the request deadline's `408` and `504`, `413`, the `503` for an exhausted byte budget (`-32010`), the `400` for an unreadable body, and a `429` from the edge rate limits or from a batch's extra tokens (see [Batches](#batches)), which the gateway answers without recovering the id.
 With `--rate-limit-submissions` set, the global bucket's verdict is settled after the body is read (see [Rate limiting](#rate-limiting)), so the `429` it gives a single call, and the one the submission bucket gives, echo the `id` like any other error.
 An `id` that is an array, an object, a boolean or a string over 256 bytes is echoed as `null` on every path, a refused batch element's included.
 
@@ -746,52 +762,48 @@ Hyper answers an unparseable request head itself, before the request reaches the
 | No upstream ready | `503` | `-32000` |
 | Upstream unreachable | `502` | `-32001` |
 | Upstream request timed out | `504` | `-32002` |
+| Upstream answered a submission, but its answer was lost (the transaction may have been accepted; reason `upstream_answer_lost`) | `502` | `-32013` |
 | Request body too large | `413` | `-32003` |
 | Batch longer than `--max-batch-len` | `413` | `-32003` |
 | Proxy loop detected (the request carries `X-TN-Gateway`; reason `loop_detected`) | `508` | `-32004` |
 | Redirect loop detected (the request carries `X-TN-Gateway-Redirect` and this gateway has `--redirect-queries`; reason `redirect_loop_detected`) | `508` | `-32004` |
-| Request deadline exceeded | `408` | `-32005` |
+| Request deadline exceeded before the request was sent upstream | `408` | `-32005` |
+| Request deadline exceeded after the request was sent upstream | `504` | `-32005` |
 | Rate limit exceeded | `429` | `-32006` |
 | Raw transaction undecodable | `400` | `-32007` |
-| Unsupported transaction type (EIP-4844 blob or EIP-7702 set-code; the message names which) | `400` | `-32008` |
+| Unsupported transaction type: an EIP-4844 blob, an EIP-7702 set-code or an unknown typed envelope (`0x05`..=`0x7f`), refused from its type byte, so a malformed type-3 or type-4 payload gets this code rather than `-32007` (the message names the type) | `400` | `-32008` |
 | Request body unreadable (client aborted), or a batch the gateway cannot read to its end | `400` | `-32600` |
 | Method other than `POST` (other than `GET` or `HEAD` on `/health`, `/ready` and `/ready/any`) | `405` | `-32600` |
 | In-flight cap reached (overloaded) | `503` | `-32009` |
 | In-flight request byte budget exhausted | `503` | `-32010` |
 | Method refused by the [method policy](#method-policy) (no `--redirect-queries`) | `403` | `-32011` |
-| Upstream answered an error status without a JSON body | the upstream's | `-32012` |
+| Upstream answered an error status without a JSON body, or a `2xx` from the query URL without one | the upstream's, or `502` for a `1xx` or `304` | `-32012` |
 
 The two capacity `503`s, `-32009` and `-32010`, carry `Retry-After: 1`: a slot or a byte reservation frees as soon as a request in flight finishes, so a client or proxy that honours the header waits a second instead of retrying at once.
 
-An upstream error answer with a JSON body (`application/json` or any `+json`
-subtype) is the upstream's own JSON-RPC error and passes through unchanged:
-status, body and content type. Any other non-2xx answer (a worker's `403`,
-`415` or `429` text/plain, or a `3xx`) keeps its status but has its body
-replaced by the `-32012` error, which echoes the request `id`. The
-`upstream_error` outcome also covers refusals a client can cause (a request
-whose `Content-Type` is not JSON gets the worker's `415`), so it is not by
-itself a worker-saturation signal.
+An upstream error answer with a JSON body (`application/json` or any `+json` subtype) is the upstream's own JSON-RPC error and passes through unchanged: status, body and content type.
+Any other non-2xx answer (a worker's `403`, `415` or `429` text/plain, or a `3xx`) keeps its status but has its body replaced by the `-32012` error, which echoes the request `id`.
+A `1xx` or `304`, which cannot carry a body, gets the same error with status `502`, whatever its content type.
+The `upstream_error` outcome also covers refusals a client can cause (a request whose `Content-Type` is not JSON gets the worker's `415`), so it is not by itself a worker-saturation signal.
 
-An upstream body that fails after the status and headers have gone out (the
-upstream closes or resets mid-stream) cannot be turned into an error any more:
-the client gets the upstream's status with a truncated body (a chunked
-response without its final chunk), and the gateway logs the failure at debug
-and counts it as `result="body_failed"` in
-`tn_worker_gateway_routed_requests_total`.
-The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32001`, and the forward counts as `body_failed` only, without a `forwarded`.
+An upstream body that fails after the status and headers have gone out (the upstream closes or resets mid-stream, or sends nothing for the route's request timeout) cannot be turned into an error any more: the client gets the upstream's status with a truncated body (shorter than the upstream's `Content-Length`, which the gateway passes on, or a chunked response without its final chunk), and the gateway logs the failure at debug and counts it as `result="body_failed"` in `tn_worker_gateway_routed_requests_total`.
+The worker's answer to a single submission whose hash the gateway would remember is read whole before any of it goes out (see [Reads kept on the worker](#reads-kept-on-the-worker)), so a failure there still becomes an error: the client gets `502` / `-32013`, or `504` / `-32002` when the read times out, and the forward counts as `forwarded` and then `body_failed`, like a streamed answer.
 
-The `408` message says whether the request may have been delivered.
-"request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
-"request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
-An upstream's own `408` is not rewritten; the client gets it with the upstream's status and body.
+The request deadline's answer says whether the request may have been delivered.
+A `408` with "request did not complete within the gateway's deadline" means the deadline passed before the gateway started sending the request upstream, so no upstream received it and it is safe to send again.
+A `504` with "request did not complete within the gateway's deadline; the request may have reached the upstream" means it passed after that point, so a submission may already be on its way into the network: look the transaction up by hash before sending it again.
+Both carry `-32005`, which tells the deadline's `504` from the upstream timeout's `504` (`-32002`).
+The answer after forwarding is not a `408` because client stacks such as OkHttp resend a `408` on their own, and the client would never see that message.
+An upstream's own `408` is not turned into the gateway's deadline error: it keeps its status, with its body if that is JSON and the `-32012` error otherwise, like any other upstream error status.
 Nor does the deadline cut a request whose upstream has already answered: the client gets that answer.
 
-A `504`, and a `502`, do not mean the request was not delivered: the gateway may already have sent it when the upstream timed out or the connection failed.
-With the default timeouts a slow worker produces the `504`, not the `408`.
-Treat either like the second `408` message and look a submission up by hash before sending it again.
+Neither `504` (`-32002` or `-32005`), nor a `502`, means the request was not delivered: the gateway may already have sent it when the upstream or the deadline timed out, or the connection failed.
+With the default timeouts a slow worker produces the upstream timeout's `504`, not the deadline's.
+Treat any of them like the deadline's `504` and look a submission up by hash before sending it again.
 
 A gateway error answering a batch (a JSON array) is one error object, not an array of per-call errors, and its `id` is `null`, except for a screen rejection inside a batch made only of submissions, which carries the refused element's `id` (see [Transaction screening](#transaction-screening)).
-The gateway refuses a batch only as a whole: it never splits one, and it decides a `405` or `429` before reading the body.
+The gateway refuses a batch only as a whole: it never splits one.
+A `405`, and a `429` from the edge rate limit, come before the body is read; a `429` for a batch's extra tokens, or with `--rate-limit-submissions` from its class's bucket, comes after it, still for the whole batch.
 That is the shape JSON-RPC 2.0 prescribes when a batch cannot be taken as a whole (invalid JSON or an empty array).
 A batch the upstream answers comes back as the upstream sent it.
 
@@ -816,8 +828,9 @@ On SIGTERM (or ctrl-c) the gateway shuts down in two phases.
 The probe listener (`--probe-addr`) follows the same phases: it keeps answering through the delay and stops accepting at the same moment as the client listener.
 With the delay at `0` the first phase is skipped: the listeners close as soon as the signal arrives, and a front that has not noticed yet sees refused connections.
 Set the delay to at least the time your fronts outside Kubernetes take to act on a failing `/ready` or `/ready/any` (health-check interval times unhealthy threshold, plus the record TTL for DNS).
-A request accepted just before the listener closes can run for the whole request deadline, `--upstream-request-timeout` plus `--header-read-timeout` (45s at the defaults), so the `30s` default drain can cut a slow `eth_sendRawTransactionSync` short; set the drain timeout to that deadline if those answers must survive a shutdown.
+A request accepted just before the listener closes can run for the whole request deadline, `--upstream-request-timeout` plus `--header-read-timeout` (45s at the defaults), and the drain defaults to that deadline so such a request can finish; an explicit `--graceful-shutdown-timeout` below it is kept, with a startup warning.
 Keep the delay plus the drain timeout plus about 1s inside the orchestrator's termination grace period.
+Kubernetes' default `terminationGracePeriodSeconds` is 30s, shorter than the 45s default drain, so set the pod's grace period explicitly (the shutdown delay plus the drain plus about 1s); a pod spec that omits it is killed 30s into the drain.
 The reference manifest uses a 5s delay, a 45s drain and a 55s grace period; the 5s covers Kubernetes endpoint removal only (see `deploy/README.md`).
 
 ## Observability
@@ -831,45 +844,54 @@ internal interface, not the public edge.
 The endpoint reuses the node's `tn-metrics` recorder, so the gateway's
 `tn_worker_gateway_*` series render alongside a node's `tn_*` metrics under one
 Prometheus/Grafana setup. A ready-to-import Grafana dashboard is provided at
-`grafana-worker-gateway.json`.
+`grafana-worker-gateway.json`; its `job` variable (the jobs that scrape
+`tn_worker_gateway_upstream_ready`) scopes every panel, so a node's series in
+the same Prometheus stay out of it.
 
 | Metric | Type | Labels | Meaning |
 | --- | --- | --- | --- |
 | `tn_worker_gateway_inflight_requests` | gauge | | Proxied requests from their buffered body until the relayed response's body has finished streaming (or the gateway's own error); the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget) are not counted. The intended autoscaling signal. |
-| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream answered an error status without a JSON body. |
+| `tn_worker_gateway_requests_total` | counter | `outcome` (`forwarded` / `rejected` / `upstream_error` / `cancelled`) | Proxied requests by terminal outcome; `upstream_error` is a request whose upstream's answer the gateway replaced with the `-32012` error (an error status without a JSON body, an answer from the query URL without one, or a `1xx` or `304`), a submission whose answer was lost after the worker's `2xx` counts as `rejected` under the reason of the error it gets (`upstream_answer_lost` or `upstream_timeout`), and `cancelled` is a request whose connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
 | `tn_worker_gateway_rejections_total` | counter | `reason` | Rejected and `upstream_error` proxied requests, broken down by reason (the conditions in the failure table above). |
 | `tn_worker_gateway_request_duration_seconds` | histogram | | Time from a proxied request's buffered body to the end of its response body (or the gateway's own error); not end-to-end, as it leaves out the request body read and requests refused before the proxy handler (by the rate limiter or the byte budget). |
 | `tn_worker_gateway_upstream_ready` | gauge | `worker_id`, `upstream` (the RPC URL's origin, `scheme://host:port`) | Per-worker published readiness, after the poll thresholds and passive health (`1` ready, `0` not-ready); nodes whose workers share an id keep separate series. |
-| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed mid-stream, in addition to its `forwarded`, and a worker's answer to a submission that was lost while the gateway read it whole, without one (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
+| `tn_worker_gateway_routed_requests_total` | counter | `route` (`worker` / `query`), `result` (`forwarded` / `upstream_error` / `unreachable` / `timeout` / `body_failed`) | Forward attempts by route, with their result; `body_failed` counts a forwarded response whose body then failed, in addition to its `forwarded`: a streamed body that failed mid-stream, or a worker's answer to a submission that was lost while the gateway read it whole (see [Reads kept on the worker](#reads-kept-on-the-worker)); the reads kept on the worker count under `worker`. A forward cut short by the whole-request deadline has no result here; it shows as `tn_worker_gateway_rejections_total{reason="request_timeout"}`. |
 | `tn_worker_gateway_mixed_batches_total` | counter | | Batches sent whole to the `--redirect-queries` URL because they mixed submissions with other calls (an element that is not a call object counts as another call). |
 | `tn_worker_gateway_route_inflight` | gauge | `route` (`submission` / `query`) | Requests holding a slot on their class's in-flight cap. |
 | `tn_worker_gateway_upstream_inflight` | gauge | | Requests this gateway is forwarding to the worker, under `--max-upstream-inflight`. |
 | `tn_worker_gateway_inflight_request_bytes` | gauge | | Request-body bytes held against `--max-inflight-request-bytes` by requests in flight. |
 | `tn_worker_gateway_dns_lookups_total` | counter | `result` (`hit` / `miss` / `error` / `rejected`) | Upstream name resolutions: answered from the cache (fresh or stale), lookup started, lookup failed, or refused because every lookup slot was busy. A request that waits on a lookup already running for its host adds nothing. A stale answer whose background refresh is refused counts as both `hit` and `rejected`, and the request is still answered. The proxy and the readiness poller share the series. |
 | `tn_worker_gateway_connections_refused_total` | counter | `reason` (`per_ip_cap` / `proxy_header`) | Inbound connections closed before any request is read, by reason (`per_ip_cap`: the connection's client prefix already held `--max-connections-per-ip` connections, see [Connection handling](#connection-handling); `proxy_header`: a connection from a peer that must send a PROXY protocol v2 header sent a missing, malformed or late one, see [Client identity behind a front](#client-identity-behind-a-front); a peer that closes before its first byte, such as a TCP connect health check, is not counted). |
+| `tn_worker_gateway_open_connections` | gauge | | Client-listener connections holding a `--max-connections` slot; at the cap, new connections wait in the kernel's accept backlog (the probe listener is not counted). |
+| `tn_worker_gateway_access_log_suppressed_total` | counter | | Sampled access-log lines dropped because `--access-log-max-lines-per-second` was reached; see [Access log](#access-log). |
 
 The gateway's own `/health`, `/ready` and `/ready/any` probes are not proxied and
 are excluded from these series, so they reflect real client load only.
-A request to `/health`, `/ready` or `/ready/any` with a method other than
-`GET` or `HEAD` is refused with the `405`, counted as a `method_not_post`
-rejection, and is not rate-limited.
+On the client listener (`--listen-addr`), a request to `/health`, `/ready`
+or `/ready/any` with a method other than `GET` or `HEAD` is rate-limited like
+any other request, then refused with the `405` and counted as a
+`method_not_post` rejection.
+The `--probe-addr` listener answers such a request with a bare `405` and
+`Allow: GET,HEAD`, without the JSON-RPC envelope, and counts nothing.
 `tn_worker_gateway_connections_refused_total` is the exception: it counts connections before any request is read, so a probe connection to the client listener refused at the per-client cap is counted with the rest (the `--probe-addr` listener has no per-client cap).
 
 Per-request warnings (a proxy or redirect loop, a batch the gateway cannot
 read to its end or one over `--max-batch-len`, a screened transaction, no
 ready upstream, an oversized body, a worker's answer to a submission that
 could not be read whole, and, per route, a forwarding failure or an
-upstream error or redirect answer), and the per-connection warning on a missing,
-malformed or late PROXY header, are throttled per call site, so neither clients nor a
+upstream error or redirect answer), the per-connection warning on a missing,
+malformed or late PROXY header, and an accept error on either listener, are throttled per call site, so neither clients nor a
 failing upstream can turn request volume into log volume: the first is logged,
 then at most one line per 10 s, whose `suppressed` field counts the warnings
 skipped since the previous line. A burst that stops is summarized within 20 s
 by a line that names its call site (`site`) and the count it suppressed. The
 counters above still count every request, including the rejections that log
-nothing per request (`405`, `429`, `408`, `-32010`, `-32011` and an aborted body). The scrape also
+nothing per request (`405`, `429`, the deadline's `408` and `504`, `-32010`, `-32011` and an aborted body). The scrape also
 carries a `tn_info{version}` build gauge and process metrics; the process
 metrics render under a `reth_` prefix (`reth_process_*`), an artifact of the
-shared recorder's reth-compatible naming.
+shared recorder's reth-compatible naming, so they share their names with a
+node's own process metrics; the dashboard tells them apart by its `job`
+variable, and its process panels show one series per replica.
 
 ### Access log
 
@@ -880,11 +902,11 @@ A value outside that range, or one that is not a number, stops the gateway at st
 Sampling is deterministic and uses no random source.
 The gateway counts the requests and logs the `n`th one when `floor(n * rate)` is greater than `floor((n - 1) * rate)`, so exactly `floor(n * rate)` of the first `n` requests are logged, evenly spread: at `0.5` every second request, at `0.25` every fourth.
 The probes are neither counted nor logged: `/health` and `/ready` are exempt by path, `/ready/any` is outside the log, and the `--probe-addr` listener has no access log.
-The log sits outside every layer that answers a request itself, so such a request is logged like any other: a `429` from the rate limiter, a `413` or `503` from the request-size checks, a `405` for a method other than `POST`, a `408`, and, with `--cors-allowed-origins` set, a CORS preflight.
+The log sits outside every layer that answers a request itself, so such a request is logged like any other: a `429` from the rate limiter, a `413` or `503` from the request-size checks, a `405` for a method other than `POST`, the deadline's `408` or `504`, and, with `--cors-allowed-origins` set, a CORS preflight.
 
 | Field | Meaning |
 | --- | --- |
-| `client` | The resolved client address (the peer, or behind a `--trusted-proxies` front the client it forwarded for; see [Client identity behind a front](#client-identity-behind-a-front)), never the front's own, masked to the per-IP rate limiter's prefix (`--rate-limit-per-ip-v4-prefix`, `--rate-limit-per-ip-v6-prefix`), so a line names a client the way the limiter meters it. At the default IPv4 `/32` this is the full address. |
+| `client` | The resolved client address (the peer, or behind a `--trusted-proxies` front the client it forwarded for; see [Client identity behind a front](#client-identity-behind-a-front)), or the front's own address when it forwarded no usable client (no, an empty or an unparsable `X-Forwarded-For`, a chain of only listed addresses, or a PROXY `LOCAL` connection), masked to the per-IP rate limiter's prefix (`--rate-limit-per-ip-v4-prefix`, `--rate-limit-per-ip-v6-prefix`), so a line names a client the way the limiter meters it. At the default IPv4 `/32` this is the full address. |
 | `class` | `submission` for a single `eth_sendRawTransaction` or `eth_sendRawTransactionSync` call, `batch` for any JSON-RPC batch whatever it holds, `query` for any other request body, and `unknown` when the gateway answered before reading the body. It does not depend on `--redirect-queries`. |
 | `route` | `worker` or `query` for a request forwarded to that upstream, whatever the forward's result, a timeout included; `rejected` for a request the gateway answered itself (rate limit, request size or in-flight byte budget, a method other than `POST`, a CORS preflight, a request timeout before the forward started, loop marker, unreadable or over-long batch, denied method, transaction screen, submission budget, in-flight cap, no ready worker). |
 | `status` | The HTTP status returned to the client, or `499` when the connection closed before the gateway answered (client disconnect, `--max-connection-duration`, shutdown). |
@@ -894,7 +916,7 @@ The log sits outside every layer that answers a request itself, so such a reques
 A line never carries the request URL, a header value, the body, the params, or a method name beyond its class.
 Under `--log-format json` a line is one object with `target` `gateway::access` and the same fields under `fields`, next to `message` `request`.
 With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
-The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, with no ceiling of its own, so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
+The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, capped at `--access-log-max-lines-per-second` (default 1000; lines over it are dropped and counted in `tn_worker_gateway_access_log_suppressed_total`; the cap counts whole seconds, so a burst across one second's edge can write about twice it), so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
 One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, not by its rate limit.
 Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
 
@@ -905,7 +927,7 @@ The [production-readiness review](docs/production-readiness.md#operator-guidance
 ### Validators: always redirect queries
 
 Set `--redirect-queries` on every gateway in front of a validator.
-Without it, reads reach the worker, and slow reads through one gateway can use up the worker's RPC connection limit for every gateway.
+Without it, every read reaches the worker and holds one of its `--rpc.max-connections` permits while the worker computes the answer (not while the client reads it); one gateway's reads hold at most `--max-upstream-inflight` less a fifth, but N gateways together can fill the worker's limit (see [Sizing for N gateways](#sizing-for-n-gateways)).
 The [method policy](#method-policy) refuses the `tn_*` calls the node says a validator should not serve publicly, but every other read still lands on the validator.
 Point it at an `https` public RPC for the same chain.
 
@@ -915,12 +937,12 @@ Every limit is per process, so the worker sees the sum over all gateways.
 
 - **Rate.** The worker receives up to N × `--rate-limit-global` calls per second, where N is the largest number of gateways that can run at once: the HPA's `maxReplicas` if you install it (10 in the reference manifest).
   Size `--rate-limit-global` as the worker's budget divided by that N.
-  With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives submissions, up to N × `--rate-limit-submissions` requests per second, plus the [reads kept on the worker](#reads-kept-on-the-worker), which count against `--rate-limit-global` like every other read; size that flag the same way.
+  With `--rate-limit-submissions` and `--redirect-queries` both set, the worker receives submissions, up to N × `--rate-limit-submissions` requests per second, each carrying up to the batch cap; the calls beyond the first, and the [reads kept on the worker](#reads-kept-on-the-worker), count against `--rate-limit-global`; size that flag the same way.
   With `--rate-limit-submissions` set and no redirect, the worker receives both budgets, so keep N × (`--rate-limit-global` + `--rate-limit-submissions`) within the worker's budget.
-- **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), and the worker answers `429` to everything over its limit.
-  Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`.
-  The reference manifest does not on its own: its HPA allows 10 replicas, and 10 × 100 (the default cap) is 1000, above the worker's 500.
-  Lower the cap to 49 or less (10 × 49 = 490), lower `maxReplicas`, or raise the worker's `--rpc.max-connections` above N × the cap.
+- **Worker connections.** Each gateway sends at most `--max-upstream-inflight` requests to the worker at once, so N gateways hold up to N × `--max-upstream-inflight` of the worker's `--rpc.max-connections` (500 by default), which counts in-flight HTTP requests, not TCP connections; the worker answers `429` to everything over its limit.
+  Keep N × `--max-upstream-inflight` below the worker's `--rpc.max-connections`, where N counts every gateway that can hold worker requests at once: the HPA's `maxReplicas`, plus the pod a rollout is replacing while it drains.
+  At the default cap (100) the reference manifest's 10 replicas plus that one could hold 1100, above the worker's 500, so the manifest sets the cap to 45 (11 × 45 = 495).
+  For a higher replica ceiling lower the cap with it, or raise the worker's `--rpc.max-connections` above N × the cap.
   With `--redirect-queries` only submissions and the [reads kept on the worker](#reads-kept-on-the-worker) reach the worker, and they finish quickly except `eth_sendRawTransactionSync`, which can hold a worker connection for up to 30 s (reth's `--rpc.send-raw-transaction-sync-timeout`, inside the gateway's 35 s `--upstream-request-timeout`); a gateway whose cap is full answers `503` / `-32009` itself instead of letting the worker refuse submissions from every gateway.
 - **Memory.** Peak request memory per gateway is about `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB (see [Request size](#request-size)); the reference manifest's 1Gi limit covers the defaults.
 
@@ -985,15 +1007,17 @@ Build it from the repository root:
 docker build -f bin/worker-gateway/Dockerfile -t telcoin-worker-gateway:<tag> .
 ```
 
-Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, Service,
-ServiceMonitor, and a HorizontalPodAutoscaler keyed on the
-`tn_worker_gateway_inflight_requests` gauge). They are a starting point, not a
+Reference Kubernetes manifests live under `deploy/k8s/` (a Deployment, a
+client Service carrying only the `rpc` port, a cluster-internal
+`worker-gateway-metrics` Service for `/metrics`, a ServiceMonitor, a
+HorizontalPodAutoscaler keyed on the `tn_worker_gateway_inflight_requests`
+gauge, and a PodDisruptionBudget). They are a starting point, not a
 turnkey install: see `deploy/README.md` for the placeholders to replace and the
 prometheus-adapter rule the autoscaler needs.
 
-The reference Service is a `ClusterIP`, so clients reach the gateways through a
-front, and the gateways see that front as every client's address until client
-identity is configured (see
+The reference client Service is a `ClusterIP`, so clients reach the gateways
+through a front, and the gateways see that front as every client's address
+until client identity is configured (see
 [Client identity behind a front](#client-identity-behind-a-front)):
 
 - **Behind an ingress controller or another HTTP proxy**, set `--trusted-proxies`
@@ -1007,9 +1031,11 @@ identity is configured (see
 - **Behind an L4 load balancer**, first check whether it preserves client
   addresses: a `LoadBalancer` or `NodePort` Service with
   `externalTrafficPolicy: Local` does, and the gateway then needs neither
-  mechanism. A balancer that terminates TCP needs PROXY protocol v2 enabled on
-  it, and the gateway started with `--proxy-protocol` and
-  `--proxy-protocol-from` (or `--trusted-proxies`) set to the addresses the
+  mechanism. Changing the client Service (`worker-gateway`) to such a type
+  publishes only its `rpc` port; `/metrics` stays on the cluster-internal
+  `worker-gateway-metrics` Service. A balancer that terminates TCP needs PROXY
+  protocol v2 enabled on it, and the gateway started with `--proxy-protocol`
+  and `--proxy-protocol-from` (or `--trusted-proxies`) set to the addresses the
   balancer connects from. Every connection from those addresses must then
   carry the header, so a kubelet probe on the `rpc` port from one of them is
   closed and the pod never turns ready: the probe listener (`--probe-addr`,

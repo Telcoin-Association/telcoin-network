@@ -16,6 +16,7 @@ mod cli;
 mod config;
 mod dns;
 mod error;
+mod fd;
 mod identity;
 mod proxy;
 mod ratelimit;
@@ -40,10 +41,22 @@ fn main() {
 /// Parse the CLI, initialize tracing, and run the gateway on a multi-thread
 /// runtime until SIGTERM / ctrl-c.
 fn try_main() -> eyre::Result<()> {
-    let cli = Cli::parse();
+    // clap's own error quotes the offending token, which can be a secret, so
+    // print a redacted message for the kinds that carry one
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(err) => match cli::redacted_parse_error(&err) {
+            Some(message) => eyre::bail!(message),
+            None => err.exit(),
+        },
+    };
     let ansi = use_ansi(std::io::stdout().is_terminal(), std::env::var_os("NO_COLOR").as_deref());
     init_tracing(&cli.log_filter, cli.log_format, ansi);
+    let fd_limit = fd::raise_limit();
     let settings = cli.into_settings()?;
+    if let Some(limit) = fd_limit {
+        fd::warn_on_budget(&settings, limit);
+    }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .thread_name("worker-gateway")
@@ -51,7 +64,12 @@ fn try_main() -> eyre::Result<()> {
         .enable_time()
         .build()?;
 
-    runtime.block_on(app::run(settings))
+    let result = runtime.block_on(app::run(settings));
+    // a getaddrinfo still running on the blocking pool cannot be cancelled, and
+    // dropping the runtime would wait for it without limit; the drain has
+    // already finished, so give blocking work a short grace and exit
+    runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+    result
 }
 
 /// Whether log lines carry colour codes: only when stdout is a terminal and

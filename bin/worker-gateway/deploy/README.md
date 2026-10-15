@@ -8,11 +8,14 @@ placeholders below and adapt them to your cluster before applying.
 ```
 deploy/
   k8s/
-    deployment.yaml      # apps/v1 Deployment (2 replicas, hardened pod securityContext)
-    service.yaml         # v1 ClusterIP Service (rpc 8545, metrics 9100)
+    deployment.yaml      # apps/v1 Deployment (hardened pod securityContext, replicas spread over nodes and zones)
+    service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
-    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests
+    hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests (2 to 10 replicas)
+    pdb.yaml             # policy/v1 PodDisruptionBudget (at most one pod evicted at a time)
 ```
+
+The Deployment sets no `spec.replicas`, because the HPA owns the count; set `spec.replicas` if you do not install the HPA.
 
 A Grafana dashboard for the metrics these expose lives at
 `../grafana-worker-gateway.json`.
@@ -46,6 +49,11 @@ A Grafana dashboard for the metrics these expose lives at
 - **Query upstream** (`deployment.yaml`): `WORKER_GATEWAY_REDIRECT_QUERIES` (equivalently `--redirect-queries`) sends every call except `eth_sendRawTransaction` and `eth_sendRawTransactionSync` to a public JSON-RPC endpoint for the same chain, so the validator's worker receives only submissions (see the README's "Query redirect" section).
   Replace `<PUBLIC_RPC_HOST>` with that endpoint, preferably over `https`; until you do, the URL does not parse and the gateway exits at startup.
   Remove the variable only for a gateway that should send every call to its worker, never in front of a validator.
+- **Client identity** (`deployment.yaml`): the Service is a `ClusterIP`, so clients arrive through a front, and until `WORKER_GATEWAY_TRUSTED_PROXIES` (equivalently `--trusted-proxies`) or PROXY protocol is set the gateway sees the front as every client: all of them share one `--max-connections-per-ip` (32) and `--rate-limit-per-ip` (100/s) budget per front address.
+  Behind an ingress controller or another HTTP proxy, replace `<FRONT_CIDRS>` with the narrowest ranges that cover the proxy pods (not the whole pod network), and have the proxy append the address it received the connection from to `X-Forwarded-For` (see the README's "Client identity behind a front" section).
+  Behind an L4 load balancer that terminates TCP, enable PROXY protocol v2 on it and replace the variable with `WORKER_GATEWAY_PROXY_PROTOCOL` and `WORKER_GATEWAY_PROXY_PROTOCOL_FROM` (equivalently `--proxy-protocol` and `--proxy-protocol-from`) set to the addresses the balancer connects from.
+  Until you do one of these, `<FRONT_CIDRS>` does not parse and the gateway exits at startup.
+  Remove the variable without a replacement only behind a front that preserves client addresses, such as a `LoadBalancer` Service with `externalTrafficPolicy: Local`.
 
 ## Ports and endpoints
 
@@ -58,7 +66,10 @@ A Grafana dashboard for the metrics these expose lives at
   A NetworkPolicy that admits only `8545` and `9100`, like the example below, shuts other pods out (on a network plugin that enforces NetworkPolicy) and still lets the kubelet's probes in, because a pod always accepts connections from its own node.
 - `metrics` / `9100` -- Prometheus `/metrics`, enabled by
   `WORKER_GATEWAY_METRICS_ADDR` (equivalently `--metrics <addr>`). This is a
-  **separate** listener from the client port.
+  **separate** listener from the client port, carried by its own
+  cluster-internal Service, `worker-gateway-metrics`, not by the client
+  Service, `worker-gateway`, which carries only `rpc` (see the security note
+  below).
 
 Whatever exposes the `rpc` port must preserve client addresses: the gateway keys `--max-connections-per-ip` and the per-IP rate limit (`--rate-limit-per-ip`) on the resolved client address (the PROXY source or the believed `X-Forwarded-For` entry), so behind an L4 front that neither keeps the source address nor sends a PROXY header (`--proxy-protocol`), both apply to the front's own address and every client shares one budget.
 A front listed in `--trusted-proxies` whose `X-Forwarded-For` is believed is not held to the connection cap; its requests are rate-limited per client.
@@ -68,7 +79,7 @@ After SIGTERM the gateway keeps accepting and serving for those 5s while `/ready
 The 5s covers the endpoint controller dropping the terminating pod from the Service, which happens when the pod is deleted whatever the readiness probe says, and that change reaching kube-proxy and any load balancer fed from the endpoints.
 An external load balancer or DNS health check that probes `/ready` or `/ready/any` stops routing here within those 5s only if its interval times its unhealthy threshold (plus the record TTL for DNS) fits in them; for a slower front, raise the delay and the grace period below with it.
 The container has no `preStop` sleep: a sleep only postpones SIGTERM, and fronts outside Kubernetes never learn from it that the pod is going away.
-The Deployment also sets `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` (equivalently `--graceful-shutdown-timeout`, default 30s) to `45s`, the gateway's whole-request deadline at the defaults (`--upstream-request-timeout` 35s plus `--header-read-timeout` 10s), so a request accepted just before the listener closes, such as an `eth_sendRawTransactionSync` waiting for its receipt, can still finish; the drain ends as soon as the last request does.
+The Deployment also sets `WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT` (equivalently `--graceful-shutdown-timeout`, default: the whole-request deadline, 45s at the defaults) to `45s`, the gateway's whole-request deadline at the defaults (`--upstream-request-timeout` 35s plus `--header-read-timeout` 10s), so a request accepted just before the listener closes, such as an `eth_sendRawTransactionSync` waiting for its receipt, can still finish; the drain ends as soon as the last request does.
 The `terminationGracePeriodSeconds: 55` in the Deployment covers the 5s delay plus the 45s drain and the gateway's 1s join margin, 51s in total, so the process has room to drain in-flight proxied requests before the kubelet escalates to SIGKILL.
 If you raise the delay, the drain timeout or `--upstream-request-timeout`, raise this too.
 
@@ -95,6 +106,7 @@ A body with a declared length is read into one buffer of exactly that size, so a
 Each open connection also keeps a read buffer of up to `--http1-max-buf-size` (default 64 KiB).
 Size the container's memory limit as `--max-inflight-request-bytes` + `--max-connections` × `--http1-max-buf-size` + 64 MiB for the process baseline and response streaming.
 At the defaults that is 512 MiB + 500 × 64 KiB + 64 MiB, about 608 MiB, and the Deployment's 1Gi limit leaves about 416 MiB over that.
+Set the memory request to cover the same bound (the Deployment requests 768Mi): below it the pod is scheduled as if it needed less than clients can make it hold, and under node memory pressure the kubelet evicts the gateways first.
 In a test process that also ran the client and the upstream, 128 parallel 1 MiB bodies against a 64 MiB budget peaked 81 to 83 MiB above the idle process, about 1.3 times the budget, the read buffers of all three sides' connections included.
 Each extra connection adds at most `--http1-max-buf-size`.
 Raising `--max-request-bytes` does not raise the memory bound, but it makes the budget cheaper to exhaust: a request reserves its declared length (or the whole cap when chunked) from its head and holds it until the request deadline (`--upstream-request-timeout` + `--header-read-timeout`, 45 s by default) even if no body byte arrives.
@@ -108,9 +120,11 @@ The probe port is not counted in the formula: each open probe connection holds u
 `servicemonitor.yaml` uses `monitoring.coreos.com/v1`, which is provided by the
 **Prometheus Operator**. It requires the Operator's CRDs to be installed in the
 cluster and a Prometheus instance whose `serviceMonitorSelector` matches these
-labels. If you scrape Prometheus some other way (static config, annotations,
-Grafana Alloy, ...), delete this file and point your scraper at the `metrics`
-port / `/metrics` path instead.
+labels. It selects the `worker-gateway-metrics` Service by its
+`app.kubernetes.io/component: metrics` label and scrapes its `metrics` port. If
+you scrape Prometheus some other way (static config, annotations, Grafana
+Alloy, ...), delete this file and point your scraper at that Service's
+`metrics` port / `/metrics` path instead.
 
 ## Autoscaling (HPA + prometheus-adapter)
 
@@ -153,10 +167,11 @@ flapping when traffic dips) and a 30s scale-up window (react quickly to load).
 
 ## Security note: the metrics port is unauthenticated
 
-The `/metrics` endpoint on port `9100` has **no authentication**. Keep it
-cluster-internal: the Service is `ClusterIP` (not exposed externally), and you
-should not add an Ingress or LoadBalancer in front of the metrics port. Consider
-a NetworkPolicy that only admits your Prometheus scraper to `9100`, for example:
+The `/metrics` endpoint on port `9100` has **no authentication**.
+Keep it cluster-internal: only its own `ClusterIP` Service, `worker-gateway-metrics`, carries the port, and the ServiceMonitor selects that Service by its `app.kubernetes.io/component: metrics` label.
+Never change that Service's type or put an Ingress or LoadBalancer in front of it.
+The client Service, `worker-gateway`, carries only `rpc`, so changing its type to reach clients does not publish `9100`.
+Any pod in the cluster can still reach `9100` on the pod IP, so consider a NetworkPolicy that only admits your Prometheus scraper to it, for example:
 
 ```yaml
 apiVersion: networking.k8s.io/v1
