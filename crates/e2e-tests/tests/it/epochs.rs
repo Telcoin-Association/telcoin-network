@@ -1,7 +1,5 @@
 //! Test the epoch boundary and validator shuffles.
 
-use crate::common::get_block;
-
 use super::common::{
     assert_epoch_records_verify, create_genesis_for_test, fetch_verified_epoch_record,
     generate_new_validator_txs, get_block_commit_time, loop_epochs, read_consensus_headers,
@@ -443,6 +441,7 @@ async fn test_epoch_sync_inner(
     // sealed pack to its predecessor (see `assert_sealed_packs_unchanged`).
     let mut killed_epoch_records = BTreeMap::new();
     for (i, ep) in endpoints.iter().enumerate() {
+        let provider = ProviderBuilder::new().connect_http(ep.http_url.parse()?);
         for epoch in 0..=latest_epoch {
             let val_name = committee[i].0;
             let file_test = epoch_pack_path(&temp_path.join(val_name), epoch);
@@ -466,14 +465,36 @@ async fn test_epoch_sync_inner(
                 fetch_verified_epoch_record(&ep.http_url, epoch, (EPOCH_DURATION * 6).max(60))
                     .await
                     .map_err(|e| eyre::eyre!("validator {val_name}: {e}"))?;
-            // Make sure we have executed the final block from the epoch record.
-            // This should prove we have the consensus output as well (i.e. verify the pack data).
-            get_block(&ep.http_url, Some(epoch_rec.final_state.number)).unwrap_or_else(|_| {
-                panic!(
-                    "final block for {epoch} for {val_name} missing {}",
-                    epoch_rec.final_state.number
-                )
-            });
+            // Packs and certified records can arrive before execution catches up. Give execution
+            // the same recovery budget and verify the certified hash once its block is available.
+            wait_until(
+                Duration::from_secs((EPOCH_DURATION * 6).max(60)),
+                &format!(
+                    "validator {val_name} to execute final block {} for epoch {epoch}",
+                    epoch_rec.final_state.number,
+                ),
+                || async {
+                    provider
+                        .get_block_by_number(BlockNumberOrTag::Number(epoch_rec.final_state.number))
+                        .await
+                        .inspect_err(|error| {
+                            debug!(target: "epoch-test", val_name, epoch, ?error, "waiting for final execution block");
+                        })
+                        .ok()
+                        .flatten()
+                        .map_or(Ok(false), |block| {
+                            eyre::ensure!(
+                                block.header.hash == epoch_rec.final_state.hash,
+                                "validator {val_name}: epoch {epoch} final block hash mismatch: \
+                                 expected {}, got {}",
+                                epoch_rec.final_state.hash,
+                                block.header.hash,
+                            );
+                            Ok(true)
+                        })
+                },
+            )
+            .await?;
             if i == kill_idx {
                 killed_epoch_records.insert(epoch, epoch_rec);
             }
