@@ -335,9 +335,9 @@ pub(crate) fn error_response_with_id(err: &GatewayError, id: RequestId) -> Respo
     render(err, id)
 }
 
-/// Replace an upstream's non-JSON error answer with a JSON-RPC error that
-/// keeps the upstream's `status` and echoes the request `id` recovered from
-/// `request_body`.
+/// Replace an upstream answer that carries no JSON-RPC body to pass on with a
+/// JSON-RPC error under `status` (the upstream's, or `502` in place of a `1xx`
+/// or `304`), echoing the request `id` recovered from `request_body`.
 ///
 /// The gateway did forward this request, so it is counted under its own
 /// `upstream_error` outcome rather than as a rejection (see

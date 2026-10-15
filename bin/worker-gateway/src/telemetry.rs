@@ -14,11 +14,12 @@
 //!   relayed;
 //! - [`record_rejection`] bumps `tn_worker_gateway_requests_total{outcome="rejected"}` plus
 //!   `tn_worker_gateway_rejections_total{reason=...}` for a request the gateway answered with a
-//!   JSON-RPC error;
+//!   JSON-RPC error, a submission whose answer was lost after the worker's `2xx` included;
 //! - [`record_upstream_error`] bumps `tn_worker_gateway_requests_total{outcome="upstream_error"}`
 //!   plus `tn_worker_gateway_rejections_total{reason="upstream_error"}` for a request whose
-//!   upstream answered an error status without a JSON body, which the gateway replaced with a
-//!   JSON-RPC error;
+//!   upstream's answer carried no JSON-RPC body to pass on (an error status without a JSON body, an
+//!   answer from the `--redirect-queries` endpoint without one, or a `1xx` or `304`), which the
+//!   gateway replaced with a JSON-RPC error;
 //! - [`record_cancelled`] bumps `tn_worker_gateway_requests_total{outcome="cancelled"}` for a
 //!   request whose connection closed before the gateway answered it (a client disconnect, the
 //!   connection-lifetime cap or shutdown dropped it mid-flight).
@@ -32,10 +33,10 @@
 //! cannot drive log volume; the counters above still count every request.
 //!
 //! [`record_routed`] counts every forward attempt by route and result, which
-//! splits the load between the worker and the query upstream (a relayed body
-//! that fails mid-stream is counted again, as `body_failed`, and a worker's
-//! answer to a submission that is lost while it is read whole counts as
-//! `body_failed` alone), and
+//! splits the load between the worker and the query upstream (a forwarded
+//! answer whose body then fails is counted again, as `body_failed`: a relayed
+//! body that fails mid-stream, or a worker's answer to a submission that is
+//! lost while it is read whole), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 //!
@@ -282,10 +283,11 @@ pub(crate) fn record_rejection(reason: &'static str) {
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
 }
 
-/// Record a request whose upstream answered an error status without a JSON
-/// body, which the gateway replaced with a JSON-RPC error. It is kept apart
-/// from [`record_rejection`]'s `rejected` outcome because the gateway did
-/// forward it: the upstream refused it.
+/// Record a request whose upstream's answer carried no JSON-RPC body to pass
+/// on (an error status without a JSON body, an answer from the query upstream
+/// without one, or a `1xx` or `304`), which the gateway replaced with a
+/// JSON-RPC error. It is kept apart from [`record_rejection`]'s `rejected`
+/// outcome because the gateway did forward it and the upstream answered.
 pub(crate) fn record_upstream_error(reason: &'static str) {
     counter!(REQUESTS_TOTAL, "outcome" => "upstream_error").increment(1);
     counter!(REJECTIONS_TOTAL, "reason" => reason).increment(1);
@@ -299,8 +301,8 @@ pub(crate) fn record_cancelled() {
 }
 
 /// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or a
-/// response whose body then failed (`body_failed`).
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or,
+/// after its `forwarded`, an answer whose body then failed (`body_failed`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }

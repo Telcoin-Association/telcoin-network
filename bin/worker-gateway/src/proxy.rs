@@ -22,7 +22,8 @@
 //! a well-formed JSON-RPC error instead (see [`crate::error`]). So does a
 //! client whose upstream answers an error status without a JSON body (a
 //! worker's `429` text/plain, say): it keeps the upstream's status, with a
-//! JSON-RPC error in place of the body.
+//! JSON-RPC error in place of the body. A `1xx` or `304`, which can carry no
+//! body, gets the same error with a `502`.
 //!
 //! With `--redirect-queries` set, transaction submissions go to the worker,
 //! and so do the few single reads only its pool can answer: a nonce at the
@@ -1024,7 +1025,8 @@ async fn forward(
 /// Every non-2xx status counts, `3xx` included (redirects are never followed;
 /// see [`proxy_client`]). A JSON body, `application/json` or any `+json`
 /// subtype with any parameters, is relayed unchanged whatever the status: it
-/// is the upstream's own JSON-RPC error.
+/// is the upstream's own JSON-RPC error. A `1xx` or `304`, which can carry no
+/// body, never reaches this check: [`proxy`] answers it with a `502` first.
 fn is_non_json_error(upstream: &reqwest::Response) -> bool {
     !upstream.status().is_success()
         && !is_json_content_type(upstream.headers().get(header::CONTENT_TYPE))
@@ -1466,7 +1468,8 @@ impl UpstreamClientBuilder {
 /// host the gateway can reach. A `3xx` from either upstream is passed through
 /// to the client like any other status, without its `Location` (only
 /// `Content-Type` is copied back), so the client cannot follow it either, and
-/// [`proxy`] logs a warning for it, whatever its body.
+/// [`proxy`] logs a warning for it, whatever its body. A `304`, which can
+/// carry no body, gets a `502` instead.
 ///
 /// TLS, the connect timeout, the resolver and the no-proxy policy come from
 /// `builder`. reqwest builds a client over an empty native root store without
