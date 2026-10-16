@@ -785,6 +785,7 @@ where
                 )
                 .for_each(|()| std::future::ready(()))
                 .await;
+                Ok(())
             });
         }
 
