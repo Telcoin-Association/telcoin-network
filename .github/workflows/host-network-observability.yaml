@@ -120,7 +120,23 @@ jobs:
           echo "CONNTRACK_MAX_ORIGINAL=$(cat /proc/sys/net/netfilter/nf_conntrack_max)" >> "$GITHUB_ENV"
           sudo nft add rule inet tn_ci input udp dport 49597 ct state new counter accept
           sudo sysctl -w net.netfilter.nf_conntrack_max=64
-          python3 -I -c 'import socket, time; sockets = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(100)]; [s.sendto(b"flow", ("127.0.0.1", 49597)) for s in sockets]; time.sleep(1)'
+          # A full table drops each new flow on the output hook and the sender gets EPERM.
+          # That is the condition under test, so the sender counts the drops instead of failing.
+          python3 -I - <<'EOF'
+          import errno, socket, time
+          sockets = [socket.socket(socket.AF_INET, socket.SOCK_DGRAM) for _ in range(100)]
+          def open_flow(sock):
+              try:
+                  sock.sendto(b"flow", ("127.0.0.1", 49597))
+                  return "accepted"
+              except OSError as err:
+                  if err.errno != errno.EPERM:
+                      raise
+                  return "dropped"
+          outcomes = [open_flow(sock) for sock in sockets]
+          print(f"flows accepted={outcomes.count('accepted')} dropped={outcomes.count('dropped')}")
+          time.sleep(1)
+          EOF
           count=$(cat /proc/sys/net/netfilter/nf_conntrack_count)
           echo "nf_conntrack_count=$count of 64"
           test "$count" -ge 51
