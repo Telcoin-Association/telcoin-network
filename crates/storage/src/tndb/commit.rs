@@ -171,8 +171,9 @@ impl Durability {
         self.wake();
     }
 
-    /// Wake every writer blocked in [`wait_durable`] (a round ended).
-    fn notify_waiters(&self) {
+    /// Wake every writer blocked in [`wait_durable`] (a round ended, or a rollback's flush let go
+    /// of the sync lock).
+    pub(super) fn notify_waiters(&self) {
         let _now = self.durable_now.lock();
         self.durable_changed.notify_all();
     }
@@ -239,10 +240,9 @@ impl Durability {
         }
     }
 
-    /// The durability barrier: resolves once every batch numbered before the call is durable, or
-    /// fails once anything has failed.
-    /// Wait until every batch up to `target` (the last one written when the persist was asked
-    /// for) is durable, or fail once anything has failed or the commit thread has stopped short.
+    /// The durability barrier: wait until every batch up to `target` (the last one written when
+    /// the persist was asked for) is durable, or fail once anything has failed or the commit
+    /// thread has stopped short.
     pub(super) async fn persist(&self, target: u64) -> eyre::Result<()> {
         let mut durable = self.durable.subscribe();
         if *durable.borrow() < target {
@@ -292,9 +292,18 @@ pub(super) fn wait_durable(core: &Core, seq: u64) -> eyre::Result<()> {
                 durability.durable_changed.wait(&mut now);
             }
         };
+        let before = durability.durable();
         sync_round(core);
         drop(lead);
         durability.notify_waiters();
+        if durability.durable() == before {
+            // The round covered nothing new: `seq` is numbered, but its writer has not stored the
+            // frontier yet. Give it a moment rather than retake the lock at once and spin.
+            let mut now = durability.durable_now.lock();
+            if *now < seq && !durability.is_failed() {
+                durability.durable_changed.wait_for(&mut now, std::time::Duration::from_millis(1));
+            }
+        }
     }
 }
 

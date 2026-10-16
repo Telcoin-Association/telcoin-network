@@ -8,7 +8,7 @@ use tn_types::{Database as _, DbTx as _, DbTxMut as _};
 
 use super::{
     database::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
-    record::{self, KIND_PUT},
+    record::{self, KIND_CLEAR, KIND_PUT},
 };
 use crate::test::*;
 
@@ -84,6 +84,41 @@ fn append_unsealed(path: &Path, payload: &[u8]) {
     log.append_raw(payload).expect("append");
     log.commit().expect("sync");
     log.poison();
+}
+
+/// Append a well-framed record carrying `payload` to the cleanly closed log at `path`, leaving it
+/// sealed (as damage the writer never makes would).
+fn append_sealed(path: &Path, payload: &[u8]) {
+    use crate::archive::{
+        data_file::MmapFileOptions,
+        pack::{Pack, PackCompression},
+    };
+    let mut log: Pack<Vec<u8>> =
+        Pack::open_with(path, 0, false, PackCompression::None, 1, MmapFileOptions::default())
+            .expect("open log");
+    log.append_raw(payload).expect("append");
+    log.commit().expect("sync");
+}
+
+/// The commit marker at the tail of the unclean log at `path`, if one is there and valid.
+fn commit_marker(path: &Path) -> Option<u64> {
+    let bytes = std::fs::read(path).expect("read log");
+    let tail = &bytes[bytes.len() - 16..];
+    let committed = u64::from_le_bytes(tail[0..8].try_into().expect("8 bytes"));
+    let crc = |range: std::ops::Range<usize>| crc32fast::hash(&tail[range]);
+    (u32::from_le_bytes(tail[8..12].try_into().expect("4 bytes")) == crc(0..8)
+        && u32::from_le_bytes(tail[12..16].try_into().expect("4 bytes")) == crc(8..12))
+    .then_some(committed)
+}
+
+/// Flip a byte of the file at `path` at offset `at`.
+fn flip_byte(path: &Path, at: u64) {
+    use std::os::unix::fs::FileExt as _;
+    let file = std::fs::OpenOptions::new().read(true).write(true).open(path).expect("open");
+    let mut byte = [0_u8; 1];
+    file.read_exact_at(&mut byte, at).expect("read");
+    byte[0] ^= 0x5a;
+    file.write_all_at(&byte, at).expect("write");
 }
 
 /// Copy the directory tree at `from` to `to`.
@@ -759,6 +794,38 @@ fn wait_only_gen(root: &Path, gen: u64) {
 /// The log's length (its end, after the last batch).
 fn log_len(db: &TnDatabase) -> u64 {
     db.core().writer.lock().log_len()
+}
+
+/// Every table emptied while a compaction runs (an epoch ends mid-compaction, and the next one's
+/// first write lands before the switch): the switch keeps the emptied signal, so the reset follows
+/// and the copied rows, dead after the catch-up's clears, leave at once.
+#[test]
+fn test_tndb_emptied_during_a_compaction_still_resets() {
+    let tmp = TempDir::with_prefix("tndb_emptied_mid").expect("temp dir");
+    // Only the emptied trigger fires automatically.
+    let compaction = CompactionConfig { auto_min_bytes: Some(1 << 40), bytes_per_sec: 0 };
+    let db = open_compacting(tmp.path(), CommitMode::Group, compaction);
+    let value = "v".repeat(64 << 10);
+    for i in 0..20_u64 {
+        db.insert::<TestTable>(&i, &value).expect("insert");
+        db.insert::<OtherTable>(&i, &value).expect("insert");
+    }
+    let (arrivals, release) = db.core().compact.test.gate_next();
+    std::thread::scope(|s| {
+        let compaction = s.spawn(|| db.compact_now());
+        assert_eq!(arrivals.recv_timeout(Duration::from_secs(20)), Ok(1), "the copy's end");
+        db.clear_table::<TestTable>().expect("clear");
+        db.clear_table::<OtherTable>().expect("clear");
+        db.insert::<TestTable>(&1_000, &"next epoch".to_string()).expect("insert");
+        drop(release);
+        assert_eq!(compaction.join().expect("thread"), Ok(true));
+    });
+    assert!(log_len(&db) > 2 << 20, "the switch copied the cleared rows: {}", log_len(&db));
+    // The next batch asks for the reset.
+    db.insert::<TestTable>(&2_000, &"x".to_string()).expect("insert");
+    assert_eq!(db.core().compact.wait_done(2), Some(Ok(true)), "the reset ran");
+    assert!(log_len(&db) < 1 << 20, "the dead rows left: {}", log_len(&db));
+    assert_eq!(rows::<TestTable>(&db).len(), 2, "the next epoch's rows");
 }
 
 type Tables3 = [BTreeMap<u64, String>; 3];
@@ -1727,10 +1794,220 @@ fn test_tndb_remove_through_a_damaged_index_fails() {
         let db = open(tmp.path(), CommitMode::Group);
         let removed = db.remove::<TestTable>(&1_000);
         assert!(removed.is_err(), "a removal through a damaged index: {removed:?}");
+        // The database stopped: no table takes a write, and no persist acknowledges.
+        let other = db.insert::<OtherTable>(&1, &"o".to_string());
+        assert!(other.is_err(), "a write after the damage: {other:?}");
+        assert!(block_on(db.persist::<OtherTable>()).is_err(), "a persist after the damage");
     }
     let db = open(tmp.path(), CommitMode::Group);
     assert_eq!(db.get::<TestTable>(&1_000).expect("get"), Some("v1000".to_string()));
     assert_eq!(db.iter::<TestTable>().count(), 2_000, "the rebuilt index holds every row");
+}
+
+/// A scan that meets index damage cannot report it (a `DBIter` ends), so its shorter answer would
+/// pass for a whole one: it stops the database instead, and the next open rebuilds the index.
+#[test]
+fn test_tndb_scan_through_a_damaged_index_stops_the_database() {
+    let tmp = TempDir::with_prefix("tndb_scan_damaged").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..2_000_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+    }
+    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        assert!(db.iter::<TestTable>().count() < 2_000, "the scan ended at the damage");
+        let write = db.insert::<OtherTable>(&1, &"o".to_string());
+        assert!(write.is_err(), "the short scan stopped the database: {write:?}");
+    }
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(db.iter::<TestTable>().count(), 2_000, "the rebuilt index holds every row");
+    db.insert::<OtherTable>(&1, &"o".to_string()).expect("writes resume after the rebuild");
+}
+
+/// A read the disk fails during an unclean open's replay is an error, never a torn tail: the open
+/// fails and cuts nothing, whether the read falls in the last acknowledged batch (which the commit
+/// marker never covers after a crash) or anywhere once the marker is lost (a power loss). Once the
+/// disk reads again, the next open keeps every acknowledged row.
+#[test]
+fn test_tndb_replay_read_error_fails_the_open() {
+    use crate::archive::pack_iter::FAIL_READ_AT;
+    for lose_marker in [false, true] {
+        let tmp = TempDir::with_prefix("tndb_replay_eio").expect("temp dir");
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..100_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+            block_on(db.persist::<TestTable>()).expect("acknowledged");
+        }
+        crash(db);
+        let log = log_path(tmp.path());
+        let ends = record_ends(&log);
+        assert_eq!(ends.len(), 100, "one record per batch");
+        if lose_marker {
+            let len = std::fs::metadata(&log).expect("log").len();
+            use std::os::unix::fs::FileExt as _;
+            let file = std::fs::OpenOptions::new().write(true).open(&log).expect("open");
+            file.write_all_at(&[0_u8; 16], len - 16).expect("zero the marker");
+        } else {
+            assert_eq!(commit_marker(&log), Some(ends[98]), "the marker misses the last batch");
+        }
+        // The last batch's first byte, or (with the marker lost) the middle batch's.
+        let at = if lose_marker { ends[49] } else { ends[98] };
+        let before = std::fs::read(&log).expect("read");
+        FAIL_READ_AT.with(|fail| fail.set(Some(at)));
+        let opened = TnDatabase::open_with(tmp.path(), options(CommitMode::Group));
+        FAIL_READ_AT.with(|fail| fail.set(None));
+        let err = opened.expect_err("a read error fails the open");
+        assert!(format!("{err:#}").contains("read error"), "{err:#}");
+        assert_eq!(std::fs::read(&log).expect("read"), before, "the failed open cut nothing");
+        let db = open(tmp.path(), CommitMode::Group);
+        assert_eq!(
+            db.iter::<TestTable>().count(),
+            100,
+            "every acknowledged row (marker lost: {lose_marker})"
+        );
+    }
+}
+
+/// An unclean log damaged below its commit marker fails the open, changes no byte, and stays
+/// refused on a retry: the cut happens only after a replay that passed every check.
+#[test]
+fn test_tndb_tear_below_the_commit_marker_fails_the_open() {
+    let tmp = TempDir::with_prefix("tndb_below_marker").expect("temp dir");
+    let db = open(tmp.path(), CommitMode::Group);
+    for round in 0..20_u64 {
+        for i in 0..50_u64 {
+            db.insert::<TestTable>(&(round * 1_000 + i), &format!("v{round}-{i}")).expect("insert");
+        }
+        block_on(db.persist::<TestTable>()).expect("persist");
+    }
+    // One more write stamps the marker up to the last sync.
+    db.insert::<TestTable>(&999_999, &"last".to_string()).expect("insert");
+    block_on(db.persist::<TestTable>()).expect("persist");
+    crash(db);
+    let log = log_path(tmp.path());
+    let committed = commit_marker(&log).expect("a valid commit marker at the tail");
+    let ends = record_ends(&log);
+    let middle = ends[ends.len() / 2];
+    assert!(middle < committed, "damage well below the marker ({middle} < {committed})");
+    flip_byte(&log, middle + 6);
+    let before = std::fs::read(&log).expect("read");
+    for attempt in 0..2 {
+        let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+            .err()
+            .unwrap_or_else(|| panic!("attempt {attempt} opened"));
+        assert!(format!("{err:#}").contains("below its commit marker"), "{err:#}");
+    }
+    assert_eq!(std::fs::read(&log).expect("read"), before, "the failed opens changed nothing");
+}
+
+/// A cleanly closed log that does not replay to its end (a damaged record, here with its index
+/// gone so it must replay) fails the open, changes no byte, and stays refused on every retry: a
+/// failed open re-seals it rather than leave it to be cut as a crash's tail.
+#[test]
+fn test_tndb_damaged_sealed_log_stays_refused() {
+    let tmp = TempDir::with_prefix("tndb_sealed_damage").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..500_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+    }
+    std::fs::remove_dir_all(tmp.path().join("gen-0").join("idx-0")).expect("remove the index");
+    let log = log_path(tmp.path());
+    let ends = record_ends(&log);
+    flip_byte(&log, ends[ends.len() / 2] + 6);
+    let before = std::fs::read(&log).expect("read");
+    for attempt in 0..3 {
+        let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+            .err()
+            .unwrap_or_else(|| panic!("attempt {attempt} opened"));
+        assert!(format!("{err:#}").contains("closed cleanly"), "{err:#}");
+    }
+    assert_eq!(std::fs::read(&log).expect("read"), before, "byte-identical after the retries");
+}
+
+/// A cleanly closed log must replay whole, in whole batches: one whose last record does not end
+/// its batch (damage: the writer never closes inside one) fails the open rather than be cut.
+#[test]
+fn test_tndb_sealed_log_ending_inside_a_batch_is_refused() {
+    let tmp = TempDir::with_prefix("tndb_sealed_partial").expect("temp dir");
+    let id = {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..10_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        db.core().table(<TestTable as tn_types::Table>::NAME).expect("open").id
+    };
+    // The log is longer than the indexes cover now, so the open replays it.
+    append_sealed(&log_path(tmp.path()), &record::head(KIND_CLEAR, id, false));
+    let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+        .expect_err("a sealed log ending inside a batch");
+    assert!(format!("{err:#}").contains("ends inside a batch"), "{err:#}");
+}
+
+/// A generation's log always holds its header before the generation exists, so a log that is
+/// empty, or zeroed where its header goes, is damage: the open fails rather than re-initialise
+/// it and open as an empty database.
+#[test]
+fn test_tndb_log_without_a_header_is_refused() {
+    for zeroed in [false, true] {
+        let tmp = TempDir::with_prefix("tndb_no_header").expect("temp dir");
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..100_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+        block_on(db.persist::<TestTable>()).expect("persist");
+        crash(db);
+        let log = log_path(tmp.path());
+        if zeroed {
+            let len = std::fs::metadata(&log).expect("log").len();
+            std::fs::write(&log, vec![0_u8; len.min(1 << 20) as usize]).expect("zero");
+        } else {
+            truncate(&log, 0);
+        }
+        let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+            .err()
+            .unwrap_or_else(|| panic!("a log with no header opened (zeroed: {zeroed})"));
+        assert!(format!("{err:#}").contains("no header"), "{err:#}");
+    }
+}
+
+/// An index the manifest does not name means the manifest was rolled back (one is always written
+/// before a table's index exists): the open replays the log, so the missing table's records fail
+/// it, and the index is kept rather than deleted with its rows. An orphan index whose table has no
+/// records in the log indexes nothing, and goes.
+#[test]
+fn test_tndb_rolled_back_manifest_fails_the_open() {
+    let tmp = TempDir::with_prefix("tndb_old_manifest").expect("temp dir");
+    {
+        let db = TnDatabase::open_with(tmp.path(), options(CommitMode::Group)).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        db.insert::<TestTable>(&1, &"a".to_string()).expect("insert");
+    }
+    let old = std::fs::read(tmp.path().join("tables")).expect("manifest");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..10_u64 {
+            db.insert::<OtherTable>(&i, &format!("o{i}")).expect("insert");
+        }
+    }
+    let orphan = tmp.path().join("gen-0").join("idx-1");
+    assert!(orphan.exists(), "the newer table's index");
+    std::fs::write(tmp.path().join("tables"), &old).expect("roll the manifest back");
+    let err = TnDatabase::open_with(tmp.path(), options(CommitMode::Group))
+        .expect_err("the missing table's records fail the open");
+    assert!(format!("{err:#}").contains("unknown table"), "{err:#}");
+    assert!(orphan.exists(), "the orphan index is kept");
+
+    let tmp = TempDir::with_prefix("tndb_stray_index").expect("temp dir");
+    drop(open(tmp.path(), CommitMode::Group));
+    let stray = tmp.path().join("gen-0").join("idx-9");
+    std::fs::create_dir(&stray).expect("a stray index");
+    drop(open(tmp.path(), CommitMode::Group));
+    assert!(!stray.exists(), "an orphan with no records in the log is removed");
 }
 
 /// Creating a database's first generation is atomic: a failure (or a crash) once its directory
@@ -1753,8 +2030,9 @@ fn test_tndb_interrupted_creation_reopens() {
 }
 
 /// A read checks that the record at an index position is the row it asked for: a damaged index
-/// entry that lands on another row's record is `CorruptIndex`, never that row's value, and a
-/// compaction abandons rather than copy the mismatch.
+/// entry that lands on another row's record is `CorruptIndex`, never that row's value; a
+/// compaction abandons rather than copy the mismatch; and a read that finds it latches the
+/// database, so writes stop (and the node with them) rather than act on a short scan.
 #[test]
 fn test_tndb_misindexed_row_is_corrupt_not_another_value() {
     let tmp = TempDir::with_prefix("tndb_misindexed").expect("temp dir");
@@ -1765,13 +2043,19 @@ fn test_tndb_misindexed_row_is_corrupt_not_another_value() {
     let id = db.core().table(<TestTable as tn_types::Table>::NAME).expect("open").id;
     db.core().misindex(id, &tn_types::encode_key(&3_u64), &tn_types::encode_key(&7_u64));
 
+    let compacted = db.compact_now().expect_err("the copy finds the mismatch");
+    assert!(compacted.contains("index"), "{compacted}");
+    db.insert::<TestTable>(&10, &"v10".to_string())
+        .expect("a compaction's abandon latches nothing");
+
     let read = db.get::<TestTable>(&3);
     assert!(read.is_err(), "the record at 3's position is row 7's: {read:?}");
+    let write = db.insert::<TestTable>(&11, &"v11".to_string());
+    assert!(write.is_err(), "the damage the get found is latched: {write:?}");
     assert_eq!(db.get::<TestTable>(&7).expect("get"), Some("v7".to_string()), "7 itself reads");
     let scanned: Vec<u64> = db.iter::<TestTable>().map(|(k, _)| k).collect();
     assert_eq!(scanned, [0, 1, 2], "a scan ends at the mismatch");
-    let compacted = db.compact_now().expect_err("the copy finds the mismatch");
-    assert!(compacted.contains("index"), "{compacted}");
+    assert!(block_on(db.persist::<TestTable>()).is_err(), "and no persist acknowledges past it");
 }
 
 // ---- production metrics ----

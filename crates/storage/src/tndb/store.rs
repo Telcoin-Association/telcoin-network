@@ -187,18 +187,24 @@ impl TableShared {
         self.ksize.load(Ordering::Acquire)
     }
 
-    /// Read the published value for `key` and map its bytes with `decode`, or `None`.
+    /// Read the published value for `key` and map its bytes with `decode`, or `None`. Damage the
+    /// read finds is an error, latched in `core` (see [`Core::read_damaged`]).
     pub(super) fn get_with<R>(
         &self,
+        core: &Core,
         key: &[u8],
         decode: impl FnOnce(&[u8]) -> R,
     ) -> eyre::Result<Option<R>> {
-        self.published.load().get_with(key, decode)
+        self.published
+            .load()
+            .get_with(key, decode)
+            .inspect_err(|e| core.read_damaged(&self.name, e))
     }
 
-    /// True if the published state holds `key` (a damaged index is an error, not "absent").
-    pub(super) fn contains(&self, key: &[u8]) -> eyre::Result<bool> {
-        Ok(self.published.load().contains(key)?)
+    /// True if the published state holds `key` (a damaged index is an error, not "absent", and
+    /// latched in `core`).
+    pub(super) fn contains(&self, core: &Core, key: &[u8]) -> eyre::Result<bool> {
+        Ok(self.published.load().contains(key).inspect_err(|e| core.read_damaged(&self.name, e))?)
     }
 
     /// Rows in the published state.
@@ -213,16 +219,17 @@ impl TableShared {
         let cursor = published.index.as_ref().and_then(|index| match kind.cursor(index) {
             Ok(cursor) => Some(cursor),
             Err(e) => {
-                scan_error(&self.name, &e);
+                scan_error(&core, &self.name, &e);
                 None
             }
         });
-        TableScan { published, cursor, name: self.name.clone(), _core: core }
+        TableScan { published, cursor, name: self.name.clone(), core }
     }
 
     /// Map the single `(key, value)` a scan of `kind` lands on first with `f` (a direct seek).
     pub(super) fn first_with<R>(
         &self,
+        core: &Core,
         kind: ScanKind,
         f: impl FnOnce(&[u8], &[u8]) -> R,
     ) -> Option<R> {
@@ -237,17 +244,19 @@ impl TableShared {
             Ok(Some((key, value))) => Some(f(key, value)),
             Ok(None) => None,
             Err(e) => {
-                scan_error(&self.name, &e);
+                scan_error(core, &self.name, &e);
                 None
             }
         }
     }
 }
 
-/// Log a scan or seek ended by an error: `DBIter` cannot carry it, but a damaged table must not
-/// pass for a shorter one in silence.
-fn scan_error(table: &str, e: &FetchError) {
+/// A scan or seek ended by an error: `DBIter` cannot carry it, so the shorter answer would pass
+/// for a whole one. Log it and latch the damage (see [`Core::read_damaged`]): every later write
+/// and persist then fails, so the node stops rather than act on the short answer.
+fn scan_error(core: &Core, table: &str, e: &FetchError) {
     tracing::error!(target: "tndb", "scan of table {table} ended by an error: {e}");
+    core.read_damaged(table, e);
 }
 
 /// A lazy, key-ordered scan of a published snapshot.
@@ -255,8 +264,9 @@ pub(super) struct TableScan {
     published: Arc<Published>,
     cursor: Option<BtreeCursor>,
     name: String,
-    /// Keeps the database (and so the current generation's files) open while the scan lives.
-    _core: Arc<Core>,
+    /// Keeps the database (and so the current generation's files) open while the scan lives, and
+    /// latches damage the scan finds.
+    core: Arc<Core>,
 }
 
 impl TableScan {
@@ -271,7 +281,7 @@ impl TableScan {
         match row {
             Some(Ok((key, value))) => Some(f(key, value)),
             Some(Err(e)) => {
-                scan_error(&self.name, &e);
+                scan_error(&self.core, &self.name, &e);
                 self.cursor = None;
                 None
             }
@@ -381,9 +391,14 @@ pub(super) struct Writer {
     has_dead: bool,
     /// A batch left every table empty while the log held at least [`EMPTIED_MIN_BYTES`] (the
     /// epoch tables are all cleared at an epoch's end): the log compacts at once, whatever its
-    /// growth threshold, since nothing live is left to copy. Kept until a compaction switches, so
-    /// writes that resume meanwhile do not cancel it.
+    /// growth threshold, since nothing live is left to copy. Kept until a compaction whose
+    /// snapshot came after it switches, so writes that resume meanwhile do not cancel it, and one
+    /// raised while a compaction runs survives that compaction's switch.
     emptied: bool,
+    /// The log's length when `emptied` was last set.
+    emptied_at: u64,
+    /// The log's length at the last compaction snapshot (see [`Core::compaction_snapshot`]).
+    snapshot_end: u64,
     /// Test-only: the next batch panics after appending this many records.
     #[cfg(test)]
     panic_after: Option<usize>,
@@ -596,10 +611,14 @@ impl Writer {
             // reported once per open file, so a flush beside a sync round could take the error
             // the round must see, and the round would acknowledge data the disk lost. Holding the
             // round's lock across the flush and its latch, a round after it finds the failure.
-            let _one_sync = sync_lock.lock();
+            let one_sync = sync_lock.lock();
             if let Err(e) = self.view.msync(start, end) {
                 self.stop(format!("flush a failed batch's rollback: {e}"));
             }
+            drop(one_sync);
+            // A writer that found the sync lock held by this flush waits for a round: wake it to
+            // lead one itself.
+            self.durability.notify_waiters();
             #[cfg(test)]
             {
                 self.rollback_flushes += 1;
@@ -618,6 +637,19 @@ impl Writer {
         }
         if self.log.is_failed() {
             self.stop("the log failed".to_string());
+        }
+    }
+
+    /// Stop if the index of a table `ops` writes is poisoned (see [`Self::revert`]).
+    fn stop_if_poisoned(&mut self, ops: &[BatchOp<'_>]) {
+        let poisoned = ops.iter().map(BatchOp::table).find(|id| {
+            self.tables
+                .get(id)
+                .and_then(|table| table.idx.as_ref())
+                .is_some_and(|idx| idx.is_poisoned())
+        });
+        if let Some(id) = poisoned {
+            self.stop(format!("table {id}'s index is poisoned"));
         }
     }
 
@@ -662,6 +694,7 @@ impl Writer {
             && self.tables.values().all(|table| table.idx.as_ref().is_none_or(BtreeIndex::is_empty))
         {
             self.emptied = true;
+            self.emptied_at = self.log.file_len();
         }
     }
 
@@ -708,7 +741,9 @@ impl Writer {
         self.stamped = self.log.file_len();
         self.base = base;
         self.has_dead = has_dead;
-        self.emptied = false;
+        // An emptying after the snapshot was copied with the rows it cleared (live when copied,
+        // dead after the catch-up's clears): the new generation still needs its reset.
+        self.emptied = self.emptied && self.emptied_at > self.snapshot_end;
         let ids: Vec<TableId> = self.tables.keys().copied().collect();
         for id in ids {
             self.publish(id);
@@ -812,9 +847,13 @@ impl Core {
         let manifest = manifest.unwrap_or_default();
         let (gen, mut log, older) = open_current_gen(root)?;
         let gen_path = gen_dir(root, gen);
-        if !manifest_lost {
-            remove_orphan_indexes(&gen_path, &manifest)?;
-        }
+        // A table's index is created only after the manifest names the table, so an index the
+        // manifest does not name means it was rolled back (an older copy restored): replay the
+        // log, as for a lost one, so a record of a table it no longer names fails the open. Once
+        // the replay has passed, the orphans index nothing the log holds, and go.
+        let orphans =
+            if manifest_lost { Vec::new() } else { orphan_indexes(&gen_path, &manifest)? };
+        let replay_all = manifest_lost || !orphans.is_empty();
         let header = *log.header();
 
         // Each table's index: a stale or damaged one is rebuilt from the log.
@@ -845,7 +884,7 @@ impl Core {
         }
         #[cfg(test)]
         let mut rebuilt = Vec::new();
-        if log.opened_unclean() || !stale.is_empty() || manifest_lost {
+        if log.opened_unclean() || !stale.is_empty() || replay_all {
             let all = log.opened_unclean();
             let rebuild = |id: TableId| all || stale.contains(&id);
             #[cfg(test)]
@@ -853,6 +892,9 @@ impl Core {
                 rebuilt = manifest.tables.iter().map(|t| t.id).filter(|&id| rebuild(id)).collect();
             }
             recover(&mut log, &manifest, &gen_path, &header, &mut idxs, rebuild)?;
+        }
+        for orphan in orphans {
+            let _ = fs::remove_dir_all(orphan);
         }
         // The current generation has opened: an older one (left by a crash right after a switch)
         // is no longer the only other copy.
@@ -885,6 +927,8 @@ impl Core {
             // Unknown for a log with records; a new one holds nothing dead.
             has_dead: stamped > DATA_HEADER_BYTES as u64,
             emptied: false,
+            emptied_at: 0,
+            snapshot_end: 0,
             #[cfg(test)]
             panic_after: None,
             #[cfg(test)]
@@ -939,6 +983,13 @@ impl Core {
     }
 
     /// Bytes of the log not yet synced.
+    /// Latch damage a read of table `table` found (its index, or the record an index entry points
+    /// at): the database can no longer be trusted to answer, so every later write and persist
+    /// fails and the node stops; the restart rebuilds the index (a damaged index is never sealed).
+    pub(super) fn read_damaged(&self, table: &str, e: &dyn std::fmt::Display) {
+        self.durability.fail(format!("tndb: a read of table {table} found damage: {e}"));
+    }
+
     pub(super) fn unsynced(&self) -> u64 {
         let frontier = self.frontier.load();
         frontier.end.saturating_sub(frontier.sync.synced.load(Ordering::Acquire))
@@ -966,7 +1017,7 @@ impl Core {
     /// compaction is due: a requested one (`requested`: the least log it compacts) needs a log
     /// that long; an automatic one, [`Writer::wants_compaction`].
     pub(super) fn compaction_snapshot(&self, requested: Option<u64>) -> Option<Snapshot> {
-        let writer = self.writer.lock();
+        let mut writer = self.writer.lock();
         writer.check().ok()?;
         let end = writer.log.file_len();
         let due = match requested {
@@ -976,6 +1027,7 @@ impl Core {
         if !due {
             return None;
         }
+        writer.snapshot_end = end;
         let tables = writer
             .tables
             .iter()
@@ -1090,7 +1142,15 @@ impl Core {
         }
         writer.check()?;
         writer.stamp_synced();
-        let effective = writer.effective(ops)?;
+        let effective = match writer.effective(ops) {
+            Ok(effective) => effective,
+            Err(e) => {
+                // A removal's lookup that met index damage poisoned that index; nothing was
+                // written, but the database stops, as after a failed batch on it.
+                writer.stop_if_poisoned(ops);
+                return Err(e);
+            }
+        };
         if effective.is_empty() {
             return Ok(None);
         }
@@ -1322,10 +1382,33 @@ fn open_current_gen(root: &Path) -> eyre::Result<(u64, Log, Vec<u64>)> {
     if !dir.join("log").exists() {
         bail!("tndb: generation {current} of {} has no log", root.display());
     }
+    // A generation's log holds its header before the generation exists (generation 0 is built
+    // aside; a compaction syncs its log before the rename), so one with none is damage: refuse it
+    // rather than let the open re-initialise it as an empty log.
+    if !log_has_header(&dir.join("log"))? {
+        bail!(
+            "tndb: generation {current} of {} has a log with no header (damaged)",
+            root.display()
+        );
+    }
     let log = open_log(&dir)
         .wrap_err_with(|| format!("tndb: open generation {current} of {}", root.display()))?;
     let older = gens.into_iter().filter(|&n| n < current).collect();
     Ok((current, log, older))
+}
+
+/// True if the log file at `path` holds a header: it is at least a header long and that span is not
+/// all zeros.
+fn log_has_header(path: &Path) -> eyre::Result<bool> {
+    use std::io::Read as _;
+    let mut header = [0_u8; DATA_HEADER_BYTES];
+    let mut file =
+        fs::File::open(path).wrap_err_with(|| format!("tndb: open {}", path.display()))?;
+    match file.read_exact(&mut header) {
+        Ok(()) => Ok(header.iter().any(|&b| b != 0)),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e).wrap_err_with(|| format!("tndb: read {}", path.display())),
+    }
 }
 
 /// Build an empty first generation in `dir`: its log, committed and closed, and the directory
@@ -1342,9 +1425,10 @@ fn build_gen0(dir: &Path) -> eyre::Result<()> {
     Ok(crate::archive::data_file::fsync_directory(dir)?)
 }
 
-/// Delete the index directories of tables the manifest does not have (or whose key size it has
-/// not fixed): derived data with nothing to index.
-fn remove_orphan_indexes(gen_path: &Path, manifest: &Manifest) -> eyre::Result<()> {
+/// The index directories of tables the manifest does not have (or whose key size it has not
+/// fixed).
+fn orphan_indexes(gen_path: &Path, manifest: &Manifest) -> eyre::Result<Vec<PathBuf>> {
+    let mut orphans = Vec::new();
     for entry in fs::read_dir(gen_path)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -1354,53 +1438,133 @@ fn remove_orphan_indexes(gen_path: &Path, manifest: &Manifest) -> eyre::Result<(
             .ok()
             .is_some_and(|id| manifest.tables.iter().any(|t| t.id == id && t.ksize > 0));
         if !known {
-            let _ = fs::remove_dir_all(entry.path());
+            orphans.push(entry.path());
         }
     }
-    Ok(())
+    Ok(orphans)
 }
 
 /// A table's live rows found by a replay: key to record position.
 type Rows = BTreeMap<Vec<u8>, u64>;
 
 /// One record of a batch still being read in a replay.
-enum Pending {
+pub(super) enum Pending {
     Put(Vec<u8>, u64),
     Remove(Vec<u8>),
     Clear,
 }
 
-/// Replay the log (read through a cloned handle; nothing is changed) for the tables `want`
-/// selects: their live `key → position` maps, and where the log's whole batches end. Every record
-/// is checked (an unknown table or kind, or a malformed record, is an error); a batch applies only
-/// once its flagged last record reads back intact, so a crash keeps no part of a partly written
-/// batch. A sealed log must read whole; an unclean one may end in a tear, but not below its
-/// commit marker.
+/// Where a replay applies each whole batch's records.
+pub(super) trait ReplaySink {
+    /// True if the replay applies table `id`'s records.
+    fn wants(&self, id: TableId) -> bool;
+    /// Apply one record of a whole batch to table `id`.
+    fn apply(&mut self, id: TableId, op: Pending) -> eyre::Result<()>;
+}
+
+/// A replay into memory: the live `key → position` map of each wanted table.
+pub(super) struct RowsSink(pub(super) BTreeMap<TableId, Rows>);
+
+impl RowsSink {
+    /// Collect the rows of the tables `ids`.
+    pub(super) fn wanting(ids: impl IntoIterator<Item = TableId>) -> Self {
+        Self(ids.into_iter().map(|id| (id, BTreeMap::new())).collect())
+    }
+}
+
+impl ReplaySink for RowsSink {
+    fn wants(&self, id: TableId) -> bool {
+        self.0.contains_key(&id)
+    }
+
+    fn apply(&mut self, id: TableId, op: Pending) -> eyre::Result<()> {
+        let table = self.0.get_mut(&id).expect("only wanted tables are applied");
+        match op {
+            Pending::Put(key, pos) => {
+                table.insert(key, pos);
+            }
+            Pending::Remove(key) => {
+                table.remove(&key);
+            }
+            Pending::Clear => table.clear(),
+        }
+        Ok(())
+    }
+}
+
+/// A replay straight into fresh indexes (recovery's rebuild), so no table's rows are held in
+/// memory. An index still here when the sink drops (a failed recovery) is removed, so the next
+/// open rebuilds it again.
+struct IndexSink(BTreeMap<TableId, BtreeIndex>);
+
+impl ReplaySink for IndexSink {
+    fn wants(&self, id: TableId) -> bool {
+        self.0.contains_key(&id)
+    }
+
+    fn apply(&mut self, id: TableId, op: Pending) -> eyre::Result<()> {
+        let idx = self.0.get_mut(&id).expect("only wanted tables are applied");
+        match op {
+            Pending::Put(key, pos) => idx.save(&key, pos)?,
+            Pending::Remove(key) => {
+                idx.remove(&key)?;
+            }
+            Pending::Clear => idx.clear()?,
+        }
+        Ok(())
+    }
+}
+
+impl Drop for IndexSink {
+    fn drop(&mut self) {
+        for idx in self.0.values_mut() {
+            idx.set_remove_on_drop();
+        }
+    }
+}
+
+/// What a replay found: where the log's whole batches end, and the tear it stopped at, if any.
+pub(super) struct Replayed {
+    pub(super) end: u64,
+    pub(super) tear: Option<String>,
+}
+
+/// Replay the log (read through a cloned handle; nothing is changed) into `sink`, for the tables
+/// it wants, and find where the log's whole batches end. Every record is checked (an unknown
+/// table or kind, or a malformed record, is an error); a batch applies only once its flagged last
+/// record reads back intact, so a crash keeps no part of a partly written batch. A sealed log must
+/// read whole, in whole batches; an unclean one may end in a tear (a record that fails its CRC or
+/// runs past the end), but not below its commit marker. A read the disk fails is an error, never a
+/// tear: acknowledged batches may follow it.
 pub(super) fn replay(
     log: &Log,
     manifest: &Manifest,
-    want: &impl Fn(TableId) -> bool,
-) -> eyre::Result<(BTreeMap<TableId, Rows>, u64)> {
+    sink: &mut impl ReplaySink,
+) -> eyre::Result<Replayed> {
     let ksizes: BTreeMap<TableId, u16> = manifest.tables.iter().map(|t| (t.id, t.ksize)).collect();
-    let mut rows: BTreeMap<TableId, Rows> =
-        ksizes.keys().filter(|&&id| want(id)).map(|&id| (id, BTreeMap::new())).collect();
     let mut pending: Vec<(TableId, Pending)> = Vec::new();
+    let mut in_batch = false;
     let mut end = DATA_HEADER_BYTES as u64;
-    let mut torn = false;
+    let mut tear = None;
     let mut iter = log.raw_iter()?;
     loop {
         let start = iter.logical_position();
         let payload = match iter.next_raw() {
             None => break,
-            Some(Err(_)) => {
-                torn = true;
+            Some(Err(FetchError::IO(e))) if e.kind() != std::io::ErrorKind::UnexpectedEof => {
+                return Err(eyre::Report::new(e).wrap_err(format!(
+                    "tndb: reading the log at {start} failed (a read error, not a torn tail)"
+                )));
+            }
+            Some(Err(e)) => {
+                tear = Some(format!("a bad record at {start} ({e})"));
                 break;
             }
             Some(Ok(payload)) => payload,
         };
         let record = record::parse(payload, |id| ksizes.get(&id).copied())
             .wrap_err_with(|| format!("tndb: the record at {start}"))?;
-        if rows.contains_key(&record.table) {
+        if sink.wants(record.table) {
             pending.push((
                 record.table,
                 match record.op {
@@ -1410,33 +1574,38 @@ pub(super) fn replay(
                 },
             ));
         }
+        in_batch = !record.end;
         if record.end {
             for (id, op) in pending.drain(..) {
-                let table = rows.get_mut(&id).expect("only wanted tables are pending");
-                match op {
-                    Pending::Put(key, pos) => {
-                        table.insert(key, pos);
-                    }
-                    Pending::Remove(key) => {
-                        table.remove(&key);
-                    }
-                    Pending::Clear => table.clear(),
-                }
+                sink.apply(id, op)?;
             }
             end = iter.logical_position();
         }
     }
-    if torn && !log.opened_unclean() {
-        bail!("tndb: the log was closed cleanly but does not replay to its end (corrupt)");
+    if !log.opened_unclean() {
+        if let Some(tear) = &tear {
+            bail!(
+                "tndb: the log was closed cleanly but does not replay to its end: {tear} (corrupt)"
+            );
+        }
+        if in_batch {
+            bail!("tndb: the log was closed cleanly but ends inside a batch after {end} (corrupt)");
+        }
     }
     if log.opened_unclean() && log.committed_end().is_some_and(|committed| end < committed) {
-        bail!("tndb: the log's whole batches end at {end}, below its commit marker");
+        bail!(
+            "tndb: the log's whole batches end at {end}, below its commit marker{}",
+            tear.map(|tear| format!(", at {tear}")).unwrap_or_default()
+        );
     }
-    Ok((rows, end))
+    Ok(Replayed { end, tear })
 }
 
 /// Rebuild the indexes of the tables `rebuild` selects from the log, after cutting an unclean
-/// log back to its last whole batch. Changes nothing until the whole log has replayed and checked.
+/// log back to its last whole batch. The log is not changed until it has replayed whole and been
+/// checked. The indexes being rebuilt (stale, or they would not be) are refilled as it replays,
+/// batch by batch, so no rows are held in memory; a failed recovery removes them, so the next
+/// open rebuilds them again.
 fn recover(
     log: &mut Log,
     manifest: &Manifest,
@@ -1445,15 +1614,21 @@ fn recover(
     idxs: &mut BTreeMap<TableId, Option<BtreeIndex>>,
     rebuild: impl Fn(TableId) -> bool,
 ) -> eyre::Result<()> {
-    let (rows, end) = replay(log, manifest, &|id| {
-        rebuild(id) && manifest.tables.iter().any(|t| t.id == id && t.ksize > 0)
-    })?;
+    let mut sink = IndexSink(BTreeMap::new());
+    for entry in manifest.tables.iter().filter(|t| t.ksize > 0 && rebuild(t.id)) {
+        let dir = idx_dir(gen_path, entry.id);
+        // Close the stale index before its directory goes.
+        idxs.insert(entry.id, None);
+        let _ = fs::remove_dir_all(&dir);
+        sink.0.insert(entry.id, BtreeIndex::open_btx_file(&dir, header, entry.ksize, false)?);
+    }
+    let Replayed { end, tear } = replay(log, manifest, &mut sink)?;
     if end < log.file_len() {
         if let Some(cut) = log.rewind_to(end) {
             // Bytes followed the last whole batch. After a power loss that is normal (a round's
             // pages reach the disk in any order, so unacknowledged batches can survive past a
             // torn page); otherwise it can mean damage to acknowledged data. Say what was cut.
-            tracing::warn!(target: "tndb", "recovery cut the log at {end}, its last whole batch; non-zero bytes followed up to {} (commit marker: {:?})", cut.end, log.committed_end());
+            tracing::warn!(target: "tndb", "recovery cut the log at {end}, its last whole batch, after {}; non-zero bytes followed up to {} (commit marker: {:?})", tear.as_deref().unwrap_or("a partial batch"), cut.end, log.committed_end());
             // The open-time sync made the old tail durable, and its zeros are only in memory:
             // flush them now, as a rollback does, or a power loss before writeback could bring
             // stale batches back behind the ones written next.
@@ -1461,13 +1636,7 @@ fn recover(
         }
     }
     let len = log.file_len();
-    for (id, rows) in rows {
-        let entry = manifest.tables.iter().find(|t| t.id == id).expect("a manifest table");
-        let dir = idx_dir(gen_path, id);
-        idxs.insert(id, None);
-        let _ = fs::remove_dir_all(&dir);
-        let mut idx = BtreeIndex::open_btx_file(&dir, header, entry.ksize, false)?;
-        idx.rebuild_from(rows)?;
+    for (id, mut idx) in std::mem::take(&mut sink.0) {
         idx.set_data_file_length(len);
         idx.sync()?;
         idx.mark_consistent();

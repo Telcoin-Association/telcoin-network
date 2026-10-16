@@ -8,8 +8,9 @@
 //! own B+tree index of positions in it; a manifest ([`manifest`]) names the tables. All writes take
 //! one write lock and land as whole batches (a bare write, or a whole transaction, atomic across
 //! tables), so every batch end is a commit point and the commit thread ([`commit`]) syncs the log
-//! up to the latest without taking any lock a writer takes: one sync per round, however many
-//! tables and writers it covers. Readers take no lock. A compaction thread ([`compact`])
+//! up to the latest without taking the write lock (only the sync lock, which a rollback's flush
+//! and a writer leading its own round also take): one sync per round, however many tables and
+//! writers it covers. Readers take no lock. A compaction thread ([`compact`])
 //! rewrites the log's live rows into a new generation in the background, once the log has doubled
 //! since the last one.
 

@@ -25,7 +25,8 @@
 //! synced first), so a crash on either side of the rename loses nothing; a `compact-*` directory
 //! is never a generation, and an open deletes a leftover one. A compaction that fails before the
 //! rename is abandoned (its files are deleted) and the automatic trigger backs off; one that fails
-//! after it stops the writer, since which generation the next open picks is then unknown.
+//! after it (or whose rename reports an error yet moved the directory) stops the writer, since
+//! which generation the next open picks is then unknown.
 //!
 //! The automatic trigger ([`Writer::wants_compaction`](super::store)) needs no accounting per
 //! write: the log compacts once it is at least `auto_min_bytes` long, has at least doubled since
@@ -95,12 +96,26 @@ const AUTO_BACKOFF_MAX: Duration = Duration::from_secs(60 * 60);
 /// index), rather than from the environment.
 fn is_corruption(e: &eyre::Report) -> bool {
     e.chain().any(|cause| {
-        matches!(
-            cause.downcast_ref::<FetchError>(),
-            Some(FetchError::CrcFailed | FetchError::CorruptIndex(_))
-        )
+        cause.is::<DamagedRecord>()
+            || matches!(
+                cause.downcast_ref::<FetchError>(),
+                Some(FetchError::CrcFailed | FetchError::CorruptIndex(_))
+            )
     })
 }
+
+/// A record of the old log that read back whole (its CRC held) but does not parse: damage (see
+/// [`record::parse`]), carried in the catch-up's error so the run loop counts it as corruption.
+#[derive(Debug)]
+struct DamagedRecord(String);
+
+impl std::fmt::Display for DamagedRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for DamagedRecord {}
 
 /// The most the switch replays under the write lock: past it, the switch lets go of its locks
 /// and runs another background round first, so writers wait for a small tail only.
@@ -313,8 +328,10 @@ pub(super) struct TestHooks {
     /// The next switch panics just before its rename, or just after it.
     pub(super) panic_before_rename: AtomicBool,
     pub(super) panic_after_rename: AtomicBool,
-    /// The next switch's rename into place fails, or its directory sync after the rename.
+    /// The next switch's rename into place fails (moving nothing), or moves the directory and
+    /// then reports a failure, or its directory sync after the rename fails.
     pub(super) fail_rename: AtomicBool,
+    pub(super) fail_after_rename: AtomicBool,
     pub(super) fail_root_sync: AtomicBool,
     /// The next compaction reports each checkpoint it reaches on the first channel and waits
     /// for a message (or the sender's drop) on the second. Checkpoints: 1 after the copy, 2 after
@@ -374,6 +391,14 @@ fn free_bytes(core: &Core) -> Option<u64> {
     available_bytes(&core.root).ok()
 }
 
+/// Stop a running compaction when the database closes (a cancel), or once its durability has
+/// failed: a stopped writer never switches, so the rest of the copy would only add I/O to a disk
+/// that may be failing.
+fn check_stop(core: &Core) -> eyre::Result<()> {
+    core.compact.check_cancel()?;
+    core.durability.check().wrap_err("tndb: compaction: the database stopped")
+}
+
 /// Give way to the writer when the disk is nearly full (an unknown free space does not block).
 fn check_room(core: &Core) -> eyre::Result<()> {
     #[cfg(test)]
@@ -430,9 +455,17 @@ fn dir_bytes(dir: &Path) -> u64 {
         .sum()
 }
 
-/// Paces the copy at `rate` bytes a second (0: unpaced), checking for a cancellation and for
-/// room on the disk (the copy is the longest phase) once per [`BATCH_BYTES`], and for a
-/// cancellation during each sleep.
+/// Whether a rename of `from` to `to` that returned an error took effect anyway. Only `from` still
+/// there and `to` absent counts as not moved; anything else (a path that cannot be checked
+/// included) counts as moved, so a doubt stops the writer rather than letting it carry on in a
+/// generation the next open may pass over.
+fn moved(from: &Path, to: &Path) -> bool {
+    !matches!((from.try_exists(), to.try_exists()), (Ok(true), Ok(false)))
+}
+
+/// Paces the copy at `rate` bytes a second (0: unpaced), checking for a stop ([`check_stop`]) and
+/// for room on the disk (the copy is the longest phase) once per [`BATCH_BYTES`], and for a stop
+/// during each sleep.
 struct Pacer {
     rate: u64,
     written: u64,
@@ -446,13 +479,12 @@ impl Pacer {
     }
 
     fn pace(&mut self, bytes: u64, core: &Core) -> eyre::Result<()> {
-        let shared = &core.compact;
         self.written += bytes;
         if self.written < self.next_check {
             return Ok(());
         }
         self.next_check = self.written + BATCH_BYTES;
-        shared.check_cancel()?;
+        check_stop(core)?;
         check_room(core)?;
         if self.rate > 0 {
             let due = Duration::from_secs_f64(self.written as f64 / self.rate as f64);
@@ -461,7 +493,7 @@ impl Pacer {
                 let slice = ahead.min(PACE_SLICE);
                 std::thread::sleep(slice);
                 ahead -= slice;
-                shared.check_cancel()?;
+                check_stop(core)?;
             }
         }
         Ok(())
@@ -707,16 +739,22 @@ fn catch_up(
     guard: Option<&Core>,
 ) -> eyre::Result<()> {
     // A round can be large (the first replays everything written during the copy), so outside
-    // the write lock it checks for a cancellation and for room on the disk as it goes, as the copy
-    // does (unpaced): a writer's growth must not be what finds the disk full.
+    // the write lock it checks for a stop as it reads, and for a stop and room on the disk as it
+    // copies, as the copy does (unpaced): a writer's growth must not be what finds the disk full.
     let mut pacer = guard.map(|core| (Pacer::new(0), core));
     let mut cleared = BTreeSet::new();
     let mut net: BTreeMap<(TableId, Vec<u8>), Net> = BTreeMap::new();
     let mut pos = from;
+    let mut next_check = from + BATCH_BYTES;
     while pos < to {
+        if let Some(core) = guard.filter(|_| pos >= next_check) {
+            check_stop(core)?;
+            next_check = pos + BATCH_BYTES;
+        }
         let payload = Log::record_bytes_within(view, pos, to, MAX_RECORD)?;
-        let record = record::parse(payload, |id| ksizes.get(id))
-            .wrap_err_with(|| format!("tndb: compaction: the record at {pos}"))?;
+        let record = record::parse(payload, |id| ksizes.get(id)).map_err(|e| {
+            DamagedRecord(format!("tndb: compaction: the record at {pos} does not parse: {e:#}"))
+        })?;
         let id = record.table;
         match record.op {
             Op::Put(key) => {
@@ -754,6 +792,7 @@ fn catch_up(
 /// One compaction: `Ok(true)` if the database switched to a compacted generation, `Ok(false)` if
 /// none was due (or the writer had stopped).
 fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
+    #[cfg(test)]
     let shared = &core.compact;
     #[cfg(test)]
     let gate = shared.test.gate.lock().take();
@@ -770,8 +809,14 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     #[cfg(test)]
     let mut skip_a_row = shared.test.skip_a_row.swap(false, Ordering::Relaxed);
     // Room for the new generation, and the floor the copy keeps above it: a compaction admitted
-    // with less would copy almost everything and then give way (`check_room`), every backoff.
-    let needed = dir_bytes(&snap.gen_dir) + DISK_HEADROOM + MIN_FREE;
+    // with less would copy almost everything and then give way (`check_room`), every backoff. The
+    // current generation's size bounds the copy; when every table is empty at the snapshot (the
+    // epoch tables at an epoch's end) there is nothing to copy, and the catch-up checks for room
+    // as it writes. Counting the old log there would refuse the one compaction that frees it.
+    let empty =
+        snap.tables.iter().all(|table| table.published.index.as_ref().is_none_or(|i| i.len() == 0));
+    let copy = if empty { 0 } else { dir_bytes(&snap.gen_dir) };
+    let needed = copy + DISK_HEADROOM + MIN_FREE;
     if let Some(free) = free_bytes(core).filter(|&free| free < needed) {
         let why = format!("tndb: compaction skipped: {free} bytes free, {needed} needed");
         return Err(GiveWay::DiskFull(why).into());
@@ -811,7 +856,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
     let mut done = snap.end;
     let mut rounds = 0;
     loop {
-        shared.check_cancel()?;
+        check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
         catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
@@ -839,7 +884,7 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
                 out.index(id, ksize)?;
             }
         }
-        shared.check_cancel()?;
+        check_stop(core)?;
         check_room(core)?;
         let to = core.frontier.load().end;
         catch_up(&mut out, &view, done, to, &ksizes, Some(core))?;
@@ -886,10 +931,33 @@ fn compact_once(core: &Core, requested: bool, rate: u64) -> eyre::Result<bool> {
         let gen = snap.gen + 1;
         let dir = gen_dir(&core.root, gen);
         #[cfg(test)]
-        if shared.test.fail_rename.swap(false, Ordering::Relaxed) {
-            bail!("tndb: compaction: injected rename failure");
+        let renamed = if shared.test.fail_rename.swap(false, Ordering::Relaxed) {
+            Err(std::io::Error::other("injected rename failure"))
+        } else if shared.test.fail_after_rename.swap(false, Ordering::Relaxed) {
+            fs::rename(&out.dir, &dir)
+                .and(Err(std::io::Error::other("injected failure after the rename")))
+        } else {
+            fs::rename(&out.dir, &dir)
+        };
+        #[cfg(not(test))]
+        let renamed = fs::rename(&out.dir, &dir);
+        if let Err(e) = renamed {
+            if !moved(&out.dir, &dir) {
+                return Err(eyre::Report::new(e).wrap_err("tndb: compaction: rename into place"));
+            }
+            // A failing disk can apply a rename and still report an error. The next open may then
+            // pick the new generation, so no batch may be acknowledged that it lacks: stop the
+            // writer. The new log holds every batch so far (synced above, with the write lock
+            // held throughout), so whichever generation the next open picks holds every
+            // acknowledged write. The builder's drop deletes only what is left at its own paths
+            // (nothing, once moved): the new generation stays unsealed, and the next open
+            // recovers it.
+            let cause = format!(
+                "the compacted generation {gen} moved into place, yet its rename failed: {e}"
+            );
+            writer.stop(cause.clone());
+            bail!("tndb: {cause}");
         }
-        fs::rename(&out.dir, &dir).wrap_err("tndb: compaction: rename into place")?;
         let (log, idxs, has_dead) = out.finish();
         #[cfg(test)]
         shared.test.private_at_switch.store(
@@ -1055,7 +1123,14 @@ fn run(core: &Core, rate: u64) {
 
 #[cfg(test)]
 mod test {
-    use super::*;
+    use tempfile::TempDir;
+    use tn_types::Database as _;
+
+    use super::{
+        super::database::{CommitMode, CompactionConfig, TnDatabase, TnDbOptions},
+        *,
+    };
+    use crate::{archive::pack::DATA_HEADER_BYTES, test::TestTable};
 
     /// An abandon's cause comes from the typed error wherever it sits in the chain, then from
     /// damage, else it is a plain error.
@@ -1069,5 +1144,195 @@ mod test {
         let damaged = eyre::Report::new(FetchError::CrcFailed).wrap_err("copy a row");
         assert_eq!(cause(&damaged), Cause::Corruption);
         assert_eq!(cause(&eyre::eyre!("an I/O error")), Cause::Error);
+    }
+
+    /// A second table, so that emptying the database takes more than one clear.
+    #[derive(Debug)]
+    struct CompactTable;
+    impl tn_types::Table for CompactTable {
+        type Key = u64;
+        type Value = String;
+
+        const NAME: &'static str = "CompactTable";
+        const HINT: tn_types::TableHint = tn_types::TableHint::Cache;
+    }
+
+    /// The database at `path`, both test tables open, compacting as `compaction` says.
+    fn open(path: &Path, compaction: CompactionConfig) -> TnDatabase {
+        let options = TnDbOptions { commit: CommitMode::Group, compaction };
+        let db = TnDatabase::open_with(path, options).expect("open");
+        db.open_table::<TestTable>().expect("open table");
+        db.open_table::<CompactTable>().expect("open table");
+        db
+    }
+
+    /// No automatic compaction, and an unpaced copy.
+    fn manual() -> CompactionConfig {
+        CompactionConfig { auto_min_bytes: None, bytes_per_sec: 0 }
+    }
+
+    fn log_len(db: &TnDatabase) -> u64 {
+        db.core().writer.lock().log_len()
+    }
+
+    /// The unfinished compactions under `root`.
+    fn compact_dirs(root: &Path) -> usize {
+        fs::read_dir(root)
+            .expect("read root")
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("compact-"))
+            .count()
+    }
+
+    /// Wait (up to 10 s) for a compaction to start building.
+    fn wait_for_a_build(root: &Path) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while compact_dirs(root) == 0 {
+            assert!(Instant::now() < deadline, "the compaction started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The epoch-end reset (every table emptied) needs no room for a copy: with free space above
+    /// the floor a compaction keeps but below that plus the old generation, the reset is admitted
+    /// and leaves a log of its header alone, while a compaction with rows to copy is still
+    /// refused.
+    #[test]
+    fn test_tndb_compaction_emptied_reset_needs_no_room_for_a_copy() {
+        let tmp = TempDir::with_prefix("tndb_compact_emptied_room").expect("temp dir");
+        // Only the emptied trigger fires automatically.
+        let config = CompactionConfig { auto_min_bytes: Some(1 << 40), bytes_per_sec: 0 };
+        let db = open(tmp.path(), config);
+        let value = "v".repeat(64 << 10);
+        let fill = || {
+            for i in 0..20_u64 {
+                db.insert::<TestTable>(&i, &value).expect("insert");
+                db.insert::<CompactTable>(&i, &value).expect("insert");
+            }
+        };
+        fill();
+        *db.core().compact.test.free_space.lock() = Some(DISK_HEADROOM + MIN_FREE + (1 << 20));
+        db.clear_table::<TestTable>().expect("clear");
+        db.clear_table::<CompactTable>().expect("clear");
+        assert_eq!(db.core().compact.wait_done(1), Some(Ok(true)), "the reset ran");
+        assert_eq!(log_len(&db), DATA_HEADER_BYTES as u64, "nothing copied");
+        fill();
+        let refused = db.compact_now().expect_err("rows to copy, and too little room");
+        assert!(refused.contains("skipped"), "{refused}");
+    }
+
+    /// A latched durability failure stops a running compaction promptly, whether it is copying
+    /// or about to run a catch-up round: it ends without a switch and leaves nothing.
+    #[test]
+    fn test_tndb_compaction_stops_once_durability_fails() {
+        // Mid-copy: about 8 s of copying at 1 MiB/s.
+        let tmp = TempDir::with_prefix("tndb_compact_latch_copy").expect("temp dir");
+        let db =
+            open(tmp.path(), CompactionConfig { auto_min_bytes: None, bytes_per_sec: 1 << 20 });
+        let value = "v".repeat(4096);
+        for i in 0..2_048_u64 {
+            db.insert::<TestTable>(&i, &value).expect("insert");
+        }
+        db.compact().expect("request");
+        wait_for_a_build(tmp.path());
+        let latched = Instant::now();
+        db.fail_durability_for_test();
+        let ended = db.core().compact.wait_done(1).expect("the compaction ended");
+        assert!(latched.elapsed() < Duration::from_secs(2), "stopped in {:?}", latched.elapsed());
+        let stopped = ended.expect_err("no switch");
+        assert!(stopped.contains("the database stopped"), "{stopped}");
+        assert_eq!(compact_dirs(tmp.path()), 0, "nothing left");
+        assert_eq!(super::super::layout::list_gens(tmp.path()).expect("gens"), [0]);
+        drop(db);
+
+        // After the copy, before the first catch-up round: no round runs.
+        let tmp = TempDir::with_prefix("tndb_compact_latch_round").expect("temp dir");
+        let db = open(tmp.path(), manual());
+        for i in 0..100_u64 {
+            db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
+        }
+        let (arrivals, release) = db.core().compact.test.gate_next();
+        std::thread::scope(|s| {
+            let compaction = s.spawn(|| db.compact_now());
+            assert_eq!(arrivals.recv_timeout(Duration::from_secs(30)), Ok(1), "the copy's end");
+            db.fail_durability_for_test();
+            drop(release);
+            let stopped = compaction.join().expect("compaction thread").expect_err("no switch");
+            assert!(stopped.contains("the database stopped"), "{stopped}");
+        });
+        assert!(arrivals.try_recv().is_err(), "no catch-up round ran");
+        assert_eq!(compact_dirs(tmp.path()), 0, "nothing left");
+        assert_eq!(super::super::layout::list_gens(tmp.path()).expect("gens"), [0]);
+    }
+
+    /// A rename into place that reports an error yet moved the directory stops the writer, as a
+    /// failure after the rename does: the next open picks the new generation, which holds every
+    /// row. (A rename that moved nothing is abandoned, the database carrying on:
+    /// `test_tndb_compaction_failures_before_the_rename_abandon`.)
+    #[test]
+    fn test_tndb_compaction_rename_that_moved_despite_an_error_stops_the_writer() {
+        let tmp = TempDir::with_prefix("tndb_compact_rename_moved").expect("temp dir");
+        let db = open(tmp.path(), manual());
+        for i in 0..100_u64 {
+            db.insert::<TestTable>(&i, &format!("a{i}")).expect("insert");
+        }
+        db.core().compact.test.fail_after_rename.store(true, Ordering::Relaxed);
+        let failed = db.compact_now().expect_err("the rename reported an error");
+        assert!(failed.contains("moved into place"), "{failed}");
+        // Carrying on in the old generation would acknowledge writes the next open never sees.
+        assert!(db.insert::<TestTable>(&200, &"x".to_string()).is_err(), "the writer stopped");
+        assert_eq!(compact_dirs(tmp.path()), 0);
+        drop(db);
+        let db = open(tmp.path(), manual());
+        assert_eq!(db.core().writer.lock().gen(), 1, "the next open picks the new generation");
+        assert_eq!(db.iter::<TestTable>().count(), 100, "every row");
+    }
+
+    /// A catch-up round stops for a stop (here a close's cancel) while it reads its records,
+    /// before it copies any; and a record that reads back whole but does not parse is counted as
+    /// corruption.
+    #[test]
+    fn test_tndb_compaction_catch_up_reads_check_for_a_stop_and_damage() {
+        let tmp = TempDir::with_prefix("tndb_compact_catch_up_reads").expect("temp dir");
+        let db = open(&tmp.path().join("db"), manual());
+        db.insert::<TestTable>(&0, &"fixes the key size".to_string()).expect("insert");
+        let core: &Core = db.core();
+        let (id, ksize) =
+            core.table_ksizes().into_iter().find(|&(_, ksize)| ksize > 0).expect("a key size");
+        assert_eq!(ksize, 8);
+        // An old log: 1.2 MiB of rows, then a record of a table the database does not have.
+        let old_dir = tmp.path().join("old");
+        fs::create_dir(&old_dir).expect("mkdir");
+        let mut old = open_log(&old_dir).expect("old log");
+        let from = old.file_len();
+        let value = [7_u8; 4096];
+        for k in 0..300_u64 {
+            let head = record::head(record::KIND_PUT, id, true);
+            old.append_raw_parts(&[&head, &k.to_be_bytes(), &value]).expect("append");
+        }
+        let to = old.file_len();
+        let head = record::head(record::KIND_PUT, TableId::MAX, true);
+        old.append_raw_parts(&[&head, &0_u64.to_be_bytes(), &value]).expect("append");
+        let end = old.file_len();
+        let view = old.view();
+        let ksizes = Ksizes::new(core, &[]);
+        let catch_up_into = |name: &str, from, to| {
+            let mut out = Builder::new(tmp.path().join(name)).expect("builder");
+            let result = catch_up(&mut out, &view, from, to, &ksizes, Some(core));
+            (result, out.rows(id))
+        };
+
+        let (result, rows) = catch_up_into("all", from, to);
+        result.expect("caught up");
+        assert_eq!(rows, 300);
+        core.compact.cancel.store(true, Ordering::Relaxed);
+        let (result, rows) = catch_up_into("cancelled", from, to);
+        core.compact.cancel.store(false, Ordering::Relaxed);
+        let cancelled = result.expect_err("cancelled");
+        assert!(format!("{cancelled:#}").contains("cancelled"), "{cancelled:#}");
+        assert_eq!(rows, 0, "stopped while reading, before copying a row");
+        let (result, _) = catch_up_into("damaged", to, end);
+        let damaged = result.expect_err("damaged");
+        assert_eq!(cause(&damaged), Cause::Corruption, "{damaged:#}");
     }
 }

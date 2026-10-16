@@ -194,6 +194,11 @@ where
         if *pos >= end {
             return Err(FetchError::NotFound);
         }
+        #[cfg(test)]
+        if FAIL_READ_AT.with(|at| at.get() == Some(*pos)) {
+            FAIL_READ_AT.with(|at| at.set(None));
+            return Err(FetchError::IO(io::Error::from_raw_os_error(5)));
+        }
         let mut val_size_buf = [0_u8; 4];
         if let Err(err) = file.read_exact(&mut val_size_buf) {
             // An EOF here should be caused by no more records although it is possible there
@@ -424,4 +429,12 @@ where
     pub fn into_reader(self) -> R {
         self.reader
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: this thread's next read of a record frame starting at this position fails once,
+    /// as a disk read can (`EIO`).
+    pub(crate) static FAIL_READ_AT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
 }

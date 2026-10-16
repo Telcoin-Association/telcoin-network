@@ -14,7 +14,7 @@ use super::{
     layout::{gen_dir, list_gens, lock_dir_shared},
     manifest::{Entry, Manifest},
     split::{ENVIRONMENTS, MDBX_MIGRATED},
-    store::{idx_dir, open_log_read_only, replay},
+    store::{idx_dir, open_log_read_only, replay, RowsSink},
 };
 use crate::archive::{
     btree_index::BtreeIndex,
@@ -123,8 +123,11 @@ pub fn inspect(root: &Path) -> eyre::Result<EnvReport> {
     let log = open_log_read_only(&gen_path)
         .wrap_err_with(|| format!("tndb: open generation {generation} of {}", root.display()))?;
     let header = *log.header();
-    let (rows, data_end) = replay(&log, &manifest, &|_| true)
-        .wrap_err_with(|| format!("tndb: replay generation {generation} of {}", root.display()))?;
+    let mut sink = RowsSink::wanting(manifest.tables.iter().map(|t| t.id));
+    let data_end = replay(&log, &manifest, &mut sink)
+        .wrap_err_with(|| format!("tndb: replay generation {generation} of {}", root.display()))?
+        .end;
+    let rows = sink.0;
     let mut tables = Vec::with_capacity(manifest.tables.len());
     for entry in &manifest.tables {
         let positions = rows.get(&entry.id);

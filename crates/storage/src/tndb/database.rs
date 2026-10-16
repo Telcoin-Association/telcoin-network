@@ -247,17 +247,17 @@ fn scan<T: Table>(core: &Arc<Core>, kind: ScanKind) -> DBIter<'static, T> {
 /// The single `(key, value)` a one-shot scan of table `T` lands on.
 fn first_of<T: Table>(core: &Core, kind: ScanKind) -> Option<(T::Key, T::Value)> {
     core.table(T::NAME)?
-        .first_with(kind, |key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
+        .first_with(core, kind, |key, value| (decode_key::<T::Key>(key), decode::<T::Value>(value)))
 }
 
 fn get<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<Option<T::Value>> {
     let table = table::<T>(core)?;
-    with_key(key, |key| table.get_with(key, |bytes| decode::<T::Value>(bytes)))
+    with_key(key, |key| table.get_with(core, key, |bytes| decode::<T::Value>(bytes)))
 }
 
 fn contains_key<T: Table>(core: &Core, key: &T::Key) -> eyre::Result<bool> {
     let table = table::<T>(core)?;
-    with_key(key, |key| table.contains(key))
+    with_key(key, |key| table.contains(core, key))
 }
 
 /// A read transaction: reads the tables' published snapshots.
@@ -398,7 +398,7 @@ impl DbTx for TnDbTxMut {
         match self.last_write(table.id, &encoded) {
             Some(Some(value)) => Ok(Some(decode::<T::Value>(value))),
             Some(None) => Ok(None),
-            None => table.get_with(&encoded, |bytes| decode::<T::Value>(bytes)),
+            None => table.get_with(&self.core, &encoded, |bytes| decode::<T::Value>(bytes)),
         }
     }
 }

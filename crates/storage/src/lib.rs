@@ -726,6 +726,10 @@ mod test {
         // Skip to prior of first value
         // Note: returns an empty iterator!
         assert!(db.record_prior_to::<TestTable>(&000).is_none());
+
+        // A key that is present: the record strictly before it, never the key itself.
+        assert_eq!(db.record_prior_to::<TestTable>(&456), Some((123, "123".to_string())));
+        assert!(db.record_prior_to::<TestTable>(&123).is_none(), "nothing precedes the first key");
     }
 
     pub(crate) fn test_iter_skip_to_previous_gap<DB: Database>(db: DB) {

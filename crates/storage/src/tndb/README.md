@@ -11,7 +11,7 @@ in the log until a background compaction rewrites it (see Compaction).
 |---|---|---|
 | files | one log + one index per table | one log + one index per table |
 | a commit syncs | each written table's log | the one log, once, however many tables |
-| commit thread vs writers | takes each table's lock twice per round | takes no lock a writer takes |
+| commit thread vs writers | takes each table's lock twice per round | never takes the write lock (only the sync lock; see Lock order) |
 | transactions | applied at once; atomic per table | buffered until commit; atomic across tables |
 | clear | a new generation (durable on return; data leaves the disk) | a CLEAR record (bytes leave at the next compaction) |
 | compaction | per table | the whole log, one new generation |
@@ -96,7 +96,11 @@ default pack allows 16 MiB: the cap is per pack (`MmapFileOptions::max_record_si
 from peers keep the smaller one, which guards against decompression bombs.
 
 **Lock order.** The registry lock (table registration, key-size fixes, and each manifest rewrite) is
-taken only before the write lock, never while holding it. The commit thread holds neither.
+taken only before the write lock, never while holding it. The sync lock, which one sync round
+holds at a time, comes after the write lock: a rollback takes it, under the write lock, to flush
+the failed batch's zeros, and a `Sync`-mode writer (or one past the unsynced cap) leads a round
+under it after letting go of the write lock. The commit thread takes only the sync lock, never the
+registry or write lock, so no order is ever reversed.
 
 ## Reads
 
@@ -109,9 +113,14 @@ copy) checks that the record an index entry points at is a put of that table and
 (`record::put_value`), so a damaged position is `CorruptIndex`, not another row's value; a scan
 ends there (logged), and a compaction abandons rather than copy it. A removal whose key the index
 cannot read fails the batch (nothing written) rather than counting the key absent, which would
-leave the row in place. The index latches any damage it finds (its file is poisoned): a failed
-batch on it stops the database, and the next open rebuilds it from the log. An index whose
-open-time walk fails is refused at open and rebuilt the same way.
+leave the row in place.
+
+**Damage a read finds stops the database.** A get, a scan, a seek or a removal's lookup that meets
+index damage (or a record that does not match its index entry) latches it as a durability failure:
+every later write and persist fails, so the node stops rather than act on a missing row or a scan
+that ended short (a scan cannot carry the error), and the damaged index, never sealed again, is
+rebuilt from the log at the next open. An index whose open-time walk fails is refused at open and
+rebuilt the same way.
 
 A scan holds the database core, so its files stay open while the scan lives, even after every
 handle has dropped. The database's `LOCK` is the core's last field, so it is released only once the
@@ -172,18 +181,31 @@ transaction), so buffering changes nothing they rely on.
 ## Recovery (open)
 
 **When the log is replayed.** If the log is unclean, it is replayed once and every index is
-rebuilt. If the log is clean but an index is stale (unclean, missing, or covering another length),
-only that table's index is rebuilt; the replay still reads the whole log.
+rebuilt. If the log is clean but an index is stale (unclean, missing, covering another length, or
+refused by its open-time walk), only that table's index is rebuilt; the replay still reads the
+whole log. An index the manifest does not name (a manifest rolled back to an older copy: one is
+always written before a table's index exists) also forces a replay, so the missing table's records
+fail the open; an orphan whose table has no records left goes once the replay has passed.
 
 **How the replay works.** It reads through a cloned handle. Batches apply in log order: PUT
-inserts, REMOVE removes, CLEAR empties that table. Records after the last whole batch are dropped.
+inserts, REMOVE removes, CLEAR empties that table, applied straight into the fresh indexes being
+rebuilt, so no table's rows are held in memory (only the batch being read). Records after the last
+whole batch are dropped.
 
 **Fail-closed rules:**
-- a sealed log must replay whole;
-- an unclean log may end in a tear, but not below its commit marker;
-- a failed replay changes nothing.
+- a generation's log must hold its header (it does before the generation exists), so an empty or
+  zeroed one fails the open rather than open as an empty database;
+- a sealed log must replay whole, in whole batches;
+- an unclean log may end in a tear (a record that fails its CRC or runs past the end), but not
+  below its commit marker;
+- a read the disk fails is an error, never a tear: the open fails, since acknowledged batches may
+  follow it (the commit marker never covers the last one after a crash, and a power loss can lose
+  it);
+- a failed replay changes no byte of the log; the indexes it was rebuilding (stale anyway) are
+  removed, so the next open rebuilds them again.
 
-Only then is the log cut back, each index rebuilt and synced, and both files marked consistent.
+Only then is the log cut back (the warning names the tear), each index synced, and both files
+marked consistent.
 
 ## Tests (`test.rs`)
 
@@ -221,7 +243,11 @@ Only then is the log cut back, each index rebuilt and synced, and both files mar
   opened and a table cleared during one; a scan across the switch; the switch holding the
   registry; the switch's tail cap; a crash after the switch; copied rows as whole batches; a
   leftover `compact-*` deleted and a generation without a log refused; a close cancelling; the
-  failures before the rename (abandoned) and after it (the writer stopped); a sync round paused
+  failures before the rename (abandoned) and after it (the writer stopped), and a rename that
+  reports an error yet moved (the writer stopped); a latched durability failure stopping one
+  mid-copy and before a round; the epoch-end reset admitted with room for no copy; a catch-up
+  round's reads stopping for a cancel, and a record that does not parse counted as corruption; a
+  sync round paused
   across the switch; the disk filling during the copy; an emptied log compacting at once (also
   after a reopen); writeback as the copy goes; and compactions inside the randomized crash model;
 - hardening: a failed open keeping the older generation; an interrupted creation reopening; a
@@ -308,11 +334,16 @@ per MiB of the copy and of each catch-up round outside the write lock, and befor
 more than 64 MiB landing before the last switch try) abandons the compaction: its files are
 deleted after the locks are released, and the database carries on in its generation. After the
 rename, a failure (the directory sync) or a panic stops the writer, latched: which generation the
-next open picks is unknown. A compaction needs the generation's size plus 128 MiB, plus the
-256 MiB floor, free to start, so it is not admitted only to give way near the copy's end. A close cancels a
-running compaction (checked each MiB of the copy, during pacing sleeps, between rounds and
-before each sync); its unfinished log is discarded without a flush, so the close does not wait on
-writing out what it throws away.
+next open picks is unknown. So does a rename that reports an error yet moved the directory (or
+whose outcome cannot be told): the new generation holds every batch written before it, and
+nothing is acknowledged after the stop, so either generation holds every acknowledged write. A
+compaction needs the generation's size plus 128 MiB, plus the 256 MiB floor, free to start, so it
+is not admitted only to give way near the copy's end; one whose snapshot has every table empty
+(the epoch-end reset) has nothing to copy, and needs only the 384 MiB. A close cancels a running
+compaction, and a latched durability failure stops one the same way (it could never switch):
+checked each MiB of the copy, during pacing sleeps, each MiB a catch-up round reads, between
+rounds and before each sync; its unfinished log is discarded without a flush, so the close does
+not wait on writing out what it throws away.
 
 **Durability across the switch.** The new log is synced before the rename, and the root
 directory before the new frontier is stored, so no round acks a batch while the next open might
