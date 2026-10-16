@@ -345,11 +345,13 @@ impl GenesisArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::b256;
     use clap::Parser as _;
     use tn_config::NodeInfo;
+    use tn_reth::system_calls::CONSENSUS_REGISTRY_ADDRESS;
     use tn_types::{
         generate_proof_of_possession_bls_for_test, test_utils::CommandParser, Address, BlsKeypair,
-        Committee, Multiaddr, NetworkKeypair, NodeP2pInfo, U256,
+        Committee, Genesis, Multiaddr, NetworkKeypair, NodeP2pInfo, B256, MAINNET_GENESIS, U256,
     };
 
     /// Prepare signed validator inputs and parse the real genesis CLI defaults and fee flags.
@@ -565,13 +567,91 @@ mod tests {
     /// `etc/genesis.sh`); restated here so regeneration reproduces the same identity.
     const MAINNET_PLACEHOLDER_OWNER: &str = "0x3DCc9a6f3A71F0A6C8C659c65558321c374E917a";
 
+    /// The mainnet epoch duration in seconds: 6 hours, the same value testnet runs (issue
+    /// #1512).
+    ///
+    /// The regeneration ceremony passes this value and the gate below pins it. Epoch duration
+    /// is a genesis parameter. An operator cannot change it on a node.
+    const MAINNET_EPOCH_DURATION_SECS: u32 = 21_600;
+
+    /// The total reward for one mainnet epoch, in whole TEL.
+    ///
+    /// This is the testnet value and the `--epoch-block-rewards` default. It is restated here
+    /// so the ceremony does not depend on the clap default. The registry pays this amount once
+    /// for each epoch, so 6-hour epochs issue 103,224 TEL for each day.
+    const MAINNET_EPOCH_ISSUANCE_TEL: u64 = 25_806;
+
+    /// The number of wei in one TEL (18 decimals), the scale `--epoch-block-rewards` applies.
+    const WEI_PER_TEL: u64 = 1_000_000_000_000_000_000;
+
+    /// The `ConsensusRegistry` storage slot of `StakeConfig.epochIssuance` for stake version 0.
+    ///
+    /// The genesis `StakeConfig` fills four consecutive slots: stake amount, min withdrawal,
+    /// epoch issuance, epoch duration. This is the third slot.
+    const STAKE_CONFIG_EPOCH_ISSUANCE_SLOT: B256 =
+        b256!("0x13da86008ba1c6922daee3e07db95305ef49ebced9f5467a0b8613fcc6b343e5");
+
+    /// The `ConsensusRegistry` storage slot of `StakeConfig.epochDuration` for stake version 0.
+    ///
+    /// This is the fourth and last `StakeConfig` slot (see
+    /// [`STAKE_CONFIG_EPOCH_ISSUANCE_SLOT`]).
+    const STAKE_CONFIG_EPOCH_DURATION_SLOT: B256 =
+        b256!("0x13da86008ba1c6922daee3e07db95305ef49ebced9f5467a0b8613fcc6b343e6");
+
+    /// How to regenerate the committed mainnet chain-config placeholders when
+    /// `mainnet_genesis_encodes_the_six_hour_epoch_target` fails.
+    const MAINNET_REGENERATION_LEVER: &str =
+        "regenerate chain-configs/mainnet with `cargo test -p telcoin-network-cli \
+         regenerate_mainnet_chain_configs -- --ignored`";
+
+    /// The committed mainnet genesis must encode 6-hour epochs and the epoch issuance that the
+    /// regeneration ceremony passes (issue #1512).
+    ///
+    /// The epoch duration sets the batch cache throughput ceiling, and the hardware
+    /// requirements are sized for 6-hour epochs. A committed file with 24-hour epochs gives a
+    /// ceiling 4 times lower than the documented one. The registry pays rewards once for each
+    /// epoch, so this gate pins the issuance together with the duration: a change to only one
+    /// of them changes the daily issuance.
+    ///
+    /// The gate reads the two `StakeConfig` slots from the compiled-in genesis, the same
+    /// storage the ceremony writes. If a tn-contracts storage layout change moves these slots,
+    /// the lookup returns `None` and the gate fails. Update the slot constants in that change.
+    #[test]
+    fn mainnet_genesis_encodes_the_six_hour_epoch_target() {
+        let genesis: Genesis = serde_yaml::from_str(MAINNET_GENESIS)
+            .expect("embedded mainnet genesis.yaml must deserialize");
+        let stake_config_word = |slot: &B256| {
+            genesis
+                .alloc
+                .get(&CONSENSUS_REGISTRY_ADDRESS)
+                .and_then(|account| account.storage.as_ref())
+                .and_then(|storage| storage.get(slot))
+                .map(|word| U256::from_be_bytes(word.0))
+        };
+
+        assert_eq!(
+            stake_config_word(&STAKE_CONFIG_EPOCH_DURATION_SLOT),
+            Some(U256::from(MAINNET_EPOCH_DURATION_SECS)),
+            "mainnet genesis must encode {MAINNET_EPOCH_DURATION_SECS} s epochs in the registry \
+             StakeConfig.epochDuration slot (issue #1512) - {MAINNET_REGENERATION_LEVER}"
+        );
+        // 25,806 TEL in wei fits in a U256, so the expected value is always `Some`
+        assert_eq!(
+            stake_config_word(&STAKE_CONFIG_EPOCH_ISSUANCE_SLOT),
+            U256::from(MAINNET_EPOCH_ISSUANCE_TEL).checked_mul(U256::from(WEI_PER_TEL)),
+            "mainnet genesis must encode {MAINNET_EPOCH_ISSUANCE_TEL} TEL for each epoch in the \
+             registry StakeConfig.epochIssuance slot (issue #1512) - {MAINNET_REGENERATION_LEVER}"
+        );
+    }
+
     /// Regenerate the committed `chain-configs/mainnet/{genesis,committee,parameters}.yaml`
     /// placeholders from the CURRENT tn-contracts artifacts (issue #1063).
     ///
-    /// WHEN to run: after a tn-contracts submodule/artifact bump, or whenever the tn-config
-    /// mainnet gates fail (`mainnet_genesis_registry_code_matches_current_artifact` /
-    /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config`, or
-    /// `test_mainnet_genesis_registry_serves_post_fork_reads` in `crates/tn-reth`).
+    /// WHEN to run: after a tn-contracts submodule/artifact bump, or whenever a mainnet gate
+    /// fails (`mainnet_genesis_registry_code_matches_current_artifact` /
+    /// `mainnet_chain_configs_load_via_the_node_paths` in `crates/config`,
+    /// `test_mainnet_genesis_registry_serves_post_fork_reads` in `crates/tn-reth`, or
+    /// `mainnet_genesis_encodes_the_six_hour_epoch_target` in this module).
     ///
     /// HOW to run: `cargo test -p telcoin-network-cli regenerate_mainnet_chain_configs --
     /// --ignored` then commit the three rewritten yaml files.
@@ -583,9 +663,12 @@ mod tests {
     /// - chain id 0x1e7 (487), unchanged from the committed genesis;
     /// - owner + dev-funded account [`MAINNET_PLACEHOLDER_OWNER`];
     /// - basefee address 0x99..99, preserving the committed parameters.yaml;
-    /// - epoch duration 86400s, decoded from the committed registry `StakeConfig` storage (stake
-    ///   amount / min withdrawal / epoch issuance stay on the clap defaults, which also match the
-    ///   committed storage: 1M TEL / 1k TEL / 25,806 TEL);
+    /// - epoch duration [`MAINNET_EPOCH_DURATION_SECS`] (21600s, the mainnet target of issue
+    ///   #1512). Do not decode this value from the committed file: that copied a stale 86400s into
+    ///   each regeneration;
+    /// - epoch issuance [`MAINNET_EPOCH_ISSUANCE_TEL`] (25,806 TEL), passed explicitly (stake
+    ///   amount / min withdrawal stay on the clap defaults, which also match the committed storage:
+    ///   1M TEL / 1k TEL);
     /// - 1s max/min header delays, preserving the committed parameters.yaml.
     ///
     /// The validator BLS/network keys are freshly minted placeholders by design: the
@@ -630,6 +713,8 @@ mod tests {
             .expect("copy node-info.yaml into the shared genesis dir");
         });
 
+        let epoch_duration = MAINNET_EPOCH_DURATION_SECS.to_string();
+        let epoch_issuance = MAINNET_EPOCH_ISSUANCE_TEL.to_string();
         let ceremony = CommandParser::<GenesisArgs>::parse_from([
             "tn",
             "--chain-id",
@@ -641,7 +726,9 @@ mod tests {
             "--basefee-address",
             "0x9999999999999999999999999999999999999999",
             "--epoch-duration-in-secs",
-            "86400",
+            epoch_duration.as_str(),
+            "--epoch-block-rewards",
+            epoch_issuance.as_str(),
             "--max-header-delay-ms",
             "1000",
             "--min-header-delay-ms",
