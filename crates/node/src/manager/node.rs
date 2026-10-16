@@ -902,19 +902,24 @@ where
         // Bind operator endpoints before any startup synchronization waits for peers.
         let (network_readiness_tx, network_readiness_rx) =
             watch::channel(NetworkReadiness::pending());
-        if let Some(port) = self.builder.healthcheck {
+        if let Some(bind) = self.builder.healthcheck {
             let engine = engine.clone();
+            let consensus_bus = self.consensus_bus.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
-                async move { engine.worker_readiness().await }
+                // Each probe reads the same live mode as RPC admission, so the gateway
+                // stops routing to a demoted validator (issue #1514).
+                let mode: tn_types::NodeMode = consensus_bus.current_node_mode().into();
+                async move { engine.worker_readiness(mode).await }
             };
-            let _ = HealthcheckServer::spawn(
+            // Propagate health bind errors: the operator requested this endpoint (#1689).
+            HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
-                port,
+                bind,
                 worker_ready,
                 network_readiness_rx,
             )
-            .await;
+            .await?;
         }
 
         // Propagate metrics bind errors because the operator requested this endpoint.

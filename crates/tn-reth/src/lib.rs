@@ -134,6 +134,7 @@ mod rpc_bundle;
 mod rpc_call;
 mod rpc_debug;
 mod rpc_fee_cap;
+pub use rpc_fee_cap::node_mode_accepts_submissions;
 mod rpc_fee_history;
 mod rpc_fill_transaction;
 mod rpc_gas_price;

@@ -26,8 +26,8 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, NodeMode, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -49,15 +49,14 @@ pub struct TnBuilder {
     ///
     /// The metrics will be served at the given interface and port.
     pub metrics: Option<SocketAddr>,
-    /// Optional TCP port to start healthcheck service.
-    /// If a port is provided, the healthcheck service will spawn. Otherwise, no healthcheck
-    /// service starts.
+    /// Optional healthcheck listener bind. `None` starts no listener.
     ///
-    /// IMPORTANT: only enable healthcheck if the endpoint is protected by a firewall. The
-    /// liveness route responds unconditionally; `/health/workers` reports transaction acceptance
-    /// and `/health/network` reports cached swarm reachability and established-peer counts,
-    /// returning 503 while not-ready. This reads from the `HEALTHCHECK_TCP_PORT` env var.
-    pub healthcheck: Option<u16>,
+    /// A bare port binds IPv4 loopback; an explicit socket address binds that interface (a
+    /// wildcard has to be written out). The liveness route responds unconditionally;
+    /// `/health/workers` reports transaction acceptance and `/health/network` reports cached
+    /// swarm reachability and established-peer counts, returning 503 while not-ready. Read from
+    /// `--healthcheck` / `HEALTHCHECK_TCP_PORT`. A bind failure fails node startup (#1689).
+    pub healthcheck: Option<crate::health::HealthcheckBind>,
     /// Export each epoch's final execution state to a snapshot pack when set.
     pub enable_state_export: bool,
     /// Maximum completed export bundles to retain, or unlimited when absent.
@@ -376,13 +375,14 @@ impl ExecutionNode {
     /// Snapshot initialized workers and their current epoch's accepting state.
     ///
     /// Removed workers remain visible with a false accepting flag. Active workers accept only
-    /// after their RPC listeners bind and until consensus shuts down their epoch.
-    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+    /// after their RPC listeners bind, until consensus shuts down their epoch, and only while
+    /// the node's `mode` admits submissions (issue #1514).
+    pub(crate) async fn worker_readiness(&self, mode: NodeMode) -> Vec<WorkerReadiness> {
         let engine = self.internal.read().await;
         self.worker_readiness
             .read()
             .await
-            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()))
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()), mode)
     }
 
     /// Start the worker's batch builder for the epoch.

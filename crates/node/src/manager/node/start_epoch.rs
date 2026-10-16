@@ -1518,7 +1518,7 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         assert_topics(2)?;
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, true),
@@ -1647,7 +1647,7 @@ mod tests {
         assert_topics(1)?;
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, false),
@@ -1728,7 +1728,7 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         assert_topics(2)?;
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, true),
@@ -1805,7 +1805,7 @@ mod tests {
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_005);
         regrow_config.shutdown().notify();
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, false),
                 crate::health::WorkerReadiness::new(1, false),
