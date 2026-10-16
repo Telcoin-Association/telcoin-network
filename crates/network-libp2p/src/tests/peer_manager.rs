@@ -2283,8 +2283,11 @@ async fn committee_convergence_tracks_resolution_and_rotation() {
         HashSet::from([stub, incoming]),
     );
     metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    // The debugging recorder drains every gauge when taking a snapshot.
+    let observations = std::cell::RefCell::new(snapshotter.snapshot().into_vec());
+    let refresh = || *observations.borrow_mut() = snapshotter.snapshot().into_vec();
     let gauge = |name: &str, slot: &str| {
-        snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+        observations.borrow().iter().find_map(|(key, _, _, value)| {
             (key.key().name() == name
                 && key.key().labels().count() == 2
                 && key.key().labels().any(|label| label.key() == "slot" && label.value() == slot))
@@ -2309,10 +2312,12 @@ async fn committee_convergence_tracks_resolution_and_rotation() {
     // Accepting verified metadata upgrades a stub without requiring a restart.
     manager.add_restored_peer(stub, stub_info);
     metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
     assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
     assert_eq!(manager.committee_rpc_snapshot().rpcs().len(), 2);
     manager.update_committees(HashSet::from([learned]), HashSet::from([incoming]), HashSet::new());
     metrics::with_local_recorder(&recorder, || manager.observe_committee_resolution(local));
+    refresh();
     assert_eq!(gauge("tn_network.committee_required_members", "current"), Some(1.0));
     assert_eq!(gauge("tn_network.committee_unresolved_members", "current"), Some(1.0));
     assert_eq!(gauge("tn_network.committee_required_members", "next"), Some(0.0));

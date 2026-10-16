@@ -1564,8 +1564,11 @@ mod tests {
         let rpc = test_rpc("https://validator.example.com:8545/")?;
         let second = test_rpc("https://second.example.com:8545/")?;
         let private = test_rpc("http://127.0.0.1:8545/")?;
+        // The debugging recorder drains every gauge; assertions share one state snapshot.
+        let observations = std::cell::RefCell::new(snapshotter.snapshot().into_vec());
+        let refresh = || *observations.borrow_mut() = snapshotter.snapshot().into_vec();
         let gauge = |name: &str, network: &str| {
-            snapshotter.snapshot().into_vec().into_iter().find_map(|(key, _, _, value)| {
+            observations.borrow().iter().find_map(|(key, _, _, value)| {
                 (key.key().name() == name
                     && key.key().labels().count() == 1
                     && key
@@ -1581,10 +1584,12 @@ mod tests {
         };
         metrics::with_local_recorder(&recorder, || {
             forwarder.clear_submit_coverage(0);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_observed_timestamp_seconds", "worker-0"), Some(0.0));
             // Cache an old URL, then omit it from the authoritative snapshot.
             forwarder.cached_providers(&[(departed, rpc.clone())]);
             forwarder.observe_submit_coverage(0, &members, &[], &[]);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             let advertised = [
                 (member, rpc.clone()),
@@ -1593,9 +1598,11 @@ mod tests {
                 (departed, rpc.clone()),
             ];
             forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(3.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
             other_worker.observe_submit_coverage(1, &HashSet::from([missing]), &[], &[]);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-1"), Some(1.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-1"), Some(0.0));
             forwarder
@@ -1603,24 +1610,29 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .demote_endpoint(second.http.as_str());
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
             // A refresh while demoted must retain enough consumer state to observe recovery.
             let advertised = [(member, second.clone())];
             forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             // Losing record freshness must not retire an endpoint's advertised cooldown.
             forwarder.observe_submit_coverage(0, &members, &[], &advertised);
             assert!(forwarder.cached_providers(&advertised).is_empty());
             forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             forwarder
                 .cache
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .recover_endpoint(second.http.as_str());
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(1.0));
             let advertised = [(member, rpc.clone()), (missing, rpc.clone()), (refused, rpc)];
             forwarder.observe_submit_coverage(0, &members, &advertised, &advertised);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(3.0));
             // Rotation removes departed identities even if their URL is supplied again.
             let advertised = [(member, second)];
@@ -1630,9 +1642,11 @@ mod tests {
                 &advertised,
                 &advertised,
             );
+            refresh();
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(1.0));
             assert_eq!(gauge("tn_worker_submit_usable_members", "worker-0"), Some(0.0));
             forwarder.clear_submit_coverage(0);
+            refresh();
             assert_eq!(gauge("tn_worker_submit_expected_members", "worker-0"), Some(0.0));
             assert_eq!(gauge("tn_worker_submit_observed_timestamp_seconds", "worker-0"), Some(0.0));
         });
