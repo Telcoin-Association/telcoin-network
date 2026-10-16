@@ -904,9 +904,13 @@ where
             watch::channel(NetworkReadiness::pending());
         if let Some(port) = self.builder.healthcheck {
             let engine = engine.clone();
+            let consensus_bus = self.consensus_bus.clone();
             let worker_ready = move || {
                 let engine = engine.clone();
-                async move { engine.worker_readiness().await }
+                // Each probe reads the same live mode as RPC admission, so the gateway
+                // stops routing to a demoted validator (issue #1514).
+                let mode: tn_types::NodeMode = consensus_bus.current_node_mode().into();
+                async move { engine.worker_readiness(mode).await }
             };
             let _ = HealthcheckServer::spawn(
                 node_task_manager.get_spawner(),
