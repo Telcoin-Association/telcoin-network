@@ -26,8 +26,8 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, NodeMode, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -376,13 +376,14 @@ impl ExecutionNode {
     /// Snapshot initialized workers and their current epoch's accepting state.
     ///
     /// Removed workers remain visible with a false accepting flag. Active workers accept only
-    /// after their RPC listeners bind and until consensus shuts down their epoch.
-    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+    /// after their RPC listeners bind, until consensus shuts down their epoch, and only while
+    /// the node's `mode` admits submissions (issue #1514).
+    pub(crate) async fn worker_readiness(&self, mode: NodeMode) -> Vec<WorkerReadiness> {
         let engine = self.internal.read().await;
         self.worker_readiness
             .read()
             .await
-            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()))
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()), mode)
     }
 
     /// Start the worker's batch builder for the epoch.
