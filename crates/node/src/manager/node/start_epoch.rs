@@ -114,9 +114,18 @@ where
         committee: Committee,
         to_engine: &mpsc::Sender<ConsensusOutput>,
     ) -> eyre::Result<ReplayResult> {
+        let executed =
+            state_sync::last_executed_consensus_block(&self.consensus_bus, &self.consensus_chain)
+                .await?
+                .unwrap_or_default();
+        // Repair a stale slot even if a previous recovery already executed the whole suffix
+        // and there is nothing left to replay, including across an epoch boundary.
+        self.consensus_chain.recover_latest_consensus_from_execution(&executed).await?;
         let missing =
             state_sync::get_missing_consensus(&self.consensus_bus, &self.consensus_chain).await?;
         let mut last_replayed_hash = None;
+        let mut epoch_close_hash = None;
+        let mut parent = executed;
         for consensus_header in missing.into_iter() {
             if consensus_header.sub_dag.leader_epoch() != committee.epoch() {
                 error!(target: "epoch-manager", "Crossed epoch boundary with missing execution! expected epoch {} got {}",
@@ -127,27 +136,43 @@ where
                     consensus_header.sub_dag.leader_epoch()
                 ));
             }
+            eyre::ensure!(
+                consensus_header.number == parent.number + 1
+                    && consensus_header.parent_hash == parent.digest(),
+                "restart replay is not contiguous: expected consensus {} following {}, got {}",
+                parent.number + 1,
+                parent.number,
+                consensus_header.number,
+            );
             let consensus_output =
                 self.consensus_chain.get_consensus_output_current(consensus_header.number).await?;
             let is_epoch_close = consensus_output.reaches_epoch_boundary(self.epoch_boundary);
             let output_hash = consensus_output.consensus_header_hash();
+            // Imported packs already contain these outputs but their saved marker can lag.
+            // The normal save path validates the stored epoch/digest before advancing it.
+            // Outputs saved before shutdown still need execution, without a non-monotonic save.
+            if consensus_header.number > self.consensus_chain.latest_consensus_number() {
+                self.consensus_chain.save_consensus_output(consensus_output.clone()).await?;
+            }
             if let Err(e) = self.process_output(to_engine, consensus_output).await {
                 error!(target: "epoch-manager", "error sending consensus output to engine: {}", e);
                 return Err(e);
             }
             self.metrics.replayed_outputs_total.increment(1);
             last_replayed_hash = Some(output_hash);
+            parent = consensus_header.clone();
             if is_epoch_close {
                 // stash the boundary header (digest-identical to `output_hash`) for the caller's
                 // close-and-write sequence
                 self.last_consensus_header = Some(consensus_header);
-                return Ok(ReplayResult {
-                    epoch_close_hash: Some(output_hash),
-                    last_replayed_hash,
-                });
+                epoch_close_hash = Some(output_hash);
+                break;
             }
         }
-        Ok(ReplayResult { epoch_close_hash: None, last_replayed_hash })
+        if last_replayed_hash.is_some() {
+            self.consensus_chain.persist_current().await?;
+        }
+        Ok(ReplayResult { epoch_close_hash, last_replayed_hash })
     }
 
     /// Derive the current [`Committee`] from state pinned to the previous epoch's closing block.
