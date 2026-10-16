@@ -5072,19 +5072,17 @@ thread_local! {
 }
 
 /// Aggregate budget on the DECODED footprint (`tx_count * size_of::<Vec<u8>>() + tx_bytes`) of all
-/// batches buffered for a single consensus output. `2x` the honest byte-content ceiling
+/// batches buffered for a single consensus output of `epoch`. `2x` the honest byte-content ceiling
 /// (`max_batches_per_output * max_batch_size`): an honest output's per-transaction `Vec` overhead
 /// is a small fraction of its bytes (real transactions are >= ~65 bytes), so this never rejects a
 /// legitimate output, while a crafted flood of tiny transactions — each within the per-batch byte
 /// cap but carrying 24 B of `Vec` overhead apiece — is rejected before it can exhaust memory.
-fn output_buffer_budget(committee: &Committee) -> usize {
+fn output_buffer_budget(committee: &Committee, epoch: Epoch) -> usize {
     #[cfg(test)]
     if let Some(limit) = TEST_OUTPUT_BUFFER_BUDGET.with(|c| c.get()) {
         return limit;
     }
-    max_batches_per_output(committee)
-        .saturating_mul(max_batch_size(committee.epoch()))
-        .saturating_mul(2)
+    max_batches_per_output(committee).saturating_mul(max_batch_size(epoch)).saturating_mul(2)
 }
 
 /// What the caller already knows about the consensus header of the output being decoded, used to
@@ -5321,15 +5319,21 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // An authenticated header (Digest) or a verified parent link (Parent) bounds everything that
     // follows to the batches the header declares; a wrong/forged header is rejected here.
     check_header_expectation(&consensus_header, expectation)?;
-    // The committee decodes the output (its batch bound, its authors). One of another epoch, as
-    // when the caller's epoch record lags the output, is the caller's state, not the sender's.
+    // The committee decodes the output: its size bounds the batches, and each certificate author's
+    // execution address comes from it. A committee of another epoch, as when the caller's epoch
+    // record lags the output (a node catching up walks back from the next epoch before it has that
+    // epoch's record), still decodes it: an author's execution address is its registry key in
+    // every epoch. The per-batch size limit is the output's own epoch's. A failure that comes from
+    // the committee (an author it lacks, a bound sized for it) is then the caller's state, not the
+    // sender's, so it is a local `LocalEpochMismatch`, never charged to the sender.
     let output_epoch = consensus_header.sub_dag.leader_epoch();
-    if output_epoch != committee.epoch() {
-        return Err(PackError::LocalEpochMismatch {
-            local: committee.epoch(),
-            found: output_epoch,
-        });
-    }
+    let from_committee = |error: PackError| {
+        if output_epoch == committee.epoch() {
+            error
+        } else {
+            PackError::LocalEpochMismatch { local: committee.epoch(), found: output_epoch }
+        }
+    };
     let parent_hash = consensus_header.parent_hash;
     let deliver = consensus_header.sub_dag;
     let num_blocks = deliver.num_primary_batches();
@@ -5356,7 +5360,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // any batches.  A legitimate ConsensusOutput references far fewer batches than this.
     let max_batches = max_batches_per_output(committee);
     if expected_digest_count > max_batches {
-        return Err(PackError::TooManyBatches(max_batches));
+        return Err(from_committee(PackError::TooManyBatches(max_batches)));
     }
     let mut expected_batch_digests = expected_batch_digests.into_iter();
 
@@ -5368,7 +5372,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
     // honest output's overhead is a small fraction of its bytes (real transactions are >= ~65
     // bytes) — so this never rejects a legitimate output while bounding the
     // crafted-tiny-transaction case.
-    let output_buffer_limit = output_buffer_budget(committee);
+    let output_buffer_limit = output_buffer_budget(committee, output_epoch);
     let mut buffered_decoded = 0usize;
     // Load and verify batches.  Batches are matched positionally against `expected_batch_digests`
     // (sorted digest order): producers write them in `BTreeMap`/`BTreeSet` digest order (see
@@ -5400,7 +5404,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                 // oversized batches inflate `available_batches` ~16x (finding #10 OOM). Rejecting
                 // before the insert keeps only batches within the limit buffered.
                 let batch_bytes = batch.transactions.iter().map(|tx| tx.len()).sum::<usize>();
-                let max = max_batch_size(committee.epoch());
+                let max = max_batch_size(output_epoch);
                 if batch_bytes > max {
                     return Err(PackError::BatchTooLarge { size: batch_bytes, max });
                 }
@@ -5413,10 +5417,10 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
                     .saturating_add(batch_bytes);
                 buffered_decoded = buffered_decoded.saturating_add(batch_decoded);
                 if buffered_decoded > output_buffer_limit {
-                    return Err(PackError::OutputTooLarge {
+                    return Err(from_committee(PackError::OutputTooLarge {
                         size: buffered_decoded,
                         max: output_buffer_limit,
-                    });
+                    }));
                 }
                 referenced_batches.insert(digest);
                 available_batches.insert(digest, batch);
@@ -5479,7 +5483,7 @@ async fn iter_to_output<R: AsyncRead + Unpin>(
             // main collection for execution
             batches.push(CertifiedBatch { address, batches: cert_batches });
         } else {
-            return Err(PackError::MissingAuthority);
+            return Err(from_committee(PackError::MissingAuthority));
         }
     }
     Ok(ConsensusOutput::new(
@@ -5618,9 +5622,10 @@ pub enum PackError {
     /// A certificate author is not present in the pack's committee.
     MissingAuthority,
     /// The local state an output or a pack was checked with belongs to another epoch: a committee
-    /// of epoch `local` given an output of epoch `found`, or the record of epoch `local` given as
-    /// the one before epoch `found`. The caller's state is behind or mismatched (for example an
-    /// epoch record that lags the output), so this is never charged to the sender.
+    /// of epoch `local` that cannot decode an output of epoch `found` (it lacks an author, or a
+    /// bound sized for it is too small), or the record of epoch `local` given as the one before
+    /// epoch `found`. The caller's state is behind or mismatched (for example an epoch record that
+    /// lags the output), so this is never charged to the sender.
     LocalEpochMismatch {
         /// The epoch of the caller's committee or previous-epoch record.
         local: Epoch,
@@ -7216,12 +7221,14 @@ pub(crate) mod test {
         .expect("the output decodes within the real budget");
     }
 
-    /// The committee decodes an output (its batch bound, its certificate authors), so a committee
-    /// of another epoch than the output's must not: that is the caller's state lagging the output
-    /// (for example its epoch record), a local `LocalEpochMismatch` never charged to the sender,
-    /// rather than an honest peer's bytes misjudged.
+    /// A node catching up walks back from the next epoch before it has that epoch's record, so it
+    /// decodes a next-epoch output with its own epoch's committee. That must decode: an author's
+    /// execution address is the same in every epoch, so the output equals the one decoded with the
+    /// output's own committee. A failure that comes from the lagging committee (here an author it
+    /// lacks) is the caller's state, a local `LocalEpochMismatch` never charged to the sender,
+    /// while the same failure with the output's own committee stays the sender's.
     #[tokio::test]
-    async fn test_iter_to_output_refuses_another_epochs_committee() {
+    async fn test_iter_to_output_decodes_with_a_lagging_committee() {
         use crate::consensus_pack::{bytes_to_output, PackError};
         use std::io::Cursor;
 
@@ -7229,33 +7236,73 @@ pub(crate) mod test {
         let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
         let fixture = CommitteeFixture::builder(MemDatabase::default).build();
         let committee = fixture.committee();
+        let next_committee = committee.advance_epoch_for_test(committee.epoch() + 1);
         let batch = tn_reth::test_utils::batches(chain, 1).pop().expect("one batch");
-        let member = committee.authorities().first().expect("committee has authorities").id();
-        let mut leader = leader_with_batches(&committee, member, std::slice::from_ref(&batch));
-        leader.update_header_epoch_for_test(committee.epoch() + 1);
-        let header = header_with_leader(leader);
-        let path = temp_dir.path().join("next_epoch_output");
-        let len = {
+        // One output's records, header first, as a peer streams them.
+        let records = |name: &str, author, epoch| {
+            let mut leader = leader_with_batches(&committee, author, std::slice::from_ref(&batch));
+            leader.update_header_epoch_for_test(epoch);
+            let path = temp_dir.path().join(name);
             let mut pack: Pack<PackRecord> =
                 Pack::open(&path, 0, false, PackCompression::ZStd, PACK_VERSION)
                     .expect("open pack");
-            pack.append(&PackRecord::Consensus(Box::new(header))).expect("append header");
-            pack.append(&PackRecord::Batch(batch)).expect("append batch");
+            pack.append(&PackRecord::Consensus(Box::new(header_with_leader(leader))))
+                .expect("append header");
+            pack.append(&PackRecord::Batch(batch.clone())).expect("append batch");
             pack.commit().expect("commit");
-            pack.file_len() as usize
+            let len = pack.file_len() as usize;
+            drop(pack);
+            std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..len].to_vec()
         };
-        let bytes = std::fs::read(&path).expect("read file")[DATA_HEADER_BYTES..len].to_vec();
+        let decode = |bytes: Vec<u8>, committee: Committee| async move {
+            bytes_to_output(
+                Cursor::new(bytes),
+                PackCompression::ZStd,
+                Duration::from_secs(5),
+                &committee,
+            )
+            .await
+        };
+        let summary = |output: &ConsensusOutput| {
+            let batches = output
+                .batches()
+                .iter()
+                .map(|certified| {
+                    (
+                        certified.address,
+                        certified.batches.iter().map(Batch::digest).collect::<Vec<_>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            (output.consensus_header_hash(), batches)
+        };
 
-        let res = bytes_to_output(
-            Cursor::new(bytes),
-            PackCompression::ZStd,
-            Duration::from_secs(5),
-            &committee,
+        let member = committee.authorities().first().expect("committee has authorities").id();
+        let next = records("member", member.clone(), committee.epoch() + 1);
+        let lagging = decode(next.clone(), committee.clone())
+            .await
+            .expect("a next-epoch output decodes with the lagging committee");
+        let own = decode(next, next_committee.clone()).await.expect("and with its own committee");
+        assert_eq!(summary(&lagging), summary(&own), "both committees decode the same output");
+        assert_eq!(lagging.batches().len(), 1, "the output's one certified batch is decoded");
+
+        // An author outside the lagging committee: a local mismatch, not the sender's fault.
+        let other = CommitteeFixture::builder(MemDatabase::default).build();
+        let stranger = other.committee().authorities().first().expect("authorities").id();
+        let res = decode(
+            records("stranger_next", stranger.clone(), committee.epoch() + 1),
+            committee.clone(),
         )
         .await;
         assert!(
             matches!(res, Err(PackError::LocalEpochMismatch { local: 0, found: 1 })),
             "expected LocalEpochMismatch, got {res:?}"
+        );
+        let res =
+            decode(records("stranger_own", stranger, committee.epoch()), committee.clone()).await;
+        assert!(
+            matches!(res, Err(PackError::MissingAuthority)),
+            "with the output's own committee a missing author is the sender's: got {res:?}"
         );
     }
 
