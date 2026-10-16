@@ -98,7 +98,7 @@ jobs:
               ("crates/tn-reth/src/forward.rs", "tn-reth",
                "committee_convergence_submit_coverage",
                "self.cached_providers(&current_advertisements)",
-               "self.cached_providers(&current_rpcs)"),
+               "self.cached_providers(if current_rpcs.is_empty() { &current_rpcs } else { &current_advertisements })"),
           ]
           for filename, package, test, original, mutation in mutants:
               path = Path(filename)
