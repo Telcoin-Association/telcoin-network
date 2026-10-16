@@ -240,11 +240,26 @@ impl std::fmt::Debug for Shared {
     }
 }
 
+/// Whether a save must carry every batch its output's sub-dag declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DeclaredBatches {
+    /// Exactly the declared batches: replay expects their records after the header.
+    Required,
+    /// Test fixtures only: an output carrying no batches at all is saved without them (a fixture's
+    /// committed sub-dag whose batches never existed). The pack can then not be replayed past it.
+    #[cfg(any(test, feature = "test-utils"))]
+    MayBeAbsent,
+}
+
 impl Shared {
     /// Save `consensus`: checked under the read lock ([`Inner::check_save`]), encoded under the
     /// writer lock alone, then appended and indexed under the write lock
     /// ([`Inner::append_prepared`]).
-    fn save(&self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
+    fn save(
+        &self,
+        consensus: &ConsensusOutput,
+        declared: DeclaredBatches,
+    ) -> Result<u64, PackError> {
         let mut encoder = self.writer.lock();
         #[cfg(test)]
         let started = std::time::Instant::now();
@@ -257,7 +272,7 @@ impl Shared {
                 drop(guard);
                 return self.mutate(|inner| inner.save_consensus_output(consensus));
             }
-            inner.check_save(consensus)?
+            inner.check_save(consensus, declared)?
         };
         let (consensus_idx, batches) = match check {
             SaveCheck::Saved(bytes) => return Ok(bytes),
@@ -1185,7 +1200,17 @@ impl ConsensusPack {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<u64, PackError> {
-        self.write(move |shared| shared.save(&consensus)).await
+        self.write(move |shared| shared.save(&consensus, DeclaredBatches::Required)).await
+    }
+
+    /// Test fixtures only: [`Self::save_consensus_output`] for an output that carries none of the
+    /// batches its sub-dag declares (see [`DeclaredBatches::MayBeAbsent`]).
+    #[cfg(any(test, feature = "test-utils"))]
+    pub(crate) async fn save_consensus_output_without_its_batches(
+        &self,
+        consensus: ConsensusOutput,
+    ) -> Result<u64, PackError> {
+        self.write(move |shared| shared.save(&consensus, DeclaredBatches::MayBeAbsent)).await
     }
 
     /// Load and return the consensus output form this epoch.
@@ -1221,7 +1246,7 @@ impl ConsensusPack {
     /// by [`Self::get_consensus_output_bytes`]) into a [`ConsensusOutput`] using this pack's
     /// committee and compression. The committee resolves each certificate author to an execution
     /// address, so the pack must be for the same epoch as the bytes. It checks the header against
-    /// nothing, so bytes from a peer go through [`Self::decode_output_stream`] instead, which
+    /// nothing, so bytes from a peer go through [`Self::output_stream_decoder`] instead, which
     /// verifies the header's digest first.
     #[cfg(all(test, feature = "adiri"))]
     pub(crate) async fn decode_output(&self, bytes: Vec<u8>) -> Result<ConsensusOutput, PackError> {
@@ -1230,27 +1255,11 @@ impl ConsensusPack {
         bytes_to_output(reader, self.compression, Duration::from_secs(5), &self.committee).await
     }
 
-    /// Stream-decode a v1 (header-first) pack-encoded [`ConsensusOutput`] from `reader`, verifying
-    /// the header's digest equals `expected_digest` the instant the header record is read — BEFORE
-    /// any batch record is buffered. Used on the requested-output receive path so an unverified
-    /// peer stream cannot force buffering/decoding more than a single ≤`MAX_RECORD_SIZE` header
-    /// record before the known hash is checked. Uses this pack's committee (author -> execution
-    /// address) and compression, so the pack must be for the same epoch as the stream. Each record
-    /// must arrive within `record_timeout`.
-    pub async fn decode_output_stream<R: AsyncRead + Unpin>(
-        &self,
-        reader: R,
-        expected_digest: ConsensusHeaderDigest,
-        record_timeout: Duration,
-    ) -> Result<ConsensusOutput, PackError> {
-        bytes_to_verified_output(
-            reader,
-            self.compression,
-            record_timeout,
-            &self.committee,
-            expected_digest,
-        )
-        .await
+    /// A decoder of output streams for this pack's epoch (its committee and compression), holding
+    /// no handle on the pack: a decode waits on a peer's stream, and a handle held meanwhile would
+    /// keep the epoch's handoff from sealing the pack (see [`OutputStreamDecoder`]).
+    pub fn output_stream_decoder(&self) -> OutputStreamDecoder {
+        OutputStreamDecoder { committee: self.committee.clone(), compression: self.compression }
     }
 
     /// Load and return the pack file bytes for consensus output form this epoch.
@@ -4177,10 +4186,11 @@ impl Inner {
     /// encoding outside the write lock.
     #[cfg(test)]
     fn save_consensus_output(&mut self, consensus: &ConsensusOutput) -> Result<u64, PackError> {
-        let (consensus_idx, batches) = match self.check_save(consensus)? {
-            SaveCheck::Saved(bytes) => return Ok(bytes),
-            SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
-        };
+        let (consensus_idx, batches) =
+            match self.check_save(consensus, DeclaredBatches::Required)? {
+                SaveCheck::Saved(bytes) => return Ok(bytes),
+                SaveCheck::Next { consensus_idx, batches } => (consensus_idx, batches),
+            };
         if self.version() == 0 {
             let data_start = self.data.file_len();
             let pos_idx_start = self.consensus_pos_idx.len();
@@ -4198,7 +4208,11 @@ impl Inner {
     /// next output (its index in this pack, and its batches by digest), or an error (the wrong
     /// epoch or number, a different output under a stored number, or a batch set that does not
     /// match its sub-dag). Writes nothing.
-    fn check_save(&self, consensus: &ConsensusOutput) -> Result<SaveCheck, PackError> {
+    fn check_save(
+        &self,
+        consensus: &ConsensusOutput,
+        declared: DeclaredBatches,
+    ) -> Result<SaveCheck, PackError> {
         let consensus_number = consensus.number();
         // Adjusted consensus index for this pack file.
         let consensus_idx = consensus_number.saturating_sub(self.epoch_meta.start_consensus_number);
@@ -4244,14 +4258,17 @@ impl Inner {
             ));
         }
         // The pack stores exactly the batches the output's sub-dag declares, and recovery replays
-        // each output expecting exactly those batch records: an output carrying a partial or
-        // extra batch set would be written fine but make the pack unrecoverable after the next
-        // unclean shutdown. Refuse it before anything is written. An output carrying NO batches is
-        // exempt: production only builds one for a sub-dag with no payload (the subscriber
-        // fetches every declared batch otherwise), while test fixtures save committed sub-dags
-        // whose batches do not exist through `ConsensusChain::write_subdag_for_test`.
+        // each output expecting exactly those batch records: an output carrying a partial, extra
+        // or missing batch set would be written fine but make the pack unrecoverable after the
+        // next unclean shutdown. Refuse it before anything is written. Only a test fixture may
+        // save a committed sub-dag whose batches never existed (`DeclaredBatches::MayBeAbsent`).
         let batches = collect_batches(consensus);
-        if !batches.is_empty() {
+        let checked = match declared {
+            DeclaredBatches::Required => true,
+            #[cfg(any(test, feature = "test-utils"))]
+            DeclaredBatches::MayBeAbsent => !batches.is_empty(),
+        };
+        if checked {
             let declared = sub_dag_batch_digests(consensus.sub_dag());
             if declared.iter().any(|digest| !batches.contains_key(digest)) {
                 return Err(PackError::MissingBatches);
@@ -5162,6 +5179,39 @@ pub async fn bytes_to_output<R: AsyncRead + Unpin>(
             .await
             .map_err(|e| PackError::ReadError(e.to_string()))?;
     iter_to_output(&mut stream_iter, timeout, committee, HeaderExpectation::None).await
+}
+
+/// Decodes output streams for one epoch: what [`ConsensusPack::output_stream_decoder`] takes from a
+/// pack, without the pack.
+#[derive(Clone, Debug)]
+pub struct OutputStreamDecoder {
+    committee: Committee,
+    compression: PackCompression,
+}
+
+impl OutputStreamDecoder {
+    /// Stream-decode a v1 (header-first) pack-encoded [`ConsensusOutput`] from `reader`, verifying
+    /// the header's digest equals `expected_digest` the instant the header record is read — BEFORE
+    /// any batch record is buffered. Used on the requested-output receive path so an unverified
+    /// peer stream cannot force buffering/decoding more than a single ≤`MAX_RECORD_SIZE` header
+    /// record before the known hash is checked. Uses the epoch's committee (author -> execution
+    /// address) and compression, so the stream must be of the same epoch. Each record must arrive
+    /// within `record_timeout`.
+    pub async fn decode_output_stream<R: AsyncRead + Unpin>(
+        &self,
+        reader: R,
+        expected_digest: ConsensusHeaderDigest,
+        record_timeout: Duration,
+    ) -> Result<ConsensusOutput, PackError> {
+        bytes_to_verified_output(
+            reader,
+            self.compression,
+            record_timeout,
+            &self.committee,
+            expected_digest,
+        )
+        .await
+    }
 }
 
 /// Take an async (v1, header-first) stream of pack-encoded ConsensusOutput bytes and return the
@@ -9724,7 +9774,7 @@ pub(crate) mod test {
 
     /// An output whose batches are not exactly the set its sub-dag declares would be written but
     /// make the pack unrecoverable (replay expects exactly the declared batch records), so it is
-    /// refused before anything is written.
+    /// refused before anything is written: a partial set, an extra batch, or none at all.
     #[tokio::test]
     async fn test_save_refuses_an_output_whose_batches_do_not_match_its_sub_dag() {
         let temp_dir = TempDir::with_prefix("test_save_batch_set").expect("temp dir");
@@ -9768,6 +9818,18 @@ pub(crate) mod test {
             .await
             .expect_err("an extra batch must be refused");
         assert!(matches!(err, super::PackError::ExtraBatches), "extra: {err:?}");
+
+        // A sub-dag declaring batches with none of them carried is no exception.
+        let none = ConsensusOutput::new(
+            full.sub_dag().clone(),
+            parent,
+            1,
+            false,
+            full.batch_digests().clone(),
+            Vec::new(),
+        );
+        let err = pack.save_consensus_output(none).await.expect_err("no batches carried");
+        assert!(matches!(err, super::PackError::MissingBatches), "none: {err:?}");
 
         assert_eq!(pack.data_file_len().await.expect("len"), len_before, "nothing was written");
         partial.push(dropped);

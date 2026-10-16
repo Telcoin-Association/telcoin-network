@@ -48,7 +48,8 @@ use tracing::{error, warn};
 use crate::{
     archive::data_file::{fsync_directory, fsync_file},
     consensus_pack::{
-        install_dir_rename_aside, pack_unsealed_version, ConsensusPack, PackError, DATA_NAME,
+        install_dir_rename_aside, pack_unsealed_version, ConsensusPack, DeclaredBatches, PackError,
+        DATA_NAME,
     },
     epoch_records::{EpochDbError, EpochRecordDb},
 };
@@ -1180,6 +1181,16 @@ impl ConsensusChain {
         &self,
         consensus: ConsensusOutput,
     ) -> Result<u64, ConsensusChainError> {
+        self.save_output(consensus, DeclaredBatches::Required).await
+    }
+
+    /// [`Self::save_consensus_output`], with `declared` saying whether the output must carry the
+    /// batches its sub-dag declares (always, but for a test fixture).
+    async fn save_output(
+        &self,
+        consensus: ConsensusOutput,
+        declared: DeclaredBatches,
+    ) -> Result<u64, ConsensusChainError> {
         let number = consensus.number();
         let latest = self.latest_consensus.number();
         let epoch = consensus.sub_dag().leader_epoch();
@@ -1203,7 +1214,13 @@ impl ConsensusChain {
             // If this an open pack file then save.
             // Note, saving an output that is already in the pack is a no-op, not an error
             // so this is fine.
-            let output_bytes = pack.save_consensus_output(consensus).await?;
+            let output_bytes = match declared {
+                DeclaredBatches::Required => pack.save_consensus_output(consensus).await?,
+                #[cfg(any(test, feature = "test-utils"))]
+                DeclaredBatches::MayBeAbsent => {
+                    pack.save_consensus_output_without_its_batches(consensus).await?
+                }
+            };
             self.latest_consensus.update(epoch, number).await;
             Ok(output_bytes)
         } else if !pack.contains_consensus_header_number(number).await.unwrap_or_default() {
@@ -1409,20 +1426,22 @@ impl ConsensusChain {
         expected_hash: ConsensusHeaderDigest,
         record_timeout: Duration,
     ) -> Result<ConsensusOutput, ConsensusChainError> {
-        if let Some(pack) = self.current_pack_for(epoch) {
-            return Ok(pack.decode_output_stream(reader, expected_hash, record_timeout).await?);
-        }
-        if let Ok(pack) = self.get_static(epoch).await {
-            Ok(pack.decode_output_stream(reader, expected_hash, record_timeout).await?)
-        } else if let Some(staging) = self.staging() {
-            if epoch == staging.pack.epoch() {
-                Ok(staging.pack.decode_output_stream(reader, expected_hash, record_timeout).await?)
-            } else {
-                Err(ConsensusChainError::NoCurrentEpoch)
-            }
+        // Only the epoch's committee and compression are needed: every pack handle is dropped
+        // before the stream is read, since a peer can keep a decode waiting, and a handle held on
+        // the live pack would keep the handoff from sealing it.
+        let decoder = if let Some(pack) = self.current_pack_for(epoch) {
+            pack.output_stream_decoder()
+        } else if let Ok(pack) = self.get_static(epoch).await {
+            pack.output_stream_decoder()
         } else {
-            Err(ConsensusChainError::NoCurrentEpoch)
-        }
+            match self.staging() {
+                Some(staging) if epoch == staging.pack.epoch() => {
+                    staging.pack.output_stream_decoder()
+                }
+                _ => return Err(ConsensusChainError::NoCurrentEpoch),
+            }
+        };
+        Ok(decoder.decode_output_stream(reader, expected_hash, record_timeout).await?)
     }
 
     /// True if the consensus chain contains a pack or partial pack for epoch.
@@ -1757,6 +1776,10 @@ impl ConsensusChain {
     /// This uses garbage parent hash and number and is ONLY for testing.
     /// As a test only function this will panic if unable to write the sub dag
     /// to the consensus chain
+    ///
+    /// The sub-dag's batches are not saved (a fixture's never existed), which only a test may do:
+    /// the pack cannot be replayed past such an output.
+    #[cfg(any(test, feature = "test-utils"))]
     pub async fn write_subdag_for_test(&self, number: u64, sub_dag: CommittedSubDag) {
         let output = ConsensusOutput::new(
             sub_dag,
@@ -1766,7 +1789,7 @@ impl ConsensusChain {
             VecDeque::new(),
             Vec::new(),
         );
-        self.save_consensus_output(output)
+        self.save_output(output, DeclaredBatches::MayBeAbsent)
             .await
             .expect("error saving a consensus output to persistant storage!");
     }
@@ -4034,6 +4057,59 @@ mod test {
         assert!(!reading.is_finished(), "the read waits out the in-flight install");
         drop(install);
         assert!(!reading.await.expect("read task"), "this node holds no epoch 5");
+    }
+
+    /// A stream decode of the CURRENT epoch stalled on its peer's stream holds no handle on the
+    /// live pack either: it takes what the decode needs (the committee, the compression) and
+    /// lets go of the pack before it reads the stream, so the next handoff seals the pack at
+    /// once instead of waiting out `HANDOFF_SEAL_GRACE`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_a_stalled_decode_of_the_current_epoch_does_not_hold_up_the_handoff() {
+        let temp_dir = TempDir::with_prefix("test_handoff_current_decode").expect("temp dir");
+        let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+        let chain: Arc<RethChainSpec> = Arc::new(test_genesis().into());
+        let committee = fixture.committee();
+        let (consensus_chain, record0, _) =
+            chain_with_epoch0_outputs(&temp_dir, &committee, &chain).await;
+        consensus_chain.persist_current().await.unwrap();
+        let committee1 = committee.advance_epoch_for_test(1);
+        consensus_chain.new_epoch(record0.clone(), committee1.clone()).await.unwrap();
+
+        // A stream decode of the current epoch (1) whose peer stream stalls before its first byte.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let decoding = tokio::spawn({
+            let consensus_chain = consensus_chain.clone();
+            async move {
+                consensus_chain
+                    .stream_decode_consensus_output(
+                        1,
+                        StalledStream { started: Some(started_tx) },
+                        ConsensusHeaderDigest::default(),
+                        Duration::from_secs(60),
+                    )
+                    .await
+            }
+        });
+        started_rx.await.expect("the decode reads its stream");
+        assert!(
+            consensus_chain.current_pack.lock().is_sole_handle(),
+            "a stalled decode of the current epoch must hold no clone of the live pack"
+        );
+        let record1 = EpochRecord {
+            epoch: 1,
+            committee: committee1.bls_keys().iter().copied().collect(),
+            next_committee: committee1.bls_keys().iter().copied().collect(),
+            parent_hash: record0.digest(),
+            ..Default::default()
+        };
+        let handoff = std::time::Instant::now();
+        consensus_chain.new_epoch(record1, committee.advance_epoch_for_test(2)).await.unwrap();
+        let handoff = handoff.elapsed();
+        assert!(
+            handoff < ConsensusChain::HANDOFF_SEAL_GRACE,
+            "the handoff must not wait for a stalled decode of the epoch it seals: took {handoff:?}"
+        );
+        decoding.abort();
     }
 
     /// The handoff's seal of the previous epoch reports whether that epoch's data log ended up
