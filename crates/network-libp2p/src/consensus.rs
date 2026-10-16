@@ -14,6 +14,7 @@ use crate::{
     quic_incoming::QuicIncomingLimits,
     record_exchange::{RecordCodec, RecordExchange, RecordResponse},
     send_or_log_error,
+    serve_permits::ServePermits,
     service_class::{InboundOccupancy, ServiceClass},
     stream::{StreamBehavior, StreamEvent},
     types::{
@@ -520,6 +521,8 @@ where
     record_retry_interval: Duration,
     /// Prometheus metrics for swarm-level events (gossip, requests).
     metrics: SwarmMetrics,
+    /// The application's per-class serve permits, shared with every handle of this swarm.
+    serve_permits: ServePermits,
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
     /// refuses.
     inbound_denial_warning: InboundDenialWarning,
@@ -842,14 +845,18 @@ where
             ),
             record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
+            serve_permits: ServePermits::new(&network_type, network_config.serve_budget()),
             inbound_denial_warning: InboundDenialWarning::default(),
             quic_incoming,
         })
     }
 
     /// Return a [NetworkHandle] to send commands to this network.
+    ///
+    /// The handle shares this swarm's serve permits, so every request handler offers inbound
+    /// requests to the same per-class budget.
     pub fn network_handle(&self) -> NetworkHandle<Req, Res> {
-        NetworkHandle::new(self.handle.clone())
+        NetworkHandle::new(self.handle.clone()).with_serve_permits(self.serve_permits.clone())
     }
 
     /// Attach the process-wide source budget before starting the swarm.
