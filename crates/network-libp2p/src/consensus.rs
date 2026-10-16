@@ -1480,6 +1480,9 @@ where
                     .map_err(|error| NetworkError::StoreKademliaRecord(error.to_string()));
                 // Authoritative membership and identity confirmation must not depend on a
                 // capacity rejection or a failed database deletion during retention cleanup.
+                // the peer manager has no BLS key; both networks key members by the primary key
+                let local_member = current.contains(&self.key_config.primary_public_key());
+                self.swarm.behaviour_mut().peer_manager.set_local_committee_member(local_member);
                 self.swarm.behaviour_mut().peer_manager.update_committees(previous, current, next);
                 self.refresh_explicit_peers();
                 self.query_missing_required_records();

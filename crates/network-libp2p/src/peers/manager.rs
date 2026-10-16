@@ -272,6 +272,11 @@ pub(crate) struct PeerManager {
     /// These peers are not connected and reserved for dial attempts at heartbeat intervals if
     /// connections drop.
     discovery_peers: HashMap<PeerId, Vec<Multiaddr>>,
+    /// Whether this node's own BLS key sits in the current committee slot.
+    ///
+    /// The manager knows only the local [PeerId], so the swarm loop sets this on every committee
+    /// update; it lowers the expected committee peer count by one for a member.
+    local_in_current_committee: bool,
     /// Per-source inbound kad `PutRecord` rate windows.
     ///
     /// Bounds the expensive BLS verify plus kad store write in `process_kad_put_request` to
@@ -370,6 +375,7 @@ impl PeerManager {
             dial_requests: Default::default(),
             temporarily_banned,
             discovery_peers: Default::default(),
+            local_in_current_committee: false,
             put_record_windows: Default::default(),
             add_provider_windows: Default::default(),
             metrics,
@@ -704,6 +710,7 @@ impl PeerManager {
             self.discovery_peers.len(),
             banned_count,
         );
+        self.record_committee_connectivity();
 
         // enforce connection limits
         self.prune_connected_peers();
@@ -1190,6 +1197,7 @@ impl PeerManager {
         // neither pinned nor a current committee member so rotated-out members and stale discovered
         // records cannot accumulate across epochs (issue #827).
         self.prune_known_peers();
+        self.record_committee_connectivity();
     }
 
     /// Pre-dial recovery: forgive bans for a committee so a subsequent dial loop can connect,
@@ -1201,6 +1209,24 @@ impl PeerManager {
         self.forgive_temporarily_banned(&committee);
         let unban_actions = self.peers.mark_committee_for_dial(committee);
         self.apply_unban_actions(unban_actions);
+    }
+
+    /// Record whether this node is a member of the current committee.
+    ///
+    /// Called by the swarm loop before [`Self::update_committees`], because the manager has no
+    /// BLS key of its own.
+    pub(crate) fn set_local_committee_member(&mut self, member: bool) {
+        self.local_in_current_committee = member;
+    }
+
+    /// Write the committee connectivity gauges from the current committee slot.
+    ///
+    /// Expected peers exclude this node when it is a member; all three gauges stay zero until a
+    /// committee is known.
+    fn record_committee_connectivity(&self) {
+        let (size, connected) = self.peers.current_committee_connectivity();
+        let expected = size.saturating_sub(usize::from(self.local_in_current_committee));
+        self.metrics.set_committee_connectivity(size, expected, connected);
     }
 
     /// Drop cached network info for peers no longer worth tracking, bounding `known_peers`.

@@ -1,0 +1,116 @@
+# Host network pressure and committee connectivity rules (issue #1688).
+#
+# Every expression carries a job matcher; the dashboard adds instance and
+# network template variables on top. Every alert names its severity, an
+# operator action and the runbook section that explains it. The thresholds are
+# launch defaults; the runbook explains how to re-derive them from the
+# recording rules. Unit tests: telcoin-host-network.test.yaml.
+groups:
+  - name: telcoin-host-network
+    rules:
+      # Baselines for threshold selection.
+      - record: tn_host:firewall_drop_packets:rate5m
+        expr: sum by (job, instance) (rate(tn_host_firewall_rule_packets_total{job="node",rule=~"drop_.*"}[5m]))
+      - record: tn_host:udp_rcvbuf_errors:rate5m
+        expr: sum by (job, instance) (rate({__name__=~"node_netstat_Udp6?_RcvbufErrors",job="node"}[5m]))
+      - record: tn_host:conntrack_occupancy:ratio
+        expr: (node_nf_conntrack_entries{job="node"} / node_nf_conntrack_entries_limit{job="node"}) and on (instance) tn_host_conntrack_mode{job="node",mode="tracked"} == 1
+      - record: tn_network:committee_coverage:ratio
+        expr: (tn_network_committee_peers_connected{job="telcoin-node"} / tn_network_committee_peers_expected{job="telcoin-node"}) and tn_network_committee_peers_expected{job="telcoin-node"} > 0
+
+      # Exporter and collector state: a missing signal is an alert, not a zero.
+      - alert: TnHostExporterDown
+        expr: up{job="node"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "node_exporter on {{ $labels.instance }} is down"
+          description: "Prometheus has not scraped node_exporter on {{ $labels.instance }} for 2 minutes. Every host series of this instance is absent; treat the host as unobserved, not as healthy."
+          action: "Restart the node-exporter service or container, confirm the 127.0.0.1:9100 bind and the Prometheus scrape target, then watch the exporter and collector state panel."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#exporter-and-collector-state
+      - alert: TnHostCollectorAbsent
+        expr: up{job="node"} == 1 unless on (instance) node_textfile_mtime_seconds{job="node",file="tn_host_network.prom"}
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "host network collector absent on {{ $labels.instance }}"
+          description: "node_exporter on {{ $labels.instance }} answers but has no tn_host_network.prom textfile. Firewall, conntrack and UDP buffer series are absent; the dashboard shows collector-absent, not zero."
+          action: "Install etc/host-metrics/tn-host-network.sh, enable tn-host-network.timer and check that node_exporter runs with --collector.textfile.directory pointing at the same directory."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#exporter-and-collector-state
+      - alert: TnHostCollectorStale
+        expr: time() - node_textfile_mtime_seconds{job="node",file="tn_host_network.prom"} > 120
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "host network collector stale on {{ $labels.instance }}"
+          description: "tn_host_network.prom on {{ $labels.instance }} is older than 120 seconds. The timer writes it every 15 seconds; the host series are frozen at their last value."
+          action: "Run systemctl status tn-host-network.timer and journalctl -u tn-host-network.service on the host and fix the failing collector run (nft, jq or permissions)."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#exporter-and-collector-state
+
+      # Host pressure.
+      - alert: TnHostFirewallDropsRising
+        expr: increase(tn_host_firewall_rule_packets_total{job="node",rule=~"drop_.*"}[5m]) > 100
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "firewall drops rising on {{ $labels.instance }} (rule {{ $labels.rule }})"
+          description: "Named nft counter {{ $labels.rule }} on {{ $labels.instance }} dropped more than 100 packets in 5 minutes for 5 minutes. Counter resets are absorbed by increase()."
+          action: "Compare the drop rate with the QUIC Retry and inbound request panels. A rise that matches committee connectivity loss means a peer is blocked; a rise with stable connectivity is a scan or flood that the firewall absorbs."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#firewall-drops
+      - alert: TnHostUdpRcvbufErrors
+        expr: increase(node_netstat_Udp_RcvbufErrors{job="node"}[5m]) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "UDP receive buffer errors on {{ $labels.instance }}"
+          description: "The kernel on {{ $labels.instance }} dropped UDP datagrams because a socket receive buffer was full, for 10 minutes. The QUIC listener loses packets before the node sees them."
+          action: "Check tn_host_udp_rmem_max_bytes against the buffer the node requests, raise net.core.rmem_max and net.core.rmem_default if the node hits the ceiling, and look for CPU starvation of the node process."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#udp-receive-buffer-errors
+      - alert: TnHostConntrackHigh
+        expr: (node_nf_conntrack_entries{job="node"} / node_nf_conntrack_entries_limit{job="node"}) > 0.8 and on (instance) tn_host_conntrack_mode{job="node",mode="tracked"} == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "conntrack table above 80% on {{ $labels.instance }}"
+          description: "nf_conntrack_entries on {{ $labels.instance }} is above 80% of nf_conntrack_max for 5 minutes while the host tracks connections. At 100% the kernel drops new flows, including consensus traffic."
+          action: "Raise net.netfilter.nf_conntrack_max, add a notrack rule for the primary and worker UDP ports, or block the source of the flow churn at the edge."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#conntrack-occupancy
+      - alert: TnHostConntrackUnsupported
+        expr: tn_host_conntrack_mode{job="node",mode="unsupported"} == 1 or node_scrape_collector_success{job="node",collector="conntrack"} == 0
+        for: 15m
+        labels:
+          severity: info
+        annotations:
+          summary: "conntrack occupancy unobserved on {{ $labels.instance }}"
+          description: "{{ $labels.instance }} reports no conntrack limit or its node_exporter conntrack collector fails. Conntrack occupancy is unknown, not zero."
+          action: "Load the nf_conntrack module or enable the node_exporter conntrack collector; if the host intentionally runs without conntrack, document it and silence this alert for the instance."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#conntrack-occupancy
+
+      # Committee connectivity. expected > 0 is the restart guard: the gauges are
+      # 0 until the node knows its first committee.
+      - alert: TnCommitteeConnectivityDegraded
+        expr: tn_network_committee_peers_expected{job="telcoin-node"} > 0 and (tn_network_committee_peers_expected{job="telcoin-node"} - tn_network_committee_peers_connected{job="telcoin-node"}) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "committee connectivity degraded on {{ $labels.instance }} ({{ $labels.network }})"
+          description: "{{ $labels.instance }} has fewer connected current-committee peers than expected on the {{ $labels.network }} network for 5 minutes. Unrelated peers do not count."
+          action: "Identify the missing committee members from their own connectivity gauges, check the firewall drop and QUIC Retry panels on both sides, and confirm the address set in the current manifest."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#committee-connectivity
+      - alert: TnCommitteeConnectivityLost
+        expr: tn_network_committee_peers_expected{job="telcoin-node"} > 0 and tn_network_committee_peers_connected{job="telcoin-node"} * 3 < tn_network_committee_peers_expected{job="telcoin-node"} * 2
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "committee connectivity lost on {{ $labels.instance }} ({{ $labels.network }})"
+          description: "{{ $labels.instance }} reaches less than two thirds of the expected current-committee peers on the {{ $labels.network }} network for 2 minutes. Quorum from this node is at risk."
+          action: "Treat as an incident: check host firewall drops, conntrack and UDP errors on this host, confirm the node's advertised addresses, and fail over to a sentry path if the private network is impaired."
+          runbook_url: https://github.com/Telcoin-Association/telcoin-network/blob/main/docs/src/getting-started/host-network-observability.md#committee-connectivity
