@@ -7,7 +7,7 @@ use crate::{
     error::NetworkError,
     kad::{node_record_key, KadStore},
     metrics::{
-        ConnectionLimitReason, InboundDenial, InboundFailureOutcome, PeerManagerMetrics,
+        ConnectionLimitReason, InboundFailureOutcome, InboundRejection, PeerManagerMetrics,
         SwarmMetrics,
     },
     peers::{self, LoadPenalty, PeerEvent, PeerManager, Penalty, PutRecordRate},
@@ -249,6 +249,39 @@ impl InboundDenialWarning {
         self.denied = self.denied.saturating_add(1);
         (now.saturating_duration_since(window_start) >= INBOUND_DENIAL_WARN_INTERVAL)
             .then(|| std::mem::take(self).denied)
+    }
+}
+
+/// Minimum time between two `error` logs about listener errors (see [`ListenerErrorLog`]).
+const LISTENER_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Rate limit for the `error` log about `SwarmEvent::ListenerError`.
+///
+/// Every listener error is counted in the `tn_network.listener_errors_total` metric. The first
+/// error logs at once. Later errors within [`LISTENER_ERROR_LOG_INTERVAL`] of the last log are
+/// suppressed, and the next log carries the number of errors suppressed since the last log.
+#[derive(Debug, Default)]
+struct ListenerErrorLog {
+    /// When the last log fired, or `None` before the first error.
+    last: Option<tokio::time::Instant>,
+    /// The number of errors suppressed since the last log.
+    suppressed: u64,
+}
+
+impl ListenerErrorLog {
+    /// Count one error at `now`. Return the number of errors suppressed since the last log when
+    /// a log is due, and `None` when this error is suppressed.
+    fn record(&mut self, now: tokio::time::Instant) -> Option<u64> {
+        if self
+            .last
+            .is_none_or(|last| now.saturating_duration_since(last) >= LISTENER_ERROR_LOG_INTERVAL)
+        {
+            self.last = Some(now);
+            Some(std::mem::take(&mut self.suppressed))
+        } else {
+            self.suppressed = self.suppressed.saturating_add(1);
+            None
+        }
     }
 }
 
@@ -523,6 +556,8 @@ where
     /// Rate limit for the warning about inbound connections that a `connection_limits` bound
     /// refuses.
     inbound_denial_warning: InboundDenialWarning,
+    /// Rate limit for the `error` log about listener errors.
+    listener_error_log: ListenerErrorLog,
     /// Decision counters of this swarm's QUIC listener (Retry, Accept, Refuse, Ignore,
     /// budget yields), mirrored into [`SwarmMetrics`] once per event-loop iteration.
     quic_incoming: std::sync::Arc<libp2p::quic::IncomingStats>,
@@ -849,6 +884,7 @@ where
             record_retry_interval,
             metrics: SwarmMetrics::new_for(&network_type).with_capacity(&quic_config, budget),
             inbound_denial_warning: InboundDenialWarning::default(),
+            listener_error_log: ListenerErrorLog::default(),
             quic_incoming,
         })
     }
@@ -1129,16 +1165,26 @@ where
                 );
             }
             SwarmEvent::ListenerError { listener_id, error } => {
-                // log listener errors
-                error!(
-                    target: "network",
-                    ?listener_id,
-                    ?error,
-                    "listener error"
+                // count every listener error by class; log the first at once, then at most one
+                // per interval with the number of errors suppressed since the last log
+                let reason = self.metrics.record_listener_error(&error);
+                self.listener_error_log.record(tokio::time::Instant::now()).into_iter().for_each(
+                    |suppressed| {
+                        error!(
+                            target: "network",
+                            ?listener_id,
+                            ?error,
+                            reason = reason.label(),
+                            suppressed,
+                            window = ?LISTENER_ERROR_LOG_INTERVAL,
+                            "listener error"
+                        );
+                    },
                 );
             }
             SwarmEvent::ListenerClosed { addresses, reason, .. } => {
-                // log errors
+                // count every close by outcome, then log errors
+                self.metrics.record_listener_closed(&reason);
                 if let Err(e) = reason {
                     error!(target: "network", ?e, "listener unexpectedly closed");
                 }
@@ -1149,35 +1195,28 @@ where
                     return Err(NetworkError::AllListenersClosed);
                 }
             }
-            // an inbound connection refused by a `connection_limits` bound (the pending inbound
-            // ceiling, the per-peer established ceiling or the total established ceiling); count
-            // it by the bound that the refusal names, and log only the configured limit and the
-            // fixed limit description, never peer-supplied data
+            // an inbound connection that a behaviour refused; count it once by its terminal
+            // reason and stage, never by peer-supplied data. A `connection_limits` refusal (the
+            // pending inbound ceiling, the per-peer established ceiling or the total established
+            // ceiling) also counts by bound and feeds the rate-limited warning
             SwarmEvent::IncomingConnectionError {
                 error: libp2p::swarm::ListenError::Denied { cause },
                 ..
             } => {
-                cause.downcast_ref::<connection_limits::Exceeded>().into_iter().for_each(
-                    |exceeded| {
-                        // classify by the refusal text, not by the peer id: both established
-                        // ceilings refuse after authentication, so a peer id cannot tell them apart
-                        let reason = ConnectionLimitReason::from_exceeded(exceeded);
-                        self.metrics.record_connection_limit_rejection(reason);
-                        let denial = InboundDenial::from_reason(reason);
-                        self.metrics.record_inbound_denied(&denial);
-                        self.inbound_denial_warning
-                            .record(tokio::time::Instant::now())
-                            .into_iter()
-                            .for_each(|denied| {
-                                warn!(
-                                    target: "network",
-                                    denied,
-                                    window = ?INBOUND_DENIAL_WARN_INTERVAL,
-                                    "inbound connections keep being refused by connection limits"
-                                );
-                            });
-                    },
-                );
+                let rejection = self.metrics.record_inbound_rejection(&cause);
+                if matches!(rejection, InboundRejection::Limit(_)) {
+                    self.inbound_denial_warning
+                        .record(tokio::time::Instant::now())
+                        .into_iter()
+                        .for_each(|denied| {
+                            warn!(
+                                target: "network",
+                                denied,
+                                window = ?INBOUND_DENIAL_WARN_INTERVAL,
+                                "inbound connections keep being refused by connection limits"
+                            );
+                        });
+                }
             }
             SwarmEvent::OutgoingConnectionError {
                 error: libp2p::swarm::DialError::Denied { cause },

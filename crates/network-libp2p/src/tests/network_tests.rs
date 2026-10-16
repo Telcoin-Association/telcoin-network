@@ -5496,3 +5496,31 @@ fn inbound_denial_warning_fires_only_when_refusals_persist() {
         "refusals that persist for a second window fire the warning again"
     );
 }
+
+/// The listener error log fires for the first error at once, suppresses errors inside the interval
+/// and reports the suppressed count with the first error after the interval.
+#[test]
+fn listener_error_log_suppresses_errors_inside_the_interval() {
+    let start = tokio::time::Instant::now();
+    let interval = LISTENER_ERROR_LOG_INTERVAL;
+    let mut log = ListenerErrorLog::default();
+
+    assert_eq!(log.record(start), Some(0), "the first error logs at once");
+    assert_eq!(
+        log.record(start + interval / 2),
+        None,
+        "an error inside the interval is suppressed"
+    );
+    assert_eq!(log.record(start + interval * 3 / 4), None, "a second error is suppressed too");
+    assert_eq!(
+        log.record(start + interval),
+        Some(2),
+        "the first error after the interval logs with the suppressed count"
+    );
+    assert_eq!(log.record(start + interval), None, "the log restarts the interval");
+    assert_eq!(
+        log.record(start + interval * 2),
+        Some(1),
+        "the next log carries only the errors suppressed since the last log"
+    );
+}
