@@ -11,6 +11,7 @@ use super::common::{
     RPC_REQUEST_TIMEOUT,
 };
 use alloy::{
+    eips::BlockNumberOrTag,
     primitives::{utils::parse_ether, Bytes},
     providers::{Provider, ProviderBuilder},
     sol_types::SolCall,
