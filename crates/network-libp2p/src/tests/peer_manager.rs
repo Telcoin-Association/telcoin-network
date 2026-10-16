@@ -3016,9 +3016,9 @@ async fn test_self_id_filtered_from_discovery() {
 
     // our own id is not eligible; a normal peer is
     assert!(!peer_manager
-        .eligible_for_discovery(&PeerInfo { peer_id: local, addrs: vec![addr.clone()] }));
+        .eligible_for_discovery(&PeerInfo { peer_id: local, addrs: vec![addr.clone()] }, None));
     assert!(peer_manager
-        .eligible_for_discovery(&PeerInfo { peer_id: other, addrs: vec![addr.clone()] }));
+        .eligible_for_discovery(&PeerInfo { peer_id: other, addrs: vec![addr.clone()] }, None));
 
     // feeding self + a normal peer through the discovery sink registers only the
     // normal peer
