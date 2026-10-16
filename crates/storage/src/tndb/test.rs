@@ -1657,8 +1657,62 @@ fn damage_index_below_the_root(gen: &Path) {
     assert!(damaged > 0, "an index with pages below its root");
 }
 
-/// A removal whose key the index cannot read (a damaged page) fails: counted as "absent", it
-/// would write nothing, and the row would silently survive its removal.
+/// An index damaged at rest below its root (its open-time walk reaches a damaged page) is
+/// refused at open and rebuilt from the log: every row reads back and a removal works.
+#[test]
+fn test_tndb_damaged_index_is_rebuilt_at_open() {
+    let tmp = TempDir::with_prefix("tndb_rebuild_damaged").expect("temp dir");
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        for i in 0..2_000_u64 {
+            db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
+        }
+    }
+    damage_index_below_the_root(&tmp.path().join("gen-0"));
+    let db = open(tmp.path(), CommitMode::Group);
+    assert_eq!(db.iter::<TestTable>().count(), 2_000, "every row, through the rebuilt index");
+    assert_eq!(db.get::<TestTable>(&1_000).expect("get"), Some("v1000".to_string()));
+    db.remove::<TestTable>(&1_000).expect("a removal through the rebuilt index");
+    assert_eq!(db.get::<TestTable>(&1_000).expect("get"), None);
+}
+
+/// Zero the CRC trailer of every leaf of each index in generation directory `gen` but the
+/// leftmost: damage the open-time walk (internal pages and the leftmost leaf) does not reach, so
+/// the open trusts the index and the damage is met by the reads and writes that reach it.
+fn damage_index_leaves_past_the_first(gen: &Path) {
+    use crate::archive::btree_index::{
+        header::BtreeHeader,
+        page::{Node, PAGE_SIZE},
+    };
+    let mut damaged = 0;
+    for entry in std::fs::read_dir(gen).expect("read gen").flatten() {
+        if !entry.file_name().to_string_lossy().starts_with("idx-") {
+            continue;
+        }
+        let file = entry.path().join("index.btx");
+        let mut bytes = std::fs::read(&file).expect("read index");
+        let header = BtreeHeader::from_page(&bytes[..PAGE_SIZE]).expect("index header");
+        let node = Node::new(header.ksize as usize);
+        let page = |p: u32| p as usize * PAGE_SIZE..(p as usize + 1) * PAGE_SIZE;
+        let mut leftmost = header.root_page;
+        for _ in 1..header.height {
+            leftmost = node.internal_child(&bytes[page(leftmost)], 0);
+        }
+        for p in (1..header.page_count).filter(|&p| p != leftmost) {
+            if node.is_leaf(&bytes[page(p)]) {
+                let end = page(p).end;
+                bytes[end - 4..end].fill(0);
+                damaged += 1;
+            }
+        }
+        std::fs::write(&file, bytes).expect("write index");
+    }
+    assert!(damaged > 0, "an index with leaves past its first");
+}
+
+/// A removal whose key the index cannot read (a damaged page the open trusted) fails: counted as
+/// "absent", it would write nothing, and the row would silently survive its removal. The damage
+/// is latched, so the next open rebuilds the index, and the row is still there.
 #[test]
 fn test_tndb_remove_through_a_damaged_index_fails() {
     let tmp = TempDir::with_prefix("tndb_remove_damaged").expect("temp dir");
@@ -1668,11 +1722,15 @@ fn test_tndb_remove_through_a_damaged_index_fails() {
             db.insert::<TestTable>(&i, &format!("v{i}")).expect("insert");
         }
     }
-    // Closed cleanly: the next open trusts the index.
-    damage_index_below_the_root(&tmp.path().join("gen-0"));
+    damage_index_leaves_past_the_first(&tmp.path().join("gen-0"));
+    {
+        let db = open(tmp.path(), CommitMode::Group);
+        let removed = db.remove::<TestTable>(&1_000);
+        assert!(removed.is_err(), "a removal through a damaged index: {removed:?}");
+    }
     let db = open(tmp.path(), CommitMode::Group);
-    let removed = db.remove::<TestTable>(&1_000);
-    assert!(removed.is_err(), "a removal through a damaged index: {removed:?}");
+    assert_eq!(db.get::<TestTable>(&1_000).expect("get"), Some("v1000".to_string()));
+    assert_eq!(db.iter::<TestTable>().count(), 2_000, "the rebuilt index holds every row");
 }
 
 /// Creating a database's first generation is atomic: a failure (or a crash) once its directory

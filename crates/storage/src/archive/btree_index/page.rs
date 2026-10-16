@@ -167,6 +167,16 @@ impl Node {
         &buf[off..off + self.ksize]
     }
 
+    /// True if every key of the leaf `buf` lies in `[lo, hi)`, the range the separators on the
+    /// way down give it (`None`: unbounded). Keys within a leaf are sorted, so the first and last
+    /// decide it.
+    pub(crate) fn leaf_in_range(&self, buf: &[u8], lo: Option<&[u8]>, hi: Option<&[u8]>) -> bool {
+        let n = self.entry_count(buf);
+        n == 0
+            || (lo.is_none_or(|lo| self.leaf_key(buf, 0) >= lo)
+                && hi.is_none_or(|hi| self.leaf_key(buf, n - 1) < hi))
+    }
+
     fn set_leaf_key(&self, buf: &mut [u8], i: usize, key: &[u8]) {
         let off = LEAF_KEYS_OFF + i * self.ksize;
         buf[off..off + self.ksize].copy_from_slice(key);
@@ -299,7 +309,9 @@ impl Node {
         write_u32(buf, INTERNAL_CHILDREN_OFF + i * 4, v);
     }
 
-    fn internal_key<'a>(&self, buf: &'a [u8], i: usize) -> &'a [u8] {
+    /// The separator at internal key slot `i`: child `i` holds keys below it, child `i + 1` keys
+    /// from it up.
+    pub(crate) fn internal_key<'a>(&self, buf: &'a [u8], i: usize) -> &'a [u8] {
         let off = self.internal_keys_off + i * self.ksize;
         &buf[off..off + self.ksize]
     }

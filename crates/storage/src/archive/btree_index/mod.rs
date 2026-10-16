@@ -15,5 +15,8 @@ pub(crate) mod page;
 pub mod index;
 pub mod iter;
 
+#[cfg(test)]
+mod model_test;
+
 pub use index::{BtreeIndex, PageCrcReport};
 pub use iter::BtreeIter;

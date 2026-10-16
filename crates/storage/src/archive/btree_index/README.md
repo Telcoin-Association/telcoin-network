@@ -199,8 +199,9 @@ grow until it is dropped.
 
 **Reopen.** The free list lives in memory. On a clean, writable reopen `unreachable_pages` walks
 the tree from the root (checking each internal page's CRC, child bounds and that no page is reached
-twice) and frees every page it does not reach. Any walk failure frees nothing: a page that might be
-live is never reused, and the damage surfaces on the lookups that reach it.
+twice) and frees every page it does not reach. A walk failure fails the open
+(`LoadHeaderError::CorruptIndex`), so the owner rebuilds: a page that might be live is never
+reused, and a damaged pointer never misroutes a lookup into the next session.
 
 ---
 
@@ -241,14 +242,21 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   private.
 - **Publish/sync** stamps exactly the private pages (O(pages written), never a full scan). A page
   zeroed *at rest* is never re-stamped as valid, because it is not in the private set.
-- **Reads do not recompute the full CRC**, but three cheap checks turn damage into
+- **Reads do not recompute the full CRC**, but cheap checks turn damage into
   `FetchError::CorruptIndex` instead of a wrong answer or a panic:
   - the page number must be inside the tree (`1 ≤ p < page_count`);
   - an all-zero trailer is only legal on a page this handle wrote since its last publish. On a
     published snapshot every page must be stamped;
   - the page's tag must be a node's (`Node::tag_ok`): a leaf or internal type, with no more entries
     than that type holds. Every slot access is bounded by the entry count, so a page with a damaged
-    count or type cannot be read outside its 4 KiB.
+    count or type cannot be read outside its 4 KiB;
+  - the leaf a lookup or a scan reaches must be at the tree's height, with its first and last keys
+    inside the range its ancestors' separators give it. A child pointer damaged so that it names
+    another valid page is then `CorruptIndex`, not a `NotFound` for a key that exists or a scan
+    that repeats one leaf and skips another. That is two key comparisons per lookup.
+
+  Damage these checks don't see (a flipped key or value bit inside a leaf) is found by
+  `page_crc_scan()`, or by a write's copy-on-write check.
 - **Writes into a damaged page are refused.** `page_mut` runs the same checks. Copy-on-write
   (`make_writable`) also verifies the source page's full CRC before copying a page read from disk
   (one this handle did not stamp), so a publish or sync never stamps at-rest damage as valid. A
@@ -256,10 +264,21 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   every copy, under the write lock (about 5% of a write-heavy round). The cost of skipping it is
   one case: a page this process wrote, evicted by the OS and then re-read from a silently
   damaged sector.
+- **Pages whose child pointers decide what is live** are CRC-checked when read from disk: the
+  open-time walk checks every internal page, and `clear`, which retires the old tree through its
+  child pointers, checks each internal page this handle neither wrote nor stamped (as does
+  `collapse_root` for the child it promotes). A damaged pointer there could otherwise hand a live
+  page to the free list.
+- **Damage found is latched.** Every `CorruptIndex` a read or write finds poisons the index file:
+  `is_poisoned()` turns true, `sync()` is refused, and the file is never sealed as clean again, so
+  the next open finds it unclean and the owner rebuilds it. A snapshot doesn't hold the file, so it
+  sets a flag the writer checks (in `is_poisoned()`, `sync()` and `Drop`). tndb stops the database
+  on a poisoned index after a failed batch; damage found only by reads is healed at the next open.
 - **`page_crc_scan()`** is the off-path full check: it classifies every data page as valid, dirty
   (unsynced writes: rebuild from the log) or corrupt (genuine on-disk corruption), in a
   `PageCrcReport { dirty, corrupt }`.
-- **Open** checks the header CRC, and on a cleanly sealed file the root page's full CRC.
+- **Open** checks the header CRC, on a cleanly sealed file the root page's full CRC, and on a clean
+  writable open the walk above.
 
 ---
 
@@ -268,9 +287,11 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
 `sync()` (also run by `Drop` when the index has unsynced changes) commits **pages first, header
 last**:
 
-1. `publish_pages()`: CRC-stamp the private pages.
-2. `msync` the whole file (`MmapDataFile::sync_all`).
-3. Rewrite page 0 from the in-memory header (root, height, page count, key count,
+1. Refuse a poisoned file before anything is published, so a failed sync leaves the published
+   state (what `revert_to_published` restores) where it was.
+2. `publish_pages()`: CRC-stamp the private pages.
+3. `msync` the whole file (`MmapDataFile::sync_all`).
+4. Rewrite page 0 from the in-memory header (root, height, page count, key count,
    `data_file_length`, `owner_value`), then `msync` just that page (`sync_range(0, 4096)`).
 
 So a durable header never names pages that did not reach disk with it.
@@ -316,7 +337,9 @@ BtreeIndex::open_btx_file(dir, data_header: &DataHeader, ksize: u16, read_only: 
    - when writable, trailing bytes past `page_count` are trimmed (not recovery: an unclean index
      stays unclean);
    - on a cleanly sealed file, the root page's CRC must be valid (`CrcFailed`).
-6. Publish the tree as opened to the reader view; on a clean writable reopen, recover the free list.
+6. Publish the tree as opened to the reader view; on a clean writable reopen, walk the tree and
+   recover the free list. A walk failure (an internal page failing its CRC, a bad or repeated
+   child pointer, a height that does not reach the leaves) fails the open (`CorruptIndex`).
 
 A pack wrapper treats any rejection (except an `IO` error, which it surfaces) as "rebuild from the
 log".
@@ -332,12 +355,15 @@ this contract with the owner:
 1. **Never trust an unclean index.** `opened_unclean()` is true when the file had no valid
    clean-close sentinel. Such an index may lag its log or hold unstamped pages.
 2. **Rebuild from the log.** Replay the data log to the live `(key, position)` set and call
-   `rebuild_from(entries)` (or discard the directory and create a fresh index).
+   `rebuild_from(entries)` (or discard the directory and create a fresh index). A `rebuild_from`
+   that fails part way poisons the file, so the partial tree is never sealed; it also resets
+   `data_file_length` to 0, which the owner sets for the rebuilt tree.
 3. **Record coverage, sync and mark consistent:** `set_data_file_length(log_len)`, `sync()`, then
    `mark_consistent()`, so the next clean close seals the file and the next open skips the rebuild.
    An index that is never marked consistent rebuilds on every open.
 4. **Also rebuild** when the index fails to open, or when `data_file_length()` differs from the log's
-   length (the index lags the log).
+   length (the index lags the log). An index that found damage is never sealed again (see the CRC
+   regime), so it reopens unclean.
 
 `tndb::store`'s `Core::open` / `recover` is the reference implementation of this contract.
 
@@ -392,10 +418,10 @@ Public (`pub`) unless marked crate-internal.
 
 | type | from | notable variants |
 |---|---|---|
-| `LoadHeaderError` | `open_btx_file` | `IO`, `CrcFailed`, `InvalidType`, `InvalidIndexVersion`, `InvalidIndexUID`, `InvalidIndexAppNum`, `InvalidIndexGeometry` (geometry mismatch, implausible header, or a short file), `ReadOnlyEmpty` |
-| `FetchError` | reads | `NotFound` (a miss, not an error condition), `KeySize { expected, got }` (a key that is not `ksize` bytes), `CorruptIndex(msg)` (out-of-tree page, zero-CRC page not written by this handle, depth exceeded, bad walk), `IO`, `CrcFailed` |
+| `LoadHeaderError` | `open_btx_file` | `IO`, `CrcFailed`, `InvalidType`, `InvalidIndexVersion`, `InvalidIndexUID`, `InvalidIndexAppNum`, `InvalidIndexGeometry` (geometry mismatch, implausible header, or a short file), `CorruptIndex(msg)` (a clean writable open's walk failed), `ReadOnlyEmpty` |
+| `FetchError` | reads | `NotFound` (a miss, not an error condition), `KeySize { expected, got }` (a key that is not `ksize` bytes), `CorruptIndex(msg)` (out-of-tree page, zero-CRC page not written by this handle, impossible tag, a leaf off its height or outside its separators, depth exceeded, bad walk; latched), `IO`, `CrcFailed` |
 | `AppendError` | writes | `ReadOnly`, `KeySize { expected, got }`, `CorruptIndex`, `CrcError`, `WriteDataError(io)` (a failed growth also poisons the file, so it is never sealed; a failed split changes nothing) |
-| `CommitError` | `sync` | `ReadOnly`, `IndexFileSync(io)` |
+| `CommitError` | `sync` | `ReadOnly`, `IndexFileSync(io)` (including a poisoned file, refused before publishing) |
 
 ---
 

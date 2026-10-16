@@ -109,7 +109,9 @@ copy) checks that the record an index entry points at is a put of that table and
 (`record::put_value`), so a damaged position is `CorruptIndex`, not another row's value; a scan
 ends there (logged), and a compaction abandons rather than copy it. A removal whose key the index
 cannot read fails the batch (nothing written) rather than counting the key absent, which would
-leave the row in place.
+leave the row in place. The index latches any damage it finds (its file is poisoned): a failed
+batch on it stops the database, and the next open rebuilds it from the log. An index whose
+open-time walk fails is refused at open and rebuilt the same way.
 
 A scan holds the database core, so its files stay open while the scan lives, even after every
 handle has dropped. The database's `LOCK` is the core's last field, so it is released only once the

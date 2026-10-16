@@ -25,8 +25,13 @@ pub(crate) trait PageSource {
     fn node(&self) -> Node;
     /// The tree's root page.
     fn root(&self) -> u32;
+    /// The tree's height (1 = a single leaf): every leaf lies this many pages down from the root.
+    fn height(&self) -> u32;
     /// Borrow page `p` (bounds- and corruption-checked by the source).
     fn page(&self, p: u32) -> Result<&[u8], FetchError>;
+    /// Record damage at rest found while reading this source, and return the error to report. The
+    /// index latches it: it is never sealed as clean again, so its owner rebuilds it.
+    fn damaged(&self, what: String) -> FetchError;
 }
 
 /// The position of a sorted scan over a B-tree: the path from the root to the current leaf, as
@@ -45,9 +50,7 @@ pub(crate) struct BtreeCursor {
 }
 
 /// The tree is deeper than [`MAX_DEPTH`] or a child pointer loops: corruption, not a miss.
-fn too_deep() -> FetchError {
-    FetchError::CorruptIndex("btree descent exceeded max depth".to_string())
-}
+const TOO_DEEP: &str = "btree descent exceeded max depth";
 
 impl BtreeCursor {
     /// Position a cursor at the first entry, in scan order, within the bounds.
@@ -62,12 +65,52 @@ impl BtreeCursor {
         Ok(cursor)
     }
 
-    fn push(&mut self, page: u32, slot: usize) -> Result<(), FetchError> {
+    fn push<S: PageSource + ?Sized>(
+        &mut self,
+        src: &S,
+        page: u32,
+        slot: usize,
+    ) -> Result<(), FetchError> {
         if self.depth == MAX_DEPTH {
-            return Err(too_deep());
+            return Err(src.damaged(TOO_DEEP.to_string()));
         }
         self.path[self.depth] = (page, slot);
         self.depth += 1;
+        Ok(())
+    }
+
+    /// The leaf `leaf` just pushed must be where the tree says: at the tree's height, with its keys
+    /// inside the range its ancestors' separators give it. A child pointer damaged at rest that
+    /// leads to another valid page fails here, rather than the scan yielding that page's entries.
+    fn check_leaf<S: PageSource + ?Sized>(&self, src: &S, leaf: &[u8]) -> Result<(), FetchError> {
+        let node = src.node();
+        if self.depth != src.height() as usize {
+            return Err(src.damaged(format!(
+                "a leaf at depth {} of a tree of height {} (at-rest corruption)",
+                self.depth,
+                src.height()
+            )));
+        }
+        // The nearest ancestor with a separator on each side bounds the leaf most tightly.
+        let (mut lo, mut hi) = (None, None);
+        for &(p, ci) in self.path[..self.depth - 1].iter().rev() {
+            if lo.is_some() && hi.is_some() {
+                break;
+            }
+            let buf = src.page(p)?;
+            if lo.is_none() && ci > 0 {
+                lo = Some(node.internal_key(buf, ci - 1));
+            }
+            if hi.is_none() && ci < node.entry_count(buf) {
+                hi = Some(node.internal_key(buf, ci));
+            }
+        }
+        if !node.leaf_in_range(leaf, lo, hi) {
+            let p = self.path[self.depth - 1].0;
+            return Err(src.damaged(format!(
+                "leaf {p} holds keys outside its parents' separators (at-rest corruption)"
+            )));
+        }
         Ok(())
     }
 
@@ -109,7 +152,8 @@ impl BtreeCursor {
                         },
                     }
                 };
-                return self.push(p, slot);
+                self.push(src, p, slot)?;
+                return self.check_leaf(src, buf);
             }
             let ci = match &bound {
                 Some(k) => node.internal_child_index(buf, k),
@@ -117,7 +161,7 @@ impl BtreeCursor {
                 None => 0,
             };
             let child = node.internal_child(buf, ci);
-            self.push(p, ci)?;
+            self.push(src, p, ci)?;
             p = child;
         }
     }
@@ -133,11 +177,12 @@ impl BtreeCursor {
             let buf = src.page(p)?;
             let n = node.entry_count(buf);
             if node.is_leaf(buf) {
-                return self.push(p, if self.reverse { n } else { 0 });
+                self.push(src, p, if self.reverse { n } else { 0 })?;
+                return self.check_leaf(src, buf);
             }
             let ci = if self.reverse { n } else { 0 };
             let child = node.internal_child(buf, ci);
-            self.push(p, ci)?;
+            self.push(src, p, ci)?;
             p = child;
         }
     }
@@ -193,6 +238,15 @@ impl BtreeCursor {
             }
             let (leaf, slot) = self.path[self.depth - 1];
             let buf = src.page(leaf)?;
+            // The leaf was checked when it was pushed, and a source's pages don't change, so this
+            // fails only for a cursor read from a source it was not positioned in (a misuse, not
+            // damage, so nothing is latched), where the bottom page need not be a leaf.
+            if !node.is_leaf(buf) {
+                return Err(FetchError::CorruptIndex(format!(
+                    "page {leaf} at the bottom of a scan is not a leaf (a cursor read from another \
+                     source?)"
+                )));
+            }
             let n = node.entry_count(buf);
             let i = if self.reverse { slot.checked_sub(1) } else { (slot < n).then_some(slot) };
             let Some(i) = i.filter(|&i| i < n) else {
