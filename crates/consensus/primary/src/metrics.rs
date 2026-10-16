@@ -9,6 +9,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use tn_types::{Noticer, TaskSpawner};
 use tracing::debug;
 
+#[cfg(test)]
+#[path = "tests/metrics_recorder.rs"]
+pub(crate) mod test_recorder;
+
 /// Process-wide running max of consensus output byte sizes.
 ///
 /// The `metrics` `Gauge` handle has no getter, so the "max since startup" gauge needs an

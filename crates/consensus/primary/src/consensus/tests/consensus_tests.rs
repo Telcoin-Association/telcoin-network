@@ -29,20 +29,13 @@ use tokio::fs::create_dir_all;
 /// direct call to the observer's expiry or commit methods can make this test pass.
 #[tokio::test(start_paused = true)]
 async fn quorum_loss_and_recovery_through_consensus_driver() -> Result<(), String> {
+    use crate::metrics::test_recorder::TestMetricsRecorder;
     use futures::{stream, StreamExt, TryStreamExt};
-    use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+    use metrics_util::debugging::DebugValue;
     use tn_test_utils::wait_until;
 
-    let recorder = DebuggingRecorder::new();
-    let snapshotter = recorder.snapshotter();
-    let metric = |name: &str| {
-        snapshotter
-            .snapshot()
-            .into_vec()
-            .into_iter()
-            .find(|(key, ..)| key.key().name() == name)
-            .map(|(_, _, _, value)| value)
-    };
+    let recorder = TestMetricsRecorder::new();
+    let metric = |name: &str| recorder.metric(name);
     let cb = metrics::with_local_recorder(&recorder, ConsensusBus::new);
     let fixture = CommitteeFixture::builder(MemDatabase::default).build();
     let committee = fixture.committee();

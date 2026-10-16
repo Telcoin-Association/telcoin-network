@@ -1,7 +1,8 @@
 //! Deterministic quorum observation boundary, identity and lifecycle tests.
 
 use super::*;
-use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+use crate::metrics::test_recorder::TestMetricsRecorder;
+use metrics_util::debugging::DebugValue;
 use tn_storage::mem_db::MemDatabase;
 use tn_test_utils_committee::CommitteeFixture;
 
@@ -9,7 +10,7 @@ use tn_test_utils_committee::CommitteeFixture;
 #[test]
 fn quorum_recovered_uncommitted_authors_are_not_sampled_again() {
     use tn_types::{Certificate, Hash as _};
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     let authors: Vec<_> = committee.authorities().iter().map(|authority| authority.id()).collect();
     let genesis = Certificate::genesis(&committee).iter().map(|cert| cert.digest()).collect();
@@ -39,18 +40,12 @@ fn quorum_recovered_uncommitted_authors_are_not_sampled_again() {
 }
 
 /// Read a recorded metric without relying on process-global recorder installation.
-fn metric(recorder: &DebuggingRecorder, name: &str) -> Option<DebugValue> {
-    recorder
-        .snapshotter()
-        .snapshot()
-        .into_vec()
-        .into_iter()
-        .find(|(key, ..)| key.key().name() == name)
-        .map(|(_, _, _, value)| value)
+fn metric(recorder: &TestMetricsRecorder, name: &str) -> Option<DebugValue> {
+    recorder.metric(name)
 }
 
 /// Assert a counter's exact process-lifetime value.
-fn assert_counter(recorder: &DebuggingRecorder, name: &str, expected: u64) {
+fn assert_counter(recorder: &TestMetricsRecorder, name: &str, expected: u64) {
     assert!(
         matches!(metric(recorder, name), Some(DebugValue::Counter(value)) if value == expected),
         "{name}: expected {expected}, got {:?}",
@@ -59,14 +54,14 @@ fn assert_counter(recorder: &DebuggingRecorder, name: &str, expected: u64) {
 }
 
 /// Assert a lifecycle gauge's exact value.
-fn assert_gauge(recorder: &DebuggingRecorder, name: &str, expected: f64) {
+fn assert_gauge(recorder: &TestMetricsRecorder, name: &str, expected: f64) {
     assert!(
         matches!(metric(recorder, name), Some(DebugValue::Gauge(value)) if value.0 == expected)
     );
 }
 
 /// Bind fresh handles to the test recorder, avoiding the default metric handle cache.
-fn test_metrics(recorder: &DebuggingRecorder) -> PrimaryMetrics {
+fn test_metrics(recorder: &TestMetricsRecorder) -> PrimaryMetrics {
     metrics::with_local_recorder(recorder, || {
         PrimaryMetrics::new_with_labels(Vec::<metrics::Label>::new())
     })
@@ -75,7 +70,7 @@ fn test_metrics(recorder: &DebuggingRecorder) -> PrimaryMetrics {
 /// A partial round is evaluated once, even with duplicates, repeated polls and late recovery.
 #[test]
 fn quorum_timeout_deduplicates_authors_polls_and_late_arrivals() {
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     let authors = committee.authorities();
     let now = Instant::now();
@@ -101,7 +96,7 @@ fn quorum_timeout_deduplicates_authors_polls_and_late_arrivals() {
 /// Three distinct unit-weight authors satisfy the actual four-member committee threshold.
 #[test]
 fn quorum_threshold_and_higher_round_boundary() {
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     assert_eq!(committee.quorum_threshold(), 3);
     let now = Instant::now();
@@ -123,7 +118,7 @@ fn quorum_threshold_and_higher_round_boundary() {
 /// The arrival at the deadline is late even when it would supply the missing quorum vote.
 #[test]
 fn quorum_deadline_is_fixed_at_first_arrival() {
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     let now = Instant::now();
     let mut observer = RoundQuorumObserver::new(committee.clone(), test_metrics(&recorder), 0);
@@ -156,7 +151,7 @@ fn quorum_voting_power_is_unique_author_weight() {
 /// Round jumps, reordering, recovered history and nonmembers never grow retained round state.
 #[test]
 fn quorum_round_state_is_bounded_and_recovery_skips_history() {
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     let now = Instant::now();
     let mut observer = RoundQuorumObserver::new(committee.clone(), test_metrics(&recorder), 10);
@@ -188,7 +183,7 @@ fn quorum_round_state_is_bounded_and_recovery_skips_history() {
 /// Shutdown disables observations; a new epoch starts from its own cursor and commit baseline.
 #[test]
 fn quorum_epoch_rollover_and_commit_signal_lifecycle() {
-    let recorder = DebuggingRecorder::new();
+    let recorder = TestMetricsRecorder::new();
     let metrics = test_metrics(&recorder);
     let old_committee = CommitteeFixture::builder(MemDatabase::default).build().committee();
     let now = Instant::now();
@@ -220,9 +215,5 @@ fn quorum_epoch_rollover_and_commit_signal_lifecycle() {
     observer.evaluate_expired(now + QUORUM_OBSERVATION_WINDOW);
     assert_counter(&recorder, "tn_primary.rounds_evaluated_total", 2);
     assert_counter(&recorder, "tn_primary.round_quorum_shortfalls_total", 1);
-    assert!(recorder.snapshotter().snapshot().into_vec().iter().all(|(key, ..)| key
-        .key()
-        .labels()
-        .next()
-        .is_none()));
+    assert!(!recorder.has_labels());
 }
