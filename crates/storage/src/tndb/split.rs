@@ -118,6 +118,13 @@ impl SplitDatabase {
     fn db<T: Table>(&self) -> &TnDatabase {
         &self.dbs[env(T::HINT)]
     }
+
+    /// Test-only: latch a durability failure in the database holding `T` (see
+    /// [`TnDatabase::fail_durability_for_test`]); the other two are unaffected.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_durability_for_test<T: Table>(&self) {
+        self.db::<T>().fail_durability_for_test();
+    }
 }
 
 /// A read transaction: each read goes to its table's environment.

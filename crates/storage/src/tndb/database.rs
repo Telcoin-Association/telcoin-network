@@ -173,6 +173,13 @@ impl TnDatabase {
         super::commit::wait_durable(&self.core, self.core.durability.last_seq())
     }
 
+    /// Test-only (other crates' tests too, through `test-utils`): latch a durability failure as a
+    /// failed sync does, so every later write and persist fails until the database is reopened.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn fail_durability_for_test(&self) {
+        self.core.durability.fail("a durability failure injected by a test".to_string());
+    }
+
     /// Test-only, for a simulated crash (a leaked handle): stop the commit thread at once and
     /// release the database's lock, as a dead process's are.
     #[cfg(test)]

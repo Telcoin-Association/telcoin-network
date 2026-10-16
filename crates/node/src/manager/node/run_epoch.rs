@@ -33,7 +33,7 @@ use tn_reth::{error::StateReadError, RethEnv};
 use tn_storage::{
     certificate_pack::CertificatePack,
     epoch_records::EpochRecordDb,
-    tables::{NodeBatchesCache, OurNodeBatchesCache},
+    tables::{KadRecords, NodeBatchesCache, OurNodeBatchesCache, Votes},
 };
 use tn_types::{
     gas_accumulator::{next_base_fee_for_config, GasAccumulator},
@@ -348,7 +348,6 @@ where
             .await?;
         // consensus config for shutdown subscribers
         let consensus_shutdown = primary.shutdown_signal().await;
-        let epoch_shutdown_rx = consensus_shutdown.subscribe();
 
         // This needs to be created early so required machinery for other tasks exists when needed.
         let mut workers = futures::stream::iter(&worker_nodes)
@@ -513,17 +512,11 @@ where
             res = epoch_task_manager.until_task_ends(consensus_shutdown_clone) => {
                 match res {
                     Ok(()) => info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee"),
-                    // There are times when the epoch task manager can exit with Ok...
-                    Err(TaskJoinError::CriticalExitOk(task)) => {
-                        // It is possible for the epoch to get a shutdown signal before the join.
-                        // In that case it will not reconize the Ok task exit so we double check it here
-                        // with a noticer that was aquired much earlier on epoch startup.
-                        if epoch_shutdown_rx.noticed() {
-                            info!(target: "epoch-manager", "epoch task manager exited - likely syncing with committee");
-                        } else {
-                            error!(target: "epoch-manager", ?task, "failed to reach epoch boundary");
-                            return Err(TaskJoinError::CriticalExitOk(task).into());
-                        }
+                    // A critical task that ends before the epoch is told to is a failure even when
+                    // it returns Ok (an epoch-ending notify makes its exit an `Ok(())` above),
+                    // unless the node itself is going down.
+                    Err(TaskJoinError::CriticalExitOk(task)) if self.node_shutdown.is_notified() => {
+                        info!(target: "epoch-manager", ?task, "epoch task exited while the node shuts down");
                     }
                     Err(e) => {
                         error!(target: "epoch-manager", ?e, "failed to reach epoch boundary");
@@ -575,6 +568,10 @@ where
         if clear_tables_for_next_epoch {
             self.clear_consensus_db_for_next_epoch()?;
         }
+        // An epoch task that saw a store refuse a write (a failed durability barrier) ends the
+        // epoch the way a mode change does. Running another epoch on a store the node can no
+        // longer write to would only defer the failure, so the node stops here instead.
+        ensure_stores_durable(&self.consensus_db).await?;
 
         Ok(res)
     }
@@ -1090,6 +1087,27 @@ async fn resolve_prior_epoch_record(
     Ok((rec, digest))
 }
 
+/// Check that every store of the consensus DB can still make writes durable, by a `persist` of one
+/// table in each (the epoch's working state, peer records, the batch cache). A store that failed a
+/// write or a sync refuses every later one until restart, and a node that can no longer write to
+/// its stores must stop: the error names the store.
+async fn ensure_stores_durable<DB: TNDatabase>(db: &DB) -> eyre::Result<()> {
+    use eyre::WrapErr as _;
+    db.persist::<Votes>().await.wrap_err(
+        "the epoch store (votes, certificates, proposals) can no longer make writes durable; \
+         stopping the node (a restart reopens it)",
+    )?;
+    db.persist::<KadRecords>().await.wrap_err(
+        "the peer-record store can no longer make writes durable; stopping the node (a restart \
+         reopens it)",
+    )?;
+    db.persist::<NodeBatchesCache>().await.wrap_err(
+        "the batch-cache store can no longer make writes durable; stopping the node (a restart \
+         reopens it)",
+    )?;
+    Ok(())
+}
+
 /// Remove a committed output's batches from [`NodeBatchesCache`] and [`OurNodeBatchesCache`].
 ///
 /// Every caller of `process_output` hands it an output that is already saved and persisted to the
@@ -1156,6 +1174,33 @@ mod tests {
         CommittedSubDag, ConsensusHeader, EpochSeedChainValue, ExecHeader, GenesisAccount,
         HeaderBuilder, ReputationScores, SolCall as _, WorkerId, B256, MIN_PROTOCOL_BASE_FEE, U256,
     };
+
+    /// A node that can no longer write to one of its consensus stores stops rather than run
+    /// another epoch on it: the probe passes on healthy stores and fails, naming the store, once
+    /// any one of them has latched a failed write.
+    #[tokio::test]
+    async fn stores_that_cannot_write_stop_the_node() {
+        let healthy = TempDir::new().unwrap();
+        ensure_stores_durable(&tn_storage::open_db(healthy.path())).await.expect("healthy stores");
+
+        let epoch = TempDir::new().unwrap();
+        let db = tn_storage::open_db(epoch.path());
+        db.fail_durability_for_test::<Votes>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed epoch store");
+        assert!(format!("{err:#}").contains("the epoch store"), "{err:#}");
+
+        let kad = TempDir::new().unwrap();
+        let db = tn_storage::open_db(kad.path());
+        db.fail_durability_for_test::<KadRecords>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed peer-record store");
+        assert!(format!("{err:#}").contains("the peer-record store"), "{err:#}");
+
+        let cache = TempDir::new().unwrap();
+        let db = tn_storage::open_db(cache.path());
+        db.fail_durability_for_test::<NodeBatchesCache>();
+        let err = ensure_stores_durable(&db).await.expect_err("a failed batch-cache store");
+        assert!(format!("{err:#}").contains("the batch-cache store"), "{err:#}");
+    }
 
     /// Issue #1443: once an output is saved to the pack, eviction removes its batches from both
     /// batch caches while the pack keeps serving them.
