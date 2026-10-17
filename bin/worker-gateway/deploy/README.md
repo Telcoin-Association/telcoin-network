@@ -12,7 +12,7 @@ deploy/
     service.yaml         # v1 ClusterIP Services: worker-gateway (rpc 8545), worker-gateway-metrics (metrics 9100)
     servicemonitor.yaml  # monitoring.coreos.com/v1 ServiceMonitor (Prometheus Operator)
     hpa.yaml             # autoscaling/v2 HPA driven by in-flight requests and worker slots in use (2 to 10 replicas)
-    pdb.yaml             # policy/v1 PodDisruptionBudget (keeps at most one Ready gateway disrupted at a time; pods already terminating are not counted, so evicted pods can still be draining)
+    pdb.yaml             # policy/v1 PodDisruptionBudget (keeps at most one Ready gateway disrupted at a time; pods already terminating are not counted, so evicted pods can still be draining; not-ready pods are always evictable (AlwaysAllow))
 ```
 
 The Deployment sets no `spec.replicas`, because the HPA owns the count; set `spec.replicas` if you do not install the HPA.
