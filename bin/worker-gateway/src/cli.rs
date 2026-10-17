@@ -537,8 +537,9 @@ pub(crate) struct Cli {
     pub(crate) rate_limit_submissions: u32,
 
     /// Most client prefixes the per-IP rate limiter tracks at once (default
-    /// 100,000); a first-seen client beyond it shares one overflow bucket with
-    /// every other untracked client (see the README's Rate limiting section).
+    /// 100,000); a first-seen client beyond it, once no tracked entry is idle,
+    /// shares one overflow bucket with every other untracked client (see the
+    /// README's Rate limiting section).
     /// Memory (about 100 bytes an entry) and the once-a-second idle sweep,
     /// which walks the whole table under the lock every per-IP admission takes
     /// (about 1 ms per 100,000 entries), grow with this value; startup warns
