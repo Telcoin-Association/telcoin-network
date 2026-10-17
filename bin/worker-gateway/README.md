@@ -175,7 +175,7 @@ Every flag has an environment-variable fallback.
 | `--metrics` | `WORKER_GATEWAY_METRICS_ADDR` | (none) | Prometheus scrape endpoint address (`GET /metrics`); unset disables metrics. |
 | `--cors-allowed-origins` | `WORKER_GATEWAY_CORS_ALLOWED_ORIGINS` | (none) | Comma-separated browser origins (`scheme://host[:port]`) allowed to call the gateway cross-origin, or `*` for any; unset disables CORS; see [CORS](#cors). |
 | `--access-log-sample` | `WORKER_GATEWAY_ACCESS_LOG_SAMPLE` | `0` | Fraction of proxied requests written to the access log, from `0` to `1` (`0` disables); see [Access log](#access-log). |
-| `--access-log-max-lines-per-second` | `WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND` | `1000` | Most access-log lines written per second, after sampling (`0` = unlimited); lines over it are dropped and counted; see [Access log](#access-log). |
+| `--access-log-max-lines-per-second` | `WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND` | `1000` | Most access-log lines written per second, after sampling (`0` = unlimited); lines over it are dropped and counted; the ceiling is shared by every client, so one client's flood can suppress the others' lines; see [Access log](#access-log). |
 | `--log-filter` | `RUST_LOG` | `info` | Tracing filter directive. |
 | `--log-format` | `WORKER_GATEWAY_LOG_FORMAT` | `text` | Log line format: `text` or `json` (one JSON object per line). `text` is coloured only when stdout is a terminal and `NO_COLOR` is unset or empty; `json` is never coloured. |
 
@@ -930,6 +930,8 @@ Under `--log-format json` a line is one object with `target` `gateway::access` a
 With the default `--log-filter info` the lines join the gateway's normal output; a filter such as `warn,gateway::access=info` keeps them while quieting the rest.
 The line rate follows the raw request rate, ahead of the rate limiter: it is `rate` times whatever clients send, `429`s included, capped at `--access-log-max-lines-per-second` (default 1000; lines over it are dropped and counted in `tn_worker_gateway_access_log_suppressed_total`; the cap counts whole seconds, so a burst across one second's edge can write about twice it), so size the rate for the request rate a flood can reach at the listener, not for `--rate-limit-global`.
 One client is no exception: its `429`s are logged too, so its lines are bounded by how fast it can send on its `--max-connections-per-ip` connections, not by its rate limit.
+The ceiling is one window shared by every client: a client sending a flood of `429`s can take every line of a second, and the other clients' sampled lines in that second, proxied ones included, are dropped and counted, so a rising `tn_worker_gateway_access_log_suppressed_total` means lines of any client were lost.
+This is deliberate: the ceiling protects the log consumer, and a per-client share would need per-client state on the hot path.
 Lines are written synchronously to standard output, so a log consumer that stops reading stalls request handling, `/health` and `/ready` included, once the pipe fills; keep the rate low on a public edge and send standard output to a consumer that keeps up.
 
 ## Operator guidance
