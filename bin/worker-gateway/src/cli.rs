@@ -330,6 +330,11 @@ pub(crate) struct Cli {
     /// it would put every client behind that front under one cap. A connection
     /// over the cap is closed at once, without a response, so one client
     /// cannot hold every `--max-connections` slot.
+    /// Keep it at or below the per-IP burst (`--rate-limit-per-ip-burst`, 200
+    /// by default; the default 32 is within it): with
+    /// `--rate-limit-submissions`, a first-seen client's concurrent first
+    /// requests all pass the edge before its entry exists, and are recorded
+    /// against it as debt afterwards.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_CONNECTIONS_PER_IP",
