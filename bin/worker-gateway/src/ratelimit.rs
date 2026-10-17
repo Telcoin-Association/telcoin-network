@@ -1125,8 +1125,8 @@ mod tests {
         }
     }
 
-    /// The background task sweeps once per [`GC_INTERVAL`]: an entry idle by
-    /// the limiter's clock survives until the interval has passed, then goes.
+    /// The background task sweeps once a second: an entry idle by the
+    /// limiter's clock survives until the second has passed, then goes.
     #[tokio::test(start_paused = true)]
     async fn run_gc_sweeps_once_per_interval() {
         let clock = ManualClock::new();
@@ -1137,7 +1137,7 @@ mod tests {
         let task = tokio::spawn(run_gc(Arc::clone(&limiters), shutdown.subscribe()));
         // the task starts its ticker and takes the immediate first tick
         tokio::task::yield_now().await;
-        tokio::time::advance(GC_INTERVAL - Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_millis(999)).await;
         for _ in 0..3 {
             tokio::task::yield_now().await;
         }
