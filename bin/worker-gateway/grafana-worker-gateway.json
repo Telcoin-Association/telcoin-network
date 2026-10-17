@@ -52,7 +52,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Proxied requests per second split by terminal outcome (forwarded, rejected, or upstream_error: an upstream error status without a JSON body)."
+      "description": "Proxied requests per second split by terminal outcome: forwarded, rejected, upstream_error (an upstream error status without a JSON body), or cancelled (the connection closed before the gateway answered: a client disconnect, --max-connection-duration or shutdown)."
     },
     {
       "id": 3,
@@ -183,7 +183,7 @@
           ]
         }
       },
-      "description": "Fraction of proxied requests rejected by the gateway or answered with an upstream error status without a JSON body. The clamp on the denominator only avoids a division by zero, so the ratio reads 0 (not NaN) when there is no traffic and is exact at any traffic level."
+      "description": "Fraction of proxied requests rejected by the gateway or answered with an upstream error status without a JSON body. The clamp on the denominator only avoids a division by zero, so the ratio reads 0 (not NaN) when there is no traffic and is exact at any traffic level. The denominator counts every outcome, cancelled requests included."
     },
     {
       "id": 7,
