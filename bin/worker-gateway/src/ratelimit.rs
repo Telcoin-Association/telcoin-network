@@ -1180,11 +1180,12 @@ mod tests {
         }
     }
 
-    /// Thread A reads the clock at `t1` and stalls in that reading while the
-    /// clock moves to `t2` and thread B admits a request. A reading taken
-    /// before the bucket lock lets B refill to `t2` first and A then move the
-    /// refill clock back to `t1`, crediting `t1..t2` twice; read under the
-    /// lock, A holds the bucket while it stalls and B refills after it.
+    /// Thread A reads the clock and stalls in that reading while the clock
+    /// moves on and thread B admits a request. The clock is read under the
+    /// bucket lock, so A holds the bucket while it stalls (asserted with
+    /// `try_lock`) and B refills after it. The rewind itself is also prevented
+    /// by [`Bucket::try_admit`] never moving `last_refill` backwards, so the
+    /// lock assertion is what pins the order.
     #[test]
     fn stale_clock_read_cannot_rewind_a_bucket() {
         let (entered, entered_rx) = std::sync::mpsc::channel();
@@ -1199,6 +1200,11 @@ mod tests {
             std::thread::spawn(move || limiters.check(None))
         };
         entered_rx.recv().expect("thread A read the clock");
+        let global = limiters.global.as_ref().expect("global limit on");
+        assert!(
+            matches!(global.bucket.try_lock(), Err(std::sync::TryLockError::WouldBlock)),
+            "thread A read the clock without holding the bucket lock"
+        );
         clock.inner.advance(Duration::from_millis(100));
         let t2 = clock.inner.now();
         // thread B is this one
