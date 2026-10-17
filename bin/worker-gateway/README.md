@@ -154,7 +154,7 @@ Every flag has an environment-variable fallback.
 | `--max-inflight-queries` | `WORKER_GATEWAY_MAX_INFLIGHT_QUERIES` | `256` | In-flight cap for every other request; over it the gateway answers `503` at once (`0` = unlimited). Without `--redirect-queries` it is lowered to at most `--max-upstream-inflight` less a fifth (80 by default), so submissions keep the rest of the worker slots (see [Per-route capacity](#per-route-capacity)). |
 | `--max-upstream-inflight` | `WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT` | `100` | Cap on concurrent requests to the worker; over it the gateway answers `503` at once (`0` = unlimited; see [Sizing for N gateways](#sizing-for-n-gateways)). With `--redirect-queries`, the reads kept on the worker may hold at most a fifth of it (20 by default; see [Per-route capacity](#per-route-capacity)). |
 | `--tcp-user-timeout` | `WORKER_GATEWAY_TCP_USER_TIMEOUT` | `30s` | Transport-stall deadline (`TCP_USER_TIMEOUT`, Linux; `0` disables). |
-| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables). |
+| `--max-connection-duration` | `WORKER_GATEWAY_MAX_CONNECTION_DURATION` | `10m` | Cap on one connection's lifetime; an exchange in flight at the cap gets the whole-request deadline to finish (`0` disables, with a startup warning: nothing then bounds an answer that keeps arriving, or a client that keeps reading one slowly). |
 | `--max-request-bytes` | `WORKER_GATEWAY_MAX_REQUEST_BYTES` | `1048576` | Max request body size, in bytes (1 MiB; see [Request size](#request-size)). Must be greater than `0`; startup warns below 263168 (one hex-encoded 128 KiB transaction plus its envelope). |
 | `--max-batch-len` | `WORKER_GATEWAY_MAX_BATCH_LEN` | `50` | Max calls in one JSON-RPC batch (`0` means unlimited), never more than the smallest per-IP or global burst (the submission budget does not lower it); a longer batch gets `413` / `-32003` (see [Batches](#batches)). |
 | `--max-inflight-request-bytes` | `WORKER_GATEWAY_MAX_INFLIGHT_REQUEST_BYTES` | `536870912` | Request-body bytes held across all in-flight requests (512 MiB; at least `--max-request-bytes`, at most 4294967295; `0` disables; see [Request size](#request-size)). |
@@ -264,22 +264,25 @@ Every other connection counts, the `/health`, `/ready` and `/ready/any` probes o
 Upstream response bodies are streamed through, never buffered whole (except
 the capped answer to a submission whose hash is remembered; see
 [Reads kept on the worker](#reads-kept-on-the-worker)), so
-response size does not translate into gateway memory. A stalled *upstream* is
-bounded by the upstream request timeout; a stalled or slow-reading *client*
-(the response-side slow loris: that timeout is only observed while the body
-is being polled, which downstream backpressure prevents) is bounded by two
-write-path guards instead: `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, Linux
-kernels) closes a connection whose peer stops acknowledging written data
-(note it replaces the kernel's default ~15min retransmit budget for that
-socket, so a peer black-holed past the deadline is dropped where stock TCP
-might have recovered), and a connection-lifetime cap
-(`--max-connection-duration`) closes any connection, keep-alive sessions
-included, that outlives it, catching a client that trickles reads too slowly
-to be worth a slot but fast enough to defeat the transport guard. At the cap
-the connection stops taking new requests: an idle keep-alive session closes
-at once, and an exchange in flight gets the whole-request deadline above to
-finish before the connection is closed, so a response still streaming then
-is cut off; size the cap well above the longest legitimate transfer.
+response size does not translate into gateway memory. An *upstream* that stalls
+is bounded by its route's read timeout (`--upstream-request-timeout`, or
+`--query-request-timeout` on the query route), which ends an answer after a
+pause that long; one that keeps trickling is bounded only by
+`--max-connection-duration`, and by nothing with `0`; a stalled or slow-reading
+*client* (the response-side slow loris: the read timeout is only observed while
+the body is being polled, which downstream backpressure prevents) is bounded by
+two write-path guards instead: `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, Linux
+kernels) closes a connection whose peer stops acknowledging written data (note
+it replaces the kernel's default ~15min retransmit budget for that socket, so a
+peer black-holed past the deadline is dropped where stock TCP might have
+recovered), and a connection-lifetime cap (`--max-connection-duration`) closes
+any connection, keep-alive sessions included, that outlives it, catching a
+client that trickles reads too slowly to be worth a slot but fast enough to
+defeat the transport guard. At the cap the connection stops taking new
+requests: an idle keep-alive session closes at once, and an exchange in flight
+gets the whole-request deadline above to finish before the connection is
+closed, so a response still streaming then is cut off; size the cap well above
+the longest legitimate transfer.
 It must be at least the gateway's single-request bound
 (`--header-read-timeout` + the whole-request deadline above, plus one more
 `--header-read-timeout` for the PROXY header with `--proxy-protocol`) so the
@@ -502,12 +505,14 @@ A request made only of `eth_sendRawTransaction` and `eth_sendRawTransactionSync`
   Startup logs the share as `max_worker_pool_reads` on the "edge protections configured" line.
   The startup line `edge protections configured` logs that reserve as `submission_reserve`: the worker cap less the effective query cap, or with `--redirect-queries` less the share of the reads kept on the worker (80 with the defaults); `0` when nothing is held back, or `unlimited` with an unlimited worker cap.
   The worker cap bounds how much of the worker's shared RPC connection limit one gateway can hold; size it with [Sizing for N gateways](#sizing-for-n-gateways).
-- With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never answers frees each query slot after 10 s rather than 35 s.
+- With `--redirect-queries`, a request to the query URL has its own deadline, `--query-request-timeout` (10 s by default, at most `--upstream-request-timeout`, `0` to use that instead), so a query URL that accepts reads and never sends an answer's head frees each query slot after 10 s rather than 35 s (one that trickles its answer holds the slot longer; see below).
   Requests to the worker keep `--upstream-request-timeout`.
 
 A class slot is held from classification until the response body has been sent to the client, or until the request fails, so a query upstream that sends its head and then stalls still holds only query slots.
 A client that reads its response slowly holds its query slot for the whole transfer too: with the defaults, 80 slow readers (256 with `--redirect-queries`) put every other read on `503`, while submissions keep their own slots.
 On Linux `TCP_USER_TIMEOUT` (`--tcp-user-timeout`, 30 s) ends a read whose client stops acknowledging, and `--max-connection-duration` (10 m) ends one that trickles; on other hosts only `--max-connection-duration` does (see [Connection handling](#connection-handling)), and the per-IP limit and `--max-connections-per-ip` bound how many such reads one client starts.
+An upstream that keeps sending, however slowly, holds its slot the same way, so the query URL can hold every query slot for up to `--max-connection-duration` plus the request deadline.
+With `--max-connection-duration 0`, neither a trickling read nor a trickling upstream has a time bound, and startup warns.
 A worker slot is released when the worker's response head arrives: by then the worker has built the whole response and freed its own connection permit.
 `tn_worker_gateway_route_inflight{route}` and `tn_worker_gateway_upstream_inflight` show the slots in use, and every `503` from a cap counts as `tn_worker_gateway_rejections_total{reason="overloaded"}`.
 
@@ -654,7 +659,7 @@ The query URL gets no readiness gate and no fallback: when it fails, the client 
 The gateway does probe it, with one `eth_chainId` call per `--readiness-poll-interval` carrying `X-TN-Gateway-Redirect: 1` (and the [query upstream header](#query-upstream-header) when one is set) and bounded by `--readiness-poll-timeout`, but only to report read availability on `/ready/any`; the result never changes routing.
 A `2xx` reply whose JSON body has a `result` member counts as up; anything else, including a reply over 64 KiB, counts as down.
 Like a worker's readiness, the probed state changes only on a run of `--readiness-success-threshold` answered probes or `--readiness-failure-threshold` failed ones in a row.
-A query URL that accepts reads and never answers holds each one for `--query-request-timeout`, and reads beyond `--max-inflight-queries` get `503` / `-32009` at once; submissions have their own slots and keep reaching the worker (see [Per-route capacity](#per-route-capacity)).
+A query URL that accepts reads and never sends an answer's head holds each one for `--query-request-timeout`, one that trickles its answer holds it until `--max-connection-duration` plus the request deadline, and reads beyond `--max-inflight-queries` get `503` / `-32009` at once; submissions have their own slots and keep reaching the worker (see [Per-route capacity](#per-route-capacity)).
 
 | Worker | Query URL | `/ready` | `/ready/any` | Submissions and reads kept on the worker | Other calls |
 | --- | --- | --- | --- | --- | --- |
