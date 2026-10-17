@@ -435,7 +435,7 @@ pub(crate) async fn run_throttle_summaries(
                             target: "gateway::proxy",
                             site = throttle.site,
                             suppressed,
-                            "per-request warnings suppressed since the last line"
+                            "warnings suppressed since the last line"
                         );
                     }
                 });

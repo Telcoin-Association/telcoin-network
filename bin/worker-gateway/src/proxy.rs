@@ -214,8 +214,7 @@ static FORWARD_FAILURE_WARNINGS: PerRoute =
 static UPSTREAM_ERROR_WARNINGS: PerRoute =
     PerRoute::new("upstream_error_worker", "upstream_error_query");
 
-/// Every per-request (or, for a PROXY header, per-connection) warning
-/// throttle, summarized by [`telemetry::run_throttle_summaries`].
+/// Every throttled warning, summarized by [`telemetry::run_throttle_summaries`].
 pub(crate) static WARNING_THROTTLES: [&Throttle; 15] = [
     &HOP_LOOP_WARNINGS,
     &REDIRECT_LOOP_WARNINGS,
