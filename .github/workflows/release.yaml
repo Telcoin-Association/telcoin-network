@@ -1,0 +1,256 @@
+# Public releases: check a release tag, open a draft release for it, and check the
+# release again once a maintainer has published it.
+#
+# CI validates and drafts; it never builds. The binary and the image are built on a
+# maintainer's host by `make release-build`, from a commit whose full local suite, e2e
+# included, was attested on-chain. CI cannot run that suite, and a job that compiled
+# the workspace would run every dependency's build code next to a token that can write
+# releases. The only job here with a write token runs the pinned actions/checkout,
+# which receives the token for its fetch and does not leave it in the checkout, and
+# etc/release.sh, which calls gh. That token guards nothing by itself: anyone with write
+# access can get the same permission from a workflow on their own branch. No token in CI
+# can sign: the signatures on the tag and on SHA256SUMS come from maintainer keys that
+# never touch a runner, and they are what protects a release. The procedure:
+# https://docs.telcoin.network/maintainers/releasing.html
+#
+# Every job checks out main as it stands when the job starts, never the tagged tree,
+# and takes etc/release.sh, .github/scripts/verify_commit_hash.sh and the key allowlist
+# (.github/maintainer-gpg-keys) from there, for the reason the `attest` job in pr.yaml
+# gives: a tag on a commit that edits a script or adds a key would otherwise be judged
+# by its own edit. This file itself is not covered by that. GitHub reads the job
+# definitions from the tagged commit (for a dispatch, from the branch it is run on), so
+# who may push a `v*` tag is decided by the tag ruleset, a repository setting
+# (.github/ACTIONS.md, "Release workflow"). The ruleset limits who can create, move or
+# delete a `v*` tag and nothing else; it does not limit who can write releases.
+#
+# The post-publish check (`verify-release`) is detective only. The release is already
+# public when it runs, so a failure is an alarm for a maintainer, not a gate.
+#
+# No job here may share its name with the single required check, the `ci-success` job
+# in pr.yaml. GitHub matches that check by name on a commit, whatever workflow
+# reported it, and a tag can be pushed on any commit, a pull request's head included.
+name: Release
+
+on:
+  # Deliberately broader than the tag grammar: a malformed `v` tag runs and fails
+  # visibly in validate-tag instead of being ignored. etc/release.sh is the authority
+  # on what a release tag is.
+  push:
+    tags: ["v*"]
+  # `published` also fires when a draft is published as a prerelease, which every adiri
+  # and rc release is; `prereleased` does not fire for those. The maintainer publishes
+  # with their own gh login, so the event fires. A publish made with a GITHUB_TOKEN
+  # starts no workflow, so a release published from another workflow is never checked
+  # here; the maintainer guide says to confirm a verify-release run exists after every
+  # publish and to dispatch `verify` if none does.
+  release:
+    types: [published]
+  # Runs only once this file is on the default branch. `validate` repeats the tag
+  # checks and drafts nothing; run on an old, unsigned tag it fails, which shows the
+  # gate fails closed. `verify` repeats the post-publish check; the token cannot see
+  # draft releases, so it works on published ones only.
+  # If the attestation was missing when a tag was pushed, run `make attest` on the
+  # tagged commit (with ALLOW_STALE_BASE=1 if main has moved past it) and re-run the
+  # failed jobs instead: there is no need to re-tag.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.16.0-adiri"
+        required: true
+        type: string
+      mode:
+        description: "validate: the tag checks; verify: the post-publish check"
+        required: true
+        type: choice
+        options: [validate, verify]
+        default: validate
+
+# Everything here reads the repository; draft-release alone adds the write it needs to
+# create the draft (least privilege, CodeQL actions/missing-workflow-permissions).
+permissions:
+  contents: read
+
+# One run per event and tag at a time. A running run is never cancelled, but GitHub
+# keeps only the newest waiting run in a group and cancels the one already waiting
+# there. With the event in the key, a dispatch can never displace a waiting push or
+# release run; only another run of the same event and tag can, such as a third dispatch
+# for one tag. A cancelled run shows as cancelled and can be re-run.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+# The steps read the tag from here and nowhere else. Every `run:` below uses
+# "$RELEASE_TAG" and interpolates no expression, so the tag reaches the shell as data,
+# and etc/release.sh rejects anything outside the tag grammar before it uses it.
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag || github.ref_name }}
+
+jobs:
+  # Proves: the tag is an annotated tag signed by a key in the allowlist on main; it
+  # points at a commit on main whose Cargo version and CHANGELOG section match the tag;
+  # and that commit's hash is in the attestation registry on adiri (hence `cast`). The
+  # step summary shows the notes the draft will carry.
+  # Does not prove: who pushed the tag, or that it cannot be moved or deleted later.
+  # That is the tag ruleset's job, a repository setting no workflow can check.
+  validate-tag:
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'validate')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # The scripts and the allowlist come from main, never from the tag; the header
+      # says why. `refs/heads/main` is fully qualified so that a tag named `main` cannot
+      # be picked up, as in pr.yaml's `attest` job. fetch-depth: 0 brings every tag and
+      # refs/remotes/origin/main, which the signature, ancestry and version checks read;
+      # the scripts fetch nothing in CI. The job definition, the Foundry pin below
+      # included, comes from the tagged commit instead, and what stops a tag on a commit
+      # that edits it is the tag ruleset (see the header).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which comes from the tagged
+      # commit, so they guard against a change upstream and not against a tag on a commit
+      # that edits them; the comment above the checkout says what stops that.
+      - name: Install Foundry
+        env:
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
+        run: |
+          set -euo pipefail
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
+
+      - name: Check the tag
+        run: ./etc/release.sh check-tag "$RELEASE_TAG"
+
+      - name: Release notes
+        run: ./etc/release.sh notes "$RELEASE_TAG" >> "$GITHUB_STEP_SUMMARY"
+
+  # Proves nothing of its own: it runs only after validate-tag passed for the same push,
+  # and creates the draft release with the notes, or refreshes the notes of a draft it
+  # created before. The draft carries no assets; the maintainer's `make release-build`
+  # uploads them and `make release-publish` makes the release public.
+  # Does not prove: that the draft stays as written. Anyone with write access can edit a
+  # draft, so every later step re-verifies the assets and signatures rather than trusting
+  # it, and keeping a published release from changing is the job of immutable releases,
+  # a repository setting.
+  draft-release:
+    needs: validate-tag
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # The only write in this workflow. contents: write lets the token create, edit,
+    # publish and delete releases and their assets, and push any branch or tag that no
+    # ruleset protects. It holds no artifact and cannot sign one, and the install page's
+    # check verifies SHA256SUMS.asc against the keys on main.
+    permissions:
+      contents: write
+    steps:
+      # From main, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./etc/release.sh draft "$RELEASE_TAG"
+
+  # Proves: the published release is still what `make release-publish` verified, which
+  # re-checks the asset set after its prompt and again after publishing. It repeats the
+  # tag checks, then checks the asset set and SHA256SUMS, the maintainer signatures on
+  # SHA256SUMS against the allowlist on main, the image digest against the registry, and
+  # that the binary in the image is the one in the tarball and reports the tagged commit.
+  # Does not prove anything in advance: the release is public before this runs, so a
+  # failure is an alarm, not a gate. Keeping the release from changing after this check
+  # is the job of immutable releases, a repository setting.
+  verify-release:
+    if: github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'verify')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # From main, as in validate-tag.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/main
+          fetch-depth: 0
+          persist-credentials: false
+
+      # This step supplies `cast` for the read-only registry call, whose answer decides
+      # this check. No action installs it. The step downloads the release archive itself
+      # and checks its SHA-256 against FOUNDRY_SHA256 before extracting anything, so
+      # nothing from upstream is unpacked or run before that check; `cast --version` on the
+      # last line is the first time anything from the archive runs. curl, tar and
+      # sha256sum are the runner image's own, since no step before this one adds to PATH;
+      # the image is trusted and not pinned.
+      #
+      # foundry-rs/foundry-toolchain is not used because it takes no digest. It runs
+      # foundryup, itself fetched unpinned at its latest release, which unpacks the Foundry
+      # release and executes every binary in it with `-V`; the action then runs each with
+      # `--version` too. All of that happens before a later step could check anything, so
+      # a check after that install could gate only the registry call, not those executions.
+      #
+      # A release asset replaced under the same tag, or the tag re-pointed, fails this step
+      # instead of answering the registry call. The digest is that of the linux_amd64
+      # archive, because ubuntu-latest is x64; another runner architecture needs another
+      # archive and digest. `forge` comes from the same verified archive although nothing
+      # here runs it today, so a step that needs it later inherits this pin instead of
+      # installing a Foundry of its own.
+      #
+      # FOUNDRY_VERSION and FOUNDRY_SHA256 move together, by hand: there is no action here
+      # for Dependabot to bump, and .github/ACTIONS.md ("What a pin does not cover") has the
+      # procedure. Both are part of this job definition, which comes from the tagged
+      # commit, so they guard against a change upstream and not against a tag on a commit
+      # that edits them; the comment above the checkout says what stops that.
+      - name: Install Foundry
+        env:
+          FOUNDRY_VERSION: v1.8.3
+          FOUNDRY_SHA256: 7ca48e6ca3cac1bce1403ca67e5bc1dc3bc1fd818199c9957c7165079c228568
+        run: |
+          set -euo pipefail
+          archive="foundry_${FOUNDRY_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL --retry 3 -o "${RUNNER_TEMP}/${archive}" \
+            "https://github.com/foundry-rs/foundry/releases/download/${FOUNDRY_VERSION}/${archive}"
+          echo "${FOUNDRY_SHA256}  ${RUNNER_TEMP}/${archive}" | sha256sum --check --strict -
+          mkdir "${RUNNER_TEMP}/foundry"
+          tar -xzf "${RUNNER_TEMP}/${archive}" -C "${RUNNER_TEMP}/foundry" cast forge
+          echo "${RUNNER_TEMP}/foundry" >> "${GITHUB_PATH}"
+          "${RUNNER_TEMP}/foundry/cast" --version
+
+      - name: Verify the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: ./etc/release.sh verify "$RELEASE_TAG"

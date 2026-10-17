@@ -1,4 +1,10 @@
-FROM rust:1.94-slim-bookworm AS builder
+# Base images are pinned by digest, so a re-pushed tag cannot change a release build. Each
+# reference keeps its tag for readers; with a digest present, Docker pulls by the digest and
+# ignores the tag. To move to a newer image, look up the multi-platform index digest of the tag
+# and replace the digest after it:
+#   docker buildx imagetools inspect <image>:<tag> --format '{{json .Manifest.Digest}}'
+# rust:1.94-slim-bookworm, index digest as of 2026-10-15
+FROM rust:1.94-slim-bookworm@sha256:cf9dd0ec73e75f827fe59123fff9dc65af1a1c8363c3c31ee8d7f8ad0b6a5fb2 AS builder
 
 ENV RUSTUP_TOOLCHAIN=1.94
 
@@ -8,8 +14,9 @@ ENV CARGO_PROFILE_RELEASE_STRIP=true
 
 WORKDIR /usr/src/telcoin-network
 
-# Cargo features for the node build. Empty by default; docker-adiri passes adiri,
-# docker-devnet passes faucet.
+# Cargo features for the node build. Empty by default. Ad-hoc images: `make docker-adiri`
+# passes adiri, `make docker-devnet` passes faucet. Releases: `etc/release.sh build` passes
+# the tag's channel features (adiri for -adiri tags, none for mainnet).
 ARG CARGO_FEATURES=
 
 # Commit hash for the version string, injected as a vergen override (see
@@ -38,11 +45,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,target=./target,sharing=locked \
     rm -rf /usr/local/cargo/registry/src \
-    && cargo build -p telcoin-network --bin telcoin-network --release ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
+    && cargo build -p telcoin-network --bin telcoin-network --release --locked ${CARGO_FEATURES:+--features ${CARGO_FEATURES}} \
     && mv ./target/release/telcoin-network /tmp/
 
 # production image
-FROM debian:bookworm-slim
+# debian:bookworm-slim, index digest as of 2026-10-15 (pinned like the builder above)
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
+
+# OCI image annotations — these link the ghcr.io package page back to the
+# repo and let `docker inspect` self-report version + revision. `etc/release.sh build`
+# adds version and revision labels per tag; the defaults make ad-hoc builds inspectable.
+LABEL org.opencontainers.image.source="https://github.com/Telcoin-Association/telcoin-network" \
+      org.opencontainers.image.licenses="MIT OR Apache-2.0" \
+      org.opencontainers.image.title="telcoin-network" \
+      org.opencontainers.image.description="Telcoin Network node — DAG-based BFT consensus + EVM execution"
 
 # ca-certificates for outbound rustls TLS (faucet / OTLP exporters). No libssl3 / libapr1:
 # unused by the binary. bash + coreutils ship in the base and are required by

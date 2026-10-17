@@ -1,0 +1,109 @@
+# git-cliff configuration for CHANGELOG.md.
+#
+# `make release-prep TAG=<tag>` runs the pinned git-cliff image with
+# `--tag <tag> --strip all` on the commits since the nearest final tag of either
+# channel, and splices the new section in right after the
+# `<!-- ANCHOR: releases -->` line. The Release notes page in the book includes
+# CHANGELOG.md from that anchor, so the header must end with it.
+# Only final tags get a section: rc tags are ignored and their commits roll
+# into the section of the tag they lead up to.
+#
+# Commit text reaches the book as Markdown, so `commit_preprocessors` below
+# neutralise what mdBook or a browser would act on before any template sees it.
+
+[changelog]
+header = """
+# Changelog
+
+Generated from commit messages by git-cliff when a release is cut (`make release-prep`); sections are never edited by hand.
+
+<!-- ANCHOR: releases -->
+"""
+body = """
+{% if version %}\
+## [{{ version }}] - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}\
+### {{ group | striptags | trim }}
+{% for commit in commits %}\
+- {% if commit.scope %}**{{ commit.scope }}**: {% endif %}\
+{{ commit.message | split(pat="\n") | first | trim | upper_first }}\
+{% if commit.breaking %} (**breaking**){% endif %}
+{% if group is ending_with("Batched merges") %}\
+{% for line in commit.raw_message | split(pat="\n") %}\
+{% if line is starting_with("* ") and line is containing("(#") %}\
+{{ "  - " }}{{ line | trim_start_matches(pat="* ") | trim }}
+{% endif %}\
+{% endfor %}\
+{% elif group is ending_with("Merged from private forks") %}\
+{% if commit.raw_message is containing("\n* ") %}\
+{% for line in commit.raw_message | split(pat="\n") %}\
+{% if line is starting_with("* ") %}\
+{{ "  - " }}{{ line | trim_start_matches(pat="* ") | trim }}
+{% endif %}\
+{% endfor %}\
+{% else %}\
+{% set_global described = false %}\
+{% for line in commit.raw_message | split(pat="\n") | slice(start=1) %}\
+{% if not described %}{% if line | trim %}{% if line is not starting_with("#") %}\
+{{ "  - " }}{{ line | trim }}
+{% set_global described = true %}\
+{% endif %}{% endif %}{% endif %}\
+{% endfor %}\
+{% if not described %}\
+{{ "  - " }}No commit description; see [{{ commit.id | truncate(length=9, end="") }}](https://github.com/Telcoin-Association/telcoin-network/commit/{{ commit.id }})
+{% endif %}\
+{% endif %}\
+{% endif %}\
+{% endfor %}\
+{% endfor %}\
+{% if previous and previous.version %}
+{% endif %}\
+{% endif %}\
+"""
+trim = true
+postprocessors = [
+    { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/Telcoin-Association/telcoin-network/pull/${1}))" },
+]
+
+[git]
+conventional_commits = true
+filter_unconventional = false
+split_commits = false
+protect_breaking_commits = true
+filter_commits = false
+tag_pattern = "^v[0-9]+\\.[0-9]+\\.[0-9]+(-adiri)?(-rc[0-9]+)?$"
+ignore_tags = "-rc[0-9]+$"
+topo_order = false
+sort_commits = "newest"
+# Rewrite commit text, never the header, so the anchor line above survives.
+# `{{` becomes `{\{`, which mdBook does not read as a directive and Markdown
+# shows as `{{`; the rule runs twice so a run such as `{{{` leaves no `{{`.
+# `ANCHOR:` and `ANCHOR_END:` become `ANCHOR\:` and `ANCHOR_END\:`, so a commit
+# cannot end or start an mdBook anchor and cut the page short.
+# Raw HTML is escaped: `<` before a letter, `/`, `?` or `!` becomes `&lt;`, which
+# also stops a `<!--` from hiding the rest of a release body.
+commit_preprocessors = [
+    { pattern = '\{\{', replace = '{\{' },
+    { pattern = '\{\{', replace = '{\{' },
+    { pattern = 'ANCHOR(_END)?:', replace = 'ANCHOR${1}\:' },
+    { pattern = '<([A-Za-z/?!])', replace = '&lt;${1}' },
+]
+# First match wins, so the private-fork merges are claimed before every other
+# `Merge` subject is skipped. The `<!-- NN -->` prefixes fix the order of the
+# groups and are stripped from the headings.
+commit_parsers = [
+    { message = "^Merge commit from fork", group = "<!-- 09 -->Merged from private forks" },
+    { message = "(?i)^merge\\b", skip = true },
+    { message = "^release", skip = true },
+    { message = "^chore\\(release\\)", skip = true },
+    { message = "^Staging/", group = "<!-- 08 -->Batched merges" },
+    { message = "^feat", group = "<!-- 00 -->Features" },
+    { message = "^fix", group = "<!-- 01 -->Bug fixes" },
+    { message = "^perf", group = "<!-- 02 -->Performance" },
+    { message = "^refactor", group = "<!-- 03 -->Refactoring" },
+    { message = "^docs", group = "<!-- 04 -->Documentation" },
+    { message = "^test", group = "<!-- 05 -->Tests" },
+    { message = "^(build|ci|chore)", group = "<!-- 06 -->Build, CI and chores" },
+    { message = "^[Rr]evert", group = "<!-- 07 -->Reverts" },
+    { message = ".*", group = "<!-- 10 -->Other" },
+]
