@@ -15,11 +15,13 @@
 //! full CRC ([`BtreeIndex::page_crc_scan`] is the off-path check), but cheap checks turn damage
 //! at rest into `CorruptIndex`: a zero trailer on a page this handle did not write, an impossible
 //! page type or entry count, and a leaf that is not at the tree's height or holds keys outside the
-//! range its parents' separators give it (a damaged child pointer leading elsewhere). A write into
-//! a damaged page is refused rather than stamped valid at the next sync, and a page whose child
-//! pointers decide which pages are live (the open-time walk, `clear`) has its full CRC checked
-//! when it was read from disk. Damage the checks don't see (a flipped key or value bit inside a
-//! leaf) is found by [`BtreeIndex::page_crc_scan`] or by a write's copy.
+//! range its ancestors' separators give it (the intersection of their ranges), which is where a
+//! damaged child pointer leading to another page of the tree ends. A write into a damaged page is
+//! refused rather than stamped valid at the next sync, and a page whose child pointers decide
+//! which pages are live (the open-time walk, `clear`) has its full CRC checked when it was read
+//! from disk. Damage the checks don't see (a flipped key or value bit inside a leaf, or a child
+//! pointer redirected to a stale, still CRC-valid copy of the right subtree) is found by
+//! [`BtreeIndex::page_crc_scan`] or by a write's copy.
 //!
 //! Damage found is latched: the index file is poisoned, so it is never sealed as clean again and
 //! the next open rebuilds it from its data log.
@@ -258,8 +260,9 @@ impl PageSource for IndexSnapshot {
 
 /// Point lookup of `key` in the tree `src` reads. The leaf reached must be the one its parents
 /// name: at the tree's height and, for a miss, holding the range the separators on the way down
-/// give it. A child pointer damaged at rest that leads to another valid page is then
-/// `CorruptIndex`, not a wrong `NotFound`.
+/// give it (the intersection of every ancestor's range). A child pointer damaged at rest that
+/// leads to another page of the tree is then `CorruptIndex`, not a wrong `NotFound`. One that
+/// leads to a stale, still CRC-valid copy of the right subtree passes: no range check sees it.
 fn lookup<S: PageSource + ?Sized>(src: &S, key: &[u8]) -> Result<u64, FetchError> {
     let node = src.node();
     let mut pno = src.root();
@@ -297,11 +300,20 @@ fn lookup<S: PageSource + ?Sized>(src: &S, key: &[u8]) -> Result<u64, FetchError
             };
         }
         let ci = node.internal_child_index(buf, key);
+        // Keep the intersection of every ancestor's range, not the nearest one's: in a sound tree
+        // the ranges nest, but a pointer misrouted to another internal page brings that page's
+        // separators, which can be wider.
         if ci > 0 {
-            lo = Some(node.internal_key(buf, ci - 1));
+            let k = node.internal_key(buf, ci - 1);
+            if lo.is_none_or(|lo| k > lo) {
+                lo = Some(k);
+            }
         }
         if ci < node.entry_count(buf) {
-            hi = Some(node.internal_key(buf, ci));
+            let k = node.internal_key(buf, ci);
+            if hi.is_none_or(|hi| k < hi) {
+                hi = Some(k);
+            }
         }
         pno = node.internal_child(buf, ci);
     }
@@ -894,7 +906,7 @@ impl BtreeIndex {
             path.push((pno, ci));
             pno = writable;
         }
-        Err(AppendError::CorruptIndex("btree descent exceeded max depth".to_string()))
+        Err(fetch_to_append(self.damaged("btree descent exceeded max depth".to_string())))
     }
 
     // ---- lookup ----
@@ -1118,7 +1130,9 @@ impl BtreeIndex {
         let emptied = {
             let buf = self.page_mut(leaf_no).map_err(fetch_to_append)?;
             let Ok(i) = node.leaf_search(buf, key) else {
-                return Err(AppendError::CorruptIndex("key vanished from its leaf".to_string()));
+                return Err(fetch_to_append(
+                    self.damaged("key vanished from its leaf".to_string()),
+                ));
             };
             node.leaf_delete(buf, i);
             zero_crc(buf);
@@ -2133,6 +2147,130 @@ mod tests {
         assert!(matches!(load, Err(FetchError::CorruptIndex(_))), "not NotFound: {load:?}");
         drop(snapshot);
         assert!(idx.is_poisoned(), "a snapshot's finding is latched for the writer");
+        drop(idx);
+        let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("reopen");
+        assert!(idx.opened_unclean(), "never sealed again: the next open rebuilds it");
+    }
+
+    /// The same damage one level up: a root child pointer damaged after a clean open so that it
+    /// names a sibling internal page. That page's own separators are wider than the root's, so the
+    /// range a read checks must be the intersection of every ancestor's range, not the nearest
+    /// one's. Redirected to the right sibling (the root's upper separator bounds the lost keys) and
+    /// to the left one (its lower separator does), every read of a lost key is `CorruptIndex` and
+    /// latches the damage: a lookup, and the first row of a `From` and a `RevFrom` scan, through
+    /// the writer and through a published snapshot (tndb's read path). A forward scan yields only
+    /// the rows before the lost subtree, then fails.
+    #[test]
+    fn test_archive_btx_misrouted_root_pointer_is_corrupt_not_a_wrong_answer() {
+        use std::ops::Bound;
+
+        use crate::archive::btree_index::iter::{BtreeCursor, BtreeIter};
+
+        const N: u64 = 30_000;
+        type Read = fn(&mut BtreeIndex, &[u8]) -> Result<Option<u64>, FetchError>;
+        fn first(mut scan: BtreeIter<'_>) -> Result<Option<u64>, FetchError> {
+            scan.next().transpose().map(|row| row.map(|(_, v)| v))
+        }
+        fn first_in_snapshot(
+            idx: &mut BtreeIndex,
+            reverse: bool,
+            lower: Bound<Vec<u8>>,
+            upper: Bound<Vec<u8>>,
+        ) -> Result<Option<u64>, FetchError> {
+            let snapshot = idx.publish();
+            let mut cursor = BtreeCursor::new(&snapshot, reverse, lower, upper)?;
+            cursor.next(&snapshot).transpose().map(|row| row.map(|(_, v)| v))
+        }
+        let reads: [(&str, Read); 6] = [
+            ("writer load", |idx, key| BtreeIndex::load(idx, key).map(Some)),
+            ("writer From", |idx, key| first(idx.range(key..)?)),
+            ("writer RevFrom", |idx, key| first(idx.rev_range(..key)?)),
+            ("snapshot load", |idx, key| idx.publish().load(key).map(Some)),
+            ("snapshot From", |idx, key| {
+                first_in_snapshot(idx, false, Bound::Included(key.to_vec()), Bound::Unbounded)
+            }),
+            ("snapshot RevFrom", |idx, key| {
+                first_in_snapshot(idx, true, Bound::Unbounded, Bound::Excluded(key.to_vec()))
+            }),
+        ];
+
+        let tmp = TempDir::with_prefix("btx_misrouted_root").expect("temp dir");
+        let (sealed, dh, [root, height, _, _]) = sealed_index(&tmp, N);
+        assert_eq!(height, 3, "the root's children are internal pages");
+        let node = Node::new(32);
+        let copy = |case: &str| {
+            let dir = tmp.path().join(case);
+            std::fs::create_dir(&dir).expect("mkdir");
+            for entry in std::fs::read_dir(&sealed).expect("read dir") {
+                let entry = entry.expect("entry");
+                std::fs::copy(entry.path(), dir.join(entry.file_name())).expect("copy");
+            }
+            dir
+        };
+        // A fresh writer over the sealed tree (its open walk passes), then the damage: root child
+        // `from` now names child `to`'s page (the root's CRC is left wrong).
+        let damaged = |case: &str, from: usize, to: usize| {
+            let mut idx = BtreeIndex::open_btx_file(copy(case), &dh, 32, false).expect("open");
+            let page = idx.file.slice_mut(BtreeIndex::page_offset(root), PAGE_SIZE).expect("map");
+            let target = node.internal_child(page, to);
+            node.set_internal_child(page, from, target);
+            idx
+        };
+
+        for (from, to) in [(0, 1), (1, 0)] {
+            // A key inside the lost subtree (its middle leaf's first key), and the keys before it.
+            let (lost, before) = {
+                let idx = BtreeIndex::open_btx_file(&sealed, &dh, 32, true).expect("ro");
+                let rbuf = idx.page(root).expect("root");
+                let sub = idx.page(node.internal_child(rbuf, from)).expect("subtree");
+                assert!(!node.is_leaf(sub), "an internal page");
+                let leaf = node.internal_child(sub, node.entry_count(sub) / 2);
+                let lost = node.leaf_key(idx.page(leaf).expect("leaf"), 0).to_vec();
+                let sep = (from > 0).then(|| node.internal_key(rbuf, from - 1));
+                let before = (0..N).filter(|&i| sep.is_some_and(|s| key_of(i).as_slice() < s));
+                (lost, before.count())
+            };
+            for (name, read) in reads {
+                let mut idx = damaged(&format!("{name}-{from}"), from, to);
+                let got = read(&mut idx, &lost);
+                let case = format!("{name}, root child {from} redirected to child {to}'s page");
+                assert!(matches!(got, Err(FetchError::CorruptIndex(_))), "{case}: {got:?}");
+                assert!(idx.is_poisoned(), "{case}: latched");
+            }
+            let idx = damaged(&format!("scan-{from}"), from, to);
+            let mut rows = 0;
+            let end =
+                idx.iter().and_then(|mut scan| scan.try_for_each(|row| row.map(|_| rows += 1)));
+            assert!(matches!(end, Err(FetchError::CorruptIndex(_))), "scan {from}: {end:?}");
+            assert_eq!(rows, before, "scan {from}: no row of the subtree it was misrouted to");
+            assert!(idx.is_poisoned(), "scan {from}: latched");
+        }
+    }
+
+    /// A write's descent that loops (here through a root this handle stamped, re-read pointing at
+    /// itself: copy-on-write does not re-verify a page this handle stamped) stops at the depth cap
+    /// with `CorruptIndex`, latched like all damage a write finds: the index is never synced or
+    /// sealed as clean again.
+    #[test]
+    fn test_archive_btx_write_descent_depth_cap_is_latched() {
+        let tmp = TempDir::with_prefix("btx_depth_cap").expect("temp dir");
+        let dir = tmp.path().join("idx");
+        let dh = DataHeader::new(0, PackCompression::ZStd, 0);
+        let mut idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("open");
+        for i in 0..2_000 {
+            idx.save(&key_of(i), i).expect("save");
+        }
+        idx.sync().expect("sync");
+        let root = idx.header.root_page;
+        assert!(idx.header.height == 2 && idx.stamped.contains(root), "a root this handle stamped");
+        let at = BtreeIndex::page_offset(root);
+        redirect_child(idx.file.slice_mut(at, PAGE_SIZE).expect("mapped"), root);
+
+        let smallest = (0..2_000).map(key_of).min().expect("keys");
+        let save = idx.save(&smallest, 7);
+        assert!(matches!(save, Err(AppendError::CorruptIndex(_))), "{save:?}");
+        assert!(idx.is_poisoned(), "the damage is latched");
+        assert!(idx.sync().is_err(), "a poisoned index is never synced");
         drop(idx);
         let idx = BtreeIndex::open_btx_file(&dir, &dh, 32, false).expect("reopen");
         assert!(idx.opened_unclean(), "never sealed again: the next open rebuilds it");

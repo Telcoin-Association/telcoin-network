@@ -1,11 +1,12 @@
 //! [`SplitDatabase`]: one tndb database (one shared log, write lock and commit thread) per
-//! production environment, as `open_db` splits MDBX, routed by each table's [`TableHint`] with no
-//! layer in between. The batch caches (`Cache`) then never share a write lock with consensus
-//! (`Epoch`): a large batch append holds up only other cache writes.
+//! production environment, routed by each table's [`TableHint`] with no layer in between. The
+//! batch caches (`Cache`) then never share a write lock with consensus (`Epoch`): a large batch
+//! append holds up only other cache writes.
 //!
 //! A write transaction is atomic within each environment it writes (its part in each commits as
-//! one batch there); `persist` covers the table's environment, as with MDBX today (every
-//! production barrier is on consensus tables).
+//! one batch there); `persist` covers the table's environment. The anti-equivocation barriers are
+//! on consensus tables; the node's epoch-end check (`ensure_stores_durable`) persists one table in
+//! each environment, and [`Database::failed`] names whichever environment latched a failure.
 //!
 //! The cache environment compacts automatically only once its log is at least
 //! [`CACHE_AUTO_MIN_BYTES`]: it churns at the batch write rate, and each compaction's flushes slow
@@ -124,6 +125,11 @@ impl SplitDatabase {
     #[cfg(any(test, feature = "test-utils"))]
     pub fn fail_durability_for_test<T: Table>(&self) {
         self.db::<T>().fail_durability_for_test();
+    }
+
+    /// [`TnDatabase::scan_raw`] in the database holding `T`.
+    pub(crate) fn scan_raw<T: Table>(&self, visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
+        self.db::<T>().scan_raw::<T>(visit)
     }
 }
 
@@ -269,6 +275,23 @@ impl Database for SplitDatabase {
             db.compact()?;
         }
         Ok(())
+    }
+
+    /// Resolve once any of the three environments has latched a failure, naming it.
+    fn failed(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        use std::{future::Future as _, task::Poll};
+        let mut envs: Vec<_> = ENVIRONMENTS
+            .into_iter()
+            .zip(self.dbs.iter().map(|db| Box::pin(db.failure())))
+            .collect();
+        std::future::poll_fn(move |cx| {
+            for (env, failure) in &mut envs {
+                if let Poll::Ready(cause) = failure.as_mut().poll(cx) {
+                    return Poll::Ready(format!("tndb: the {env} environment failed: {cause}"));
+                }
+            }
+            Poll::Pending
+        })
     }
 }
 
@@ -436,5 +459,30 @@ mod test {
         assert_eq!(db.get::<EpochTable>(&1).expect("get"), Some("epoch".to_string()));
         assert_eq!(db.get::<TestTable>(&1).expect("get"), None);
         assert_eq!(db.get::<TestTable>(&2).expect("get"), Some("later".to_string()));
+    }
+
+    /// `failed` stays pending while every environment is sound, and resolves promptly once one
+    /// latches a failure (here from another thread, as a sync round's would), naming it; the
+    /// other environments carry on.
+    #[tokio::test]
+    async fn test_tndb_split_failed_names_the_environment() {
+        use std::time::Duration;
+        let tmp = TempDir::with_prefix("tndb_split_failed").expect("temp dir");
+        let db = open(tmp.path());
+        let mut failed = std::pin::pin!(db.failed());
+        let early = tokio::time::timeout(Duration::from_millis(50), failed.as_mut()).await;
+        assert!(early.is_err(), "pending while nothing failed: {early:?}");
+        let failing = db.clone();
+        let fail = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            failing.fail_durability_for_test::<KadTable>();
+        });
+        let cause = tokio::time::timeout(Duration::from_secs(5), failed).await.expect("promptly");
+        fail.join().expect("thread");
+        assert!(cause.contains("the kad environment failed"), "{cause}");
+        assert!(cause.contains("injected by a test"), "{cause}");
+        db.insert::<EpochTable>(&1, &"epoch".to_string()).expect("the epoch store carries on");
+        db.persist::<EpochTable>().await.expect("persist");
+        assert!(db.persist::<KadTable>().await.is_err(), "the kad store stays failed");
     }
 }

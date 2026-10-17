@@ -222,7 +222,9 @@ impl DbValidateArgs {
         // Every record frames, but an unclean pack can still end in an incomplete output whose
         // last record happens to end the file: an unacked in-flight write that recovery truncates,
         // not corruption. Report it as such and validate the complete prefix before it.
-        if let Some(end) = incomplete_trailing_output(&data_file, epoch) {
+        if let Some(end) = incomplete_trailing_output(&data_file, epoch)
+            .map_err(|e| eyre!("failed to check pack {}: {e}", data_file.display()))?
+        {
             if let Some(why) = recovery_refusal(&data_file, epoch) {
                 println!(
                     "NOT TRUNCATABLE: the pack was not cleanly closed and its last output is \
@@ -1564,6 +1566,12 @@ fn tndb_env_summary(env: &str, report: &tn_storage::tndb::EnvReport) -> String {
         summary.push_str(&format!(
             "\n  unfinished compaction builds: {} (deleted at the next open)",
             report.unfinished_builds
+        ));
+    }
+    if !report.orphan_indexes.is_empty() {
+        summary.push_str(&format!(
+            "\n  orphan index directories: {:?} (force a full replay at the next open; deleted once it passes)",
+            report.orphan_indexes
         ));
     }
     summary

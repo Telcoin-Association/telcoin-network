@@ -13,8 +13,8 @@
 //! thread syncs **on demand**: at once when a [`Durability::persist`] waits; otherwise once the
 //! unsynced writes are [`SYNC_DELAY`] old or [`SYNC_BYTES`] large, so a burst nobody waits on is
 //! made durable by a few syncs, not one per write. The first failure (a failed sync, a writer that
-//! stopped, a panic) is latched: every later barrier and write fails, and the watermark never moves
-//! again.
+//! stopped, a panic, damage a read found) is latched: every later barrier and write fails, and the
+//! watermark never moves again.
 
 use std::{
     sync::{
@@ -63,6 +63,13 @@ pub(super) struct Durability {
     durable_changed: Condvar,
     /// The first failure, if any (never cleared).
     failed: Mutex<Option<String>>,
+    /// Set by every failure but damage a read found ([`Self::fail_damaged`]): a failed sync, a
+    /// writer that stopped part way or a panic leaves the log's state on disk unknown, so it must
+    /// never be sealed as clean. Kept apart from `failed`, which holds only the first cause, so a
+    /// sync failing after a read's damage still blocks the seal.
+    log_unknown: AtomicBool,
+    /// Poked once, at the first failure (see [`Self::failed`]).
+    failed_signal: tokio::sync::watch::Sender<()>,
     /// Set to 1 at the first failure (the `tndb_failed` metric).
     failed_gauge: ::metrics::Gauge,
     run: Mutex<Run>,
@@ -101,6 +108,8 @@ impl Durability {
             durable_now: Mutex::new(0),
             durable_changed: Condvar::new(),
             failed: Mutex::new(None),
+            log_unknown: AtomicBool::new(false),
+            failed_signal: tokio::sync::watch::Sender::new(()),
             run: Mutex::new(Run::Go),
             wake: Condvar::new(),
             wanted: AtomicU64::new(0),
@@ -178,8 +187,22 @@ impl Durability {
         self.durable_changed.notify_all();
     }
 
-    /// Latch `cause` (the first failure wins, and only it is logged) and wake every waiter.
+    /// Latch `cause` (the first failure wins, and only it is logged) and wake every waiter: a
+    /// failed sync, a writer that stopped, or a panic. The log's state on disk is then unknown
+    /// (see `log_unknown`), whatever failed first.
     pub(super) fn fail(&self, cause: String) {
+        self.log_unknown.store(true, Ordering::Release);
+        self.latch(cause);
+    }
+
+    /// Latch damage a read found (see `Core::read_damaged`; a removal's lookup too, see
+    /// `Writer::latch_if_poisoned`): every later write and persist fails, as after any failure,
+    /// but the log itself is as it was, so the close still seals it.
+    pub(super) fn fail_damaged(&self, cause: String) {
+        self.latch(cause);
+    }
+
+    fn latch(&self, cause: String) {
         {
             let mut failed = self.failed.lock();
             if failed.is_some() {
@@ -189,6 +212,7 @@ impl Durability {
             *failed = Some(cause);
             self.failed_gauge.set(1.0);
         }
+        self.failed_signal.send_modify(|_| {});
         self.durable.send_modify(|_| {});
         let _now = self.durable_now.lock();
         self.durable_changed.notify_all();
@@ -196,6 +220,25 @@ impl Durability {
 
     pub(super) fn is_failed(&self) -> bool {
         self.failed.lock().is_some()
+    }
+
+    /// True once a failure left the log's state on disk unknown (see `log_unknown`): it must not
+    /// be sealed as clean.
+    pub(super) fn log_unknown(&self) -> bool {
+        self.log_unknown.load(Ordering::Acquire)
+    }
+
+    /// Resolve with the first failure's cause once anything has failed (at once if something
+    /// already has); never resolves otherwise. The latch is never cleared.
+    pub(super) async fn failed(&self) -> String {
+        let mut signal = self.failed_signal.subscribe();
+        loop {
+            if let Some(cause) = self.failed.lock().clone() {
+                return cause;
+            }
+            // `failed_signal` (a sender the caller's reference keeps alive) never closes.
+            let _ = signal.changed().await;
+        }
     }
 
     pub(super) fn check(&self) -> eyre::Result<()> {

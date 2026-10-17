@@ -1277,7 +1277,7 @@ where
             &self.consensus_bus,
             self.node_shutdown.subscribe(),
         )
-        .await;
+        .await?;
         info!(target: "epoch-manager", "startup epoch record sync finished");
 
         seed_node_mode_on_startup(

@@ -147,8 +147,23 @@ pub trait Database: Send + Sync + Clone + Unpin + 'static {
     /// so a caller can refuse to externalize an artifact whose anti-equivocation record never
     /// reached disk and fail-stop instead of silently equivocating on restart (issue #975).
     /// Synchronously-durable backends never fail here.
+    ///
+    /// A failure is sticky: once a store has failed (a write, a sync, or damage a read found),
+    /// every later write and `persist` on it fails until the process restarts, so a `persist`
+    /// that resolves `Ok` proves its store has not failed (the node's epoch-end
+    /// `ensure_stores_durable` relies on this).
     fn persist<T: Table>(&self) -> impl Future<Output = eyre::Result<()>> + Send {
         std::future::ready(Ok::<(), eyre::Report>(()))
+    }
+
+    /// Resolve, with a message naming the store and the cause, once any store behind this
+    /// database has failed; never resolve otherwise. A failure is sticky (see
+    /// [`Database::persist`]): the store keeps failing every write and `persist` until the process
+    /// restarts, so this resolves at once if it already has, and the node should stop when it
+    /// does rather than wait for its next write or `persist` to fail. The default never resolves:
+    /// a backend that keeps it reports each failure only on the calls that meet it.
+    fn failed(&self) -> impl Future<Output = String> + Send + 'static {
+        std::future::pending()
     }
     /// Synchronous, catch-up-only sibling of [`Database::persist`], for tests that cannot `await`.
     ///

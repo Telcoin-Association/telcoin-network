@@ -40,7 +40,7 @@ use crate::{
             iter::{BtreeCursor, PageSource},
             BtreeIndex,
         },
-        data_file::{MapView, MmapFileOptions},
+        data_file::{MapView, MmapFileOptions, COMMIT_MARKER_LEN},
         error::{fetch::FetchError, load_header::LoadHeaderError},
         fxhasher::FxHasher,
         pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
@@ -392,10 +392,14 @@ pub(super) struct Writer {
     /// A batch left every table empty while the log held at least [`EMPTIED_MIN_BYTES`] (the
     /// epoch tables are all cleared at an epoch's end): the log compacts at once, whatever its
     /// growth threshold, since nothing live is left to copy. Kept until a compaction whose
-    /// snapshot came after it switches, so writes that resume meanwhile do not cancel it, and one
-    /// raised while a compaction runs survives that compaction's switch.
+    /// snapshot came after it switches (or one whose new generation holds nothing dead), so writes
+    /// that resume meanwhile do not cancel it. One raised while a compaction copies survives that
+    /// compaction's switch, and the new generation's next switch drops it (every snapshot of the
+    /// new generation comes after it), unless another emptying came since.
     emptied: bool,
-    /// The log's length when `emptied` was last set.
+    /// The log's length at the last batch that left every table empty (see `emptied`): moved by
+    /// each one, even while an earlier one is pending, so a switch whose snapshot came between
+    /// the two keeps the signal. Reset to 0 by a switch, as a position in the old log.
     emptied_at: u64,
     /// The log's length at the last compaction snapshot (see [`Core::compaction_snapshot`]).
     snapshot_end: u64,
@@ -442,8 +446,10 @@ impl Writer {
         if let Some(cause) = &self.failed {
             bail!("tndb: the writer stopped ({cause}); restart to recover");
         }
-        if self.durability.is_failed() {
-            // A failed sync leaves the log's state on disk unknown: never seal it as clean.
+        if self.durability.log_unknown() {
+            // A failed sync leaves the log's state on disk unknown: never seal it as clean. (Damage
+            // a read found fails the write below too, but leaves the log to be sealed: see
+            // `Writer::drop`.)
             self.log.poison();
         }
         self.durability.check()
@@ -631,6 +637,9 @@ impl Writer {
                 } else if idx.is_poisoned() {
                     // It refuses every later growth: rather than one table failing its writes
                     // while the rest carry on, the database stops (the next open rebuilds it).
+                    // Each index op follows its record's append, so this batch wrote to the log:
+                    // a `stop`, unlike damage met before anything is appended (see
+                    // `Self::latch_if_poisoned`).
                     self.stop(format!("table {id}'s index is poisoned"));
                 }
             }
@@ -640,8 +649,13 @@ impl Writer {
         }
     }
 
-    /// Stop if the index of a table `ops` writes is poisoned (see [`Self::revert`]).
-    fn stop_if_poisoned(&mut self, ops: &[BatchOp<'_>]) {
+    /// Latch `e`, a failed [`Self::effective`], if it poisoned the index of a table `ops` writes
+    /// (a removal's lookup that met damage). Nothing of the batch was appended, so this latches as
+    /// damage a read found does (see [`Core::read_damaged`]): every later write and persist fails,
+    /// but the close still seals the log, with every index stale (see `Writer::drop`). A
+    /// [`Self::stop`] would leave it unsealed, and the next open would cut a damaged record past
+    /// the last commit marker as a crash's torn tail.
+    fn latch_if_poisoned(&self, ops: &[BatchOp<'_>], e: &eyre::Report) {
         let poisoned = ops.iter().map(BatchOp::table).find(|id| {
             self.tables
                 .get(id)
@@ -649,7 +663,7 @@ impl Writer {
                 .is_some_and(|idx| idx.is_poisoned())
         });
         if let Some(id) = poisoned {
-            self.stop(format!("table {id}'s index is poisoned"));
+            self.durability.fail_damaged(format!("tndb: table {id}'s index found damage: {e:#}"));
         }
     }
 
@@ -686,10 +700,10 @@ impl Writer {
     }
 
     /// Note a batch that left every table empty in a log of at least [`EMPTIED_MIN_BYTES`] (see
-    /// `emptied`). O(tables), and only once the log is that long and holds dead rows.
+    /// `emptied`), moving `emptied_at` even if one is already pending. O(tables) at most (it stops
+    /// at the first table with a row), and only once the log is that long and holds dead rows.
     fn note_if_emptied(&mut self) {
-        if !self.emptied
-            && self.has_dead
+        if self.has_dead
             && self.log.file_len() >= EMPTIED_MIN_BYTES
             && self.tables.values().all(|table| table.idx.as_ref().is_none_or(BtreeIndex::is_empty))
         {
@@ -742,8 +756,13 @@ impl Writer {
         self.base = base;
         self.has_dead = has_dead;
         // An emptying after the snapshot was copied with the rows it cleared (live when copied,
-        // dead after the catch-up's clears): the new generation still needs its reset.
-        self.emptied = self.emptied && self.emptied_at > self.snapshot_end;
+        // dead after the catch-up's clears): the new generation still needs its reset, unless
+        // nothing it holds is dead (the tables were empty already when copied).
+        self.emptied = self.emptied && self.emptied_at > self.snapshot_end && has_dead;
+        // `emptied_at` is a position in the old log. Every later snapshot of the new generation
+        // comes after that emptying, so its next switch drops a signal kept here unless a new
+        // emptying moves it on.
+        self.emptied_at = 0;
         let ids: Vec<TableId> = self.tables.keys().copied().collect();
         for id in ids {
             self.publish(id);
@@ -755,16 +774,24 @@ impl Writer {
 impl Drop for Writer {
     /// A clean close: the commit thread has stopped; commit the log the ordinary way, and record
     /// the log length every index matches, so the next open needs no rebuild. A close that cannot
-    /// commit (or follows a failed sync) leaves every index marked stale instead.
+    /// commit (or follows a failed sync, or a stopped writer) leaves the log unsealed and every
+    /// index marked stale instead.
+    ///
+    /// After damage a read found (see [`Core::read_damaged`] and [`Self::latch_if_poisoned`]), and
+    /// nothing else, the log is still committed and sealed, but every index is marked stale: the
+    /// next open replays the sealed log, which must read whole. Damage to an index is then rebuilt;
+    /// damage to the log fails the open on every retry, where an unsealed log's replay would take
+    /// the damaged record for a crash's torn tail and cut every acknowledged batch after it.
     fn drop(&mut self) {
         let committed =
-            self.failed.is_none() && !self.durability.is_failed() && self.log.commit().is_ok();
+            self.failed.is_none() && !self.durability.log_unknown() && self.log.commit().is_ok();
         if committed {
             self.log.stamp_commit_marker();
         } else {
             self.log.poison();
         }
-        let len = if committed { self.log.file_len() } else { u64::MAX };
+        let current = committed && !self.durability.is_failed();
+        let len = if current { self.log.file_len() } else { u64::MAX };
         for table in self.tables.values_mut() {
             if let Some(idx) = table.idx.as_mut() {
                 idx.set_data_file_length(len);
@@ -982,14 +1009,16 @@ impl Core {
         })
     }
 
-    /// Bytes of the log not yet synced.
-    /// Latch damage a read of table `table` found (its index, or the record an index entry points
-    /// at): the database can no longer be trusted to answer, so every later write and persist
-    /// fails and the node stops; the restart rebuilds the index (a damaged index is never sealed).
+    /// Latch damage a read of table `table` found (its index, or the log record an index entry
+    /// points at): the database can no longer be trusted to answer, so every later write and
+    /// persist fails and the node stops. The log is not poisoned: the close seals it with every
+    /// index marked stale (see `Writer::drop`), so the restart replays it whole, rebuilding a
+    /// damaged index, and refuses a damaged log record rather than cut the log there.
     pub(super) fn read_damaged(&self, table: &str, e: &dyn std::fmt::Display) {
-        self.durability.fail(format!("tndb: a read of table {table} found damage: {e}"));
+        self.durability.fail_damaged(format!("tndb: a read of table {table} found damage: {e}"));
     }
 
+    /// Bytes of the log not yet synced.
     pub(super) fn unsynced(&self) -> u64 {
         let frontier = self.frontier.load();
         frontier.end.saturating_sub(frontier.sync.synced.load(Ordering::Acquire))
@@ -1145,9 +1174,9 @@ impl Core {
         let effective = match writer.effective(ops) {
             Ok(effective) => effective,
             Err(e) => {
-                // A removal's lookup that met index damage poisoned that index; nothing was
-                // written, but the database stops, as after a failed batch on it.
-                writer.stop_if_poisoned(ops);
+                // A removal's lookup that met index damage poisoned that index: nothing was
+                // written, and the database stops as after a read's damage.
+                writer.latch_if_poisoned(ops, &e);
                 return Err(e);
             }
         };
@@ -1223,6 +1252,18 @@ impl Core {
     #[cfg(test)]
     pub(super) fn base(&self) -> u64 {
         self.writer.lock().base
+    }
+
+    /// Test-only: whether the log may hold a dead row (see `Writer::has_dead`).
+    #[cfg(test)]
+    pub(super) fn has_dead(&self) -> bool {
+        self.writer.lock().has_dead
+    }
+
+    /// Test-only: whether an emptying's reset is pending (see `Writer::emptied`).
+    #[cfg(test)]
+    pub(super) fn emptied(&self) -> bool {
+        self.writer.lock().emptied
     }
 
     /// Test-only: the next rollback panics.
@@ -1427,7 +1468,7 @@ fn build_gen0(dir: &Path) -> eyre::Result<()> {
 
 /// The index directories of tables the manifest does not have (or whose key size it has not
 /// fixed).
-fn orphan_indexes(gen_path: &Path, manifest: &Manifest) -> eyre::Result<Vec<PathBuf>> {
+pub(super) fn orphan_indexes(gen_path: &Path, manifest: &Manifest) -> eyre::Result<Vec<PathBuf>> {
     let mut orphans = Vec::new();
     for entry in fs::read_dir(gen_path)? {
         let entry = entry?;
@@ -1623,12 +1664,20 @@ fn recover(
         sink.0.insert(entry.id, BtreeIndex::open_btx_file(&dir, header, entry.ksize, false)?);
     }
     let Replayed { end, tear } = replay(log, manifest, &mut sink)?;
-    if end < log.file_len() {
+    let file_len = log.file_len();
+    if end < file_len {
+        // An unclean log runs to its capacity, whose last bytes hold the commit marker: not data,
+        // and there after every crash. Only other bytes past the last whole batch are reported.
+        let data_end = file_len.saturating_sub(COMMIT_MARKER_LEN).max(end);
+        let data_followed =
+            log.read_bytes(end, data_end).ok().is_none_or(|tail| tail.iter().any(|&b| b != 0));
         if let Some(cut) = log.rewind_to(end) {
             // Bytes followed the last whole batch. After a power loss that is normal (a round's
             // pages reach the disk in any order, so unacknowledged batches can survive past a
             // torn page); otherwise it can mean damage to acknowledged data. Say what was cut.
-            tracing::warn!(target: "tndb", "recovery cut the log at {end}, its last whole batch, after {}; non-zero bytes followed up to {} (commit marker: {:?})", tear.as_deref().unwrap_or("a partial batch"), cut.end, log.committed_end());
+            if data_followed {
+                tracing::warn!(target: "tndb", "recovery cut the log at {end}, its last whole batch, after {}; non-zero bytes followed up to {} (commit marker: {:?})", tear.as_deref().unwrap_or("a partial batch"), cut.end, log.committed_end());
+            }
             // The open-time sync made the old tail durable, and its zeros are only in memory:
             // flush them now, as a rollback does, or a power loss before writeback could bring
             // stale batches back behind the ones written next.

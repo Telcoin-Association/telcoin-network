@@ -12,16 +12,17 @@
 3. the module docs at the top of the file.
 
 **Three files are too big to read whole:**
-- `consensus_pack.rs` is 12.5k lines;
-- `consensus.rs` and `epoch_records.rs` are about 5k each.
+- `consensus_pack.rs` is 15.4k lines;
+- `consensus.rs` and `epoch_records.rs` are about 6k each.
 
 Each starts with a "Where things are" list. Grep for the symbol, read with an offset and limit,
 and remember that everything after `mod test` is tests (more than half of `consensus_pack.rs`).
 
 **Design docs:**
 - **`README.md`:**
-  - "Layered architecture" §1–7: the byte, record and index layers, `ConsensusPack`, the recovery
-    model (four invariants), `ConsensusChain`, and the key/value stores;
+  - "Layered architecture" §1–8: the byte, record and index layers, `ConsensusPack`, the recovery
+    model (four invariants), `ConsensusChain`, the key/value stores, and why a write failure stops
+    the node (and a peer's bad input never does);
   - "On-disk layout", "Tooling" (`db validate/repair/migrate`), "Benchmarks";
   - "Intentional design decisions — please do not flag these".
 - **`src/tndb/README.md`:** Layout, Records, Writes, Reads, Durability, Transactions, Recovery,
@@ -39,12 +40,14 @@ and remember that everything after `mod test` is tests (more than half of `conse
 | `archive/pack_iter.rs` | sequential record iterators (sync and async) over a data log |
 | `archive/{position_index,digest_index,btree_index}/` | derived indexes: number → position, digest → position (`HdxIndex`, a hash index with a bloom), ordered keys (`BtreeIndex`, copy-on-write) |
 | `archive/{crc,page_set,fxhasher,index}.rs` | CRC32 (aarch64 PMULL path), dirty-page sets, the stable hasher, the `Index` trait |
-| `consensus_pack.rs` (**12.5k**) | `ConsensusPack`: one epoch's outputs: save, reads, recovery, legacy migration, import from peers, output decode |
-| `consensus.rs` (**5.5k**) | `ConsensusChain`: the current pack and the static-pack cache, epoch handoff, import and staging, the `LatestConsensus` slot files |
-| `epoch_records.rs` (**5.1k**) | `EpochRecordDb`: epoch records and certificates (an actor thread) |
+| `consensus_pack.rs` (**15.4k**) | `ConsensusPack`: one epoch's outputs: save, reads, recovery, legacy migration, import from peers, output decode |
+| `consensus.rs` (**6.3k**) | `ConsensusChain`: the current pack and the static-pack cache, epoch handoff, import and staging, the `LatestConsensus` slot files |
+| `epoch_records.rs` (**6.2k**) | `EpochRecordDb`: epoch records and certificates (an actor thread) |
 | `certificate_pack.rs` | the per-epoch certificate pack (an actor thread) |
 | `exec_state_pack.rs` | the EVM state snapshot pack |
+| `error_latch.rs` | `latch_first_error`: first-error-wins for the actor packs' background-write error slots |
 | `pack_validate.rs` | read-only pack validation (`db validate`) |
+| `epoch_db_recovery.rs` | the startup check, on every `open_db`, that the epoch tables' headers decode with this binary: drops a seconds-only fork-epoch `LastProposed`, refuses any other undecodable row (#1572) |
 | `tndb/` | the shared-log `Database` (see its README): `store.rs` (log + indexes, the one write lock), `commit.rs` (the commit thread), `database.rs` (`TnDatabase`), `split.rs` (`SplitDatabase`, one log per environment), `compact.rs`, `record.rs`, `layout.rs`, `manifest.rs`, `metrics.rs`, `inspect.rs`, `test.rs` |
 | `lib.rs` | the tables (`mod tables`), `DatabaseType = tndb::SplitDatabase`, `open_db`, the MDBX → tndb migration (`migrate_from_mdbx`) |
 | `stores/` | typed stores over `Database` (certificates, payload, proposer, votes) |
@@ -84,10 +87,16 @@ and remember that everything after `mod test` is tests (more than half of `conse
   Group commit: `persist` acknowledges once the writes before it are durable.
 
 ## Invariants: do not break these
+- **A write failure of the node's own storage stops the node** (README §8): an IO or sync error, a
+  latched store or damage found on disk ends in a non-zero exit, never a log line and carry on.
+  Refusing a peer's bad input never stops it. Two exceptions: the `LatestConsensus` slot files (a
+  hint), and a pack import (its own directory, removed on failure; the fetcher tries another peer).
 - **Destructive recovery fails closed.** Validate the data log (the WAL) before deleting indexes
   (`recover_pack`, `check_recoverable`). An open that would initialise a file must first prove it
   holds nothing past its header. Never let a failed attempt or a corrupt proxy authorize erasing
-  committed data.
+  committed data. A read error is never a torn tail (only `UnexpectedEof` is a tear; `FetchError::is_read_failure`,
+  next to `pack_iter::read_frame`, is the one rule), and an absent
+  file beside an index that attests data counts as corrupt, never new.
 - **The clean-close seal is gated.**
   - `MmapDataFile`'s `Drop` seals only when the file is not `opened_unclean`, not poisoned (any
     failed write, sync, grow or remap sets the latch), and not dropped during a panic.
@@ -113,6 +122,11 @@ and remember that everything after `mod test` is tests (more than half of `conse
     containment. `EpochRecordDb`'s by-number routing (`final_numbers`) is built at open and
     extended on its thread from the stored records after every save, whatever its outcome, by one
     checked read (`extend_routing`; `sync_routing` after a save).
+- **tndb read damage latches without poisoning the log.** Damage a read finds (a removal's lookup
+  included, `Writer::latch_if_poisoned`) fails every later write and persist
+  (`Durability::fail_damaged`); only a sync or writer failure (`Durability::log_unknown`) keeps the
+  seal off. The close after read damage marks every index stale, so the next open replays a sealed
+  log: a damaged index is rebuilt, a damaged log refused.
 - **Encode changes must keep the bytes on disk identical.** Prove it the way
   `stored_append_matches_append` and `test_split_encoding_matches_one_lane` do.
 - **Sub-dag serde is fork-gated** (fields written only after their fork). Cache what a pack read
@@ -137,7 +151,7 @@ and remember that everything after `mod test` is tests (more than half of `conse
   that describes it.
 
 ## Testing
-- **Storage tests:** `cargo test --release -p tn-storage --lib` (about 600 tests, seconds in
+- **Storage tests:** `cargo test --release -p tn-storage --lib` (about 750 tests, seconds in
   release). One test: add `-- <path::to::test> --exact`.
 - **Lanes:** `./etc/ci-lanes.sh clippy` (default and `--all-features`) and
   `./etc/ci-lanes.sh test-default` (nextest, the workspace).
@@ -149,9 +163,18 @@ and remember that everything after `mod test` is tests (more than half of `conse
   - `CommitteeFixture` and `MemDatabase` for committees, `TempDir` for files.
 - **Pack test hooks:** `fail_next_save` (rollback), `panic_next_save` (the unsealed panic path),
   `set_encode_lanes` (force the split encode), `slow_batch_reads` (slow batch reads, for
-  cancellation and lock-yield tests); thread-local `SKIP_NEXT_LEGACY_CHECK`, `FAIL_NEXT_INSTALL`,
-  `FAIL_NEXT_MIGRATION_SEAL` (a legacy pack reaching the writable open, a failed install rename, an
-  unsealed staged migration). `EpochRecordDb`: `fail_index_save_after_append`,
+  cancellation and lock-yield tests), `pause_batches_after` (a `batches` request pauses after n
+  reads, outside the locks, for a seal-under-request test); thread-local `SKIP_NEXT_LEGACY_CHECK`, `FAIL_NEXT_INSTALL`,
+  `FAIL_NEXT_MIGRATION_SEAL`, `FAIL_NEXT_HEAL_SEAL` (a legacy pack reaching the writable open, a
+  failed install rename, an unsealed staged migration, an index heal that did not seal);
+  `ENVIRONMENTAL_NEXT_SEAL_CHECK` (the next `check_installed_pack_sealed` fails as descriptor
+  exhaustion does; `stream_import` carries it onto its blocking thread);
+  `pack_iter::{FAIL_READ_AT, FAIL_READ_SKIP, FAIL_READ_TORN}` (a read error or short read at a
+  frame, optionally on a later pass; the epoch DB and cert pack tests reach each walk by choosing
+  which attestations survive). `ConsensusPack::poison_data_for_test` and
+  `ConsensusChain::poison_current_pack_for_test` (test-utils: poison the data log as a failed sync
+  does; the second for node tests); thread-local `FAIL_NEXT_IMPORT_SEAL` in `consensus.rs` (an
+  imported pack left unsealed). `EpochRecordDb`: `fail_index_save_after_append`,
   `fail_epoch_slot_save_after_digest`. Log assertions: `consensus_pack::test::warnings_and_errors`.
 - **Check a new test with a mutation:** break the code it guards, see it fail, restore.
 

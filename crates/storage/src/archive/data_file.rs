@@ -352,7 +352,9 @@ pub struct MmapFileOptions {
     /// open, so its barriers skip the deferred size fsync ([`MmapDataFile::sync_size_if_grown`]):
     /// a growth's size becomes durable at the clean-close seal (or [`MmapDataFile::sync_disk`]).
     /// After a crash such a file may be shorter than its own header claims; that is safe only
-    /// because an unsealed derived file is never trusted.
+    /// because an unsealed derived file is never trusted to keep data: its owner rebuilds it, and
+    /// the one read of one before that (the consensus pack's position index in `recover_pack`)
+    /// takes it only as evidence to refuse a cut.
     pub derived: bool,
     /// Bytes of address space a writable handle reserves for its mapping (0 = off). With a
     /// reservation the file is mapped once, at `max(reserve, file length)` bytes, and grows
@@ -1816,8 +1818,10 @@ impl Write for MmapDataFile {
         // Fail closed after any earlier write/sync/remap failure: the durability of what is already
         // written is unknown, so admitting more data would only pile unsyncable bytes on a failing
         // mapping and hide the fault. Like every write error, `PackInner::append` moves the pack
-        // to its failed state on it (see `pack.rs`), which the consensus actor treats as fatal and
-        // reopens, where recovery replays the WAL and truncates the unacked tail.
+        // to its failed state on it (see `pack.rs`): every later append and commit fails until the
+        // file is reopened, and that open's recovery replays the WAL and truncates the unacked
+        // tail. (A failed consensus-pack save stops the node; a same-epoch re-entry before then
+        // keeps the failed handle, whose saves keep failing.)
         if self.is_poisoned() {
             return Err(io::Error::other(
                 "data file poisoned by an earlier write/sync failure; refusing further writes",

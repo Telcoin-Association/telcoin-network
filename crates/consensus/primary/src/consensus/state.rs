@@ -8,6 +8,7 @@ use std::{
     cmp::{max, Ordering},
     collections::{BTreeMap, BTreeSet, HashMap},
     fmt::Debug,
+    sync::Arc,
 };
 use tn_config::ConsensusConfig;
 use tn_storage::{
@@ -322,15 +323,29 @@ pub struct Consensus<DB> {
 
     /// Optional pack that is available we want to save all our certificates into
     /// before sending to bullshark.
-    certificate_pack: Option<CertificatePack>,
+    ///
+    /// Shared with the epoch's owner (`run_epoch` in the node), which seals it once this task has
+    /// ended and stops the node if the seal reports a failed save: an error this task returned
+    /// after the epoch's shutdown was signalled would only be logged.
+    certificate_pack: Option<Arc<CertificatePack>>,
 }
 
-/// Whether to keep using a certificate pack whose `try_save` returned `error`. Only a full channel
-/// is transient backpressure. Any other error is permanent for this pack: a latched open or save
-/// failure is returned by every later call, and a closed channel means its thread is gone. Keeping
-/// such a pack would only log the same failure once per certificate.
-fn keep_certificate_pack_after(error: &PackError) -> bool {
-    matches!(error, PackError::SendFull)
+/// The outcome of archiving a certificate in this epoch's certificate pack, given what
+/// [`CertificatePack::try_save`] returned.
+///
+/// Only a full channel ([`PackError::SendFull`]) is transient backpressure: that certificate goes
+/// unarchived and consensus carries on. Any other error means the pack has failed for good, and it
+/// is this node's own storage failing, never a peer's input: certificates are verified before they
+/// reach consensus, and nothing a peer sends can latch the pack (only its own open, write or sync
+/// failing, or its thread being gone, does). So it ends the consensus task, which stops the node.
+fn certificate_archived(saved: Result<(), PackError>) -> Result<(), ConsensusError> {
+    match saved {
+        Err(PackError::SendFull) => {
+            warn!(target: "telcoin::consensus_state", "cert pack is backed up; this certificate was not archived");
+            Ok(())
+        }
+        saved => saved.map_err(ConsensusError::CertificatePack),
+    }
 }
 
 /// Resolve the epoch seed chain anchor from the two cursors recovered at startup, failing closed
@@ -425,7 +440,7 @@ impl<DB: Database> Consensus<DB> {
         protocol: Bullshark,
         task_manager: &TaskManager,
         consensus_chain: &impl ConsensusChainReader,
-        certificate_pack: Option<CertificatePack>,
+        certificate_pack: Option<Arc<CertificatePack>>,
     ) -> Result<(), ConsensusError> {
         let rx_shutdown = consensus_config.shutdown().subscribe();
         // The consensus state (everything else is immutable).
@@ -523,14 +538,8 @@ impl<DB: Database> Consensus<DB> {
         // Listen to incoming certificates.
         loop {
             tokio::select! {
-                _ = &self.rx_shutdown => {
-                    if let Some(pack) = self.certificate_pack {
-                        if let Err(e) = pack.shutdown().await {
-                            error!(target: "epoch-manager", ?e, "error shutting down certificate pack");
-                        }
-                    }
-                    return Ok(())
-                }
+                // The epoch's owner seals the certificate pack once this task has ended.
+                _ = &self.rx_shutdown => return Ok(()),
 
                 Some(certificate) = rx_new_certificates.recv() => {
                     self.new_certificate(certificate).await.inspect_err(|e| {
@@ -554,16 +563,7 @@ impl<DB: Database> Consensus<DB> {
             }
         }
         if let Some(certificate_pack) = &self.certificate_pack {
-            if let Err(e) = certificate_pack.try_save(certificate.clone()) {
-                // Not a critical path, so a failed pack does not stop consensus (but a node whose
-                // storage is failing is probably not long for this world).
-                if keep_certificate_pack_after(&e) {
-                    tracing::warn!(target: "telcoin::consensus_state", ?e, "cert pack is backed up; this certificate was not archived");
-                } else {
-                    tracing::error!(target: "telcoin::consensus_state", ?e, "cert pack failed; no longer archiving certificates this epoch");
-                    self.certificate_pack = None;
-                }
-            }
+            certificate_archived(certificate_pack.try_save(certificate.clone()))?;
         }
         // Process the certificate using the selected consensus protocol.
         let (outcome, committed_sub_dags) =

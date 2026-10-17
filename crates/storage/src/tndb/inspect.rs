@@ -14,7 +14,7 @@ use super::{
     layout::{gen_dir, list_gens, lock_dir_shared},
     manifest::{Entry, Manifest},
     split::{ENVIRONMENTS, MDBX_MIGRATED},
-    store::{idx_dir, open_log_read_only, replay, RowsSink},
+    store::{idx_dir, open_log_read_only, orphan_indexes, replay, RowsSink},
 };
 use crate::archive::{
     btree_index::BtreeIndex,
@@ -31,6 +31,10 @@ pub struct EnvReport {
     pub older_generations: Vec<u64>,
     /// Unfinished `compact-*` builds left by a close or a crash (the next open deletes them).
     pub unfinished_builds: usize,
+    /// Index directories (`idx-<id>`) of tables the manifest does not name, or whose key size it
+    /// has not fixed: a manifest rolled back to an older copy. Each forces a full replay at the
+    /// next open, which fails if its table has records left, and is deleted once that passes.
+    pub orphan_indexes: Vec<String>,
     /// The log was closed cleanly (false: after a crash, the next open replays it).
     pub clean: bool,
     /// The log file's length on disk (its data, plus preallocated room).
@@ -65,10 +69,12 @@ pub struct TableReport {
     pub index: IndexState,
 }
 
-/// A table index's state, as the next open would find it.
+/// A table index's state, as the next open would find it from the index's header and root.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum IndexState {
-    /// Closed cleanly and covering the whole log: the next open uses it.
+    /// Closed cleanly, covering the whole log, with a sound root: the next open uses it, unless
+    /// its open-time walk of the internal pages (which a writable open runs, and an inspection
+    /// cannot) finds damage below the root, which rebuilds it.
     Current,
     /// Closed cleanly but covering a different length of the log: rebuilt at the next open.
     Stale,
@@ -110,7 +116,11 @@ pub struct SplitReport {
 /// it was never opened as a database, or if its log is damaged (as its next open would).
 pub fn inspect(root: &Path) -> eyre::Result<EnvReport> {
     let _lock = lock_dir_shared(root)?;
-    let manifest = Manifest::read(root)?.unwrap_or_default();
+    let manifest = Manifest::read(root)?;
+    // As at open, orphans are reckoned only against a manifest: with it lost, any record fails
+    // the replay.
+    let manifest_lost = manifest.is_none();
+    let manifest = manifest.unwrap_or_default();
     let gens = list_gens(root)?;
     let Some((&generation, older)) = gens.split_last() else {
         bail!("tndb: {} holds no generation", root.display());
@@ -120,6 +130,14 @@ pub fn inspect(root: &Path) -> eyre::Result<EnvReport> {
         .filter(|entry| entry.file_name().to_string_lossy().starts_with("compact-"))
         .count();
     let gen_path = gen_dir(root, generation);
+    let orphan_indexes = if manifest_lost {
+        Vec::new()
+    } else {
+        orphan_indexes(&gen_path, &manifest)?
+            .into_iter()
+            .filter_map(|dir| dir.file_name().map(|name| name.to_string_lossy().into_owned()))
+            .collect()
+    };
     let log = open_log_read_only(&gen_path)
         .wrap_err_with(|| format!("tndb: open generation {generation} of {}", root.display()))?;
     let header = *log.header();
@@ -149,6 +167,7 @@ pub fn inspect(root: &Path) -> eyre::Result<EnvReport> {
         generation,
         older_generations: older.to_vec(),
         unfinished_builds,
+        orphan_indexes,
         clean: !log.opened_unclean(),
         file_bytes: fs::metadata(gen_path.join("log"))?.len(),
         data_end,
@@ -170,7 +189,7 @@ pub fn inspect_split(root: &Path) -> SplitReport {
 }
 
 /// The state of `entry`'s index in the generation at `gen_path`, whose log is `log_len` long,
-/// opened read-only.
+/// opened read-only (so without the writable open's walk: see [`IndexState::Current`]).
 fn index_state(gen_path: &Path, entry: &Entry, header: &DataHeader, log_len: u64) -> IndexState {
     if entry.ksize == 0 {
         return IndexState::NoKeySize;

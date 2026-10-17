@@ -173,6 +173,14 @@ impl TnDatabase {
         super::commit::wait_durable(&self.core, self.core.durability.last_seq())
     }
 
+    /// Resolve with the cause once this database has latched a failure (a failed sync, a stopped
+    /// writer, a panic, or damage a read found): at once if it already has, never otherwise. It
+    /// holds only the durability state, not the database, so a pending one keeps no file open.
+    pub(super) fn failure(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        let durability = Arc::clone(&self.core.durability);
+        async move { durability.failed().await }
+    }
+
     /// Test-only (other crates' tests too, through `test-utils`): latch a durability failure as a
     /// failed sync does, so every later write and persist fails until the database is reopened.
     #[cfg(any(test, feature = "test-utils"))]
@@ -206,6 +214,18 @@ impl TnDatabase {
     #[cfg(test)]
     pub(super) fn compact_now(&self) -> Result<bool, String> {
         self.core.compact.compact_now()
+    }
+
+    /// Call `visit` with the stored key and value bytes of every row of table `T` (open), in key
+    /// order, decoding nothing: to check rows another binary may have written
+    /// (`epoch_db_recovery`). A scan that damage cuts short is an error, not a shorter table.
+    pub(crate) fn scan_raw<T: Table>(
+        &self,
+        mut visit: impl FnMut(&[u8], &[u8]),
+    ) -> eyre::Result<()> {
+        let mut scan = self.table::<T>()?.scan(ScanKind::Forward, Arc::clone(&self.core));
+        while scan.next_with(&mut visit).is_some() {}
+        self.core.durability.check()
     }
 }
 
@@ -530,7 +550,8 @@ impl Database for TnDatabase {
     }
 
     /// Wait until every write made before the call (in any table) is durable; an error once any
-    /// write or sync has failed. In [`CommitMode::Sync`] a write is durable when it returns, but
+    /// write or sync has failed, or a read found damage (the latch is never cleared, so every
+    /// later call fails too). In [`CommitMode::Sync`] a write is durable when it returns, but
     /// another thread's can be visible before its sync finishes: that one is waited for too (by
     /// running the round, as a Sync write does).
     fn persist<T: Table>(&self) -> impl std::future::Future<Output = eyre::Result<()>> + Send {
@@ -551,5 +572,11 @@ impl Database for TnDatabase {
     fn compact(&self) -> eyre::Result<()> {
         self.core.compact.request();
         Ok(())
+    }
+
+    /// Resolve once this database has latched a failure (see [`TnDatabase::failure`]).
+    fn failed(&self) -> impl std::future::Future<Output = String> + Send + 'static {
+        let failure = self.failure();
+        async move { format!("tndb: the database failed: {}", failure.await) }
     }
 }

@@ -158,8 +158,9 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     ) -> impl Future<Output = eyre::Result<u64>> + Send;
 
     /// Rotate the current pack file to a new epoch.  The previous pack is
-    /// persisted and moved into the recent-packs cache before the new pack
-    /// is opened.
+    /// persisted before the new pack is opened, then evicted from the
+    /// recent-packs cache and sealed (later reads reopen it read-only).  A call
+    /// for the epoch of the current writable pack is a no-op that keeps it.
     fn new_epoch(
         &self,
         previous_epoch: EpochRecord,
@@ -167,8 +168,10 @@ pub trait ConsensusChainWriter: ConsensusChainReader {
     ) -> impl Future<Output = eyre::Result<()>> + Send;
 
     /// Import an epoch's pack file from a peer stream.  Returns once the
-    /// stream is fully consumed and the resulting pack file has been moved
-    /// into the canonical epoch directory.
+    /// stream is fully consumed and the resulting pack file has been sealed,
+    /// checked, and moved into the canonical epoch directory.  Returns `Ok`
+    /// early, without reading the stream, when the chain already holds the
+    /// record's final output or this process is already importing the epoch.
     fn stream_import<R: AsyncRead + Unpin + Send>(
         &self,
         stream: R,

@@ -411,13 +411,20 @@ where
         let max_record = opts.max_record_size.unwrap_or(MAX_RECORD_SIZE);
         // Every read caps a decompressed record at `MAX_RECORD_SIZE`, and a compressed pack's cap
         // applies to the record before compression: above it, an append could succeed and the
-        // read fail.
-        if matches!(compression, PackCompression::ZStd) && max_record > MAX_RECORD_SIZE {
+        // read fail. Checked against the compression asked for before a new file is created, and
+        // against the one an existing file's header records (which is what its appends use).
+        let cap_too_large = |compression| {
+            matches!(compression, PackCompression::ZStd) && max_record > MAX_RECORD_SIZE
+        };
+        if cap_too_large(compression) {
             return Err(OpenError::RecordCapTooLarge(max_record));
         }
         let (data_file, header) =
             Self::open_data_file(path, uid_idx, read_only, compression, version, opts)
                 .map_err(OpenError::DataFileOpen)?;
+        if cap_too_large(header.compression()) {
+            return Err(OpenError::RecordCapTooLarge(max_record));
+        }
         Ok(Self {
             header,
             data_file,
@@ -1794,6 +1801,18 @@ mod tests {
             opts(MAX_RECORD_SIZE),
         )
         .expect("the read cap itself");
+        // An existing file appends with the compression its header records, whatever the caller
+        // passes: the cap is checked against that.
+        let err = Pack::<TestRec>::open_with(
+            &path,
+            0,
+            false,
+            PackCompression::None,
+            0,
+            opts(MAX_RECORD_SIZE + 1),
+        )
+        .expect_err("a compressed file, opened as uncompressed, with a cap above the read cap");
+        assert!(matches!(err, OpenError::RecordCapTooLarge(_)), "got {err:?}");
         Pack::<TestRec>::open_with(
             tmp_path.path().join("plain"),
             0,

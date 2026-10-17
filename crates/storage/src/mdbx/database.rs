@@ -419,6 +419,8 @@ impl Database for MdbxDatabase {
 }
 
 impl RawRows for MdbxDatabase {
+    const EPOCH_DIR: &'static str = "consensus-db/epoch";
+
     fn for_each_raw_row<T: Table>(&self, mut visit: impl FnMut(&[u8], &[u8])) -> eyre::Result<()> {
         let mut cursor = self.read_txn()?.cursor::<T>()?;
         while let Some((key, value)) = cursor.next::<Vec<u8>, Vec<u8>>()? {

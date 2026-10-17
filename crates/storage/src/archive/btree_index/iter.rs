@@ -81,7 +81,8 @@ impl BtreeCursor {
 
     /// The leaf `leaf` just pushed must be where the tree says: at the tree's height, with its keys
     /// inside the range its ancestors' separators give it. A child pointer damaged at rest that
-    /// leads to another valid page fails here, rather than the scan yielding that page's entries.
+    /// leads to another page of the tree fails here, rather than the scan yielding that page's
+    /// entries (one that leads to a stale, still CRC-valid copy of the right subtree does not).
     fn check_leaf<S: PageSource + ?Sized>(&self, src: &S, leaf: &[u8]) -> Result<(), FetchError> {
         let node = src.node();
         if self.depth != src.height() as usize {
@@ -91,18 +92,23 @@ impl BtreeCursor {
                 src.height()
             )));
         }
-        // The nearest ancestor with a separator on each side bounds the leaf most tightly.
-        let (mut lo, mut hi) = (None, None);
-        for &(p, ci) in self.path[..self.depth - 1].iter().rev() {
-            if lo.is_some() && hi.is_some() {
-                break;
-            }
+        // The intersection of every ancestor's range bounds the leaf. In a sound tree the nearest
+        // ancestor's is the tightest, but a pointer misrouted to another internal page brings that
+        // page's separators, which can be wider than its parents'.
+        let (mut lo, mut hi): (Option<&[u8]>, Option<&[u8]>) = (None, None);
+        for &(p, ci) in &self.path[..self.depth - 1] {
             let buf = src.page(p)?;
-            if lo.is_none() && ci > 0 {
-                lo = Some(node.internal_key(buf, ci - 1));
+            if ci > 0 {
+                let k = node.internal_key(buf, ci - 1);
+                if lo.is_none_or(|lo| k > lo) {
+                    lo = Some(k);
+                }
             }
-            if hi.is_none() && ci < node.entry_count(buf) {
-                hi = Some(node.internal_key(buf, ci));
+            if ci < node.entry_count(buf) {
+                let k = node.internal_key(buf, ci);
+                if hi.is_none_or(|hi| k < hi) {
+                    hi = Some(k);
+                }
             }
         }
         if !node.leaf_in_range(leaf, lo, hi) {

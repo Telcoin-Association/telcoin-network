@@ -16,7 +16,7 @@
 
 use super::{export_retention::PublishOutcome, run_epoch::retry_provider_faults};
 use crate::{engine::ExecutionNode, manager::EpochManager, primary::PrimaryNode};
-use eyre::eyre;
+use eyre::{eyre, WrapErr as _};
 use std::{collections::BTreeSet, path::Path, time::Duration};
 use tn_config::TelcoinDirs;
 use tn_reth::{recover_raw_transaction, RethEnv};
@@ -749,15 +749,16 @@ where
         // Flush the closed epoch's consensus pack so the copy in the completion task captures a
         // complete file. The consensus pack is only persisted by the *next* epoch's `new_epoch`, so
         // persist it here while epoch N is still the current pack. The bounded records/certs bundle
-        // is built through the actor (not copied), so no records-pack flush is needed here. A
-        // persist hiccup must not crash the node, so log and skip the export. The `data_len`
+        // is built through the actor (not copied), so no records-pack flush is needed here. The
+        // persist writes the node's own consensus pack, so a failure is our own storage failing:
+        // it is returned and stops the node, as `finish_epoch`'s persist would. The `data_len`
         // capture below (not a padding-truncate) is what makes the later copy correct, so
         // this no longer depends on the epoch being quiescent between here and the deferred
         // copy.
-        if let Err(e) = self.consensus_chain.persist_current().await {
-            warn!(target: "tn::snapshot", epoch, error = %e, "could not persist consensus pack; skipping export");
-            return Ok(());
-        }
+        self.consensus_chain
+            .persist_current()
+            .await
+            .wrap_err("the consensus pack can no longer make writes durable; stopping the node")?;
         // Capture the pack's logical data length (`end`) while epoch N is still current. The
         // completion task bounds its raw copy of the `data` file to this length, so it captures
         // exactly the written records (`[0, end)`, immutable append-only bytes) and never the mmap

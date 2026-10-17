@@ -62,7 +62,13 @@ rm -rf "$src_before/tn-contracts"
 ln -s "$repo/tn-contracts" "$src_before/tn-contracts"
 [ -f "$src_before/$bench_file" ] || die "$before has no $bench_file"
 if [ "${AB_BENCH_FROM:-}" != checkout ] && grep -q "fn $bench_fn()" "$src_before/$bench_file"; then
-    bench_before="the commit's own"
+    # A bench whose timed region changed would read as a performance change, so the report says
+    # whether the two copies differ (AB_BENCH_FROM=checkout runs one copy on both sides).
+    if cmp -s "$src_before/$bench_file" "$repo/$bench_file"; then
+        bench_before="the commit's own (identical to this checkout's)"
+    else
+        bench_before="the commit's own (DIFFERS from this checkout's; see AB_BENCH_FROM)"
+    fi
     target_key="$(git -C "$repo" rev-parse --short "$before")"
 else
     # Keeping the file's own mtime: a rerun with the same bench finds its build fresh, and an
@@ -130,6 +136,11 @@ kv "before binary" "$bin_before $(digest "$bin_before") ($(tests "$bin_before") 
 kv "after binary" "$bin_after $(digest "$bin_after") ($(tests "$bin_after") tests)"
 [ "$(digest "$bin_before")" != "$(digest "$bin_after")" ] \
     || die "the before and after test binaries are identical: refusing to compare"
+# A filter that matches no test would run nothing and pass: require the bench in both binaries.
+for bin in "$bin_before" "$bin_after"; do
+    [ "$("$bin" "$bench" --exact --ignored --list 2>/dev/null | grep -c ': test$' || true)" = 1 ] \
+        || die "$bin has no ignored test named $bench: refusing to compare"
+done
 
 run() { # <label> <test binary> <source tree> <round>
     echo "running $1 (round $4)..." >&2

@@ -28,11 +28,11 @@ fn zstd_decode_error(e: io::Error) -> FetchError {
 }
 
 /// Decompress a zstd record `compressed` payload into `out`, enforcing the in-memory
-/// `MAX_RECORD_SIZE` cap on the decompressed size. Shared by the iterator decompression sites
-/// (sync + async `read_record_file`), which own a reusable buffer and so can materialize the
-/// decompressed output and report `RequestedDecompressSizeTooLarge`. (The `&self` `fetch` path
-/// instead streams the decode with no buffer -- see `PackInner::read_record_into`.) Clears `out`
-/// first and returns a borrow of it.
+/// `MAX_RECORD_SIZE` cap on the decompressed size, so an oversized record is reported as
+/// `RequestedDecompressSizeTooLarge`. Shared by every decompression site: the iterators (sync and
+/// async), which reuse their buffer, and the `&self` `fetch` path (`PackInner::read_record_into`),
+/// which decompresses into a fresh buffer and then decodes the slice. Clears `out` first and
+/// returns a borrow of it.
 ///
 /// The record's frame passed its CRC before this runs, so a payload zstd rejects is what the writer
 /// produced, not a read failure: it is reported as a decode fault, never as `IO` (a peer stream's
@@ -195,8 +195,13 @@ where
             return Err(FetchError::NotFound);
         }
         #[cfg(test)]
-        if FAIL_READ_AT.with(|at| at.get() == Some(*pos)) {
+        if FAIL_READ_AT.with(|at| at.get() == Some(*pos))
+            && FAIL_READ_SKIP.with(|skip| skip.replace(skip.get().saturating_sub(1))) == 0
+        {
             FAIL_READ_AT.with(|at| at.set(None));
+            if FAIL_READ_TORN.with(|torn| torn.replace(false)) {
+                return Err(FetchError::IO(io::ErrorKind::UnexpectedEof.into()));
+            }
             return Err(FetchError::IO(io::Error::from_raw_os_error(5)));
         }
         let mut val_size_buf = [0_u8; 4];
@@ -247,6 +252,18 @@ where
             PackCompression::None => Ok(&buffer[..]),
             PackCompression::ZStd => decompress_checked(&buffer[..], decompress_buffer),
         }
+    }
+}
+
+impl FetchError {
+    /// Is this a read the disk failed, as opposed to a frame that is short, runs past the end or
+    /// fails its checks? [`PackIter::read_frame`] defines the split: a tear (a frame past the
+    /// logical end, a short read) is an `IO` error of kind `UnexpectedEof`; any other `IO` error is
+    /// a disk failure; CRC, decompression and decode failures are not `IO` at all. A log walk must
+    /// stop on a read failure with an error, never take it for a torn tail: acked records may
+    /// follow it, and the bytes may read on a retry.
+    pub(crate) fn is_read_failure(&self) -> bool {
+        matches!(self, FetchError::IO(e) if e.kind() != io::ErrorKind::UnexpectedEof)
     }
 }
 
@@ -437,4 +454,9 @@ thread_local! {
     /// as a disk read can (`EIO`).
     pub(crate) static FAIL_READ_AT: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
+    /// Test-only: how many reads at [`FAIL_READ_AT`] succeed before the one that fails (so a test
+    /// can fail a later pass over the same log).
+    pub(crate) static FAIL_READ_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Test-only: the injected failure is a short read (a torn frame), not `EIO`.
+    pub(crate) static FAIL_READ_TORN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }

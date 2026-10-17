@@ -243,7 +243,7 @@ fn describe() {
     describe_gauge!(
         FAILED,
         Unit::Count,
-        "1 once a tndb failure latched (a failed sync, or a stopped writer): writes fail until a \
-         restart."
+        "1 once a tndb failure latched (a failed sync, a stopped writer, or damage a read found \
+         in an index or a log record): writes fail until a restart."
     );
 }

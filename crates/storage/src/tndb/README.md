@@ -39,7 +39,8 @@ crash leaves a generation without a log.
 atomically (tmp, `fsync`, rename, directory `fsync`) when a table is first opened, or when its first
 row fixes its key size. Both happen before the log holds any record of that table, so a record whose
 table id is missing from the manifest is damage. A table's index is created when its key size is
-fixed. An index directory the manifest doesn't know is deleted at open.
+fixed. An index directory the manifest doesn't know forces a full replay at open, which fails if
+its table has records left, and is deleted once the replay passes (see Recovery).
 
 ## Records (`record.rs`)
 
@@ -115,12 +116,21 @@ ends there (logged), and a compaction abandons rather than copy it. A removal wh
 cannot read fails the batch (nothing written) rather than counting the key absent, which would
 leave the row in place.
 
-**Damage a read finds stops the database.** A get, a scan, a seek or a removal's lookup that meets
-index damage (or a record that does not match its index entry) latches it as a durability failure:
-every later write and persist fails, so the node stops rather than act on a missing row or a scan
-that ended short (a scan cannot carry the error), and the damaged index, never sealed again, is
-rebuilt from the log at the next open. An index whose open-time walk fails is refused at open and
-rebuilt the same way.
+**Damage a read finds stops the database.** A get, a scan or a seek that meets index damage, a
+record that does not match its index entry, or a log record that fails its CRC latches it as a
+durability failure (`Core::read_damaged`): every later write and persist fails, so the node stops
+rather than act on a missing row or a scan that ended short (a scan cannot carry the error). The log
+itself is not poisoned (damage at rest leaves nothing of unknown durability): the close still seals
+it, with every index marked stale, so the next open replays the sealed log, which must read whole.
+Index damage is rebuilt from the log; log damage fails the open ("closed cleanly but does not replay
+to its end") on every retry, changing no byte. Left unsealed, the replay would take a damaged record
+for a crash's torn tail and cut every acknowledged batch after it (no commit marker covers it unless
+a write in the session stamped one). This relies on the close: a process killed after the latch
+leaves the log unsealed, as any crash does. A removal's lookup that meets index damage latches the
+same way (`Writer::latch_if_poisoned`): its batch has appended nothing, so the log is still sealed.
+Damage a batch's own index write meets stops the writer instead (see Writes), since the batch has
+appended its records by then. An index whose open-time walk fails is refused at open and rebuilt
+the same way.
 
 A scan holds the database core, so its files stay open while the scan lives, even after every
 handle has dropped. The database's `LOCK` is the core's last field, so it is released only once the
@@ -154,9 +164,15 @@ lock.
 leaves more waits for a sync before it returns, running it itself if no round is running. So writes
 nobody waits on (the batch caches are never persisted) can't outrun the disk without bound.
 
-**Failures latch.** The first failure (a failed sync, a writer that stopped, a panic) is latched.
-Every later write and `persist` fails, the watermark never moves again, and the log is never sealed
-as clean, so the next open recovers it.
+**Failures latch.** The first failure (a failed sync, a writer that stopped, a panic, or damage a
+read found, a removal's lookup included) is latched, for good: every later write and `persist` fails
+until a restart, and the watermark never moves again. After any failure but a read's damage the log
+is never sealed as clean, so the next open recovers it; after a read's damage alone it is sealed
+with every index stale (see Reads). A sync or writer failure after a read's damage still keeps the
+seal off: whether the log's state on disk is known (`Durability::log_unknown`) is kept apart from
+the first cause, which is all the latch keeps. `Database::failed` resolves once a database (in a
+`SplitDatabase`, any of its environments) has latched, so the node can stop at once rather than at
+its next write or `persist`.
 
 **`persist` covers the writes made before it is called** (it reads the last batch number then, not
 at its first poll). A `persist` still waiting when the commit thread exits (a close that could not
@@ -183,7 +199,7 @@ transaction), so buffering changes nothing they rely on.
 **When the log is replayed.** If the log is unclean, it is replayed once and every index is
 rebuilt. If the log is clean but an index is stale (unclean, missing, covering another length, or
 refused by its open-time walk), only that table's index is rebuilt; the replay still reads the
-whole log. An index the manifest does not name (a manifest rolled back to an older copy: one is
+whole log. A close after a read found damage marks every index stale, so the whole log is checked. An index the manifest does not name (a manifest rolled back to an older copy: one is
 always written before a table's index exists) also forces a replay, so the missing table's records
 fail the open; an orphan whose table has no records left goes once the replay has passed.
 
@@ -204,8 +220,9 @@ whole batch are dropped.
 - a failed replay changes no byte of the log; the indexes it was rebuilding (stale anyway) are
   removed, so the next open rebuilds them again.
 
-Only then is the log cut back (the warning names the tear), each index synced, and both files
-marked consistent.
+Only then is the log cut back, each index synced, and both files marked consistent. The cut warns
+(naming the tear) only when bytes other than the commit marker followed the last whole batch: after
+an ordinary crash only the padding's zeros and the marker do.
 
 ## Tests (`test.rs`)
 
@@ -249,14 +266,21 @@ marked consistent.
   round's reads stopping for a cancel, and a record that does not parse counted as corruption; a
   sync round paused
   across the switch; the disk filling during the copy; an emptied log compacting at once (also
-  after a reopen); writeback as the copy goes; and compactions inside the randomized crash model;
+  after a reopen, after an emptying during the reset, and after a second emptying during a retried
+  reset; not again when the reset copied nothing); a catch-up removal of a row the new log never
+  held leaving nothing dead; writeback as the copy goes; and compactions inside the randomized crash model;
 - hardening: a failed open keeping the older generation; an interrupted creation reopening; a
-  removal through a damaged index failing; a misindexed row read as `CorruptIndex`;
+  removal through a damaged index failing and leaving the log sealed; a misindexed row read as
+  `CorruptIndex`; a damaged log record found by a read refusing every later open with the log
+  unchanged (no write, one acknowledged write and stamped writes in the session, or a scan), index
+  damage found by a read rebuilding from the sealed log, and a sync failing after a read's damage
+  keeping the log unsealed;
 - metrics: every series registered at open, then batches, syncs, log and unsynced bytes, a
   compaction (outcome, generation, duration, switch hold), abandons by cause, a cancel, a stall,
   the `failed` latch, and a `SplitDatabase`'s `env` labels (`metrics_util`'s debugging recorder);
 - inspection: rows and dead bytes before and after a compaction, a crashed log reported unclean
-  with no file changed, an open database refused, damage reported, and a `SplitDatabase`;
+  with no file changed, an open database refused, damage reported, orphan index directories
+  listed, and a `SplitDatabase`;
 - failures: a panic in a rollback and in a publish latching, a poisoned index latching, a
   rollback flushing its zeros, a `Sync` no-op waiting for the state it saw, a `Sync` `persist`
   waiting for another writer's sync, a `persist` failing
@@ -275,7 +299,10 @@ marked consistent.
 **Mutation checks.** Each of these fails a test: applying a batch before its end, skipping the
 revert, advancing the watermark before the sync, ignoring CLEAR in replay, writers never leading a
 round, an eager commit thread, a `persist` that doesn't ask for a round, and a write that never
-wakes an idle commit thread. Accepting writes after a latch is still refused, by the poisoned log.
+wakes an idle commit thread. Accepting writes after a latch is still refused after a failed sync,
+by the poisoned log; after a read's damage, it fails the read-damage tests. A read's damage
+poisoning the log, its close leaving the indexes current, a later sync failure not keeping the
+seal off, and a removal's damage stopping the writer (the log left unsealed) each fail one too.
 For compaction: skipping the last catch-up, copied rows without the batch-end flag, a catch-up
 that ignores CLEAR, installing before the rename, `base` not read at open, no empty indexes,
 caching an unfixed key size, no cap on the switch's tail, a switch without the registry lock,
@@ -297,7 +324,12 @@ table; assumed at open unless the log is empty). In steady state that is "dead â
 accounting per write; a log that only grows never compacts. A batch that leaves every table
 empty, in a log of at least 1 MiB with a dead row, also asks for one at once (automatic
 compaction on), whatever the threshold. The epoch tables are all cleared at every epoch's end,
-so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms.
+so the epoch log resets there: nothing is live to copy, and the switch takes about 0.1 ms. That
+request stays pending until a compaction whose snapshot came after the last such batch switches
+(each one moves it on, so a second epoch end during a retried reset is not lost), or one whose new
+generation holds nothing dead. A batch during a compaction's copy is after its snapshot, so that
+switch keeps the request; the new generation's next compaction then resets it (all its snapshots
+come after that batch), and its switch drops the request unless another such batch came since.
 `Database::compact` asks for one at once (a log of at least 1 MiB). A failed compaction backs
 the trigger off (60 s, doubling to 1 h); a request that arrives while one runs is ignored, so it
 cannot start another the moment that one ends.
@@ -389,14 +421,17 @@ faulting fresh pages. In the `workload_mixed` bench, a stream of 256 KB batches 
 rounds (N=50) from 3.3 to 55 ms.
 
 **`SplitDatabase`** opens three `TnDatabase`s under one root (`epoch/`, `kad/`, `cache/`). It
-routes each table by its `TableHint`, as `open_db` splits MDBX, so the batch caches never share a
-write lock with consensus. It's a thin router with no layer in between: `CompositeDatabase` would
+routes each table by its `TableHint`, so the batch caches never share a write lock with
+consensus. It's a thin router with no layer in between: `CompositeDatabase` would
 also wrap each database in a `LayeredDatabase`, whose in-memory layer and writer thread cost tndb
 3-4x its durability latency.
 - A write transaction opens one tndb transaction per environment it writes. Each part commits as
   one batch in its own log, so it is atomic per environment, not across them.
-- `persist` covers the table's environment, as with MDBX today: every production barrier is on
-  consensus tables.
+- `persist` covers the table's environment. The anti-equivocation barriers (votes, the proposer's
+  header, proposed certificates) are on consensus tables; the node's epoch-end check
+  (`ensure_stores_durable`) persists one table in each environment (votes, kad records, the batch
+  cache), and `Database::failed` resolves, naming the environment, once any of the three latches a
+  failure.
 
 **Gate** (`workload_bench`, 3 runs, this Mac). On consensus alone, Split matches one log (both
 2.9-3.0 ms per round at N=50; vote durable p50 0.33 ms, against the per-table engine's 0.97 ms, both in group commit). Beside the
@@ -463,16 +498,22 @@ raises vote p99 from 5.8 to about 9 ms by sharing the drive, with compaction off
 tndb is the node's consensus DB (`DatabaseType = SplitDatabase`, at `<consensus db>/tndb`, since
 2026-10; MDBX before). On its first tndb open, a node that ran on MDBX
 has its epoch tables (its anti-equivocation records: last proposal, votes, proposed certificates),
-kad tables and own uncommitted batches (`OurNodeBatchesCache`: no other copy holds them) copied
-over (`migrate_from_mdbx` in `lib.rs`) and made durable. Then the MDBX environments are deleted
-(MDBX's own files, and each directory if nothing else is in it), so a later reset of tndb cannot
-bring back their state from the time of the switch, and the migration is marked done
-(`tndb/mdbx-migrated`). A crash before the marker reruns the copy for whatever is still there.
-The other caches start empty (they refill). A downgrade to the MDBX build after the switch starts
-with empty epoch tables. Abandoning the epoch tables instead would be safe only while the
-network keeps making rounds as validators restart: after a stop-all halt every node would return
-to the same round with no memory of what it proposed and voted there. The migration is kept for
-the release that switches backends; the next one removes it with the MDBX consensus backend.
+kad tables and both batch caches copied over (`migrate_from_mdbx` in `lib.rs`) and made durable.
+Then the MDBX environments are deleted (MDBX's own files, and each directory if nothing else is
+in it), so a later reset of tndb cannot bring back their state from the time of the switch, and
+the migration is marked done (`tndb/mdbx-migrated`). A crash before the marker reruns the copy
+for whatever is still there. `ConsensusCache` starts empty: it holds outputs the network already
+committed, which state sync reads again from the consensus chain or fetches from peers. A
+downgrade to the MDBX build after the switch starts with empty epoch tables. Abandoning the epoch
+tables instead would be safe only while the network keeps making rounds as validators restart:
+after a stop-all halt every node would return to the same round with no memory of what it
+proposed and voted there. The batch caches are copied for the same halt. The restart rebuilds the
+DAG from the stored certificates and commits the uncommitted ones, whose batches are in
+`NodeBatchesCache`, and a batch is served only from it or a consensus pack: dropped on every
+node, no peer could serve them, and execution would wait on them for good.
+`OurNodeBatchesCache` holds the node's own uncommitted batches, which no other copy holds. The
+migration is kept for the release that switches backends; the next one removes it with the MDBX
+consensus backend.
 
 ## Metrics (`metrics.rs`)
 
@@ -494,7 +535,7 @@ Rendered names (the `tn_storage.` prefix becomes `tn_storage_`):
 | `tn_storage_tndb_compaction_abandons_total{cause}` | counter | `disk_full`, `writer_outran`, `corruption`, `panic`, `error` |
 | `tn_storage_tndb_compaction_seconds` | histogram | a switched compaction, snapshot to install |
 | `tn_storage_tndb_compaction_switch_seconds` | histogram | how long the switch held the write lock |
-| `tn_storage_tndb_failed` | gauge | 1 once a failure latched (a failed sync, a stopped writer): writes fail until a restart |
+| `tn_storage_tndb_failed` | gauge | 1 once a failure latched (a failed sync, a stopped writer, damage a read found): writes fail until a restart |
 
 The write path pays a few clock reads around the write lock, one counter increment and two
 gauge stores; a histogram sample only on a stall. The consensus bench showed no difference
@@ -514,10 +555,13 @@ gauge stores; a histogram sample only on a stall. The consensus bench showed no 
 
 `inspect` reports what a database holds, from its files, changing none of them: its generation,
 whether the log was closed cleanly, its length, live and dead bytes (what a compaction would give
-back) and compacted base, older generations or unfinished builds left behind, and per table the
-live rows and bytes and the index's state as the next open would find it (current, stale,
-unclean, missing, unreadable). It opens the log read-only and replays it as an open would, so a
-damaged log fails it as it would fail the open. It takes a shared lock on the database's `LOCK`,
+back) and compacted base, older generations, unfinished builds or orphan index directories left
+behind (an orphan forces a full replay at the next open), and per table the live rows and bytes and
+the index's state as the next open would find it from the index's header and root (current, stale,
+unclean, missing, unreadable). The open-time walk of an index's internal pages needs a writable
+open, so it is not run: a current index with damage below its root is found, and rebuilt, only by
+the next open. It opens the log read-only and replays it as an open would, so a damaged log fails
+it as it would fail the open. It takes a shared lock on the database's `LOCK`,
 so it refuses a database the node has open (and keeps the node from opening until it is done):
 a live node is watched through the metrics. `inspect_split` covers a `SplitDatabase`'s
 environments and notes the MDBX migration's marker; `telcoin-network db tndb-stat` prints it for

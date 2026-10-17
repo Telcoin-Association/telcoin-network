@@ -250,15 +250,23 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
   - the page's tag must be a node's (`Node::tag_ok`): a leaf or internal type, with no more entries
     than that type holds. Every slot access is bounded by the entry count, so a page with a damaged
     count or type cannot be read outside its 4 KiB;
-  - the leaf a lookup or a scan reaches must be at the tree's height, with its first and last keys
-    inside the range its ancestors' separators give it. A child pointer damaged so that it names
-    another valid page is then `CorruptIndex`, not a `NotFound` for a key that exists or a scan
-    that repeats one leaf and skips another. That is two key comparisons per lookup.
+  - the leaf a lookup or a scan reaches must be at the tree's height and inside the range its
+    ancestors' separators give it: the intersection of their ranges. In a sound tree the nearest
+    ancestor's range is the tightest, but a misrouted pointer brings the wrong page's separators,
+    which can be wider. A scan checks the first and last keys of each leaf it enters. A lookup
+    checks nothing on a hit (only the leaf whose range holds the key can hold it) and, on a miss,
+    the two keys either side of where the key would go; its descent keeps the intersection, at
+    most two key comparisons per internal level below the root. A child pointer damaged so that
+    it names another page of the tree is then `CorruptIndex`, not a `NotFound` for a key that
+    exists or a scan that repeats one leaf and skips another. One case passes every range check:
+    a pointer redirected to a stale, still CRC-valid copy of the right subtree (a page that
+    copy-on-write replaced and has not reused yet) reads what that copy held.
 
   Damage these checks don't see (a flipped key or value bit inside a leaf) is found by
   `page_crc_scan()`, or by a write's copy-on-write check.
-- **Writes into a damaged page are refused.** `page_mut` runs the same checks. Copy-on-write
-  (`make_writable`) also verifies the source page's full CRC before copying a page read from disk
+- **Writes into a damaged page are refused.** A write changes only a private page (`page_mut`),
+  so a published page is copied first: copy-on-write (`make_writable`) reads the source through
+  the same checks as a read, and also verifies its full CRC before copying a page read from disk
   (one this handle did not stamp), so a publish or sync never stamps at-rest damage as valid. A
   page this handle stamped itself is copied unverified: checking it would cost a page's CRC on
   every copy, under the write lock (about 5% of a write-heavy round). The cost of skipping it is
@@ -267,13 +275,14 @@ The B+tree does not pay a CRC per operation: it is derived and rebuildable, so i
 - **Pages whose child pointers decide what is live** are CRC-checked when read from disk: the
   open-time walk checks every internal page, and `clear`, which retires the old tree through its
   child pointers, checks each internal page this handle neither wrote nor stamped (as does
-  `collapse_root` for the child it promotes). A damaged pointer there could otherwise hand a live
-  page to the free list.
+  `collapse_root` for each root whose only child pointer it follows). A damaged pointer there
+  could otherwise hand a live page to the free list.
 - **Damage found is latched.** Every `CorruptIndex` a read or write finds poisons the index file:
   `is_poisoned()` turns true, `sync()` is refused, and the file is never sealed as clean again, so
   the next open finds it unclean and the owner rebuilds it. A snapshot doesn't hold the file, so it
   sets a flag the writer checks (in `is_poisoned()`, `sync()` and `Drop`). tndb stops the database
-  on a poisoned index after a failed batch; damage found only by reads is healed at the next open.
+  on any damage a read or a batch finds, and at the restart rebuilds the index, which was never
+  sealed.
 - **`page_crc_scan()`** is the off-path full check: it classifies every data page as valid, dirty
   (unsynced writes: rebuild from the log) or corrupt (genuine on-disk corruption), in a
   `PageCrcReport { dirty, corrupt }`.

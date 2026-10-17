@@ -634,9 +634,9 @@ impl Builder {
     /// Remove `key` from table `id`: a removal record, as its own batch, if the new log holds the
     /// row (otherwise the new log never had it, and needs nothing).
     fn remove(&mut self, id: TableId, key: &[u8]) -> eyre::Result<()> {
-        self.dead = true;
         let Some(idx) = self.idxs.get_mut(&id) else { return Ok(()) };
         if idx.contains(key)? {
+            self.dead = true;
             let log = self.log.as_mut().expect("a builder holds its log until it finishes");
             log.append_raw_parts(&[&record::head(KIND_REMOVE, id, true), key])?;
             idx.remove(key)?;

@@ -59,9 +59,12 @@ syscalls, no read/write buffers). It exposes `Read`/`Write`/`Seek` plus `slice`,
   **not** cleanly closed (a crash) — `opened_unclean()` reports that and the logical end is left at
   physical EOF for the recovery scan to trim. Trailing zero padding can never masquerade as a
   sentinel (`crc32(0x00000000) != 0`).
-- **Durability.** The default barrier is `msync` (flush dirty pages); each *size extension* is
-  `fsync`'d in the grow path, so data written within an already-fsync'd size is durable under the
-  cheap msync default. `sync_disk` is the full msync+fsync.
+- **Durability.** The default barrier is `msync` (flush dirty pages). A *size extension* is not
+  `fsync`'d in the grow path: the next durability barrier fsyncs the size if the file grew since the
+  last fsync (`sync_size_if_grown`), so a barrier still promises data `[0, end)` durable within a
+  durable size, and one with no growth since stays msync-only. A derived index file
+  (`MmapFileOptions::derived`) skips that fsync and leaves its size to the clean-close seal.
+  `sync_disk` is the full msync+fsync.
 - **Read-only handles** (`open(.., read_only=true)`) map a *sealed* file and clamp their read bound
   (`set_read_bound`) to the index-attested length as defense against a writer truncation.
 
@@ -146,7 +149,11 @@ The recovery paths (`recover_pack`, `files_consistent`, the open doors, `pack_va
   WAL index-free, tracks `consistent_end`, and decides truncate-vs-error from the data alone: a torn
   tail is truncatable unless a later complete *output* decodes past it (`output_after_tear`) —
   committed data, so it errors — and a best-effort commit marker (written by `persist()` to the mmap
-  capacity tail) catches at-rest corruption of the last committed output.
+  capacity tail) catches at-rest corruption of the last committed output. A disk read error is never
+  a torn tail: every walk (recovery, the legacy migration, the heal, `db validate`/`repair`) returns
+  `ReadError` and cuts nothing, and `recover_pack`'s second pass must end where its first did. The
+  zeros a cut writes over the tail are flushed before the open returns, so a power loss can't bring
+  the cut bytes back.
 - **INV2 — headers & meta are clean-or-error.** The `DataHeader` and the leading `EpochMeta` are
   expected present and correct; a corrupt/torn one is an **error** surfaced to the operator, **never
   repaired**. The meta is committed the instant it is written (`Pack::commit`: msync'd, its size
@@ -190,6 +197,12 @@ only with its stored record's chain, anything else, such as a prefix's partial f
 `EpochCertificate`s (`epoch_certs.pack`), auto-healed on open under the same rules: `persist()` stamps
 each log's tail commit marker, a rebuild refuses to truncate below it (or below the digest index's
 synced length), and an empty position index beside a populated digest index is rebuilt, not trusted.
+The open scans every bucket of both (small) digest indexes and rebuilds on a damaged one, and a
+failed save's index invalidation holds until a reopen rebuilds it. A log that holds no record beside
+a digest index attesting acked ones was lost (absent counts as corrupt): the open and `assess`
+refuse it (`CorruptLog`), judged by content so a retry refuses too. A read the disk fails during
+recovery is an error (`Unreadable`, a read error rather than corruption), never a torn tail, and
+nothing is cut. Recovery and save rollbacks flush the zeros they write over a cut tail.
 Each write returns its own result to its caller (the handle is shared by concurrent writers, so a
 failure is never reported to someone else), and closing persists before the files are sealed. A stored
 epoch's record is never replaced: re-saving the same record is a no-op, and a different one is refused
@@ -218,12 +231,90 @@ replaces it. `MemDatabase` is an in-memory backend for tests. The typed `stores/
 and B+tree index: every table of a database in one shared, CRC-framed log (one sync per commit,
 transactions atomic across tables), lock-free snapshot reads, crash recovery by replaying the log,
 and compaction into a new generation. It is the node's `DatabaseType` (`SplitDatabase`: one log
-per `epoch` / `kad` / `cache` environment, as `open_db` split MDBX), and the first open moves an
-existing MDBX consensus DB into it, then deletes the MDBX files. It replaced
+per `epoch` / `kad` / `cache` environment, routed by each table's hint), and the first open moves an
+existing MDBX consensus DB into it (the epoch and kad tables and both batch caches;
+`ConsensusCache` refills), then deletes the MDBX files. Every open then checks that the epoch
+tables' headers decode with this binary (`epoch_db_recovery`, #1572): it drops the seconds-only
+`LastProposed` header a late upgrader proposed for the sub-second fork epoch and refuses any other
+undecodable row. It replaced
 an earlier per-table engine of the same name, whose separate files cost a sync per table per
 commit (this engine was called `tnlog` while the two were compared). It exports
 `tn_storage_tndb_*` metrics, and `telcoin-network db tndb-stat` inspects it at rest. See
 [`src/tndb/README.md`](src/tndb/README.md).
+
+### 8. Write failures stop the node
+
+**The rule.** When this node's own storage fails, the node exits non-zero and waits for an
+operator. That covers an IO or sync error, a latched store, damage found on disk, and a store that
+refuses writes. It never logs the failure and carries on. A node that keeps running on storage it
+can't write either forgets what it acknowledged (a vote or proposal lost across a restart is
+equivocation) or quietly stops making progress. An exit is visible: it prompts the operator to
+free disk, replace a drive or re-sync. The restart then runs the open-time recovery, which heals
+what can be healed and refuses what can't.
+
+**The boundary.** Refusing a peer's bad input never stops the node; otherwise any peer could stop
+it remotely. These are refused and logged, never fatal:
+- an invalid, conflicting or oversized record, certificate or output from the network;
+- a downloaded epoch record that fails `validate_downloaded_record`;
+- a certificate that fails verification (checked before consensus sees it);
+- an import that fails verification.
+
+**How the stores report it.** A failure latches, so every later write fails the same way:
+- **tndb:** `Durability`. A failed write or sync, a stopped writer, or damage a read found;
+  `Database::failed()` resolves once any environment latches.
+- **The packs:** `MmapDataFile`'s poison and `ConsensusPack`'s failed state.
+- **`CertificatePack`:** its stored error, returned by every later `try_save`, `persist` and
+  `shutdown`.
+- **`EpochRecordDb`:** each write returns its own result.
+
+**What stops the node:**
+- **The consensus DB, mid-epoch:** `run_epoch` waits on `Database::failed()` (`store_failure`).
+  The first environment (epoch, kad, cache) to latch ends the epoch with an error naming it.
+- **The certificate pack:** any `try_save` error except `SendFull` (backpressure) ends the
+  critical consensus task (`ConsensusError::CertificatePack`).
+- **The epoch end (`finish_epoch`), after the epoch's tasks are joined:**
+  1. The certificate pack is sealed. `CertificatePack::shutdown` reports a background save or a
+     final flush that failed.
+  2. The consensus pack is persisted. This comes before the leftover drain because a save
+     advances `latest_consensus_number` before its persist, so an output whose persist failed is
+     never forwarded to execution.
+  3. `ensure_stores_durable` persists one table in each consensus DB environment.
+
+  The state export's persist (`export_epoch_state`, at the boundary) returns its error too.
+- **A failed output save or persist** ends the critical executor subscriber. A save that was rolled
+  back leaves the pack usable, but every later persist of that handle fails (`Shared::persist`), so
+  `finish_epoch`'s persist stops the node even for a save that failed in the subscriber's shutdown
+  drain.
+- **The epoch handoff (`new_epoch`):** the previous writable pack is sealed before the handoff
+  returns. If its data log is still unsealed on disk afterwards, `new_epoch` returns a
+  `PersistError` naming the epoch and `db repair`, and `open_epoch_pack` stops the node.
+- **Epoch records and certificates:** `write_epoch_record` and the startup epoch-0 record save
+  return their errors. A local failure is one `EpochDbError::is_local_storage_failure` says is our
+  own (an exhaustive match: IO, append, index, open, unreadable, corrupt, a gone actor):
+  - saving or persisting a quorum certificate or a recovered record: the vote round passes the
+    error to the critical "Epoch Vote Collector";
+  - saving or persisting a downloaded record: it ends the critical "Epoch Record Collector", or
+    fails startup in `sync_epoch_records_to_tip`.
+
+  A record or certificate the store refuses (a conflicting record, a certificate for another
+  record, an out-of-order epoch) can come from a peer, so it is only logged and requested again
+  later.
+- **Startup:** a datadir that can't be opened aborts node start (decision 11).
+
+Each error returns `Err` from `run_epoch`, then from `run_epochs`, `EpochManager::run` and
+`launch_node`, and the binary exits 1. A critical epoch task's error ends the epoch's task manager
+with `Err`, and a critical node task's (the epoch-vote and epoch-record collectors) ends the node's,
+and either takes the same path. An epoch task's error that arrives after the epoch's shutdown is
+notified is only logged, which is why `finish_epoch` re-checks the packs and stores itself.
+
+**Two exceptions:**
+- **The `LatestConsensus` slot files.** They are a non-authoritative hint; the packs are ground
+  truth. A failed slot write or fsync is logged, and `persist_current` still returns Ok.
+- **A pack import from a peer.** An import writes only its own directory, which is removed on any
+  failure and never touches installed data. So a failed import is not installed, and the fetcher
+  tries another peer, whether the fault was the peer's stream or a local write (an IO error there
+  can be either). An imported pack that fails its seal check is one of these. A disk that fails
+  here fails the node's own stores at their next write, and that stops it.
 
 ### On-disk layout
 
@@ -261,8 +352,8 @@ complete when the next epoch began, so a tail its replay cannot reach is refused
 read-side heal, `db migrate`, `db repair` and `db validate`, even when its indexes cannot attest its
 length. A legacy v0
 (batches-first) pack is not walked at all: `db validate` reports a dry run of its migration. `db repair`,
-`db migrate` and `db load-state` refuse to run while a live node holds the `<datadir>/telcoin.pid`
-lock (intentional-design item 9).
+`db migrate`, `db load-state` and `db tndb-stat` refuse to run while a live node holds the
+`<datadir>/telcoin.pid` lock (intentional-design item 9).
 
 ### Benchmarks
 
@@ -335,7 +426,7 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
    incompletely-written trailing record is INV1, not data loss. The `output_after_tear` probe (a
    complete output decoding past the tear), the `committed_end` commit marker, and the
    `attested_record_survives` position-index check ensure a tear *below* durably-acked data becomes a
-   hard `CorruptPack` error instead.
+   hard `CorruptPack` error instead, and a read the disk fails is a `ReadError` that cuts nothing.
 6. **A torn/corrupt `EpochMeta` (or `DataHeader`) is a hard error, never repaired (INV2).** Do not
    suggest "reconstructing" or "healing" the meta. It is deliberately refused: the committee (with
    network addresses) cannot be reconstructed from the epoch alone, so recovery is a re-sync, not a
@@ -400,10 +491,15 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
     equal the rewound data length, so the next `open_append` fails `files_consistent` and
     `recover_pack` rebuilds every index from the data-log WAL. This deliberately does not try to
     restore an overwritten duplicate-key position (e.g. a batch already committed by an earlier
-    output whose in-place index slot the failed output clobbered). It is safe because a failed output
-    save is **fatal** (the executor subscriber is a critical task → node shutdown), so the epoch is
-    reopened for append and rebuilt before it is served again. Corollary: a read-only `open_static` /
-    `db validate` of an epoch whose most recent save failed will correctly report it inconsistent
+    output whose in-place index slot the failed output clobbered). The invalidation is sticky
+    (`Inner::index_invalidated`): no later save on the same handle stamps the markers again, so the
+    indexes stay untrusted until a reopen rebuilds them, even if the pack saves more and closes
+    cleanly. A failed output save is fatal to the executor subscriber (a critical task), and every
+    later `persist` of that handle fails (`Shared::persist`), so the epoch end stops the node even
+    for a save that failed in the subscriber's shutdown drain; until the restart's reopen, reads stay
+    safe because a digest read masks positions past the data end and re-hashes the record it fetches (a
+    stale entry is at worst a miss). Corollary: a read-only `open_static` / `db validate` of an epoch
+    where any save failed since the pack was last opened will correctly report it inconsistent
     (rebuild pending) rather than silently trust a stale mapping — that is the intended signal, not a
     bug. (Duplicate batches across outputs cannot arise under honest consensus — Bullshark commits
     each certificate once — so this path is defense-in-depth.)
@@ -415,7 +511,8 @@ guard exists it is named so a reviewer can confirm it, not re-derive it.
 19. **Recovery reads the WAL through a cloned fd + `BufReader` (pread), not the mmap.** `recover_pack`
     and the index rebuilds walk the data log with syscall reads rather than faulting the whole file
     into the page cache through the mapping, and `PositionIndex::sync` issues a harmless extra
-    `MS_ASYNC` beside its fsync. These are deliberate, low-priority performance choices. Not a bug.
+    `MS_ASYNC` (`flush`) before its `MS_SYNC` msync (`sync_all`); as a derived file it makes no size
+    fsync (that waits for the clean-close seal). These are deliberate, low-priority performance choices. Not a bug.
 20. **Digest-index bucket placement is stable across compiler upgrades by design.** Placement feeds
     the raw key bytes straight to the vendored `FxHasher` (`HdxIndex::stable_hash` → `Hasher::write`),
     deliberately bypassing `impl Hash for [u8]`, whose length-prefix encoding is not stable across Rust

@@ -11,7 +11,7 @@ pub use crate::consensus::{
     utils::gc_round,
 };
 use thiserror::Error;
-use tn_storage::StoreError;
+use tn_storage::{certificate_pack::PackError, StoreError};
 use tn_types::{Certificate, EpochSeedChainError, HeaderDigest, Round};
 
 /// The default channel size used in the consensus and subscriber logic.
@@ -51,6 +51,13 @@ pub enum ConsensusError {
     /// (with a low-context backtrace) into a diagnosable, structured shutdown.
     #[error("Consensus invariant violated: {0}")]
     Invariant(#[from] ConsensusInvariant),
+
+    /// This epoch's certificate pack failed for good (an open, write or sync failure it latched,
+    /// or its thread is gone). It is this node's own storage failing, never a peer's input:
+    /// certificates are verified before consensus sees them. Fatal on purpose: it ends the
+    /// consensus task, which stops the node.
+    #[error("certificate pack failed: {0}")]
+    CertificatePack(PackError),
 }
 
 /// A violated internal construction invariant of the Bullshark commit hot path or of

@@ -71,8 +71,6 @@ jobs:
         run: make test-epochs
 
       - name: Run direct SIGKILL epoch-boundary recovery tests
-        env:
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-sigkill
 
       - name: Archive retained data from a failed SIGKILL reproduction

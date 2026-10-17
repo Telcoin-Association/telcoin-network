@@ -8,7 +8,7 @@
 //! non keys.  BCS encoding however does not meet the sorting requirements for DB keys so we have
 //! both encodings.  This can be experimented with by changing these functions.
 
-use std::io::{Read, Write};
+use std::io::Write;
 
 pub use bcs::Error as BcsError;
 use bincode::Options;
@@ -23,7 +23,7 @@ where
 {
     seq.next_element()?.ok_or_else(|| serde::de::Error::missing_field(field))
 }
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 /// Serde helpers that encode a byte vector as one byte string (`serialize_bytes`) instead of as a
 /// sequence of `u8`. Use as `#[serde(with = "tn_types::byte_vec")]` on a `Vec<u8>` field.
@@ -167,13 +167,6 @@ pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> T {
 /// This version will be optimized without regard to binary sort order.
 pub fn try_decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> bcs::Result<T> {
     bcs::from_bytes(bytes)
-}
-
-/// Decode a Read instance to a type.
-///
-/// This version will be optimized without regard to binary sort order.
-pub fn try_decode_from_read<T: DeserializeOwned, R: Read>(read: R) -> bcs::Result<T> {
-    bcs::from_reader(read)
 }
 
 /// Encode an object to a byte vector.

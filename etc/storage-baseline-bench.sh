@@ -4,19 +4,24 @@
 # backends on the production OS. Written for Linux; also runs on macOS.
 #
 # Usage: etc/storage-baseline-bench.sh <empty dir on the disk under test> [report file]
-#   QUICK=1 ...             one pass with only the columns the backend decision needs (Split
+#   BASELINE_QUICK=1 ...    one pass with only the columns the backend decision needs (Split
 #                           tndb, tndb group, production MDBX); skips the reference columns
 #                           that sync every write, which dominate the run time on a disk whose
 #                           fsync flushes its cache (most Linux setups), and runs 3 compaction-cost
 #                           pairs instead of 6. About 30-40 minutes on a laptop NVMe.
-#   ROUNDS=1 ...            runs each workload once instead of three times (default 3; 1 if QUICK)
-#   ONLY="workload_mixed"   runs only the named workloads (space separated)
+#   BASELINE_ROUNDS=1 ...   runs each workload once instead of three times (default 3; 1 if
+#                           BASELINE_QUICK)
+#   BASELINE_ONLY="workload_mixed"
+#                           runs only the named workloads (space separated)
+#
+# The knobs carry this script's prefix so a generic QUICK, ROUNDS or ONLY exported by another
+# script is never picked up; the report records the values used.
 #
 # Every run also ends with `consensus_pack_workload` (tn-storage `pack_bench`): production-shaped
 # consensus outputs saved and made durable at 2 a second while readers query the pack, at N=10 and
 # N=50 with 16 KB and 256 KB batches (about 7 minutes). TN_BENCH_PACK_RATE / TN_BENCH_PACK_OUTPUTS /
 # TN_BENCH_PACK_BATCH_KB / TN_BENCH_PACK_COMMITTEE / TN_BENCH_PACK_MAX_MB / TN_BENCH_PACK_READ_SECS
-# override it (see the bench's docs); ONLY="consensus_pack_workload" runs it alone.
+# override it (see the bench's docs); BASELINE_ONLY="consensus_pack_workload" runs it alone.
 #
 # The compaction-cost pairs (`workload_mixed_compaction`) run at a busy node's batch rate, 1 MB
 # batches 25 times a second, for 6000 rounds a run: long enough for the batch log to reach its
@@ -37,19 +42,19 @@ mkdir -p "$bench_dir"
 bench_dir="$(cd "$bench_dir" && pwd)"
 repo="$(cd "$(dirname "$0")/.." && pwd)"
 report="${2:-$repo/storage-baseline-$(hostname -s)-$(date +%Y%m%d-%H%M%S).txt}"
-quick="${QUICK:-}"
+quick="${BASELINE_QUICK:-}"
 # The compaction-cost pairs at a busy node's batch rate (see the usage above).
 export TN_BENCH_PAIR_BATCH_KB="${TN_BENCH_PAIR_BATCH_KB:-1024}" \
     TN_BENCH_PAIR_RATE="${TN_BENCH_PAIR_RATE:-25}" \
     TN_BENCH_PAIR_ROUNDS="${TN_BENCH_PAIR_ROUNDS:-6000}"
 if [ -n "$quick" ]; then
-    rounds="${ROUNDS:-1}"
+    rounds="${BASELINE_ROUNDS:-1}"
     # Fewer compaction-cost pairs.
     export TN_BENCH_PAIRS="${TN_BENCH_PAIRS:-3}"
 else
-    rounds="${ROUNDS:-3}"
+    rounds="${BASELINE_ROUNDS:-3}"
 fi
-workloads="${ONLY:-workload_consensus_rounds workload_batch_cache workload_mixed workload_compaction}"
+workloads="${BASELINE_ONLY:-workload_consensus_rounds workload_batch_cache workload_mixed workload_compaction}"
 os="$(uname -s)"
 
 if [ "$os" = "Linux" ]; then
@@ -112,6 +117,7 @@ kv commit "$(try git rev-parse --short HEAD) on $(try git rev-parse --abbrev-ref
 kv uncommitted "$(git status --porcelain 2>/dev/null | wc -l | tr -d ' ') paths"
 kv binary "$bin"
 kv md5 "$( (md5sum "$bin" 2>/dev/null || md5 -r "$bin") | cut -d' ' -f1)"
+kv knobs "BASELINE_QUICK=${quick:-} BASELINE_ROUNDS=$rounds BASELINE_ONLY=${BASELINE_ONLY:-}"
 
 section DISK
 kv bench_dir "$bench_dir"
@@ -145,7 +151,7 @@ else
 fi
 rm -f "$probe"
 
-# The columns QUICK runs for each workload (TN_BENCH_COLUMNS; empty: every column).
+# The columns BASELINE_QUICK runs for each workload (TN_BENCH_COLUMNS; empty: every column).
 quick_columns() {
     case "$1" in
         workload_consensus_rounds)
@@ -214,7 +220,7 @@ for round in $(seq 1 "$rounds"); do
         run "$workload" "run $round"
     done
 done
-if [ -z "${ONLY:-}" ]; then
+if [ -z "${BASELINE_ONLY:-}" ]; then
     run workload_startup_reload "run 1"
     run workload_mixed_compaction "run 1"
     run consensus_pack_workload "run 1"

@@ -231,8 +231,8 @@ impl<DB: Database> Subscriber<DB> {
         .await?;
 
         // Once we've drained through the staged partial pack's final output, it has all been
-        // written to the main pack in order — drop the staging dir. `clear_staging` is async so the
-        // staging pack's background-thread join does not block this tokio worker.
+        // written to the main pack in order — drop the staging dir. `clear_staging` is async so
+        // sealing the staging pack (on the blocking pool) does not block this tokio worker.
         if self.inner.consensus_chain.staging_final() == Some(number) {
             self.inner.consensus_chain.clear_staging().await;
         }
@@ -777,7 +777,10 @@ async fn drain_pending_on_shutdown<Fut>(
         })
         .try_fold(consensus_chain, |chain, output| async move {
             if let Err(e) = save_consensus(output.clone(), chain, consensus_bus.metrics()).await {
-                warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
+                // The epoch end stops the node on a storage failure here: a save the pack failed
+                // either poisoned it or was rolled back, and either way every later persist
+                // fails, `finish_epoch`'s included.
+                error!(target: "subscriber", "error saving consensus during shutdown: {e}");
                 Err(())
             } else {
                 // Best-effort forward: a no-op once the epoch manager has dropped its receiver,
