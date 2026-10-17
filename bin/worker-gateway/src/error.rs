@@ -41,7 +41,8 @@ mod code {
     pub(super) const NO_UPSTREAM_READY: i32 = -32000;
     /// The upstream (a worker, or the query upstream) could not be reached.
     pub(super) const UPSTREAM_UNREACHABLE: i32 = -32001;
-    /// The upstream did not answer within the request deadline.
+    /// An upstream timeout (connect, read, or a submission answer's read
+    /// budget), not the gateway's request deadline (`-32005`).
     pub(super) const UPSTREAM_TIMEOUT: i32 = -32002;
     /// The request body exceeded the gateway's size limit, or a batch its
     /// length limit.
@@ -97,7 +98,12 @@ pub(crate) enum GatewayError {
     /// The upstream (a worker, or the query upstream) could not be reached
     /// (connection failure).
     UpstreamUnreachable,
-    /// The upstream did not answer within the request deadline.
+    /// The upstream did not answer in time: the connection could not be set
+    /// up within `--upstream-connect-timeout`, the route's read timeout passed
+    /// with no response head or with a gap in a remembered submission's
+    /// answer, or that answer was not read whole within
+    /// `--upstream-request-timeout` of being sent. The gateway's own request
+    /// deadline is [`RequestTimeout`](Self::RequestTimeout) / `-32005`.
     UpstreamTimeout,
     /// The worker answered `2xx` but its answer to a remembered submission
     /// could not be read whole; the transaction may have been accepted.
