@@ -130,9 +130,11 @@ spec:
               value: "5s"
             # Drain in-flight requests for up to the gateway's whole-request
             # deadline (--upstream-request-timeout 35s + --header-read-timeout
-            # 10s), so a request accepted just before the listener closes,
-            # such as an eth_sendRawTransactionSync waiting for its receipt,
-            # still finishes. The drain ends as soon as the last request does.
+            # 10s), so a request whose headers have arrived before the listener
+            # closes, such as an eth_sendRawTransactionSync waiting for its
+            # receipt, still finishes; a connection still sending its headers
+            # then can be cut up to --header-read-timeout (10s) before its own
+            # deadline. The drain ends as soon as the last request does.
             # 45s equals the default at these timeouts; it is set explicitly
             # so the arithmetic for terminationGracePeriodSeconds and
             # minReadySeconds stays visible.
