@@ -433,7 +433,13 @@ pub(crate) struct RouterLayers {
 /// lines written, and a sampled request over the ceiling writes no line and is
 /// counted in `tn_worker_gateway_access_log_suppressed_total` instead. The
 /// window is fixed, not sliding, so a burst across one window edge can write
-/// about twice the ceiling within a second at most.
+/// about twice the ceiling within a second at most. The window is one for
+/// every client, and the access log sits outside the rate limiter, so one
+/// client's flood (its `429`s or preflights) can take every line of a second;
+/// the other clients' sampled lines in that second, proxied ones included, are
+/// then suppressed and counted. A rising
+/// `tn_worker_gateway_access_log_suppressed_total` therefore means lines of
+/// any client were lost, not only the flooding one's.
 #[derive(Debug)]
 pub(crate) struct AccessLog {
     /// Fraction of requests logged, in `(0, 1]`.

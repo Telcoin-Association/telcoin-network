@@ -650,7 +650,9 @@ pub(crate) struct Cli {
     /// `--access-log-sample`: a sampled request over it writes no line and is
     /// counted in `tn_worker_gateway_access_log_suppressed_total`. The window
     /// is a fixed second, so a burst across one window edge can write about
-    /// twice the ceiling within a second at most. Defaults to `1000`; `0`
+    /// twice the ceiling within a second at most. The ceiling is shared by
+    /// every client, so one client's flood, its `429`s included, can suppress
+    /// every other client's lines in the same second. Defaults to `1000`; `0`
     /// means unlimited.
     #[arg(long, env = "WORKER_GATEWAY_ACCESS_LOG_MAX_LINES_PER_SECOND", default_value_t = 1000)]
     pub(crate) access_log_max_lines_per_second: u32,
