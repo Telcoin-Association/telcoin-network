@@ -418,7 +418,12 @@ host):
   chain, walked from the right, listed addresses are skipped, and the walk stops
   at the first unlisted one. Entries to its left are never read. An unparsable
   entry reached first, a missing or empty chain, or a chain of nothing but
-  listed addresses falls back to the peer.
+  listed addresses falls back to the peer. A front that appends a port to an
+  IPv6 client address must bracket it (`[2001:db8::7]:4711`): an unbracketed
+  `2001:db8::7:4711` is itself a valid IPv6 address and is read as that one,
+  with the port in its low bits and the address's groups shifted one place left,
+  so the client could choose its rate-limit prefix through its interface
+  identifier.
 - **PROXY protocol v2** (`--proxy-protocol`), for a TCP load balancer that
   cannot add headers. Every connection from a `--proxy-protocol-from` peer must
   open with a binary PROXY protocol v2 header for TCP over IPv4 or IPv6, and
