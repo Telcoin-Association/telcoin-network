@@ -68,6 +68,7 @@ At the threshold the upstream is marked not-ready until the poller sees `--readi
 The request that saw the failure is answered with its own error (`502` or `504`) and is never retried on another upstream.
 Forwards to the `--redirect-queries` URL are not counted.
 Neither is a forward the gateway's own DNS lookup cap refused (see [DNS and the DDoS front](#dns-and-the-ddos-front)): that refusal says nothing about the worker, so a burst of it cannot mark a healthy worker not-ready.
+Nor is a forward that failed because the gateway itself is out of file descriptors (`EMFILE`, `ENFILE`): that says nothing about the worker either, and counting it would let fd exhaustion mark every worker not-ready.
 `--upstream-failure-threshold 0` turns passive health off.
 
 While the health listener answers and the RPC port stays down, the upstream cycles: the poller turns it ready after its run of successful polls, and the next `--upstream-failure-threshold` worker requests fail before it is marked again.
