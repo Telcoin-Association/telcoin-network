@@ -4739,9 +4739,13 @@ mod tests {
                 });
             }
         });
+        // the read timeout also bounds connecting and the wait for the head,
+        // so it leaves a loaded runner room: on loopback the head and the
+        // close arrive at once, and only the stalled body waits it out, well
+        // inside the mock's 10 s stall
         let client = proxy_client(
             UpstreamClientBuilder::for_test(Duration::from_secs(2)),
-            Duration::from_millis(200),
+            Duration::from_secs(2),
         )
         .expect("client");
         let send = || client.post(format!("http://{addr}/")).body("{}").send();
