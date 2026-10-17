@@ -2524,14 +2524,14 @@ mod tests {
 
     #[tokio::test]
     async fn lifetime_cap_lets_the_inflight_request_finish() {
-        // A worker that answers 400ms after it is asked, and counts the asks.
+        // A worker that answers 1.5 s after it is asked, and counts the asks.
         let hits = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&hits);
         let mock = Router::new().route(
             "/",
             post(move || async move {
                 counter.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(Duration::from_millis(400)).await;
+                tokio::time::sleep(Duration::from_millis(1500)).await;
                 r#"{"jsonrpc":"2.0","result":"0x1","id":1}"#
             }),
         );
@@ -2539,10 +2539,8 @@ mod tests {
 
         let state = test_state(&[upstream(upstream_addr)]);
         state.readiness.set_ready(0, true);
-        let limits = ServerLimits {
-            max_connection_duration: Some(Duration::from_millis(300)),
-            ..test_limits()
-        };
+        let limits =
+            ServerLimits { max_connection_duration: Some(Duration::from_secs(1)), ..test_limits() };
         let (gateway, _shutdown) = spawn_with_limits(test_router(state), limits).await;
 
         let body = call("eth_chainId", 1);
@@ -2552,9 +2550,11 @@ mod tests {
             body.len()
         );
 
-        // The request is written at once, well inside the 300ms cap, and its
-        // answer comes at about 400ms, past it: the cap always fires while the
-        // exchange is in flight (both deadlines share the runtime clock).
+        // The request is written at once and its answer comes about 1.5 s
+        // after it is asked, past the 1 s cap, so the cap fires while the
+        // exchange is in flight unless the connection task first reads the
+        // head more than 1 s after accept (the crate's 1 s margin for a
+        // stalled runner); both deadlines share the runtime clock.
         let mut stream = TcpStream::connect(gateway).await.expect("connect");
         stream.write_all(request.as_bytes()).await.expect("write");
 
