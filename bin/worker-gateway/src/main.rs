@@ -42,11 +42,14 @@ fn main() {
 /// runtime until SIGTERM / ctrl-c.
 fn try_main() -> eyre::Result<()> {
     // clap's own error quotes the offending token, which can be a secret, so
-    // print a redacted message for the kinds that carry one
+    // print a redacted message for the kinds that carry one, with clap's status
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(err) => match cli::redacted_parse_error(&err) {
-            Some(message) => eyre::bail!(message),
+        Err(err) => match redacted_exit(&err) {
+            Some((message, status)) => {
+                eprintln!("Error: {message}");
+                std::process::exit(status);
+            }
             None => err.exit(),
         },
     };
@@ -70,6 +73,14 @@ fn try_main() -> eyre::Result<()> {
     // already finished, so give blocking work a short grace and exit
     runtime.shutdown_timeout(std::time::Duration::from_secs(1));
     result
+}
+
+/// The redacted message and exit status for a parse error clap would print
+/// with the offending token, or `None` when clap's own output is safe; the
+/// status is clap's own (2 for a usage error), so a supervisor sees the same
+/// status either way.
+fn redacted_exit(err: &clap::Error) -> Option<(String, i32)> {
+    cli::redacted_parse_error(err).map(|message| (message, err.exit_code()))
 }
 
 /// Whether log lines carry colour codes: only when stdout is a terminal and
@@ -204,5 +215,27 @@ mod tests {
         assert!(!use_ansi(true, Some(OsStr::new("1"))), "NO_COLOR wins at a terminal");
         assert!(!use_ansi(false, None), "a file or pipe is never coloured");
         assert!(!use_ansi(false, Some(OsStr::new(""))));
+    }
+
+    #[test]
+    fn redacted_parse_errors_exit_with_clap_usage_status() {
+        for (argv, token) in [
+            (["worker-gateway", "--bogus"], "bogus"),
+            (["worker-gateway", "--max-request-bytes=s3cret"], "s3cret"),
+        ] {
+            let Err(err) = crate::cli::try_parse_test_argv(argv) else {
+                panic!("{argv:?} must not parse");
+            };
+            let Some((message, status)) = redacted_exit(&err) else {
+                panic!("{argv:?} must take the redacted path");
+            };
+            assert_eq!(status, 2, "{argv:?} must exit as a usage error: {message}");
+            assert!(!message.contains(token), "`{token}` leaked into: {message}");
+        }
+        // clap prints help itself, with its own status
+        let Err(err) = crate::cli::try_parse_test_argv(["worker-gateway", "--help"]) else {
+            panic!("--help ends the parse");
+        };
+        assert_eq!(redacted_exit(&err), None);
     }
 }
