@@ -110,8 +110,8 @@ pub(crate) struct Cli {
     /// and no fallback to the worker. Must not point at the gateway itself or
     /// at a worker's RPC or readiness host and port, where `localhost` counts
     /// as both `127.0.0.1` and `[::1]`, and an unspecified host as any loopback
-    /// address; another loopback address at a worker's port is accepted with a
-    /// warning.
+    /// or unspecified address; another loopback address at a worker's port is
+    /// accepted with a warning.
     #[arg(long, env = "WORKER_GATEWAY_REDIRECT_QUERIES", hide_env_values = true)]
     pub(crate) redirect_queries: Option<String>,
 
