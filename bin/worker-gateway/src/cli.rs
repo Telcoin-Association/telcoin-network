@@ -362,14 +362,17 @@ pub(crate) struct Cli {
     /// (default 100; `0` means unlimited). A request for the worker over the
     /// cap is answered at once with a `503` overload error instead of waiting.
     /// Every gateway in front of a worker shares its `--rpc.max-connections`
-    /// (500 by default), so keep the number of gateways times this cap below
-    /// it. Without `--redirect-queries`, reads may hold at most this cap less a
-    /// fifth of it (at least one slot), so the rest stays free for submissions
-    /// (see `--max-inflight-queries`). With it, the reads kept on the worker
-    /// (pending nonce reads and recent submission lookups) may hold at most a
-    /// fifth of it (at least one slot), and one over that share is answered at
-    /// once with the same `503`. At `1` no slot stays free for submissions, and
-    /// startup warns.
+    /// (500 by default), which counts in-flight HTTP requests, not TCP
+    /// connections, so keep N times this cap below it, where N counts every
+    /// gateway that can hold worker requests at once: the replica ceiling plus
+    /// any pod a rollout adds or is draining (see the README's Sizing for N
+    /// gateways). Without `--redirect-queries`, reads may hold at most this cap
+    /// less a fifth of it (at least one slot), so the rest stays free for
+    /// submissions (see `--max-inflight-queries`). With it, the reads kept on
+    /// the worker (pending nonce reads and recent submission lookups) may hold
+    /// at most a fifth of it (at least one slot), and one over that share is
+    /// answered at once with the same `503`. At `1` no slot stays free for
+    /// submissions, and startup warns.
     #[arg(long, env = "WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT", default_value_t = 100)]
     pub(crate) max_upstream_inflight: usize,
 
