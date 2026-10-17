@@ -11,12 +11,12 @@ metadata:
     app.kubernetes.io/part-of: telcoin-network
 spec:
   # No replicas: the HPA (hpa.yaml) owns the count; set it if you do not install the HPA.
-  # A rollout replaces one pod at a time and waits out the old pod's 51s
-  # shutdown (minReadySeconds > 5s delay + 45s drain + 1s) before the next,
-  # so a rollout adds at most one gateway to the maxReplicas holding worker
-  # slots. A node drain is not bounded this way: the PDB counts only Ready
-  # pods that are not terminating, so pods it evicted can still be draining
-  # (see WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT below).
+  # A rollout replaces one pod at a time and waits out the old pod's 52s
+  # shutdown (minReadySeconds > 5s delay + 45s drain + 1s join margin + 1s
+  # runtime shutdown) before the next, so a rollout adds at most one gateway to
+  # the maxReplicas holding worker slots. A node drain is not bounded this way:
+  # the PDB counts only Ready pods that are not terminating, so pods it evicted
+  # can still be draining (see WORKER_GATEWAY_MAX_UPSTREAM_INFLIGHT below).
   strategy:
     type: RollingUpdate
     rollingUpdate:
@@ -52,10 +52,10 @@ spec:
             matchLabels:
               app: worker-gateway
       # Longer than the gateway's --shutdown-delay (5s, set below) plus its
-      # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin:
-      # 5s + 45s + 1s = 51s, so the process can finish draining in-flight
-      # proxied requests before the kubelet sends SIGKILL. Recompute it if
-      # you change either value.
+      # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin
+      # and its 1s runtime shutdown: 5s + 45s + 1s + 1s = 52s, so the
+      # process can finish draining in-flight proxied requests before the
+      # kubelet sends SIGKILL. Recompute it if you change either value.
       terminationGracePeriodSeconds: 55
       containers:
         - name: worker-gateway
