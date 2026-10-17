@@ -55,7 +55,8 @@ spec:
       # --graceful-shutdown-timeout (45s, set below) plus its 1s join margin
       # and its 1s runtime shutdown: 5s + 45s + 1s + 1s = 52s, so the
       # process can finish draining in-flight proxied requests before the
-      # kubelet sends SIGKILL. Recompute it if you change either value.
+      # kubelet sends SIGKILL. Recompute it, and minReadySeconds above, if you
+      # change either value.
       terminationGracePeriodSeconds: 55
       containers:
         - name: worker-gateway
@@ -122,9 +123,9 @@ spec:
             # the pod's removal from the Service endpoints to reach kube-proxy
             # and load balancers, as the old preStop sleep was. A front outside
             # Kubernetes that probes /ready or /ready/any needs its interval x
-            # unhealthy threshold to fit in it; for a slower front raise this
-            # and terminationGracePeriodSeconds. The drain starts after it. No
-            # preStop sleep is needed.
+            # unhealthy threshold to fit in it; for a slower front raise this,
+            # terminationGracePeriodSeconds and minReadySeconds. The drain
+            # starts after it. No preStop sleep is needed.
             - name: WORKER_GATEWAY_SHUTDOWN_DELAY
               value: "5s"
             # Drain in-flight requests for up to the gateway's whole-request
@@ -132,8 +133,9 @@ spec:
             # 10s), so a request accepted just before the listener closes,
             # such as an eth_sendRawTransactionSync waiting for its receipt,
             # still finishes. The drain ends as soon as the last request does.
-            # 45s equals the default at these timeouts; it is set explicitly so
-            # the arithmetic for terminationGracePeriodSeconds stays visible.
+            # 45s equals the default at these timeouts; it is set explicitly
+            # so the arithmetic for terminationGracePeriodSeconds and
+            # minReadySeconds stays visible.
             - name: WORKER_GATEWAY_GRACEFUL_SHUTDOWN_TIMEOUT
               value: "45s"
             # Keep N x --max-upstream-inflight below the worker's
