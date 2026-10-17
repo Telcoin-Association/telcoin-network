@@ -627,7 +627,7 @@ pub(crate) async fn proxy(
             // this path. it is read here, while the in-flight guard, the class
             // slot and the byte reservation are still held (the worker slot no
             // longer is). the in-flight guard and the class slot then travel
-            // with the answer until the client has taken it (see
+            // with the answer until hyper has taken the last frame (see
             // [`HeldAnswer`]); the byte reservation does not, and drops when
             // this returns, so a client that reads slowly or not at all cannot
             // hold it. it is held for the read, which ends within
@@ -757,8 +757,9 @@ fn submission_accepted(answer: &[u8]) -> bool {
 /// only for an answer passed on, and a lost one as the error it gets.
 ///
 /// An answer that was read goes out as a [`HeldAnswer`], which keeps
-/// `in_flight` and `class_slot` until the client has taken it, as a streamed
-/// answer keeps them (see [`relay`]); a lost answer drops them on return.
+/// `in_flight` and `class_slot` until hyper has taken the last frame, as a
+/// streamed answer keeps them (see [`relay`]); a lost answer drops them on
+/// return.
 async fn relay_submission_answer(
     upstream: reqwest::Response,
     upstream_url: &Url,
@@ -873,17 +874,19 @@ impl fmt::Display for AnswerLost {
 
 /// A submission's answer, read whole by [`relay_submission_answer`], on its way
 /// to the client, holding the request's in-flight guard and class slot until
-/// the client has taken it.
+/// hyper has taken the last frame.
 ///
 /// [`proxy`] returns as soon as the answer has been read, but the answer then
 /// waits in hyper for a client that may read it slowly, or not at all, until
 /// the connection-layer guards close the connection. Holding the guards keeps
 /// that request in the in-flight gauge (the autoscaling signal) and its
 /// duration, and on `--max-inflight-submissions`, as [`UpstreamBody`] does for
-/// a streamed answer. The byte reservation is not held: it drops when
-/// [`proxy`] returns, once the answer has been read (within
-/// `--upstream-request-timeout` of the request being sent), whatever the
-/// client does next.
+/// a streamed answer. The guards drop once hyper has taken the last frame, so
+/// up to `--http1-max-buf-size` plus the socket's send buffer of the answer
+/// may still be unread by the client then, as on the streamed path. The byte
+/// reservation is not held: it drops when [`proxy`] returns, once the answer
+/// has been read (within `--upstream-request-timeout` of the request being
+/// sent), whatever the client does next.
 ///
 /// The answer goes out in copies of at most [`HeldAnswer::MAX_FRAME`] bytes,
 /// with an exact size hint, so hyper still sends its `Content-Length`. A
@@ -894,8 +897,8 @@ struct HeldAnswer {
     /// The part of the answer not yet handed to hyper.
     answer: Bytes,
     /// Holds the request in the in-flight gauge and its duration timer until
-    /// the answer has been taken, or is dropped because the client went away
-    /// or the connection closed.
+    /// hyper has taken the last frame, or is dropped because the client went
+    /// away or the connection closed.
     _in_flight: telemetry::RequestInFlight,
     /// The request's slot on `--max-inflight-submissions`.
     _class_slot: telemetry::InFlightSlot,
