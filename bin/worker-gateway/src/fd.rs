@@ -200,6 +200,11 @@ mod tests {
         Layer(Some(Box::new(Layer(cause))))
     }
 
+    /// The chain is built by hand, the way reqwest and hyper-util wrap a
+    /// connect error today; no test drives a real connect that fails with
+    /// `EMFILE` (that needs `RLIMIT_NOFILE` lowered in a process of its own),
+    /// so an upgrade that stopped chaining the `io::Error` would pass this test
+    /// while passive health blamed the worker again.
     #[test]
     fn fd_exhaustion_is_not_the_workers_fault() {
         for errno in [EMFILE, ENFILE] {
