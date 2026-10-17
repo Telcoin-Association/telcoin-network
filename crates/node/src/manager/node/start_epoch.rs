@@ -1101,10 +1101,10 @@ where
     /// An existing `CvvInactive` state is sticky: a node syncing to rejoin
     /// the committee stays inactive until that resolves elsewhere. Otherwise the node is an
     /// `Observer` if it is not in this committee or a newer epoch record excludes it from the
-    /// committee. A locally eligible node otherwise starts as
-    /// `CvvActive`. `CvvActive` is optimistic: the node assumes it is caught up and is
-    /// demoted to inactive later if that turns out to be false. The chosen mode is written to the
-    /// [`ConsensusBus`] before returning.
+    /// committee. A locally eligible node starts as `CvvInactive` when a newer epoch record proves
+    /// it must catch up, and otherwise starts as `CvvActive`. `CvvActive` is optimistic: the node
+    /// assumes it is caught up and is demoted to inactive later if that turns out to be false.
+    /// The chosen mode is written to the [`ConsensusBus`] before returning.
     async fn identify_node_mode(
         &self,
         consensus_config: &ConsensusConfig<DB>,
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         assert_topics(2)?;
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, true),
@@ -1754,7 +1754,7 @@ mod tests {
         assert_eq!(windows, vec![0, 1]);
         assert_eq!(engine.worker_http_local_address(&0).await?, rpc_zero);
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, false),
@@ -1835,7 +1835,7 @@ mod tests {
         assert_eq!(ids, vec![0, 1]);
         assert_topics(2)?;
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, true),
                 crate::health::WorkerReadiness::new(1, true),
@@ -1912,7 +1912,7 @@ mod tests {
         assert_eq!(retained_pool.block_info().pending_basefee, 100_000_005);
         regrow_config.shutdown().notify();
         assert_eq!(
-            engine.worker_readiness().await,
+            engine.worker_readiness(tn_types::NodeMode::CvvActive).await,
             vec![
                 crate::health::WorkerReadiness::new(0, false),
                 crate::health::WorkerReadiness::new(1, false),
