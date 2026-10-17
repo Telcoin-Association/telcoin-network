@@ -539,7 +539,10 @@ pub(crate) struct Cli {
     /// Most client prefixes the per-IP rate limiter tracks at once (default
     /// 100,000); a first-seen client beyond it shares one overflow bucket with
     /// every other untracked client (see the README's Rate limiting section).
-    /// Ignored when the per-IP rate limit is disabled.
+    /// Memory (about 100 bytes an entry) and the once-a-second idle sweep,
+    /// which walks the whole table under the lock every per-IP admission takes
+    /// (about 1 ms per 100,000 entries), grow with this value; startup warns
+    /// above 1,000,000. Ignored when the per-IP rate limit is disabled.
     #[arg(
         long,
         env = "WORKER_GATEWAY_RATE_LIMIT_PER_IP_MAX_ENTRIES",
@@ -1036,6 +1039,17 @@ impl Cli {
             resolve_rate_limit(self.rate_limit_per_ip, self.rate_limit_per_ip_burst);
         let rate_limit_global =
             resolve_rate_limit(self.rate_limit_global, self.rate_limit_global_burst);
+        if rate_limit_per_ip.is_some()
+            && self.rate_limit_per_ip_max_entries.get() > crate::ratelimit::MAX_QUIET_PER_IP_ENTRIES
+        {
+            warn!(
+                target: "gateway",
+                max_entries = self.rate_limit_per_ip_max_entries.get(),
+                "--rate-limit-per-ip-max-entries is above 1,000,000: each idle-bucket sweep \
+                 walks the whole table under the lock every per-IP admission takes (about 1 ms \
+                 per 100,000 entries)"
+            );
+        }
         // a batch of k calls needs k tokens at once and no bucket ever holds
         // more than its burst, so a batch longer than the smallest per-ip or
         // global burst could only ever get a 429 that no retry satisfies; cap
@@ -2799,6 +2813,30 @@ mod tests {
         ];
         let err = try_parse_test_argv(argv).expect_err("a zero-entry table was accepted");
         assert_eq!(err.kind(), clap::error::ErrorKind::ValueValidation);
+    }
+
+    /// A per-IP table cap above 1,000,000 entries starts with a warning, since
+    /// both idle sweeps walk the whole table under the lock every per-IP
+    /// admission takes; the ceiling itself is quiet, and so is a cap the
+    /// disabled per-IP limit ignores.
+    #[test]
+    fn per_ip_max_entries_above_a_million_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--rate-limit-per-ip-max-entries is above 1,000,000";
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--rate-limit-per-ip-max-entries=1000001"]));
+        settings?;
+        assert!(logs.contains(WARNING), "a cap above the ceiling did not warn: {logs}");
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--rate-limit-per-ip-max-entries=1000000"]));
+        settings?;
+        assert!(!logs.contains(WARNING), "the ceiling itself is quiet: {logs}");
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[
+            "--rate-limit-per-ip-max-entries=1000001",
+            "--rate-limit-per-ip=0",
+        ]));
+        settings?;
+        assert!(!logs.contains(WARNING), "ignored with the per-IP limit off: {logs}");
+        Ok(())
     }
 
     #[test]

@@ -98,22 +98,29 @@ use crate::{
 
 /// How often the background sweep reclaims idle per-IP buckets: every second,
 /// so a client whose bucket has refilled frees its slot within a second. A
-/// sweep walks the whole table under the map lock (about 1 ms over 100,000
-/// entries).
+/// sweep walks the whole table under the map lock (about 1 ms over the default
+/// 100,000 entries, linear in the `--rate-limit-per-ip-max-entries` cap).
 pub(crate) const GC_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Least time between two sweeps of a full per-IP table made inline for a
 /// first-seen client (see [`PerIpLimiter::make_room`]). A sweep walks the whole
-/// table under the map lock (about 1 ms over 100,000 entries), so this bounds
-/// its cost under a stream of new clients.
+/// table under the map lock (about 1 ms over the default 100,000 entries,
+/// linear in the cap), so this bounds its cost under a stream of new clients.
 const INLINE_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Default ceiling on tracked per-IP buckets (`--rate-limit-per-ip-max-entries`).
 /// Bounds the per-IP map so a wide spread of source IPs cannot grow it without
-/// limit; ~10 MB at the cap, and idle buckets are reclaimed between sweeps by
-/// [`RateLimiters::gc`].
+/// limit; ~10 MB at the default cap, growing linearly with the flag, and idle
+/// buckets are reclaimed between sweeps by [`RateLimiters::gc`].
 pub(crate) const DEFAULT_MAX_PER_IP_ENTRIES: NonZeroUsize =
     NonZeroUsize::new(100_000).expect("the default per-IP table size is not zero");
+
+/// Largest `--rate-limit-per-ip-max-entries` startup accepts without a
+/// warning, ten times the default: memory (about 100 bytes an entry) and each
+/// idle-bucket sweep, which walks the whole table under the map lock every
+/// per-IP admission takes (about 1 ms per 100,000 entries), grow linearly with
+/// the cap.
+pub(crate) const MAX_QUIET_PER_IP_ENTRIES: usize = 1_000_000;
 
 /// A source of monotonic time, injectable so the limiters can be driven
 /// deterministically in tests.
