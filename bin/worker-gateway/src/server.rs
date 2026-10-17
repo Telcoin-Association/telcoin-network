@@ -501,21 +501,27 @@ impl AccessLog {
     /// ceiling; one that does not is counted as suppressed.
     fn admit_line(&self, second: u64) -> bool {
         let Some(max) = self.max_lines_per_second else { return true };
-        // a poisoned lock only means a panic while holding it; the two plain
-        // fields are still consistent enough to cap a log line
-        let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
-        // a request that read the clock just before a newer one took the lock
-        // counts against the newer window rather than reopening its own
-        if second > window.second {
-            *window = LineWindow { second, lines: 0 };
-        }
-        if window.lines < max.get() {
-            window.lines += 1;
-            true
-        } else {
+        let admitted = {
+            // a poisoned lock only means a panic while holding it; the two plain
+            // fields are still consistent enough to cap a log line
+            let mut window = self.window.lock().unwrap_or_else(PoisonError::into_inner);
+            // a request that read the clock just before a newer one took the lock
+            // counts against the newer window rather than reopening its own
+            if second > window.second {
+                *window = LineWindow { second, lines: 0 };
+            }
+            let admitted = window.lines < max.get();
+            if admitted {
+                window.lines += 1;
+            }
+            admitted
+        };
+        // recorded after the lock is released: every sampled request takes it,
+        // and this is the flood path the ceiling exists for
+        if !admitted {
             telemetry::record_access_log_suppressed();
-            false
         }
+        admitted
     }
 }
 
