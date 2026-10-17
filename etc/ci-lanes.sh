@@ -140,9 +140,10 @@ lane_test_default() {
     # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
     # -p), but the workspace build below unifies features across every member, so a
     # feature the gateway needs and does not enable on its own dependencies still
-    # compiles there. Check it alone so that gap fails here; `check_gateway_image_context`
-    # above covers the image's COPY list.
-    run cargo check --locked -p tn-worker-gateway --bin worker-gateway
+    # compiles there, and neither `cargo check` nor the test build links the production
+    # binary. Build it alone so a missing feature or a link failure fails here;
+    # `check_gateway_image_context` above covers the image's COPY list.
+    run cargo build --locked -p tn-worker-gateway --bin worker-gateway
     run cargo nextest run --locked --workspace "${run_mode[@]}"
 }
 
