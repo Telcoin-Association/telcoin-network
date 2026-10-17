@@ -1638,14 +1638,17 @@ impl QueryHeader {
     /// name and the value.
     ///
     /// A framing or hop-by-hop name, or one the gateway sets on the query hop
-    /// itself, is refused: reqwest appends the header rather than replacing
-    /// one already set, so it would go out twice or mis-frame the body.
+    /// itself, is refused: reqwest appends such a header rather than replacing
+    /// the one already set, so it would go out twice or mis-frame the body;
+    /// `User-Agent`, which reqwest would replace instead, is refused because a
+    /// query upstream's operator identifies the gateway by it (see
+    /// [`USER_AGENT`]).
     ///
     /// Errors name the problem but never echo the value or a malformed line,
     /// either of which can hold a credential; a refused name is named, in its
     /// lowercase form, since it is one of a fixed list.
     pub(crate) fn parse(line: &str) -> eyre::Result<Self> {
-        const RESERVED: [HeaderName; 14] = [
+        const RESERVED: [HeaderName; 15] = [
             header::CONTENT_LENGTH,
             header::TRANSFER_ENCODING,
             header::HOST,
@@ -1654,6 +1657,7 @@ impl QueryHeader {
             header::TRAILER,
             header::UPGRADE,
             header::CONTENT_TYPE,
+            header::USER_AGENT,
             X_FORWARDED_FOR,
             X_FORWARDED_PROTO,
             HOP_HEADER,
@@ -4687,6 +4691,7 @@ mod tests {
             "Trailer",
             "UpGrade",
             "Content-type",
+            "user-AGENT",
             "X-Forwarded-For",
             "x-FORWARDED-proto",
             "X-TN-Gateway",
