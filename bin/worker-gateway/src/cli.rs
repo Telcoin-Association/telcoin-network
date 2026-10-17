@@ -2955,9 +2955,12 @@ mod tests {
 
     #[test]
     fn short_per_ip_prefix_warns() -> eyre::Result<()> {
-        for (flag, short, floor) in
-            [("--rate-limit-per-ip-v4-prefix", 8, 16), ("--rate-limit-per-ip-v6-prefix", 16, 32)]
+        for (flag, floor) in
+            [("--rate-limit-per-ip-v4-prefix", 16), ("--rate-limit-per-ip-v6-prefix", 32)]
         {
+            // one bit below the floor warns and the floor is quiet, so a floor
+            // moved by one bit either way fails
+            let short = floor - 1;
             let warning = format!("{flag} is /{short}: every client inside one /{short} shares");
             let arg = format!("{flag}={short}");
             let (settings, logs) = into_settings_logged(cli_with_flags(&[arg.as_str()]));
