@@ -20,7 +20,8 @@ use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     time::Duration,
 };
-use tn_node_record::{gossip_protocol_id_prefix, BlsPublicKey, RecordDomain};
+use tn_network_libp2p::gossipsub_config;
+use tn_node_record::{BlsPublicKey, RecordDomain};
 use tokio::{
     sync::{mpsc, oneshot},
     time::Instant,
@@ -481,18 +482,15 @@ impl Driver {
 
 /// Build the topic-less gossipsub instance that keeps the node from banning the client.
 ///
-/// Mirrors the node's builder in `ConsensusNetwork::new`: strict validation, application-side
-/// validation of every message (so nothing is ever forwarded without an explicit accept, which
-/// the client never gives), and the chain-namespaced protocol id prefix the node negotiates on.
+/// Uses the node's own configuration (`tn_network_libp2p::gossipsub_config`): strict
+/// validation, application-side validation of every message (so nothing is ever forwarded
+/// without an explicit accept, which the client never gives), the chain-namespaced protocol id
+/// prefix the node negotiates on, and the node's explicit gossipsub frame limits.
 fn build_gossipsub(
     keypair: &identity::Keypair,
     chain_id: u64,
 ) -> Result<gossipsub::Behaviour, KadClientError> {
-    let config = gossipsub::ConfigBuilder::default()
-        .validation_mode(gossipsub::ValidationMode::Strict)
-        .validate_messages()
-        .protocol_id_prefix(gossip_protocol_id_prefix(chain_id))
-        .build()
+    let config = gossipsub_config(chain_id)
         .map_err(|e| KadClientError::Transport(format!("invalid gossipsub config: {e}")))?;
     gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(keypair.clone()), config)
         .map_err(|e| KadClientError::Transport(format!("failed to build gossipsub: {e}")))
