@@ -75,7 +75,7 @@ To check a release yourself, follow [Installing a release](https://docs.telcoin.
 
 ### Maintainer release keys
 
-The fingerprint is the primary key's. Signatures are made with a signing subkey on the YubiKey, and every check matches them to the primary key.
+Each key is generated on a YubiKey and never leaves it. The fingerprint is the primary key's, and every check matches signatures on it.
 
 | Handle | Primary key fingerprint | YubiKey serial | Added | Status |
 |--------|-------------------------|----------------|-------|--------|
@@ -88,9 +88,9 @@ Until a key is provisioned, its file in `.github/maintainer-gpg-keys/` is a plac
 ### Changing this table
 
 - To add a maintainer, open one pull request that adds `.github/maintainer-gpg-keys/<handle>.asc` and a row here, and have it reviewed by someone other than the key's owner. [YubiKey signing setup](https://docs.telcoin.network/maintainers/yubikey-setup.html) covers creating and exporting the key.
-- When a YubiKey is replaced, update the `.asc` file in place with the new signing subkey and change the YubiKey serial and Added date in the row. The primary fingerprint stays the same.
-- When a key is revoked, keep its row, set Status to `revoked YYYY-MM-DD`, and delete its `.asc` file. Release checks read the allowlist from `main`, so the key stops being accepted as soon as that change merges.
-- To require more signatures, raise `MIN_SIGNATURES` in `etc/release.sh` and update the Signatures required line in the same pull request. The threshold cannot exceed the number of keys in the table.
+- Every YubiKey holds a key of its own. A spare YubiKey's key is added to the maintainer's `.asc` file with a row of its own here. A replaced or lost YubiKey means a new key: add it to the `.asc` file with a new row, set the old row's Status to `revoked YYYY-MM-DD`, and delete the old key from the file.
+- When a key is revoked, keep its row, set Status to `revoked YYYY-MM-DD`, and delete the key from its `.asc` file, deleting the file when no other key remains. Release checks read the allowlist from `main`, so the key stops being accepted as soon as that change merges.
+- To require more signatures, raise `MIN_SIGNATURES` in `etc/release.sh` and update the Signatures required line in the same pull request. The threshold cannot exceed the number of maintainers in the table.
 
 ## Credits & Acknowledgments
 

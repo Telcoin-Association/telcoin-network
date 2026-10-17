@@ -1,4 +1,4 @@
-.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint
+.PHONY: help attest udeps check test test-cargo test-faucet coverage coverage-html fmt clippy docker-login docker-adiri docker-devnet docker-push docker-builder docker-builder-init up down validators pr init-submodules update-tn-contracts revert-submodule clean-logs book book-serve release-prep release-tag release-build release-sign release-verify release-publish release-lint yubikey-setup
 
 # full path for the Makefile
 ROOT_DIR:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
@@ -138,6 +138,9 @@ help:
 	@echo ;
 	@echo "make release-lint" ;
 	@echo "    :::> Run actionlint and shellcheck (pinned Docker images) on the release workflow and scripts." ;
+	@echo ;
+	@echo "make yubikey-setup" ;
+	@echo "    :::> One-time maintainer setup: provision the release signing key on a YubiKey (etc/yubikey-setup.sh run)." ;
 	@echo ;
 
 # run CI locally and submit attestation githash to on-chain program
@@ -518,7 +521,11 @@ release-prep release-tag release-build release-sign release-verify release-publi
 	@test "$(origin TAG)" != file || { echo "usage: make $@ TAG=vX.Y.Z[-adiri][-rcN]"; exit 2; }
 	./etc/release.sh $(patsubst release-%,%,$@) "$(TAG)"
 
+# one-time maintainer setup for the release signing key; runbook: docs/src/maintainers/yubikey-setup.md
+yubikey-setup:
+	./etc/yubikey-setup.sh run
+
 # lint the release workflows and scripts with pinned actionlint and shellcheck images
 release-lint:
 	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(ACTIONLINT_IMAGE) -color .github/workflows/release.yaml .github/workflows/docs.yaml
-	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh .github/scripts/verify_commit_hash.sh
+	docker run --rm --network none -u "$$(id -u):$$(id -g)" -v "$(ROOT_DIR):/repo:ro" -w /repo $(SHELLCHECK_IMAGE) shellcheck -x -S style etc/release.sh etc/yubikey-setup.sh .github/scripts/verify_commit_hash.sh

@@ -48,7 +48,7 @@ The tag checks also enforce these version rules:
 
 - [YubiKey signing setup](yubikey-setup.md) is done, and your key is on the allowlist on `main`.
 - `gpg --card-status` shows the YubiKey.
-- `git config --get user.signingkey` prints your signing subkey fingerprint followed by `!`; `RELEASE_GPG_KEY` overrides it for one command.
+- `git config --get user.signingkey` prints your signing key fingerprint followed by `!`; `RELEASE_GPG_KEY` overrides it for one command.
 - `gh auth status` shows a login with the `repo` scope, which `release-sign` needs to read the draft and upload to it.
 - The repository is cloned and on an up-to-date `main`.
 - Foundry's `cast` is optional: with it, `release-tag` and `release-sign` also check the on-chain attestation, and without it they print a notice and leave that check to CI.
@@ -290,7 +290,7 @@ If `release-sign` had already uploaded the signature, the second run stops becau
 | 1 | `release-prep` refuses to start | The message names the precondition: a clean tracked tree, `HEAD` at `origin/main`, or a tag that already exists. |
 | 1 | `release-prep` finds the version's section lower down in `CHANGELOG.md` | That version was already released; choose the next one. |
 | 2, 3 | The `CHANGELOG.md` check fails on `release-base` | If you are tagging a later commit, set `RELEASE_COMMIT` to the release commit. If the release commit did not land alone, repeat step 1 on the new `main`. |
-| 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing subkey (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
+| 2, 3 | The signing key is not on the allowlist | Check `git config --get user.signingkey` and `RELEASE_GPG_KEY`, and that your file on `main` holds your current signing key (`gpg --show-keys .github/maintainer-gpg-keys/<handle>.asc`). |
 | 2, 3 | The commit is not attested | On xerxes, run `git switch --detach <commit> && ALLOW_STALE_BASE=1 make attest`, then `git switch main`. If CI failed on it, also run `gh run rerun <run-id>`. |
 | 3 | The tag is wrong and has to go | If CI created no draft and nothing was built, delete it with `git push --delete origin <TAG>` and `git tag -d <TAG>`, then tag again. Otherwise follow [Before publish](#before-publish). |
 | 4, 6 | `run make docker-login` | Run `make docker-login` on xerxes. |
@@ -370,8 +370,9 @@ With a threshold above 1, each signer runs `make release-sign` on their own lapt
 [Expiry, loss and rotation](yubikey-setup.md#expiry-loss-and-rotation) has the commands.
 The allowlist and `SECURITY.md` change like this:
 
-- for an extended expiry, a new signing subkey or a revoked subkey, update `<handle>.asc` in place, and update the serial and date in the `SECURITY.md` row when the YubiKey changes;
-- for a revoked primary key, delete `<handle>.asc`, mark the `SECURITY.md` row `revoked YYYY-MM-DD`, and remove the key from GitHub as [Primary key compromised](yubikey-setup.md#primary-key-compromised) describes;
+- for an extended expiry or a spare YubiKey's key, update `<handle>.asc` in place, and add a `SECURITY.md` row for a spare's key;
+- for a replacement YubiKey, which holds a new key, add that key to `<handle>.asc` with a new `SECURITY.md` row, and revoke the old key;
+- for a revoked key, after a lost YubiKey or a compromise, delete it from `<handle>.asc` (the whole file when no other key remains), mark its `SECURITY.md` row `revoked YYYY-MM-DD`, and remove it from GitHub as [Lost or broken YubiKey](yubikey-setup.md#lost-or-broken-yubikey) describes;
 - never add a placeholder file for a new maintainer; the file is added when the key exists.
 
 `release-verify` does not count a signature from an expired or revoked key, and it reads the keys from `main`.

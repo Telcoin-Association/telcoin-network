@@ -1304,7 +1304,7 @@ When a check fails, do not extract, install or run anything from this release:
 - The last line is not `Signature and hashes verified`: a step failed, and the lines above it say which.
 - `BADSIG`: `SHA256SUMS` changed after it was signed. Report it.
 - `ERRSIG`: the signing key is not in the allowlist on `main`, or `TAG` is wrong. Check `TAG`; if it is right, report it.
-- `EXPKEYSIG` or `REVKEYSIG`: the signing subkey has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
+- `EXPKEYSIG` or `REVKEYSIG`: the signing key has expired or was revoked, although gpgv still prints `Good signature`. Report it; a release signed before that can no longer be verified against `main`, which is intended.
 - `sha256sum` prints `FAILED` or `no file was verified`: a file differs from its signed hash, or none of the files is present. Check `TAG` and download once more; if it still fails, report it.
 - `sha256sum` prints `FAILED open or read` for a `chain-configs/` file: `git archive` did not extract it. Check that the tag was fetched; if it was, report it.
 - A fingerprint is missing from `SECURITY.md` or GitHub, differs, or has the Status `revoked`. Report it.

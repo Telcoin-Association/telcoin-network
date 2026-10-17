@@ -32,8 +32,8 @@ GitHub marks every Adiri release and every release candidate as a pre-release, s
 
 ## What the signature proves
 
-`IMAGE_DIGEST` names the image by its content digest, and `SHA256SUMS` lists the SHA-256 of `IMAGE_DIGEST`, of the tarball and of the network's chain-config files, so one signature over `SHA256SUMS` covers the binary, the image, and the genesis, committee and parameters files built into them.
-`SHA256SUMS.asc` is made with a maintainer's OpenPGP key whose signing subkey is held on a YubiKey.
+`IMAGE_DIGEST` names the image by its content digest, and `SHA256SUMS` lists the SHA-256 of `IMAGE_DIGEST` and of the tarball, so one signature over `SHA256SUMS` covers both the binary and the image.
+`SHA256SUMS.asc` is made with a maintainer's OpenPGP signing key, held on a YubiKey, which it never leaves.
 The same key signs the git tag.
 The keys allowed to sign are in [`.github/maintainer-gpg-keys/`](https://github.com/Telcoin-Association/telcoin-network/blob/main/.github/maintainer-gpg-keys/README.md) on `main`, and their fingerprints are in the maintainer release keys table in [`SECURITY.md`](https://github.com/Telcoin-Association/telcoin-network/blob/main/SECURITY.md#maintainer-release-keys).
 
@@ -87,7 +87,7 @@ Expect:
 - `sha256sum` to print `OK` after `IMAGE_DIGEST`, after the three `chain-configs/` files and after `telcoin-network-<TAG>-x86_64-unknown-linux-gnu.tar.gz`;
 - `Signature and hashes verified` as the last line.
 
-gpgv prints `Good signature from` and exits 0 even when the signing subkey is revoked or expired, so the block reads gpgv's status lines instead and accepts only `GOODSIG`.
+gpgv prints `Good signature from` and exits 0 even when the signing key is revoked or expired, so the block reads gpgv's status lines instead and accepts only `GOODSIG`.
 If the last line `Signature and hashes verified` is missing, the files are not verified; stop, do not extract or run anything from this release, and report it.
 The lines above it show which check failed, and [When verification fails](#when-verification-fails) explains each one.
 
@@ -229,8 +229,8 @@ Never extract, install or run anything from a release that failed one of these c
 | `git fetch` cannot find `refs/tags/<TAG>`, or `curl` fails with `404` | `TAG` is wrong, or the release is not published yet | Check `TAG` against the [releases page](https://github.com/Telcoin-Association/telcoin-network/releases). |
 | `BADSIG` (gpgv prints `BAD signature`) | `SHA256SUMS` changed after it was signed | Stop and report it. |
 | `ERRSIG` (gpgv prints `Can't check signature: No public key`) | The signing key is not in the allowlist on `main`: `TAG` is wrong, the files belong to another release, or the key was removed after this release was signed | Check `TAG`; if it is right, stop and report it. |
-| `REVKEYSIG` (gpgv still prints `Good signature`) | The signing subkey was revoked, for example after a YubiKey was lost | Stop and report it. A release signed before the revocation can no longer be verified against `main`, which is intended. |
-| `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing subkey has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key there. |
+| `REVKEYSIG` (gpgv still prints `Good signature`) | The signing key was revoked, for example after a YubiKey was lost | Stop and report it. A release signed before the revocation can no longer be verified against `main`, which is intended. |
+| `EXPKEYSIG` (gpgv still prints `Good signature`) | The signing key has expired | Stop and report it. An older release signed before the expiry cannot be verified against `main` until a maintainer extends the key there. |
 | `sha256sum` prints `FAILED` | A file differs from its signed hash | Download it again once; if it still fails, report it. |
 | `sha256sum` prints `no file was verified` | None of the files named in `SHA256SUMS` is present | Check `TAG` and the downloaded file names. |
 | `sha256sum` prints `FAILED open or read` for a `chain-configs/` file | `git archive` did not extract it from the tag | Check that the tag was fetched; if it was, stop and report it. |

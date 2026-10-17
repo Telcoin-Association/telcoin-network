@@ -3,7 +3,7 @@
 These pages are for maintainers who cut releases or hold a release signing key.
 
 - [Releasing](releasing.md) walks through the seven steps from the release PR to a published and verified release, and what to do when a step fails.
-- [YubiKey signing setup](yubikey-setup.md) creates an OpenPGP key with its signing subkey on a YubiKey, adds it to the allowlist, and sets up registry access on the build host.
+- [YubiKey signing setup](yubikey-setup.md) generates an OpenPGP key on a YubiKey, which it never leaves, adds it to the allowlist, and sets up registry access on the build host.
 
 Operators install a release with [Installing a release](../getting-started/installing-a-release.md) and read what changed in [Release notes](../getting-started/release-notes.md).
 
@@ -14,7 +14,7 @@ The same key signs the git tag and `SHA256SUMS.asc`, the detached signature over
 One signature is required (`MIN_SIGNATURES` in `etc/release.sh`).
 CI, the release scripts and the operator check in [Installing a release](../getting-started/installing-a-release.md) read the allowlist from `main`, never from the tagged tree, so a tag cannot bring its own key.
 
-Signing happens on a maintainer's macOS laptop, where the signing subkey lives on a YubiKey.
+Signing happens on a maintainer's macOS laptop, with a key that was generated on a YubiKey and never leaves it.
 Building happens on xerxes, a Linux x86_64 host that holds the registry credential and never sees the YubiKey.
 A release that passes `make release-verify` needs both machines: xerxes builds and pushes the image, and the YubiKey signs the checksums.
 
