@@ -322,9 +322,10 @@ With `--rate-limit-submissions` set (requests per second, burst twice the rate),
 The calls of a submission batch beyond its first still come from the global bucket (see below), so the flag bounds submission requests, not submitted transactions.
 The edge cannot tell the classes apart before the body is read, so there it runs only the per-IP limit, which still covers both classes and still refuses an over-limit client before its body is read.
 Once the request is read and classified, its first call is charged to the global bucket for a query or to the submission bucket for a submission.
-A refusal there is a `429` and gives the per-IP token back, so a refused submission spends no global token and a refused query no submission token.
-A first-seen client gets its per-IP entry only once a shared bucket has admitted its request: its class bucket, or, for a request answered before it is classified (a `405`, an unreadable or over-length body, a denied method), the global bucket, which then charges it as a query; a request either bucket refuses leaves no entry, so with the flag as without it a flood the shared buckets refuse cannot fill the table.
-Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit.
+A refusal there is a `429` that spends no other shared bucket, so a refused submission spends no global token and a refused query no submission token, but the per-IP token stays spent: the body has been read and screened by then, and that token pays for the work.
+A first-seen client gets its per-IP entry at that charge, whether its class bucket admits or refuses the request, or, for a request answered before it is classified (a `405`, an unreadable or over-length body, a denied method), once the global bucket admits it as a query; so an entry costs the per-IP token that paid for reading the request, and a flood the shared buckets refuse can add entries up to `--rate-limit-per-ip-max-entries`, each of which then holds its client to the per-IP limit at the edge.
+Such a `429` comes after the body has been read (up to `--max-request-bytes`) and parsed, where without the flag the global `429` leaves before the body is read; that work is bounded by `--max-connections`, the per-client connection cap (`--max-connections-per-ip`) and the per-IP limit, which refuses a client at the edge, before its body is read, once its refused requests have spent its burst.
+The exception is a first-seen client whose every request is answered before it is classified while the global bucket refuses it: it gets no entry, so only the connection caps and `--max-request-bytes` bound that work.
 A submission over its own budget is refused even while the global bucket has tokens, since letting it spend them would hand the read budget back to a submission flood.
 A batch then pays for its calls beyond the first from the per-IP and global buckets whatever its class, so while reads have emptied the global bucket a submission batch gets the `429` that a single submission does not; that refusal gives the first call's class token back; its per-IP token stays spent.
 With `--redirect-queries` set, the worker receives up to N × `--rate-limit-submissions` submission requests per second from N gateways, plus the [reads kept on the worker](#reads-kept-on-the-worker), which are queries here (see [Sizing for N gateways](#sizing-for-n-gateways)).
@@ -390,7 +391,10 @@ One IPv6 `/48` (65,536 `/64`s) still fits in the default table with a bucket per
 A client keeps its own bucket only while it is busy: a sweep drops every bucket that has refilled, and a client that returns while every entry is busy shares the overflow bucket too.
 
 > **Residual limitation.** A source holding more prefixes than the table tracks (more than 100,000 at the default: two `/48`s, or one `/47`) can keep the overflow bucket empty only while it also keeps every tracked entry busy.
-> That costs it at least one request per tracked prefix every second, each charged to the global limit too, so it is out of reach while `--rate-limit-global` is well below the table size; with the global limit raised that far or disabled, clients without an entry get `429` for as long as the source keeps that up.
+> That costs it at least one request per tracked prefix every second.
+> Without `--rate-limit-submissions` each of those is charged to the global limit too, so it is out of reach while `--rate-limit-global` is well below the table size.
+> With the flag, a request its class bucket refuses keeps its entry busy without a shared token, so once the source has emptied the submission or global bucket the global limit no longer bounds it.
+> With the global limit raised that far or disabled, or with the flag as above, clients without an entry get `429` for as long as the source keeps that up.
 > If that matters for your deployment, limit new source prefixes at the ingress.
 
 #### Client identity behind a front

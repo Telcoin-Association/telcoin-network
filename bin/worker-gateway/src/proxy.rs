@@ -432,7 +432,9 @@ pub(crate) async fn proxy(
     // has already decoded its submissions), to the same client the layer
     // charged (the resolved `ClientAddr`, not the TCP peer), from the per-IP
     // and global buckets whatever its class. Like the layer's own refusal,
-    // this one cannot name an id.
+    // this one cannot name an id. A refused batch gets back only the class
+    // charge's token (below): without a submission budget the layer's global
+    // token stays spent, like the per-IP token in both modes.
     let charged = limiters.as_ref().map_or(Ok(()), |Extension(limiters)| {
         limiters.charge_batch(Some(forwarding.client_addr().0), scan.len.saturating_sub(1))
     });
