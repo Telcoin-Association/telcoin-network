@@ -9233,7 +9233,8 @@ mod tests {
         let worker_url = Url::parse(&format!("http://{worker}/")).expect("worker url");
         for query_url in [format!("http://{query}/"), "http://127.0.0.1:1/".to_string()] {
             let query_url = Url::parse(&query_url).expect("query url");
-            let check = check_chain_ids(&client, &worker_url, &query_url, Some(&header)).await;
+            let check =
+                check_chain_ids(&client, &client, &worker_url, &query_url, Some(&header)).await;
             log_chain_id_check(&check, &worker_url, &query_url);
         }
 

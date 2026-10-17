@@ -542,7 +542,8 @@ fn one_prefix_holds_budget(
 /// every task it tracks before the process exits, so on a SIGTERM, or when a
 /// critical task such as the server ends (a failed bind), a check still
 /// waiting on a slow upstream stops at once and logs nothing instead of
-/// holding the exit for up to `--upstream-request-timeout`.
+/// holding the exit while a slow upstream answers: each client's read timeout
+/// bounds only the head and each gap in the body, not the whole call.
 fn chain_id_check_task(
     state: &AppState,
     upstreams: &[UpstreamWorker],
@@ -550,13 +551,21 @@ fn chain_id_check_task(
 ) -> Option<impl Future<Output = Result<(), TaskError>> + Send + 'static> {
     let worker = upstreams.first()?.rpc_url.clone();
     let query = state.query_upstream.clone()?;
-    let client = state.http.clone();
+    // the clients forwarded calls use (see `proxy::forward`)
+    let worker_client = state.http.clone();
+    let query_client = state.query_http.clone().unwrap_or_else(|| state.http.clone());
     let query_header = state.query_header.clone();
     let shutdown = shutdown.subscribe();
     Some(async move {
         tokio::select! {
             () = shutdown => {}
-            check = check_chain_ids(&client, &worker, &query, query_header.as_ref()) => {
+            check = check_chain_ids(
+                &worker_client,
+                &query_client,
+                &worker,
+                &query,
+                query_header.as_ref(),
+            ) => {
                 log_chain_id_check(&check, &worker, &query);
             }
         }
@@ -591,19 +600,22 @@ pub(crate) enum ChainIdCheck {
 /// Ask the first worker and the query upstream for their chain ids, both at
 /// once, and decide what to log.
 ///
-/// Each call goes through `client`, the proxy client, so
-/// `--upstream-request-timeout` bounds it, and only the query call carries
-/// `query_header` (see [`fetch_chain_id`]). A failed call is a decision like
-/// any other; it never fails startup.
+/// The worker call goes through `worker_client` and the query call through
+/// `query_client`, the clients forwarded calls use, so
+/// `--upstream-request-timeout` and `--query-request-timeout` bound the head
+/// and each gap of the answer, not the whole call, and only the query call
+/// carries `query_header` (see [`fetch_chain_id`]). A failed call is a
+/// decision like any other; it never fails startup.
 pub(crate) async fn check_chain_ids(
-    client: &Client,
+    worker_client: &Client,
+    query_client: &Client,
     worker: &Url,
     query: &Url,
     query_header: Option<&QueryHeader>,
 ) -> ChainIdCheck {
     let (worker, query) = tokio::join!(
-        fetch_chain_id(client, Route::Worker, worker, query_header),
-        fetch_chain_id(client, Route::Query, query, query_header),
+        fetch_chain_id(worker_client, Route::Worker, worker, query_header),
+        fetch_chain_id(query_client, Route::Query, query, query_header),
     );
     match (worker, query) {
         (Ok(worker), Ok(query)) if worker == query => ChainIdCheck::Match(worker),
@@ -861,22 +873,23 @@ mod tests {
     #[tokio::test]
     async fn startup_warns_when_chain_ids_differ() {
         let header = api_key_header();
+        let client = client();
         let worker = url(chain_id_mock(CHAIN_2017, false).await);
 
         // the query upstream serves another chain: a warning with both ids
         let other_chain = url(chain_id_mock(CHAIN_1, true).await);
-        let check = check_chain_ids(&client(), &worker, &other_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &other_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Mismatch { worker: 2017, query: 1 });
 
         // the same chain: no warning
         let same_chain = url(chain_id_mock(CHAIN_2017, true).await);
-        let check = check_chain_ids(&client(), &worker, &same_chain, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, Some(&header)).await;
         assert_eq!(check, ChainIdCheck::Match(2017));
 
         // the mocks only answer when the key reaches the query upstream and
         // not the worker, so the two outcomes above also prove its routing;
         // without the key the query upstream refuses
-        let check = check_chain_ids(&client(), &worker, &same_chain, None).await;
+        let check = check_chain_ids(&client, &client, &worker, &same_chain, None).await;
         assert_eq!(
             check,
             ChainIdCheck::Unchecked {
@@ -894,6 +907,7 @@ mod tests {
         // nothing listens on port 1
         let down = Url::parse("http://user:pass@127.0.0.1:1/k3y?token=t0k3n").expect("url");
         let junk = url(serve_mock(Router::new().route("/", post(|| async { "not json" }))).await);
+        let client = client();
 
         for (worker, query, worker_fails, query_fails) in [
             (&worker, &down, false, true),
@@ -901,7 +915,7 @@ mod tests {
             (&down, &down, true, true),
             (&worker, &junk, false, true),
         ] {
-            let check = check_chain_ids(&client(), worker, query, Some(&header)).await;
+            let check = check_chain_ids(&client, &client, worker, query, Some(&header)).await;
             let ChainIdCheck::Unchecked { worker: worker_reason, query: query_reason } = check
             else {
                 panic!("a failed call must leave the chains unchecked, got {check:?}");
@@ -918,7 +932,7 @@ mod tests {
         }
 
         // an upstream that accepts the call and never answers is cut off by the
-        // proxy client's request timeout (`--upstream-request-timeout`)
+        // query client's read timeout
         let hung = url(serve_mock(Router::new().route(
             "/",
             post(|| async {
@@ -933,7 +947,7 @@ mod tests {
         )
         .expect("client");
         let started = Instant::now();
-        let check = check_chain_ids(&client, &worker, &hung, Some(&header)).await;
+        let check = check_chain_ids(&client, &client, &worker, &hung, Some(&header)).await;
         assert!(started.elapsed() < Duration::from_secs(5), "took {:?}", started.elapsed());
         assert!(
             matches!(check, ChainIdCheck::Unchecked { worker: None, query: Some(_) }),
@@ -1041,6 +1055,39 @@ mod tests {
             .await
             .expect("the check ends once shutdown fires")
             .expect("the task does not panic")
+            .expect("the task succeeds");
+    }
+
+    #[tokio::test]
+    async fn chain_id_check_task_sends_the_query_call_through_the_query_client() {
+        let worker = url(chain_id_mock(CHAIN_2017, false).await);
+        // a query upstream that accepts the call and never answers
+        let hung = url(serve_mock(
+            Router::new()
+                .route("/", post(|| async { std::future::pending::<&'static str>().await })),
+        )
+        .await);
+        // the worker client waits far past the bound below, the query client
+        // gives up after 200 ms, so the check ends in time only when the
+        // query call goes through the query client
+        let slow = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_secs(600),
+        )
+        .expect("client");
+        let quick = proxy_client(
+            UpstreamClientBuilder::for_test(Duration::from_secs(2)),
+            Duration::from_millis(200),
+        )
+        .expect("client");
+        let workers = [worker_at(&worker)];
+        let shutdown = ShutdownNotifier::new();
+        let mut app_state = state(&workers, Some(hung), slow);
+        app_state.query_http = Some(quick);
+        let task = chain_id_check_task(&app_state, &workers, &shutdown).expect("a check task");
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("the query call used the worker client")
             .expect("the task succeeds");
     }
 
