@@ -28,6 +28,9 @@
 //! and `rejections_total` breaks the non-forwarded side down by reason. The gateway's own `/health`
 //! and `/ready` probes are not proxied and are deliberately not counted, so the in-flight
 //! gauge and request counters reflect real client load only.
+//! A probe path requested with a method other than `GET` or `HEAD` is counted,
+//! though: its `405` is a `method_not_post` rejection, and on the client
+//! listener a `429` before it a `rate_limited` one.
 //!
 //! [`Throttle`] rate-limits a per-request log call site, so request volume
 //! cannot drive log volume; the counters above still count every request.
