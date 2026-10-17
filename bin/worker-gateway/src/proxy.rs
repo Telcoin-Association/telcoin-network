@@ -4957,4 +4957,43 @@ mod tests {
             server.abort();
         }
     }
+
+    /// [`relay`] labels a query upstream's answer `application/json` unless
+    /// the upstream labelled it JSON, keeping its body, while a worker's
+    /// content type passes through as is. [`proxy`] answers a non-JSON query
+    /// answer with the `-32012` error before it gets here, so only a direct
+    /// call reaches this second line of defence.
+    #[tokio::test]
+    async fn relay_relabels_a_non_json_query_answer() {
+        const BODY: &str = "<html><script>alert(1)</script></html>";
+        let slots = inflight_slots(3);
+        let url = Url::parse("http://127.0.0.1:1/").expect("url");
+        for (route, class, content_type, expected) in [
+            (Route::Query, "query", Some("text/html"), "application/json"),
+            (Route::Query, "query", None, "application/json"),
+            (Route::Worker, "submission", Some("text/html"), "text/html"),
+        ] {
+            let case = format!("{} {content_type:?}", route.label());
+            let mut answer = axum::http::Response::builder().status(StatusCode::OK);
+            if let Some(content_type) = content_type {
+                answer = answer.header(header::CONTENT_TYPE, content_type);
+            }
+            let upstream = reqwest::Response::from(answer.body(BODY).expect("response"));
+            let relayed = relay(
+                upstream,
+                route,
+                url.clone(),
+                telemetry::RequestInFlight::enter(),
+                telemetry::InFlightSlot::route(&slots, class).expect("free slot"),
+            );
+            assert_eq!(relayed.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                relayed.headers().get(header::CONTENT_TYPE).and_then(|value| value.to_str().ok()),
+                Some(expected),
+                "{case}"
+            );
+            let body = axum::body::to_bytes(relayed.into_body(), usize::MAX).await.expect("body");
+            assert_eq!(body, BODY.as_bytes(), "{case}");
+        }
+    }
 }
