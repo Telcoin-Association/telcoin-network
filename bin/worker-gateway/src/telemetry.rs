@@ -435,11 +435,13 @@ impl Throttle {
 }
 
 /// Every [`THROTTLE_WINDOW`] until `shutdown` fires, write one summary line
-/// for each throttle whose suppressed count has waited a whole window.
+/// for each throttle whose suppressed count has waited a whole window, and at
+/// shutdown one last line for every throttle with a pending count.
 ///
 /// Without it, a burst that stops inside its window would go unreported until
 /// the call site's next event, however late that comes. A burst is therefore
-/// summarized at most two windows after its first line.
+/// summarized at most two windows after its first line, or at shutdown if that
+/// comes first.
 pub(crate) async fn run_throttle_summaries(
     throttles: &'static [&'static Throttle],
     shutdown: Noticer,
@@ -448,11 +450,18 @@ pub(crate) async fn run_throttle_summaries(
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // consume the immediate first tick: nothing can be due at startup
     ticker.tick().await;
+    // set on shutdown: one last pass then writes every pending count, due or
+    // not, so a burst in the last windows is not dropped
+    let mut stopping = false;
     loop {
         tokio::select! {
-            () = &shutdown => break,
+            () = &shutdown, if !stopping => {
+                stopping = true;
+                ticker.reset_immediately();
+            }
             _ = ticker.tick() => {
-                let now = Instant::now();
+                // a whole window ahead at shutdown, so every pending count is due
+                let now = if stopping { Instant::now() + THROTTLE_WINDOW } else { Instant::now() };
                 throttles.iter().for_each(|throttle| {
                     if let Some(suppressed) = throttle.flush_at(now) {
                         tracing::warn!(
@@ -463,6 +472,9 @@ pub(crate) async fn run_throttle_summaries(
                         );
                     }
                 });
+                if stopping {
+                    break;
+                }
             }
         }
     }
@@ -739,5 +751,25 @@ mod tests {
             0.0
         );
         assert_eq!(ACCEPT_ERRORS_TOTAL, "tn_worker_gateway_accept_errors_total");
+    }
+
+    /// A count still pending when shutdown fires is written on a last summary
+    /// line, however little of its window has passed, and the task then ends.
+    #[tokio::test]
+    async fn throttle_summaries_flush_pending_counts_on_shutdown() {
+        static THROTTLE: Throttle = Throttle::new("shutdown_flush_test");
+        static THROTTLES: [&Throttle; 1] = [&THROTTLE];
+        // the first event is logged, the second only counted
+        assert_eq!(THROTTLE.admit(), Some(0));
+        assert_eq!(THROTTLE.admit(), None);
+        let shutdown = tn_types::Notifier::new();
+        let noticer = shutdown.subscribe();
+        shutdown.notify();
+        tokio::time::timeout(Duration::from_secs(1), run_throttle_summaries(&THROTTLES, noticer))
+            .await
+            .expect("ends at once on shutdown")
+            .expect("ok");
+        // the shutdown pass took the pending count, so nothing is left to summarize
+        assert_eq!(THROTTLE.flush_at(Instant::now() + THROTTLE_WINDOW * 2), None);
     }
 }
