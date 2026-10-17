@@ -1607,11 +1607,18 @@ impl ForwardingStarted {
 /// hosted RPC provider's API key, for example), so log lines name an upstream
 /// by origin alone. The port is always written, falling back to the scheme's
 /// default, so two upstreams on one host stay distinguishable.
+///
+/// A URL without a special scheme (`http`, `https` and the like), such as a
+/// scheme-less `user:secret@host:port` that `Url` reads as scheme `user`,
+/// prints as `<url without http(s) scheme>`, so no part of it is echoed.
 pub(crate) struct UpstreamOrigin<'a>(pub(crate) &'a Url);
 
 impl fmt::Display for UpstreamOrigin<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let url = self.0;
+        if !url.is_special() {
+            return f.write_str("<url without http(s) scheme>");
+        }
         write!(f, "{}://{}", url.scheme(), url.host_str().unwrap_or_default())?;
         if let Some(port) = url.port_or_known_default() {
             write!(f, ":{port}")?;

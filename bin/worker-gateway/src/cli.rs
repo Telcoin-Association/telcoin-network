@@ -4157,6 +4157,16 @@ mod tests {
         let debug = format!("{cli:?}");
         assert!(debug.contains("<invalid url>"), "{debug}");
         assert!(!debug.contains("s3cret"), "{debug}");
+
+        // a scheme-less credential parses with its user name as the scheme,
+        // which is not printed as an origin
+        let cli =
+            try_parse_test_argv(["worker-gateway", "--upstream-rpc-url=apikey:secret@host:8545"])?;
+        let debug = format!("{cli:?}");
+        assert!(debug.contains("<url without http(s) scheme>"), "{debug}");
+        for secret in ["apikey", "secret"] {
+            assert!(!debug.contains(secret), "`{secret}` leaked into: {debug}");
+        }
         Ok(())
     }
 
