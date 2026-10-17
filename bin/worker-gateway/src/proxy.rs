@@ -629,8 +629,10 @@ pub(crate) async fn proxy(
             // longer is). the in-flight guard and the class slot then travel
             // with the answer until the client has taken it (see
             // [`HeldAnswer`]); the byte reservation does not, and drops when
-            // this returns, which keeps it within the request deadline (45 s
-            // by default) whether or not the client reads
+            // this returns, so a client that reads slowly or not at all cannot
+            // hold it. it is held for the read, which ends within
+            // `--upstream-request-timeout` of the request being sent, so up to
+            // that long past the request deadline
             let remember = recent
                 .zip(scan.submitted)
                 .filter(|_| route == Route::Worker && upstream.status().is_success());
@@ -879,8 +881,9 @@ impl fmt::Display for AnswerLost {
 /// that request in the in-flight gauge (the autoscaling signal) and its
 /// duration, and on `--max-inflight-submissions`, as [`UpstreamBody`] does for
 /// a streamed answer. The byte reservation is not held: it drops when
-/// [`proxy`] returns, so the request-byte budget stays bounded by the request
-/// deadline.
+/// [`proxy`] returns, once the answer has been read (within
+/// `--upstream-request-timeout` of the request being sent), whatever the
+/// client does next.
 ///
 /// The answer goes out in copies of at most [`HeldAnswer::MAX_FRAME`] bytes,
 /// with an exact size hint, so hyper still sends its `Content-Length`. A
