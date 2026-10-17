@@ -96,13 +96,19 @@ source form without changing the node lockfile.
 | Registry `quinn-proto` 0.11.6 | RUSTSEC-2024-0373 | Detected, exit 1 | Detected, exit 1 |
 | Identical path `quinn-proto` 0.11.6 | RUSTSEC-2024-0373 | Missed, exit 0 | Missed, exit 0 |
 
-This proves a path coverage gap in both tools. The source-neutral manual match
-checks the advisory's package and affected/fixed ranges against actual
-resolution and the carried diff. The node resolves registry `quinn-proto`
-0.11.18, which is outside the affected range (fixed in 0.11.7). The vendored
-diff delegates Retry to Quinn and carries no Quinn backport. That advisory
-therefore does not apply to this carried build. The control and match are
-repeated in required CI; an empty scanner report cannot replace them.
+This proves a path coverage gap in both tools. The gate closes it for the
+carried versions: `advisories.py` audits a registry-form copy of the node
+lockfile in which the recorded path packages carry the registry source, so
+cargo-audit matches advisories against `libp2p-quic` 0.14.0 and `quinn-proto`
+0.11.18 by name and version. The same rewrite of the path control must report
+RUSTSEC-2024-0373, or the gate fails. The source-neutral manual match checks
+the advisory's package and affected/fixed ranges against actual resolution and
+the carried diff. The node resolves the carried path `quinn-proto` 0.11.18
+([companion record](../quinn-proto/README.md)), which is outside the affected
+range (fixed in 0.11.7). The vendored diff delegates Retry to Quinn and carries
+no Quinn backport. That advisory therefore does not apply to this carried
+build. The controls, the registry-form scan and the match are repeated in
+required CI; an empty scanner report cannot replace them.
 
 The fresh scan also identified [GHSA-2mjx-qc3c-rqvc](https://github.com/advisories/GHSA-2mjx-qc3c-rqvc),
 RUSTSEC-2026-0285, affecting the old rustls 0.23.37 pin. This PR updates rustls
@@ -120,8 +126,10 @@ Advisory qualification reuses the hashed default and Adiri source metadata and
 requires it to identify the current lockfile. It follows every normal and build
 dependency from the resolved QUIC/TLS stack, matching findings by package name
 and exact version. A transitive certificate or crypto dependency therefore
-cannot escape the gate through a crate-name shortlist. Additional non-registry
-dependencies in that closure require an extended source record and controls.
+cannot escape the gate through a crate-name shortlist. The closure holds two
+path packages, `libp2p-quic` and `quinn-proto`; each has a source record, and
+the registry-form scan covers both. Any further non-registry dependency in
+that closure needs the same source record before `sources.py` accepts it.
 
 Dependabot was checked separately on 2026-09-30:
 

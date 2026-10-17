@@ -73,14 +73,17 @@ fn incoming_observations_release_every_disposition() -> Result<(), &'static str>
                 ));
             }
             Disposition::Refuse => {
-                pair.server.refuse(incoming, &mut Vec::new());
+                let refusal = pair.server.refuse(incoming, &mut Vec::new());
+                assert!(refusal.size > 0);
             }
             Disposition::Ignore => pair.server.ignore(incoming),
             Disposition::Retry => {
-                pair.server
+                let retry = pair
+                    .server
                     .endpoint
                     .retry(incoming, &mut Vec::new())
                     .map_err(|_| "retry failed")?;
+                assert!(retry.size > 0);
             }
         }
         assert_eq!(

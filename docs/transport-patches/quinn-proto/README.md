@@ -54,11 +54,19 @@ advisory applicability and compatibility evidence together.
 
 ## Advisory and qualification coverage
 
-The companion adds observation statements to the pinned protocol decisions. The existing
-registry/path scanner controls and transitive advisory-closure checks cover this source in
-the carried transport workflow. Path-source scanner limitations described in the active
-transport record still require manual upstream advisory review; a missing scanner finding
-does not establish that a path package is unaffected.
+The companion adds observation statements to the pinned protocol decisions. Both pinned
+scanners skip a lockfile package that has no registry source. The path override alone
+would therefore hide an advisory published against the carried `quinn-proto` 0.11.18
+itself; the path control in the active transport record measures that gap. The required
+transport gate closes it for the carried versions: `etc/transport-patches/advisories.py`
+writes a registry-form copy of the node lockfile under the evidence directory, with the
+recorded path packages (`quinn-proto` 0.11.18, `libp2p-quic` 0.14.0) re-sourced to the
+registry, and audits that copy with the same transport-closure filter as the node scan.
+The rewrite is proven on the affected control first: the path `quinn-proto` 0.11.6 copy
+must report RUSTSEC-2024-0373, or the gate fails. The copy is audit input only; the node
+lockfile is unchanged. The scanners match the published version, not the carried diff, so
+the weekly upstream advisory review in the active transport record still applies to the
+diff. A clean scanner report shows only that no advisory names the carried version.
 
 Local pinned-toolchain verification on 2026-10-15:
 

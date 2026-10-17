@@ -91,8 +91,11 @@ Required transport CI runs cargo-audit 0.22.2 and cargo-deny 0.20.2 against a re
 published advisory control. Both detect vulnerable registry `quinn-proto` 0.11.6
 and miss the identical path source. The record documents that gap, a source-neutral
 advisory match, separate Dependabot observations and the owned monitoring procedure.
-Quinn and TLS remain registry crates. Extend the same record before carrying them
-from another source form. Passing a scanner alone does not qualify this copy.
+The gate also audits a registry-form copy of the lockfile, so advisories against the
+carried versions are still matched. `quinn-proto` is carried by path as well and has its
+own record (`patches/quinn-proto/PATCH.md`); `quinn`, `libp2p-tls` and the TLS crates
+remain registry crates. Extend the same record before carrying another crate from a
+different source form. Passing a scanner alone does not qualify this copy.
 
 ## Removal condition
 
