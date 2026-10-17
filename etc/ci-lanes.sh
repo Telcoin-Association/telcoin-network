@@ -149,7 +149,8 @@ lane_test_default() {
     # hide missing dependency features in tn-types/test-utils.
     run cargo check --locked -p tn-types --features test-utils --lib
     # The gateway image copies only the paths its Dockerfile names, so a new workspace
-    # member or patch source missing from that COPY list fails here.
+    # member, patch source or compile-time input (such as chain-configs/) missing from
+    # that COPY list fails here.
     check_gateway_image_context
     # The gateway ships as its own binary (bin/worker-gateway/Dockerfile builds it with
     # -p), but the workspace build below unifies features across every member, so a
