@@ -26,8 +26,8 @@ use tn_types::{
     gas_accumulator::{BaseFeeContainer, GasAccumulator, WorkerBaseFee},
     repack_monitor::RepackMonitor,
     BatchSender, BatchValidation, BlsPublicKey, BootstrapServer, ConsensusHeaderDigest,
-    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, Noticer, SealedHeader, TaskSpawner, WorkerId,
-    B256,
+    ConsensusOutput, EngineUpdate, Epoch, ExecHeader, NodeMode, Noticer, SealedHeader, TaskSpawner,
+    WorkerId, B256,
 };
 use tn_worker::WorkerNetworkHandle;
 use tokio::sync::{mpsc, RwLock};
@@ -251,6 +251,9 @@ impl ExecutionNode {
     ///
     /// This method can run before startup synchronization. Call
     /// [`Self::respawn_worker_network_tasks`] separately when the worker enters an epoch.
+    /// Only call this for [`WorkerState::Uninitialized`], in consecutive worker id order.
+    /// Existing workers must use [`Self::restart_worker_rpc`] to reuse their components.
+    /// Invalid worker ids return an error before creating a pool or binding RPC listeners.
     ///
     /// `base_fee` is the worker's shared epoch base-fee container: the pool receives the
     /// live container so canonical updates always charge the current epoch's fee (issue
@@ -314,15 +317,21 @@ impl ExecutionNode {
 
     /// Close transaction admission for initialized workers outside the current committee.
     ///
-    /// Their pools remain available for a later epoch that reactivates the worker ids.
+    /// Hand pending and parked transactions to worker 0, including late in-flight admissions.
+    /// Each removed worker spawns a relay that moves them off this lock, so epoch entry does not
+    /// wait on the retired pool's size. Retain empty pools for reactivation. Normal destination
+    /// validation and capacity apply.
     pub async fn deactivate_workers_above(&self, active_workers: usize) {
-        self.internal
-            .write()
-            .await
-            .workers
-            .iter_mut()
-            .skip(active_workers)
-            .for_each(WorkerComponents::deactivate);
+        let mut guard = self.internal.write().await;
+        let destination =
+            guard.workers.first().filter(|_| active_workers > 0).map(WorkerComponents::pool);
+        destination.into_iter().for_each(|destination| {
+            guard
+                .workers
+                .iter_mut()
+                .skip(active_workers)
+                .for_each(|worker| worker.deactivate(&destination));
+        });
     }
 
     /// Refresh an initialized worker's fee and reopen admission on its retained RPC listeners.
@@ -353,7 +362,9 @@ impl ExecutionNode {
     ///
     /// Backs the `/health/workers` readiness endpoint. A retained pool alone does not make a
     /// removed worker ready to accept transactions.
-    pub async fn is_worker_initialized(&self, worker_id: WorkerId) -> bool {
+    /// Use [`Self::worker_state`] to decide whether initial construction is needed: stopped
+    /// workers retain their components and must be restarted rather than initialized again.
+    pub async fn is_worker_running(&self, worker_id: WorkerId) -> bool {
         self.worker_state(worker_id).await == WorkerState::Running
     }
 
@@ -365,13 +376,14 @@ impl ExecutionNode {
     /// Snapshot initialized workers and their current epoch's accepting state.
     ///
     /// Removed workers remain visible with a false accepting flag. Active workers accept only
-    /// after their RPC listeners bind and until consensus shuts down their epoch.
-    pub(crate) async fn worker_readiness(&self) -> Vec<WorkerReadiness> {
+    /// after their RPC listeners bind, until consensus shuts down their epoch, and only while
+    /// the node's `mode` admits submissions (issue #1514).
+    pub(crate) async fn worker_readiness(&self, mode: NodeMode) -> Vec<WorkerReadiness> {
         let engine = self.internal.read().await;
         self.worker_readiness
             .read()
             .await
-            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()))
+            .snapshot(engine.workers.iter().map(|worker| worker.rpc_handle().is_some()), mode)
     }
 
     /// Start the worker's batch builder for the epoch.
