@@ -401,7 +401,9 @@ pub(crate) struct Cli {
     /// single-request bound (`--header-read-timeout`, twice with `--proxy-protocol`, plus the
     /// whole-request deadline `--upstream-request-timeout` +
     /// `--header-read-timeout`) so the first request on a connection can never
-    /// be cut off. `0` disables.
+    /// be cut off. `0` disables, and then a streamed answer that keeps
+    /// arriving, or a client that keeps reading it slowly, holds its class
+    /// slot without a time bound.
     #[arg(
         long,
         env = "WORKER_GATEWAY_MAX_CONNECTION_DURATION",
@@ -938,6 +940,14 @@ impl Cli {
             );
             Ok(())
         })?;
+        if max_connection_duration.is_none() {
+            warn!(
+                target: "gateway",
+                "--max-connection-duration is 0: a streamed answer that keeps arriving, or a \
+                 client that keeps reading it slowly, holds its class slot and connection \
+                 without a time bound"
+            );
+        }
         let requested_queries = self.max_inflight_queries.unwrap_or(DEFAULT_MAX_INFLIGHT_QUERIES);
         let max_inflight_queries = effective_query_cap(
             requested_queries,
@@ -2054,6 +2064,20 @@ mod tests {
         .into_settings()?;
         assert_eq!(settings.tcp_user_timeout, Some(Duration::from_secs(30)));
         assert_eq!(settings.max_connection_duration, Some(Duration::from_secs(600)));
+        Ok(())
+    }
+
+    #[test]
+    fn zero_connection_duration_warns() -> eyre::Result<()> {
+        const WARNING: &str = "--max-connection-duration is 0";
+        let (settings, logs) =
+            into_settings_logged(cli_with_flags(&["--max-connection-duration=0"]));
+        assert_eq!(settings?.max_connection_duration, None);
+        assert!(logs.contains(WARNING), "{logs}");
+        // the default cap (10 minutes) bounds every connection, so no warning
+        let (settings, logs) = into_settings_logged(cli_with_flags(&[]));
+        assert_eq!(settings?.max_connection_duration, Some(Duration::from_secs(600)));
+        assert!(!logs.contains(WARNING), "{logs}");
         Ok(())
     }
 

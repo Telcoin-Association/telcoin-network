@@ -1181,7 +1181,7 @@ pub(crate) async fn serve(
 ///
 /// The two write-path guards close the response-side slow loris: the
 /// whole-request deadline stops covering a response once its head is produced,
-/// and the upstream client's total timeout is only observed when the streamed
+/// and the upstream client's read timeout is only observed when the streamed
 /// body is polled; under downstream backpressure hyper stops polling the body
 /// (its write loop parks on a full write buffer), so that timeout never fires.
 /// `TCP_USER_TIMEOUT` fires in the kernel when the peer stops acknowledging
