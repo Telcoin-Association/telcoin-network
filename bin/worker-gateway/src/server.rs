@@ -755,7 +755,7 @@ impl Drop for ClientSlot {
 /// its answer must not depend on the upstream.
 ///
 /// `layers` carries the optional layers (see [`RouterLayers`]). When it holds
-/// rate limiters, the rate-limit layer is installed inside up to four layers
+/// rate limiters, the rate-limit layer is installed inside up to five layers
 /// and outside every other one, so an over-limit request is shed with a
 /// JSON-RPC `429` before its body is buffered or forwarded, and before it
 /// reserves any of the byte budget. Outside it are, innermost first, the CORS
