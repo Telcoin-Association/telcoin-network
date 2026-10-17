@@ -121,6 +121,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
             .map_or_else(|| String::from("off"), |url| UpstreamOrigin(url).to_string()),
         redirect_queries_header = query_header.is_some(),
         ?recent_submission_ttl,
+        ?shutdown_delay,
+        ?graceful_shutdown_timeout,
         cors = match &cors_allowed_origins {
             None => "off",
             Some(CorsOrigins::Any) => "any origin",
@@ -175,6 +177,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         trusted_proxies = trusted_proxies.len(),
         proxy_protocol = proxy_protocol.is_some(),
         submission_budget,
+        rate_limit_per_ip_max_entries = ?rate_limit_per_ip
+            .map(|_| rate_limit_per_ip_max_entries.get()),
         ?max_connections_per_ip,
         // the per-ip key's prefix widths (`v4`, `v6`), which also key
         // --max-connections-per-ip
@@ -198,6 +202,8 @@ pub(crate) async fn run(settings: Settings) -> eyre::Result<()> {
         access_log = %access_log
             .as_ref()
             .map_or_else(|| String::from("off"), |_| format!("sampling {access_log_sample}")),
+        access_log_max_lines_per_second = access_log_max_lines_per_second
+            .map_or(0, NonZeroU32::get),
         "edge protections configured"
     );
     if let Some(idle_heads) =
