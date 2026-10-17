@@ -107,10 +107,15 @@ A peer needs at most one inbound and one outbound connection at a time, so eight
 Each swarm also caps pending inbound connections (handshakes that are not yet established) at **1024**.
 This cap is a memory bound only, not an admission policy.
 QUIC Retry, enabled by default, validates the source address before a handshake can occupy a slot.
-If `retry_unvalidated_incoming` is disabled as an operator rollback, a forged QUIC Initial datagram can hold a slot for the 10 second transport timeout, so a small cap would let a cheap flood refuse honest peers.
+If `retry_unvalidated_incoming` is disabled as an operator rollback, a forged QUIC Initial datagram can hold a slot for the QUIC handshake timeout (10 seconds by default), so a small cap would let a cheap flood refuse honest peers.
 Refusals show in `inbound_connections_denied_total` with `stage="transport_cap"` and `reason="pending_incoming_limit"`.
 
-Dial attempts time out after 15 seconds; a peer still dialing past that is marked disconnected, because dialing peers count against the inbound limit.
+Signed endpoints are dialed in record order, one at a time.
+Each endpoint gets its own QUIC handshake window, which defaults to 10 seconds.
+The outer transport timeout covers `MAX_ADVERTISED_MULTIADDRS` handshake windows plus 5 seconds of slack, or 45 seconds with the current four-address cap and defaults.
+This lets a live endpoint connect after earlier endpoints go silent during an address migration, without parallel handshakes.
+The effective peer-manager timeout is the greater of the configured `dial_timeout` and the outer transport timeout plus another 5 seconds, or at least 50 seconds by default.
+The heartbeat marks a peer still dialing past that bound disconnected, because dialing peers count against the inbound limit.
 
 ## The heartbeat
 
