@@ -1732,11 +1732,12 @@ fn parse_url_flag(flag: &str, value: &str) -> eyre::Result<Url> {
 /// `--redirect-queries-header X-Api-Key: <key>` leaves the key behind as such
 /// a stray argument, so those kinds get a message that names the flag, or a
 /// similar flag clap suggests, and never the token. A value error keeps the
-/// parser's own reason: the flags that can carry a secret are taken as strings
-/// and parsed after clap, so the typed parsers only ever see durations,
-/// numbers, addresses and the like. Help, version and the kinds that carry
-/// only flag names (a missing or conflicting argument, for example) return
-/// `None`, and the caller lets clap print and exit as usual.
+/// parser's own reason, which can quote part of the value (humantime names an
+/// unknown unit, for example): the flags that can carry a secret are taken as
+/// strings and parsed after clap, so the typed parsers only ever see
+/// durations, numbers, addresses and the like. Help, version and the kinds
+/// that carry only flag names (a missing or conflicting argument, for example)
+/// return `None`, and the caller lets clap print and exit as usual.
 pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
     use clap::error::{ContextKind, ContextValue, ErrorKind};
 
@@ -1761,6 +1762,13 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
             let reason = std::error::Error::source(err)
                 .map(|source| format!(": {source}"))
                 .unwrap_or_default();
+            // the parser's reason can quote part of the value (humantime names
+            // an unknown unit), so the message does not claim otherwise
+            let not_repeated = if reason.is_empty() {
+                "the value is not repeated here"
+            } else {
+                "the value is not repeated here, beyond what the parser's reason quotes"
+            };
             let possible = match err.get(ContextKind::ValidValue) {
                 Some(ContextValue::Strings(values)) if !values.is_empty() => {
                     format!("; possible values: {}", values.join(", "))
@@ -1768,8 +1776,7 @@ pub(crate) fn redacted_parse_error(err: &clap::Error) -> Option<String> {
                 _ => String::new(),
             };
             Some(format!(
-                "invalid value for '{arg}'{reason} (the value is not repeated here){possible}; \
-                 see --help"
+                "invalid value for '{arg}'{reason} ({not_repeated}){possible}; see --help"
             ))
         }
         _ => None,
@@ -4340,6 +4347,19 @@ mod tests {
             assert!(message.contains(flag), "{message}");
             assert!(!message.contains("s3cret"), "the value leaked into: {message}");
         }
+
+        // a duration parser's reason quotes the unknown unit, which is part of
+        // the value, and the message says so
+        let err = try_parse_test_argv(["worker-gateway", "--upstream-request-timeout=30sekret"])
+            .expect_err("an unknown unit must fail");
+        assert_eq!(err.kind(), ErrorKind::ValueValidation);
+        // control: clap's own message quotes the value
+        assert!(err.to_string().contains("30sekret"), "{err}");
+        let message = redacted_parse_error(&err).expect("a value error is redacted");
+        assert!(message.contains("--upstream-request-timeout"), "{message}");
+        assert!(message.contains("unknown time unit"), "{message}");
+        assert!(message.contains("beyond what the parser's reason quotes"), "{message}");
+        assert!(!message.contains("30sekret"), "the value leaked into: {message}");
     }
 
     #[test]
