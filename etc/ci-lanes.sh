@@ -125,7 +125,10 @@ check_gateway_image_context() {
         git archive HEAD -- "${paths[@]}" | tar -x -C "$tmp"
         # --offline needs every locked crate source in CARGO_HOME.
         run cargo fetch --locked
-        run cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
+        # `run` traces to stdout, which this redirect would discard with the JSON, so
+        # trace the call here: a failure then follows its own command line in the log.
+        echo "+ cargo metadata --locked --offline --format-version 1 --manifest-path $tmp/Cargo.toml"
+        cargo metadata --locked --offline --format-version 1 --manifest-path "$tmp/Cargo.toml" >/dev/null
         # Resolving the workspace is not enough: a compile-time input of the gateway's
         # dependencies, such as the chain-configs/ files tn-types reads with
         # include_str!, can be missing from the COPY list and still resolve, so check
