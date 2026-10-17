@@ -10620,11 +10620,13 @@ mod tests {
         assert_eq!(target_polls.load(Ordering::SeqCst), 0, "the redirect target was polled");
     }
 
-    /// Both upstream clients ignore proxy variables. Every proxy variable
+    /// Every upstream client ignores proxy variables. Every proxy variable
     /// points at a port nothing listens on, with no `NO_PROXY` exemption, yet
     /// a poll through the production readiness client still marks the worker
-    /// ready and a call through the production proxy client still reaches it.
-    /// Both clients are the ones `app::run` builds (see [`UpstreamClients`]).
+    /// ready, a call through the production proxy client still reaches the
+    /// worker, and a read through the production query client still reaches
+    /// the `--redirect-queries` upstream. The clients are the ones `app::run`
+    /// builds (see [`UpstreamClients`]).
     ///
     /// The variables set here are process-wide, so the body runs only under
     /// nextest's process-per-test model, where they reach no other test; any
@@ -10649,11 +10651,17 @@ mod tests {
         }
 
         let (worker, worker_seen, _worker) = named_mock("worker").await;
+        let (query, query_seen, _query) = named_mock("query").await;
         let (node, node_polls, _node) = counted_ready_node().await;
-        let settings = worker_settings("http", worker, node, &[]);
-        let UpstreamClients { proxy, readiness: readiness_client, .. } =
+        // the query upstream listens on its own port: a redirect to the
+        // worker's own address is refused when the settings are resolved
+        let settings =
+            worker_settings("http", worker, node, &[format!("--redirect-queries=http://{query}/")]);
+        let UpstreamClients { proxy, query: query_client, readiness: readiness_client } =
             UpstreamClients::new(&settings, Arc::new(SystemLookup)).expect("clients");
-        let state = test_state_with_client(&settings.upstreams, proxy);
+        let mut state = test_state_with_client(&settings.upstreams, proxy);
+        state.query_upstream = settings.query_upstream.clone();
+        state.query_http = Some(query_client.expect("a redirect builds the query client"));
         let readiness = Arc::clone(&state.readiness);
         let _poller = spawn_readiness_poller(Arc::clone(&readiness), readiness_client);
         assert!(
@@ -10666,14 +10674,27 @@ mod tests {
 
         // the test's own client must not use the proxy either
         let client = Client::builder().no_proxy().build().expect("client");
+        // with a redirect a read goes to the query upstream, so the call that
+        // must reach the worker is a submission
         let response = client
             .post(format!("http://{gateway}/"))
-            .body(call("eth_chainId", 1))
+            .body(submission(1))
             .send()
             .await
             .expect("send");
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.text().await.expect("text"), "worker");
+        assert_eq!(worker_seen.hits(), 1);
+
+        let response = client
+            .post(format!("http://{gateway}/"))
+            .body(call("eth_call", 2))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text().await.expect("text"), "query");
+        assert_eq!(query_seen.hits(), 1);
         assert_eq!(worker_seen.hits(), 1);
     }
 }
