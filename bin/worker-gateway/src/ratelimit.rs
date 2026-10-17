@@ -62,7 +62,7 @@
 //! With the flag, a first-seen client's per-IP bucket is inserted at its
 //! request's class charge, whatever the class bucket's verdict, or, for a
 //! request answered before it is classified (a `405`, an unreadable or
-//! over-length body, a denied method), once the global bucket admits it as a
+//! over-length body, a denied method, a loop), once the global bucket admits it as a
 //! query when its [`SubmissionBudget`] is dropped. So a table entry costs the
 //! per-IP token that paid for reading the request, and a flood the shared
 //! buckets refuse can add entries, up to `--rate-limit-per-ip-max-entries` and
@@ -1705,7 +1705,9 @@ mod tests {
     }
 
     /// The same with the global bucket empty: the unclassified request leaves
-    /// no entry, so a flood the global limit refuses cannot fill the table.
+    /// no entry, so a flood of requests answered unclassified that the global
+    /// limit refuses cannot fill the table (a classified request it refuses is
+    /// tracked at its class charge instead).
     #[test]
     fn edge_admission_without_a_class_charge_leaves_no_entry_when_global_refuses() {
         let limiters = limiters_with_submissions(
