@@ -4344,6 +4344,9 @@ mod tests {
             format!(r#"[{},["2.0",1,"tn_info",[]]]"#, call("eth_call")),
             r#"[["2.0","tn_info",[]]]"#.to_string(),
             r#"[["2.0","tn_info",null]]"#.to_string(),
+            // an escaped name in either slot is decoded, as jsonrpsee decodes it
+            r#"[["2.0",1,"\u0074n_info",[]]]"#.to_string(),
+            r#"[["2.0","\u0074n_info",[]]]"#.to_string(),
         ];
         let mut denied_bodies = vec![
             r#"{"jsonrpc":"2.0","method":"\u0074n_getStuff","params":[],"id":1}"#.to_string(),
