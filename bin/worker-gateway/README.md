@@ -772,7 +772,7 @@ With `--rate-limit-submissions` set, the global bucket's verdict is settled afte
 An `id` that is an array, an object, a boolean or a string over 256 bytes is echoed as `null` on every path, a refused batch element's included.
 
 The exceptions are a request whose head hyper, the HTTP library underneath, cannot parse (below), a connection that does not finish its request head within `--header-read-timeout` (closed without a response), a connection over `--max-connections-per-ip`, which is closed before any request is read, and an exchange still running when the connection-lifetime grace or `--graceful-shutdown-timeout` ends (see [Connection handling](#connection-handling) and [Graceful shutdown](#graceful-shutdown)).
-Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
+Hyper answers an unparseable request head itself, before the request reaches the gateway's service, with a bare `400` (malformed request line or headers), `414` (request target longer than 65,534 bytes, reachable only with `--http1-max-buf-size` above its default; at the default a head that long fills the read buffer first and gets the `431`) or `431` (request head too large, or too many headers), without a JSON-RPC body or `X-Content-Type-Options: nosniff`; the gateway cannot intercept these.
 
 | Condition | HTTP | JSON-RPC error code | `reason` |
 | --- | --- | --- | --- |
