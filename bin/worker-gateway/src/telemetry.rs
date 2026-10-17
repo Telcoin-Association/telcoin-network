@@ -32,11 +32,14 @@
 //! [`Throttle`] rate-limits a per-request log call site, so request volume
 //! cannot drive log volume; the counters above still count every request.
 //!
-//! [`record_routed`] counts every forward attempt by route and result, which
-//! splits the load between the worker and the query upstream (a forwarded
-//! answer whose body then fails is counted again, as `body_failed`: a relayed
-//! body that fails mid-stream, or a worker's answer to a submission that is
-//! lost while it is read whole), and
+//! [`record_routed`] counts every forward attempt that resolves, by route and
+//! result (an attempt the request deadline or a client disconnect drops before
+//! its response head records none: it shows as
+//! `rejections_total{reason="request_timeout"}` or as
+//! `requests_total{outcome="cancelled"}`), which splits the load between the
+//! worker and the query upstream (a forwarded answer whose body then fails is
+//! counted again, as `body_failed`: a relayed body that fails mid-stream, or a
+//! worker's answer to a submission that is lost while it is read whole), and
 //! [`record_mixed_batch`] counts the batches sent to the query upstream only
 //! because they mixed submissions with other calls.
 //!
@@ -100,10 +103,12 @@ const REQUEST_DURATION_SECONDS: &str = "tn_worker_gateway_request_duration_secon
 /// so two nodes whose workers share an id keep separate series.
 const UPSTREAM_READY: &str = "tn_worker_gateway_upstream_ready";
 
-/// Forward attempts by `route` (`worker` or `query`) and `result`
-/// (`forwarded`, `upstream_error`, `unreachable` or `timeout`), plus
-/// `body_failed` for a forwarded response whose body then failed mid-stream,
-/// or a worker's answer to a submission lost while it was read whole.
+/// Forward attempts that resolved, by `route` (`worker` or `query`) and
+/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), plus
+/// `body_failed` for a forwarded response whose body then failed mid-stream, or
+/// a worker's answer to a submission lost while it was read whole. An attempt
+/// the request deadline or a client disconnect drops before its head has no
+/// result here.
 const ROUTED_REQUESTS_TOTAL: &str = "tn_worker_gateway_routed_requests_total";
 
 /// Batches sent whole to the query upstream because they mixed submissions
@@ -310,9 +315,9 @@ pub(crate) fn record_cancelled() {
     counter!(REQUESTS_TOTAL, "outcome" => "cancelled").increment(1);
 }
 
-/// Record one forward attempt on `route` (`worker` or `query`) with its
-/// `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`), or,
-/// after its `forwarded`, an answer whose body then failed (`body_failed`).
+/// Record one resolved forward attempt on `route` (`worker` or `query`) with
+/// its `result` (`forwarded`, `upstream_error`, `unreachable` or `timeout`),
+/// or, after its `forwarded`, an answer whose body then failed (`body_failed`).
 pub(crate) fn record_routed(route: &'static str, result: &'static str) {
     counter!(ROUTED_REQUESTS_TOTAL, "route" => route, "result" => result).increment(1);
 }
