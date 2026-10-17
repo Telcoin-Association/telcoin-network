@@ -87,7 +87,7 @@
         "overrides": []
       },
       "options": {},
-      "description": "Concurrent proxied requests in flight, a relayed response counting until its body has finished streaming. This is the gauge the HorizontalPodAutoscaler targets."
+      "description": "Concurrent proxied requests in flight, a relayed response counting until its body has finished streaming. The reference HorizontalPodAutoscaler targets this gauge for read load and the Worker requests in flight gauge (tn_worker_gateway_upstream_inflight) for submission load."
     },
     {
       "id": 4,
