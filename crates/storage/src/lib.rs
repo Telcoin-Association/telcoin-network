@@ -10,9 +10,6 @@ mod stores;
 #[cfg(feature = "reth-libmdbx")]
 use mdbx::MdbxDatabase;
 pub use stores::*;
-// `redb` is always built; it backs tests/benches and the `redb` feature. MDBX is the default
-// consensus backend (see Cargo.toml `default = ["reth-libmdbx"]`).
-pub use redb::database::ReDB;
 use tables::{
     CertificateDigestByOrigin, CertificateDigestByRound, Certificates, ConsensusCache,
     KadProviderRecords, KadRecords, KadWorkerProviderRecords, KadWorkerRecords, LastProposed,
@@ -20,37 +17,40 @@ use tables::{
 };
 pub mod archive;
 pub mod certificate_pack;
-/// The `CompositeDatabase` backend that splits the workload into epoch/kad/cache sub-databases.
-pub mod composite_db;
 pub mod consensus;
 pub mod consensus_pack;
 /// On-demand comparative benchmark harness across the `Database` backends (see `db_bench.rs`).
 #[cfg(test)]
 mod db_bench;
+/// The startup check that the epoch tables' header-bearing rows decode with this binary.
 mod epoch_db_recovery;
 pub mod epoch_records;
 pub(crate) mod error_latch;
 pub mod exec_state_pack;
-/// `LayeredDatabase`: a write-behind memory layer whose writer thread commits to a backend.
-pub mod layered_db;
-/// The reth MDBX key/value backend (the default `Database` backend).
+/// The reth MDBX key/value backend: the consensus DB of the release before tndb (the migration's
+/// source), and a backend for tests and benches. With it, the layers that release put over it
+/// (`layered_db`, `composite_db`), which nothing else uses.
 #[cfg(feature = "reth-libmdbx")]
 pub mod mdbx;
 pub mod mem_db;
 /// On-demand observation benchmark for consensus pack files (see `pack_bench.rs`).
 #[cfg(test)]
 mod pack_bench;
-/// On-demand raw-KV benchmark: pack files vs MDBX (see `pack_kv_bench.rs`).
+/// On-demand raw-KV benchmark: digest vs btree pack files vs MDBX, plus sorted scans (see
+/// `pack_kv_bench.rs`).
 #[cfg(test)]
 mod pack_kv_bench;
 pub mod pack_validate;
-/// The `redb`-backed database implementation (used by tests/benches and the `redb` feature; MDBX
-/// is the default consensus backend).
-pub mod redb;
+/// On-demand benchmarks replaying production's DB traffic (see `workload_bench.rs`).
+#[cfg(test)]
+mod workload_bench;
+
+pub mod tndb;
 
 pub use tn_types::error::StoreError;
 
-use crate::composite_db::CompositeDatabase;
+#[cfg(all(test, feature = "reth-libmdbx"))]
+use crate::mdbx::composite_db::CompositeDatabase;
 
 /// Key type for the proposer's last-proposed-header table.
 pub type ProposerKey = u32;
@@ -135,99 +135,257 @@ pub mod tables {
     );
 }
 
-// mdbx is the default, if redb is set then is used (so priority is mdbx -> redb)
-/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
-pub type DatabaseType = CompositeDatabase<MdbxDatabase>;
-/// The configured composite database backend (mdbx by default, redb when the `redb` feature is on).
-#[cfg(feature = "redb")]
-pub type DatabaseType = CompositeDatabase<ReDB>;
+/// The node's consensus database: tndb, one shared log per environment ([`tndb::SplitDatabase`]).
+pub type DatabaseType = tndb::SplitDatabase;
 
-/// Open the configured DB with the required tables.
-/// This will return a concrete type for the currently configured Database.
-#[allow(unreachable_code)] // Need this so it compiles cleanly with redb.
-pub fn open_db<Path: AsRef<std::path::Path> + Send>(store_path: Path) -> DatabaseType {
-    // Open the right DB based on feature flags.  The default is MDBX unless the redb flag is
-    // set.
-    #[cfg(all(feature = "reth-libmdbx", not(feature = "redb")))]
-    return _open_mdbx(store_path);
-    #[cfg(feature = "redb")]
-    return _open_redb(store_path);
-    panic!("No DB configured!")
-}
-
-// The open functions below are the way they are so we can use if cfg!... on open_db.
-
-/// Open or reopen all the storage of the node backed by MDBX.
-#[cfg(feature = "reth-libmdbx")]
+/// The node's consensus database as the release before tndb opened it, on MDBX: the source the
+/// migration tests write.
+#[cfg(all(test, feature = "reth-libmdbx"))]
 fn _open_mdbx<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<MdbxDatabase> {
     use tn_types::Database as _;
 
-    use crate::mdbx::database::MEGABYTE;
+    let store_path = store_path.as_ref();
+    let epoch_db = open_mdbx_env(store_path, MdbxEnv::Epoch).expect("Cannot open database (epoch)");
+    let kad_db = open_mdbx_env(store_path, MdbxEnv::Kad).expect("Cannot open database (kad)");
+    let cache_db = open_mdbx_env(store_path, MdbxEnv::Cache).expect("Cannot open database (cache)");
 
-    // Test builds use smaller database sizes to allow parallel test execution.
-    // These must still be large enough for long-running e2e tests (70s+ restart scenarios).
+    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
+    // Epoch tables
+    db.open_table::<LastProposed>().expect("failed to open table!");
+    db.open_table::<Votes>().expect("failed to open table!");
+    db.open_table::<Certificates>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
+    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
+    db.open_table::<ProposedCertificates>().expect("failed to open table!");
+    db.open_table::<Payload>().expect("failed to open table!");
+    // Kad tables
+    db.open_table::<KadRecords>().expect("failed to open table!");
+    db.open_table::<KadProviderRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
+    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
+    // Cache tables
+    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
+    db.open_table::<ConsensusCache>().expect("failed to open table!");
+    db
+}
+
+/// One of the node's MDBX environments (each its own directory under the store path).
+#[cfg(feature = "reth-libmdbx")]
+#[derive(Clone, Copy, Debug)]
+enum MdbxEnv {
+    Epoch,
+    Kad,
+    Cache,
+}
+
+/// Open the MDBX environment `env` under `store_path` with the node's geometry (smaller in test
+/// builds, so tests can run in parallel; still large enough for the long e2e restart scenarios).
+#[cfg(feature = "reth-libmdbx")]
+fn open_mdbx_env(store_path: &std::path::Path, env: MdbxEnv) -> eyre::Result<MdbxDatabase> {
     cfg_if::cfg_if! {
         if #[cfg(any(test, feature = "test-utils"))] {
+            use crate::mdbx::database::MEGABYTE;
             const EPOCH_MAX: usize = 16 * MEGABYTE;
             const KAD_MAX: usize = 4 * MEGABYTE;
             const CACHE_MAX: usize = 32 * MEGABYTE;
             const GROWTH: usize = 4 * MEGABYTE;
             const CACHE_GROWTH: usize = 8 * MEGABYTE;
         } else {
-            const EPOCH_MAX: usize = 512 * MEGABYTE;
-            const KAD_MAX: usize = 64 * MEGABYTE;
-            const CACHE_MAX: usize = 1024 * MEGABYTE;
-            const GROWTH: usize = 8 * MEGABYTE;
-            const CACHE_GROWTH: usize = 64 * MEGABYTE;
+            use crate::mdbx::database::{
+                PROD_CACHE_GROWTH as CACHE_GROWTH, PROD_CACHE_MAX as CACHE_MAX,
+                PROD_EPOCH_MAX as EPOCH_MAX, PROD_GROWTH as GROWTH, PROD_KAD_MAX as KAD_MAX,
+            };
         }
     }
-
-    let store_path = store_path.as_ref();
-    let epoch_db = MdbxDatabase::open(store_path.join("epoch"), 8, EPOCH_MAX, GROWTH)
-        .expect("Cannot open database (epoch)");
-    // before the full-memory load below, which panics on a row this binary cannot decode
-    epoch_db_recovery::discard_seconds_only_proposal(&epoch_db)
-        .expect("Cannot check database (epoch)");
-    let kad_db = MdbxDatabase::open(store_path.join("kad"), 8, KAD_MAX, GROWTH)
-        .expect("Cannot open database (kad)");
-    let cache_db = MdbxDatabase::open(store_path.join("cache"), 4, CACHE_MAX, CACHE_GROWTH)
-        .expect("Cannot open database (cache)");
-
-    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
-    // Epoch tables
-    db.open_table::<LastProposed>().expect("failed to open table!");
-    db.open_table::<Votes>().expect("failed to open table!");
-    db.open_table::<Certificates>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByRound>().expect("failed to open table!");
-    db.open_table::<CertificateDigestByOrigin>().expect("failed to open table!");
-    db.open_table::<ProposedCertificates>().expect("failed to open table!");
-    db.open_table::<Payload>().expect("failed to open table!");
-    // Kad tables
-    db.open_table::<KadRecords>().expect("failed to open table!");
-    db.open_table::<KadProviderRecords>().expect("failed to open table!");
-    db.open_table::<KadWorkerRecords>().expect("failed to open table!");
-    db.open_table::<KadWorkerProviderRecords>().expect("failed to open table!");
-    // Cache tables
-    db.open_table::<NodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
-    db.open_table::<ConsensusCache>().expect("failed to open table!");
-    db
+    let (dir, tables, max_size, growth) = match env {
+        MdbxEnv::Epoch => ("epoch", 8, EPOCH_MAX, GROWTH),
+        MdbxEnv::Kad => ("kad", 8, KAD_MAX, GROWTH),
+        MdbxEnv::Cache => ("cache", 4, CACHE_MAX, CACHE_GROWTH),
+    };
+    MdbxDatabase::open(store_path.join(dir), tables, max_size, growth)
 }
 
-/// Open or reopen all the storage of the node backed by ReDB.
-#[cfg(feature = "redb")]
-fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatabase<ReDB> {
+/// Copy the node's epoch and kad tables and its two batch caches from MDBX (the backend before
+/// tndb, under `store_path`) into `db`, the tndb one, the first time the node opens tndb.
+/// Returns the rows copied. Kept for the release that switches backends only: the next one drops
+/// it with the MDBX consensus backend.
+///
+/// The epoch tables hold the node's anti-equivocation records for the current epoch (its last
+/// proposal, its votes, its proposed certificates): a node switching backends mid-epoch must not
+/// forget them, or it could sign a conflicting header in a round it already voted in. That is
+/// safe to skip only while the network keeps making rounds as nodes restart; after a stop-all
+/// halt every node would return to the same round with no memory of it. The kad tables hold its
+/// peer records. The batch caches are copied for the same stop-all halt. The restart rebuilds the
+/// DAG from the stored certificates and commits the uncommitted ones, and their batches are in
+/// `NodeBatchesCache`, which with the consensus pack is the only place a batch is served from:
+/// dropped on every node, no peer could serve them, and execution would wait on them for good.
+/// `OurNodeBatchesCache`'s sealed but uncommitted batches have no other copy (their transactions
+/// would be lost). `ConsensusCache` is not copied: it holds outputs the network already
+/// committed, which state sync reads again from the consensus chain or fetches from peers.
+///
+/// Once the copy is durable, the MDBX environments it read are deleted (MDBX's own files, and each
+/// directory if nothing else is in it), so a later reset of tndb cannot bring back their state from
+/// the time of the switch; then a marker file in `tndb_root` records that the migration is done.
+/// Until then every open runs it again: an environment still present is copied again (MDBX is not
+/// written meanwhile, so that only rewrites the same rows) and deleted, and one already deleted was
+/// copied before it. A downgrade to the MDBX build after the switch starts with empty epoch tables.
+#[cfg(feature = "reth-libmdbx")]
+pub(crate) fn migrate_from_mdbx(
+    store_path: &std::path::Path,
+    tndb_root: &std::path::Path,
+    db: &tndb::SplitDatabase,
+) -> eyre::Result<usize> {
+    use eyre::WrapErr as _;
+    use std::io::Write as _;
+
+    let marker = tndb_root.join(tndb::MDBX_MIGRATED);
+    if marker.exists() {
+        // Done before. An MDBX environment here now was made by an older binary run since (a
+        // downgrade): it is never read, so what that binary recorded (its votes, its last
+        // proposal) is not in tndb. Say so; it is the operator's to resolve.
+        for env in ["epoch", "kad", "cache"] {
+            let data = store_path.join(env).join("mdbx.dat");
+            if data.exists() {
+                tracing::error!(target: "tn::storage", "{} was written after this node moved to tndb (by an older binary?) and is not read; anything it holds is not in the consensus DB", data.display());
+            }
+        }
+        return Ok(0);
+    }
+    // An environment exists only if its data file does: opening an absent one would create it.
+    let present = |dir: &str| store_path.join(dir).join("mdbx.dat").exists();
+    let mut copied = 0;
+    let read: Vec<&str> =
+        ["epoch", "kad", "cache"].into_iter().filter(|dir| present(dir)).collect();
+    if read.contains(&"epoch") {
+        let src = open_mdbx_env(store_path, MdbxEnv::Epoch)?;
+        // Before the copy below, whose typed reads panic on a row this binary cannot decode: it
+        // removes the header this node proposed for a sub-second fork epoch on an older binary,
+        // and refuses (MDBX kept) any other undecodable epoch row.
+        epoch_db_recovery::discard_seconds_only_proposal(&src)
+            .wrap_err("Cannot check database (epoch)")?;
+        copied += copy_table::<LastProposed, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Votes, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Certificates, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<CertificateDigestByRound, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<CertificateDigestByOrigin, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<ProposedCertificates, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<Payload, _>(&src, db, ROWS_PER_TXN)?;
+    }
+    if read.contains(&"kad") {
+        let src = open_mdbx_env(store_path, MdbxEnv::Kad)?;
+        copied += copy_table::<KadRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadWorkerRecords, _>(&src, db, ROWS_PER_TXN)?;
+        copied += copy_table::<KadWorkerProviderRecords, _>(&src, db, ROWS_PER_TXN)?;
+    }
+    if read.contains(&"cache") {
+        let src = open_mdbx_env(store_path, MdbxEnv::Cache)?;
+        // A batch is up to 1 MB, and a transaction holds its rows until it commits.
+        copied += copy_table::<NodeBatchesCache, _>(&src, db, 64)?;
+        copied += copy_table::<OurNodeBatchesCache, _>(&src, db, 64)?;
+    }
+    db.wait_durable_blocking()?;
+    // The new tndb directories' own entries too (`<store>/tndb`, and its environments in it),
+    // before anything of MDBX's is deleted: a power loss must not keep the deletions but lose them.
+    archive::data_file::fsync_directory(tndb_root)?;
+    archive::data_file::fsync_directory(store_path)?;
+    // Only now, with every row copied durable in tndb (and each environment closed).
+    for dir in &read {
+        remove_mdbx_env(store_path, dir)?;
+    }
+    if !read.is_empty() {
+        archive::data_file::fsync_directory(store_path)?;
+    }
+    let tmp = tndb_root.join(format!("{}.tmp", tndb::MDBX_MIGRATED));
+    {
+        let mut file = std::fs::File::create(&tmp)?;
+        writeln!(file, "copied {copied} rows from MDBX")?;
+        archive::data_file::fsync_file(&file)?;
+    }
+    std::fs::rename(&tmp, &marker)?;
+    archive::data_file::fsync_directory(tndb_root)?;
+    if copied > 0 {
+        tracing::info!(target: "tn::storage", "copied {copied} rows of the consensus DB from MDBX to tndb");
+    }
+    Ok(copied)
+}
+
+/// The files MDBX keeps in an environment's directory, in the order they are deleted: the data
+/// file last, since its presence is what marks an environment still to move (and to delete).
+#[cfg(feature = "reth-libmdbx")]
+const MDBX_FILES: [&str; 2] = ["mdbx.lck", "mdbx.dat"];
+
+/// Delete the MDBX environment `dir` under `store_path`, whose rows are durably in tndb: MDBX's own
+/// files, then the directory if nothing else is in it. A file MDBX did not make is kept, with its
+/// directory, and logged; nothing is removed recursively.
+#[cfg(feature = "reth-libmdbx")]
+fn remove_mdbx_env(store_path: &std::path::Path, dir: &str) -> eyre::Result<()> {
+    use eyre::WrapErr as _;
+
+    let env = store_path.join(dir);
+    for file in MDBX_FILES {
+        let path = env.join(file);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).wrap_err_with(|| format!("delete {}", path.display())),
+        }
+    }
+    if let Err(e) = std::fs::remove_dir(&env) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(target: "tn::storage", "kept {} after moving to tndb: {e}", env.display());
+        }
+    }
+    Ok(())
+}
+
+/// Rows per transaction when copying a table of small values (see [`copy_table`]).
+#[cfg(feature = "reth-libmdbx")]
+const ROWS_PER_TXN: usize = 10_000;
+
+/// Copy every row of table `T` from `src` into `dst`, in transactions of at most `rows_per_txn`
+/// rows (the whole copy is made durable, and marked done, by the caller). Returns the rows copied.
+/// A read error, or fewer rows than MDBX counts, is an error ([`MdbxDatabase::try_for_each`]):
+/// MDBX is deleted after the copy, so a copy cut short must never look complete.
+#[cfg(feature = "reth-libmdbx")]
+fn copy_table<T: tn_types::Table, D: tn_types::Database>(
+    src: &MdbxDatabase,
+    dst: &D,
+    rows_per_txn: usize,
+) -> eyre::Result<usize> {
+    use tn_types::{Database as _, DbTxMut as _};
+
+    src.open_table::<T>()?;
+    let mut txn = dst.write_txn()?;
+    let mut in_txn = 0;
+    let rows = src.try_for_each::<T>(|key, value| {
+        txn.insert::<T>(&key, &value)?;
+        in_txn += 1;
+        if in_txn == rows_per_txn {
+            std::mem::replace(&mut txn, dst.write_txn()?).commit()?;
+            in_txn = 0;
+        }
+        Ok(())
+    })?;
+    txn.commit()?;
+    Ok(rows)
+}
+
+/// Open or reopen all the storage of the node: one tndb shared log per environment
+/// ([`DatabaseType`]) under `<store_path>/tndb` (beside the consensus packs in `epochs/`), in group
+/// commit (a write returns at once; `persist` waits for the sync covering it), compacting in the
+/// background, with every table open. A node that ran on MDBX (the release before tndb) has its
+/// epoch and kad tables and its batch caches copied over on the first open, and its MDBX files
+/// deleted (`migrate_from_mdbx`). Every open then checks that the epoch tables' headers decode
+/// with this binary (`epoch_db_recovery`).
+pub fn open_db<P: AsRef<std::path::Path> + Send>(store_path: P) -> DatabaseType {
     use tn_types::Database as _;
 
     let store_path = store_path.as_ref();
-    let epoch_db = ReDB::open(store_path.join("epoch")).expect("Cannot open database (epoch)");
-    // before the full-memory load below, which panics on a row this binary cannot decode
-    epoch_db_recovery::discard_seconds_only_proposal(&epoch_db)
-        .expect("Cannot check database (epoch)");
-    let kad_db = ReDB::open(store_path.join("kad")).expect("Cannot open database (kad)");
-    let cache_db = ReDB::open(store_path.join("cache")).expect("Cannot open database (cache)");
-    let db = CompositeDatabase::open(epoch_db, kad_db, cache_db);
+    let root = store_path.join(tndb::TNDB_DIR);
+    let options = tndb::TnDbOptions { commit: tndb::CommitMode::Group, ..Default::default() };
+    let db = tndb::SplitDatabase::open_with(&root, options).expect("Cannot open database (tndb)");
     // Epoch tables
     db.open_table::<LastProposed>().expect("failed to open table!");
     db.open_table::<Votes>().expect("failed to open table!");
@@ -245,7 +403,210 @@ fn _open_redb<P: AsRef<std::path::Path> + Send>(store_path: P) -> CompositeDatab
     db.open_table::<NodeBatchesCache>().expect("failed to open table!");
     db.open_table::<OurNodeBatchesCache>().expect("failed to open table!");
     db.open_table::<ConsensusCache>().expect("failed to open table!");
+    // Bring over the anti-equivocation records, peer records and batch caches of a node that ran
+    // on MDBX.
+    #[cfg(feature = "reth-libmdbx")]
+    migrate_from_mdbx(store_path, &root, &db).expect("Cannot migrate the consensus DB from MDBX");
+    // On every open, before anything reads the epoch tables with the typed decode, which panics
+    // on a row this binary cannot decode: removes the header this node proposed for a sub-second
+    // fork epoch on an older binary, and refuses any other undecodable epoch row.
+    epoch_db_recovery::discard_seconds_only_proposal(&db).expect("Cannot check database (epoch)");
     db
+}
+
+#[cfg(all(test, feature = "reth-libmdbx"))]
+mod migrate_test {
+    use tempfile::TempDir;
+    use tn_types::{
+        AuthorityIdentifier, Batch, Certificate, Database as _, Hash as _, HeaderBuilder,
+        VoteDigest, VoteInfo, B256,
+    };
+
+    use super::{
+        migrate_from_mdbx,
+        tables::*,
+        tndb::{CommitMode, SplitDatabase, TnDbOptions, MDBX_MIGRATED, TNDB_DIR},
+        CertificateStore as _, PayloadStore as _,
+    };
+
+    /// tndb opened as `open_db` opens it (its tables open), without the migration.
+    fn open_split(root: &std::path::Path) -> SplitDatabase {
+        let options = TnDbOptions { commit: CommitMode::Group, ..Default::default() };
+        let db = SplitDatabase::open_with(root, options).expect("open tndb");
+        db.open_table::<Votes>().expect("open table");
+        db.open_table::<Certificates>().expect("open table");
+        db.open_table::<CertificateDigestByRound>().expect("open table");
+        db.open_table::<CertificateDigestByOrigin>().expect("open table");
+        db.open_table::<Payload>().expect("open table");
+        db.open_table::<KadRecords>().expect("open table");
+        db.open_table::<NodeBatchesCache>().expect("open table");
+        db.open_table::<OurNodeBatchesCache>().expect("open table");
+        db
+    }
+
+    /// A node switching from MDBX to tndb keeps its epoch tables (its votes: anti-equivocation
+    /// records), its kad tables and both batch caches (the batches its stored certificates name,
+    /// and its own uncommitted ones); the copy runs once.
+    #[test]
+    fn test_migrate_from_mdbx_keeps_epoch_and_kad_tables() {
+        let tmp = TempDir::with_prefix("migrate_mdbx").expect("temp dir");
+        let store = tmp.path();
+        let authority = AuthorityIdentifier::dummy_for_test(7);
+        let vote = VoteInfo { epoch: 3, round: 41, vote_digest: VoteDigest::default() };
+        let peer = B256::repeat_byte(9);
+        {
+            let mdbx = crate::_open_mdbx(store);
+            mdbx.insert::<Votes>(&authority, &vote).expect("vote");
+            mdbx.insert::<Payload>(&(B256::repeat_byte(1), 0), &1).expect("payload");
+            mdbx.insert::<KadRecords>(&peer, &vec![1, 2, 3]).expect("kad");
+            mdbx.insert::<NodeBatchesCache>(&B256::repeat_byte(2), &Default::default())
+                .expect("batch");
+            mdbx.insert::<OurNodeBatchesCache>(&B256::repeat_byte(3), &Default::default())
+                .expect("our batch");
+            mdbx.sync_persist();
+        }
+        // The consensus packs live beside the MDBX environments (`epochs/` next to `epoch/`).
+        let pack = store.join("epochs").join("epoch-1").join("data");
+        std::fs::create_dir_all(pack.parent().expect("a parent")).expect("mkdir");
+        std::fs::write(&pack, b"pack").expect("write");
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 5, "rows copied");
+        for env in ["epoch", "kad", "cache"] {
+            assert!(!store.join(env).exists(), "the MDBX {env} environment is deleted");
+        }
+        assert!(pack.exists(), "the packs beside it are not");
+        assert!(
+            db.get::<OurNodeBatchesCache>(&B256::repeat_byte(3)).expect("get").is_some(),
+            "our own uncommitted batch is carried over"
+        );
+        assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote.clone()));
+        assert_eq!(db.get::<Payload>(&(B256::repeat_byte(1), 0)).expect("get"), Some(1));
+        assert_eq!(db.get::<KadRecords>(&peer).expect("get"), Some(vec![1, 2, 3]));
+        assert!(
+            db.get::<NodeBatchesCache>(&B256::repeat_byte(2)).expect("get").is_some(),
+            "the batch cache is carried over"
+        );
+        assert!(root.join(MDBX_MIGRATED).exists(), "the marker");
+        drop(db);
+
+        // Once done, it never runs again: MDBX recreated after the switch (as by a downgrade) is
+        // not read.
+        {
+            let mdbx = crate::_open_mdbx(store);
+            mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(8), &vote).expect("vote");
+            mdbx.sync_persist();
+        }
+        let db = open_split(&root);
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 0, "done once");
+        assert_eq!(db.get::<Votes>(&AuthorityIdentifier::dummy_for_test(8)).expect("get"), None);
+        assert_eq!(db.get::<Votes>(&authority).expect("get"), Some(vote), "kept across a reopen");
+    }
+
+    /// After a stop-all upgrade the restart commits the uncommitted certificates it finds stored,
+    /// so every batch one of them names must still be in the batch cache: with the consensus pack,
+    /// the only place a batch is served from, and no other node would still hold it.
+    #[test]
+    fn test_migrate_from_mdbx_keeps_the_batches_of_stored_certificates() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_batches").expect("temp dir");
+        let store = tmp.path();
+        let batch = Batch { transactions: vec![vec![7; 64]], epoch: 3, ..Default::default() };
+        let header = HeaderBuilder::default()
+            .author(AuthorityIdentifier::dummy_for_test(1))
+            .round(5)
+            .epoch(3)
+            .with_payload_batch(&batch, 0)
+            .build();
+        let mut certificate = Certificate::default();
+        certificate.update_header_for_test(header);
+        let digest = certificate.digest();
+        {
+            let mdbx = crate::_open_mdbx(store);
+            mdbx.write(certificate).expect("certificate");
+            mdbx.write_payload(&batch.digest(), &0).expect("payload");
+            mdbx.insert::<NodeBatchesCache>(&batch.digest(), &batch).expect("batch");
+            mdbx.sync_persist();
+        }
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        migrate_from_mdbx(store, &root, &db).expect("migrate");
+
+        let stored = db.read(digest).expect("read").expect("the certificate is carried over");
+        assert_eq!(stored.header().payload().len(), 1, "it names the batch");
+        for (batch_digest, worker) in stored.header().payload() {
+            assert!(
+                db.contains_payload(*batch_digest, *worker).expect("payload"),
+                "held, to voters"
+            );
+            assert_eq!(
+                db.get::<NodeBatchesCache>(batch_digest).expect("get"),
+                Some(batch.clone()),
+                "and readable, to the batch fetcher"
+            );
+        }
+    }
+
+    /// A file in an MDBX environment's directory that is not MDBX's keeps the directory (only
+    /// MDBX's files are deleted); a rerun with the marker gone finds nothing left to copy.
+    #[test]
+    fn test_migrate_from_mdbx_deletes_only_mdbx_files() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_files").expect("temp dir");
+        let store = tmp.path();
+        {
+            let mdbx = crate::_open_mdbx(store);
+            let vote = VoteInfo { epoch: 1, round: 1, vote_digest: VoteDigest::default() };
+            mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(7), &vote).expect("vote");
+            mdbx.sync_persist();
+        }
+        let stray = store.join("kad").join("notes.txt");
+        std::fs::write(&stray, b"an operator's file").expect("write");
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("migrate"), 1, "rows copied");
+        assert!(stray.exists(), "a file MDBX did not make is kept");
+        assert!(!store.join("kad").join("mdbx.dat").exists(), "MDBX's own files are deleted");
+        assert!(!store.join("epoch").exists());
+        std::fs::remove_file(root.join(MDBX_MIGRATED)).expect("remove the marker");
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("rerun"), 0, "nothing left to copy");
+        assert!(root.join(MDBX_MIGRATED).exists(), "the marker, written again");
+    }
+
+    /// A read error part way through a table fails the move, before anything of MDBX's is deleted
+    /// or the move is marked done: the next open copies again, from the intact MDBX.
+    #[test]
+    fn test_migrate_from_mdbx_keeps_mdbx_when_a_table_read_fails() {
+        let tmp = TempDir::with_prefix("migrate_mdbx_read_error").expect("temp dir");
+        let store = tmp.path();
+        let vote = VoteInfo { epoch: 2, round: 9, vote_digest: VoteDigest::default() };
+        {
+            let mdbx = crate::_open_mdbx(store);
+            for i in 0..10 {
+                mdbx.insert::<Votes>(&AuthorityIdentifier::dummy_for_test(i), &vote).expect("vote");
+            }
+            mdbx.sync_persist();
+        }
+        let root = store.join(TNDB_DIR);
+        let db = open_split(&root);
+        // `LastProposed` is copied first (empty), then `Votes`: fail its walk after 4 rows.
+        crate::mdbx::database::fail_next_walk_after(4);
+        let err = migrate_from_mdbx(store, &root, &db).expect_err("a read error fails the move");
+        assert!(err.to_string().contains("injected cursor error"), "{err}");
+        assert!(store.join("epoch").join("mdbx.dat").exists(), "MDBX is kept");
+        assert!(!root.join(MDBX_MIGRATED).exists(), "and the move is not marked done");
+        assert_eq!(migrate_from_mdbx(store, &root, &db).expect("retry"), 10, "a retry copies all");
+        assert!(!store.join("epoch").exists(), "then MDBX is deleted");
+    }
+
+    /// A node with no MDBX data (a fresh node) copies nothing, and records that it is done.
+    #[test]
+    fn test_migrate_from_mdbx_on_a_fresh_node() {
+        let tmp = TempDir::with_prefix("migrate_fresh").expect("temp dir");
+        let root = tmp.path().join(TNDB_DIR);
+        let db = open_split(&root);
+        assert_eq!(migrate_from_mdbx(tmp.path(), &root, &db).expect("migrate"), 0);
+        assert!(root.join(MDBX_MIGRATED).exists(), "the marker");
+        assert!(!tmp.path().join("epoch").exists(), "no MDBX environment created");
+    }
 }
 
 #[cfg(test)]
@@ -263,8 +624,8 @@ mod test {
     }
 
     /// Runs a simple bench/test for the provided DB.  Can use it for larger dataset tests as well
-    /// as comparing backends. For example run ```cargo test dbsimpbench --features redb --
-    /// --nocapture --test-threads 1``` to run each backend through the bench one at a time.
+    /// as comparing backends. For example run ```cargo test dbsimpbench -- --nocapture
+    /// --test-threads 1``` to run each backend through the bench one at a time.
     pub(crate) fn db_simp_bench<DB: Database>(db: DB, name: &str) {
         use tn_types::{DbTx, DbTxMut};
 
@@ -428,6 +789,10 @@ mod test {
         // Skip to prior of first value
         // Note: returns an empty iterator!
         assert!(db.record_prior_to::<TestTable>(&000).is_none());
+
+        // A key that is present: the record strictly before it, never the key itself.
+        assert_eq!(db.record_prior_to::<TestTable>(&456), Some((123, "123".to_string())));
+        assert!(db.record_prior_to::<TestTable>(&123).is_none(), "nothing precedes the first key");
     }
 
     pub(crate) fn test_iter_skip_to_previous_gap<DB: Database>(db: DB) {

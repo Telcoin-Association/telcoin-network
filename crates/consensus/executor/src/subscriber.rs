@@ -231,8 +231,8 @@ impl<DB: Database> Subscriber<DB> {
         .await?;
 
         // Once we've drained through the staged partial pack's final output, it has all been
-        // written to the main pack in order — drop the staging dir. `clear_staging` is async so the
-        // staging pack's background-thread join does not block this tokio worker.
+        // written to the main pack in order — drop the staging dir. `clear_staging` is async so
+        // sealing the staging pack (on the blocking pool) does not block this tokio worker.
         if self.inner.consensus_chain.staging_final() == Some(number) {
             self.inner.consensus_chain.clear_staging().await;
         }
@@ -777,7 +777,10 @@ async fn drain_pending_on_shutdown<Fut>(
         })
         .try_fold(consensus_chain, |chain, output| async move {
             if let Err(e) = save_consensus(output.clone(), chain, consensus_bus.metrics()).await {
-                warn!(target: "subscriber", "error saving consensus during shutdown: {e}");
+                // The epoch end stops the node on a storage failure here: a save the pack failed
+                // either poisoned it or was rolled back, and either way every later persist
+                // fails, `finish_epoch`'s included.
+                error!(target: "subscriber", "error saving consensus during shutdown: {e}");
                 Err(())
             } else {
                 // Best-effort forward: a no-op once the epoch manager has dropped its receiver,
@@ -835,11 +838,7 @@ mod tests {
     };
     use crate::{metrics::ExecutorMetrics, SubscriberError};
     use futures::{future, stream::FuturesOrdered};
-    use std::{
-        collections::{BTreeSet, VecDeque},
-        sync::Arc,
-        time::Duration,
-    };
+    use std::{collections::VecDeque, sync::Arc, time::Duration};
     use tempfile::TempDir;
     use tn_primary::{network::PrimaryNetworkHandle, ConsensusBusApp};
     use tn_storage::{consensus::ConsensusChain, mem_db::MemDatabase};
@@ -881,8 +880,9 @@ mod tests {
         count: u64,
     ) -> Vec<ConsensusOutput> {
         let committee = fixture.committee();
-        let genesis: BTreeSet<_> = fixture.genesis().collect();
-        let (_, headers) = fixture.headers_round(0, &genesis);
+        // Round-1 headers with no payload: these outputs carry no batches, so their sub-dags may
+        // declare none (a saved output carries every batch its sub-dag declares).
+        let headers = fixture.headers();
         let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
         let mut parent: ConsensusHeaderDigest = B256::ZERO.into();
         let mut outputs = Vec::new();
@@ -932,8 +932,9 @@ mod tests {
                 .unwrap();
         let consensus_bus = ConsensusBusApp::new();
 
-        let genesis: BTreeSet<_> = fixture.genesis().collect();
-        let (_, headers) = fixture.headers_round(0, &genesis);
+        // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+        // none (a saved output carries every batch its sub-dag declares).
+        let headers = fixture.headers();
         let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
 
         let parent0: ConsensusHeaderDigest = B256::ZERO.into();
@@ -1028,8 +1029,9 @@ mod tests {
         // that if the drain wrongly continued past the failed fetch, its save would succeed and
         // it would be broadcast -- making the swallow-and-continue bug observable rather than
         // masked by the pack rejecting a non-contiguous number.
-        let genesis: BTreeSet<_> = fixture.genesis().collect();
-        let (_, headers) = fixture.headers_round(0, &genesis);
+        // Round-1 headers with no payload: the outputs carry no batches, so their sub-dags declare
+        // none (a saved output carries every batch its sub-dag declares).
+        let headers = fixture.headers();
         let certificates: Vec<_> = headers.iter().map(|h| fixture.certificate(h)).collect();
         let leader = certificates.last().cloned().unwrap();
 

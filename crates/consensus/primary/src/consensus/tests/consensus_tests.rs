@@ -821,34 +821,81 @@ async fn test_seed_chain_survives_restart() {
     );
 }
 
-/// A certificate pack that cannot be used again is dropped on its first failure; only a full
-/// channel (transient backpressure) keeps it. A failed open or save latches an error that every
-/// later call returns, so before this only `SendFailed` dropped the pack, and a pack whose open
-/// failed was kept and logged an error for every certificate.
+/// A certificate pack failure stops the node; only a full channel (transient backpressure) lets
+/// consensus carry on without archiving that certificate. Every other `try_save` error is this
+/// node's own storage failing for good (a latched open, write or sync failure, or the pack's thread
+/// gone), so it becomes the consensus task's error.
 #[test]
 fn test_certificate_pack_failure_policy() {
-    use tn_storage::certificate_pack::{CertificatePack, PackError};
+    use tn_storage::certificate_pack::PackError;
 
-    assert!(super::keep_certificate_pack_after(&PackError::SendFull));
-    assert!(!super::keep_certificate_pack_after(&PackError::SendFailed));
-    assert!(!super::keep_certificate_pack_after(&PackError::Append("disk full".into())));
+    super::certificate_archived(Ok(())).expect("a queued certificate");
+    super::certificate_archived(Err(PackError::SendFull)).expect("backpressure is not a failure");
+    for failure in [PackError::SendFailed, PackError::Append("disk full".into())] {
+        let err = super::certificate_archived(Err(failure)).expect_err("a failed pack stops");
+        assert!(matches!(err, ConsensusError::CertificatePack(_)), "{err:?}");
+    }
+    let err =
+        super::certificate_archived(failed_certificate_pack().try_save(Certificate::default()))
+            .expect_err("a pack whose open failed stops consensus");
+    assert!(matches!(err, ConsensusError::CertificatePack(_)), "{err:?}");
+}
 
-    // The premise: a pack whose open failed returns its latched error (not `SendFailed`) from
-    // every later `try_save`. A plain file where the epoch directory belongs makes the open fail.
+/// A certificate pack whose open failed, once that failure has latched (a plain file where the
+/// epoch directory belongs makes the open fail). Every later `try_save` returns the latched error,
+/// not `SendFailed`.
+fn failed_certificate_pack() -> tn_storage::certificate_pack::CertificatePack {
     let dir = TempDir::new().expect("temp dir");
     std::fs::write(dir.path().join("epoch-0"), b"not a directory").expect("block the epoch dir");
-    let pack = CertificatePack::open(dir.path(), 0);
+    let pack = tn_storage::certificate_pack::CertificatePack::open(dir.path(), 0);
     // The open runs on the pack's thread; wait (bounded) for it to latch its failure.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
     while pack.get_error().is_ok() {
         assert!(std::time::Instant::now() < deadline, "the failed open never latched an error");
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        std::thread::sleep(Duration::from_millis(10));
     }
-    for _ in 0..2 {
-        let err = pack.try_save(Certificate::default()).expect_err("a failed pack refuses saves");
-        assert!(!matches!(err, PackError::SendFailed), "the latched error is returned: {err:?}");
-        assert!(!super::keep_certificate_pack_after(&err), "a failed pack is dropped: {err:?}");
-    }
+    pack
+}
+
+/// The consensus task ends with the certificate pack's error at the first certificate it cannot
+/// archive, instead of logging it and dropping the pack. The task is critical, so its error ends
+/// the epoch's task manager, and `run_epoch` returns it: the node exits non-zero.
+#[tokio::test]
+async fn test_failed_certificate_pack_ends_the_consensus_task() {
+    let fixture = CommitteeFixture::builder(MemDatabase::default).build();
+    let committee = fixture.committee();
+    let config = fixture.authorities().next().unwrap().consensus_config().clone();
+    let temp_dir = TempDir::new().unwrap();
+    let consensus_chain =
+        ConsensusChain::new_for_test(temp_dir.path().to_owned(), committee.clone()).await.unwrap();
+    let bullshark = Bullshark::new(
+        committee.clone(),
+        FLOOR_SUB_DAGS_PER_SCHEDULE,
+        LeaderSchedule::new(committee.clone(), LeaderSwapTable::default()),
+        DEFAULT_BAD_NODES_STAKE_THRESHOLD,
+    );
+    let cb = ConsensusBus::new();
+    let mut task_manager = TaskManager::default();
+    let pack = std::sync::Arc::new(failed_certificate_pack());
+    Consensus::spawn(config, &cb, bullshark, &task_manager, &consensus_chain, Some(pack))
+        .await
+        .unwrap();
+
+    let ids: Vec<_> = fixture.authorities().map(|a| a.id()).collect();
+    let genesis =
+        Certificate::genesis(&committee).iter().map(|x| x.digest()).collect::<BTreeSet<_>>();
+    let (certificates, _) = make_optimal_certificates(&committee, 1..=1, &genesis, &ids);
+    let certificate = certificates.front().expect("a round-1 certificate").clone();
+    cb.new_certificates().send(certificate).await.unwrap();
+
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        task_manager.until_task_ends(tn_types::ShutdownNotifier::new()),
+    )
+    .await
+    .expect("the consensus task ends");
+    let err = ended.expect_err("the consensus task ends with an error");
+    assert!(format!("{err}").contains("certificate pack failed"), "{err}");
 }
 
 /// Whole seconds of every header's creation time in the epoch commit floor tests (see

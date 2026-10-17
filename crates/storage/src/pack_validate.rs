@@ -755,27 +755,39 @@ pub fn recovery_refusal(data_path: &Path, epoch: Epoch) -> Option<String> {
 /// defect. That is not corruption. This returns `Some(end)` when the WAL replay stops short of the
 /// file end (and recovery would accept stopping there) and everything before `end` validates
 /// without a data-logical issue; `None` for a sealed pack, a log that replays to its end, a replay
-/// recovery would refuse, or a defect inside the complete prefix.
-pub fn incomplete_trailing_output(data_path: &Path, epoch: Epoch) -> Option<u64> {
-    let (_, unclean) = pack_unsealed_version(data_path, epoch)?;
+/// recovery would refuse, or a defect inside the complete prefix. A read the disk fails during the
+/// replay is an `Err` ([`PackError::ReadError`]): it is no verdict on the bytes.
+pub fn incomplete_trailing_output(
+    data_path: &Path,
+    epoch: Epoch,
+) -> Result<Option<u64>, PackError> {
+    let Some((_, unclean)) = pack_unsealed_version(data_path, epoch) else {
+        return Ok(None);
+    };
     if !unclean {
-        return None;
+        return Ok(None);
     }
-    let data_len = Pack::<PackRecord>::open(
+    let Ok(data) = Pack::<PackRecord>::open(
         data_path,
         epoch as u64,
         true,
         PackCompression::ZStd,
         PACK_VERSION,
-    )
-    .ok()?
-    .file_len();
-    let end = wal_consistent_end(data_path, epoch).ok()?;
-    if end >= data_len {
-        return None;
+    ) else {
+        return Ok(None);
+    };
+    let end = match wal_consistent_end(data_path, epoch) {
+        Ok(end) => end,
+        Err(e @ PackError::ReadError(_)) => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    if end >= data.file_len() {
+        return Ok(None);
     }
-    let prefix = validate_pack_file_bounded(data_path, epoch, None, Some(end)).ok()?;
-    (!prefix.has_data_logical_issue()).then_some(end)
+    let Ok(prefix) = validate_pack_file_bounded(data_path, epoch, None, Some(end)) else {
+        return Ok(None);
+    };
+    Ok((!prefix.has_data_logical_issue()).then_some(end))
 }
 
 /// Walk a pack's `data` stream read-only and classify the first physical (record-framing) failure,
@@ -786,7 +798,8 @@ pub fn incomplete_trailing_output(data_path: &Path, epoch: Epoch) -> Option<u64>
 /// as a truncatable torn tail / empty-meta versus a data-losing mid-log or corrupt-meta failure, so
 /// an operator can tell "restart heals it" from "replace this epoch". Header/open failures
 /// propagate as `Err` (a corrupt 28-byte header is a separate, rarer failure than a corrupt record
-/// stream).
+/// stream), and so does a read the disk fails ([`PackError::ReadError`]): it is no verdict on the
+/// bytes.
 pub fn classify_physical_corruption(
     path: &Path,
     epoch: Epoch,
@@ -841,13 +854,15 @@ pub fn classify_physical_corruption(
                 return Ok(None);
             }
             Some(Ok(_)) => records_ok_before += 1,
+            // A read the disk failed is not a damaged record: say so rather than classify it.
+            Some(Err(e)) if e.is_read_failure() => return Err(read_failed(path, offset, &e)),
             Some(Err(e)) => {
                 // A corrupted 4-byte size prefix desyncs `probe_decodable_after`'s walk, hiding a
                 // later intact output and misreading data-losing corruption as a truncatable tail.
                 // The position index frames the later output from its recorded (desync-immune)
                 // boundary; fall back to the walk only when the index is absent/unreadable.
                 let decodable_after = attested_output_survives_past(path, epoch, offset)
-                    || probe_decodable_after(&mut iter);
+                    || probe_decodable_after(path, &mut iter)?;
                 let kind = match (records_ok_before == 0, decodable_after) {
                     // record 0 is the epoch meta
                     (true, false) => CorruptionKind::TornMetaEmpty,
@@ -883,25 +898,38 @@ pub fn classify_physical_corruption(
 /// probe — a CRC-failed frame advances past itself, so decoding continues after it, while a
 /// short/torn record leaves the reader at EOF. Guards against a record whose claimed extent runs
 /// past EOF (the iterator's logical position does not advance on that read): if a repeated error
-/// makes no forward progress, stop rather than spin.
-fn probe_decodable_after(iter: &mut RawIter<PackRecord>) -> bool {
+/// makes no forward progress, stop rather than spin. A read the disk fails is an error: the probe
+/// cannot see past it, so it cannot say nothing follows.
+fn probe_decodable_after(path: &Path, iter: &mut RawIter<PackRecord>) -> Result<bool, PackError> {
     // `logical_position` (bytes consumed to the last frame boundary) is the syscall-free
     // forward-progress signal — advanced by each frame's on-disk size, no per-frame `lseek`.
     let mut last_pos = iter.logical_position();
     loop {
         match iter.next() {
-            None => return false,
-            Some(Ok(_)) => return true,
+            None => return Ok(false),
+            Some(Ok(_)) => return Ok(true),
+            Some(Err(e)) if e.is_read_failure() => {
+                return Err(read_failed(path, iter.logical_position(), &e));
+            }
             Some(Err(_)) => {
                 let pos = iter.logical_position();
                 if pos <= last_pos {
                     // No forward progress (extent-past-EOF): treat as nothing readable after.
-                    return false;
+                    return Ok(false);
                 }
                 last_pos = pos;
             }
         }
     }
+}
+
+/// The error for a read of the data log at `pos` that the disk failed: no verdict on the bytes.
+fn read_failed(path: &Path, pos: u64, error: &FetchError) -> PackError {
+    PackError::ReadError(format!(
+        "reading {} at offset {pos} failed ({error}); this is a disk read error, not damage found \
+         in the pack",
+        path.display()
+    ))
 }
 
 /// Validate the `data` record stream of a header-first (v1/v2) pack.

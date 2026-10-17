@@ -713,7 +713,7 @@ mod tests {
     use super::*;
     use tn_network_libp2p::SyncFrameError;
 
-    /// F15: the throughput floor trips only on a COMPLETED window that carried fewer than
+    /// The throughput floor trips only on a COMPLETED window that carried fewer than
     /// `min_bytes`; an at/above-floor window resets and does not trip, and a partial
     /// (not-yet-elapsed) window keeps accumulating. Uses a manual clock so the tumbling-window
     /// logic is deterministic.

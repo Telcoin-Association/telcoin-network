@@ -173,7 +173,9 @@ where
         // too far behind.
         let (exec_number, exec_epoch, exec_round) = self
             .consensus_bus
-            .last_consensus_block(&self.consensus_chain)
+            .with_last_consensus_block(&self.consensus_chain, |h| {
+                (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round())
+            })
             .await
             .inspect_err(|e| {
                 // A failed lookup is logged loudly but degrades to the same conservative
@@ -184,7 +186,6 @@ where
             })
             .ok()
             .flatten()
-            .map(|h| (h.number, h.sub_dag.leader_epoch(), h.sub_dag.leader_round()))
             .unwrap_or((0, 0, 0));
         // When empty outputs are skipped by execution, no new EVM block is produced.
         // In that case, rely on the most recent consensus round processed by the engine.
@@ -610,14 +611,15 @@ where
                 // never on disk, so recasting here would risk the same
                 // self-inflicted equivocation on restart that the first-vote barrier guards
                 // against. The poison latch fails this barrier after any failed
-                // commit; fail-stop the node rather than recast a non-durable vote
-                // (issue #975).
+                // commit; end the epoch rather than recast a non-durable vote (issue
+                // #975), after which `run_epoch` finds the store unable to make writes
+                // durable and stops the node.
                 self.consensus_config
                     .node_storage()
                     .persist::<Votes>()
                     .await
                     .inspect_err(|e| {
-                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; initiating node shutdown: {e}");
+                        error!(target: "primary", "epoch DB durable barrier failed on fast vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                         self.consensus_config.shutdown().notify();
                     })?;
                 info!(target: "primary", "Recast vote {vote:?} for {} at round {}", header, header.round());
@@ -1111,14 +1113,14 @@ where
                         // authoritative mem layer and not on disk, so
                         // resending it here would risk the same
                         // self-inflicted equivocation on restart. The poison latch fails this
-                        // barrier after any failed commit; fail-stop rather than recast a
-                        // non-durable vote (issue #975).
+                        // barrier after any failed commit; end the epoch rather than recast a
+                        // non-durable vote (issue #975), and `run_epoch` then stops the node.
                         self.consensus_config
                             .node_storage()
                             .persist::<Votes>()
                             .await
                             .inspect_err(|e| {
-                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; initiating node shutdown: {e}");
+                                error!(target: "primary", "epoch DB durable barrier failed on vote recast; ending the epoch (the node stops if its stores cannot write): {e}");
                                 self.consensus_config.shutdown().notify();
                             })?;
                         return Ok(PrimaryResponse::Vote(vote));
@@ -1147,8 +1149,9 @@ where
         // ordinary crash. See issue #934.
         //
         // If the barrier reports a failed commit (disk full, `EIO`, checksum), the vote is not on
-        // disk, so returning it would risk that same self-inflicted equivocation. Fail-stop the
-        // node and refuse to return the vote. The error maps to `PrimaryNetworkError::Storage`,
+        // disk, so returning it would risk that same self-inflicted equivocation. Refuse to return
+        // the vote and end the epoch: `run_epoch` then finds the store unable to make writes
+        // durable and stops the node. The error maps to `PrimaryNetworkError::Storage`,
         // which carries no peer penalty: this is our local disk failure, not the peer's fault
         // (issue #975).
         self.consensus_config
@@ -1156,7 +1159,7 @@ where
             .persist::<Votes>()
             .await
             .inspect_err(|e| {
-                error!(target: "primary", "epoch DB durable barrier failed for vote; initiating node shutdown: {e}");
+                error!(target: "primary", "epoch DB durable barrier failed for vote; ending the epoch (the node stops if its stores cannot write): {e}");
                 self.consensus_config.shutdown().notify();
             })?;
 

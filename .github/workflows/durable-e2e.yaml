@@ -1,20 +1,13 @@
-# Scheduled Durable-mode e2e lane (#1149, follow-up to #982 / #917).
+# Scheduled e2e lane (#1149, follow-up to #982 / #917): the restart and epoch suites, nightly.
 #
-# PR CI runs the e2e suites with the test-build MDBX default (`SafeNoSync`, no hot-path
-# fsync; see crates/storage/src/mdbx/database.rs). That removed the Durable timing regime
-# -- where the externalization barriers (`persist().await` before a certificate, header,
-# or vote goes on the wire) wait on a real per-commit flush that races the proposer
-# timers -- from every test run. This lane restores that regime on a schedule by
-# exporting TN_TEST_MDBX_SYNC=durable, which every spawned node process inherits, at
-# zero wall-clock cost to PR CI. An invalid value fails MdbxDatabase::open outright, so
-# a typo here cannot green-run the wrong sync regime.
-#
-# The timings of the two suite steps, compared against a `safe-no-sync` dispatch run on
-# the same runner class, give the #917 acceptance measurement (Durable-vs-SafeNoSync
-# wall clock on a CI disk): post the first numbers on #1149. The untimed build step ahead
-# of them absorbs every compile (node binary and all test binaries) plus the cache state,
-# so the timed steps measure test execution only and the A/B pair stays comparable even
-# when one side runs cold.
+# PR CI cannot afford the e2e suites, so this lane is the only CI that runs them. It was
+# created to restore the Durable timing regime -- where the externalization barriers
+# (`persist().await` before a certificate, header, or vote goes on the wire) wait on a real
+# flush that races the proposer timers -- which MDBX test builds removed (`SafeNoSync`), by
+# exporting TN_TEST_MDBX_SYNC=durable to the spawned nodes. The node's consensus DB is now
+# tndb, which syncs for real at every barrier in every build, so every e2e run is in that
+# regime and the variable no longer reaches the node (it still selects the sync mode of the
+# MDBX backend that storage tests and benches use; see crates/storage/src/mdbx/database.rs).
 name: Durable e2e
 
 on:
@@ -22,14 +15,6 @@ on:
     # Nightly at 08:17 UTC, off the top of the hour to dodge the scheduled-load spike.
     - cron: "17 8 * * *"
   workflow_dispatch:
-    inputs:
-      sync_mode:
-        description: "TN_TEST_MDBX_SYNC value for the spawned nodes"
-        type: choice
-        options:
-          - durable
-          - safe-no-sync
-        default: durable
 
 # The job only reads the repository (checkout + build + test); the token gets no
 # write scopes (least privilege, CodeQL actions/missing-workflow-permissions).
@@ -48,7 +33,7 @@ jobs:
   durable-e2e:
     runs-on: ubuntu-latest
     # Covers a cold cache: full workspace test-binary build plus both e2e suites run
-    # serialized (nextest pins the e2e group to max-threads 1) in the slower Durable regime.
+    # serialized (nextest pins the e2e group to max-threads 1).
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -73,9 +58,6 @@ jobs:
       # Untimed: absorbs the node-binary build and every workspace test-binary compile, and
       # validates the committed lockfile (`fetch --locked` fails on drift, matching the
       # `--locked` discipline of pr.yaml), so the timed suite steps below are compile-free.
-      # TN_TEST_MDBX_SYNC is scoped to the suite steps, not exported job-wide: a build needs
-      # no override, and a future "variable must be unset" test (the
-      # TN_*_FORK_EPOCH pattern in the Makefile) must not inherit it.
       - name: Build node binary and test binaries (untimed)
         run: |
           cargo fetch --locked
@@ -83,19 +65,12 @@ jobs:
           cargo nextest run --no-run --locked --workspace
 
       - name: Run restart e2e tests
-        env:
-          # Scheduled runs get `durable`; a manual dispatch may select either side of the A/B.
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-restarts
 
       - name: Run epoch e2e tests
-        env:
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-epochs
 
       - name: Run direct SIGKILL epoch-boundary recovery tests
-        env:
-          TN_TEST_MDBX_SYNC: ${{ inputs.sync_mode || 'durable' }}
         run: make test-sigkill
 
       - name: Archive retained data from a failed SIGKILL reproduction

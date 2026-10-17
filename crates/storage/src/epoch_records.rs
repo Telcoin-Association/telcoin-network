@@ -4,15 +4,24 @@
 //! - A records file containing [`EpochRecord`] entries, indexed by epoch number (position index)
 //!   and by digest (hash index).
 //! - A certs file containing [`EpochCertificate`] entries, indexed by digest only.
+//!
+//! ## Where things are
+//! - `EpochRecordDb`: the handle; `run_db_loop` is its actor thread.
+//! - Validation: `EpochRecordValidation`, `epoch_committee_valid`, `validate_record_against_anchor`
+//!   and `CertifiedRecordError`.
+//! - `impl EpochRecordDb`: the API.
+//! - `impl Inner`: the two logs: open, recovery, appends and reads.
+//! - `EpochDbError` and the bundle helpers (`write_bounded_pack`, `append_bundle_increment`), then
+//!   `mod test`.
 
 use std::{
+    collections::HashSet,
     error::Error,
     fmt::Display,
     future::Future,
     hash::BuildHasherDefault,
     io,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -45,7 +54,8 @@ use crate::{
 /// Current version of the epoch pack file.
 const EPOCH_PACK_VERSION: u16 = 0;
 
-/// Interval between lookups in the bounded waits [`EpochRecordDb::cert_by_digest_with_timeout`].
+/// Interval between lookups in the bounded waits [`EpochRecordDb::cert_by_digest_with_timeout`]
+/// and [`EpochRecordDb::certified_record_by_epoch_with_timeout`].
 const POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Where the actor returns its verdict on one write, to the caller that sent it.
@@ -115,7 +125,8 @@ pub struct EpochRecordDb {
     /// Join handle for the background thread running commands.
     handle: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Vector to map epochs to the last consensus header number.
-    /// Used for quickly deducing an epoch for a given consensus header number.
+    /// Used for quickly deducing an epoch for a given consensus header number. Built from the
+    /// stored records at open, then extended by the database's thread as records are stored.
     final_numbers: Arc<Mutex<Vec<u64>>>,
     /// Set the first time a read wrapper sees the actor's channel closed, so a dead actor is
     /// logged once per handle rather than on every poll (`cert_by_digest_with_timeout` polls
@@ -123,7 +134,11 @@ pub struct EpochRecordDb {
     dead_logged: Arc<AtomicBool>,
 }
 
-fn run_db_loop(mut inner: Inner, mut rx: Receiver<EpochDbMessage>) {
+fn run_db_loop(
+    mut inner: Inner,
+    mut rx: Receiver<EpochDbMessage>,
+    final_numbers: Arc<Mutex<Vec<u64>>>,
+) {
     // An async shutdown stashes its confirmation here so it can be sent AFTER the clean-close
     // below.
     let mut async_confirm: Option<oneshot::Sender<()>> = None;
@@ -145,6 +160,9 @@ fn run_db_loop(mut inner: Inner, mut rx: Receiver<EpochDbMessage>) {
                 if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save epoch record");
                 }
+                // Whatever the outcome: a save can store its record and still fail (its
+                // certificate), and the routing follows what is stored.
+                sync_routing(&mut inner, &final_numbers);
                 let _ = tx.send(res);
             }
             EpochDbMessage::Save(record, cert, tx) => {
@@ -152,6 +170,7 @@ fn run_db_loop(mut inner: Inner, mut rx: Receiver<EpochDbMessage>) {
                 if let Err(e) = &res {
                     error!(target: "epoch-db", %e, "failed to save epoch record and certificate");
                 }
+                sync_routing(&mut inner, &final_numbers);
                 let _ = tx.send(res);
             }
             EpochDbMessage::SaveCertificate(digest, cert, tx) => {
@@ -233,6 +252,40 @@ fn run_db_loop(mut inner: Inner, mut rx: Receiver<EpochDbMessage>) {
     inner.close();
     if let Some(tx) = async_confirm {
         let _ = tx.send(());
+    }
+}
+
+/// Extend the by-number routing `finals` to every epoch the database stores, each from its stored
+/// (first-write-wins) record, read with [`Inner::try_record_by_epoch`]'s checks.
+/// [`EpochRecordDb::open`] builds the routing with it, and [`sync_routing`] extends it after every
+/// save. It stops at the first stored epoch whose record does not read back, naming it, rather than
+/// leave a hole: a number past there routes to that epoch. Records are stored contiguously in epoch
+/// order, so the routing stays sorted.
+fn extend_routing(inner: &mut Inner, finals: &mut Vec<u64>) -> Result<(), EpochDbError> {
+    let stored_end = inner.start_epoch as usize + inner.epoch_idx.len();
+    if finals.is_empty() {
+        // Epochs before the first stored one route to it.
+        finals.resize(inner.start_epoch as usize, 0);
+    }
+    while finals.len() < stored_end {
+        let epoch = finals.len() as Epoch;
+        let record = inner
+            .try_record_by_epoch(epoch)
+            .and_then(|record| record.ok_or(FetchError::NotFound))
+            .map_err(EpochDbError::unreadable(format!("epoch {epoch}'s record")))?;
+        finals.push(record.final_consensus.number);
+    }
+    Ok(())
+}
+
+/// [`extend_routing`], run on the database's thread after every record save, whatever its outcome
+/// (a save can store its record and then fail on its certificate), before the writer hears back:
+/// so a stored record is routed by then, a refused one never is, and the routing never has a gap.
+/// A record that does not read back is logged and the routing stops before it; the next save tries
+/// again.
+fn sync_routing(inner: &mut Inner, final_numbers: &Mutex<Vec<u64>>) {
+    if let Err(e) = extend_routing(inner, &mut final_numbers.lock()) {
+        error!(target: "epoch-db", %e, "stored epoch record unreadable; routing stops before it");
     }
 }
 
@@ -449,25 +502,21 @@ impl EpochRecordDb {
         let (tx, rx) = mpsc::channel(1000);
         let path: PathBuf = path.into();
         let mut inner = Inner::open_append(path, 0)?;
-        // Build `final_numbers` from the records the actor serves: the position index's
-        // (first-write-wins) record for each epoch, not a raw walk of the log, where a duplicate
-        // left by an interrupted save may differ from the indexed record. Index it by absolute
-        // epoch (matching `reserve_finals`). (Epochs are contiguous from the first stored one by
-        // construction, so there are no gaps to leave as zero.)
-        let mut final_numbers: Vec<u64> = Vec::with_capacity(inner.epoch_idx.len());
-        for slot in 0..inner.epoch_idx.len() as u64 {
-            let record = inner.records.fetch(inner.epoch_idx.load(slot)?)?;
-            let epoch = record.epoch as usize;
-            if epoch >= final_numbers.len() {
-                final_numbers.resize(epoch + 1, 0);
-            }
-            final_numbers[epoch] = record.final_consensus.number;
-        }
-        let handle = std::thread::spawn(move || run_db_loop(inner, rx));
+        // Build `final_numbers` from the records the actor serves, as its thread extends it after
+        // each save (`extend_routing`): the position index's (first-write-wins) record for each
+        // epoch, not a raw walk of the log, where a duplicate left by an interrupted save may
+        // differ from the indexed record. A stored record that does not read back fails the open,
+        // naming its epoch.
+        let mut final_numbers =
+            Vec::with_capacity(inner.start_epoch as usize + inner.epoch_idx.len());
+        extend_routing(&mut inner, &mut final_numbers)?;
+        let final_numbers = Arc::new(Mutex::new(final_numbers));
+        let routing = final_numbers.clone();
+        let handle = std::thread::spawn(move || run_db_loop(inner, rx, routing));
         Ok(Self {
             tx,
             handle: Arc::new(Mutex::new(Some(handle))),
-            final_numbers: Arc::new(Mutex::new(final_numbers)),
+            final_numbers,
             dead_logged: Arc::new(AtomicBool::new(false)),
         })
     }
@@ -478,67 +527,43 @@ impl EpochRecordDb {
     /// - `Ok(None)`: both logs are cleanly sealed and decode to the end.
     /// - `Ok(Some(what))`: `open` would heal them (an unclean log's torn tail truncated, indexes
     ///   rebuilt), or would create them.
-    /// - `Err`: what `open` would refuse with: a sealed log that does not decode, or acked records
-    ///   damaged behind a tear.
+    /// - `Err`: what `open` would refuse with: a sealed log that does not decode, acked records
+    ///   damaged behind a tear, or a missing (or empty) log whose index attests records.
     pub fn assess<P: AsRef<Path>>(path: P) -> Result<Option<String>, EpochDbError> {
         let dir = path.as_ref();
-        if !dir.join(Inner::RECORDS_NAME).exists() {
-            return Ok(Some("no epoch-record logs yet; they would be created".to_string()));
-        }
-        let records = match Pack::<EpochRecord>::open(
-            dir.join(Inner::RECORDS_NAME),
-            Inner::PACK_EPOCH,
-            true,
-            PackCompression::ZStd,
-            EPOCH_PACK_VERSION,
-        ) {
-            Ok(records) => records,
-            // A log a writable open initialises (empty, or sized but never written) holds nothing
-            // to assess and nothing to lose.
-            Err(e) if open_would_initialise(&e) => {
-                return Ok(Some("the records log is empty; it would be initialised".to_string()))
-            }
-            Err(e) => return Err(e.into()),
-        };
         let mut heals = Vec::new();
-        Inner::assess_log(
-            &records,
-            &dir.join(Inner::RECORD_HASH_NAME),
-            Some(&dir.join(Inner::EPOCH_POS_NAME)),
+        let records = Inner::assess_open::<EpochRecord>(
+            dir,
+            Inner::RECORDS_NAME,
+            Inner::PACK_EPOCH,
+            Inner::RECORD_HASH_NAME,
             "records",
             &mut heals,
         )?;
-        let certs = if dir.join(Inner::CERTS_NAME).exists() {
-            match Pack::<EpochCertificate>::open(
-                dir.join(Inner::CERTS_NAME),
-                Inner::CERT_PACK_EPOCH,
-                true,
-                PackCompression::ZStd,
-                EPOCH_PACK_VERSION,
-            ) {
-                Ok(certs) => {
-                    Inner::assess_log(
-                        &certs,
-                        &dir.join(Inner::CERT_HASH_NAME),
-                        None,
-                        "certs",
-                        &mut heals,
-                    )?;
-                    Some(certs)
-                }
-                Err(e) if open_would_initialise(&e) => {
-                    heals.push("the certs log is empty; it would be initialised".to_string());
-                    None
-                }
-                Err(e) => return Err(e.into()),
-            }
-        } else {
-            None
-        };
+        if let Some(records) = &records {
+            Inner::assess_log(
+                records,
+                &dir.join(Inner::RECORD_HASH_NAME),
+                Some(&dir.join(Inner::EPOCH_POS_NAME)),
+                "records",
+                &mut heals,
+            )?;
+        }
+        let certs = Inner::assess_open::<EpochCertificate>(
+            dir,
+            Inner::CERTS_NAME,
+            Inner::CERT_PACK_EPOCH,
+            Inner::CERT_HASH_NAME,
+            "certs",
+            &mut heals,
+        )?;
+        if let Some(certs) = &certs {
+            Inner::assess_log(certs, &dir.join(Inner::CERT_HASH_NAME), None, "certs", &mut heals)?;
+        }
         // The open also rebuilds indexes that were not cleanly sealed or whose tracked length
         // disagrees with their log, even when the logs themselves are sealed.
-        if heals.is_empty() {
-            if let Some(what) = Inner::assess_indexes(dir, &records, certs.as_ref()) {
+        if let (true, Some(records)) = (heals.is_empty(), &records) {
+            if let Some(what) = Inner::assess_indexes(dir, records, certs.as_ref()) {
                 heals.push(what);
             }
         }
@@ -612,69 +637,39 @@ impl EpochRecordDb {
         self.write(|tx| EpochDbMessage::SaveDummy0Record(record, tx)).await
     }
 
-    /// Reserve `record`'s by-number routing entry before it is written: the next epoch's final
-    /// number is pushed (so consecutive saves keep their order checks), while an epoch that already
-    /// has an entry keeps it (first-write-wins, the record the database serves). Returns whether an
-    /// entry was pushed, for [`Self::release_finals`] to undo if the write is then refused.
-    fn reserve_finals(&self, record: &EpochRecord) -> Result<bool, EpochDbError> {
-        let epoch = record.epoch as usize;
-        let mut finals = self.final_numbers.lock();
-        let finals_len = finals.len();
-        if epoch > finals_len {
-            return Err(EpochDbError::EpochOutOfOrder(finals_len as u32, epoch as u32));
-        }
-        if epoch == finals_len {
-            finals.push(record.final_consensus.number);
-            return Ok(true);
-        }
-        Ok(false)
-    }
-
-    /// Undo a [`Self::reserve_finals`] push for `record` whose write was refused, while it is still
-    /// the last entry, so a refused write leaves no routing behind.
-    fn release_finals(&self, record: &EpochRecord) {
-        let mut finals = self.final_numbers.lock();
-        if finals.len() == record.epoch as usize + 1 {
-            finals.pop();
-        }
-    }
-
-    /// Write `record` (with `cert`, if any), keeping the by-number routing in step with what the
-    /// database actually stores.
-    async fn write_record(
-        &self,
-        record: EpochRecord,
-        message: impl FnOnce(EpochRecord, WriteReply) -> EpochDbMessage,
-    ) -> Result<(), EpochDbError> {
-        let pushed = self.reserve_finals(&record)?;
-        let reserved = pushed.then(|| record.clone());
-        let res = self.write(|tx| message(record, tx)).await;
-        if let (Err(_), Some(reserved)) = (&res, reserved) {
-            self.release_finals(&reserved);
-        }
-        res
-    }
-
     /// Save an [`EpochRecord`] without a certificate.
     /// Returns `Ok(())` idempotently if the record is already stored; a different record for an
     /// already-stored epoch is refused ([`EpochDbError::ConflictingRecord`]).
     pub async fn save_record(&self, record: EpochRecord) -> Result<(), EpochDbError> {
-        self.write_record(record, EpochDbMessage::SaveRecord).await
+        self.write(|tx| EpochDbMessage::SaveRecord(record, tx)).await
     }
 
     /// Save an [`EpochRecord`] and its [`EpochCertificate`] to the database.
     /// If the record is already stored, only the certificate is saved; a different record for an
     /// already-stored epoch is refused ([`EpochDbError::ConflictingRecord`]) with nothing saved.
+    /// A stored certificate that does not read back is reported ([`EpochDbError::Unreadable`]),
+    /// not replaced.
+    ///
+    /// The caller verifies the pair first. Storage checks only that `cert.epoch_hash` is the
+    /// record's digest ([`EpochDbError::CertificateMismatch`]) and keeps one record per epoch; the
+    /// certificate's signatures and quorum, and the record's anchoring to the locally trusted
+    /// committee, are the caller's to verify ([`Self::validate_downloaded_record`],
+    /// [`EpochRecord::verify_with_cert`]).
     pub async fn save(
         &self,
         record: EpochRecord,
         cert: EpochCertificate,
     ) -> Result<(), EpochDbError> {
-        self.write_record(record, |record, tx| EpochDbMessage::Save(record, cert, tx)).await
+        self.write(|tx| EpochDbMessage::Save(record, cert, tx)).await
     }
 
     /// Save an [`EpochCertificate`] keyed by `digest` (the corresponding [`EpochRecord`]'s digest).
-    /// Idempotent: returns `Ok(())` if a certificate for this digest is already stored.
+    /// Idempotent: returns `Ok(())` if a certificate for this digest is already stored and reads
+    /// back; one that does not read back is reported ([`EpochDbError::Unreadable`]), not replaced.
+    ///
+    /// The caller verifies the certificate first. Storage checks only that `cert.epoch_hash` is
+    /// `digest` ([`EpochDbError::CertificateMismatch`]); its signatures and quorum against the
+    /// record's committee are the caller's to verify ([`EpochRecord::verify_with_cert`]).
     pub async fn save_certificate(
         &self,
         digest: EpochDigest,
@@ -855,8 +850,8 @@ impl EpochRecordDb {
             })
     }
 
-    /// Waits up to `timeout` for the record and
-    /// its certificate to arrive, polling every 200ms
+    /// Waits up to `timeout` for the record and its certificate to arrive, polling every
+    /// [`POLL_INTERVAL`] (see `certified_record_poll`).
     ///
     /// Only the retryable outcomes are waited on (see [`CertifiedRecordError::is_retryable`]):
     /// a record or certificate that has not arrived yet can still be supplied asynchronously,
@@ -873,28 +868,25 @@ impl EpochRecordDb {
         self.certified_record_poll(epoch, deadline).await
     }
 
-    /// Recursive polling body of [`Self::certified_record_by_epoch_with_timeout`].
+    /// Polling loop of [`Self::certified_record_by_epoch_with_timeout`].
     ///
-    /// Boxed because async recursion needs an indirected future type. Always performs at least
-    /// one check, then recurses only while the failure is retryable and `deadline` has not
-    /// passed; the final (non-retryable or timed-out) error is returned to the caller intact.
-    fn certified_record_poll(
+    /// Always performs at least one check, then checks again every [`POLL_INTERVAL`] only while
+    /// the failure is retryable and `deadline` has not passed; the final (non-retryable or
+    /// timed-out) error is returned to the caller intact. Each sleep is clamped to `deadline`, so
+    /// the wait ends with a check at the deadline, as in [`Self::poll_until_deadline`].
+    async fn certified_record_poll(
         &self,
         epoch: Epoch,
         deadline: tokio::time::Instant,
-    ) -> Pin<Box<dyn Future<Output = Result<EpochRecord, CertifiedRecordError>> + Send + '_>> {
-        Box::pin(async move {
-            let mut outcome = self.certified_record_by_epoch(epoch).await;
-            let mut retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
-                && tokio::time::Instant::now() < deadline;
-            while retry {
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                outcome = self.certified_record_by_epoch(epoch).await;
-                retry = outcome.as_ref().err().is_some_and(|e| e.is_retryable())
-                    && tokio::time::Instant::now() < deadline;
+    ) -> Result<EpochRecord, CertifiedRecordError> {
+        loop {
+            let outcome = self.certified_record_by_epoch(epoch).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline || !outcome.as_ref().is_err_and(|e| e.is_retryable()) {
+                return outcome;
             }
-            outcome
-        })
+            tokio::time::sleep_until(deadline.min(now + POLL_INTERVAL)).await;
+        }
     }
 
     /// Retrieve an [`EpochRecord`] by its digest.
@@ -1189,9 +1181,9 @@ impl EpochRecordDb {
     /// Find the epoch for a consensus header number.
     ///
     /// Uses binary search (`partition_point`) over `final_numbers` for O(log n)
-    /// lookup. The vector is guaranteed sorted because `reserve_finals` enforces
-    /// sequential epoch insertion. If `number` is beyond the last stored epoch,
-    /// returns `last_epoch + 1` (the current in-progress epoch).
+    /// lookup. The vector is sorted because the database's thread extends it from the stored
+    /// records, which are stored in epoch order ([`sync_routing`]). If `number` is beyond the last
+    /// stored epoch, returns `last_epoch + 1` (the current in-progress epoch).
     pub fn number_to_epoch(&self, number: u64) -> Epoch {
         let finals = self.final_numbers.lock();
         finals.partition_point(|final_num| number > *final_num) as u32
@@ -1250,6 +1242,32 @@ fn absent_to_none<T>(res: Result<T, FetchError>) -> Result<Option<T>, FetchError
     res.map(Some).or_else(|e| fetch_error_is_absent(&e).then_some(None).ok_or(e))
 }
 
+/// Roll `log` back to `to` after a failed save (see [`Pack::rewind_to`]) and flush the zeros
+/// written over the abandoned bytes: they may already be on disk (the system's writeback), and a
+/// power loss could otherwise bring the failed save back. A failed flush poisons the log, so it
+/// refuses later writes and is not sealed: the next open recovers it.
+fn rewind_after_failed_save<V>(log: &mut Pack<V>, to: u64)
+where
+    V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+{
+    if let Some(cut) = log.rewind_to(to) {
+        if let Err(e) = log.view().msync(cut.start, cut.end) {
+            error!(target: "epoch-db", %e, "failed to flush a failed save's rollback; the log refuses writes until reopened");
+            log.poison();
+        }
+    }
+}
+
+/// The error for a read of the `name` log at `pos` that the disk failed (see
+/// [`FetchError::is_read_failure`]): the log is left as it is, for a retry once the disk reads
+/// again.
+fn read_failure(name: &str, pos: u64, source: FetchError) -> EpochDbError {
+    EpochDbError::Unreadable {
+        what: format!("the {name} log at offset {pos} (a read error, not a torn tail)"),
+        source: Arc::new(source),
+    }
+}
+
 /// What is on disk about how far one log was acked, read before any index is touched: the digest
 /// index's durably synced data length (the acked end; `0` when that index cannot be opened, which
 /// attests nothing), the position index's recorded record offsets (empty when the log has no
@@ -1292,11 +1310,25 @@ struct Inner {
     /// are rolled back to these, or the close would attest records that never reached disk and
     /// the next open would refuse to truncate that unacked tail.
     committed_lens: (u64, u64),
+    /// Set by a failed save that invalidated the digest index's data-length marker (`records`,
+    /// `certs`); holds that marker at `0` for the rest of this handle's life, so neither a later
+    /// successful save nor a failed persist makes a possibly damaged index look trusted again,
+    /// and the next open rebuilds it from the log (mirrors `CertificatePack`'s
+    /// `index_invalidated`).
+    index_invalidated: (bool, bool),
+    /// Certificates already reported unreadable (see [`Self::cert_by_digest`]), so each is
+    /// reported once rather than on every read of a caller that polls for it.
+    unreadable_certs: HashSet<EpochDigest>,
     /// Test-only: when set, the next record index-save fails right after the data append, so tests
     /// can exercise the atomic rollback (mirrors ConsensusPack's `fail_save_after_append`).
     /// Consumed once.
     #[cfg(test)]
     fail_index_save_after_append: bool,
+    /// Test-only: when set, the next record save fails after indexing the record's digest and
+    /// before its epoch slot, so tests can see the digest entry a failed save leaves behind.
+    /// Consumed once.
+    #[cfg(test)]
+    fail_epoch_slot_save_after_digest: bool,
 }
 
 /// Would a writable open of a log that failed to open read-only with `error` simply initialise it?
@@ -1343,14 +1375,12 @@ impl Inner {
         }
         if !epoch_idx.is_empty() {
             let last = epoch_idx.len() as u64 - 1;
-            let decodes =
-                epoch_idx.load(last).is_ok_and(|position| records.record_size(position).is_ok());
-            if !decodes {
-                return Err(EpochDbError::CorruptLog(
-                    "sealed records log: its last indexed record does not decode; at-rest \
+            if let Err(e) = epoch_idx.load(last).and_then(|position| records.record_size(position))
+            {
+                return Err(EpochDbError::CorruptLog(format!(
+                    "sealed records log: its last indexed record does not decode ({e}); at-rest \
                      corruption, re-sync required"
-                        .to_string(),
-                ));
+                )));
             }
         }
         // A header-only log left at mmap capacity by an unclean close: nothing was ever appended,
@@ -1462,18 +1492,18 @@ impl Inner {
         record_digests: &mut HdxIndex,
         cert_digests: &mut HdxIndex,
     ) -> Result<(), EpochDbError> {
-        let consistent_end = Self::replay_records(records, epoch_idx, record_digests)?;
-        Self::drop_torn_tail(records, consistent_end, "records")?;
+        let (consistent_end, stop) = Self::replay_records(records, epoch_idx, record_digests)?;
+        Self::drop_torn_tail(records, consistent_end, stop, "records")?;
         record_digests.set_data_file_length(records.file_len());
 
-        let consistent_end = Self::replay_certs(certs, cert_digests)?;
-        Self::drop_torn_tail(certs, consistent_end, "certs")?;
+        let (consistent_end, stop) = Self::replay_certs(certs, cert_digests)?;
+        Self::drop_torn_tail(certs, consistent_end, stop, "certs")?;
         cert_digests.set_data_file_length(certs.file_len());
         Ok(())
     }
 
     /// Replay the records log into the position + record-digest indexes, returning the end of its
-    /// last fully-decoded record.
+    /// last fully-decoded record and, if a record failed to decode there, why.
     ///
     /// The position index is keyed by the record's OWN epoch (relative to the first record's
     /// epoch), not by a running ordinal: an interrupted-then-retried save can leave a duplicate
@@ -1484,15 +1514,15 @@ impl Inner {
         records: &Pack<EpochRecord>,
         epoch_idx: &mut PositionIndex<u64>,
         record_digests: &mut HdxIndex,
-    ) -> Result<u64, EpochDbError> {
+    ) -> Result<(u64, Option<FetchError>), EpochDbError> {
         let mut iter = records.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         let mut expected_slot = 0u64;
         let mut base_epoch: Option<Epoch> = None;
         let mut consistent_end = iter.logical_position();
-        loop {
+        let stop = loop {
             let pos = iter.logical_position();
             match iter.next() {
-                None => break,
+                None => break None,
                 Some(Ok(record)) => {
                     let base = *base_epoch.get_or_insert(record.epoch);
                     let slot = (record.epoch as u64).checked_sub(base as u64).ok_or_else(|| {
@@ -1536,45 +1566,49 @@ impl Inner {
                     expected_slot += 1;
                     consistent_end = iter.logical_position();
                 }
-                Some(Err(_)) => break,
+                Some(Err(e)) if e.is_read_failure() => return Err(read_failure("records", pos, e)),
+                Some(Err(e)) => break Some(e),
             }
-        }
-        Ok(consistent_end)
+        };
+        Ok((consistent_end, stop))
     }
 
     /// Replay the certs log into the cert-digest index (keyed by `EpochCertificate::epoch_hash`,
     /// the digest of the record it certifies), returning the end of its last fully-decoded
-    /// certificate.
+    /// certificate and, if a certificate failed to decode there, why.
     fn replay_certs(
         certs: &Pack<EpochCertificate>,
         cert_digests: &mut HdxIndex,
-    ) -> Result<u64, EpochDbError> {
+    ) -> Result<(u64, Option<FetchError>), EpochDbError> {
         let mut iter = certs.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         let mut consistent_end = iter.logical_position();
-        loop {
+        let stop = loop {
             let pos = iter.logical_position();
             match iter.next() {
-                None => break,
+                None => break None,
                 Some(Ok(cert)) => {
                     cert_digests
                         .save(cert.epoch_hash.into(), pos)
                         .map_err(|e| EpochDbError::IndexAppend(format!("cert digest: {e}")))?;
                     consistent_end = iter.logical_position();
                 }
-                Some(Err(_)) => break,
+                Some(Err(e)) if e.is_read_failure() => return Err(read_failure("certs", pos, e)),
+                Some(Err(e)) => break Some(e),
             }
-        }
-        Ok(consistent_end)
+        };
+        Ok((consistent_end, stop))
     }
 
     /// Roll `log` back to `consistent_end` (the end of its last fully-decoded record) when a replay
-    /// stopped short of its end. A cleanly-sealed log is complete by construction, so there a
-    /// decode failure is at-rest corruption, not an unacked torn tail: fail closed instead of
-    /// silently dropping acked records (INV4). In an unclean log the trailing record was
-    /// interrupted mid-write (unacked): drop it (INV1), logged so a truncation is never invisible.
+    /// stopped short of its end, `stop` being the decode failure it stopped at. A cleanly-sealed
+    /// log is complete by construction, so there a decode failure is at-rest corruption, not an
+    /// unacked torn tail: fail closed instead of silently dropping acked records (INV4). In an
+    /// unclean log the trailing record was interrupted mid-write (unacked): drop it (INV1), logged
+    /// so a truncation is never invisible, and flush the zeros written over it.
     fn drop_torn_tail<V>(
         log: &mut Pack<V>,
         consistent_end: u64,
+        stop: Option<FetchError>,
         name: &str,
     ) -> Result<(), EpochDbError>
     where
@@ -1583,10 +1617,11 @@ impl Inner {
         if consistent_end >= log.file_len() {
             return Ok(());
         }
+        let cause = stop.map_or_else(|| "no further record".to_string(), |e| e.to_string());
         if !log.opened_unclean() {
             return Err(EpochDbError::CorruptLog(format!(
-                "sealed {name} log stops decoding at offset {consistent_end} of {}; at-rest \
-                 corruption, re-sync required",
+                "sealed {name} log stops decoding at offset {consistent_end} of {} ({cause}); \
+                 at-rest corruption, re-sync required",
                 log.file_len()
             )));
         }
@@ -1595,15 +1630,34 @@ impl Inner {
             log = name,
             offset = consistent_end,
             bytes_dropped = log.file_len() - consistent_end,
+            %cause,
             "truncating torn tail of unclean log"
         );
-        log.rewind_to(consistent_end);
+        if let Some(cut) = log.rewind_to(consistent_end) {
+            // The unclean open's sync made the torn tail durable, and its zeros are only in the
+            // mapping: flush them now, or a power loss before writeback could bring stale records
+            // back behind the ones written next (mirrors tndb's `recover`).
+            log.view().msync(cut.start, cut.end)?;
+        }
         Ok(())
+    }
+
+    /// Does a main bucket of `index` fail its CRC (or hold writes that were never CRC'd)? A clean
+    /// open checks only the first bucket, so a bucket damaged at rest would otherwise be trusted:
+    /// its keys would not read back and a save into it would be refused, in every session, until a
+    /// crash forced a rebuild. A failed save invalidates the index for the next open (see
+    /// `index_invalidated`), but a read, or a bloom false positive that fails the idempotency
+    /// read before any append, invalidates nothing. The epoch indexes are small enough to scan on
+    /// every open.
+    fn buckets_damaged(index: &HdxIndex) -> bool {
+        let report = index.bucket_crc_scan();
+        report.corrupt + report.dirty > 0
     }
 
     /// The index-side part of [`EpochRecordDb::assess`]: `Some(why)` when [`Self::open_append`]
     /// would discard and rebuild the indexes of otherwise clean logs (one that will not open,
-    /// was not cleanly sealed, or whose tracked data length disagrees with its log).
+    /// was not cleanly sealed, whose tracked data length disagrees with its log, or with a
+    /// damaged bucket).
     fn assess_indexes(
         base_dir: &Path,
         records: &Pack<EpochRecord>,
@@ -1611,8 +1665,13 @@ impl Inner {
     ) -> Option<String> {
         let unclean_or_lagging = |name: &str, index: Result<HdxIndex, _>, log_len: u64| match index
         {
-            Ok(index) if !index.opened_unclean() && index.data_file_length() == log_len => None,
-            Ok(_) => Some(format!("{name} index was not cleanly sealed or lags its log")),
+            Ok(index) if index.opened_unclean() || index.data_file_length() != log_len => {
+                Some(format!("{name} index was not cleanly sealed or lags its log"))
+            }
+            Ok(index) if Self::buckets_damaged(&index) => {
+                Some(format!("{name} index has a bucket that fails its CRC"))
+            }
+            Ok(_) => None,
             Err(e) => Some(format!("{name} index will not open ({e})")),
         };
         let open_hdx = |dir: PathBuf, header: &DataHeader| {
@@ -1655,6 +1714,82 @@ impl Inner {
             .then(|| format!("indexes would be rebuilt from the logs: {}", why.join(", ")))
     }
 
+    /// Open one log read-only for [`EpochRecordDb::assess`]. `None` (described into `heals`) when
+    /// the writable open would create it (missing) or initialise it (empty, or sized but never
+    /// written): nothing in it to assess or to lose, unless its digest index attests records
+    /// (see [`Self::refuse_a_lost_log`]), which is refused here as the open refuses it.
+    fn assess_open<V>(
+        dir: &Path,
+        log_name: &str,
+        uid_idx: u64,
+        digest_name: &str,
+        name: &str,
+        heals: &mut Vec<String>,
+    ) -> Result<Option<Pack<V>>, EpochDbError>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let header = DataHeader::new(uid_idx, PackCompression::ZStd, EPOCH_PACK_VERSION);
+        let attested_end = Self::attested_end(&dir.join(digest_name), &header);
+        let path = dir.join(log_name);
+        if !std::fs::exists(&path)? {
+            Self::refuse_a_lost_log::<V>(None, attested_end, name)?;
+            heals.push(format!("the {name} log is missing; it would be created"));
+            return Ok(None);
+        }
+        match Pack::<V>::open(path, uid_idx, true, PackCompression::ZStd, EPOCH_PACK_VERSION) {
+            Ok(log) => {
+                Self::refuse_a_lost_log(Some(&log), attested_end, name)?;
+                Ok(Some(log))
+            }
+            Err(e) if open_would_initialise(&e) => {
+                Self::refuse_a_lost_log::<V>(None, attested_end, name)?;
+                heals.push(format!("the {name} log is empty; it would be initialised"));
+                Ok(None)
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The data length the digest index in `digest_dir` durably attests for the log whose header
+    /// is `header` (see [`AttestedLog::end`]), read with a read-only open: `0` when the index
+    /// cannot be opened, which attests nothing.
+    fn attested_end(digest_dir: &Path, header: &DataHeader) -> u64 {
+        HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
+            digest_dir,
+            header,
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .map(|index| index.data_file_length())
+        .unwrap_or(0)
+    }
+
+    /// Refuse (`CorruptLog`) a log that holds no record (`None`: missing, or one the open would
+    /// initialise) while its digest index attests acked records past the header: the log was lost
+    /// (deleted, or left out of a copy or restore), and a writable open recreates it empty.
+    /// Absent counts as corrupt, never new: rebuilding the indexes to match would drop every acked
+    /// record silently. Judged by the log's content, not by whether this open created it, so a
+    /// retry refuses the same way after the first attempt left a fresh log behind; and whatever
+    /// the index's seal state, since the attested length is synced only after the data it covers.
+    fn refuse_a_lost_log<V>(
+        log: Option<&Pack<V>>,
+        attested_end: u64,
+        name: &str,
+    ) -> Result<(), EpochDbError>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let header = DATA_HEADER_BYTES as u64;
+        if attested_end > header && !log.is_some_and(|log| log.any_content_after(header)) {
+            return Err(EpochDbError::CorruptLog(format!(
+                "the {name} log holds no record but its digest index attests {attested_end} \
+                 bytes of acked records; the log was lost, re-sync required"
+            )));
+        }
+        Ok(())
+    }
+
     /// One log's part of [`EpochRecordDb::assess`]: decode it read-only and classify it the way
     /// [`Self::open_append`] would. `digest_dir` is its digest index, whose on-disk data length
     /// attests the acked end, and `position_dir` its position index if it has one. A heal is
@@ -1671,21 +1806,21 @@ impl Inner {
     {
         let mut iter = log.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         let mut consistent_end = iter.logical_position();
-        let decodes_to_end = loop {
+        let stop = loop {
+            let pos = iter.logical_position();
             match iter.next() {
-                None => break true,
+                None => break None,
                 Some(Ok(_)) => consistent_end = iter.logical_position(),
-                Some(Err(_)) => break false,
+                Some(Err(e)) if e.is_read_failure() => return Err(read_failure(name, pos, e)),
+                Some(Err(e)) => break Some(e),
             }
         };
         drop(iter);
         if !log.opened_unclean() {
-            if decodes_to_end {
-                return Ok(());
-            }
+            let Some(cause) = stop else { return Ok(()) };
             return Err(EpochDbError::CorruptLog(format!(
-                "sealed {name} log stops decoding at offset {consistent_end} of {}; at-rest \
-                 corruption, re-sync required",
+                "sealed {name} log stops decoding at offset {consistent_end} of {} ({cause}); \
+                 at-rest corruption, re-sync required",
                 log.file_len()
             )));
         }
@@ -1704,14 +1839,7 @@ impl Inner {
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let end = HdxIndex::<32, BuildHasherDefault<FxHasher>>::open_hdx_file(
-            digest_dir,
-            log.header(),
-            BuildHasherDefault::<FxHasher>::default(),
-            true,
-        )
-        .map(|index| index.data_file_length())
-        .unwrap_or(0);
+        let end = Self::attested_end(digest_dir, log.header());
         // Read straight from the index file: a read-only open refuses an unsealed (crashed)
         // index, and a writable one would heal it, while this must attest the same offsets
         // whether the caller is the writable open or the read-only assessment.
@@ -1739,11 +1867,17 @@ impl Inner {
     /// Independently of both, a tail commit marker past the point the rebuild would keep means
     /// acked data would be dropped, even with nothing decodable after the damage and no readable
     /// index (mirrors `ConsensusPack::recover_pack`).
-    fn acked_damage_after_tear<V>(log: &Pack<V>, attested: &AttestedLog) -> bool
+    ///
+    /// A read the disk fails is an error, never a tear: the walk cannot tell what lies behind it.
+    fn acked_damage_after_tear<V>(
+        log: &Pack<V>,
+        attested: &AttestedLog,
+        name: &str,
+    ) -> Result<bool, EpochDbError>
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let Ok(mut iter) = log.raw_iter() else { return false };
+        let mut iter = log.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         let mut tear: Option<u64> = None;
         let mut last_pos = iter.logical_position();
         loop {
@@ -1752,9 +1886,12 @@ impl Inner {
                 Some(Ok(_)) => {
                     let end = iter.logical_position();
                     if tear.is_some() && end <= attested.end {
-                        return true;
+                        return Ok(true);
                     }
                     last_pos = end;
+                }
+                Some(Err(e)) if e.is_read_failure() => {
+                    return Err(read_failure(name, iter.logical_position(), e));
                 }
                 Some(Err(_)) => {
                     tear.get_or_insert(last_pos);
@@ -1769,25 +1906,37 @@ impl Inner {
         // The rebuild keeps the log up to its first undecodable record (or all of it).
         let kept_end = tear.unwrap_or(last_pos);
         if attested.committed.is_some_and(|committed| kept_end < committed) {
-            return true;
+            return Ok(true);
         }
-        let Some(tear) = tear else { return false };
-        attested
-            .offsets
-            .iter()
-            .any(|&offset| offset > tear && Self::record_decodes_within(log, offset, attested.end))
+        let Some(tear) = tear else { return Ok(false) };
+        for &offset in attested.offsets.iter().filter(|&&offset| offset > tear) {
+            if Self::record_decodes_within(log, offset, attested.end, name)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
-    /// Does the record at `offset` of `log` decode, ending within `attested_end`?
-    fn record_decodes_within<V>(log: &Pack<V>, offset: u64, attested_end: u64) -> bool
+    /// Does the record at `offset` of `log` decode, ending within `attested_end`? A read the disk
+    /// fails is an error (see [`Self::acked_damage_after_tear`]).
+    fn record_decodes_within<V>(
+        log: &Pack<V>,
+        offset: u64,
+        attested_end: u64,
+        name: &str,
+    ) -> Result<bool, EpochDbError>
     where
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
-        let Ok(mut iter) = log.raw_iter() else { return false };
+        let mut iter = log.raw_iter().map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
         if iter.set_position(offset).is_err() {
-            return false;
+            return Ok(false);
         }
-        matches!(iter.next(), Some(Ok(_))) && iter.logical_position() <= attested_end
+        match iter.next() {
+            Some(Ok(_)) => Ok(iter.logical_position() <= attested_end),
+            Some(Err(e)) if e.is_read_failure() => Err(read_failure(name, offset, e)),
+            _ => Ok(false),
+        }
     }
 
     /// Before a log's indexes are discarded and rebuilt, refuse (`CorruptLog`, nothing changed)
@@ -1804,7 +1953,7 @@ impl Inner {
         V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
     {
         let attests = attested.end > DATA_HEADER_BYTES as u64 || attested.committed.is_some();
-        if attests && Self::acked_damage_after_tear(log, attested) {
+        if attests && Self::acked_damage_after_tear(log, attested, name)? {
             return Err(EpochDbError::CorruptLog(format!(
                 "{name} log has an undecodable record followed by acked records (durably synced \
                  through offset {}); at-rest corruption of acked data, re-sync required",
@@ -1817,7 +1966,8 @@ impl Inner {
     fn open_append<P: AsRef<Path>>(path: P, start_epoch: Epoch) -> Result<Self, EpochDbError> {
         let base_dir = path.as_ref();
         let _ = create_dir_synced(base_dir);
-        let have_records = std::fs::exists(base_dir.join(Self::RECORDS_NAME)).unwrap_or_default();
+        let have_records = std::fs::exists(base_dir.join(Self::RECORDS_NAME))?;
+        let have_certs = std::fs::exists(base_dir.join(Self::CERTS_NAME))?;
 
         let mut records = Pack::<EpochRecord>::open(
             base_dir.join(Self::RECORDS_NAME),
@@ -1844,6 +1994,10 @@ impl Inner {
             Some(&base_dir.join(Self::EPOCH_POS_NAME)),
         );
         let attested_certs = Self::attested_log(&certs, &base_dir.join(Self::CERT_HASH_NAME), None);
+        // A log that holds no record beside an index that attests acked ones was lost, not new:
+        // refuse before any index is reset or stamped to the fresh length.
+        Self::refuse_a_lost_log(Some(&records), attested_records.end, "records")?;
+        Self::refuse_a_lost_log(Some(&certs), attested_certs.end, "certs")?;
 
         // Open the position + digest indexes; if any is unreadable, fall back to a fresh set and
         // force a rebuild from the data logs below rather than failing the open. A corrupt sidecar
@@ -1869,9 +2023,12 @@ impl Inner {
                 }
             };
 
+        // A freshly created log (its index attests nothing, checked above): initialise the stored
+        // data length in its digest index.
         if !have_records {
-            // Freshly created: initialise the stored data lengths in all indexes.
             record_digests.set_data_file_length(records.file_len());
+        }
+        if !have_certs {
             cert_digests.set_data_file_length(certs.file_len());
         }
 
@@ -1884,7 +2041,9 @@ impl Inner {
         // cheap `heal_*` validation runs. An empty position index beside a digest index that holds
         // records was lost (its directory removed, or recreated empty), not new: a writable open
         // creates a missing one fresh and clean, and trusting it would miss every by-epoch read
-        // (mirrors `ConsensusPack::files_consistent`).
+        // (mirrors `ConsensusPack::files_consistent`). Both digest indexes are small (an entry per
+        // epoch), so every bucket's CRC is checked, not only the first one their open checks: a
+        // clean open would otherwise trust a damaged bucket (see `buckets_damaged`).
         let must_rebuild = index_open_failed
             || records.opened_unclean()
             || certs.opened_unclean()
@@ -1893,7 +2052,9 @@ impl Inner {
             || cert_digests.opened_unclean()
             || record_digests.data_file_length() != records.file_len()
             || cert_digests.data_file_length() != certs.file_len()
-            || (epoch_idx.is_empty() && !record_digests.is_empty());
+            || (epoch_idx.is_empty() && !record_digests.is_empty())
+            || Self::buckets_damaged(&record_digests)
+            || Self::buckets_damaged(&cert_digests);
         if must_rebuild {
             // Validate before mutating: a recovery that fails must leave the state a retry needs.
             // (Already checked above when an index failed to open.)
@@ -1930,8 +2091,11 @@ impl Inner {
 
         // Derive start_epoch from the first stored record if present.
         let start_epoch = if !epoch_idx.is_empty() {
-            let pos = epoch_idx.load(0).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
-            records.fetch(pos).map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?.epoch
+            epoch_idx
+                .load(0)
+                .and_then(|pos| records.fetch(pos))
+                .map_err(EpochDbError::unreadable("the first stored record"))?
+                .epoch
         } else {
             start_epoch
         };
@@ -1948,8 +2112,12 @@ impl Inner {
             dummy_epoch0: None,
             certified_watermark: 0,
             committed_lens: (records_len, certs_len),
+            index_invalidated: (false, false),
             #[cfg(test)]
             fail_index_save_after_append: false,
+            #[cfg(test)]
+            fail_epoch_slot_save_after_digest: false,
+            unreadable_certs: HashSet::new(),
         };
         inner.seed_certified_watermark();
         Ok(inner)
@@ -1985,11 +2153,12 @@ impl Inner {
             // on every node, so a different one is divergence, refused rather than silently
             // dropped. (An epoch before the first stored one has nothing to compare against.)
             if epoch >= self.start_epoch {
-                let pos = self
+                let stored = self
                     .epoch_idx
                     .load(idx)
-                    .map_err(|e| EpochDbError::HeaderLoad(e.to_string()))?;
-                let stored = self.records.fetch(pos)?.digest();
+                    .and_then(|pos| self.records.fetch(pos))
+                    .map_err(EpochDbError::unreadable(format!("epoch {epoch}'s stored record")))?
+                    .digest();
                 let offered = record.digest();
                 if stored != offered {
                     return Err(EpochDbError::ConflictingRecord { epoch, stored, offered });
@@ -2009,7 +2178,11 @@ impl Inner {
             self.rollback_record(data_start, idx_len);
             return Err(e);
         }
-        self.record_digests.set_data_file_length(self.records.file_len());
+        // Once invalidated, the marker stays at `0` until a reopen rebuilds the index: a later
+        // successful save must not make a possibly damaged index look trusted again.
+        if !self.index_invalidated.0 {
+            self.record_digests.set_data_file_length(self.records.file_len());
+        }
         Ok(())
     }
 
@@ -2033,6 +2206,10 @@ impl Inner {
         self.record_digests
             .save(record_digest.into(), record_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("record digest: {e}")))?;
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_epoch_slot_save_after_digest) {
+            return Err(EpochDbError::IndexAppend("injected epoch slot failure".to_string()));
+        }
         self.epoch_idx
             .save(idx, record_pos)
             .map_err(|e| EpochDbError::IndexAppend(format!("epoch position: {e}")))?;
@@ -2043,16 +2220,18 @@ impl Inner {
     /// their pre-append lengths and invalidate the digest commit marker so the next open rebuilds
     /// every index from the (now-rewound) data log. `0` can never equal a real data length (it is
     /// always `>=` the pack header), so `files_consistent` always fails — same discipline as
-    /// `ConsensusPack::rollback_output`.
+    /// `ConsensusPack::rollback_output`. The invalidation is sticky (see `index_invalidated`).
     fn rollback_record(&mut self, data_start: u64, idx_len: usize) {
-        self.records.rewind_to(data_start);
+        rewind_after_failed_save(&mut self.records, data_start);
         self.epoch_idx.rewind_to_len(idx_len);
+        self.index_invalidated.0 = true;
         self.record_digests.set_data_file_length(0);
     }
 
     /// Save an [`EpochRecord`] paired with its [`EpochCertificate`].
     /// If the record is already stored, only the certificate is saved.
-    /// The certificate save is idempotent: a duplicate cert is silently skipped.
+    /// The certificate save is idempotent: a stored certificate that reads back is kept (see
+    /// [`Self::cert_stored`]).
     fn save(&mut self, record: EpochRecord, cert: EpochCertificate) -> Result<(), EpochDbError> {
         let record_digest = record.digest();
         // The cert is filed under the record's digest: refuse one that certifies another record
@@ -2067,15 +2246,14 @@ impl Inner {
         // Save the record (idempotent, atomic).
         self.save_record(record)?;
 
-        // Skip if the cert is already stored.
-        if self.cert_digests.load(record_digest.into()).is_ok() {
+        if self.cert_stored(record_digest)? {
             return Ok(());
         }
 
         self.save_cert_atomic(record_digest.into(), &cert)
     }
 
-    /// Save an [`EpochCertificate`] keyed by `digest`. Idempotent.
+    /// Save an [`EpochCertificate`] keyed by `digest`. Idempotent (see [`Self::cert_stored`]).
     fn save_certificate(
         &mut self,
         digest: EpochDigest,
@@ -2087,10 +2265,21 @@ impl Inner {
                 certified: cert.epoch_hash,
             });
         }
-        if self.cert_digests.load(digest.into()).is_ok() {
+        if self.cert_stored(digest)? {
             return Ok(());
         }
         self.save_cert_atomic(digest.into(), &cert)
+    }
+
+    /// Whether a certificate for `digest` is already stored, judged by reading it back, not by
+    /// the index alone. One that is indexed but does not read back is an error carrying the cause,
+    /// never "stored" (a save would be a silent no-op) nor "absent": a replacement appended after
+    /// it would leave the damaged certificate in the log, where an unclean reopen's rebuild
+    /// refuses to drop the acked certificates past it, so the cure is a re-sync.
+    fn cert_stored(&mut self, digest: EpochDigest) -> Result<bool, EpochDbError> {
+        self.try_cert_by_digest(digest).map(|cert| cert.is_some()).map_err(
+            EpochDbError::unreadable(format!("the stored certificate for record {digest}")),
+        )
     }
 
     /// Atomically append a certificate and index it by `key` (same rollback discipline as
@@ -2106,19 +2295,27 @@ impl Inner {
             Ok(())
         };
         if let Err(e) = append_and_index(self) {
-            self.certs.rewind_to(data_start);
+            rewind_after_failed_save(&mut self.certs, data_start);
+            self.index_invalidated.1 = true;
             self.cert_digests.set_data_file_length(0);
             return Err(e);
         }
-        self.cert_digests.set_data_file_length(self.certs.file_len());
+        if !self.index_invalidated.1 {
+            self.cert_digests.set_data_file_length(self.certs.file_len());
+        }
         Ok(())
     }
 
     /// Raw first-write-wins fetch of the record for `epoch`; collapses EVERY storage failure
-    /// into `None`. Callers that must distinguish corruption from absence use
+    /// into `None` (logged). Callers that must distinguish corruption from absence use
     /// [`Self::try_record_by_epoch`] instead.
     fn record_by_epoch(&mut self, epoch: Epoch) -> Option<EpochRecord> {
-        self.try_record_by_epoch(epoch).ok().flatten()
+        self.try_record_by_epoch(epoch)
+            .inspect_err(|e| {
+                error!(target: "epoch-db", epoch, %e, "epoch record read failed (not a miss); reporting it absent");
+            })
+            .ok()
+            .flatten()
     }
 
     /// Non-collapsing read of the record for `epoch`.
@@ -2154,19 +2351,46 @@ impl Inner {
         }
     }
 
+    /// Fetch of the record stored under `digest`; collapses every storage failure into `None`
+    /// (logged).
+    ///
+    /// An entry that resolves to no record, or to a record with another digest, is absent rather
+    /// than damage: a save that fails after indexing its digest leaves the entry behind (the
+    /// index has no removal, and the next successful save makes it durable), pointing at the end
+    /// of the log or at whatever record a later save put there.
     fn record_by_digest(&mut self, digest: EpochDigest) -> Option<EpochRecord> {
-        let pos = self.record_digests.load(digest.into()).ok()?;
-        let record = self.records.fetch(pos).ok()?;
-        // The hash index has no per-hit CRC; verify the fetched record actually hashes to the
-        // requested digest so a mis-keyed entry can't return a record for a different digest.
-        (record.digest() == digest).then_some(record)
+        let read =
+            absent_to_none(self.record_digests.load(digest.into())).and_then(|pos| match pos {
+                Some(pos) if pos < self.records.file_len() => {
+                    absent_to_none(self.records.fetch(pos))
+                }
+                _ => Ok(None),
+            });
+        match read {
+            // The hash index has no per-hit CRC; verify the fetched record actually hashes to the
+            // requested digest so a mis-keyed entry can't return a record for a different digest.
+            Ok(record) => record.filter(|record| record.digest() == digest),
+            Err(e) => {
+                error!(target: "epoch-db", %digest, %e, "epoch record read by digest failed (not a miss); reporting it absent");
+                None
+            }
+        }
     }
 
     /// Raw fetch of the certificate stored under `digest`; collapses EVERY storage failure
-    /// into `None`. Callers that must distinguish corruption from absence use
+    /// into `None` (logged once per certificate: waiting never makes it readable, and a caller
+    /// may poll). Callers that must distinguish corruption from absence use
     /// [`Self::try_cert_by_digest`] instead.
     fn cert_by_digest(&mut self, digest: EpochDigest) -> Option<EpochCertificate> {
-        self.try_cert_by_digest(digest).ok().flatten()
+        match self.try_cert_by_digest(digest) {
+            Ok(cert) => cert,
+            Err(e) => {
+                if self.unreadable_certs.insert(digest) {
+                    error!(target: "epoch-db", %digest, %e, "epoch certificate read failed (not a miss); reporting it absent");
+                }
+                None
+            }
+        }
     }
 
     /// Non-collapsing read of the certificate stored under `digest`; same absence semantics as
@@ -2212,12 +2436,11 @@ impl Inner {
         }
     }
 
+    /// Whether a record with `digest` is stored: read back and verified like
+    /// [`Self::record_by_digest`], since the digest index alone can hold an entry a failed save
+    /// left behind.
     fn contains_record_digest(&mut self, digest: EpochDigest) -> bool {
-        if let Ok(pos) = self.record_digests.load(digest.into()) {
-            pos < self.records.file_len()
-        } else {
-            false
-        }
+        self.record_by_digest(digest).is_some()
     }
 
     fn latest_record(&mut self) -> Option<EpochRecord> {
@@ -2229,13 +2452,15 @@ impl Inner {
         }
     }
 
-    /// True if `epoch` has both a stored record and a stored certificate for that record.
+    /// True if `epoch` has both a stored record and a stored certificate for that record, each
+    /// read back: a certificate that is indexed but does not read back does not count, so the
+    /// certified watermark stops at it.
     ///
     /// The epoch-0 dummy record deliberately fails this check: it exists only to let the chain
     /// start and never has a certificate.
     fn epoch_certified(&mut self, epoch: Epoch) -> bool {
         self.record_by_epoch(epoch)
-            .is_some_and(|record| self.cert_digests.load(record.digest().into()).is_ok())
+            .is_some_and(|record| self.cert_by_digest(record.digest()).is_some())
     }
 
     /// Return the first epoch in `0..tip_epoch` without a stored record + certificate pair, or
@@ -2285,9 +2510,14 @@ impl Inner {
         let committed = self.records.commit().and_then(|()| self.certs.commit());
         if let Err(e) = committed {
             // The data past the last successful commit is of unknown durability: pull the digest
-            // markers back to it so a close cannot attest that tail (see `committed_lens`).
-            self.record_digests.set_data_file_length(self.committed_lens.0);
-            self.cert_digests.set_data_file_length(self.committed_lens.1);
+            // markers back to it so a close cannot attest that tail (see `committed_lens`). An
+            // invalidated marker stays at `0`.
+            if !self.index_invalidated.0 {
+                self.record_digests.set_data_file_length(self.committed_lens.0);
+            }
+            if !self.index_invalidated.1 {
+                self.cert_digests.set_data_file_length(self.committed_lens.1);
+            }
             return Err(EpochDbError::PersistError(e.to_string()));
         }
         self.committed_lens = (self.records.file_len(), self.certs.file_len());
@@ -2317,6 +2547,13 @@ pub enum EpochDbError {
     IndexAppend(String),
     /// Failed to open a data file or one of its indexes.
     Open(Arc<OpenError>),
+    /// A stored entry did not read back: a storage failure, not a miss.
+    Unreadable {
+        /// The entry that was read, e.g. an epoch's record.
+        what: String,
+        /// Why it did not read back.
+        source: Arc<FetchError>,
+    },
     /// A record for this epoch was already saved.
     EpochAlreadySaved,
     /// Epoch records must be saved in order (expected, got).
@@ -2364,6 +2601,73 @@ pub enum EpochDbError {
 
 impl Error for EpochDbError {}
 
+impl EpochDbError {
+    /// Map a read failure of `what` (e.g. "epoch 7's record") to [`Self::Unreadable`].
+    fn unreadable(what: impl Into<String>) -> impl FnOnce(FetchError) -> Self {
+        let what = what.into();
+        move |source| Self::Unreadable { what, source: Arc::new(source) }
+    }
+
+    /// Whether this is our own epoch store failing rather than a record or certificate it
+    /// refused. A save or persist that fails locally stops the node for operator intervention
+    /// (`manage_epoch_votes`, `collect_epoch_records`); a refusal must not, because what it
+    /// refuses can be a peer's, and stopping on it would hand peers a kill switch.
+    ///
+    /// Local: the IO, open, append, index, read-back, persist, corruption and background-thread
+    /// variants. They describe this node's files or actor, which no input reaches: a peer's
+    /// record is validated and then written like our own, so a failed append, a stored entry
+    /// that does not read back or a dead actor is the disk or the process, never the record.
+    ///
+    /// Not local:
+    /// - `ConflictingRecord`, `CertificateMismatch`, `EpochOutOfOrder`, `EpochAlreadySaved`: the
+    ///   store is intact and declined the write. On the sync and recovery paths the offered record
+    ///   or certificate is a peer's (a different record for a stored epoch, a certificate for
+    ///   another record, a record past the next slot).
+    /// - `MissingRecord`, `MissingCertificate`: raised only by the bundle export, for an epoch not
+    ///   yet certified to us (a failed vote quorum leaves its certificate for peers to supply).
+    ///   Absence is not a failed write, and reads report a failure as absent, so these prove
+    ///   nothing about the disk.
+    /// - `BundleValidation`: the incremental export's check of the previous bundle, a derived copy;
+    ///   on failure the export rebuilds the bundle from the store.
+    ///
+    /// The `match` has no catch-all, so a new variant has to be classified here.
+    pub fn is_local_storage_failure(&self) -> bool {
+        match self {
+            Self::IO(_)
+            | Self::HeaderLoad(_)
+            | Self::Append(_)
+            | Self::IndexAppend(_)
+            | Self::Open(_)
+            | Self::Unreadable { .. }
+            | Self::SendFailed
+            | Self::ReceiveFailed
+            | Self::PersistError(_)
+            | Self::CorruptDb
+            | Self::CorruptLog(_)
+            | Self::JoinError => true,
+            Self::ConflictingRecord { .. }
+            | Self::CertificateMismatch { .. }
+            | Self::EpochOutOfOrder(..)
+            | Self::EpochAlreadySaved
+            | Self::MissingRecord(_)
+            | Self::MissingCertificate(_)
+            | Self::BundleValidation(_) => false,
+        }
+    }
+
+    /// Split a failed epoch-store save by [`Self::is_local_storage_failure`]: our own store
+    /// failing is returned with `what` as its context, so the caller's task ends with an error
+    /// that stops the node; a refused record or certificate is only logged, because it can be a
+    /// peer's and must never stop the node.
+    pub fn stop_on_local_failure(self, what: String) -> eyre::Result<()> {
+        if self.is_local_storage_failure() {
+            return Err(eyre::Report::new(self).wrap_err(what));
+        }
+        error!(target: "epoch-manager", e = ?self, "{what}");
+        Ok(())
+    }
+}
+
 impl Display for EpochDbError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -2372,6 +2676,9 @@ impl Display for EpochDbError {
             EpochDbError::Append(e) => write!(f, "Data append error ({e})"),
             EpochDbError::IndexAppend(e) => write!(f, "Index append error ({e})"),
             EpochDbError::Open(e) => write!(f, "Open error: {e}"),
+            EpochDbError::Unreadable { what, source } => {
+                write!(f, "{what} does not read back: {source}")
+            }
             EpochDbError::EpochAlreadySaved => write!(f, "Epoch record already saved"),
             EpochDbError::EpochOutOfOrder(expected, got) => {
                 write!(f, "Epochs must be saved in order; expected {expected}, got {got}")
@@ -2406,12 +2713,6 @@ impl Display for EpochDbError {
 impl From<OpenError> for EpochDbError {
     fn from(value: OpenError) -> Self {
         Self::Open(Arc::new(value))
-    }
-}
-
-impl From<FetchError> for EpochDbError {
-    fn from(value: FetchError) -> Self {
-        Self::HeaderLoad(value.to_string())
     }
 }
 
@@ -2561,7 +2862,9 @@ mod test {
     use std::{
         collections::BTreeSet,
         fs::OpenOptions,
+        hash::BuildHasherDefault,
         io::{Seek as _, SeekFrom},
+        os::unix::fs::FileExt as _,
         path::Path,
         sync::Arc,
     };
@@ -2577,7 +2880,9 @@ mod test {
 
     use crate::{
         archive::{
-            pack::{Pack, PackCompression, DATA_HEADER_BYTES},
+            digest_index::HdxIndex,
+            fxhasher::FxHasher,
+            pack::{DataHeader, Pack, PackCompression, DATA_HEADER_BYTES},
             position_index::index::PositionIndex,
         },
         epoch_records::{
@@ -2720,8 +3025,8 @@ mod test {
         let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
         let other_writer = db.clone();
 
-        // Writes the actor rejects (epochs 5 and 7 are out of order on an empty db), sent past the
-        // handle-side ordering guard so the actor's own verdict is what reaches the caller.
+        // Writes the actor rejects (epochs 5 and 7 are out of order on an empty db), sent straight
+        // to the actor, whose own verdict is what reaches the caller.
         let rejected = |epoch| {
             let db = db.clone();
             async move {
@@ -2746,6 +3051,127 @@ mod test {
         assert_eq!(db.record_by_epoch(0).await.map(|r| r.digest()), Some(record.digest()));
         assert!(db.record_by_epoch(5).await.is_none(), "a rejected write is not stored");
         db.close().await;
+    }
+
+    /// A save the database refuses never drops the by-number routing of a record another writer
+    /// stored for the same epoch: with epoch 0 stored, a save of epoch 1 with a certificate for
+    /// another record (refused) races a plain save of epoch 1 (stored), and afterwards epoch 1's
+    /// numbers, and only those, route to epoch 1.
+    #[tokio::test]
+    async fn a_refused_save_does_not_drop_a_stored_epochs_routing() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("refused_save_routing").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (record0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        db.save(record0.clone(), cert0).await.expect("save epoch 0");
+        let (record1, _) = make_test_pair(1, &signers, record0.digest());
+        let (_, foreign_cert) = make_test_pair(2, &signers, record1.digest());
+
+        let (refused, stored) =
+            tokio::join!(db.save(record1.clone(), foreign_cert), db.save_record(record1.clone()));
+        assert!(
+            matches!(refused, Err(EpochDbError::CertificateMismatch { .. })),
+            "got {refused:?}"
+        );
+        stored.expect("the plain save of epoch 1 is stored");
+        assert_eq!(db.record_by_epoch(1).await.map(|r| r.digest()), Some(record1.digest()));
+
+        let final1 = record1.final_consensus.number;
+        assert_eq!(*db.final_numbers.lock(), vec![record0.final_consensus.number, final1]);
+        assert_eq!(db.number_to_epoch(final1), 1, "epoch 1's last number");
+        assert_eq!(db.number_to_epoch(final1 + 1), 2, "past epoch 1: the next epoch");
+        db.close().await;
+    }
+
+    /// By-number routing follows exactly the records stored: a refused out-of-order save adds no
+    /// entry, re-saving a stored record adds none, and a reopen rebuilds the same routing.
+    #[tokio::test]
+    async fn routing_follows_the_stored_records() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let temp_dir = TempDir::with_prefix("routing_follows_records").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+        let (record0, cert0) = make_test_pair(0, &signers, EpochDigest::default());
+        let (record1, cert1) = make_test_pair(1, &signers, record0.digest());
+        let (record3, _) = make_test_pair(3, &signers, EpochDigest::default());
+        db.save(record0.clone(), cert0).await.expect("save epoch 0");
+        db.save(record1.clone(), cert1).await.expect("save epoch 1");
+        let routing = vec![record0.final_consensus.number, record1.final_consensus.number];
+        assert_eq!(*db.final_numbers.lock(), routing);
+
+        let gap = db.save_record(record3).await.expect_err("epoch 3 skips epoch 2");
+        assert!(matches!(gap, EpochDbError::EpochOutOfOrder(2, 3)), "got {gap:?}");
+        db.save_record(record1.clone()).await.expect("re-saving a stored record");
+        assert_eq!(*db.final_numbers.lock(), routing, "neither adds an entry");
+
+        db.persist().await.expect("persist");
+        db.close().await;
+        let reopened = EpochRecordDb::open(temp_dir.path()).expect("reopen db");
+        assert_eq!(*reopened.final_numbers.lock(), routing, "rebuilt from the stored records");
+        reopened.close().await;
+    }
+
+    /// A save that stores its record and then fails on the certificate (here a certificates log
+    /// that refuses appends) still routes the record, so the next epoch's save leaves no gap: the
+    /// routing stays sorted and every number reaches its epoch, wherever the failure lands.
+    #[tokio::test]
+    async fn a_record_stored_by_a_failed_save_is_still_routed() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        for k in [3_u32, 5, 11] {
+            let dir = TempDir::with_prefix("failed_save_routing").expect("temp dir");
+            let mut parent = EpochDigest::default();
+            let pairs: Vec<_> = (0..k + 2)
+                .map(|epoch| {
+                    let pair = make_test_pair(epoch, &signers, parent);
+                    parent = pair.0.digest();
+                    pair
+                })
+                .collect();
+            {
+                let db = EpochRecordDb::open(dir.path()).expect("open db");
+                for (record, cert) in pairs[..k as usize].iter().cloned() {
+                    db.save(record, cert).await.expect("save");
+                }
+                db.persist().await.expect("persist");
+                db.close().await;
+            }
+            // Reopen with the certificates log refusing appends.
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open");
+            inner.certs.fail_next_append_for_test();
+            let finals: Vec<u64> = pairs[..k as usize]
+                .iter()
+                .map(|(record, _)| record.final_consensus.number)
+                .collect();
+            let (tx, rx) = tokio::sync::mpsc::channel(1000);
+            let final_numbers = Arc::new(parking_lot::Mutex::new(finals));
+            let routing = final_numbers.clone();
+            let handle = std::thread::spawn(move || super::run_db_loop(inner, rx, routing));
+            let db = EpochRecordDb {
+                tx,
+                handle: Arc::new(parking_lot::Mutex::new(Some(handle))),
+                final_numbers,
+                dead_logged: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+
+            let (record_k, cert_k) = pairs[k as usize].clone();
+            db.save(record_k.clone(), cert_k).await.expect_err("the certificate append fails");
+            assert!(db.contains_epoch(k).await, "k={k}: the record is stored despite the error");
+            // Routed at once, not only at the next save: a number past epoch k's last is k + 1's.
+            let past_k = record_k.final_consensus.number + 1;
+            assert_eq!(db.number_to_epoch(past_k), k + 1, "k={k}: routed by the failed save");
+            db.save_record(pairs[k as usize + 1].0.clone()).await.expect("the next epoch's record");
+
+            let finals = db.final_numbers.lock().clone();
+            assert!(finals.windows(2).all(|w| w[0] <= w[1]), "k={k}: sorted routing {finals:?}");
+            assert_eq!(finals.len(), k as usize + 2, "k={k}: both new epochs routed");
+            for (epoch, (record, _)) in pairs.iter().enumerate() {
+                let last = record.final_consensus.number;
+                assert_eq!(db.number_to_epoch(last), epoch as Epoch, "k={k}: epoch {epoch}");
+            }
+            db.close().await;
+        }
     }
 
     #[test]
@@ -2873,6 +3299,61 @@ mod test {
         // The record-absent case in `export_bounded_bundle` uses `MissingRecord`, not the
         // misleading `EpochOutOfOrder` ("Epochs must be saved in order...").
         assert_eq!(EpochDbError::MissingRecord(5).to_string(), "Missing record for epoch 5");
+    }
+
+    /// Our own store failing is local (the node stops); a refused write, an epoch not yet
+    /// certified to us and a stale export bundle are not.
+    #[test]
+    fn local_storage_failures_are_classified() {
+        let digest = EpochDigest::default();
+        let local = [
+            EpochDbError::IO(Arc::new(std::io::Error::other("disk"))),
+            EpochDbError::HeaderLoad("header".into()),
+            EpochDbError::Append("append".into()),
+            EpochDbError::IndexAppend("index".into()),
+            EpochDbError::Open(Arc::new(crate::archive::error::open::OpenError::InvalidFiles)),
+            EpochDbError::Unreadable {
+                what: "epoch 1's record".into(),
+                source: Arc::new(crate::archive::error::fetch::FetchError::CrcFailed),
+            },
+            EpochDbError::SendFailed,
+            EpochDbError::ReceiveFailed,
+            EpochDbError::PersistError("msync".into()),
+            EpochDbError::CorruptDb,
+            EpochDbError::CorruptLog("gap".into()),
+            EpochDbError::JoinError,
+        ];
+        for err in &local {
+            assert!(err.is_local_storage_failure(), "{err}: our own store failing is local");
+        }
+        let refused = [
+            EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest },
+            EpochDbError::CertificateMismatch { record: digest, certified: digest },
+            EpochDbError::EpochOutOfOrder(1, 3),
+            EpochDbError::EpochAlreadySaved,
+        ];
+        for err in &refused {
+            assert!(!err.is_local_storage_failure(), "{err}: a refused write is not local");
+        }
+        for err in [EpochDbError::MissingRecord(1), EpochDbError::MissingCertificate(1)] {
+            assert!(!err.is_local_storage_failure(), "{err}: an absent epoch is not local");
+        }
+        let bundle = EpochDbError::BundleValidation("stale".into());
+        assert!(!bundle.is_local_storage_failure(), "the export rebuilds a stale bundle");
+    }
+
+    /// The split behind every epoch-store save on the vote and record-sync paths: our own store
+    /// failing is returned (the node stops), a refused record or certificate, which a peer can
+    /// send, is only logged.
+    #[test]
+    fn only_local_store_failures_stop_the_node() {
+        let digest = EpochDigest::default();
+        let refused = EpochDbError::ConflictingRecord { epoch: 1, stored: digest, offered: digest };
+        assert!(refused.stop_on_local_failure("refused".into()).is_ok());
+        let err = EpochDbError::SendFailed
+            .stop_on_local_failure("failed to save".into())
+            .expect_err("a dead epoch store is local");
+        assert!(format!("{err:#}").contains("failed to save"), "unexpected error: {err:#}");
     }
 
     #[tokio::test]
@@ -3231,6 +3712,7 @@ mod test {
         let err = EpochRecordDb::open(temp_dir.path())
             .expect_err("open must fail closed on sealed-log corruption");
         assert!(matches!(err, EpochDbError::CorruptLog(_)), "expected CorruptLog, got {err:?}");
+        assert!(err.to_string().contains("crc32 mismatch"), "the decode cause is kept: {err}");
     }
 
     #[tokio::test]
@@ -3572,12 +4054,12 @@ mod test {
         bytes[last_at as usize + 8] ^= 0xFF;
         std::fs::write(&path, &bytes).expect("write records log");
 
-        assert!(
-            matches!(EpochRecordDb::assess(dir.path()), Err(EpochDbError::CorruptLog(_))),
-            "the read-only assessment must predict the refusal"
-        );
+        let err = EpochRecordDb::assess(dir.path()).expect_err("the dry run predicts the refusal");
+        assert!(matches!(err, EpochDbError::CorruptLog(_)), "got {err:?}");
+        assert!(err.to_string().contains("crc32 mismatch"), "the dry run keeps the cause: {err}");
         let err = EpochRecordDb::open(dir.path()).expect_err("a sealed log is never trimmed");
         assert!(matches!(err, EpochDbError::CorruptLog(_)), "got {err:?}");
+        assert!(err.to_string().contains("crc32 mismatch"), "the open keeps the cause: {err}");
         assert_eq!(std::fs::read(&path).expect("read records log"), bytes, "log rewritten");
     }
 
@@ -3629,8 +4111,13 @@ mod test {
         inner.save_record(record3.clone()).expect("retry save 3");
         assert_eq!(inner.epoch_idx.len(), 4);
         assert_eq!(inner.record_by_epoch(3).expect("record 3").digest(), record3.digest());
+        // The failed save's invalidation holds until a reopen rebuilds the index: the retry must
+        // not make it look trusted again.
+        assert_eq!(inner.record_digests.data_file_length(), 0, "the retry re-stamped the marker");
         inner.persist().expect("persist");
         drop(inner); // clean close (seals)
+        let what = EpochRecordDb::assess(dir.path()).expect("assess").expect("a rebuild");
+        assert!(what.contains("record-digest"), "{what}");
 
         // Exactly four records — the failed attempt left no orphan and the retry no duplicate.
         let records = EpochRecordDb::read_records_from_pack(dir.path().join(RECORDS_NAME))
@@ -3872,6 +4359,172 @@ mod test {
         let err =
             inner.try_cert_by_digest(cert0.epoch_hash).expect_err("mis-keyed cert slot must error");
         assert!(matches!(err, FetchError::CorruptIndex(_)), "unexpected error: {err:?}");
+    }
+
+    /// A stored certificate that no longer reads back (a payload byte flipped at rest in the sealed
+    /// certificates log, which a clean open never decodes) is not certified and not "already
+    /// stored": the certified prefix stops at it, a re-save reports the cause instead of a no-op
+    /// `Ok` and appends nothing, and the reads report it as designed (absent through the raw
+    /// reads, a storage error through the certified one).
+    #[tokio::test]
+    async fn test_unreadable_stored_certificate_is_reported_not_skipped() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_unreadable_cert").expect("temp dir");
+        let chain = make_chain4(&signers);
+        let (damaged_at, certs_len) = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            for (record, cert) in chain.iter().cloned() {
+                inner.save(record, cert).expect("save");
+            }
+            inner.persist().expect("persist");
+            let at = inner.cert_digests.load(chain[1].0.digest().into()).expect("cert 1 offset");
+            let len = inner.certs.file_len();
+            drop(inner); // clean close: sealed logs and indexes
+            (at, len)
+        };
+        let path = dir.path().join(CERTS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read certs log");
+        bytes[damaged_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write certs log");
+
+        let db = EpochRecordDb::open(dir.path()).expect("a clean open decodes no certificate");
+        let (record1, cert1) = chain[1].clone();
+        let digest1 = record1.digest();
+        assert_eq!(db.first_missing_historical_cert(4).await, Some(1), "not certified");
+
+        let err = db.save(record1.clone(), cert1.clone()).await.expect_err("re-save with record");
+        assert!(matches!(err, EpochDbError::Unreadable { .. }), "got {err:?}");
+        assert!(err.to_string().contains("crc32 mismatch"), "the cause is reported: {err}");
+        let err = db.save_certificate(digest1, cert1).await.expect_err("re-save alone");
+        assert!(matches!(err, EpochDbError::Unreadable { .. }), "got {err:?}");
+
+        assert!(db.cert_by_digest(digest1).await.is_none());
+        let (record, cert) = db.get_epoch_by_number(1).await.expect("epoch 1's record");
+        assert_eq!(record.digest(), digest1);
+        assert!(cert.is_none(), "the raw read reports the certificate absent");
+        assert!(matches!(db.get_epoch_by_hash(digest1).await, Some((_, None))));
+        let err = db.certified_record_by_epoch(1).await.expect_err("the certified read refuses");
+        assert_eq!(err, CertifiedRecordError::Storage(1));
+        assert!(db.cert_by_digest(chain[2].0.digest()).await.is_some(), "its neighbour reads");
+        db.close().await;
+
+        let inner = Inner::open_append(dir.path(), 0).expect("reopen");
+        assert_eq!(inner.certs.file_len(), certs_len, "no replacement was appended");
+    }
+
+    /// A certificate that no longer reads back is reported once, not on every read: a caller that
+    /// polls for one (the epoch-close export waits up to 90 s, every 200 ms) would otherwise log
+    /// the same failure hundreds of times, and waiting never makes it readable.
+    #[test]
+    fn test_unreadable_certificate_is_logged_once() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_unreadable_cert_once").expect("temp dir");
+        let chain = make_chain4(&signers);
+        let damaged_at = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            for (record, cert) in chain.iter().cloned() {
+                inner.save(record, cert).expect("save");
+            }
+            inner.persist().expect("persist");
+            inner.cert_digests.load(chain[1].0.digest().into()).expect("cert 1 offset")
+        };
+        let path = dir.path().join(CERTS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read certs log");
+        bytes[damaged_at as usize + 8] ^= 0xFF;
+        std::fs::write(&path, &bytes).expect("write certs log");
+
+        let digest1 = chain[1].0.digest();
+        let ((), levels) = crate::consensus_pack::test::warnings_and_errors(|| {
+            // The open reads the certificates too (the certified watermark).
+            let mut inner = Inner::open_append(dir.path(), 0).expect("reopen");
+            for _ in 0..5 {
+                assert!(inner.cert_by_digest(digest1).is_none(), "reported absent");
+            }
+        });
+        let errors = levels.iter().filter(|level| **level == tracing::Level::ERROR).count();
+        assert_eq!(errors, 1, "one error for the open and five reads: {levels:?}");
+    }
+
+    /// A save that fails after indexing its record's digest and before its epoch slot leaves that
+    /// digest entry behind (the index has no removal, and the next successful save makes it
+    /// durable). The record was never stored, so `contains_record_digest` must say so once
+    /// another record holds the failed save's offset, and after a reopen.
+    #[test]
+    fn test_failed_save_leaves_no_false_record_digest() {
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_stale_digest").expect("temp dir");
+        let [(r0, _), (r1, _), (r2, _), (r3, _)] = make_chain4(&signers);
+        let failed = sentinel_copy(&r3, 999);
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            for record in [r0, r1, r2] {
+                inner.save_record(record).expect("save");
+            }
+            inner.fail_epoch_slot_save_after_digest = true;
+            inner.save_record(failed.clone()).expect_err("the epoch slot save fails");
+            inner.save_record(r3.clone()).expect("epoch 3, at the failed save's offset");
+            assert!(inner.contains_record_digest(r3.digest()));
+            assert!(!inner.contains_record_digest(failed.digest()), "never stored");
+            inner.persist().expect("persist");
+        }
+        let mut inner = Inner::open_append(dir.path(), 0).expect("reopen");
+        assert!(!inner.contains_record_digest(failed.digest()), "nor after a reopen");
+        assert!(inner.contains_record_digest(r3.digest()));
+    }
+
+    /// A clean open checks only that the last record decodes, so a record damaged at rest before it
+    /// is first met building the by-number routing: the open refuses, naming the epoch and the
+    /// cause.
+    #[test]
+    fn test_open_names_the_epoch_whose_record_does_not_read_back() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_open_names_epoch").expect("temp dir");
+        let damaged_at = {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            for (record, cert) in make_chain4(&signers) {
+                inner.save(record, cert).expect("save");
+            }
+            inner.persist().expect("persist");
+            let pos = inner.epoch_idx.load(1).expect("epoch 1 offset");
+            drop(inner); // clean close: sealed logs and indexes
+            pos
+        };
+        damage_record(dir.path(), damaged_at);
+        let err = EpochRecordDb::open(dir.path()).expect_err("an unreadable record fails the open");
+        let msg = err.to_string();
+        assert!(msg.contains("epoch 1") && msg.contains("crc32 mismatch"), "got: {msg}");
+    }
+
+    /// The open builds the by-number routing with the same checked read as `sync_routing`: a
+    /// position-index slot that resolves to another epoch's record is refused, naming the epoch,
+    /// rather than leaving that epoch unrouted.
+    #[test]
+    fn test_open_refuses_a_mis_keyed_epoch_slot() {
+        use crate::archive::index::Index as _;
+        let mut rng = StdRng::from_os_rng();
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let dir = TempDir::with_prefix("epoch_open_miskey").expect("temp dir");
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            let [(r0, _), (r1, _), (r2, _), _] = make_chain4(&signers);
+            for record in [r0, r1, r2] {
+                inner.save_record(record).expect("save");
+            }
+            // Point epoch 2's slot at epoch 0's record.
+            let pos_of_0 = inner.epoch_idx.load(0).expect("load slot 0");
+            inner.epoch_idx.rewind_to_len(2);
+            inner.epoch_idx.save(2, pos_of_0).expect("overwrite slot 2");
+            inner.persist().expect("persist");
+        }
+        let err = EpochRecordDb::open(dir.path()).expect_err("a mis-keyed slot fails the open");
+        assert!(err.to_string().contains("epoch 2"), "names the epoch: {err}");
     }
 
     /// After an unclean reopen of a DB that has records but no certs, the header-only
@@ -4758,6 +5411,27 @@ mod test {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn certified_record_with_timeout_ends_at_a_deadline_inside_one_poll_interval() {
+        // The certified poll clamps its sleep to the deadline too, so a timeout shorter than the
+        // 200ms poll interval ends with a lookup at the deadline, not a full interval later.
+        let temp_dir = TempDir::with_prefix("certified_timeout_short").expect("temp dir");
+        let db = EpochRecordDb::open(temp_dir.path()).expect("open db");
+
+        let start = tokio::time::Instant::now();
+        let err = db
+            .certified_record_by_epoch_with_timeout(0, std::time::Duration::from_millis(50))
+            .await
+            .expect_err("nothing is stored");
+        let waited = start.elapsed();
+        assert_eq!(err, CertifiedRecordError::MissingRecord(0));
+        assert!(
+            waited < std::time::Duration::from_millis(200),
+            "a 50ms timeout must not sleep a full poll interval, waited {waited:?}"
+        );
+        db.close().await;
+    }
+
     #[tokio::test]
     async fn export_bounded_bundle_writes_exactly_through_epoch() {
         // The bundle must hold records + certs for exactly 0..=N and round-trip through the bare
@@ -5134,5 +5808,389 @@ mod test {
             "wronglast",
         )
         .await;
+    }
+
+    /// A chain of `count` record and certificate pairs from epoch 0.
+    fn make_chain(count: u32, signers: &[TestSigner]) -> Vec<(EpochRecord, EpochCertificate)> {
+        let mut parent = EpochDigest::default();
+        (0..count)
+            .map(|epoch| {
+                let pair = make_test_pair(epoch, signers, parent);
+                parent = pair.0.digest();
+                pair
+            })
+            .collect()
+    }
+
+    /// Open the digest index directory `index` under `dir` read-only, beside the log tagged
+    /// `uid_idx`.
+    fn open_digest_index(dir: &Path, index: &str, uid_idx: u64) -> HdxIndex {
+        HdxIndex::open_hdx_file(
+            dir.join(index),
+            &DataHeader::new(uid_idx, PackCompression::ZStd, EPOCH_PACK_VERSION),
+            BuildHasherDefault::<FxHasher>::default(),
+            true,
+        )
+        .expect("open the digest index read-only")
+    }
+
+    /// Toggle one payload byte in every main bucket but the first (the one the open CRC-checks)
+    /// of the digest index `index` under `dir`, leaving the buckets' CRCs stale; a second call
+    /// restores them. It writes through the file, so a handle with the index mapped sees it too.
+    fn toggle_digest_buckets(dir: &Path, index: &str) {
+        // An `index.hdx` is a 68-byte header, the bloom, then the main buckets: 1,000 at
+        // creation, `16 + (32 + 8) * 32` bytes each for 32-byte keys.
+        const HEADER: u64 = 68;
+        const BUCKET: u64 = 16 + (32 + 8) * 32;
+        let first = HEADER + crate::archive::digest_index::bloom::BLOOM_SIZE_BYTES as u64;
+        let path = dir.join(index).join("index.hdx");
+        for bucket in 1..1_000 {
+            toggle_byte(&path, first + bucket * BUCKET + 12);
+        }
+    }
+
+    /// Flip every bit of the byte at `at` in the file at `path`.
+    fn toggle_byte(path: &Path, at: u64) {
+        let file = OpenOptions::new().read(true).write(true).open(path).expect("open");
+        let mut byte = [0_u8];
+        file.read_exact_at(&mut byte, at).expect("read a byte");
+        file.write_all_at(&[byte[0] ^ 0xFF], at).expect("write a byte");
+    }
+
+    /// A digest-index bucket damaged at rest, past the first bucket the open checks, must not be
+    /// trusted by a clean open: the keys in it would not read back, and a save into it would be
+    /// refused in every session. The dry run predicts the rebuild, and the open rebuilds the
+    /// indexes from the logs.
+    #[tokio::test]
+    async fn test_damaged_digest_bucket_rebuilds_the_index() {
+        let mut rng = StdRng::seed_from_u64(11);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let pairs = make_chain(4, &signers);
+        for (index, uid_idx) in [
+            (Inner::RECORD_HASH_NAME, Inner::PACK_EPOCH),
+            (Inner::CERT_HASH_NAME, Inner::CERT_PACK_EPOCH),
+        ] {
+            let dir = TempDir::with_prefix("epoch_damaged_bucket").expect("temp dir");
+            {
+                let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+                for (record, cert) in &pairs {
+                    inner.save(record.clone(), cert.clone()).expect("save");
+                }
+                inner.persist().expect("persist");
+            }
+            toggle_digest_buckets(dir.path(), index);
+            assert_eq!(
+                open_digest_index(dir.path(), index, uid_idx).bucket_crc_scan().corrupt,
+                999,
+                "{index}: every bucket but the first is damaged"
+            );
+
+            let what = EpochRecordDb::assess(dir.path()).expect("assess").expect("a rebuild");
+            assert!(what.contains("fails its CRC"), "{index}: {what}");
+            let db = EpochRecordDb::open(dir.path()).expect("the open rebuilds the index");
+            for (record, _) in &pairs {
+                let epoch = record.epoch;
+                assert!(
+                    db.contains_record_digest(record.digest()).await,
+                    "{index}: record {epoch}"
+                );
+                assert!(
+                    db.cert_by_digest(record.digest()).await.is_some(),
+                    "{index}: cert {epoch}"
+                );
+            }
+            db.close().await;
+            assert_eq!(EpochRecordDb::assess(dir.path()).expect("assess"), None, "{index}: healed");
+        }
+    }
+
+    /// A certificate save that a damaged digest-index bucket refuses invalidates that index until
+    /// a reopen rebuilds it. A later successful save must not re-stamp its marker: the close
+    /// would then seal the damaged index as trusted, and the refused certificate could never be
+    /// stored.
+    #[test]
+    fn test_failed_cert_save_keeps_the_index_invalidated_until_reopen() {
+        let mut rng = StdRng::seed_from_u64(12);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let pairs = make_chain(6, &signers);
+        let dir = TempDir::with_prefix("epoch_cert_invalidated").expect("temp dir");
+        {
+            let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+            for (record, cert) in &pairs[..4] {
+                inner.save(record.clone(), cert.clone()).expect("save");
+            }
+            inner.persist().expect("persist");
+        }
+        let mut inner = Inner::open_append(dir.path(), 0).expect("clean reopen");
+        // Damage the buckets under the open handle (its mapping shares the file's pages).
+        toggle_digest_buckets(dir.path(), Inner::CERT_HASH_NAME);
+        let (record4, cert4) = pairs[4].clone();
+        let err = inner.save(record4.clone(), cert4.clone()).expect_err("a damaged bucket refuses");
+        assert!(matches!(err, EpochDbError::IndexAppend(_)), "{err:?}");
+        toggle_digest_buckets(dir.path(), Inner::CERT_HASH_NAME);
+        let (record5, cert5) = pairs[5].clone();
+        inner.save(record5, cert5).expect("a later save succeeds");
+        assert_eq!(inner.cert_digests.data_file_length(), 0, "a later save re-stamped the marker");
+        inner.persist().expect("persist");
+        drop(inner); // clean close: seals the index with its marker
+
+        let index = open_digest_index(dir.path(), Inner::CERT_HASH_NAME, Inner::CERT_PACK_EPOCH);
+        assert_eq!(index.data_file_length(), 0, "the close sealed a trusted marker");
+        drop(index);
+        let what = EpochRecordDb::assess(dir.path()).expect("assess").expect("a rebuild");
+        assert!(what.contains("cert-digest"), "{what}");
+        let mut inner = Inner::open_append(dir.path(), 0).expect("the reopen rebuilds");
+        inner.save_certificate(record4.digest(), cert4).expect("the refused certificate is stored");
+        assert!(inner.epoch_certified(4), "epoch 4 is certified");
+    }
+
+    /// A data log that is gone while its digest index attests acked entries was lost, not new:
+    /// recreating it empty and rebuilding the indexes to match would drop every record or
+    /// certificate silently. The open and the dry run refuse, whatever the index's seal state,
+    /// and a retry refuses again although the first attempt left a fresh log behind.
+    #[test]
+    fn test_missing_log_beside_an_attesting_index_is_refused() {
+        let mut rng = StdRng::seed_from_u64(13);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let pairs = make_chain(3, &signers);
+        for log in [CERTS_NAME, RECORDS_NAME] {
+            for clean in [true, false] {
+                let dir = TempDir::with_prefix("epoch_lost_log").expect("temp dir");
+                let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+                for (record, cert) in &pairs {
+                    inner.save(record.clone(), cert.clone()).expect("save");
+                }
+                inner.persist().expect("persist");
+                if clean {
+                    drop(inner);
+                } else {
+                    std::mem::forget(inner); // crash: the indexes are left unsealed
+                }
+                std::fs::remove_file(dir.path().join(log)).expect("remove the log");
+                for attempt in 1..=2 {
+                    assert!(
+                        matches!(
+                            EpochRecordDb::assess(dir.path()),
+                            Err(EpochDbError::CorruptLog(_))
+                        ),
+                        "{log} (clean: {clean}): dry run {attempt} must predict the refusal"
+                    );
+                    let err = EpochRecordDb::open(dir.path())
+                        .err()
+                        .unwrap_or_else(|| panic!("{log} (clean: {clean}): open {attempt}"));
+                    assert!(
+                        matches!(err, EpochDbError::CorruptLog(_)),
+                        "{log} (clean: {clean}): open {attempt}: {err:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The lost-log refusal leaves a new database alone: a fresh directory opens, and so do logs
+    /// gone beside indexes that attest nothing (no record or certificate was ever saved).
+    #[test]
+    fn test_logs_missing_beside_indexes_that_attest_nothing_open() {
+        let dir = TempDir::with_prefix("epoch_index_only").expect("temp dir");
+        assert!(matches!(EpochRecordDb::assess(dir.path()), Ok(Some(_))), "would be created");
+        drop(EpochRecordDb::open(dir.path()).expect("a fresh directory opens"));
+        for log in [RECORDS_NAME, CERTS_NAME] {
+            std::fs::remove_file(dir.path().join(log)).expect("remove the log");
+        }
+        assert!(matches!(EpochRecordDb::assess(dir.path()), Ok(Some(_))), "would be created");
+        drop(EpochRecordDb::open(dir.path()).expect("indexes that attest nothing open"));
+    }
+
+    /// Recovery that cuts an unclean log's torn tail flushes the zeros it writes there. The
+    /// unclean open's sync made the old tail durable (here a damaged record and a whole one after
+    /// it), and zeros only in the mapping would leave it on disk past the cut after a power loss,
+    /// for a later replay to reach behind newer records.
+    #[test]
+    fn test_recovery_flushes_the_tail_it_cuts() {
+        use crate::archive::data_file::disk_model;
+        let mut rng = StdRng::seed_from_u64(14);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let pairs = make_chain(6, &signers);
+        let dir = TempDir::with_prefix("epoch_recovery_flush").expect("temp dir");
+        let path = dir.path().join(RECORDS_NAME);
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        for (record, _) in &pairs[..4] {
+            inner.save_record(record.clone()).expect("save");
+        }
+        inner.persist().expect("persist");
+        let cut = inner.records.file_len();
+        for (record, _) in &pairs[4..] {
+            inner.save_record(record.clone()).expect("save, never persisted");
+        }
+        let stale_end = inner.records.file_len();
+        std::mem::forget(inner); // crash
+
+        // Damage the first unpersisted record: the next open keeps the log up to `cut`.
+        toggle_byte(&path, cut + 8);
+
+        disk_model::track(&path);
+        let inner = Inner::open_append(dir.path(), 0).expect("the open cuts the torn tail");
+        assert_eq!(inner.records.file_len(), cut, "cut at the damaged record");
+        std::mem::forget(inner); // crash again, before any writeback
+        disk_model::power_loss(&path);
+        let mut tail = vec![0_u8; (stale_end - cut) as usize];
+        std::fs::File::open(&path).expect("open").read_exact_at(&mut tail, cut).expect("read");
+        assert!(tail.iter().all(|&b| b == 0), "the cut tail's zeros reached the disk");
+        disk_model::untrack(&path);
+    }
+
+    /// A failed save whose bytes reached the disk before its rollback (the system's writeback)
+    /// does not come back after a power loss: the rollback's zeros are flushed over it.
+    #[test]
+    fn test_power_loss_never_brings_back_a_rolled_back_save() {
+        use crate::archive::data_file::disk_model;
+        let mut rng = StdRng::seed_from_u64(15);
+        let signers: Vec<TestSigner> = (0..4).map(|_| TestSigner::new(&mut rng)).collect();
+        let pairs = make_chain(2, &signers);
+        let dir = TempDir::with_prefix("epoch_rollback_flush").expect("temp dir");
+        let path = dir.path().join(RECORDS_NAME);
+        let mut inner = Inner::open_append(dir.path(), 0).expect("open_append");
+        inner.save_record(pairs[0].0.clone()).expect("save");
+        inner.persist().expect("persist");
+        disk_model::track(&path);
+        let start = inner.records.file_len();
+        inner.records.append(&pairs[1].0).expect("append");
+        let end = inner.records.file_len();
+        inner.records.view().msync(start, end).expect("writeback before the rollback");
+        super::rewind_after_failed_save(&mut inner.records, start);
+        std::mem::forget(inner); // crash, before any writeback of the zeros
+        disk_model::power_loss(&path);
+        let mut tail = vec![0_u8; (end - start) as usize];
+        std::fs::File::open(&path).expect("open").read_exact_at(&mut tail, start).expect("read");
+        assert!(tail.iter().all(|&b| b == 0), "the rolled-back save stays gone");
+        disk_model::untrack(&path);
+    }
+
+    /// The offset of every record in the log at `path` (tagged `uid_idx`), walked read-only.
+    fn log_offsets<V>(path: &Path, uid_idx: u64) -> Vec<u64>
+    where
+        V: std::fmt::Debug + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let log = Pack::<V>::open(path, uid_idx, true, PackCompression::ZStd, EPOCH_PACK_VERSION)
+            .expect("open the log read-only");
+        let mut iter = log.raw_iter().expect("iterate");
+        let mut offsets = Vec::new();
+        loop {
+            let pos = iter.logical_position();
+            let Some(Ok(_)) = iter.next() else { break };
+            offsets.push(pos);
+        }
+        offsets
+    }
+
+    /// Lose what attests a crashed log under `dir`: zero its tail commit marker (as a power loss
+    /// can) and tear its digest index's header, so the rebuild's replay is the first walk of it.
+    fn lose_attestation(dir: &Path, log: &str, index: &str) {
+        let path = dir.join(log);
+        let len = std::fs::metadata(&path).expect("log").len();
+        let file = OpenOptions::new().write(true).open(&path).expect("open the log");
+        file.write_all_at(&[0_u8; 16], len - 16).expect("zero the commit marker");
+        OpenOptions::new()
+            .write(true)
+            .open(dir.join(index).join("index.hdx"))
+            .expect("open the index")
+            .set_len(16)
+            .expect("tear the index header");
+    }
+
+    /// A read the disk fails while an unclean open walks a log is an error, never a torn tail:
+    /// the open and the dry run fail with the read error and cut nothing, and once the disk reads
+    /// again the next open keeps every acked entry. The acked-damage walk reads first while the
+    /// commit marker attests the log; with the marker lost and the index torn, the rebuild's
+    /// replay does, for either log.
+    #[test]
+    fn test_replay_read_error_fails_the_open() {
+        use crate::archive::pack_iter::FAIL_READ_AT;
+        for case in ["acked walk", "records replay", "certs replay"] {
+            let (dir, at) = crashed_db_with_eight_records(if case == "acked walk" { 7 } else { 3 });
+            let records = dir.path().join(RECORDS_NAME);
+            let certs = dir.path().join(CERTS_NAME);
+            let at = match case {
+                "acked walk" => at,
+                "records replay" => {
+                    lose_attestation(dir.path(), RECORDS_NAME, Inner::RECORD_HASH_NAME);
+                    lose_attestation(dir.path(), CERTS_NAME, Inner::CERT_HASH_NAME);
+                    at
+                }
+                _ => {
+                    lose_attestation(dir.path(), CERTS_NAME, Inner::CERT_HASH_NAME);
+                    // A certificate offset no record starts at: the hook fires on whichever log
+                    // reads that offset first, and the records log is walked first.
+                    let taken = log_offsets::<EpochRecord>(&records, Inner::PACK_EPOCH);
+                    log_offsets::<EpochCertificate>(&certs, Inner::CERT_PACK_EPOCH)
+                        .into_iter()
+                        .skip(1)
+                        .find(|offset| !taken.contains(offset))
+                        .expect("a certificate offset no record shares")
+                }
+            };
+            let before =
+                (std::fs::read(&records).expect("read"), std::fs::read(&certs).expect("read"));
+            for what in ["open", "dry run"] {
+                FAIL_READ_AT.with(|fail| fail.set(Some(at)));
+                let failed = if what == "open" {
+                    EpochRecordDb::open(dir.path()).err()
+                } else {
+                    EpochRecordDb::assess(dir.path()).err()
+                };
+                FAIL_READ_AT.with(|fail| fail.set(None));
+                let err =
+                    failed.unwrap_or_else(|| panic!("{case}: a read error must fail the {what}"));
+                assert!(
+                    matches!(err, EpochDbError::Unreadable { .. })
+                        && err.to_string().contains("a read error, not a torn tail"),
+                    "{case}: {what}: {err:?}"
+                );
+            }
+            let after =
+                (std::fs::read(&records).expect("read"), std::fs::read(&certs).expect("read"));
+            // The records log is recovered before the certs log is replayed, so a read error in
+            // the certs log comes after the records log's unacked tail (here its padding) was cut.
+            let unchanged =
+                if case == "certs replay" { after.1 == before.1 } else { after == before };
+            assert!(unchanged, "{case}: the failed open cut the log it could not read");
+
+            let mut inner = Inner::open_append(dir.path(), 0).expect("the disk reads again");
+            assert_eq!(inner.epoch_idx.len(), 8, "{case}: every acked record is kept");
+            assert!(inner.epoch_certified(7), "{case}: every acked certificate is kept");
+        }
+    }
+
+    /// The position-index probe behind a damaged size prefix reads too: a read the disk fails
+    /// there is an error, not "no record here", so the open reports the read error rather than
+    /// judging the damage on what it could not read.
+    #[test]
+    fn test_read_error_behind_a_bad_size_prefix_fails_the_open() {
+        use crate::archive::pack_iter::FAIL_READ_AT;
+        let (dir, damaged_at) = crashed_db_with_eight_records(2);
+        // Epoch 3's recorded offset, the first one past the damage.
+        let probed_at = PositionIndex::<u64>::raw_entries(
+            &dir.path().join(Inner::EPOCH_POS_NAME).join("index.pdx"),
+            &DataHeader::new(Inner::PACK_EPOCH, PackCompression::ZStd, EPOCH_PACK_VERSION),
+        )[3];
+        let path = dir.path().join(RECORDS_NAME);
+        let mut bytes = std::fs::read(&path).expect("read records log");
+        // Epoch 2's size prefix far past any valid size, so the walk stops dead; the commit
+        // marker lost, so only the probe of the recorded offsets can see past it.
+        bytes[damaged_at as usize..damaged_at as usize + 4].copy_from_slice(&[0xFF; 4]);
+        let len = bytes.len();
+        bytes[len - 16..].fill(0);
+        std::fs::write(&path, &bytes).expect("write records log");
+
+        FAIL_READ_AT.with(|fail| fail.set(Some(probed_at)));
+        let failed = EpochRecordDb::open(dir.path()).err();
+        FAIL_READ_AT.with(|fail| fail.set(None));
+        let err = failed.expect("a read error must fail the open");
+        assert!(matches!(err, EpochDbError::Unreadable { .. }), "{err:?}");
+        assert_eq!(std::fs::read(&path).expect("read"), bytes, "the failed open cut nothing");
+        let Err(err) = EpochRecordDb::open(dir.path()) else {
+            panic!("the damage itself is refused");
+        };
+        assert!(matches!(err, EpochDbError::CorruptLog(_)), "{err:?}");
     }
 }

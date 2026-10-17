@@ -9,7 +9,7 @@ use std::{
 
 use crate::archive::{
     crc::{add_crc32, check_crc},
-    data_file::{fsync_directory, sentinel_matches, MmapDataFile, SENTINEL_LEN},
+    data_file::{fsync_directory, sentinel_matches, MmapDataFile, MmapFileOptions, SENTINEL_LEN},
     error::{
         commit::CommitError, fetch::FetchError, insert::AppendError, load_header::LoadHeaderError,
     },
@@ -151,7 +151,10 @@ impl<T: PosIndexValue> PositionIndex<T> {
                 let _ = fsync_directory(parent);
             }
         }
-        let mut pdx_file = MmapDataFile::open(dir.join(file_name), read_only)?;
+        // Derived from the data log (rebuilt after any unclean open), so its size waits for the
+        // seal.
+        let opts = MmapFileOptions { derived: true, ..Default::default() };
+        let mut pdx_file = MmapDataFile::open_with(dir.join(file_name), read_only, opts)?;
 
         let was_empty = pdx_file.is_empty();
         let header = if was_empty {
@@ -285,6 +288,34 @@ impl<T: PosIndexValue> PositionIndex<T> {
         self.pdx_file.seek(SeekFrom::Start(PDX_HEADER_SIZE as u64))?;
         self.pdx_file.read_exact(data.as_mut_slice())?;
         Ok(PositionIter::new(data))
+    }
+
+    /// The value at `key`, read straight from the mapping through a shared reference (the
+    /// cursor-free sibling of [`Index::load`]): for readers that share the index with its writer
+    /// behind a read lock.
+    pub fn get(&self, key: u64) -> Result<T, FetchError> {
+        if key as usize >= self.len() {
+            return Err(FetchError::NotFound);
+        }
+        let buffer_len = T::buffer_len();
+        let pos = PDX_HEADER_SIZE as u64 + key * buffer_len as u64;
+        let bytes = self.pdx_file.slice(pos, buffer_len).ok_or_else(|| {
+            FetchError::IO(std::io::Error::other("a position index entry is not mapped"))
+        })?;
+        T::decode(bytes)
+    }
+
+    /// [`Self::rev_iter`] through a shared reference, reading the mapping (see [`Self::get`]).
+    pub fn rev_iter_shared(&self, len: usize) -> Result<PositionIter<T>, std::io::Error> {
+        let count = len.min(self.len());
+        let buffer_len = T::buffer_len();
+        let start = PDX_HEADER_SIZE as u64 + ((self.len() - count) * buffer_len) as u64;
+        let data = self
+            .pdx_file
+            .slice(start, count * buffer_len)
+            .ok_or_else(|| std::io::Error::other("the position index is not mapped"))?
+            .to_vec();
+        Ok(PositionIter::new_rev(data))
     }
 
     /// Return a reverse iterator over file positions with up to len items.

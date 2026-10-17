@@ -35,8 +35,9 @@ pub enum SyncFrame<R> {
     /// requester can give up immediately instead of waiting out its timeout.
     Deny(DenyReason),
     /// DATA: a chunk of opaque response payload. The payload encoding is defined
-    /// by each exchange's cutover, not by this frame layer.
-    Data(Vec<u8>),
+    /// by each exchange's cutover, not by this frame layer. Encoded as one byte string
+    /// (byte-identical to a sequence of `u8`), not byte by byte.
+    Data(#[serde(with = "tn_types::byte_vec")] Vec<u8>),
     /// END: orderly end of the response stream.
     End,
     /// ERR: the responder aborted the exchange after an error.
@@ -106,6 +107,39 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `SyncFrame` as it was derived before `Data` was encoded as a byte string (element by
+    /// element): the oracle the byte-string encoding must match exactly.
+    #[derive(Serialize, Deserialize)]
+    enum ElementwiseFrame {
+        Req(u32),
+        Ack,
+        Deny(DenyReason),
+        Data(Vec<u8>),
+        End,
+        Err(SyncFrameError),
+    }
+
+    /// Encoding a `Data` payload as one byte string leaves the frame's bytes exactly as the
+    /// element-by-element derive wrote them, and each encoding decodes the other's bytes.
+    #[test]
+    fn data_frame_encodes_identically_as_a_byte_string() {
+        for len in [0_usize, 1, 127, 128, 16_384, 1 << 20] {
+            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let frame = SyncFrame::<u32>::Data(payload.clone());
+            let bytes = bcs::to_bytes(&frame).expect("encode frame");
+            assert_eq!(
+                bytes,
+                bcs::to_bytes(&ElementwiseFrame::Data(payload.clone())).expect("encode oracle"),
+                "{len}-byte payload: bytes must not change"
+            );
+            let decoded: SyncFrame<u32> = bcs::from_bytes(&bytes).expect("decode frame");
+            assert_eq!(decoded, frame);
+            let old: ElementwiseFrame =
+                bcs::from_bytes(&bytes).expect("decode with the old derive");
+            assert!(matches!(old, ElementwiseFrame::Data(p) if p == payload));
+        }
+    }
 
     /// A 1 MiB cap, generous enough that no test frame is rejected for size
     /// except the one that deliberately overflows it.
