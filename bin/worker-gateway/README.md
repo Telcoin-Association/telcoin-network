@@ -731,7 +731,7 @@ Use an `https` query URL with a header; over plain `http` the header crosses the
 
 At startup a gateway with `--redirect-queries` sends `eth_chainId` to the first configured worker and to the query URL, the second call carrying the header.
 When the two chain ids differ it logs a warning with both, since reads would then describe a different chain from the one submissions reach; when they match it logs at info.
-The check runs in the background, so it never delays the listener, and `--upstream-request-timeout` bounds each call.
+The check runs in the background, so it never delays the listener, and each call's wait for its answer's head, and each pause in it, is bounded by its route's read timeout (`--upstream-request-timeout` for the worker, `--query-request-timeout` for the query URL), not the whole call.
 When either call fails (the upstream is down, answers with an error status, or returns no hex chain id), the gateway logs the reason at info and serves anyway.
 The check runs once; a query URL that changes chains later is not detected.
 
